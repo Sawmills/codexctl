@@ -3,6 +3,7 @@ name = "codexctl"
 version = "0.1.0"
 edition = "2024"
 description = "Manage multiple OpenAI Codex CLI accounts"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"

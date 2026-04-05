@@ -97,4 +97,4 @@ Supports both Codex CLI auth formats:
 
 ## License
 
-MIT
+Apache-2.0
