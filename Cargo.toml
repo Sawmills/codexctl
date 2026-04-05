@@ -1,0 +1,21 @@
+[package]
+name = "codexctl"
+version = "0.1.0"
+edition = "2024"
+description = "Manage multiple OpenAI Codex CLI accounts"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+comfy-table = "7"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+dirs = "6"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
