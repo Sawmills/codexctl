@@ -43,6 +43,9 @@ fn build_row(
 
     match api::fetch_usage(access_token) {
         Ok(usage) => {
+            if let Some(plan) = &usage.plan_type {
+                let _ = profile::update_meta_plan(&p.meta.alias, plan);
+            }
             let plan = usage.plan_type.as_deref().unwrap_or("-");
             let (h5_used, h5_reset) = format_window(usage.rate_limit.as_ref().and_then(|r| r.primary.as_ref()));
             let (d7_used, d7_reset) = format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary.as_ref()));

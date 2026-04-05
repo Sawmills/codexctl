@@ -125,6 +125,20 @@ pub fn switch_to_from(paths: &Paths, alias: &str) -> Result<String> {
     Ok(profile.meta.email.unwrap_or_else(|| "unknown".to_string()))
 }
 
+pub fn update_meta_plan(alias: &str, plan: &str) -> Result<()> {
+    let dir = config::profiles_dir()?.join(alias);
+    let meta_path = dir.join("meta.json");
+    if !meta_path.exists() {
+        return Ok(());
+    }
+    let contents = std::fs::read_to_string(&meta_path)?;
+    let mut meta: Meta = serde_json::from_str(&contents)?;
+    meta.plan = Some(plan.to_string());
+    let json = serde_json::to_string_pretty(&meta)?;
+    std::fs::write(&meta_path, json)?;
+    Ok(())
+}
+
 // === Default-paths wrappers (used by commands) ===
 
 pub fn list_profiles() -> Result<Vec<Profile>> { list_profiles_from(&config::default_paths()?) }
