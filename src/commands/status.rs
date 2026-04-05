@@ -1,5 +1,5 @@
 use anyhow::Result;
-use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, Table};
+use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 use crate::api;
 use crate::profile;
@@ -32,11 +32,7 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn build_row(
-    p: &profile::Profile,
-    access_token: &str,
-    active: &Option<String>,
-) -> Vec<Cell> {
+fn build_row(p: &profile::Profile, access_token: &str, active: &Option<String>) -> Vec<Cell> {
     let is_active = active.as_deref() == Some(&p.meta.alias);
     let active_marker = if is_active { "*" } else { "" };
     let email = p.meta.email.as_deref().unwrap_or("-");
@@ -47,8 +43,10 @@ fn build_row(
                 let _ = profile::update_meta_plan(&p.meta.alias, plan);
             }
             let plan = usage.plan_type.as_deref().unwrap_or("-");
-            let (h5_used, h5_reset) = format_window(usage.rate_limit.as_ref().and_then(|r| r.primary.as_ref()));
-            let (d7_used, d7_reset) = format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary.as_ref()));
+            let (h5_used, h5_reset) =
+                format_window(usage.rate_limit.as_ref().and_then(|r| r.primary.as_ref()));
+            let (d7_used, d7_reset) =
+                format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary.as_ref()));
 
             vec![
                 Cell::new(&p.meta.alias),
@@ -72,11 +70,7 @@ fn build_row(
     }
 }
 
-fn build_error_row(
-    p: &profile::Profile,
-    msg: &str,
-    active: &Option<String>,
-) -> Vec<Cell> {
+fn build_error_row(p: &profile::Profile, msg: &str, active: &Option<String>) -> Vec<Cell> {
     let is_active = active.as_deref() == Some(&p.meta.alias);
     let active_marker = if is_active { "*" } else { "" };
     let email = p.meta.email.as_deref().unwrap_or("-");

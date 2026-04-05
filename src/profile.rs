@@ -67,10 +67,14 @@ pub fn get_profile_from(paths: &Paths, alias: &str) -> Result<Profile> {
     Ok(Profile { meta, dir })
 }
 
-pub fn save_profile_to(paths: &Paths, alias: &str, email: Option<&str>, auth_json_src: &std::path::Path) -> Result<()> {
+pub fn save_profile_to(
+    paths: &Paths,
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &std::path::Path,
+) -> Result<()> {
     let dir = paths.profiles_dir().join(alias);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
 
     let dest = dir.join("auth.json");
     std::fs::copy(auth_json_src, &dest)
@@ -92,8 +96,7 @@ pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
     if !dir.exists() {
         anyhow::bail!("profile '{}' not found", alias);
     }
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("failed to remove {}", dir.display()))?;
+    std::fs::remove_dir_all(&dir).with_context(|| format!("failed to remove {}", dir.display()))?;
     Ok(())
 }
 
@@ -141,10 +144,28 @@ pub fn update_meta_plan(alias: &str, plan: &str) -> Result<()> {
 
 // === Default-paths wrappers (used by commands) ===
 
-pub fn list_profiles() -> Result<Vec<Profile>> { list_profiles_from(&config::default_paths()?) }
-pub fn get_profile(alias: &str) -> Result<Profile> { get_profile_from(&config::default_paths()?, alias) }
-pub fn save_profile(alias: &str, email: Option<&str>, auth_json_src: &std::path::Path) -> Result<()> { save_profile_to(&config::default_paths()?, alias, email, auth_json_src) }
-pub fn delete_profile(alias: &str) -> Result<()> { delete_profile_from(&config::default_paths()?, alias) }
-pub fn get_active() -> Result<Option<String>> { get_active_from(&config::default_paths()?) }
-pub fn set_active(alias: &str) -> Result<()> { set_active_from(&config::default_paths()?, alias) }
-pub fn switch_to(alias: &str) -> Result<String> { switch_to_from(&config::default_paths()?, alias) }
+pub fn list_profiles() -> Result<Vec<Profile>> {
+    list_profiles_from(&config::default_paths()?)
+}
+pub fn get_profile(alias: &str) -> Result<Profile> {
+    get_profile_from(&config::default_paths()?, alias)
+}
+pub fn save_profile(
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &std::path::Path,
+) -> Result<()> {
+    save_profile_to(&config::default_paths()?, alias, email, auth_json_src)
+}
+pub fn delete_profile(alias: &str) -> Result<()> {
+    delete_profile_from(&config::default_paths()?, alias)
+}
+pub fn get_active() -> Result<Option<String>> {
+    get_active_from(&config::default_paths()?)
+}
+pub fn set_active(alias: &str) -> Result<()> {
+    set_active_from(&config::default_paths()?, alias)
+}
+pub fn switch_to(alias: &str) -> Result<String> {
+    switch_to_from(&config::default_paths()?, alias)
+}

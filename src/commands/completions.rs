@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::CommandFactory;
-use clap_complete::{generate, Shell};
+use clap_complete::{Shell, generate};
 
 use crate::Cli;
 
@@ -29,7 +29,9 @@ pub fn run(shell: Shell) -> Result<()> {
         println!(r#"_codexctl_profiles() {{"#);
         println!(r#"  local profiles_dir="$HOME/.codexctl/profiles""#);
         println!(r#"  if [[ -d "$profiles_dir" ]]; then"#);
-        println!(r#"    COMPREPLY=($(compgen -W "$(ls "$profiles_dir")" -- "${{COMP_WORDS[COMP_CWORD]}}"))"#);
+        println!(
+            r#"    COMPREPLY=($(compgen -W "$(ls "$profiles_dir")" -- "${{COMP_WORDS[COMP_CWORD]}}"))"#
+        );
         println!(r#"  fi"#);
         println!(r#"}}"#);
         println!(r#"complete -F _codexctl_profiles codexctl use"#);
@@ -39,7 +41,9 @@ pub fn run(shell: Shell) -> Result<()> {
     if shell == Shell::Fish {
         println!();
         println!(r#"# Dynamic profile completion"#);
-        println!(r#"complete -c codexctl -n '__fish_seen_subcommand_from use remove' -xa '(ls ~/.codexctl/profiles/ 2>/dev/null)'"#);
+        println!(
+            r#"complete -c codexctl -n '__fish_seen_subcommand_from use remove' -xa '(ls ~/.codexctl/profiles/ 2>/dev/null)'"#
+        );
     }
 
     Ok(())

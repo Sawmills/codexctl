@@ -23,7 +23,13 @@ fn save_and_list_profile() {
     let (_tmp, paths) = setup_test_env();
     let auth_src = paths.codex_auth_json();
 
-    profile::save_profile_to(&paths, "test@example.com", Some("test@example.com"), &auth_src).unwrap();
+    profile::save_profile_to(
+        &paths,
+        "test@example.com",
+        Some("test@example.com"),
+        &auth_src,
+    )
+    .unwrap();
 
     let profiles = profile::list_profiles_from(&paths).unwrap();
     assert_eq!(profiles.len(), 1);

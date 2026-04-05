@@ -23,10 +23,10 @@ A Rust CLI tool for managing multiple OpenAI Codex CLI accounts. Solves the pain
 ~/.codexctl/
   active                    # plain text file containing the active profile alias
   profiles/
-    work-main/
+    amir@sawmills.ai/
       auth.json             # copy of ~/.codex/auth.json at save time
-      meta.json             # { "alias": "work-main", "email": "...", "plan": "pro", "saved_at": "..." }
-    personal/
+      meta.json             # { "alias": "amir@sawmills.ai", "email": "amir@sawmills.ai", "plan": "pro", "saved_at": "..." }
+    amir+2@sawmills.ai/
       auth.json
       meta.json
     ...
@@ -38,7 +38,7 @@ A Rust CLI tool for managing multiple OpenAI Codex CLI accounts. Solves the pain
 
 1. Read `~/.codex/auth.json` — fail if missing or unparseable.
 2. Extract identity: call `GET https://chatgpt.com/backend-api/me` with the access token to get email. If the call fails (expired token, network), prompt user for an alias instead of auto-detecting.
-3. If no alias provided and email retrieved, derive alias from email local part (e.g., `amir@sawmills.ai` -> `amir-sawmills`).
+3. If no alias provided and email retrieved, use the full email as the alias (e.g., `amir@sawmills.ai`, `amir+2@sawmills.ai`). Profile directory names use the email verbatim — `@` and `+` are valid in directory names.
 4. If alias already exists, confirm overwrite.
 5. Copy `auth.json` into `~/.codexctl/profiles/<alias>/auth.json`.
 6. Write `meta.json` with alias, email (if known), and timestamp.
@@ -66,13 +66,13 @@ A Rust CLI tool for managing multiple OpenAI Codex CLI accounts. Solves the pain
 4. Render table:
 
 ```
- Account       Email                Plan   5h Used   5h Reset      7d Used   7d Reset       Active
- work-main     amir@sawmills.ai     Pro    27%       in 3h 12m     46%       in 4d 2h       *
- personal      amir@gmail.com       Plus   0%        in 4h 58m     12%       in 6d 1h
- work-2        dev@sawmills.ai      Pro    89%       in 1h 03m     71%       in 2d 5h
+ Account                Email                Plan   5h Used   5h Reset      7d Used   7d Reset       Active
+ amir@sawmills.ai       amir@sawmills.ai     Pro    27%       in 3h 12m     46%       in 4d 2h       *
+ amir+2@sawmills.ai     amir+2@sawmills.ai   Plus   0%        in 4h 58m     12%       in 6d 1h
+ dev@sawmills.ai        dev@sawmills.ai      Pro    89%       in 1h 03m     71%       in 2d 5h
 ```
 
-5. If a token is expired (401/403), show `expired` in the status columns instead of failing.
+1. If a token is expired (401/403), show `expired` in the status columns instead of failing.
 
 ## Rate Limit API
 
@@ -122,6 +122,7 @@ Use `clap_complete` with a custom completer for profile-aware tab completion:
 - `codexctl completions <TAB>` — lists shells: `zsh`, `bash`, `fish`
 
 Generate via:
+
 ```bash
 codexctl completions zsh > ~/.zfunc/_codexctl
 ```

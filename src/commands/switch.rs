@@ -45,7 +45,10 @@ pub fn run() -> Result<()> {
                 .unwrap_or_default();
 
             let plan = p.meta.plan.as_deref().unwrap_or("-");
-            format!("{} ({}) [{}]{}{}", p.meta.alias, email, plan, usage_info, marker)
+            format!(
+                "{} ({}) [{}]{}{}",
+                p.meta.alias, email, plan, usage_info, marker
+            )
         })
         .collect();
 
