@@ -22,10 +22,10 @@ enum Commands {
         /// Custom alias (defaults to email)
         alias: Option<String>,
     },
-    /// Switch to a profile by alias
+    /// Switch to a profile by alias (or most available if omitted)
     Use {
-        /// Profile alias to switch to
-        alias: String,
+        /// Profile alias to switch to (auto-selects most available if omitted)
+        alias: Option<String>,
     },
     /// Interactive fuzzy picker to switch accounts
     Switch,
@@ -56,7 +56,7 @@ fn main() {
     let result = match cli.command {
         Commands::Status => commands::status::run(),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
-        Commands::Use { ref alias } => commands::use_profile::run(alias),
+        Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),
         Commands::Switch => commands::switch::run(),
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
