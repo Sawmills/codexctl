@@ -42,8 +42,9 @@ pub fn run() -> Result<()> {
 
     let active = profile::get_active()?;
 
-    let mut statuses: Vec<AccountStatus> =
-        profiles.iter().map(|p| fetch_status(p, &active)).collect();
+    // Fetch all accounts in parallel
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut statuses = rt.block_on(fetch_all_statuses(&profiles, &active));
 
     statuses.sort_by(|a, b| {
         a.availability_score()
@@ -65,75 +66,89 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn fetch_status(p: &profile::Profile, active: &Option<String>) -> AccountStatus {
-    let is_active = active.as_deref() == Some(&p.meta.alias);
+async fn fetch_all_statuses(
+    profiles: &[profile::Profile],
+    active: &Option<String>,
+) -> Vec<AccountStatus> {
+    let client = reqwest::Client::new();
 
-    let auth = match api::read_auth_json(&p.auth_json_path()) {
-        Ok(a) => a,
-        Err(_) => {
-            return AccountStatus {
-                alias: p.meta.alias.clone(),
+    let futures: Vec<_> = profiles
+        .iter()
+        .map(|p| {
+            let client = client.clone();
+            let alias = p.meta.alias.clone();
+            let is_active = active.as_deref() == Some(&p.meta.alias);
+            let auth = api::read_auth_json(&p.auth_json_path());
 
-                plan: "-".to_string(),
-                h5_pct: None,
-                d7_pct: None,
-                h5_reset: "-".to_string(),
-                d7_reset: "-".to_string(),
-                is_active,
-                is_error: true,
-                error_msg: "bad auth.json".to_string(),
-            };
-        }
-    };
+            async move {
+                let auth = match auth {
+                    Ok(a) => a,
+                    Err(_) => {
+                        return AccountStatus {
+                            alias,
+                            plan: "-".to_string(),
+                            h5_pct: None,
+                            d7_pct: None,
+                            h5_reset: "-".to_string(),
+                            d7_reset: "-".to_string(),
+                            is_active,
+                            is_error: true,
+                            error_msg: "bad auth.json".to_string(),
+                        };
+                    }
+                };
 
-    match api::fetch_usage(&auth.access_token) {
-        Ok(usage) => {
-            if let Some(plan) = &usage.plan_type {
-                let _ = profile::update_meta_plan(&p.meta.alias, plan);
+                match api::fetch_usage_async(&client, &auth.access_token).await {
+                    Ok(usage) => {
+                        if let Some(plan) = &usage.plan_type {
+                            let _ = profile::update_meta_plan(&alias, plan);
+                        }
+                        let plan = usage.plan_type.as_deref().unwrap_or("-").to_string();
+
+                        let primary = usage.rate_limit.as_ref().and_then(|r| r.primary());
+                        let secondary = usage.rate_limit.as_ref().and_then(|r| r.secondary());
+
+                        let h5_pct = primary.map(|w| w.used_percent);
+                        let d7_pct = secondary.map(|w| w.used_percent);
+                        let (_, h5_reset) = format_window(primary);
+                        let (_, d7_reset) = format_window(secondary);
+
+                        AccountStatus {
+                            alias,
+                            plan,
+                            h5_pct,
+                            d7_pct,
+                            h5_reset,
+                            d7_reset,
+                            is_active,
+                            is_error: false,
+                            error_msg: String::new(),
+                        }
+                    }
+                    Err(e) => {
+                        let msg = if e.to_string().contains("expired") {
+                            "expired"
+                        } else {
+                            "error"
+                        };
+                        AccountStatus {
+                            alias,
+                            plan: "-".to_string(),
+                            h5_pct: None,
+                            d7_pct: None,
+                            h5_reset: "-".to_string(),
+                            d7_reset: "-".to_string(),
+                            is_active,
+                            is_error: true,
+                            error_msg: msg.to_string(),
+                        }
+                    }
+                }
             }
-            let plan = usage.plan_type.as_deref().unwrap_or("-").to_string();
+        })
+        .collect();
 
-            let primary = usage.rate_limit.as_ref().and_then(|r| r.primary());
-            let secondary = usage.rate_limit.as_ref().and_then(|r| r.secondary());
-
-            let h5_pct = primary.map(|w| w.used_percent);
-            let d7_pct = secondary.map(|w| w.used_percent);
-            let (_, h5_reset) = format_window(primary);
-            let (_, d7_reset) = format_window(secondary);
-
-            AccountStatus {
-                alias: p.meta.alias.clone(),
-
-                plan,
-                h5_pct,
-                d7_pct,
-                h5_reset,
-                d7_reset,
-                is_active,
-                is_error: false,
-                error_msg: String::new(),
-            }
-        }
-        Err(e) => {
-            let msg = if e.to_string().contains("expired") {
-                "expired"
-            } else {
-                "error"
-            };
-            AccountStatus {
-                alias: p.meta.alias.clone(),
-
-                plan: "-".to_string(),
-                h5_pct: None,
-                d7_pct: None,
-                h5_reset: "-".to_string(),
-                d7_reset: "-".to_string(),
-                is_active,
-                is_error: true,
-                error_msg: msg.to_string(),
-            }
-        }
-    }
+    futures::future::join_all(futures).await
 }
 
 fn render_row(s: &AccountStatus) -> Vec<Cell> {

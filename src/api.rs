@@ -93,6 +93,30 @@ pub fn fetch_usage(access_token: &str) -> Result<RateLimitResponse> {
         .context("failed to parse rate limit response")
 }
 
+pub async fn fetch_usage_async(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> Result<RateLimitResponse> {
+    let resp = client
+        .get(USAGE_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .context("failed to reach rate limit API")?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!("expired");
+    }
+    if !status.is_success() {
+        anyhow::bail!("API returned {status}");
+    }
+
+    resp.json::<RateLimitResponse>()
+        .await
+        .context("failed to parse rate limit response")
+}
+
 pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
