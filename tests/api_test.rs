@@ -39,7 +39,7 @@ fn parse_auth_json_without_refresh() {
 }
 
 #[test]
-fn parse_rate_limit_response() {
+fn parse_rate_limit_response_old_format() {
     let json = r#"{
         "plan_type": "pro",
         "rate_limit": {
@@ -60,11 +60,42 @@ fn parse_rate_limit_response() {
     let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
     assert_eq!(resp.plan_type.as_deref(), Some("pro"));
     let rl = resp.rate_limit.unwrap();
-    let primary = rl.primary.unwrap();
+    let primary = rl.primary().unwrap();
     assert!((primary.used_percent - 27.0).abs() < f64::EPSILON);
-    assert_eq!(primary.window_minutes, 300);
-    let secondary = rl.secondary.unwrap();
+    assert_eq!(primary.reset_timestamp(), Some(1743789600));
+    let secondary = rl.secondary().unwrap();
     assert!((secondary.used_percent - 46.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn parse_rate_limit_response_team_format() {
+    let json = r#"{
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 0,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 18000,
+                "reset_at": 1775369763
+            },
+            "secondary_window": {
+                "used_percent": 25,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 414415,
+                "reset_at": 1775766178
+            }
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(resp.plan_type.as_deref(), Some("team"));
+    let rl = resp.rate_limit.unwrap();
+    let primary = rl.primary().unwrap();
+    assert!((primary.used_percent - 0.0).abs() < f64::EPSILON);
+    assert_eq!(primary.reset_timestamp(), Some(1775369763));
+    let secondary = rl.secondary().unwrap();
+    assert!((secondary.used_percent - 25.0).abs() < f64::EPSILON);
 }
 
 #[test]

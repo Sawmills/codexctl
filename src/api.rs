@@ -32,16 +32,43 @@ pub struct RateLimitResponse {
 
 #[derive(Deserialize)]
 pub struct RateLimit {
+    // API returns both naming conventions depending on plan
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,
+    pub primary_window: Option<RateLimitWindow>,
+    pub secondary_window: Option<RateLimitWindow>,
+}
+
+impl RateLimit {
+    pub fn primary(&self) -> Option<&RateLimitWindow> {
+        self.primary.as_ref().or(self.primary_window.as_ref())
+    }
+    pub fn secondary(&self) -> Option<&RateLimitWindow> {
+        self.secondary.as_ref().or(self.secondary_window.as_ref())
+    }
 }
 
 #[derive(Deserialize)]
 pub struct RateLimitWindow {
     pub used_percent: f64,
+    // Supports both field names from API
     #[allow(dead_code)]
-    pub window_minutes: u64,
-    pub resets_at: i64,
+    pub window_minutes: Option<u64>,
+    #[allow(dead_code)]
+    pub limit_window_seconds: Option<u64>,
+    pub resets_at: Option<i64>,
+    pub reset_at: Option<i64>,
+    pub reset_after_seconds: Option<i64>,
+}
+
+impl RateLimitWindow {
+    /// Get reset timestamp, preferring absolute time, falling back to relative
+    pub fn reset_timestamp(&self) -> Option<i64> {
+        self.resets_at.or(self.reset_at).or_else(|| {
+            self.reset_after_seconds
+                .map(|s| chrono::Utc::now().timestamp() + s)
+        })
+    }
 }
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";

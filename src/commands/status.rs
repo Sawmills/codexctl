@@ -44,9 +44,9 @@ fn build_row(p: &profile::Profile, access_token: &str, active: &Option<String>) 
             }
             let plan = usage.plan_type.as_deref().unwrap_or("-");
             let (h5_used, h5_reset) =
-                format_window(usage.rate_limit.as_ref().and_then(|r| r.primary.as_ref()));
+                format_window(usage.rate_limit.as_ref().and_then(|r| r.primary()));
             let (d7_used, d7_reset) =
-                format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary.as_ref()));
+                format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary()));
 
             vec![
                 Cell::new(&p.meta.alias),
@@ -91,14 +91,19 @@ fn format_window(window: Option<&api::RateLimitWindow>) -> (String, String) {
     match window {
         Some(w) => {
             let used = format!("{:.0}%", w.used_percent);
-            let now = chrono::Utc::now().timestamp();
-            let diff_secs = w.resets_at - now;
-            let reset = if diff_secs <= 0 {
-                "now".to_string()
-            } else {
-                format_duration(diff_secs)
-            };
-            (used, format!("in {reset}"))
+            match w.reset_timestamp() {
+                Some(reset_ts) => {
+                    let now = chrono::Utc::now().timestamp();
+                    let diff_secs = reset_ts - now;
+                    let reset = if diff_secs <= 0 {
+                        "now".to_string()
+                    } else {
+                        format_duration(diff_secs)
+                    };
+                    (used, format!("in {reset}"))
+                }
+                None => (used, "-".to_string()),
+            }
         }
         None => ("-".to_string(), "-".to_string()),
     }

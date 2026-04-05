@@ -31,13 +31,13 @@ pub fn run() -> Result<()> {
                     let h5 = u
                         .rate_limit
                         .as_ref()
-                        .and_then(|r| r.primary.as_ref())
+                        .and_then(|r| r.primary())
                         .map(|w| format!("{:.0}%", w.used_percent))
                         .unwrap_or_else(|| "-".to_string());
                     let d7 = u
                         .rate_limit
                         .as_ref()
-                        .and_then(|r| r.secondary.as_ref())
+                        .and_then(|r| r.secondary())
                         .map(|w| format!("{:.0}%", w.used_percent))
                         .unwrap_or_else(|| "-".to_string());
                     format!(" — 5h: {h5}, 7d: {d7}")
