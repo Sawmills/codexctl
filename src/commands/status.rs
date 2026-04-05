@@ -4,6 +4,35 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 use crate::api;
 use crate::profile;
 
+struct AccountStatus {
+    alias: String,
+    plan: String,
+    h5_pct: Option<f64>,
+    d7_pct: Option<f64>,
+    h5_reset: String,
+    d7_reset: String,
+    is_active: bool,
+    is_error: bool,
+    error_msg: String,
+}
+
+impl AccountStatus {
+    /// Sort score: lower = more available. Errors/expired go to bottom.
+    fn availability_score(&self) -> f64 {
+        if self.is_error {
+            return 1000.0;
+        }
+        let h5 = self.h5_pct.unwrap_or(0.0);
+        let d7 = self.d7_pct.unwrap_or(0.0);
+        // 5h limit matters more (it's the one that blocks you right now)
+        // 100% on 5h = unusable regardless of 7d
+        if h5 >= 100.0 {
+            return 500.0 + d7;
+        }
+        h5 * 2.0 + d7
+    }
+}
+
 pub fn run() -> Result<()> {
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
@@ -13,51 +42,77 @@ pub fn run() -> Result<()> {
 
     let active = profile::get_active()?;
 
+    let mut statuses: Vec<AccountStatus> =
+        profiles.iter().map(|p| fetch_status(p, &active)).collect();
+
+    statuses.sort_by(|a, b| {
+        a.availability_score()
+            .partial_cmp(&b.availability_score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     table.set_header(vec![
-        "Account", "Email", "Plan", "5h Used", "5h Reset", "7d Used", "7d Reset", "Active",
+        "Account", "Plan", "5h Used", "5h Reset", "7d Used", "7d Reset", "Active",
     ]);
 
-    for p in &profiles {
-        let auth = api::read_auth_json(&p.auth_json_path());
-        let row = match auth {
-            Ok(auth) => build_row(p, &auth.access_token, &active),
-            Err(_) => build_error_row(p, "bad auth.json", &active),
-        };
-        table.add_row(row);
+    for s in &statuses {
+        table.add_row(render_row(s));
     }
 
     println!("{table}");
     Ok(())
 }
 
-fn build_row(p: &profile::Profile, access_token: &str, active: &Option<String>) -> Vec<Cell> {
+fn fetch_status(p: &profile::Profile, active: &Option<String>) -> AccountStatus {
     let is_active = active.as_deref() == Some(&p.meta.alias);
-    let active_marker = if is_active { "*" } else { "" };
-    let email = p.meta.email.as_deref().unwrap_or("-");
 
-    match api::fetch_usage(access_token) {
+    let auth = match api::read_auth_json(&p.auth_json_path()) {
+        Ok(a) => a,
+        Err(_) => {
+            return AccountStatus {
+                alias: p.meta.alias.clone(),
+
+                plan: "-".to_string(),
+                h5_pct: None,
+                d7_pct: None,
+                h5_reset: "-".to_string(),
+                d7_reset: "-".to_string(),
+                is_active,
+                is_error: true,
+                error_msg: "bad auth.json".to_string(),
+            };
+        }
+    };
+
+    match api::fetch_usage(&auth.access_token) {
         Ok(usage) => {
             if let Some(plan) = &usage.plan_type {
                 let _ = profile::update_meta_plan(&p.meta.alias, plan);
             }
-            let plan = usage.plan_type.as_deref().unwrap_or("-");
-            let (h5_used, h5_reset) =
-                format_window(usage.rate_limit.as_ref().and_then(|r| r.primary()));
-            let (d7_used, d7_reset) =
-                format_window(usage.rate_limit.as_ref().and_then(|r| r.secondary()));
+            let plan = usage.plan_type.as_deref().unwrap_or("-").to_string();
 
-            vec![
-                Cell::new(&p.meta.alias),
-                Cell::new(email),
-                Cell::new(plan),
-                colorize_usage(&h5_used),
-                Cell::new(&h5_reset),
-                colorize_usage(&d7_used),
-                Cell::new(&d7_reset),
-                Cell::new(active_marker),
-            ]
+            let primary = usage.rate_limit.as_ref().and_then(|r| r.primary());
+            let secondary = usage.rate_limit.as_ref().and_then(|r| r.secondary());
+
+            let h5_pct = primary.map(|w| w.used_percent);
+            let d7_pct = secondary.map(|w| w.used_percent);
+            let (_, h5_reset) = format_window(primary);
+            let (_, d7_reset) = format_window(secondary);
+
+            AccountStatus {
+                alias: p.meta.alias.clone(),
+
+                plan,
+                h5_pct,
+                d7_pct,
+                h5_reset,
+                d7_reset,
+                is_active,
+                is_error: false,
+                error_msg: String::new(),
+            }
         }
         Err(e) => {
             let msg = if e.to_string().contains("expired") {
@@ -65,24 +120,53 @@ fn build_row(p: &profile::Profile, access_token: &str, active: &Option<String>) 
             } else {
                 "error"
             };
-            build_error_row(p, msg, active)
+            AccountStatus {
+                alias: p.meta.alias.clone(),
+
+                plan: "-".to_string(),
+                h5_pct: None,
+                d7_pct: None,
+                h5_reset: "-".to_string(),
+                d7_reset: "-".to_string(),
+                is_active,
+                is_error: true,
+                error_msg: msg.to_string(),
+            }
         }
     }
 }
 
-fn build_error_row(p: &profile::Profile, msg: &str, active: &Option<String>) -> Vec<Cell> {
-    let is_active = active.as_deref() == Some(&p.meta.alias);
-    let active_marker = if is_active { "*" } else { "" };
-    let email = p.meta.email.as_deref().unwrap_or("-");
+fn render_row(s: &AccountStatus) -> Vec<Cell> {
+    let active_marker = if s.is_active { "*" } else { "" };
+
+    if s.is_error {
+        return vec![
+            Cell::new(&s.alias),
+            Cell::new("-"),
+            Cell::new(&s.error_msg).fg(Color::Red),
+            Cell::new("-"),
+            Cell::new(&s.error_msg).fg(Color::Red),
+            Cell::new("-"),
+            Cell::new(active_marker),
+        ];
+    }
+
+    let h5_str = s
+        .h5_pct
+        .map(|p| format!("{:.0}%", p))
+        .unwrap_or_else(|| "-".to_string());
+    let d7_str = s
+        .d7_pct
+        .map(|p| format!("{:.0}%", p))
+        .unwrap_or_else(|| "-".to_string());
 
     vec![
-        Cell::new(&p.meta.alias),
-        Cell::new(email),
-        Cell::new("-"),
-        Cell::new(msg).fg(Color::Red),
-        Cell::new("-"),
-        Cell::new(msg).fg(Color::Red),
-        Cell::new("-"),
+        Cell::new(&s.alias),
+        Cell::new(&s.plan),
+        colorize_usage(&h5_str),
+        Cell::new(&s.h5_reset),
+        colorize_usage(&d7_str),
+        Cell::new(&s.d7_reset),
         Cell::new(active_marker),
     ]
 }
