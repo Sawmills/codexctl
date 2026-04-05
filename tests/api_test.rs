@@ -1,16 +1,39 @@
-use codexctl::api::{AuthJson, RateLimitResponse};
+use codexctl::api::{self, RateLimitResponse};
 
 #[test]
-fn parse_auth_json() {
-    let json = r#"{"access_token": "tok_abc", "refresh_token": "ref_123"}"#;
-    let auth: AuthJson = serde_json::from_str(json).unwrap();
+fn parse_auth_json_flat_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    std::fs::write(
+        &path,
+        r#"{"access_token": "tok_abc", "refresh_token": "ref_123"}"#,
+    )
+    .unwrap();
+    let auth = api::read_auth_json(&path).unwrap();
     assert_eq!(auth.access_token, "tok_abc");
+    assert_eq!(auth.refresh_token.as_deref(), Some("ref_123"));
+}
+
+#[test]
+fn parse_auth_json_codex_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    std::fs::write(
+        &path,
+        r#"{"auth_mode": "chatgpt", "tokens": {"access_token": "tok_nested", "refresh_token": "ref_nested"}}"#,
+    )
+    .unwrap();
+    let auth = api::read_auth_json(&path).unwrap();
+    assert_eq!(auth.access_token, "tok_nested");
+    assert_eq!(auth.refresh_token.as_deref(), Some("ref_nested"));
 }
 
 #[test]
 fn parse_auth_json_without_refresh() {
-    let json = r#"{"access_token": "tok_abc"}"#;
-    let auth: AuthJson = serde_json::from_str(json).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    std::fs::write(&path, r#"{"access_token": "tok_abc"}"#).unwrap();
+    let auth = api::read_auth_json(&path).unwrap();
     assert_eq!(auth.access_token, "tok_abc");
     assert!(auth.refresh_token.is_none());
 }
