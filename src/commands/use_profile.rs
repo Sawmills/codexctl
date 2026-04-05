@@ -1,5 +1,9 @@
 use anyhow::Result;
 
-pub fn run(_alias: &str) -> Result<()> {
-    todo!()
+use crate::profile;
+
+pub fn run(alias: &str) -> Result<()> {
+    let email = profile::switch_to(alias)?;
+    println!("switched to {} ({})", alias, email);
+    Ok(())
 }
