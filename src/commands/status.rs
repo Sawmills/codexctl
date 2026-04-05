@@ -1,5 +1,5 @@
 use anyhow::Result;
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
+use comfy_table::{presets::UTF8_FULL_CONDENSED, Cell, Color, Table};
 
 use crate::api;
 use crate::profile;

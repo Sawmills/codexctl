@@ -6,16 +6,16 @@ A Rust CLI tool for managing multiple OpenAI Codex CLI accounts. Solves the pain
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `codexctl status` | Table of all accounts: alias, email, plan, 5h usage%, 7d usage%, reset times |
-| `codexctl save [alias]` | Save current `~/.codex/auth.json` as a named profile. Auto-detects email from token; optional alias override. |
-| `codexctl use <alias>` | Direct switch — copies profile's auth.json into `~/.codex/auth.json` |
-| `codexctl switch` | Interactive fuzzy picker to select and switch account |
-| `codexctl list` | List all saved profiles (alias, email, active marker) |
-| `codexctl remove <alias>` | Delete a saved profile |
-| `codexctl whoami` | Show currently active account (alias + email + plan) |
-| `codexctl completions <shell>` | Generate shell completions (zsh/bash/fish) |
+| Command                        | Description                                                                                                   |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `codexctl status`              | Table of all accounts: alias, email, plan, 5h usage%, 7d usage%, reset times                                  |
+| `codexctl save [alias]`        | Save current `~/.codex/auth.json` as a named profile. Auto-detects email from token; optional alias override. |
+| `codexctl use <alias>`         | Direct switch — copies profile's auth.json into `~/.codex/auth.json`                                          |
+| `codexctl switch`              | Interactive fuzzy picker to select and switch account                                                         |
+| `codexctl list`                | List all saved profiles (alias, email, active marker)                                                         |
+| `codexctl remove <alias>`      | Delete a saved profile                                                                                        |
+| `codexctl whoami`              | Show currently active account (alias + email + plan)                                                          |
+| `codexctl completions <shell>` | Generate shell completions (zsh/bash/fish)                                                                    |
 
 ## Data Layout
 
@@ -131,15 +131,15 @@ The completer reads the profiles directory at completion time, so new profiles a
 
 ## Dependencies
 
-| Crate | Purpose |
-|---|---|
-| `clap` + `clap_complete` | CLI parsing + shell completions |
-| `reqwest` (blocking) | HTTP calls to rate limit API |
-| `serde` + `serde_json` | JSON parsing |
-| `comfy-table` | Status table rendering |
-| `dialoguer` | Interactive fuzzy picker |
-| `chrono` | Timestamp formatting for reset times |
-| `anyhow` | Error handling |
+| Crate                    | Purpose                              |
+| ------------------------ | ------------------------------------ |
+| `clap` + `clap_complete` | CLI parsing + shell completions      |
+| `reqwest` (blocking)     | HTTP calls to rate limit API         |
+| `serde` + `serde_json`   | JSON parsing                         |
+| `comfy-table`            | Status table rendering               |
+| `dialoguer`              | Interactive fuzzy picker             |
+| `chrono`                 | Timestamp formatting for reset times |
+| `anyhow`                 | Error handling                       |
 
 ## File Structure
 
