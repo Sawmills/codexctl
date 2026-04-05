@@ -23,6 +23,7 @@ pub struct RateLimit {
 #[derive(Deserialize)]
 pub struct RateLimitWindow {
     pub used_percent: f64,
+    #[allow(dead_code)]
     pub window_minutes: u64,
     pub resets_at: i64,
 }
@@ -52,6 +53,5 @@ pub fn fetch_usage(access_token: &str) -> Result<RateLimitResponse> {
 pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&contents)
-        .with_context(|| format!("failed to parse {}", path.display()))
+    serde_json::from_str(&contents).with_context(|| format!("failed to parse {}", path.display()))
 }

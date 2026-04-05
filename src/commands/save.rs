@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::api;
 use crate::config;
@@ -30,7 +30,10 @@ pub fn run(alias: Option<&str>) -> Result<()> {
 
     let existing = config::profiles_dir()?.join(&resolved_alias);
     if existing.exists() {
-        eprint!("profile '{}' already exists. Overwrite? [y/N] ", resolved_alias);
+        eprint!(
+            "profile '{}' already exists. Overwrite? [y/N] ",
+            resolved_alias
+        );
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {

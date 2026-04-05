@@ -44,8 +44,15 @@ pub fn default_paths() -> Result<Paths> {
 }
 
 // Convenience functions that delegate to default_paths()
-pub fn codexctl_dir() -> Result<PathBuf> { Ok(default_paths()?.codexctl_dir()) }
-pub fn profiles_dir() -> Result<PathBuf> { Ok(default_paths()?.profiles_dir()) }
-pub fn active_file() -> Result<PathBuf> { Ok(default_paths()?.active_file()) }
-pub fn codex_auth_json() -> Result<PathBuf> { Ok(default_paths()?.codex_auth_json()) }
-pub fn ensure_dirs() -> Result<()> { default_paths()?.ensure_dirs() }
+pub fn profiles_dir() -> Result<PathBuf> {
+    Ok(default_paths()?.profiles_dir())
+}
+pub fn active_file() -> Result<PathBuf> {
+    Ok(default_paths()?.active_file())
+}
+pub fn codex_auth_json() -> Result<PathBuf> {
+    Ok(default_paths()?.codex_auth_json())
+}
+pub fn ensure_dirs() -> Result<()> {
+    default_paths()?.ensure_dirs()
+}
