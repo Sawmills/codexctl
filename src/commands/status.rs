@@ -182,14 +182,14 @@ fn render_row(s: &AccountStatus) -> Vec<Cell> {
         .unwrap_or_else(|| "-".to_string());
     let d7_str = s
         .d7_pct
-        .map(|p| {
-            if s.d7_used_note.is_empty() {
-                format!("{:.0}%", p)
-            } else {
-                format!("{:.0}% ({})", p, s.d7_used_note)
-            }
-        })
+        .map(|p| format!("{:.0}%", p))
         .unwrap_or_else(|| "-".to_string());
+
+    let d7_reset_str = if s.d7_used_note.is_empty() {
+        s.d7_reset.clone()
+    } else {
+        format!("{}\n{}", s.d7_reset, s.d7_used_note)
+    };
 
     vec![
         Cell::new(&s.alias),
@@ -197,7 +197,7 @@ fn render_row(s: &AccountStatus) -> Vec<Cell> {
         colorize_usage(&h5_str),
         Cell::new(&s.h5_reset),
         colorize_usage(&d7_str),
-        Cell::new(&s.d7_reset),
+        Cell::new(&d7_reset_str),
         Cell::new(active_marker),
     ]
 }
