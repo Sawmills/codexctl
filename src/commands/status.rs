@@ -188,7 +188,7 @@ fn render_row(s: &AccountStatus) -> Vec<Cell> {
     let d7_reset_str = if s.d7_used_note.is_empty() {
         s.d7_reset.clone()
     } else {
-        format!("{}\n{}", s.d7_reset, s.d7_used_note)
+        format!("{} ({})", s.d7_reset, s.d7_used_note)
     };
 
     vec![
