@@ -11,6 +11,7 @@ struct AccountStatus {
     d7_pct: Option<f64>,
     h5_reset: String,
     d7_reset: String,
+    d7_used_note: String,
     is_active: bool,
     is_error: bool,
     error_msg: String,
@@ -97,6 +98,7 @@ async fn fetch_all_statuses(
                             d7_pct: None,
                             h5_reset: "-".to_string(),
                             d7_reset: "-".to_string(),
+                            d7_used_note: String::new(),
                             is_active,
                             is_error: true,
                             error_msg: "bad auth.json".to_string(),
@@ -116,8 +118,8 @@ async fn fetch_all_statuses(
 
                         let h5_pct = primary.map(|w| w.used_percent);
                         let d7_pct = secondary.map(|w| w.used_percent);
-                        let (_, h5_reset) = format_window(primary);
-                        let (_, d7_reset) = format_window(secondary);
+                        let (_, h5_reset, _) = format_window(primary);
+                        let (_, d7_reset, d7_used_note) = format_window(secondary);
 
                         AccountStatus {
                             alias,
@@ -126,6 +128,7 @@ async fn fetch_all_statuses(
                             d7_pct,
                             h5_reset,
                             d7_reset,
+                            d7_used_note,
                             is_active,
                             is_error: false,
                             error_msg: String::new(),
@@ -144,6 +147,7 @@ async fn fetch_all_statuses(
                             d7_pct: None,
                             h5_reset: "-".to_string(),
                             d7_reset: "-".to_string(),
+                            d7_used_note: String::new(),
                             is_active,
                             is_error: true,
                             error_msg: msg.to_string(),
@@ -178,7 +182,13 @@ fn render_row(s: &AccountStatus) -> Vec<Cell> {
         .unwrap_or_else(|| "-".to_string());
     let d7_str = s
         .d7_pct
-        .map(|p| format!("{:.0}%", p))
+        .map(|p| {
+            if s.d7_used_note.is_empty() {
+                format!("{:.0}%", p)
+            } else {
+                format!("{:.0}% ({})", p, s.d7_used_note)
+            }
+        })
         .unwrap_or_else(|| "-".to_string());
 
     vec![
@@ -192,7 +202,8 @@ fn render_row(s: &AccountStatus) -> Vec<Cell> {
     ]
 }
 
-fn format_window(window: Option<&api::RateLimitWindow>) -> (String, String) {
+/// Returns (used_str, reset_str, reset_datetime_str).
+fn format_window(window: Option<&api::RateLimitWindow>) -> (String, String, String) {
     match window {
         Some(w) => {
             let used = format!("{:.0}%", w.used_percent);
@@ -205,12 +216,18 @@ fn format_window(window: Option<&api::RateLimitWindow>) -> (String, String) {
                     } else {
                         format_duration(diff_secs)
                     };
-                    (used, format!("in {reset}"))
+                    let dt = chrono::DateTime::from_timestamp(reset_ts, 0)
+                        .map(|dt| {
+                            let local = dt.with_timezone(&chrono::Local);
+                            local.format("%a %b %d %H:%M").to_string()
+                        })
+                        .unwrap_or_default();
+                    (used, format!("in {reset}"), dt)
                 }
-                None => (used, "-".to_string()),
+                None => (used, "-".to_string(), String::new()),
             }
         }
-        None => ("-".to_string(), "-".to_string()),
+        None => ("-".to_string(), "-".to_string(), String::new()),
     }
 }
 
