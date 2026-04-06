@@ -53,7 +53,15 @@ fn find_most_available() -> Result<String> {
                                 .and_then(|r| r.secondary())
                                 .map(|w| w.used_percent)
                                 .unwrap_or(0.0);
-                            let score = if h5 >= 100.0 { 500.0 + d7 } else { h5 * 2.0 + d7 };
+                            let score = if h5 >= 100.0 && d7 >= 100.0 {
+                                900.0
+                            } else if d7 >= 100.0 {
+                                700.0 + h5
+                            } else if h5 >= 100.0 {
+                                500.0 + d7
+                            } else {
+                                h5 * 2.0 + d7
+                            };
                             (alias, score)
                         }
                         Err(_) => (alias, f64::MAX),
