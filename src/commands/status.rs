@@ -24,10 +24,15 @@ impl AccountStatus {
         }
         let h5 = self.h5_pct.unwrap_or(0.0);
         let d7 = self.d7_pct.unwrap_or(0.0);
-        // 5h limit matters more (it's the one that blocks you right now)
-        // 100% on 5h = unusable regardless of 7d
+        // Either limit at 100% = unusable right now
+        if h5 >= 100.0 && d7 >= 100.0 {
+            return 900.0;
+        }
         if h5 >= 100.0 {
             return 500.0 + d7;
+        }
+        if d7 >= 100.0 {
+            return 500.0 + h5;
         }
         h5 * 2.0 + d7
     }
