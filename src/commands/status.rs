@@ -4,6 +4,12 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 use crate::api;
 use crate::profile;
 
+pub enum Filter {
+    All,
+    RateLimited,
+    UsageBased,
+}
+
 struct AccountStatus {
     alias: String,
     plan: String,
@@ -40,7 +46,8 @@ impl AccountStatus {
     }
 }
 
-pub fn run() -> Result<()> {
+pub fn run(filter: Filter) -> Result<()> {
+    let _ = &filter; // used in task 4
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");

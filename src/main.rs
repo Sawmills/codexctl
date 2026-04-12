@@ -16,7 +16,14 @@ pub struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show rate limit status for all accounts
-    Status,
+    Status {
+        /// Show only rate-limited accounts
+        #[arg(long, conflicts_with = "usage_based")]
+        rate_limited: bool,
+        /// Show only usage-based accounts
+        #[arg(long, conflicts_with = "rate_limited")]
+        usage_based: bool,
+    },
     /// Save current ~/.codex/auth.json as a profile
     Save {
         /// Custom alias (defaults to email)
@@ -54,7 +61,16 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Status => commands::status::run(),
+        Commands::Status { rate_limited, usage_based } => {
+            let filter = if rate_limited {
+                commands::status::Filter::RateLimited
+            } else if usage_based {
+                commands::status::Filter::UsageBased
+            } else {
+                commands::status::Filter::All
+            };
+            commands::status::run(filter)
+        }
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),
         Commands::Switch => commands::switch::run(),

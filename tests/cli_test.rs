@@ -20,3 +20,12 @@ fn unknown_subcommand_fails() {
     let mut cmd = Command::cargo_bin("codexctl").unwrap();
     cmd.arg("nonexistent").assert().failure();
 }
+
+#[test]
+fn status_accepts_rate_limited_flag() {
+    let mut cmd = Command::cargo_bin("codexctl").unwrap();
+    let output = cmd.args(["status", "--help"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--rate-limited"));
+    assert!(stdout.contains("--usage-based"));
+}
