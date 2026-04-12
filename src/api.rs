@@ -28,6 +28,8 @@ struct CodexTokens {
 pub struct RateLimitResponse {
     pub plan_type: Option<String>,
     pub rate_limit: Option<RateLimit>,
+    pub credits: Option<Credits>,
+    pub spend_control: Option<SpendControl>,
 }
 
 #[derive(Deserialize)]
@@ -69,6 +71,21 @@ impl RateLimitWindow {
                 .map(|s| chrono::Utc::now().timestamp() + s)
         })
     }
+}
+
+#[derive(Deserialize)]
+pub struct Credits {
+    pub has_credits: bool,
+    #[serde(default)]
+    pub unlimited: bool,
+    #[serde(default)]
+    pub overage_limit_reached: bool,
+    pub balance: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SpendControl {
+    pub reached: bool,
 }
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";

@@ -105,3 +105,93 @@ fn parse_rate_limit_response_missing_fields() {
     assert!(resp.plan_type.is_none());
     assert!(resp.rate_limit.is_none());
 }
+
+#[test]
+fn parse_usage_based_response_with_credits() {
+    let json = r#"{
+        "plan_type": "self_serve_business_usage_based",
+        "rate_limit": null,
+        "credits": {
+            "has_credits": true,
+            "unlimited": false,
+            "overage_limit_reached": false,
+            "balance": null,
+            "approx_local_messages": null,
+            "approx_cloud_messages": null
+        },
+        "spend_control": {
+            "reached": false
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(resp.plan_type.as_deref(), Some("self_serve_business_usage_based"));
+    assert!(resp.rate_limit.is_none());
+    let credits = resp.credits.unwrap();
+    assert!(credits.has_credits);
+    assert!(!credits.unlimited);
+    assert!(!credits.overage_limit_reached);
+    assert!(credits.balance.is_none());
+    let spend = resp.spend_control.unwrap();
+    assert!(!spend.reached);
+}
+
+#[test]
+fn parse_usage_based_response_with_balance() {
+    let json = r#"{
+        "plan_type": "self_serve_business_usage_based",
+        "rate_limit": null,
+        "credits": {
+            "has_credits": true,
+            "unlimited": false,
+            "overage_limit_reached": false,
+            "balance": "1234.56",
+            "approx_local_messages": null,
+            "approx_cloud_messages": null
+        },
+        "spend_control": {
+            "reached": false
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    let credits = resp.credits.unwrap();
+    assert_eq!(credits.balance.as_deref(), Some("1234.56"));
+}
+
+#[test]
+fn parse_team_response_still_works_with_new_fields() {
+    let json = r#"{
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 5,
+                "limit_window_seconds": 18000,
+                "reset_after_seconds": 17000,
+                "reset_at": 1775369763
+            },
+            "secondary_window": {
+                "used_percent": 20,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 400000,
+                "reset_at": 1775766178
+            }
+        },
+        "credits": {
+            "has_credits": false,
+            "unlimited": false,
+            "overage_limit_reached": false,
+            "balance": null,
+            "approx_local_messages": null,
+            "approx_cloud_messages": null
+        },
+        "spend_control": {
+            "reached": false
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(resp.plan_type.as_deref(), Some("team"));
+    assert!(resp.rate_limit.is_some());
+    let credits = resp.credits.unwrap();
+    assert!(!credits.has_credits);
+}
