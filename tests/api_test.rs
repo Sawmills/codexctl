@@ -124,7 +124,10 @@ fn parse_usage_based_response_with_credits() {
         }
     }"#;
     let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
-    assert_eq!(resp.plan_type.as_deref(), Some("self_serve_business_usage_based"));
+    assert_eq!(
+        resp.plan_type.as_deref(),
+        Some("self_serve_business_usage_based")
+    );
     assert!(resp.rate_limit.is_none());
     let credits = resp.credits.unwrap();
     assert!(credits.has_credits);

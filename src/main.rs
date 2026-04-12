@@ -61,7 +61,10 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Status { rate_limited, usage_based } => {
+        Commands::Status {
+            rate_limited,
+            usage_based,
+        } => {
             let filter = if rate_limited {
                 commands::status::Filter::RateLimited
             } else if usage_based {

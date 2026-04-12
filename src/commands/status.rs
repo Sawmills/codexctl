@@ -126,7 +126,13 @@ pub fn run(filter: Filter) -> Result<()> {
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED);
         table.set_header(vec![
-            "Account", "Plan", "Balance", "Seat Limit", "Credits", "Spending", "Active",
+            "Account",
+            "Plan",
+            "Balance",
+            "Seat Limit",
+            "Credits",
+            "Spending",
+            "Active",
         ]);
         for s in &usage_based {
             table.add_row(render_usage_based_row(s));
@@ -193,9 +199,7 @@ async fn fetch_and_split(
         let auth = match auth {
             Ok(a) => a,
             Err(_) => {
-                let is_ub = plan_from_meta
-                    .as_deref()
-                    .is_some_and(|p| is_usage_based_plan(p));
+                let is_ub = plan_from_meta.as_deref().is_some_and(is_usage_based_plan);
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
@@ -234,9 +238,7 @@ async fn fetch_and_split(
                 } else {
                     "error"
                 };
-                let is_ub = plan_from_meta
-                    .as_deref()
-                    .is_some_and(|p| is_usage_based_plan(p));
+                let is_ub = plan_from_meta.as_deref().is_some_and(is_usage_based_plan);
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
@@ -284,10 +286,7 @@ async fn fetch_and_split(
                 _ => CreditsStatus::None,
             };
             let credit_balance = credits.as_ref().and_then(|c| c.balance.clone());
-            let spend_control_reached = usage
-                .spend_control
-                .as_ref()
-                .is_some_and(|sc| sc.reached);
+            let spend_control_reached = usage.spend_control.as_ref().is_some_and(|sc| sc.reached);
 
             let idx = usage_based.len();
             usage_based.push(UsageBasedAccount {
@@ -343,8 +342,7 @@ async fn fetch_and_split(
             let token = token.clone();
             let account_id = account_id.clone();
             async move {
-                let result =
-                    api::fetch_account_settings_async(&client, &token, &account_id).await;
+                let result = api::fetch_account_settings_async(&client, &token, &account_id).await;
                 (account_id, result)
             }
         })
@@ -353,14 +351,12 @@ async fn fetch_and_split(
     let settings_results = futures::future::join_all(settings_futures).await;
     let mut settings_map: HashMap<String, u64> = HashMap::new();
     for (account_id, result) in settings_results {
-        if let Ok(settings) = result {
-            if let Some(limits) = settings.seat_type_credit_limits {
-                if let Some(ub_limits) = limits.usage_based {
-                    if let Some(first) = ub_limits.first() {
-                        settings_map.insert(account_id, first.limit);
-                    }
-                }
-            }
+        if let Ok(settings) = result
+            && let Some(limits) = settings.seat_type_credit_limits
+            && let Some(ub_limits) = limits.usage_based
+            && let Some(first) = ub_limits.first()
+        {
+            settings_map.insert(account_id, first.limit);
         }
     }
 

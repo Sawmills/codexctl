@@ -100,6 +100,7 @@ pub struct SeatTypeCreditLimits {
 
 #[derive(Deserialize)]
 pub struct CreditLimit {
+    #[allow(dead_code)]
     pub enforcement_mode: String,
     pub limit: u64,
 }
