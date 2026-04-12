@@ -1,4 +1,4 @@
-use codexctl::api::{self, RateLimitResponse};
+use codexctl::api::{self, AccountSettings, RateLimitResponse};
 
 #[test]
 fn parse_auth_json_flat_format() {
@@ -194,4 +194,42 @@ fn parse_team_response_still_works_with_new_fields() {
     assert!(resp.rate_limit.is_some());
     let credits = resp.credits.unwrap();
     assert!(!credits.has_credits);
+}
+
+#[test]
+fn parse_account_settings_with_credit_limits() {
+    let json = r#"{
+        "seat_type_credit_limits": {
+            "default": [],
+            "usage_based": [
+                {"enforcement_mode": "HARD_CAP", "limit": 20000}
+            ]
+        }
+    }"#;
+    let settings: AccountSettings = serde_json::from_str(json).unwrap();
+    let limits = settings.seat_type_credit_limits.unwrap();
+    let usage_based = limits.usage_based.unwrap();
+    assert_eq!(usage_based.len(), 1);
+    assert_eq!(usage_based[0].limit, 20000);
+    assert_eq!(usage_based[0].enforcement_mode, "HARD_CAP");
+}
+
+#[test]
+fn parse_account_settings_empty_limits() {
+    let json = r#"{
+        "seat_type_credit_limits": {
+            "default": [],
+            "usage_based": []
+        }
+    }"#;
+    let settings: AccountSettings = serde_json::from_str(json).unwrap();
+    let limits = settings.seat_type_credit_limits.unwrap();
+    assert!(limits.usage_based.unwrap().is_empty());
+}
+
+#[test]
+fn parse_account_settings_missing_limits() {
+    let json = r#"{}"#;
+    let settings: AccountSettings = serde_json::from_str(json).unwrap();
+    assert!(settings.seat_type_credit_limits.is_none());
 }

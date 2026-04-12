@@ -88,6 +88,48 @@ pub struct SpendControl {
     pub reached: bool,
 }
 
+#[derive(Deserialize)]
+pub struct AccountSettings {
+    pub seat_type_credit_limits: Option<SeatTypeCreditLimits>,
+}
+
+#[derive(Deserialize)]
+pub struct SeatTypeCreditLimits {
+    pub usage_based: Option<Vec<CreditLimit>>,
+}
+
+#[derive(Deserialize)]
+pub struct CreditLimit {
+    pub enforcement_mode: String,
+    pub limit: u64,
+}
+
+const ACCOUNT_SETTINGS_URL: &str = "https://chatgpt.com/backend-api/accounts";
+
+pub async fn fetch_account_settings_async(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: &str,
+) -> Result<AccountSettings> {
+    let url = format!("{ACCOUNT_SETTINGS_URL}/{account_id}/settings");
+    let resp = client
+        .get(&url)
+        .bearer_auth(access_token)
+        .header("chatgpt-account-id", account_id)
+        .send()
+        .await
+        .context("failed to reach account settings API")?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("account settings API returned {status}");
+    }
+
+    resp.json::<AccountSettings>()
+        .await
+        .context("failed to parse account settings response")
+}
+
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 pub fn fetch_usage(access_token: &str) -> Result<RateLimitResponse> {
