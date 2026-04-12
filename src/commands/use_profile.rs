@@ -41,6 +41,12 @@ fn find_most_available() -> Result<String> {
                     };
                     match api::fetch_usage_async(&client, &token).await {
                         Ok(usage) => {
+                            // Skip usage-based accounts — they don't have rate limits
+                            let plan = usage.plan_type.as_deref().unwrap_or("");
+                            if plan.contains("usage_based") {
+                                return (alias, f64::MAX);
+                            }
+
                             let h5 = usage
                                 .rate_limit
                                 .as_ref()
