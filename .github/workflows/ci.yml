@@ -43,6 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Cache Trunk and Rust artifacts
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         # yamllint disable-line rule:line-length
         uses: namespacelabs/nscloud-cache-action@15799a6b54e5765f85b2aac25b3f0df43ed571c0
         with:
