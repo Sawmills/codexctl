@@ -13,6 +13,7 @@
 ### Task 1: Add Credits and SpendControl structs to api.rs
 
 **Files:**
+
 - Modify: `src/api.rs:27-31`
 - Test: `tests/api_test.rs`
 
@@ -169,6 +170,7 @@ git commit -m "feat: add Credits and SpendControl structs to api response"
 ### Task 2: Add account settings endpoint for seat credit limits
 
 **Files:**
+
 - Modify: `src/api.rs`
 - Test: `tests/api_test.rs`
 
@@ -288,6 +290,7 @@ git commit -m "feat: add account settings endpoint for seat credit limits"
 ### Task 3: Add --rate-limited and --usage-based flags to CLI
 
 **Files:**
+
 - Modify: `src/main.rs`
 - Modify: `src/commands/status.rs`
 - Test: `tests/cli_test.rs`
@@ -380,9 +383,11 @@ git commit -m "feat: add --rate-limited and --usage-based flags to status comman
 ### Task 4: Split status into two tables with usage-based rendering
 
 **Files:**
+
 - Modify: `src/commands/status.rs`
 
 This is the main task — rewrite `status.rs` to:
+
 1. Parse credits/spend data from the API response
 2. Fetch seat limits for usage-based accounts
 3. Split accounts into two groups
@@ -1002,6 +1007,7 @@ git commit -m "feat: split status into rate-limited and usage-based tables"
 ### Task 5: Cleanup and final verification
 
 **Files:**
+
 - All modified files
 
 - [ ] **Step 1: Run full test suite**

@@ -36,19 +36,20 @@ Usage-Based Accounts
 
 **Columns:**
 
-| Column | Source | Format |
-|--------|--------|--------|
-| Account | profile alias | string |
-| Plan | `plan_type` | shortened display name (e.g. `biz_usage`) |
-| Balance | `credits.balance` | dollar amount when populated, `-` when null |
-| Seat Limit | `seat_type_credit_limits.usage_based[0].limit` | dollar amount (value / 100), `-` if unavailable |
-| Credits | `credits.has_credits`, `credits.overage_limit_reached`, `credits.unlimited` | green "ok" / blue "unlimited" / red "none" / red "overage" |
-| Spending | `spend_control.reached` | green "ok" / red "limit" |
-| Active | active profile marker | `*` or empty |
+| Column     | Source                                                                      | Format                                                     |
+| ---------- | --------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| Account    | profile alias                                                               | string                                                     |
+| Plan       | `plan_type`                                                                 | shortened display name (e.g. `biz_usage`)                  |
+| Balance    | `credits.balance`                                                           | dollar amount when populated, `-` when null                |
+| Seat Limit | `seat_type_credit_limits.usage_based[0].limit`                              | dollar amount (value / 100), `-` if unavailable            |
+| Credits    | `credits.has_credits`, `credits.overage_limit_reached`, `credits.unlimited` | green "ok" / blue "unlimited" / red "none" / red "overage" |
+| Spending   | `spend_control.reached`                                                     | green "ok" / red "limit"                                   |
+| Active     | active profile marker                                                       | `*` or empty                                               |
 
 ### Detecting Account Type
 
 An account is "usage-based" when:
+
 - `rate_limit` is `null` AND `credits` is present with `has_credits: true`, OR
 - `plan_type` contains `usage_based`
 
@@ -58,11 +59,11 @@ Error accounts (bad auth, expired tokens) appear in whichever table matches thei
 
 ### CLI Flags
 
-| Flag | Behavior |
-|------|----------|
-| (none) | Show both tables |
+| Flag             | Behavior                     |
+| ---------------- | ---------------------------- |
+| (none)           | Show both tables             |
 | `--rate-limited` | Show only rate-limited table |
-| `--usage-based` | Show only usage-based table |
+| `--usage-based`  | Show only usage-based table  |
 
 Flags are mutually exclusive.
 
@@ -139,22 +140,22 @@ enum CreditsStatus {
 
 Lower score = healthier. Used for display ordering.
 
-| Condition | Score |
-|-----------|-------|
-| Credits ok, spending ok | 0 |
-| Credits ok, spend limit reached | 100 |
-| Credits unlimited | 0 |
-| Overage limit reached | 200 |
-| No credits | 300 |
-| Error/expired | 1000 |
+| Condition                       | Score |
+| ------------------------------- | ----- |
+| Credits ok, spending ok         | 0     |
+| Credits ok, spend limit reached | 100   |
+| Credits unlimited               | 0     |
+| Overage limit reached           | 200   |
+| No credits                      | 300   |
+| Error/expired                   | 1000  |
 
 ### Plan Display Names
 
 Shorten long plan type strings for the table:
 
-| API value | Display |
-|-----------|---------|
+| API value                         | Display     |
+| --------------------------------- | ----------- |
 | `self_serve_business_usage_based` | `biz_usage` |
-| `enterprise_cbp_usage_based` | `ent_usage` |
-| `team` | `team` |
-| Other | as-is |
+| `enterprise_cbp_usage_based`      | `ent_usage` |
+| `team`                            | `team`      |
+| Other                             | as-is       |
