@@ -24,6 +24,11 @@ enum Commands {
         #[arg(long, conflicts_with = "rate_limited")]
         usage_based: bool,
     },
+    /// Log into a Codex account in an isolated auth home and save it
+    Login {
+        /// Profile alias to save the login as
+        alias: String,
+    },
     /// Save current ~/.codex/auth.json as a profile
     Save {
         /// Custom alias (defaults to email)
@@ -74,6 +79,7 @@ fn main() {
             };
             commands::status::run(filter)
         }
+        Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),
         Commands::Switch => commands::switch::run(),

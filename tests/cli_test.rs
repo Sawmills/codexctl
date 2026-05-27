@@ -6,6 +6,7 @@ fn help_shows_all_subcommands() {
     let output = cmd.arg("--help").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("status"));
+    assert!(stdout.contains("login"));
     assert!(stdout.contains("save"));
     assert!(stdout.contains("use"));
     assert!(stdout.contains("switch"));

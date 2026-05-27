@@ -26,7 +26,9 @@ pub fn run() -> Result<()> {
             // Try to fetch usage for display — fall back gracefully
             let usage_info = api::read_auth_json(&p.auth_json_path())
                 .ok()
-                .and_then(|auth| api::fetch_usage(&auth.access_token).ok())
+                .and_then(|auth| {
+                    api::fetch_usage(&auth.access_token, auth.account_id.as_deref()).ok()
+                })
                 .map(|u| {
                     let h5 = u
                         .rate_limit

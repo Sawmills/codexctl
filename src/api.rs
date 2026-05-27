@@ -8,6 +8,7 @@ pub struct AuthJson {
     pub access_token: String,
     #[allow(dead_code)]
     pub refresh_token: Option<String>,
+    pub account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -16,12 +17,16 @@ struct CodexAuthJson {
     // Flat fallback fields
     access_token: Option<String>,
     refresh_token: Option<String>,
+    account_id: Option<String>,
+    chatgpt_account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct CodexTokens {
     access_token: String,
     refresh_token: Option<String>,
+    account_id: Option<String>,
+    chatgpt_account_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,13 +138,14 @@ pub async fn fetch_account_settings_async(
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
-pub fn fetch_usage(access_token: &str) -> Result<RateLimitResponse> {
+pub fn fetch_usage(access_token: &str, account_id: Option<&str>) -> Result<RateLimitResponse> {
     let client = reqwest::blocking::Client::new();
-    let resp = client
-        .get(USAGE_URL)
-        .bearer_auth(access_token)
-        .send()
-        .context("failed to reach rate limit API")?;
+    let mut request = client.get(USAGE_URL).bearer_auth(access_token);
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+
+    let resp = request.send().context("failed to reach rate limit API")?;
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -156,10 +162,14 @@ pub fn fetch_usage(access_token: &str) -> Result<RateLimitResponse> {
 pub async fn fetch_usage_async(
     client: &reqwest::Client,
     access_token: &str,
+    account_id: Option<&str>,
 ) -> Result<RateLimitResponse> {
-    let resp = client
-        .get(USAGE_URL)
-        .bearer_auth(access_token)
+    let mut request = client.get(USAGE_URL).bearer_auth(access_token);
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+
+    let resp = request
         .send()
         .await
         .context("failed to reach rate limit API")?;
@@ -183,18 +193,72 @@ pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
     let raw: CodexAuthJson = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
-    // Prefer nested tokens format, fall back to flat
     if let Some(tokens) = raw.tokens {
+        let account_id = tokens
+            .account_id
+            .or(tokens.chatgpt_account_id)
+            .or_else(|| extract_account_id(&tokens.access_token));
         Ok(AuthJson {
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
+            account_id,
         })
     } else if let Some(access_token) = raw.access_token {
+        let account_id = raw
+            .account_id
+            .or(raw.chatgpt_account_id)
+            .or_else(|| extract_account_id(&access_token));
         Ok(AuthJson {
             access_token,
             refresh_token: raw.refresh_token,
+            account_id,
         })
     } else {
         anyhow::bail!("no access_token found in {}", path.display())
     }
+}
+
+/// Decode the (unverified) claims payload of a JWT access token.
+fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    parts.next()?;
+
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let bytes = engine.decode(payload).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Extract account_id from JWT access_token claims when auth.json does not store it directly.
+pub fn extract_account_id(token: &str) -> Option<String> {
+    let value = decode_jwt_payload(token)?;
+    let auth = value.get("https://api.openai.com/auth")?;
+    auth.get("chatgpt_account_id")
+        .or_else(|| auth.get("account_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// The `sub` (subject) claim — identifies the individual seat/user behind a token.
+/// Distinct per seat even when many seats share one `chatgpt_account_id`.
+pub fn token_subject(token: &str) -> Option<String> {
+    decode_jwt_payload(token)?
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// The `exp` (expiry) claim as a unix timestamp, if present.
+pub fn token_expiry(token: &str) -> Option<i64> {
+    decode_jwt_payload(token)?
+        .get("exp")
+        .and_then(|v| v.as_i64())
+}
+
+/// True only when the token's `exp` claim is in the past. An unreadable/absent
+/// `exp` returns false so a rotated-but-not-time-expired token isn't mislabeled.
+pub fn is_token_expired(token: &str) -> bool {
+    token_expiry(token).is_some_and(|exp| exp < chrono::Utc::now().timestamp())
 }

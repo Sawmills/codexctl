@@ -21,6 +21,10 @@ impl Paths {
         self.codexctl_dir().join("profiles")
     }
 
+    pub fn login_homes_dir(&self) -> PathBuf {
+        self.codexctl_dir().join("login-homes")
+    }
+
     pub fn active_file(&self) -> PathBuf {
         self.codexctl_dir().join("active")
     }

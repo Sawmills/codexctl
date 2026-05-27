@@ -1,18 +1,24 @@
 use anyhow::{Result, bail};
 
 use crate::api;
+use crate::commands::alias;
+use crate::commands::status;
 use crate::profile;
 
 pub fn run(alias: Option<&str>) -> Result<()> {
-    match alias {
+    match alias::optional(alias) {
         Some(a) => {
             let email = profile::switch_to(a)?;
             println!("switched to {} ({})", a, email);
+            println!();
+            status::run_focused(a)?;
         }
         None => {
             let best = find_most_available()?;
             let email = profile::switch_to(&best)?;
             println!("auto-selected most available: {} ({})", best, email);
+            println!();
+            status::run_focused(&best)?;
         }
     }
     Ok(())
@@ -35,13 +41,18 @@ fn find_most_available() -> Result<String> {
                 let alias = p.meta.alias.clone();
                 let auth = api::read_auth_json(&p.auth_json_path());
                 async move {
-                    let token = match auth {
-                        Ok(a) => a.access_token,
+                    let auth = match auth {
+                        Ok(a) => a,
                         Err(_) => return (alias, f64::MAX),
                     };
-                    match api::fetch_usage_async(&client, &token).await {
+                    match api::fetch_usage_async(
+                        &client,
+                        &auth.access_token,
+                        auth.account_id.as_deref(),
+                    )
+                    .await
+                    {
                         Ok(usage) => {
-                            // Skip usage-based accounts — they don't have rate limits
                             let plan = usage.plan_type.as_deref().unwrap_or("");
                             if plan.contains("usage_based") {
                                 return (alias, f64::MAX);

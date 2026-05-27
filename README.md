@@ -12,17 +12,20 @@ cargo install --git https://github.com/Sawmills/codexctl
 
 ### Save accounts
 
-Log into each Codex account and save it:
+Bootstrap each Codex account through `codexctl` so the Codex login runs in an isolated auth home:
 
 ```bash
-codex --login          # log into amir@example.com
-codexctl save          # auto-detects email, saves as profile
+codexctl login amir@example.com    # opens Codex device login, saves as profile
 
-codex --login          # log into amir+2@example.com
-codexctl save
+codexctl login amir+2@example.com
 ```
 
-Or provide a custom alias:
+After an account is saved, switch with `codexctl use <alias>` instead of running `codex --login`
+again. A fresh Codex login can invalidate another saved seat on the same ChatGPT account/workspace;
+`codexctl login` avoids logging over `~/.codex/auth.json` by running Codex with
+`CODEX_HOME=~/.codexctl/login-homes/<alias>`, and `codexctl use` only swaps the local auth file.
+
+If you already logged in with Codex directly, save the current `~/.codex/auth.json`:
 
 ```bash
 codexctl save work-main
@@ -35,17 +38,38 @@ codexctl status
 ```
 
 ```
-┌────────────────────┬──────┬─────────┬───────────┬─────────┬───────────┬────────┐
-│ Account            ┆ Plan ┆ 5h Used ┆ 5h Reset  ┆ 7d Used ┆ 7d Reset  ┆ Active │
-╞════════════════════╪══════╪═════════╪═══════════╪═════════╪═══════════╪════════╡
-│ amir+5@sawmills.ai ┆ team ┆ 0%      ┆ in 5h 00m ┆ 25%     ┆ in 4d 18h ┆        │
-│ amir+6@sawmills.ai ┆ team ┆ 0%      ┆ in 5h 00m ┆ 25%     ┆ in 4d 16h ┆        │
-│ amir@sawmills.ai   ┆ team ┆ 78%     ┆ in 3h 54m ┆ 92%     ┆ in 4d 15h ┆ *      │
-│ amir+2@sawmills.ai ┆ team ┆ 100%    ┆ in 3h 12m ┆ 80%     ┆ in 4d 15h ┆        │
-└────────────────────┴──────┴─────────┴───────────┴─────────┴───────────┴────────┘
+Live status fetched at Tue Apr 28 22:20:56
+
+Rate-Limited Accounts
+┌──────────────────────┬─────┬───────────┬─────┬────────────────────────────────┬─────────────┐
+│ Account              ┆ 5h  ┆ 5h Reset  ┆ 7d  ┆ 7d Reset                      ┆ Token       │
+╞══════════════════════╪═════╪═══════════╪═════╪════════════════════════════════╪═════════════╡
+│ amir+5@sawmills.ai   ┆ 0%  ┆ in 5h 00m ┆ 25% ┆ in 4d 18h (Sun May 03 16:20) ┆ 9d 23h      │
+│ * amir@sawmills.ai   ┆ 78% ┆ in 3h 54m ┆ 92% ┆ in 4d 15h (Sun May 03 13:20) ┆ 3h 20m      │
+│ amir+8@sawmills.ai   ┆ -   ┆ -         ┆ -   ┆ -                            ┆ invalidated │
+└──────────────────────┴─────┴───────────┴─────┴────────────────────────────────┴─────────────┘
+
+Usage-Based Accounts
+┌───────────────────────────┬─────────┬──────┬─────────┬───────┬─────────┐
+│ Account                   ┆ Balance ┆ Seat ┆ Credits ┆ Spend ┆ Token   │
+╞═══════════════════════════╪═════════╪══════╪═════════╪═══════╪═════════╡
+│ amir+ezra@sawmills.ai     ┆ -       ┆ -    ┆ ok      ┆ ok    ┆ 9d 1h   │
+│ amir+reviewer@sawmills.ai ┆ -       ┆ -    ┆ ok      ┆ ok    ┆ expired │
+└───────────────────────────┴─────────┴──────┴─────────┴───────┴─────────┘
 ```
 
-Sorted by availability — most available accounts first. All accounts fetched in parallel.
+Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
+The account column is the saved profile alias, with `*` marking the active account.
+
+The `Token` column shows how long the stored access token is good for **without re-logging in**
+(green = days left, yellow = hours, red = under an hour). An `invalidated` value means OpenAI revoked
+the grant server-side even though the token has not yet timed out — this happens when another seat
+on the same ChatGPT account is logged in, since a fresh `codex login` revokes the previously-active
+seat. Prefer `codexctl use` (a pure file copy that never contacts OpenAI) over re-logging-in, and
+only re-login a seat once its token genuinely shows `expired`.
+
+Usage-based accounts are shown in a separate table with balance, seat limit, credits, and spend
+control status.
 
 ### Switch accounts
 
@@ -65,6 +89,7 @@ codexctl switch
 
 ```bash
 codexctl list          # list saved profiles
+codexctl login <alias> # isolated Codex login and save
 codexctl whoami        # show active account
 codexctl remove <alias>
 ```
@@ -86,9 +111,11 @@ Completions dynamically list profile names for `use` and `remove`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with an isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
+When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is
+scoped to the intended account/workspace.
 
 Supports both Codex CLI auth formats:
 

@@ -4,6 +4,7 @@ use anyhow::Result;
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 use crate::api;
+use crate::config;
 use crate::profile;
 
 pub enum Filter {
@@ -21,12 +22,11 @@ enum CreditsStatus {
 
 struct RateLimitedAccount {
     alias: String,
-    plan: String,
     h5_pct: Option<f64>,
     d7_pct: Option<f64>,
     h5_reset: String,
     d7_reset: String,
-    d7_used_note: String,
+    token_expiry: Option<i64>,
     is_active: bool,
     is_error: bool,
     error_msg: String,
@@ -34,11 +34,11 @@ struct RateLimitedAccount {
 
 struct UsageBasedAccount {
     alias: String,
-    plan: String,
     credit_balance: Option<String>,
     seat_limit_cents: Option<u64>,
     credits_status: CreditsStatus,
     spend_control_reached: bool,
+    token_expiry: Option<i64>,
     is_active: bool,
     is_error: bool,
     error_msg: String,
@@ -79,65 +79,28 @@ impl UsageBasedAccount {
 }
 
 pub fn run(filter: Filter) -> Result<()> {
-    let profiles = profile::list_profiles()?;
-    if profiles.is_empty() {
-        println!("no profiles saved. Use 'codexctl save' to save the current account.");
-        return Ok(());
-    }
-
-    let active = profile::get_active()?;
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let (mut rate_limited, mut usage_based) = rt.block_on(fetch_and_split(&profiles, &active));
-
-    rate_limited.sort_by(|a, b| {
-        a.availability_score()
-            .partial_cmp(&b.availability_score())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    usage_based.sort_by(|a, b| {
-        a.health_score()
-            .partial_cmp(&b.health_score())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
 
     let show_rl = matches!(filter, Filter::All | Filter::RateLimited);
     let show_ub = matches!(filter, Filter::All | Filter::UsageBased);
+    let has_rows = (show_rl && !rate_limited.is_empty()) || (show_ub && !usage_based.is_empty());
 
-    if show_rl && !rate_limited.is_empty() {
-        println!("Rate-Limited Accounts");
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec![
-            "Account", "Plan", "5h Used", "5h Reset", "7d Used", "7d Reset", "Active",
-        ]);
-        for s in &rate_limited {
-            table.add_row(render_rate_limited_row(s));
-        }
-        println!("{table}");
+    if has_rows {
+        print_live_fetched_at(fetched_at);
+    }
+
+    if show_rl {
+        let rate_limited_refs: Vec<&RateLimitedAccount> = rate_limited.iter().collect();
+        print_rate_limited_table("Rate-Limited Accounts", &rate_limited_refs);
     }
 
     if show_rl && !rate_limited.is_empty() && show_ub && !usage_based.is_empty() {
         println!();
     }
 
-    if show_ub && !usage_based.is_empty() {
-        println!("Usage-Based Accounts");
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL_CONDENSED);
-        table.set_header(vec![
-            "Account",
-            "Plan",
-            "Balance",
-            "Seat Limit",
-            "Credits",
-            "Spending",
-            "Active",
-        ]);
-        for s in &usage_based {
-            table.add_row(render_usage_based_row(s));
-        }
-        println!("{table}");
+    if show_ub {
+        let usage_based_refs: Vec<&UsageBasedAccount> = usage_based.iter().collect();
+        print_usage_based_table("Usage-Based Accounts", &usage_based_refs);
     }
 
     if (show_rl && rate_limited.is_empty() && !show_ub)
@@ -150,21 +113,140 @@ pub fn run(filter: Filter) -> Result<()> {
     Ok(())
 }
 
-fn is_usage_based_plan(plan: &str) -> bool {
-    plan.contains("usage_based")
+pub fn run_focused(focused_alias: &str) -> Result<()> {
+    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
+    if !rate_limited.is_empty() || !usage_based.is_empty() {
+        print_live_fetched_at(fetched_at);
+    }
+
+    let selected_rate_limited: Vec<&RateLimitedAccount> = rate_limited
+        .iter()
+        .filter(|account| account.alias == focused_alias)
+        .collect();
+    let selected_usage_based: Vec<&UsageBasedAccount> = usage_based
+        .iter()
+        .filter(|account| account.alias == focused_alias)
+        .collect();
+
+    let mut printed_selected =
+        print_rate_limited_table("Selected Rate-Limited Account", &selected_rate_limited);
+    if printed_selected && !selected_usage_based.is_empty() {
+        println!();
+    }
+    printed_selected |=
+        print_usage_based_table("Selected Usage-Based Account", &selected_usage_based);
+
+    if !printed_selected {
+        println!("selected account status unavailable: {focused_alias}");
+    }
+
+    let other_rate_limited: Vec<&RateLimitedAccount> = rate_limited
+        .iter()
+        .filter(|account| account.alias != focused_alias)
+        .collect();
+    let other_usage_based: Vec<&UsageBasedAccount> = usage_based
+        .iter()
+        .filter(|account| account.alias != focused_alias)
+        .collect();
+
+    if !other_rate_limited.is_empty() || !other_usage_based.is_empty() {
+        println!();
+        println!("Other Accounts");
+        let printed_rate_limited =
+            print_rate_limited_table("Rate-Limited Accounts", &other_rate_limited);
+        if printed_rate_limited && !other_usage_based.is_empty() {
+            println!();
+        }
+        print_usage_based_table("Usage-Based Accounts", &other_usage_based);
+    }
+
+    Ok(())
 }
 
-fn shorten_plan(plan: &str) -> String {
-    match plan {
-        "self_serve_business_usage_based" => "biz_usage".to_string(),
-        "enterprise_cbp_usage_based" => "ent_usage".to_string(),
-        other => other.to_string(),
+fn load_sorted_statuses() -> Result<(
+    Vec<RateLimitedAccount>,
+    Vec<UsageBasedAccount>,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let profiles = profile::list_profiles()?;
+    let fetched_at = chrono::Utc::now();
+    if profiles.is_empty() {
+        println!("no profiles saved. Use 'codexctl save' to save the current account.");
+        return Ok((Vec::new(), Vec::new(), fetched_at));
     }
+
+    let active = profile::get_active()?;
+    let codex_auth = config::codex_auth_json()?;
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let (mut rate_limited, mut usage_based) =
+        rt.block_on(fetch_and_split(&profiles, &active, &codex_auth));
+
+    rate_limited.sort_by(|a, b| {
+        a.availability_score()
+            .partial_cmp(&b.availability_score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    usage_based.sort_by(|a, b| {
+        a.health_score()
+            .partial_cmp(&b.health_score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    Ok((rate_limited, usage_based, fetched_at))
+}
+
+fn print_live_fetched_at(fetched_at: chrono::DateTime<chrono::Utc>) {
+    let local = fetched_at.with_timezone(&chrono::Local);
+    println!(
+        "Live status fetched at {}",
+        local.format("%a %b %d %H:%M:%S")
+    );
+    println!();
+}
+
+fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bool {
+    if accounts.is_empty() {
+        return false;
+    }
+
+    println!("{title}");
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec!["Account", "5h", "5h Reset", "7d", "7d Reset", "Token"]);
+    for account in accounts {
+        table.add_row(render_rate_limited_row(account));
+    }
+    println!("{table}");
+    true
+}
+
+fn print_usage_based_table(title: &str, accounts: &[&UsageBasedAccount]) -> bool {
+    if accounts.is_empty() {
+        return false;
+    }
+
+    println!("{title}");
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(vec![
+        "Account", "Balance", "Seat", "Credits", "Spend", "Token",
+    ]);
+    for account in accounts {
+        table.add_row(render_usage_based_row(account));
+    }
+    println!("{table}");
+    true
+}
+
+fn is_usage_based_plan(plan: &str) -> bool {
+    plan.contains("usage_based")
 }
 
 async fn fetch_and_split(
     profiles: &[profile::Profile],
     active: &Option<String>,
+    codex_auth_path: &std::path::Path,
 ) -> (Vec<RateLimitedAccount>, Vec<UsageBasedAccount>) {
     let client = reqwest::Client::new();
 
@@ -176,11 +258,21 @@ async fn fetch_and_split(
             let alias = p.meta.alias.clone();
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
-            let auth = api::read_auth_json(&p.auth_json_path());
+            // The active profile's live, Codex-maintained tokens are the source of
+            // truth; the stored snapshot can be stale until the next switch/save.
+            let auth_path = if is_active {
+                codex_auth_path.to_path_buf()
+            } else {
+                p.auth_json_path()
+            };
+            let auth = api::read_auth_json(&auth_path);
 
             async move {
                 let usage_result = match &auth {
-                    Ok(a) => Some(api::fetch_usage_async(&client, &a.access_token).await),
+                    Ok(a) => Some(
+                        api::fetch_usage_async(&client, &a.access_token, a.account_id.as_deref())
+                            .await,
+                    ),
                     Err(_) => None,
                 };
                 (alias, plan_from_meta, is_active, auth, usage_result)
@@ -196,6 +288,7 @@ async fn fetch_and_split(
     let mut ub_needing_settings: Vec<(usize, String, String)> = Vec::new();
 
     for (alias, plan_from_meta, is_active, auth, usage_result) in &results {
+        let account_id = auth.as_ref().ok().and_then(|a| a.account_id.clone());
         let auth = match auth {
             Ok(a) => a,
             Err(_) => {
@@ -203,11 +296,11 @@ async fn fetch_and_split(
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
-                        plan: shorten_plan(plan_from_meta.as_deref().unwrap_or("-")),
                         credit_balance: None,
                         seat_limit_cents: None,
                         credits_status: CreditsStatus::None,
                         spend_control_reached: false,
+                        token_expiry: None,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: "bad auth.json".to_string(),
@@ -215,12 +308,11 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
-                        plan: "-".to_string(),
                         h5_pct: None,
                         d7_pct: None,
                         h5_reset: "-".to_string(),
                         d7_reset: "-".to_string(),
-                        d7_used_note: String::new(),
+                        token_expiry: None,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: "bad auth.json".to_string(),
@@ -230,11 +322,13 @@ async fn fetch_and_split(
             }
         };
 
+        let token_expiry = api::token_expiry(&auth.access_token);
+
         let usage = match usage_result {
             Some(Ok(u)) => u,
             Some(Err(e)) => {
                 let msg = if e.to_string().contains("expired") {
-                    "expired"
+                    auth_failure_label(&auth.access_token)
                 } else {
                     "error"
                 };
@@ -242,11 +336,11 @@ async fn fetch_and_split(
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
-                        plan: shorten_plan(plan_from_meta.as_deref().unwrap_or("-")),
                         credit_balance: None,
                         seat_limit_cents: None,
                         credits_status: CreditsStatus::None,
                         spend_control_reached: false,
+                        token_expiry,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: msg.to_string(),
@@ -254,12 +348,11 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
-                        plan: "-".to_string(),
                         h5_pct: None,
                         d7_pct: None,
                         h5_reset: "-".to_string(),
                         d7_reset: "-".to_string(),
-                        d7_used_note: String::new(),
+                        token_expiry,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: msg.to_string(),
@@ -291,17 +384,19 @@ async fn fetch_and_split(
             let idx = usage_based.len();
             usage_based.push(UsageBasedAccount {
                 alias: alias.clone(),
-                plan: shorten_plan(plan_str),
                 credit_balance,
                 seat_limit_cents: None,
                 credits_status,
                 spend_control_reached,
+                token_expiry,
                 is_active: *is_active,
                 is_error: false,
                 error_msg: String::new(),
             });
 
-            if let Some(account_id) = extract_account_id(&auth.access_token) {
+            if let Some(account_id) =
+                account_id.or_else(|| api::extract_account_id(&auth.access_token))
+            {
                 ub_needing_settings.push((idx, auth.access_token.clone(), account_id));
             }
         } else {
@@ -309,17 +404,16 @@ async fn fetch_and_split(
             let secondary = usage.rate_limit.as_ref().and_then(|r| r.secondary());
             let h5_pct = primary.map(|w| w.used_percent);
             let d7_pct = secondary.map(|w| w.used_percent);
-            let (_, h5_reset, _) = format_window(primary);
-            let (_, d7_reset, d7_used_note) = format_window(secondary);
+            let h5_reset = format_window_reset(primary);
+            let d7_reset = format_window_reset(secondary);
 
             rate_limited.push(RateLimitedAccount {
                 alias: alias.clone(),
-                plan: plan_str.to_string(),
                 h5_pct,
                 d7_pct,
                 h5_reset,
                 d7_reset,
-                d7_used_note,
+                token_expiry,
                 is_active: *is_active,
                 is_error: false,
                 error_msg: String::new(),
@@ -369,35 +463,17 @@ async fn fetch_and_split(
     (rate_limited, usage_based)
 }
 
-/// Extract account_id from JWT access_token claims.
-fn extract_account_id(token: &str) -> Option<String> {
-    let parts: Vec<&str> = token.split('.').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    use base64::Engine;
-    let engine = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let payload = engine.decode(parts[1]).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-    value
-        .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
-        .as_str()
-        .map(|s| s.to_string())
-}
-
 fn render_rate_limited_row(s: &RateLimitedAccount) -> Vec<Cell> {
-    let active_marker = if s.is_active { "*" } else { "" };
+    let alias = display_alias(&s.alias, s.is_active);
 
     if s.is_error {
         return vec![
-            Cell::new(&s.alias),
+            Cell::new(alias),
             Cell::new("-"),
-            Cell::new(&s.error_msg).fg(Color::Red),
             Cell::new("-"),
-            Cell::new(&s.error_msg).fg(Color::Red),
             Cell::new("-"),
-            Cell::new(active_marker),
+            Cell::new("-"),
+            token_cell(s.token_expiry, true, &s.error_msg),
         ];
     }
 
@@ -410,35 +486,27 @@ fn render_rate_limited_row(s: &RateLimitedAccount) -> Vec<Cell> {
         .map(|p| format!("{:.0}%", p))
         .unwrap_or_else(|| "-".to_string());
 
-    let d7_reset_str = if s.d7_used_note.is_empty() {
-        s.d7_reset.clone()
-    } else {
-        format!("{} ({})", s.d7_reset, s.d7_used_note)
-    };
-
     vec![
-        Cell::new(&s.alias),
-        Cell::new(&s.plan),
+        Cell::new(alias),
         colorize_usage(&h5_str),
         Cell::new(&s.h5_reset),
         colorize_usage(&d7_str),
-        Cell::new(&d7_reset_str),
-        Cell::new(active_marker),
+        Cell::new(&s.d7_reset),
+        token_cell(s.token_expiry, false, &s.error_msg),
     ]
 }
 
 fn render_usage_based_row(s: &UsageBasedAccount) -> Vec<Cell> {
-    let active_marker = if s.is_active { "*" } else { "" };
+    let alias = display_alias(&s.alias, s.is_active);
 
     if s.is_error {
         return vec![
-            Cell::new(&s.alias),
-            Cell::new(&s.plan),
-            Cell::new(&s.error_msg).fg(Color::Red),
+            Cell::new(alias),
             Cell::new("-"),
-            Cell::new(&s.error_msg).fg(Color::Red),
             Cell::new("-"),
-            Cell::new(active_marker),
+            Cell::new("-"),
+            Cell::new("-"),
+            token_cell(s.token_expiry, true, &s.error_msg),
         ];
     }
 
@@ -467,42 +535,89 @@ fn render_usage_based_row(s: &UsageBasedAccount) -> Vec<Cell> {
     };
 
     vec![
-        Cell::new(&s.alias),
-        Cell::new(&s.plan),
+        Cell::new(alias),
         Cell::new(&balance_str),
         Cell::new(&seat_limit_str),
         Cell::new(credits_str).fg(credits_color),
         Cell::new(spend_str).fg(spend_color),
-        Cell::new(active_marker),
+        token_cell(s.token_expiry, false, &s.error_msg),
     ]
 }
 
-fn format_window(window: Option<&api::RateLimitWindow>) -> (String, String, String) {
-    match window {
-        Some(w) => {
-            let used = format!("{:.0}%", w.used_percent);
-            match w.reset_timestamp() {
-                Some(reset_ts) => {
-                    let now = chrono::Utc::now().timestamp();
-                    let diff_secs = reset_ts - now;
-                    let reset = if diff_secs <= 0 {
-                        "now".to_string()
-                    } else {
-                        format_duration(diff_secs)
-                    };
-                    let dt = chrono::DateTime::from_timestamp(reset_ts, 0)
-                        .map(|dt| {
-                            let local = dt.with_timezone(&chrono::Local);
-                            local.format("%a %b %d %H:%M").to_string()
-                        })
-                        .unwrap_or_default();
-                    (used, format!("in {reset}"), dt)
-                }
-                None => (used, "-".to_string(), String::new()),
-            }
-        }
-        None => ("-".to_string(), "-".to_string(), String::new()),
+/// The "Token" column: how long the stored access token is good for without a
+/// re-login, or — for an errored row — what went wrong. An `invalidated` value
+/// means the JWT still looks valid but OpenAI revoked the grant server-side (a
+/// sibling seat was logged in), so the remaining lifetime would be misleading.
+fn token_cell(token_expiry: Option<i64>, is_error: bool, error_msg: &str) -> Cell {
+    if is_error {
+        return Cell::new(error_msg).fg(Color::Red);
     }
+    match token_expiry {
+        None => Cell::new("-"),
+        Some(exp) => {
+            let diff = exp - chrono::Utc::now().timestamp();
+            if diff <= 0 {
+                return Cell::new("expired").fg(Color::Red);
+            }
+            let color = if diff >= 86400 {
+                Color::Green
+            } else if diff >= 3600 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+            Cell::new(format_duration(diff)).fg(color)
+        }
+    }
+}
+
+fn auth_failure_label(access_token: &str) -> &'static str {
+    if api::is_token_expired(access_token) {
+        "expired"
+    } else {
+        "invalidated"
+    }
+}
+
+fn display_alias(alias: &str, is_active: bool) -> String {
+    if is_active {
+        format!("* {alias}")
+    } else {
+        alias.to_string()
+    }
+}
+
+fn format_window_reset(window: Option<&api::RateLimitWindow>) -> String {
+    match window {
+        Some(w) => match w.reset_timestamp() {
+            Some(reset_ts) => {
+                let now = chrono::Utc::now().timestamp();
+                let diff_secs = reset_ts - now;
+                if diff_secs <= 0 {
+                    "now".to_string()
+                } else if diff_secs >= 86400 {
+                    format!(
+                        "in {} ({})",
+                        format_duration(diff_secs),
+                        format_reset_timestamp(reset_ts)
+                    )
+                } else {
+                    format!("in {}", format_duration(diff_secs))
+                }
+            }
+            None => "-".to_string(),
+        },
+        None => "-".to_string(),
+    }
+}
+
+fn format_reset_timestamp(reset_ts: i64) -> String {
+    chrono::DateTime::from_timestamp(reset_ts, 0)
+        .map(|dt| {
+            let local = dt.with_timezone(&chrono::Local);
+            local.format("%a %b %d %H:%M").to_string()
+        })
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn format_duration(secs: i64) -> String {
@@ -529,4 +644,59 @@ fn colorize_usage(usage_str: &str) -> Cell {
         Color::Green
     };
     Cell::new(usage_str).fg(color)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+    #[test]
+    fn auth_failure_label_reports_invalidated_when_token_is_not_time_expired() {
+        let token = format!("{JWT_HDR}.eyJleHAiOjk5OTk5OTk5OTl9.sig");
+
+        assert_eq!(auth_failure_label(&token), "invalidated");
+    }
+
+    #[test]
+    fn auth_failure_label_reports_expired_when_exp_claim_is_past() {
+        let token = format!("{JWT_HDR}.eyJleHAiOjEwMDAwMDAwMDB9.sig");
+
+        assert_eq!(auth_failure_label(&token), "expired");
+    }
+
+    #[test]
+    fn render_rate_limited_row_has_expected_column_count() {
+        let account = RateLimitedAccount {
+            alias: "amir+8@sawmills.ai".to_string(),
+            h5_pct: Some(10.0),
+            d7_pct: Some(20.0),
+            h5_reset: "in 1h 00m".to_string(),
+            d7_reset: "in 1d 00h".to_string(),
+            token_expiry: None,
+            is_active: false,
+            is_error: false,
+            error_msg: String::new(),
+        };
+
+        assert_eq!(render_rate_limited_row(&account).len(), 6);
+    }
+
+    #[test]
+    fn render_usage_based_row_has_expected_column_count() {
+        let account = UsageBasedAccount {
+            alias: "amir+11@sawmills.ai".to_string(),
+            credit_balance: Some("10.00".to_string()),
+            seat_limit_cents: Some(2000),
+            credits_status: CreditsStatus::Ok,
+            spend_control_reached: false,
+            token_expiry: None,
+            is_active: false,
+            is_error: false,
+            error_msg: String::new(),
+        };
+
+        assert_eq!(render_usage_based_row(&account).len(), 6);
+    }
 }

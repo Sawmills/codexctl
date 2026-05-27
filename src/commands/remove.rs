@@ -1,8 +1,11 @@
 use anyhow::Result;
 
+use crate::commands::alias;
 use crate::profile;
 
 pub fn run(alias: &str) -> Result<()> {
+    let alias = alias::required(alias)?;
+
     profile::delete_profile(alias)?;
 
     // Clear active if this was the active profile

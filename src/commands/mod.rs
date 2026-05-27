@@ -1,5 +1,7 @@
+mod alias;
 pub mod completions;
 pub mod list;
+pub mod login;
 pub mod remove;
 pub mod save;
 pub mod status;

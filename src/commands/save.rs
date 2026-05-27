@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::api;
+use crate::commands::alias;
 use crate::config;
 use crate::profile;
 
@@ -16,7 +17,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     let auth = api::read_auth_json(&auth_path)?;
 
     let email = fetch_email(&auth.access_token);
-    let resolved_alias = match alias {
+    let resolved_alias = match alias::optional(alias) {
         Some(a) => a.to_string(),
         None => match &email {
             Some(e) => e.clone(),

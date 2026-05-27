@@ -39,6 +39,19 @@ fn parse_auth_json_without_refresh() {
 }
 
 #[test]
+fn parse_auth_json_codex_account_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    std::fs::write(
+        &path,
+        r#"{"auth_mode": "chatgpt", "tokens": {"access_token": "tok_nested", "refresh_token": "ref_nested", "account_id": "acc_123"}}"#,
+    )
+    .unwrap();
+    let auth = api::read_auth_json(&path).unwrap();
+    assert_eq!(auth.account_id.as_deref(), Some("acc_123"));
+}
+
+#[test]
 fn parse_rate_limit_response_old_format() {
     let json = r#"{
         "plan_type": "pro",
@@ -235,4 +248,29 @@ fn parse_account_settings_missing_limits() {
     let json = r#"{}"#;
     let settings: AccountSettings = serde_json::from_str(json).unwrap();
     assert!(settings.seat_type_credit_limits.is_none());
+}
+
+// Fake JWT header `{"alg":"none"}`; only the (unverified) claims payload is read.
+const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+#[test]
+fn token_subject_reads_sub_claim() {
+    // payload {"sub":"seatA"}
+    let tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig");
+    assert_eq!(api::token_subject(&tok).as_deref(), Some("seatA"));
+    assert_eq!(api::token_subject("not-a-jwt"), None);
+}
+
+#[test]
+fn is_token_expired_distinguishes_exp_claim() {
+    let future = format!("{JWT_HDR}.eyJleHAiOjk5OTk5OTk5OTl9.sig"); // exp 9999999999
+    let past = format!("{JWT_HDR}.eyJleHAiOjEwMDAwMDAwMDB9.sig"); // exp 1000000000 (year 2001)
+    assert!(!api::is_token_expired(&future));
+    assert!(api::is_token_expired(&past));
+    // A token whose grant was rotated/revoked still has a valid (or unreadable)
+    // exp — it must not be reported as time-expired.
+    assert!(!api::is_token_expired("opaque-token"));
+    assert!(!api::is_token_expired(&format!(
+        "{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig"
+    )));
 }

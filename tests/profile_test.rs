@@ -96,3 +96,87 @@ fn active_starts_as_none() {
     let active = profile::get_active_from(&paths).unwrap();
     assert!(active.is_none());
 }
+
+// Fake JWT header `{"alg":"none"}`; profile capture only reads the `sub` claim.
+const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+fn write_profile(paths: &Paths, alias: &str, access_token: &str) {
+    let dir = paths.profiles_dir().join(alias);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{access_token}"}}"#),
+    )
+    .unwrap();
+    let meta = profile::Meta {
+        alias: alias.to_string(),
+        email: None,
+        plan: None,
+        saved_at: "2026-01-01T00:00:00Z".to_string(),
+    };
+    std::fs::write(
+        dir.join("meta.json"),
+        serde_json::to_string_pretty(&meta).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn switch_captures_outgoing_active_tokens() {
+    let (_tmp, paths) = setup_test_env();
+    // sub seatA (payload eyJzdWIiOiJzZWF0QSJ9), sub seatB (eyJzdWIiOiJzZWF0QiJ9)
+    let a_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old");
+    let a_live = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live"); // rotated by Codex
+    let b_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.sig");
+
+    write_profile(&paths, "a@test", &a_old);
+    write_profile(&paths, "b@test", &b_tok);
+    profile::set_active_from(&paths, "a@test").unwrap();
+    // Codex rotated the active profile's token in ~/.codex after it was saved.
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{a_live}"}}"#),
+    )
+    .unwrap();
+
+    profile::switch_to_from(&paths, "b@test").unwrap();
+
+    // Outgoing profile's rotated token was folded back into its store.
+    let a_store =
+        std::fs::read_to_string(paths.profiles_dir().join("a@test").join("auth.json")).unwrap();
+    assert!(
+        a_store.contains(".live"),
+        "expected captured token, got {a_store}"
+    );
+    // ~/.codex now holds the switched-to profile.
+    let codex = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
+    assert!(codex.contains(&b_tok));
+    assert_eq!(
+        profile::get_active_from(&paths).unwrap().as_deref(),
+        Some("b@test")
+    );
+}
+
+#[test]
+fn switch_skips_capture_for_foreign_codex_auth() {
+    let (_tmp, paths) = setup_test_env();
+    let a_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old"); // active store, sub seatA
+    let foreign = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.live"); // ~/.codex, sub seatB
+    let c_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.c");
+
+    write_profile(&paths, "a@test", &a_old);
+    write_profile(&paths, "c@test", &c_tok);
+    profile::set_active_from(&paths, "a@test").unwrap();
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{foreign}"}}"#),
+    )
+    .unwrap();
+
+    profile::switch_to_from(&paths, "c@test").unwrap();
+
+    // A different seat in ~/.codex must not clobber the active profile's store.
+    let a_store =
+        std::fs::read_to_string(paths.profiles_dir().join("a@test").join("auth.json")).unwrap();
+    assert!(a_store.contains(".old") && !a_store.contains(".live"));
+}
