@@ -24,11 +24,11 @@ pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
 pub fn run(args: &[String], recovery_prompt: &str) -> Result<i32> {
     let paths = config::default_paths()?;
-    let mut runner = PtyCodexRunner;
+    let mut reporter = HerdrAgentReporter::from_env();
+    let mut runner = PtyCodexRunner::new(reporter.clone());
     let failed_alias = failed_alias_for_child_auth(&paths);
     let mut switcher = CodexctlProfileSwitcher::new(&paths, failed_alias);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
-    let mut reporter = HerdrAgentReporter::from_env();
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
     run_with_reporter(
@@ -177,12 +177,18 @@ fn run_with_reporter_inner(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HerdrAgentState {
     Unknown,
+    Idle,
+    Working,
+    Blocked,
 }
 
 impl HerdrAgentState {
     fn as_str(self) -> &'static str {
         match self {
             Self::Unknown => "unknown",
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -213,6 +219,7 @@ impl AgentReporter for Option<HerdrAgentReporter> {
     }
 }
 
+#[derive(Clone)]
 struct HerdrAgentReporter {
     socket_path: PathBuf,
     pane_id: String,
@@ -1121,17 +1128,28 @@ fn string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a
     current.as_str()
 }
 
-struct PtyCodexRunner;
+struct PtyCodexRunner {
+    state_reporter: Option<HerdrAgentReporter>,
+}
+
+impl PtyCodexRunner {
+    fn new(state_reporter: Option<HerdrAgentReporter>) -> Self {
+        Self { state_reporter }
+    }
+}
 
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 impl CodexRunner for PtyCodexRunner {
     fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
-        run_codex_in_pty(invocation)
+        run_codex_in_pty(invocation, self.state_reporter.clone())
     }
 }
 
-fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
+fn run_codex_in_pty(
+    invocation: &CodexInvocation,
+    state_reporter: Option<HerdrAgentReporter>,
+) -> Result<CodexRunOutcome> {
     let interactive = std::io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::enable(interactive)?;
     let pty_system = native_pty_system();
@@ -1169,6 +1187,7 @@ fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
         Arc::clone(&stop_input),
         Arc::clone(&writer),
         invocation.continue_goal_on_start,
+        state_reporter,
         move || {
             let _ = killer.kill();
         },
@@ -1240,6 +1259,7 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_output_thread(
     mut reader: Box<dyn Read + Send>,
     spend_cap: Arc<AtomicBool>,
@@ -1247,6 +1267,7 @@ fn spawn_output_thread(
     stop_input: Arc<AtomicBool>,
     continue_goal_writer: SharedPtyWriter,
     continue_goal_on_start: bool,
+    state_reporter: Option<HerdrAgentReporter>,
     mut kill_child: impl FnMut() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -1254,6 +1275,7 @@ fn spawn_output_thread(
         let mut buffer = [0; 8192];
         let mut recent = String::new();
         let mut continue_goal_auto_enter = ContinueGoalAutoEnter::default();
+        let mut state_watcher = state_reporter.as_ref().map(|_| CodexStateWatcher::new());
 
         loop {
             let bytes_read = match reader.read(&mut buffer) {
@@ -1282,6 +1304,13 @@ fn spawn_output_thread(
 
             if continue_goal_on_start && continue_goal_auto_enter.observe_output(&chunk_text) {
                 let _ = write_continue_goal_enter_to_pty(&continue_goal_writer);
+            }
+
+            if let (Some(reporter), Some(watcher)) =
+                (state_reporter.as_ref(), state_watcher.as_mut())
+                && let Some(state) = watcher.observe(chunk)
+            {
+                reporter.report(state, None);
             }
         }
     })
@@ -1637,6 +1666,92 @@ fn find_resume_hint_session_id(output: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Renders Codex's raw PTY output into a terminal screen and derives the agent
+/// state from the *current* screen. Codexctl runs Codex inside its own PTY, so
+/// herdr sees `codexctl` as the foreground process and can't run its own
+/// detection; this watcher lets codexctl report Codex's real state instead of a
+/// constant `unknown`. Working on the live screen (rather than the accumulated
+/// byte stream) avoids reporting a stale `Working` after a past frame scrolls
+/// off.
+struct CodexStateWatcher {
+    parser: vt100::Parser,
+    last: HerdrAgentState,
+}
+
+impl CodexStateWatcher {
+    fn new() -> Self {
+        let size = current_pty_size();
+        Self {
+            parser: vt100::Parser::new(size.rows, size.cols, 0),
+            last: HerdrAgentState::Unknown,
+        }
+    }
+
+    /// Feed a chunk of Codex output and return the new state only when it
+    /// changed, so callers report transitions instead of every frame.
+    fn observe(&mut self, chunk: &[u8]) -> Option<HerdrAgentState> {
+        if let Ok((cols, rows)) = terminal::size()
+            && self.parser.screen().size() != (rows, cols)
+        {
+            self.parser.screen_mut().set_size(rows, cols);
+        }
+        self.parser.process(chunk);
+        let state = detect_codex_state(&self.parser.screen().contents());
+        (state != self.last).then(|| {
+            self.last = state;
+            state
+        })
+    }
+}
+
+/// Classify Codex's current screen. Mirrors herdr's own `detect_codex` so a
+/// wrapped Codex reports the same Working/Idle/Blocked states herdr would
+/// detect for an unwrapped one.
+fn detect_codex_state(content: &str) -> HerdrAgentState {
+    let lower = content.to_lowercase();
+
+    if lower.contains("press enter to confirm or esc to cancel")
+        || lower.contains("enter to submit answer")
+        || lower.contains("enter to submit all")
+        || lower.contains("allow command?")
+        || lower.contains("[y/n]")
+        || lower.contains("yes (y)")
+        || codex_confirmation_prompt(&lower)
+    {
+        return HerdrAgentState::Blocked;
+    }
+
+    if codex_interrupt_pattern(&lower) || codex_working_header(content) {
+        return HerdrAgentState::Working;
+    }
+
+    HerdrAgentState::Idle
+}
+
+fn codex_confirmation_prompt(lower_content: &str) -> bool {
+    if let Some(pos) = lower_content
+        .find("do you want")
+        .or_else(|| lower_content.find("would you like"))
+    {
+        let after = &lower_content[pos..];
+        return after.contains("yes") || after.contains('❯');
+    }
+    false
+}
+
+fn codex_interrupt_pattern(lower_content: &str) -> bool {
+    lower_content.contains("esc to interrupt")
+        || lower_content.contains("ctrl+c to interrupt")
+        || (lower_content.contains("esc") && lower_content.contains("interrupt"))
+}
+
+fn codex_working_header(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with('•') && trimmed.contains("Working (")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1822,6 +1937,91 @@ mod tests {
         assert!(spend_cap_seen(&format!(
             "\u{25a0} {SELF_MANAGED_SPEND_CAP_MESSAGE}"
         )));
+    }
+
+    #[test]
+    fn detect_codex_state_reports_idle_for_composer_prompt() {
+        let content = concat!(
+            "  Built the spend-cap recovery wrapper.\n\n",
+            "▌ Ask Codex to do something\n",
+            "  ⏎ send   ⌃J newline   /help\n"
+        );
+
+        assert_eq!(detect_codex_state(content), HerdrAgentState::Idle);
+    }
+
+    #[test]
+    fn detect_codex_state_reports_working_on_interrupt_hint() {
+        assert_eq!(
+            detect_codex_state("• Working (12s • Esc to interrupt)"),
+            HerdrAgentState::Working
+        );
+        assert_eq!(
+            detect_codex_state("thinking…   Ctrl+C to interrupt"),
+            HerdrAgentState::Working
+        );
+    }
+
+    #[test]
+    fn detect_codex_state_reports_blocked_on_approval_prompts() {
+        assert_eq!(
+            detect_codex_state("Allow command?  cargo test"),
+            HerdrAgentState::Blocked
+        );
+        assert_eq!(
+            detect_codex_state("Run `rm`?\n  Press enter to confirm or Esc to cancel"),
+            HerdrAgentState::Blocked
+        );
+        assert_eq!(
+            detect_codex_state("Do you want to apply this change?\n  ❯ Yes   No"),
+            HerdrAgentState::Blocked
+        );
+    }
+
+    #[test]
+    fn detect_codex_state_keeps_resume_paused_goal_prompt_non_blocked() {
+        let prompt = concat!(
+            "  Resume paused goal?\n",
+            "› 1. Resume goal   Mark it active and continue when idle\n",
+            "  Press enter to confirm or esc to go back\n"
+        );
+
+        // Codex's own "go back" goal prompt is not a tool-approval blocker, and
+        // codexctl auto-confirms it during recovery; match herdr by not flagging
+        // it as Blocked.
+        assert_eq!(detect_codex_state(prompt), HerdrAgentState::Idle);
+    }
+
+    #[test]
+    fn state_watcher_reports_transitions_on_the_rendered_screen() {
+        let mut watcher = CodexStateWatcher::new();
+
+        // Working frame ("•" = e2 80 a2, used by Codex's working header).
+        assert_eq!(
+            watcher.observe(
+                b"\x1b[2J\x1b[H\xe2\x80\xa2 Working (3s \xe2\x80\xa2 Esc to interrupt)\r\n"
+            ),
+            Some(HerdrAgentState::Working)
+        );
+
+        // A fresh screen ("\x1b[2J" clears it) that no longer shows the interrupt
+        // hint must report Idle, never a stale Working. This is the whole reason
+        // detection runs on the rendered screen instead of the byte stream.
+        assert_eq!(
+            watcher.observe(b"\x1b[2J\x1b[H\xe2\x96\x8c Ask Codex to do something\r\n"),
+            Some(HerdrAgentState::Idle)
+        );
+
+        // Unchanged screen -> no transition reported.
+        assert_eq!(watcher.observe(b"\r\n"), None);
+
+        // Tool-approval prompt -> Blocked.
+        assert_eq!(
+            watcher.observe(
+                b"\x1b[2J\x1b[HAllow command?\r\n  Press enter to confirm or Esc to cancel\r\n"
+            ),
+            Some(HerdrAgentState::Blocked)
+        );
     }
 
     #[test]
