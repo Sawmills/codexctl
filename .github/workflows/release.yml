@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to release (e.g. v0.1.4)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    name: Resolve tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref || github.ref }}"
+          tag="${ref#refs/tags/}"
+          tag="${tag#refs/heads/}"
+          if [[ "${tag}" != v* ]]; then
+            echo "Expected a v* tag, got '${tag}'." >&2
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.label }}
+    needs: setup
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            label: Darwin_arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            label: Darwin_x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            label: Linux_x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          archive="codexctl_${{ needs.setup.outputs.tag }}_${{ matrix.label }}.tar.gz"
+          strip "target/${{ matrix.target }}/release/codexctl" || true
+          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" codexctl
+          shasum -a 256 "${archive}" > "${archive}.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: codexctl_${{ matrix.label }}
+          path: |
+            codexctl_*.tar.gz
+            codexctl_*.tar.gz.sha256
+
+  release:
+    name: Publish release
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    outputs:
+      sha_darwin_arm64: ${{ steps.shas.outputs.darwin_arm64 }}
+      sha_darwin_x86_64: ${{ steps.shas.outputs.darwin_x86_64 }}
+      sha_linux_x86_64: ${{ steps.shas.outputs.linux_x86_64 }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - id: shas
+        name: Collect checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          tag="${{ needs.setup.outputs.tag }}"
+          sha() { shasum -a 256 "codexctl_${tag}_$1.tar.gz" | cut -d' ' -f1; }
+          {
+            echo "darwin_arm64=$(sha Darwin_arm64)"
+            echo "darwin_x86_64=$(sha Darwin_x86_64)"
+            echo "linux_x86_64=$(sha Linux_x86_64)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.setup.outputs.tag }}"
+          if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
+              --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
+              --repo "${{ github.repository }}" --title "${tag}" --generate-notes
+          fi
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: [setup, release]
+    runs-on: ubuntu-latest
+    steps:
+      - id: token
+        name: Create token
+        continue-on-error: true
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ vars.SAWMILLS_REPO_APP_ID }}
+          private_key: ${{ secrets.SAWMILLS_APP_PRIVATE_KEY }}
+
+      - name: Push formula to public tap
+        if: steps.token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          TAG: ${{ needs.setup.outputs.tag }}
+          VERSION: ${{ needs.setup.outputs.version }}
+          SHA_DARWIN_ARM64: ${{ needs.release.outputs.sha_darwin_arm64 }}
+          SHA_DARWIN_X86_64: ${{ needs.release.outputs.sha_darwin_x86_64 }}
+          SHA_LINUX_X86_64: ${{ needs.release.outputs.sha_linux_x86_64 }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
+
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "${workdir}"' EXIT
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/Sawmills/homebrew-tap.git" \
+            "${workdir}/tap"
+
+          cat > "${workdir}/tap/Formula/codexctl.rb" << EOF
+          class Codexctl < Formula
+            desc "Manage multiple OpenAI Codex CLI accounts"
+            homepage "https://github.com/Sawmills/codexctl"
+            version "${VERSION}"
+            license "Apache-2.0"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${base}/codexctl_${TAG}_Darwin_arm64.tar.gz"
+                sha256 "${SHA_DARWIN_ARM64}"
+              else
+                url "${base}/codexctl_${TAG}_Darwin_x86_64.tar.gz"
+                sha256 "${SHA_DARWIN_X86_64}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "${base}/codexctl_${TAG}_Linux_x86_64.tar.gz"
+                sha256 "${SHA_LINUX_X86_64}"
+              end
+            end
+
+            def install
+              bin.install "codexctl"
+              generate_completions_from_executable(bin/"codexctl", "completions")
+            end
+
+            test do
+              help = shell_output("#{bin}/codexctl --help")
+              assert_match "Usage:", help
+              assert_match "codexctl", help
+              assert_path_exists bash_completion/"codexctl"
+              assert_path_exists zsh_completion/"_codexctl"
+              assert_path_exists fish_completion/"codexctl.fish"
+            end
+          end
+          EOF
+          sed -i 's/^          //' "${workdir}/tap/Formula/codexctl.rb"
+
+          cd "${workdir}/tap"
+          if git diff --quiet -- Formula/codexctl.rb; then
+            echo "Formula already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/codexctl.rb
+          git commit -m "chore(codexctl): update to ${TAG}"
+          git push origin HEAD:main
