@@ -19,6 +19,8 @@ jobs:
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
+      target: ${{ steps.resolve.outputs.target }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,17 +35,30 @@ jobs:
 
           if [[ "${REF_TYPE}" == "tag" ]]; then
             tag="${REF_NAME}"
+            checkout_ref="${REF_NAME}"
+            target="$(git rev-list -n 1 "${tag}")"
           else
-            tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n1)"
+            version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+            tag="v${version}"
+            target="${GITHUB_SHA}"
+            checkout_ref="${GITHUB_SHA}"
+
+            existing="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}" || true)"
+            if [[ -n "${existing}" && "${existing}" != "${target}" ]]; then
+              echo "Tag ${tag} already points at ${existing}, not ${target}." >&2
+              exit 1
+            fi
           fi
 
           if [[ -z "${tag}" || "${tag}" != v* ]]; then
-            echo "Expected a v* tag ref or a branch commit tagged v*." >&2
+            echo "Expected a v* tag or package version." >&2
             exit 1
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
+          echo "target=${target}" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.label }}
@@ -65,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.setup.outputs.tag }}
+          ref: ${{ needs.setup.outputs.checkout_ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -131,7 +146,8 @@ jobs:
               --repo "${{ github.repository }}" --clobber
           else
             gh release create "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
-              --repo "${{ github.repository }}" --title "${tag}" --generate-notes
+              --repo "${{ github.repository }}" --target "${{ needs.setup.outputs.target }}" \
+              --title "${tag}" --generate-notes
           fi
 
   homebrew:
