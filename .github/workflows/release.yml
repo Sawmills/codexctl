@@ -4,12 +4,7 @@ on:
   push:
     tags:
       - v*
-  workflow_dispatch:
-    inputs:
-      ref:
-        description: Git ref to release (e.g. v0.1.4)
-        required: true
-        type: string
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -28,7 +23,7 @@ jobs:
       - id: resolve
         run: |
           set -euo pipefail
-          ref="${{ inputs.ref || github.ref }}"
+          ref="${{ github.ref }}"
           tag="${ref#refs/tags/}"
           tag="${tag#refs/heads/}"
           if [[ "${tag}" != v* ]]; then
