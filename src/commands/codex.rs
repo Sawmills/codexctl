@@ -571,7 +571,7 @@ impl SessionStore for FilesystemSessionStore {
         &mut self,
         session_id: &str,
     ) -> Result<Option<SessionGoalStatus>> {
-        let mut newest: Option<(SystemTime, PathBuf)> = None;
+        let mut candidates = Vec::new();
         for path in session_files(&self.sessions_dir)? {
             let meta = match session_meta_from_file(&path) {
                 Ok(Some(meta)) => meta,
@@ -585,19 +585,22 @@ impl SessionStore for FilesystemSessionStore {
                 let modified = std::fs::metadata(&path)
                     .and_then(|metadata| metadata.modified())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                if newest
-                    .as_ref()
-                    .is_none_or(|(newest_modified, _)| modified > *newest_modified)
-                {
-                    newest = Some((modified, path));
-                }
+                candidates.push((modified, path));
             }
         }
 
-        let Some((_, path)) = newest else {
-            return Ok(None);
-        };
-        session_goal_status_from_file(&path, session_id)
+        candidates.sort_by(|(left, _), (right, _)| right.cmp(left));
+        for (_, path) in candidates {
+            match session_goal_state_from_file(&path, session_id)? {
+                SessionGoalState::Status(status) => return Ok(Some(status)),
+                SessionGoalState::Cleared | SessionGoalState::MatchedGoalWithoutStatus => {
+                    return Ok(None);
+                }
+                SessionGoalState::Unknown => continue,
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -756,14 +759,34 @@ fn session_meta_from_file(path: &std::path::Path) -> Result<Option<SessionMeta>>
     }))
 }
 
+#[cfg(test)]
 fn session_goal_status_from_file(
     path: &std::path::Path,
     session_id: &str,
 ) -> Result<Option<SessionGoalStatus>> {
+    match session_goal_state_from_file(path, session_id)? {
+        SessionGoalState::Status(status) => Ok(Some(status)),
+        SessionGoalState::Cleared
+        | SessionGoalState::MatchedGoalWithoutStatus
+        | SessionGoalState::Unknown => Ok(None),
+    }
+}
+
+enum SessionGoalState {
+    Unknown,
+    Cleared,
+    MatchedGoalWithoutStatus,
+    Status(SessionGoalStatus),
+}
+
+fn session_goal_state_from_file(
+    path: &std::path::Path,
+    session_id: &str,
+) -> Result<SessionGoalState> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("failed to open session file {}", path.display()))?;
     let mut accepted_thread_ids = HashSet::from([session_id.to_string()]);
-    let mut latest = None;
+    let mut latest = SessionGoalState::Unknown;
     for line in std::io::BufReader::new(file).lines() {
         let Ok(line) = line else {
             continue;
@@ -782,7 +805,7 @@ fn session_goal_status_from_file(
             add_session_goal_thread_aliases(payload, session_id, &mut accepted_thread_ids);
         }
         if goal_clear_matches_session(payload, &accepted_thread_ids) {
-            latest = None;
+            latest = SessionGoalState::Cleared;
             continue;
         }
         let Some(goal) = payload.get("goal") else {
@@ -800,6 +823,7 @@ fn session_goal_status_from_file(
             continue;
         }
 
+        latest = SessionGoalState::MatchedGoalWithoutStatus;
         let Some(status) = goal
             .get("status")
             .and_then(|status| status.as_str())
@@ -807,7 +831,7 @@ fn session_goal_status_from_file(
         else {
             continue;
         };
-        latest = Some(status);
+        latest = SessionGoalState::Status(status);
     }
 
     Ok(latest)
@@ -2175,6 +2199,68 @@ mod tests {
             store.goal_status_for_session_id(SESSION_ID).unwrap(),
             Some(SessionGoalStatus::Paused)
         );
+    }
+
+    #[test]
+    fn session_store_goal_status_skips_newer_rollouts_without_goal_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older_path = sessions.join("rollout-parent.jsonl");
+        write_session_file(&older_path, SESSION_ID, "/Users/amirjakoby/Code/codexctl");
+        append_goal_status_line_for_thread(&older_path, SESSION_ID, "paused");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let newer_path = sessions.join("rollout-resumed-empty.jsonl");
+        write_resumed_session_file(
+            &newer_path,
+            "019e9480-cccc-7071-ab90-16b81c7cfd1d",
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+
+        assert_eq!(
+            store.goal_status_for_session_id(SESSION_ID).unwrap(),
+            Some(SessionGoalStatus::Paused)
+        );
+    }
+
+    #[test]
+    fn session_store_goal_status_stops_at_newer_unparseable_goal_event() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older_path = sessions.join("rollout-parent.jsonl");
+        write_session_file(&older_path, SESSION_ID, "/Users/amirjakoby/Code/codexctl");
+        append_goal_status_line_for_thread(&older_path, SESSION_ID, "paused");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let newer_path = sessions.join("rollout-resumed-new-status.jsonl");
+        write_resumed_session_file(
+            &newer_path,
+            "019e9480-dddd-7071-ab90-16b81c7cfd1d",
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        append_goal_status_line_for_thread(&newer_path, SESSION_ID, "newTerminalStatus");
+
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+
+        assert_eq!(store.goal_status_for_session_id(SESSION_ID).unwrap(), None);
     }
 
     #[test]
