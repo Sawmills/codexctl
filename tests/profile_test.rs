@@ -91,6 +91,87 @@ fn switch_copies_auth_json() {
 }
 
 #[test]
+fn switch_copies_auth_json_to_custom_codex_auth_path() {
+    let (tmp, paths) = setup_test_env();
+
+    write_profile(&paths, "acct@test.com", "custom_home_tok");
+    let custom_auth = tmp.path().join("custom-codex-home").join("auth.json");
+
+    profile::switch_to_auth_json_from(&paths, "acct@test.com", &custom_auth).unwrap();
+
+    let custom_contents = std::fs::read_to_string(&custom_auth).unwrap();
+    assert!(custom_contents.contains("custom_home_tok"));
+    let default_contents = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
+    assert!(default_contents.contains("test_tok"));
+    assert!(profile::get_active_from(&paths).unwrap().is_none());
+}
+
+#[test]
+fn switch_custom_auth_path_captures_matching_profile_tokens_before_overwrite() {
+    let (tmp, paths) = setup_test_env();
+    let failed_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old");
+    let failed_live = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+    let next_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.next");
+    write_profile(&paths, "failed@test", &failed_old);
+    write_profile(&paths, "next@test", &next_tok);
+    let custom_auth = tmp.path().join("custom-codex-home").join("auth.json");
+    std::fs::create_dir_all(custom_auth.parent().unwrap()).unwrap();
+    std::fs::write(
+        &custom_auth,
+        format!(r#"{{"access_token":"{failed_live}"}}"#),
+    )
+    .unwrap();
+
+    profile::switch_to_auth_json_from(&paths, "next@test", &custom_auth).unwrap();
+
+    let failed_store =
+        std::fs::read_to_string(paths.profiles_dir().join("failed@test").join("auth.json"))
+            .unwrap();
+    assert!(failed_store.contains(".live"));
+    let custom_contents = std::fs::read_to_string(&custom_auth).unwrap();
+    assert!(custom_contents.contains(&next_tok));
+}
+
+#[test]
+fn alias_for_auth_json_prefers_exact_token_before_subject_fallback() {
+    let (tmp, paths) = setup_test_env();
+    let stale_same_seat = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old");
+    let exact_token = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.exact");
+    write_profile(&paths, "aaa-stale@test", &stale_same_seat);
+    write_profile(&paths, "zzz-exact@test", &exact_token);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{exact_token}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json)
+            .unwrap()
+            .as_deref(),
+        Some("zzz-exact@test")
+    );
+}
+
+#[test]
+fn alias_for_auth_json_rejects_ambiguous_subject_fallback() {
+    let (tmp, paths) = setup_test_env();
+    let stale_a = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old-a");
+    let stale_b = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old-b");
+    let live_same_seat = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+    write_profile(&paths, "seat-a-primary@test", &stale_a);
+    write_profile(&paths, "seat-a-copy@test", &stale_b);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(
+        &auth_json,
+        format!(r#"{{"access_token":"{live_same_seat}"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
     let active = profile::get_active_from(&paths).unwrap();

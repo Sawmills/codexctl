@@ -1,0 +1,1793 @@
+use std::collections::HashSet;
+use std::io::{BufRead, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+
+use anyhow::{Context, Result, bail};
+#[cfg(not(unix))]
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+use crate::commands::use_profile;
+use crate::config::{self, Paths};
+use crate::profile;
+
+const SPEND_CAP_MESSAGE: &str = "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.";
+const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
+    "You hit your spend cap set in your workspace. Increase your spend cap to continue.";
+pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
+
+pub fn run(args: &[String], recovery_prompt: &str) -> Result<i32> {
+    let paths = config::default_paths()?;
+    let mut runner = PtyCodexRunner;
+    let failed_alias = failed_alias_for_child_auth(&paths);
+    let mut switcher = CodexctlProfileSwitcher::new(&paths, failed_alias);
+    let mut sessions = FilesystemSessionStore::new(&paths)?;
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
+    run_with(&options, &mut runner, &mut switcher, &mut sessions)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CodexRunOutcome {
+    Exited(i32),
+    SpendCap { session_id: Option<String> },
+}
+
+trait CodexRunner {
+    fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome>;
+}
+
+trait ProfileSwitcher {
+    fn use_profile(&mut self) -> Result<()>;
+}
+
+trait SessionStore {
+    fn discover_latest_session_id(
+        &mut self,
+        invocation: &CodexInvocation,
+    ) -> Result<Option<String>>;
+}
+
+#[derive(Debug, Clone)]
+struct WrapperOptions {
+    args: Vec<String>,
+    recovery_prompt: String,
+    cwd: PathBuf,
+}
+
+impl WrapperOptions {
+    fn new(args: Vec<String>, recovery_prompt: String, cwd: PathBuf) -> Self {
+        Self {
+            args,
+            recovery_prompt,
+            cwd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexInvocation {
+    args: Vec<String>,
+    cwd: PathBuf,
+}
+
+impl CodexInvocation {
+    fn new(args: Vec<String>, cwd: PathBuf) -> Self {
+        Self { args, cwd }
+    }
+
+    fn from_forwarded_args(args: &[String], cwd: &std::path::Path) -> Self {
+        Self::new(invocation_args_for_cwd(args, cwd), cwd.to_path_buf())
+    }
+}
+
+fn run_with(
+    options: &WrapperOptions,
+    runner: &mut impl CodexRunner,
+    switcher: &mut impl ProfileSwitcher,
+    sessions: &mut impl SessionStore,
+) -> Result<i32> {
+    let initial = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
+    match runner.run_codex(&initial)? {
+        CodexRunOutcome::Exited(code) => Ok(code),
+        CodexRunOutcome::SpendCap { session_id } => {
+            let recovery_args = recovery_args(options, session_id, sessions)?;
+            let recovery = CodexInvocation::from_forwarded_args(&recovery_args, &options.cwd);
+
+            eprintln!();
+            eprintln!("codexctl: spend cap detected; running `codexctl use`");
+            switcher.use_profile()?;
+
+            eprintln!();
+            eprintln!("codexctl: running `codex {}`", recovery.args.join(" "));
+            match runner.run_codex(&recovery)? {
+                CodexRunOutcome::Exited(code) => Ok(code),
+                CodexRunOutcome::SpendCap { .. } => {
+                    bail!("spend cap detected again after switching profiles")
+                }
+            }
+        }
+    }
+}
+
+fn recovery_args(
+    options: &WrapperOptions,
+    detected_session_id: Option<String>,
+    sessions: &mut impl SessionStore,
+) -> Result<Vec<String>> {
+    let mut session_id = session_id_from_codex_args(&options.args).or(detected_session_id);
+    if session_id.is_none() {
+        let invocation = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
+        session_id = sessions.discover_latest_session_id(&invocation)?;
+    }
+
+    if let Some(session_id) = session_id {
+        return Ok(resume_args_for_session(
+            preserved_codex_options(&options.args),
+            &session_id,
+            &options.recovery_prompt,
+        ));
+    }
+
+    if resume_command_index(&options.args).is_some() {
+        return Ok(resume_args_with_recovery_prompt(
+            &options.args,
+            &options.recovery_prompt,
+        ));
+    }
+
+    bail!("spend cap detected, but no Codex session id was available to resume")
+}
+
+fn resume_args_with_recovery_prompt(args: &[String], recovery_prompt: &str) -> Vec<String> {
+    let mut args = args.to_vec();
+    if recovery_prompt.trim().is_empty() {
+        return args;
+    }
+
+    if let Some(prompt_index) = resume_prompt_index(&args) {
+        args[prompt_index] = recovery_prompt.to_string();
+    } else {
+        args.push(recovery_prompt.to_string());
+    }
+    args
+}
+
+fn resume_args_for_session(
+    mut preserved_options: Vec<String>,
+    session_id: &str,
+    recovery_prompt: &str,
+) -> Vec<String> {
+    let mut args = Vec::with_capacity(preserved_options.len() + 3);
+    args.append(&mut preserved_options);
+    args.push("resume".to_string());
+    args.push(session_id.to_string());
+    append_recovery_prompt(&mut args, recovery_prompt);
+    args
+}
+
+fn append_recovery_prompt(args: &mut Vec<String>, recovery_prompt: &str) {
+    if !recovery_prompt.trim().is_empty() {
+        args.push(recovery_prompt.to_string());
+    }
+}
+
+fn invocation_args_for_cwd(args: &[String], cwd: &std::path::Path) -> Vec<String> {
+    if codex_args_set_cwd(args) {
+        return args.to_vec();
+    }
+
+    let mut invocation_args = Vec::with_capacity(args.len() + 2);
+    invocation_args.push("--cd".to_string());
+    invocation_args.push(cwd.display().to_string());
+    invocation_args.extend(args.iter().cloned());
+    invocation_args
+}
+
+fn codex_args_set_cwd(args: &[String]) -> bool {
+    cwd_from_codex_args(args).is_some()
+}
+
+fn preserved_codex_options(args: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if let Some(name) = arg.strip_prefix("--") {
+            let option_name = name.split_once('=').map_or(name, |(name, _)| name);
+            let long_name = format!("--{option_name}");
+
+            if long_option_takes_value(&long_name) {
+                preserved.push(arg.clone());
+                if !arg.contains('=')
+                    && let Some(value) = args.get(index + 1)
+                {
+                    preserved.push(value.clone());
+                    index += 2;
+                    continue;
+                }
+            } else if long_option_is_preserved_flag(&long_name) {
+                preserved.push(arg.clone());
+            }
+
+            index += 1;
+            continue;
+        }
+
+        if short_option_takes_value(arg) {
+            preserved.push(arg.clone());
+            if let Some(value) = args.get(index + 1) {
+                preserved.push(value.clone());
+                index += 2;
+                continue;
+            }
+        } else if short_option_is_preserved_flag(arg) {
+            preserved.push(arg.clone());
+        }
+
+        index += 1;
+    }
+
+    preserved
+}
+
+fn long_option_is_preserved_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--strict-config"
+            | "--oss"
+            | "--dangerously-bypass-approvals-and-sandbox"
+            | "--dangerously-bypass-hook-trust"
+            | "--search"
+            | "--no-alt-screen"
+            | "--full-auto"
+            | "--skip-git-repo-check"
+    )
+}
+
+fn short_option_is_preserved_flag(_arg: &str) -> bool {
+    false
+}
+
+fn session_id_from_codex_args(args: &[String]) -> Option<String> {
+    let mut index = resume_command_index(args)? + 1;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with("--") {
+            if !arg.contains('=') && long_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            if short_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        return is_session_id(arg).then(|| arg.clone());
+    }
+
+    None
+}
+
+fn resume_command_index(args: &[String]) -> Option<usize> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            return None;
+        }
+        if arg.starts_with("--") {
+            if !arg.contains('=') && long_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            if short_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        return (arg == "resume").then_some(index);
+    }
+
+    None
+}
+
+fn resume_prompt_index(args: &[String]) -> Option<usize> {
+    let shape = resume_args_shape(args)?;
+    if shape.has_last {
+        shape.positionals.first().copied()
+    } else {
+        shape.positionals.get(1).copied()
+    }
+}
+
+struct ResumeArgsShape {
+    has_last: bool,
+    positionals: Vec<usize>,
+}
+
+fn resume_args_shape(args: &[String]) -> Option<ResumeArgsShape> {
+    let mut index = resume_command_index(args)? + 1;
+    let mut has_last = false;
+    let mut positionals = Vec::new();
+    let mut after_terminator = false;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if !after_terminator {
+            if arg == "--" {
+                after_terminator = true;
+                index += 1;
+                continue;
+            }
+            if arg == "--last" {
+                has_last = true;
+                index += 1;
+                continue;
+            }
+            if arg.starts_with("--") {
+                if !arg.contains('=') && long_option_takes_value(arg) {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if arg.starts_with('-') {
+                if short_option_takes_value(arg) {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        positionals.push(index);
+        index += 1;
+    }
+
+    Some(ResumeArgsShape {
+        has_last,
+        positionals,
+    })
+}
+
+fn long_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--config"
+            | "--remote"
+            | "--remote-auth-token-env"
+            | "--image"
+            | "--model"
+            | "--local-provider"
+            | "--profile"
+            | "--sandbox"
+            | "--cd"
+            | "--add-dir"
+            | "--ask-for-approval"
+            | "--enable"
+            | "--disable"
+    )
+}
+
+fn short_option_takes_value(arg: &str) -> bool {
+    matches!(arg, "-c" | "-i" | "-m" | "-p" | "-s" | "-C" | "-a")
+}
+
+fn is_session_id(candidate: &str) -> bool {
+    let bytes = candidate.as_bytes();
+    bytes.len() == 36
+        && [8, 13, 18, 23].iter().all(|i| bytes[*i] == b'-')
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| [8, 13, 18, 23].contains(&i) || b.is_ascii_hexdigit())
+}
+
+struct CodexctlProfileSwitcher {
+    auth_json: PathBuf,
+    excluded_alias: Option<String>,
+}
+
+impl CodexctlProfileSwitcher {
+    fn new(paths: &Paths, excluded_alias: Option<String>) -> Self {
+        Self {
+            auth_json: codex_auth_json_for_child(paths),
+            excluded_alias,
+        }
+    }
+}
+
+impl ProfileSwitcher for CodexctlProfileSwitcher {
+    fn use_profile(&mut self) -> Result<()> {
+        use_profile::run_recovery_to_auth_json(&self.auth_json, self.excluded_alias.as_deref())
+    }
+}
+
+struct FilesystemSessionStore {
+    sessions_dir: PathBuf,
+    seen: HashSet<PathBuf>,
+}
+
+impl FilesystemSessionStore {
+    fn new(paths: &Paths) -> Result<Self> {
+        let codex_home = codex_home_for_child(paths);
+        let sessions_dir = codex_home.join("sessions");
+        let seen = session_files(&sessions_dir)?;
+        Ok(Self { sessions_dir, seen })
+    }
+}
+
+impl SessionStore for FilesystemSessionStore {
+    fn discover_latest_session_id(
+        &mut self,
+        invocation: &CodexInvocation,
+    ) -> Result<Option<String>> {
+        let expected_cwd = invocation_session_cwd(invocation);
+        let mut newest: Option<(SystemTime, String)> = None;
+        for path in session_files(&self.sessions_dir)? {
+            if self.seen.contains(&path) {
+                continue;
+            }
+            let modified = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            let meta = match session_meta_from_file(&path) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to inspect codex session file {}: {e:#}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            if meta.is_subagent {
+                continue;
+            }
+            if !session_cwd_matches(meta.cwd.as_deref(), &expected_cwd) {
+                continue;
+            };
+            if newest
+                .as_ref()
+                .is_none_or(|(newest_modified, _)| modified > *newest_modified)
+            {
+                newest = Some((modified, meta.id));
+            }
+        }
+
+        Ok(newest.map(|(_, session_id)| session_id))
+    }
+}
+
+fn codex_auth_json_for_child(paths: &Paths) -> PathBuf {
+    codex_home_for_child(paths).join("auth.json")
+}
+
+fn codex_home_for_child(paths: &Paths) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.home.join(".codex"))
+}
+
+fn failed_alias_for_child_auth(paths: &Paths) -> Option<String> {
+    let auth_json = codex_auth_json_for_child(paths);
+    profile::alias_for_auth_json_from(paths, &auth_json)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            if auth_json == paths.codex_auth_json() {
+                profile::get_active_from(paths).ok().flatten()
+            } else {
+                None
+            }
+        })
+}
+
+fn invocation_session_cwd(invocation: &CodexInvocation) -> PathBuf {
+    let cwd = cwd_from_codex_args(&invocation.args).unwrap_or_else(|| invocation.cwd.clone());
+    let cwd = if cwd.is_absolute() {
+        cwd
+    } else {
+        invocation.cwd.join(cwd)
+    };
+    normalize_cwd(cwd)
+}
+
+fn cwd_from_codex_args(args: &[String]) -> Option<PathBuf> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--" {
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--cd=") {
+            return Some(PathBuf::from(value));
+        }
+        if arg == "--cd" || arg == "-C" {
+            return args.get(index + 1).map(PathBuf::from);
+        }
+        if arg.starts_with("--") {
+            if !arg.contains('=') && long_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            if short_option_takes_value(arg) {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+
+        index += 1;
+    }
+
+    None
+}
+
+fn normalize_cwd(cwd: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&cwd).unwrap_or(cwd)
+}
+
+fn session_cwd_matches(session_cwd: Option<&Path>, expected_cwd: &Path) -> bool {
+    session_cwd
+        .map(|cwd| normalize_cwd(cwd.to_path_buf()) == expected_cwd)
+        .unwrap_or(false)
+}
+
+struct SessionMeta {
+    id: String,
+    cwd: Option<PathBuf>,
+    is_subagent: bool,
+}
+
+fn session_files(root: &std::path::Path) -> Result<HashSet<PathBuf>> {
+    let mut files = HashSet::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in
+            std::fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+            {
+                files.insert(path);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn session_meta_from_file(path: &std::path::Path) -> Result<Option<SessionMeta>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open session file {}", path.display()))?;
+    let mut lines = std::io::BufReader::new(file).lines();
+    let Some(line) = lines.next().transpose()? else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&line)
+        .with_context(|| format!("failed to parse session file {}", path.display()))?;
+    let Some(id) = value
+        .get("payload")
+        .and_then(|payload| payload.get("id"))
+        .and_then(|id| id.as_str())
+        .map(str::to_string)
+    else {
+        return Ok(None);
+    };
+    let cwd = value
+        .get("payload")
+        .and_then(|payload| payload.get("cwd"))
+        .and_then(|cwd| cwd.as_str())
+        .map(PathBuf::from);
+    let is_subagent = value.get("payload").is_some_and(|payload| {
+        payload
+            .get("thread_source")
+            .and_then(|thread_source| thread_source.as_str())
+            .is_some_and(|thread_source| thread_source == "subagent")
+            || payload
+                .get("source")
+                .and_then(|source| source.get("subagent"))
+                .is_some()
+    });
+
+    Ok(Some(SessionMeta {
+        id,
+        cwd,
+        is_subagent,
+    }))
+}
+
+struct PtyCodexRunner;
+
+impl CodexRunner for PtyCodexRunner {
+    fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
+        run_codex_in_pty(invocation)
+    }
+}
+
+fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
+    let interactive = std::io::stdin().is_terminal();
+    let _raw_mode = RawModeGuard::enable(interactive)?;
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(current_pty_size())
+        .context("failed to open pty")?;
+    let mut command = CommandBuilder::new("codex");
+    for arg in &invocation.args {
+        command.arg(arg);
+    }
+    command.cwd(invocation.cwd.as_os_str());
+    if std::env::var_os("TERM").is_none() {
+        command.env("TERM", "xterm-256color");
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .context("failed to run `codex`")?;
+    drop(pair.slave);
+
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let spend_cap = Arc::new(AtomicBool::new(false));
+    let session_id = Arc::new(Mutex::new(None));
+
+    let mut master = Some(pair.master);
+    let reader = master.as_ref().unwrap().try_clone_reader()?;
+    let writer = master.as_ref().unwrap().take_writer()?;
+    let mut killer = child.clone_killer();
+
+    let reader_thread = spawn_output_thread(
+        reader,
+        Arc::clone(&spend_cap),
+        Arc::clone(&session_id),
+        Arc::clone(&stop_input),
+        move || {
+            let _ = killer.kill();
+        },
+    );
+    let input_thread = if interactive {
+        Some(InputThread {
+            handle: spawn_input_thread(writer, Arc::clone(&stop_input), master.take().unwrap()),
+            join_on_stop: true,
+        })
+    } else {
+        Some(InputThread {
+            handle: spawn_pipe_input_thread(writer, Arc::clone(&stop_input)),
+            join_on_stop: pipe_input_thread_is_stop_aware(),
+        })
+    };
+
+    let status = child.wait().context("failed to wait for codex")?;
+    stop_input.store(true, Ordering::SeqCst);
+    if let Some(input_thread) = input_thread
+        && input_thread.join_on_stop
+    {
+        let _ = input_thread.handle.join();
+    }
+    let _ = reader_thread.join();
+
+    if spend_cap.load(Ordering::SeqCst) {
+        let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
+        Ok(CodexRunOutcome::SpendCap { session_id })
+    } else {
+        Ok(CodexRunOutcome::Exited(status.exit_code() as i32))
+    }
+}
+
+struct InputThread {
+    handle: std::thread::JoinHandle<()>,
+    join_on_stop: bool,
+}
+
+fn current_pty_size() -> PtySize {
+    let (cols, rows) = terminal::size().unwrap_or((80, 24));
+    PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }
+}
+
+struct RawModeGuard {
+    enabled: bool,
+}
+
+impl RawModeGuard {
+    fn enable(interactive: bool) -> Result<Self> {
+        if interactive {
+            terminal::enable_raw_mode().context("failed to enable terminal raw mode")?;
+        }
+        Ok(Self {
+            enabled: interactive,
+        })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn spawn_output_thread(
+    mut reader: Box<dyn Read + Send>,
+    spend_cap: Arc<AtomicBool>,
+    session_id: Arc<Mutex<Option<String>>>,
+    stop_input: Arc<AtomicBool>,
+    mut kill_child: impl FnMut() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        let mut buffer = [0; 8192];
+        let mut recent = String::new();
+
+        loop {
+            let bytes_read = match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            let chunk = &buffer[..bytes_read];
+            let _ = stdout.write_all(chunk);
+            let _ = stdout.flush();
+
+            recent.push_str(&String::from_utf8_lossy(chunk));
+            if recent.len() > 16_384 {
+                let keep_from = recent.len().saturating_sub(8_192);
+                let drain_to = recent
+                    .char_indices()
+                    .map(|(index, _)| index)
+                    .find(|index| *index >= keep_from)
+                    .unwrap_or(0);
+                recent.drain(..drain_to);
+            }
+
+            if spend_cap_seen(&recent) {
+                spend_cap.store(true, Ordering::SeqCst);
+                if let Some(id) = find_resume_hint_session_id(&recent)
+                    && let Ok(mut guard) = session_id.lock()
+                {
+                    *guard = Some(id);
+                }
+                stop_input.store(true, Ordering::SeqCst);
+                kill_child();
+                break;
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn pipe_input_thread_is_stop_aware() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn pipe_input_thread_is_stop_aware() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn spawn_pipe_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    stop_input: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let stdin_fd = stdin.as_raw_fd();
+        let mut buffer = [0; 8192];
+        while !stop_input.load(Ordering::SeqCst) {
+            let mut pollfd = libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if result == 0 {
+                continue;
+            }
+            if pollfd.revents & libc::POLLIN == 0 {
+                if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    break;
+                }
+                continue;
+            }
+
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_pipe_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    _stop_input: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0; 8192];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(unix)]
+fn spawn_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    stop_input: Arc<AtomicBool>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let stdin_fd = stdin.as_raw_fd();
+        let mut stdin = stdin.lock();
+        let mut buffer = [0; 8192];
+        let mut last_size = terminal::size().ok();
+
+        while !stop_input.load(Ordering::SeqCst) {
+            resize_child_if_needed(master.as_ref(), &mut last_size);
+
+            let mut pollfd = libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if result == 0 {
+                continue;
+            }
+            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                break;
+            }
+            if pollfd.revents & libc::POLLIN == 0 {
+                continue;
+            }
+
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    stop_input: Arc<AtomicBool>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        while !stop_input.load(Ordering::SeqCst) {
+            match event::poll(std::time::Duration::from_millis(50)) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key)) => {
+                        if let Some(bytes) = key_event_bytes(key) {
+                            if writer.write_all(&bytes).is_err() {
+                                break;
+                            }
+                            let _ = writer.flush();
+                        }
+                    }
+                    Ok(Event::Paste(text)) => {
+                        if writer.write_all(&paste_event_bytes(&text)).is_err() {
+                            break;
+                        }
+                        let _ = writer.flush();
+                    }
+                    Ok(Event::Resize(cols, rows)) => {
+                        let _ = master.resize(PtySize {
+                            rows,
+                            cols,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                Ok(false) => {}
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn paste_event_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 12);
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
+}
+
+#[cfg(not(unix))]
+fn key_event_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        bytes.push(0x1b);
+    }
+
+    match key.code {
+        KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            bytes.push(control_byte(c)?);
+        }
+        KeyCode::Char(c) => {
+            let mut encoded = [0; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
+        }
+        KeyCode::Enter => bytes.push(b'\r'),
+        KeyCode::Backspace => bytes.push(0x7f),
+        KeyCode::Esc => bytes.push(0x1b),
+        KeyCode::Tab => bytes.push(b'\t'),
+        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
+        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
+        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
+        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
+        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
+        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
+        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
+        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
+        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
+        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
+        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
+        KeyCode::F(n) => bytes.extend_from_slice(function_key_bytes(n)?),
+        _ => return None,
+    }
+
+    Some(bytes)
+}
+
+#[cfg(not(unix))]
+fn control_byte(c: char) -> Option<u8> {
+    let lower = c.to_ascii_lowercase();
+    if lower.is_ascii_alphabetic() {
+        Some((lower as u8) - b'a' + 1)
+    } else {
+        match c {
+            '[' => Some(0x1b),
+            '\\' => Some(0x1c),
+            ']' => Some(0x1d),
+            '^' => Some(0x1e),
+            '_' => Some(0x1f),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn function_key_bytes(n: u8) -> Option<&'static [u8]> {
+    match n {
+        1 => Some(b"\x1bOP"),
+        2 => Some(b"\x1bOQ"),
+        3 => Some(b"\x1bOR"),
+        4 => Some(b"\x1bOS"),
+        5 => Some(b"\x1b[15~"),
+        6 => Some(b"\x1b[17~"),
+        7 => Some(b"\x1b[18~"),
+        8 => Some(b"\x1b[19~"),
+        9 => Some(b"\x1b[20~"),
+        10 => Some(b"\x1b[21~"),
+        11 => Some(b"\x1b[23~"),
+        12 => Some(b"\x1b[24~"),
+        _ => None,
+    }
+}
+
+fn resize_child_if_needed(
+    master: &(dyn portable_pty::MasterPty + Send),
+    last_size: &mut Option<(u16, u16)>,
+) {
+    let Ok((cols, rows)) = terminal::size() else {
+        return;
+    };
+    if last_size.is_some_and(|size| size == (cols, rows)) {
+        return;
+    }
+    *last_size = Some((cols, rows));
+    let _ = master.resize(PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+}
+
+fn spend_cap_seen(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.contains("\u{25a0} ")
+            && (line.contains(SPEND_CAP_MESSAGE) || line.contains(SELF_MANAGED_SPEND_CAP_MESSAGE))
+    })
+}
+
+fn find_resume_hint_session_id(output: &str) -> Option<String> {
+    output
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            line.find("codex resume")
+                .map(|index| &line[index + "codex resume".len()..])
+        })
+        .flat_map(|line| line.split(|c: char| !(c.is_ascii_hexdigit() || c == '-')))
+        .find(|token| is_session_id(token))
+        .map(str::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SESSION_ID: &str = "019e8489-aa28-7071-ab90-16b81c7cfd1d";
+    const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+    #[test]
+    fn session_id_from_resume_args_reads_explicit_session() {
+        let args = vec!["resume".to_string(), SESSION_ID.to_string()];
+
+        assert_eq!(
+            session_id_from_codex_args(&args).as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn session_id_from_resume_args_skips_resume_flags() {
+        let args = vec![
+            "resume".to_string(),
+            "--all".to_string(),
+            SESSION_ID.to_string(),
+        ];
+
+        assert_eq!(
+            session_id_from_codex_args(&args).as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn session_id_from_resume_args_allows_global_codex_flags() {
+        let args = vec![
+            "-C".to_string(),
+            "/Users/amirjakoby/Code/codexctl".to_string(),
+            "resume".to_string(),
+            SESSION_ID.to_string(),
+        ];
+
+        assert_eq!(
+            session_id_from_codex_args(&args).as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn invocation_args_add_current_cwd_when_not_supplied() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+
+        assert_eq!(
+            invocation_args_for_cwd(&["resume".to_string(), SESSION_ID.to_string()], &cwd),
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invocation_args_preserve_explicit_cwd() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+
+        assert_eq!(
+            invocation_args_for_cwd(
+                &[
+                    "--cd".to_string(),
+                    "/tmp/other".to_string(),
+                    "resume".to_string(),
+                    SESSION_ID.to_string(),
+                ],
+                &cwd,
+            ),
+            vec![
+                "--cd".to_string(),
+                "/tmp/other".to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn invocation_args_ignore_cwd_after_codex_terminator() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+
+        assert_eq!(
+            invocation_args_for_cwd(
+                &[
+                    "--".to_string(),
+                    "--cd".to_string(),
+                    "/tmp/prompt-text".to_string(),
+                    "explain".to_string(),
+                ],
+                &cwd,
+            ),
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "--".to_string(),
+                "--cd".to_string(),
+                "/tmp/prompt-text".to_string(),
+                "explain".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserved_codex_options_stop_at_codex_terminator() {
+        assert_eq!(
+            preserved_codex_options(&[
+                "--".to_string(),
+                "--cd".to_string(),
+                "/tmp/prompt-text".to_string(),
+            ]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn resume_command_index_ignores_prompt_after_codex_terminator() {
+        assert_eq!(
+            resume_command_index(&[
+                "--".to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string()
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn alias_for_auth_json_matches_custom_child_auth_by_subject() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let seat_a_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old");
+        let seat_a_live = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+        let seat_b = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.sig");
+        write_profile_auth(&paths, "failed@test", &seat_a_old);
+        write_profile_auth(&paths, "next@test", &seat_b);
+        let custom_auth = tmp.path().join("custom-codex-home").join("auth.json");
+        std::fs::create_dir_all(custom_auth.parent().unwrap()).unwrap();
+        std::fs::write(
+            &custom_auth,
+            format!(r#"{{"access_token":"{seat_a_live}"}}"#),
+        )
+        .unwrap();
+
+        assert_eq!(
+            profile::alias_for_auth_json_from(&paths, &custom_auth)
+                .unwrap()
+                .as_deref(),
+            Some("failed@test")
+        );
+    }
+
+    #[test]
+    fn resume_hint_session_id_ignores_unrelated_screen_uuid() {
+        let output = format!("run id: aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n{SPEND_CAP_MESSAGE}");
+
+        assert_eq!(find_resume_hint_session_id(&output), None);
+    }
+
+    #[test]
+    fn resume_hint_session_id_reads_codex_resume_hint() {
+        let output = format!("To continue, run codex resume {SESSION_ID}\n{SPEND_CAP_MESSAGE}");
+
+        assert_eq!(
+            find_resume_hint_session_id(&output).as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn spend_cap_seen_requires_codex_error_marker() {
+        let output = format!("assistant quoted: {SPEND_CAP_MESSAGE}");
+
+        assert!(!spend_cap_seen(&output));
+        assert!(spend_cap_seen(&format!("\u{25a0} {SPEND_CAP_MESSAGE}")));
+        assert!(spend_cap_seen(&format!(
+            "\u{25a0} {SELF_MANAGED_SPEND_CAP_MESSAGE}"
+        )));
+    }
+
+    #[test]
+    fn spend_cap_recovery_switches_profile_and_resumes_session() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            "resume".to_string(),
+            cwd.clone(),
+        );
+
+        let exit = run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(switcher.use_calls, 1);
+        assert_eq!(
+            runner.calls,
+            vec![
+                CodexInvocation::new(
+                    vec![
+                        "--cd".to_string(),
+                        cwd.display().to_string(),
+                        "resume".to_string(),
+                        SESSION_ID.to_string(),
+                    ],
+                    cwd.clone()
+                ),
+                CodexInvocation::new(
+                    vec![
+                        "--cd".to_string(),
+                        cwd.display().to_string(),
+                        "resume".to_string(),
+                        SESSION_ID.to_string(),
+                        "resume".to_string()
+                    ],
+                    cwd,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_discovers_session_for_new_run() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore {
+            discovered: Some(SESSION_ID.to_string()),
+        };
+        let options = WrapperOptions::new(
+            vec!["finish this".to_string()],
+            "resume".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1],
+            CodexInvocation::new(
+                vec![
+                    "--cd".to_string(),
+                    cwd.display().to_string(),
+                    "resume".to_string(),
+                    SESSION_ID.to_string(),
+                    "resume".to_string()
+                ],
+                cwd,
+            )
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_prefers_explicit_resume_id_over_detected_uuid() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let unrelated = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(unrelated.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert!(runner.calls[1].args.contains(&SESSION_ID.to_string()));
+        assert!(!runner.calls[1].args.contains(&unrelated.to_string()));
+    }
+
+    #[test]
+    fn spend_cap_recovery_replaces_resume_last_prompt() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "resume".to_string(),
+                "--last".to_string(),
+                "fix tests".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_appends_resume_last_prompt_when_missing() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), "--last".to_string()],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_replaces_named_resume_prompt() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "resume".to_string(),
+                "release-lane".to_string(),
+                "fix tests".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "release-lane".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_discovery_ignores_new_files_for_other_cwds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_session_file(
+            &sessions.join("rollout-other.jsonl"),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "/tmp/other",
+        );
+        write_session_file(
+            &sessions.join("rollout-current.jsonl"),
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        let invocation = CodexInvocation::new(
+            vec![
+                "--cd".to_string(),
+                "/Users/amirjakoby/Code/codexctl".to_string(),
+            ],
+            PathBuf::from("/Users/amirjakoby/Code/codexctl"),
+        );
+
+        assert_eq!(
+            store
+                .discover_latest_session_id(&invocation)
+                .unwrap()
+                .as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn session_discovery_ignores_new_subagent_files_for_same_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        write_session_file(
+            &sessions.join("rollout-current.jsonl"),
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        write_subagent_session_file(
+            &sessions.join("rollout-subagent.jsonl"),
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        let invocation = CodexInvocation::new(
+            vec![
+                "--cd".to_string(),
+                "/Users/amirjakoby/Code/codexctl".to_string(),
+            ],
+            PathBuf::from("/Users/amirjakoby/Code/codexctl"),
+        );
+
+        assert_eq!(
+            store
+                .discover_latest_session_id(&invocation)
+                .unwrap()
+                .as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn session_discovery_skips_invalid_new_session_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout-bad.jsonl"), "{not-json\n").unwrap();
+        write_session_file(
+            &sessions.join("rollout-current.jsonl"),
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        let invocation = CodexInvocation::new(
+            vec![
+                "--cd".to_string(),
+                "/Users/amirjakoby/Code/codexctl".to_string(),
+            ],
+            PathBuf::from("/Users/amirjakoby/Code/codexctl"),
+        );
+
+        assert_eq!(
+            store
+                .discover_latest_session_id(&invocation)
+                .unwrap()
+                .as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    fn write_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": cwd,
+            }
+        });
+        std::fs::write(path, format!("{line}\n")).unwrap();
+    }
+
+    fn write_subagent_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": cwd,
+                "thread_source": "subagent",
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": SESSION_ID
+                        }
+                    }
+                }
+            }
+        });
+        std::fs::write(path, format!("{line}\n")).unwrap();
+    }
+
+    fn write_profile_auth(paths: &Paths, alias: &str, access_token: &str) {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{access_token}"}}"#),
+        )
+        .unwrap();
+        let meta = profile::Meta {
+            alias: alias.to_string(),
+            email: None,
+            plan: None,
+            saved_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn spend_cap_recovery_preserves_explicit_cwd_and_model() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let explicit_cwd = "/tmp/other-repo".to_string();
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "--cd".to_string(),
+                explicit_cwd.clone(),
+                "-m".to_string(),
+                "gpt-5".to_string(),
+                "finish this".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd,
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                explicit_cwd,
+                "-m".to_string(),
+                "gpt-5".to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_preserves_resume_relevant_codex_flags() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "--full-auto".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--local-provider".to_string(),
+                "ollama".to_string(),
+                "finish this".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "--full-auto".to_string(),
+                "--skip-git-repo-check".to_string(),
+                "--local-provider".to_string(),
+                "ollama".to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeProfileSwitcher {
+        use_calls: usize,
+    }
+
+    impl ProfileSwitcher for FakeProfileSwitcher {
+        fn use_profile(&mut self) -> anyhow::Result<()> {
+            self.use_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeSessionStore {
+        discovered: Option<String>,
+    }
+
+    impl SessionStore for FakeSessionStore {
+        fn discover_latest_session_id(
+            &mut self,
+            _invocation: &CodexInvocation,
+        ) -> anyhow::Result<Option<String>> {
+            Ok(self.discovered.clone())
+        }
+    }
+
+    struct FakeCodexRunner {
+        calls: Vec<CodexInvocation>,
+        outcomes: Vec<CodexRunOutcome>,
+    }
+
+    impl FakeCodexRunner {
+        fn new(outcomes: Vec<CodexRunOutcome>) -> Self {
+            Self {
+                calls: Vec::new(),
+                outcomes,
+            }
+        }
+    }
+
+    impl CodexRunner for FakeCodexRunner {
+        fn run_codex(&mut self, invocation: &CodexInvocation) -> anyhow::Result<CodexRunOutcome> {
+            self.calls.push(invocation.clone());
+            Ok(self.outcomes.remove(0))
+        }
+    }
+}

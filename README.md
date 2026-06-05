@@ -85,12 +85,37 @@ Interactive fuzzy picker:
 codexctl switch
 ```
 
+### Run Codex with spend-cap recovery
+
+Use `codexctl codex` as the Codex launcher when you want account failover:
+
+```bash
+codexctl codex
+codexctl codex -- "start prompt"
+codexctl codex -- -C ~/Code/codexctl -m gpt-5
+codexctl codex resume 019e8489-aa28-7071-ab90-16b81c7cfd1d
+```
+
+The wrapper runs `codex` in a PTY and watches for this spend-cap message:
+
+```text
+You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.
+```
+
+Codex is launched from the current directory where `codexctl codex` was run. When detected, it
+terminates that Codex process, runs the same account selection as
+`codexctl use`, then resumes with `codex resume <session-id> "Continue the previous request."`.
+For a new session, it discovers the session id from the new Codex session file created under
+`~/.codex/sessions/`. For an existing session, pass `resume <session-id>` so the wrapper can
+recover without discovery.
+
 ### Other commands
 
 ```bash
 codexctl list          # list saved profiles
 codexctl login <alias> # isolated Codex login and save
 codexctl whoami        # show active account
+codexctl codex -- ...  # run Codex with spend-cap recovery
 codexctl remove <alias>
 ```
 

@@ -121,46 +121,84 @@ pub fn set_active_from(paths: &Paths, alias: &str) -> Result<()> {
 }
 
 pub fn switch_to_from(paths: &Paths, alias: &str) -> Result<String> {
+    switch_to_auth_json_from(paths, alias, &paths.codex_auth_json())
+}
+
+pub fn switch_to_auth_json_from(
+    paths: &Paths,
+    alias: &str,
+    codex_auth: &std::path::Path,
+) -> Result<String> {
     let profile = get_profile_from(paths, alias)?;
-    let codex_auth = paths.codex_auth_json();
 
     // Capture the outgoing active profile's live tokens before we overwrite
     // ~/.codex/auth.json. OpenAI uses single-use rotating refresh tokens, so the
     // Codex CLI may have rotated this profile's tokens since it was saved; if we
     // don't fold them back into the store they're lost and the profile later
     // looks "expired". See capture_active_profile_tokens for the safety guard.
-    capture_active_profile_tokens(paths, &codex_auth);
+    capture_auth_file_profile_tokens(paths, codex_auth);
 
-    std::fs::copy(profile.auth_json_path(), &codex_auth)
-        .with_context(|| "failed to copy auth.json to ~/.codex/")?;
-    set_active_from(paths, alias)?;
+    if let Some(parent) = codex_auth.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::copy(profile.auth_json_path(), codex_auth)
+        .with_context(|| format!("failed to copy auth.json to {}", codex_auth.display()))?;
+    if codex_auth == paths.codex_auth_json() {
+        set_active_from(paths, alias)?;
+    }
     Ok(profile.meta.email.unwrap_or_else(|| "unknown".to_string()))
 }
 
-/// Best-effort: copy the live ~/.codex/auth.json back into the currently-active
-/// profile's store, but only when both files decode to the same seat (`sub`).
-/// The guard prevents clobbering the store when ~/.codex was changed out-of-band
-/// (e.g. a direct `codex login`). Failures only warn — they must not block a switch.
-fn capture_active_profile_tokens(paths: &Paths, codex_auth: &std::path::Path) {
-    let Ok(Some(active)) = get_active_from(paths) else {
-        return;
+pub fn alias_for_auth_json_from(
+    paths: &Paths,
+    auth_json: &std::path::Path,
+) -> Result<Option<String>> {
+    let Ok(target_auth) = api::read_auth_json(auth_json) else {
+        return Ok(None);
     };
+    let target_sub = api::token_subject(&target_auth.access_token);
+    let mut profile_auths = Vec::new();
+    for profile in list_profiles_from(paths)? {
+        let Ok(profile_auth) = api::read_auth_json(&profile.auth_json_path()) else {
+            continue;
+        };
+        profile_auths.push((profile, profile_auth));
+    }
+
+    for (profile, profile_auth) in &profile_auths {
+        if profile_auth.access_token == target_auth.access_token {
+            return Ok(Some(profile.meta.alias.clone()));
+        }
+    }
+
+    let mut sub_matches = profile_auths
+        .into_iter()
+        .filter_map(|(profile, profile_auth)| {
+            let profile_sub = api::token_subject(&profile_auth.access_token);
+            (target_sub.is_some() && target_sub == profile_sub).then_some(profile.meta.alias)
+        });
+    if let Some(alias) = sub_matches.next()
+        && sub_matches.next().is_none()
+    {
+        return Ok(Some(alias));
+    }
+    Ok(None)
+}
+
+/// Best-effort: copy the live Codex auth file back into the saved profile that
+/// owns that auth, but only when the token matches by exact value or seat (`sub`).
+/// Failures only warn — they must not block a switch.
+fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &std::path::Path) {
     if !codex_auth.exists() {
         return;
     }
-    let dest = paths.profiles_dir().join(&active).join("auth.json");
-    let stored_sub = api::read_auth_json(&dest)
-        .ok()
-        .and_then(|a| api::token_subject(&a.access_token));
-    let live_sub = api::read_auth_json(codex_auth)
-        .ok()
-        .and_then(|a| api::token_subject(&a.access_token));
-
-    if stored_sub.is_some()
-        && stored_sub == live_sub
-        && let Err(e) = std::fs::copy(codex_auth, &dest)
-    {
-        eprintln!("warning: failed to capture tokens for active profile '{active}': {e}");
+    let Ok(Some(alias)) = alias_for_auth_json_from(paths, codex_auth) else {
+        return;
+    };
+    let dest = paths.profiles_dir().join(&alias).join("auth.json");
+    if let Err(e) = std::fs::copy(codex_auth, &dest) {
+        eprintln!("warning: failed to capture tokens for profile '{alias}': {e}");
     }
 }
 
@@ -204,4 +242,7 @@ pub fn set_active(alias: &str) -> Result<()> {
 }
 pub fn switch_to(alias: &str) -> Result<String> {
     switch_to_from(&config::default_paths()?, alias)
+}
+pub fn switch_to_auth_json(alias: &str, auth_json: &std::path::Path) -> Result<String> {
+    switch_to_auth_json_from(&config::default_paths()?, alias, auth_json)
 }
