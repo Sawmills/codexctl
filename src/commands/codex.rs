@@ -5,7 +5,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 #[cfg(not(unix))]
@@ -28,9 +28,16 @@ pub fn run(args: &[String], recovery_prompt: &str) -> Result<i32> {
     let failed_alias = failed_alias_for_child_auth(&paths);
     let mut switcher = CodexctlProfileSwitcher::new(&paths, failed_alias);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
+    let mut reporter = HerdrAgentReporter::from_env();
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
-    run_with(&options, &mut runner, &mut switcher, &mut sessions)
+    run_with_reporter(
+        &options,
+        &mut runner,
+        &mut switcher,
+        &mut sessions,
+        &mut reporter,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,11 +107,40 @@ impl CodexInvocation {
     }
 }
 
+#[cfg(test)]
 fn run_with(
     options: &WrapperOptions,
     runner: &mut impl CodexRunner,
     switcher: &mut impl ProfileSwitcher,
     sessions: &mut impl SessionStore,
+) -> Result<i32> {
+    let mut reporter = None;
+    run_with_reporter(options, runner, switcher, sessions, &mut reporter)
+}
+
+fn run_with_reporter(
+    options: &WrapperOptions,
+    runner: &mut impl CodexRunner,
+    switcher: &mut impl ProfileSwitcher,
+    sessions: &mut impl SessionStore,
+    reporter: &mut impl AgentReporter,
+) -> Result<i32> {
+    let session_id = session_id_from_codex_args(&options.args);
+    if let Some(session_id) = session_id.as_deref() {
+        reporter.report_session(session_id);
+    }
+    reporter.report(HerdrAgentState::Unknown, session_id.as_deref());
+    let result = run_with_reporter_inner(options, runner, switcher, sessions, reporter);
+    reporter.release();
+    result
+}
+
+fn run_with_reporter_inner(
+    options: &WrapperOptions,
+    runner: &mut impl CodexRunner,
+    switcher: &mut impl ProfileSwitcher,
+    sessions: &mut impl SessionStore,
+    reporter: &mut impl AgentReporter,
 ) -> Result<i32> {
     let initial = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
     match runner.run_codex(&initial)? {
@@ -113,6 +149,11 @@ fn run_with(
             let recovery_plan = recovery_plan(options, session_id, sessions)?;
             let mut recovery =
                 CodexInvocation::from_forwarded_args(&recovery_plan.args, &options.cwd);
+            let recovery_session_id = session_id_from_codex_args(&recovery.args);
+            if let Some(session_id) = recovery_session_id.as_deref() {
+                reporter.report_session(session_id);
+            }
+            reporter.report(HerdrAgentState::Unknown, recovery_session_id.as_deref());
             if recovery_plan.continue_paused_goal_on_prompt {
                 recovery = recovery.with_continue_goal_on_start();
             }
@@ -131,6 +172,174 @@ fn run_with(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HerdrAgentState {
+    Unknown,
+}
+
+impl HerdrAgentState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+trait AgentReporter {
+    fn report_session(&mut self, session_id: &str);
+    fn report(&mut self, state: HerdrAgentState, session_id: Option<&str>);
+    fn release(&mut self);
+}
+
+impl AgentReporter for Option<HerdrAgentReporter> {
+    fn report_session(&mut self, session_id: &str) {
+        if let Some(reporter) = self {
+            reporter.report_session(session_id);
+        }
+    }
+
+    fn report(&mut self, state: HerdrAgentState, session_id: Option<&str>) {
+        if let Some(reporter) = self {
+            reporter.report(state, session_id);
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(reporter) = self {
+            reporter.release();
+        }
+    }
+}
+
+struct HerdrAgentReporter {
+    socket_path: PathBuf,
+    pane_id: String,
+}
+
+impl HerdrAgentReporter {
+    const SOURCE: &'static str = "codexctl";
+    const CODEX_SESSION_SOURCE: &'static str = "herdr:codex";
+    const AGENT: &'static str = "codex";
+
+    fn from_env() -> Option<Self> {
+        if std::env::var_os("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            return None;
+        }
+        let socket_path = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from)?;
+        let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
+        if pane_id.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            socket_path,
+            pane_id,
+        })
+    }
+
+    fn report_session(&self, session_id: &str) {
+        self.send(herdr_report_agent_session_request(
+            &self.pane_id,
+            session_id,
+            herdr_seq(),
+        ));
+    }
+
+    fn report(&self, state: HerdrAgentState, session_id: Option<&str>) {
+        self.send(herdr_report_agent_request(
+            &self.pane_id,
+            state,
+            session_id,
+            herdr_seq(),
+        ));
+    }
+
+    fn release(&self) {
+        self.send(herdr_release_agent_request(&self.pane_id, herdr_seq()));
+    }
+
+    fn send(&self, request: serde_json::Value) {
+        let Ok(payload) = serde_json::to_vec(&request) else {
+            return;
+        };
+
+        #[cfg(unix)]
+        {
+            let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.socket_path) else {
+                return;
+            };
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            let _ = stream
+                .write_all(&payload)
+                .and_then(|_| stream.write_all(b"\n"));
+        }
+
+        #[cfg(not(unix))]
+        let _ = payload;
+    }
+}
+
+fn herdr_report_agent_request(
+    pane_id: &str,
+    state: HerdrAgentState,
+    session_id: Option<&str>,
+    seq: u64,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "pane_id": pane_id,
+        "source": HerdrAgentReporter::SOURCE,
+        "agent": HerdrAgentReporter::AGENT,
+        "state": state.as_str(),
+        "seq": seq,
+    });
+    if let Some(session_id) = session_id {
+        params["agent_session_id"] = serde_json::json!(session_id);
+    }
+    serde_json::json!({
+        "id": format!("codexctl:report-agent:{seq}"),
+        "method": "pane.report_agent",
+        "params": params,
+    })
+}
+
+fn herdr_report_agent_session_request(
+    pane_id: &str,
+    session_id: &str,
+    seq: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("codexctl:report-agent-session:{seq}"),
+        "method": "pane.report_agent_session",
+        "params": {
+            "pane_id": pane_id,
+            "source": HerdrAgentReporter::CODEX_SESSION_SOURCE,
+            "agent": HerdrAgentReporter::AGENT,
+            "seq": seq,
+            "agent_session_id": session_id,
+        },
+    })
+}
+
+fn herdr_release_agent_request(pane_id: &str, seq: u64) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("codexctl:release-agent:{seq}"),
+        "method": "pane.release_agent",
+        "params": {
+            "pane_id": pane_id,
+            "source": HerdrAgentReporter::SOURCE,
+            "agent": HerdrAgentReporter::AGENT,
+            "seq": seq,
+        },
+    })
+}
+
+fn herdr_seq() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    u64::try_from(nanos).unwrap_or(u64::MAX)
 }
 
 struct RecoveryPlan {
@@ -1616,6 +1825,54 @@ mod tests {
     }
 
     #[test]
+    fn wrapper_reports_codex_agent_to_herdr_while_child_runs() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![CodexRunOutcome::Exited(0)]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let mut reporter = FakeAgentReporter::default();
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            "Continue the previous request.".to_string(),
+            cwd,
+        );
+
+        let exit = run_with_reporter(
+            &options,
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut reporter,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(
+            reporter.events,
+            vec![
+                AgentReportEvent::ReportSession {
+                    session_id: SESSION_ID.to_string(),
+                },
+                AgentReportEvent::Report {
+                    state: HerdrAgentState::Unknown,
+                    session_id: Some(SESSION_ID.to_string()),
+                },
+                AgentReportEvent::Release,
+            ]
+        );
+    }
+
+    #[test]
+    fn herdr_session_reports_use_codex_hook_source() {
+        let request = herdr_report_agent_session_request("pane-1", SESSION_ID, 42);
+
+        assert_eq!(request["method"], "pane.report_agent_session");
+        assert_eq!(request["params"]["source"], "herdr:codex");
+        assert_eq!(request["params"]["agent"], "codex");
+        assert_eq!(request["params"]["agent_session_id"], SESSION_ID);
+    }
+
+    #[test]
     fn continue_goal_enter_writes_carriage_return() {
         let mut bytes = Vec::new();
 
@@ -2510,6 +2767,42 @@ mod tests {
             _session_id: &str,
         ) -> anyhow::Result<Option<SessionGoalStatus>> {
             Ok(self.goal_status)
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum AgentReportEvent {
+        ReportSession {
+            session_id: String,
+        },
+        Report {
+            state: HerdrAgentState,
+            session_id: Option<String>,
+        },
+        Release,
+    }
+
+    #[derive(Default)]
+    struct FakeAgentReporter {
+        events: Vec<AgentReportEvent>,
+    }
+
+    impl AgentReporter for FakeAgentReporter {
+        fn report_session(&mut self, session_id: &str) {
+            self.events.push(AgentReportEvent::ReportSession {
+                session_id: session_id.to_string(),
+            });
+        }
+
+        fn report(&mut self, state: HerdrAgentState, session_id: Option<&str>) {
+            self.events.push(AgentReportEvent::Report {
+                state,
+                session_id: session_id.map(str::to_string),
+            });
+        }
+
+        fn release(&mut self) {
+            self.events.push(AgentReportEvent::Release);
         }
     }
 
