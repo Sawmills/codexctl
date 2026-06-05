@@ -136,12 +136,27 @@ fn recovery_args(
     }
 
     if resume_command_index(&options.args).is_some() {
-        let mut args = options.args.clone();
-        append_recovery_prompt(&mut args, &options.recovery_prompt);
-        return Ok(args);
+        return Ok(resume_args_with_recovery_prompt(
+            &options.args,
+            &options.recovery_prompt,
+        ));
     }
 
     bail!("spend cap detected, but no Codex session id was available to resume")
+}
+
+fn resume_args_with_recovery_prompt(args: &[String], recovery_prompt: &str) -> Vec<String> {
+    let mut args = args.to_vec();
+    if recovery_prompt.trim().is_empty() {
+        return args;
+    }
+
+    if let Some(prompt_index) = resume_prompt_index(&args) {
+        args[prompt_index] = recovery_prompt.to_string();
+    } else {
+        args.push(recovery_prompt.to_string());
+    }
+    args
 }
 
 fn resume_args_for_session(
@@ -305,6 +320,67 @@ fn resume_command_index(args: &[String]) -> Option<usize> {
     None
 }
 
+fn resume_prompt_index(args: &[String]) -> Option<usize> {
+    let shape = resume_args_shape(args)?;
+    if shape.has_last {
+        shape.positionals.first().copied()
+    } else {
+        shape.positionals.get(1).copied()
+    }
+}
+
+struct ResumeArgsShape {
+    has_last: bool,
+    positionals: Vec<usize>,
+}
+
+fn resume_args_shape(args: &[String]) -> Option<ResumeArgsShape> {
+    let mut index = resume_command_index(args)? + 1;
+    let mut has_last = false;
+    let mut positionals = Vec::new();
+    let mut after_terminator = false;
+
+    while index < args.len() {
+        let arg = &args[index];
+        if !after_terminator {
+            if arg == "--" {
+                after_terminator = true;
+                index += 1;
+                continue;
+            }
+            if arg == "--last" {
+                has_last = true;
+                index += 1;
+                continue;
+            }
+            if arg.starts_with("--") {
+                if !arg.contains('=') && long_option_takes_value(arg) {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+            if arg.starts_with('-') {
+                if short_option_takes_value(arg) {
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+                continue;
+            }
+        }
+
+        positionals.push(index);
+        index += 1;
+    }
+
+    Some(ResumeArgsShape {
+        has_last,
+        positionals,
+    })
+}
+
 fn long_option_takes_value(arg: &str) -> bool {
     matches!(
         arg,
@@ -361,20 +437,14 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
 struct FilesystemSessionStore {
     sessions_dir: PathBuf,
     seen: HashSet<PathBuf>,
-    started_at: SystemTime,
 }
 
 impl FilesystemSessionStore {
     fn new(paths: &Paths) -> Result<Self> {
-        let started_at = SystemTime::now();
         let codex_home = codex_home_for_child(paths);
         let sessions_dir = codex_home.join("sessions");
         let seen = session_files(&sessions_dir)?;
-        Ok(Self {
-            sessions_dir,
-            seen,
-            started_at,
-        })
+        Ok(Self { sessions_dir, seen })
     }
 }
 
@@ -391,10 +461,7 @@ impl SessionStore for FilesystemSessionStore {
             }
             let modified = std::fs::metadata(&path)
                 .and_then(|metadata| metadata.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            if modified < self.started_at {
-                continue;
-            }
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             let Some(meta) = session_meta_from_file(&path)? else {
                 continue;
             };
@@ -1262,6 +1329,101 @@ mod tests {
 
         assert!(runner.calls[1].args.contains(&SESSION_ID.to_string()));
         assert!(!runner.calls[1].args.contains(&unrelated.to_string()));
+    }
+
+    #[test]
+    fn spend_cap_recovery_replaces_resume_last_prompt() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "resume".to_string(),
+                "--last".to_string(),
+                "fix tests".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_appends_resume_last_prompt_when_missing() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), "--last".to_string()],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "--last".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_replaces_named_resume_prompt() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap { session_id: None },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore::default();
+        let options = WrapperOptions::new(
+            vec![
+                "resume".to_string(),
+                "release-lane".to_string(),
+                "fix tests".to_string(),
+            ],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                "release-lane".to_string(),
+                "Continue the previous request.".to_string(),
+            ]
+        );
     }
 
     #[test]
