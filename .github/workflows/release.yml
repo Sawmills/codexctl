@@ -20,16 +20,28 @@ jobs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - id: resolve
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
-          ref="${{ github.ref }}"
-          tag="${ref#refs/tags/}"
-          tag="${tag#refs/heads/}"
-          if [[ "${tag}" != v* ]]; then
-            echo "Expected a v* tag, got '${tag}'." >&2
+
+          if [[ "${REF_TYPE}" == "tag" ]]; then
+            tag="${REF_NAME}"
+          else
+            tag="$(git tag --points-at "${GITHUB_SHA}" --list 'v*' | sort -V | tail -n1)"
+          fi
+
+          if [[ -z "${tag}" || "${tag}" != v* ]]; then
+            echo "Expected a v* tag ref or a branch commit tagged v*." >&2
             exit 1
           fi
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
