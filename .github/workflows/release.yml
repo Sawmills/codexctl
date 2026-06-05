@@ -164,7 +164,7 @@ jobs:
           app_id: ${{ vars.SAWMILLS_REPO_APP_ID }}
           private_key: ${{ secrets.SAWMILLS_APP_PRIVATE_KEY }}
 
-      - name: Push formula to public tap
+      - name: Open formula PR on public tap
         if: steps.token.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
@@ -229,8 +229,25 @@ jobs:
             echo "Formula already up to date."
             exit 0
           fi
+
+          # The public tap's main is protected (PR + required checks), so land
+          # the update through a PR instead of pushing to main directly.
+          branch="codexctl-${TAG}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${branch}"
           git add Formula/codexctl.rb
           git commit -m "chore(codexctl): update to ${TAG}"
-          git push origin HEAD:main
+          git push -f origin "HEAD:${branch}"
+
+          if ! gh pr view "${branch}" --repo Sawmills/homebrew-tap >/dev/null 2>&1; then
+            gh pr create --repo Sawmills/homebrew-tap \
+              --base main --head "${branch}" \
+              --title "chore(codexctl): update to ${TAG}" \
+              --body "Automated formula update for codexctl ${TAG}, built from https://github.com/${{ github.repository }}/releases/tag/${TAG}."
+          fi
+
+          # Best effort: queue auto-merge if the tap enables it; otherwise the
+          # PR stays open for a maintainer to merge once formula-ci is green.
+          gh pr merge "${branch}" --repo Sawmills/homebrew-tap --squash --auto --delete-branch \
+            || echo "Auto-merge unavailable; PR left open for manual merge."
