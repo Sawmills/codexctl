@@ -52,6 +52,9 @@ trait SessionStore {
         &mut self,
         invocation: &CodexInvocation,
     ) -> Result<Option<String>>;
+
+    fn goal_status_for_session_id(&mut self, session_id: &str)
+    -> Result<Option<SessionGoalStatus>>;
 }
 
 #[derive(Debug, Clone)]
@@ -75,15 +78,25 @@ impl WrapperOptions {
 struct CodexInvocation {
     args: Vec<String>,
     cwd: PathBuf,
+    continue_goal_on_start: bool,
 }
 
 impl CodexInvocation {
     fn new(args: Vec<String>, cwd: PathBuf) -> Self {
-        Self { args, cwd }
+        Self {
+            args,
+            cwd,
+            continue_goal_on_start: false,
+        }
     }
 
     fn from_forwarded_args(args: &[String], cwd: &std::path::Path) -> Self {
         Self::new(invocation_args_for_cwd(args, cwd), cwd.to_path_buf())
+    }
+
+    fn with_continue_goal_on_start(mut self) -> Self {
+        self.continue_goal_on_start = true;
+        self
     }
 }
 
@@ -97,8 +110,12 @@ fn run_with(
     match runner.run_codex(&initial)? {
         CodexRunOutcome::Exited(code) => Ok(code),
         CodexRunOutcome::SpendCap { session_id } => {
-            let recovery_args = recovery_args(options, session_id, sessions)?;
-            let recovery = CodexInvocation::from_forwarded_args(&recovery_args, &options.cwd);
+            let recovery_plan = recovery_plan(options, session_id, sessions)?;
+            let mut recovery =
+                CodexInvocation::from_forwarded_args(&recovery_plan.args, &options.cwd);
+            if recovery_plan.continue_paused_goal_on_prompt {
+                recovery = recovery.with_continue_goal_on_start();
+            }
 
             eprintln!();
             eprintln!("codexctl: spend cap detected; running `codexctl use`");
@@ -116,11 +133,16 @@ fn run_with(
     }
 }
 
-fn recovery_args(
+struct RecoveryPlan {
+    args: Vec<String>,
+    continue_paused_goal_on_prompt: bool,
+}
+
+fn recovery_plan(
     options: &WrapperOptions,
     detected_session_id: Option<String>,
     sessions: &mut impl SessionStore,
-) -> Result<Vec<String>> {
+) -> Result<RecoveryPlan> {
     let mut session_id = session_id_from_codex_args(&options.args).or(detected_session_id);
     if session_id.is_none() {
         let invocation = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
@@ -128,21 +150,76 @@ fn recovery_args(
     }
 
     if let Some(session_id) = session_id {
-        return Ok(resume_args_for_session(
-            preserved_codex_options(&options.args),
-            &session_id,
-            &options.recovery_prompt,
-        ));
+        let continue_paused_goal_on_prompt =
+            should_continue_paused_goal_on_recovery(options, &session_id, sessions)?;
+        let recovery_prompt = if continue_paused_goal_on_prompt {
+            ""
+        } else {
+            &options.recovery_prompt
+        };
+        return Ok(RecoveryPlan {
+            args: resume_args_for_session(
+                preserved_codex_options(&options.args),
+                &session_id,
+                recovery_prompt,
+            ),
+            continue_paused_goal_on_prompt,
+        });
     }
 
     if resume_command_index(&options.args).is_some() {
-        return Ok(resume_args_with_recovery_prompt(
-            &options.args,
-            &options.recovery_prompt,
-        ));
+        return Ok(RecoveryPlan {
+            args: resume_args_with_recovery_prompt(&options.args, &options.recovery_prompt),
+            continue_paused_goal_on_prompt: false,
+        });
     }
 
     bail!("spend cap detected, but no Codex session id was available to resume")
+}
+
+fn should_continue_paused_goal_on_recovery(
+    options: &WrapperOptions,
+    session_id: &str,
+    sessions: &mut impl SessionStore,
+) -> Result<bool> {
+    if options.recovery_prompt.trim().is_empty() {
+        return Ok(false);
+    }
+    if options.recovery_prompt != DEFAULT_RECOVERY_PROMPT {
+        return Ok(false);
+    }
+
+    Ok(sessions
+        .goal_status_for_session_id(session_id)?
+        .is_some_and(SessionGoalStatus::prompts_on_quiet_resume))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionGoalStatus {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+}
+
+impl SessionGoalStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "paused" => Some(Self::Paused),
+            "blocked" => Some(Self::Blocked),
+            "usage_limited" | "usageLimited" => Some(Self::UsageLimited),
+            "budget_limited" | "budgetLimited" => Some(Self::BudgetLimited),
+            "complete" => Some(Self::Complete),
+            _ => None,
+        }
+    }
+
+    fn prompts_on_quiet_resume(self) -> bool {
+        matches!(self, Self::Paused | Self::Blocked | Self::UsageLimited)
+    }
 }
 
 fn resume_args_with_recovery_prompt(args: &[String], recovery_prompt: &str) -> Vec<String> {
@@ -489,6 +566,39 @@ impl SessionStore for FilesystemSessionStore {
 
         Ok(newest.map(|(_, session_id)| session_id))
     }
+
+    fn goal_status_for_session_id(
+        &mut self,
+        session_id: &str,
+    ) -> Result<Option<SessionGoalStatus>> {
+        let mut newest: Option<(SystemTime, PathBuf)> = None;
+        for path in session_files(&self.sessions_dir)? {
+            let meta = match session_meta_from_file(&path) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(_) => continue,
+            };
+            if meta.is_subagent {
+                continue;
+            }
+            if meta.thread_ids.contains(session_id) {
+                let modified = std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if newest
+                    .as_ref()
+                    .is_none_or(|(newest_modified, _)| modified > *newest_modified)
+                {
+                    newest = Some((modified, path));
+                }
+            }
+        }
+
+        let Some((_, path)) = newest else {
+            return Ok(None);
+        };
+        session_goal_status_from_file(&path, session_id)
+    }
 }
 
 fn codex_auth_json_for_child(paths: &Paths) -> PathBuf {
@@ -573,6 +683,7 @@ fn session_cwd_matches(session_cwd: Option<&Path>, expected_cwd: &Path) -> bool 
 
 struct SessionMeta {
     id: String,
+    thread_ids: HashSet<String>,
     cwd: Option<PathBuf>,
     is_subagent: bool,
 }
@@ -613,38 +724,173 @@ fn session_meta_from_file(path: &std::path::Path) -> Result<Option<SessionMeta>>
     };
     let value: serde_json::Value = serde_json::from_str(&line)
         .with_context(|| format!("failed to parse session file {}", path.display()))?;
-    let Some(id) = value
-        .get("payload")
-        .and_then(|payload| payload.get("id"))
+    let Some(payload) = value.get("payload") else {
+        return Ok(None);
+    };
+    let Some(id) = payload
+        .get("id")
         .and_then(|id| id.as_str())
         .map(str::to_string)
     else {
         return Ok(None);
     };
-    let cwd = value
-        .get("payload")
-        .and_then(|payload| payload.get("cwd"))
+    let thread_ids = session_thread_ids_from_payload(payload);
+    let cwd = payload
+        .get("cwd")
         .and_then(|cwd| cwd.as_str())
         .map(PathBuf::from);
-    let is_subagent = value.get("payload").is_some_and(|payload| {
-        payload
-            .get("thread_source")
-            .and_then(|thread_source| thread_source.as_str())
-            .is_some_and(|thread_source| thread_source == "subagent")
-            || payload
-                .get("source")
-                .and_then(|source| source.get("subagent"))
-                .is_some()
-    });
+    let is_subagent = payload
+        .get("thread_source")
+        .and_then(|thread_source| thread_source.as_str())
+        .is_some_and(|thread_source| thread_source == "subagent")
+        || payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .is_some();
 
     Ok(Some(SessionMeta {
         id,
+        thread_ids,
         cwd,
         is_subagent,
     }))
 }
 
+fn session_goal_status_from_file(
+    path: &std::path::Path,
+    session_id: &str,
+) -> Result<Option<SessionGoalStatus>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open session file {}", path.display()))?;
+    let mut accepted_thread_ids = HashSet::from([session_id.to_string()]);
+    let mut latest = None;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        if value
+            .get("type")
+            .and_then(|event_type| event_type.as_str())
+            .is_some_and(|event_type| event_type == "session_meta")
+        {
+            add_session_goal_thread_aliases(payload, session_id, &mut accepted_thread_ids);
+        }
+        if goal_clear_matches_session(payload, &accepted_thread_ids) {
+            latest = None;
+            continue;
+        }
+        let Some(goal) = payload.get("goal") else {
+            continue;
+        };
+        let matches_session = payload
+            .get("threadId")
+            .and_then(|thread_id| thread_id.as_str())
+            .is_some_and(|thread_id| accepted_thread_ids.contains(thread_id))
+            || goal
+                .get("threadId")
+                .and_then(|thread_id| thread_id.as_str())
+                .is_some_and(|thread_id| accepted_thread_ids.contains(thread_id));
+        if !matches_session {
+            continue;
+        }
+
+        let Some(status) = goal
+            .get("status")
+            .and_then(|status| status.as_str())
+            .and_then(SessionGoalStatus::parse)
+        else {
+            continue;
+        };
+        latest = Some(status);
+    }
+
+    Ok(latest)
+}
+
+fn goal_clear_matches_session(
+    payload: &serde_json::Value,
+    accepted_thread_ids: &HashSet<String>,
+) -> bool {
+    let is_clear = [
+        &["type"][..],
+        &["method"][..],
+        &["notification", "type"][..],
+        &["notification", "method"][..],
+    ]
+    .into_iter()
+    .filter_map(|path| string_at_path(payload, path))
+    .any(is_goal_clear_marker);
+    if !is_clear {
+        return false;
+    }
+
+    [
+        &["threadId"][..],
+        &["thread_id"][..],
+        &["params", "threadId"][..],
+        &["params", "thread_id"][..],
+        &["notification", "threadId"][..],
+        &["notification", "thread_id"][..],
+        &["notification", "params", "threadId"][..],
+        &["notification", "params", "thread_id"][..],
+    ]
+    .into_iter()
+    .filter_map(|path| string_at_path(payload, path))
+    .any(|thread_id| accepted_thread_ids.contains(thread_id))
+}
+
+fn is_goal_clear_marker(value: &str) -> bool {
+    matches!(
+        value,
+        "thread_goal_cleared" | "thread/goal/cleared" | "ThreadGoalCleared"
+    )
+}
+
+fn add_session_goal_thread_aliases(
+    payload: &serde_json::Value,
+    session_id: &str,
+    accepted_thread_ids: &mut HashSet<String>,
+) {
+    let thread_ids = session_thread_ids_from_payload(payload);
+    if !thread_ids.contains(session_id) {
+        return;
+    }
+    accepted_thread_ids.extend(thread_ids);
+}
+
+fn session_thread_ids_from_payload(payload: &serde_json::Value) -> HashSet<String> {
+    let mut thread_ids = HashSet::new();
+    for path in [
+        &["id"][..],
+        &["forked_from_id"][..],
+        &["parent_thread_id"][..],
+        &["source", "subagent", "thread_spawn", "parent_thread_id"][..],
+        &["source", "thread_spawn", "parent_thread_id"][..],
+    ] {
+        if let Some(thread_id) = string_at_path(payload, path) {
+            thread_ids.insert(thread_id.to_string());
+        }
+    }
+    thread_ids
+}
+
+fn string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a str> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_str()
+}
+
 struct PtyCodexRunner;
+
+type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 impl CodexRunner for PtyCodexRunner {
     fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
@@ -680,7 +926,7 @@ fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
 
     let mut master = Some(pair.master);
     let reader = master.as_ref().unwrap().try_clone_reader()?;
-    let writer = master.as_ref().unwrap().take_writer()?;
+    let writer = Arc::new(Mutex::new(master.as_ref().unwrap().take_writer()?));
     let mut killer = child.clone_killer();
 
     let reader_thread = spawn_output_thread(
@@ -688,6 +934,8 @@ fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
         Arc::clone(&spend_cap),
         Arc::clone(&session_id),
         Arc::clone(&stop_input),
+        Arc::clone(&writer),
+        invocation.continue_goal_on_start,
         move || {
             let _ = killer.kill();
         },
@@ -764,12 +1012,15 @@ fn spawn_output_thread(
     spend_cap: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
     stop_input: Arc<AtomicBool>,
+    continue_goal_writer: SharedPtyWriter,
+    continue_goal_on_start: bool,
     mut kill_child: impl FnMut() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut stdout = std::io::stdout();
         let mut buffer = [0; 8192];
         let mut recent = String::new();
+        let mut continue_goal_auto_enter = ContinueGoalAutoEnter::default();
 
         loop {
             let bytes_read = match reader.read(&mut buffer) {
@@ -781,16 +1032,8 @@ fn spawn_output_thread(
             let _ = stdout.write_all(chunk);
             let _ = stdout.flush();
 
-            recent.push_str(&String::from_utf8_lossy(chunk));
-            if recent.len() > 16_384 {
-                let keep_from = recent.len().saturating_sub(8_192);
-                let drain_to = recent
-                    .char_indices()
-                    .map(|(index, _)| index)
-                    .find(|index| *index >= keep_from)
-                    .unwrap_or(0);
-                recent.drain(..drain_to);
-            }
+            let chunk_text = String::from_utf8_lossy(chunk);
+            push_bounded_recent(&mut recent, &chunk_text);
 
             if spend_cap_seen(&recent) {
                 spend_cap.store(true, Ordering::SeqCst);
@@ -803,8 +1046,41 @@ fn spawn_output_thread(
                 kill_child();
                 break;
             }
+
+            if continue_goal_on_start && continue_goal_auto_enter.observe_output(&chunk_text) {
+                let _ = write_continue_goal_enter_to_pty(&continue_goal_writer);
+            }
         }
     })
+}
+
+#[derive(Default)]
+struct ContinueGoalAutoEnter {
+    recent: String,
+}
+
+impl ContinueGoalAutoEnter {
+    fn observe_output(&mut self, output: &str) -> bool {
+        push_bounded_recent(&mut self.recent, output);
+        if resume_paused_goal_prompt_seen(&self.recent) {
+            self.recent.clear();
+            return true;
+        }
+        false
+    }
+}
+
+fn push_bounded_recent(recent: &mut String, output: &str) {
+    recent.push_str(output);
+    if recent.len() > 16_384 {
+        let keep_from = recent.len().saturating_sub(8_192);
+        let drain_to = recent
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= keep_from)
+            .unwrap_or(0);
+        recent.drain(..drain_to);
+    }
 }
 
 #[cfg(unix)]
@@ -819,7 +1095,7 @@ fn pipe_input_thread_is_stop_aware() -> bool {
 
 #[cfg(unix)]
 fn spawn_pipe_input_thread(
-    mut writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
     stop_input: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -852,10 +1128,9 @@ fn spawn_pipe_input_thread(
             match stdin.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write_all(&buffer[..n]).is_err() {
+                    if !write_to_pty(&writer, &buffer[..n]) {
                         break;
                     }
-                    let _ = writer.flush();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -866,20 +1141,19 @@ fn spawn_pipe_input_thread(
 
 #[cfg(not(unix))]
 fn spawn_pipe_input_thread(
-    mut writer: Box<dyn Write + Send>,
-    _stop_input: Arc<AtomicBool>,
+    writer: SharedPtyWriter,
+    stop_input: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0; 8192];
-        loop {
+        while !stop_input.load(Ordering::SeqCst) {
             match stdin.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write_all(&buffer[..n]).is_err() {
+                    if !write_to_pty(&writer, &buffer[..n]) {
                         break;
                     }
-                    let _ = writer.flush();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -890,7 +1164,7 @@ fn spawn_pipe_input_thread(
 
 #[cfg(unix)]
 fn spawn_input_thread(
-    mut writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
     stop_input: Arc<AtomicBool>,
     master: Box<dyn portable_pty::MasterPty + Send>,
 ) -> std::thread::JoinHandle<()> {
@@ -929,10 +1203,9 @@ fn spawn_input_thread(
             match stdin.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if writer.write_all(&buffer[..n]).is_err() {
+                    if !write_to_pty(&writer, &buffer[..n]) {
                         break;
                     }
-                    let _ = writer.flush();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -943,7 +1216,7 @@ fn spawn_input_thread(
 
 #[cfg(not(unix))]
 fn spawn_input_thread(
-    mut writer: Box<dyn Write + Send>,
+    writer: SharedPtyWriter,
     stop_input: Arc<AtomicBool>,
     master: Box<dyn portable_pty::MasterPty + Send>,
 ) -> std::thread::JoinHandle<()> {
@@ -953,17 +1226,15 @@ fn spawn_input_thread(
                 Ok(true) => match event::read() {
                     Ok(Event::Key(key)) => {
                         if let Some(bytes) = key_event_bytes(key) {
-                            if writer.write_all(&bytes).is_err() {
+                            if !write_to_pty(&writer, &bytes) {
                                 break;
                             }
-                            let _ = writer.flush();
                         }
                     }
                     Ok(Event::Paste(text)) => {
-                        if writer.write_all(&paste_event_bytes(&text)).is_err() {
+                        if !write_to_pty(&writer, &paste_event_bytes(&text)) {
                             break;
                         }
-                        let _ = writer.flush();
                     }
                     Ok(Event::Resize(cols, rows)) => {
                         let _ = master.resize(PtySize {
@@ -981,6 +1252,31 @@ fn spawn_input_thread(
             }
         }
     })
+}
+
+fn write_continue_goal_enter(writer: &mut dyn Write) -> bool {
+    writer.write_all(b"\r").and_then(|_| writer.flush()).is_ok()
+}
+
+fn write_continue_goal_enter_to_pty(writer: &SharedPtyWriter) -> bool {
+    writer
+        .lock()
+        .map(|mut writer| write_continue_goal_enter(writer.as_mut()))
+        .unwrap_or(false)
+}
+
+fn write_to_pty(writer: &SharedPtyWriter, bytes: &[u8]) -> bool {
+    writer
+        .lock()
+        .map(|mut writer| writer.write_all(bytes).and_then(|_| writer.flush()).is_ok())
+        .unwrap_or(false)
+}
+
+fn resume_paused_goal_prompt_seen(output: &str) -> bool {
+    output.contains("Resume paused goal?")
+        && output.contains("Resume goal")
+        && output.contains("Mark it active and continue when idle")
+        && output.contains("Press enter to confirm or esc to go back")
 }
 
 #[cfg(not(unix))]
@@ -1296,6 +1592,45 @@ mod tests {
     }
 
     #[test]
+    fn continue_goal_enter_writes_carriage_return() {
+        let mut bytes = Vec::new();
+
+        assert!(write_continue_goal_enter(&mut bytes));
+
+        assert_eq!(bytes, b"\r");
+    }
+
+    #[test]
+    fn resume_paused_goal_prompt_requires_default_resume_action() {
+        let prompt = concat!(
+            "  Resume paused goal?\n",
+            "  Goal: Keep improving the bare goal command.\n\n",
+            "› 1. Resume goal   Mark it active and continue when idle\n",
+            "  2. Leave paused  Keep it paused; use /goal resume later\n\n",
+            "  Press enter to confirm or esc to go back\n"
+        );
+
+        assert!(resume_paused_goal_prompt_seen(prompt));
+        assert!(!resume_paused_goal_prompt_seen("Resume goal"));
+    }
+
+    #[test]
+    fn continue_goal_auto_enter_can_retry_after_replayed_prompt_text() {
+        let prompt = concat!(
+            "  Resume paused goal?\n",
+            "  Goal: Keep improving the bare goal command.\n\n",
+            "› 1. Resume goal   Mark it active and continue when idle\n",
+            "  2. Leave paused  Keep it paused; use /goal resume later\n\n",
+            "  Press enter to confirm or esc to go back\n"
+        );
+        let mut auto_enter = ContinueGoalAutoEnter::default();
+
+        assert!(auto_enter.observe_output(prompt));
+        assert!(!auto_enter.observe_output("restored transcript continues\n"));
+        assert!(auto_enter.observe_output(prompt));
+    }
+
+    #[test]
     fn spend_cap_recovery_switches_profile_and_resumes_session() {
         let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
         let mut runner = FakeCodexRunner::new(vec![
@@ -1316,6 +1651,8 @@ mod tests {
 
         assert_eq!(exit, 0);
         assert_eq!(switcher.use_calls, 1);
+        assert!(!runner.calls[0].continue_goal_on_start);
+        assert!(!runner.calls[1].continue_goal_on_start);
         assert_eq!(
             runner.calls,
             vec![
@@ -1337,8 +1674,45 @@ mod tests {
                         "resume".to_string()
                     ],
                     cwd,
-                ),
+                )
             ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_quiet_resumes_and_auto_confirms_paused_goal() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore {
+            goal_status: Some(SessionGoalStatus::Paused),
+            ..Default::default()
+        };
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            "Continue the previous request.".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert_eq!(
+            runner.calls[1],
+            CodexInvocation::new(
+                vec![
+                    "--cd".to_string(),
+                    cwd.display().to_string(),
+                    "resume".to_string(),
+                    SESSION_ID.to_string(),
+                ],
+                cwd,
+            )
+            .with_continue_goal_on_start()
         );
     }
 
@@ -1352,6 +1726,7 @@ mod tests {
         let mut switcher = FakeProfileSwitcher::default();
         let mut sessions = FakeSessionStore {
             discovered: Some(SESSION_ID.to_string()),
+            ..Default::default()
         };
         let options = WrapperOptions::new(
             vec!["finish this".to_string()],
@@ -1373,6 +1748,110 @@ mod tests {
                 ],
                 cwd,
             )
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_does_not_auto_continue_when_recovery_prompt_is_disabled() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore {
+            goal_status: Some(SessionGoalStatus::Paused),
+            ..Default::default()
+        };
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            String::new(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert!(!runner.calls[1].continue_goal_on_start);
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_preserves_custom_prompt_for_paused_goal() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore {
+            goal_status: Some(SessionGoalStatus::Paused),
+            ..Default::default()
+        };
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            "do X after switching".to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert!(!runner.calls[1].continue_goal_on_start);
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+                "do X after switching".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn spend_cap_recovery_preserves_default_prompt_for_budget_limited_goal() {
+        let cwd = PathBuf::from("/Users/amirjakoby/Code/codexctl");
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::default();
+        let mut sessions = FakeSessionStore {
+            goal_status: Some(SessionGoalStatus::BudgetLimited),
+            ..Default::default()
+        };
+        let options = WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            DEFAULT_RECOVERY_PROMPT.to_string(),
+            cwd.clone(),
+        );
+
+        run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
+
+        assert!(!runner.calls[1].continue_goal_on_start);
+        assert_eq!(
+            runner.calls[1].args,
+            vec![
+                "--cd".to_string(),
+                cwd.display().to_string(),
+                "resume".to_string(),
+                SESSION_ID.to_string(),
+                DEFAULT_RECOVERY_PROMPT.to_string(),
+            ]
         );
     }
 
@@ -1612,12 +2091,182 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_goal_status_reads_latest_thread_goal_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout-current.jsonl");
+        write_session_file(&path, SESSION_ID, "/Users/amirjakoby/Code/codexctl");
+        append_goal_status_line(&path, "paused");
+        append_goal_status_line(&path, "usageLimited");
+
+        assert_eq!(
+            session_goal_status_from_file(&path, SESSION_ID).unwrap(),
+            Some(SessionGoalStatus::UsageLimited)
+        );
+        assert_eq!(
+            session_goal_status_from_file(&path, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_goal_status_treats_goal_clear_as_no_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout-current.jsonl");
+        write_session_file(&path, SESSION_ID, "/Users/amirjakoby/Code/codexctl");
+        append_goal_status_line(&path, "paused");
+        append_goal_clear_line_for_thread(&path, SESSION_ID);
+
+        assert_eq!(
+            session_goal_status_from_file(&path, SESSION_ID).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_goal_status_accepts_parent_thread_goal_updates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rollout-current.jsonl");
+        let parent_thread_id = "019e7766-2198-7071-ab90-16b81c7cfd1d";
+        write_resumed_session_file(
+            &path,
+            SESSION_ID,
+            parent_thread_id,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        append_goal_status_line_for_thread(&path, parent_thread_id, "usageLimited");
+        append_goal_status_line_for_thread(&path, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "paused");
+
+        assert_eq!(
+            session_goal_status_from_file(&path, SESSION_ID).unwrap(),
+            Some(SessionGoalStatus::UsageLimited)
+        );
+        assert_eq!(
+            session_goal_status_from_file(&path, "bbbbbbbb-cccc-dddd-eeee-ffffffffffff").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_store_goal_status_reads_resumed_rollout_for_explicit_parent_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let resumed_session_id = "019e9480-aaaa-7071-ab90-16b81c7cfd1d";
+        let path = sessions.join("rollout-resumed.jsonl");
+        write_resumed_session_file(
+            &path,
+            resumed_session_id,
+            SESSION_ID,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        append_goal_status_line_for_thread(&path, SESSION_ID, "paused");
+
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+
+        assert_eq!(
+            store.goal_status_for_session_id(SESSION_ID).unwrap(),
+            Some(SessionGoalStatus::Paused)
+        );
+    }
+
+    #[test]
+    fn session_store_goal_status_ignores_subagent_rollouts_for_parent_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent_path = sessions.join("rollout-parent.jsonl");
+        write_session_file(&parent_path, SESSION_ID, "/Users/amirjakoby/Code/codexctl");
+        append_goal_status_line_for_thread(&parent_path, SESSION_ID, "paused");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let subagent_session_id = "019e9480-bbbb-7071-ab90-16b81c7cfd1d";
+        let subagent_path = sessions.join("rollout-subagent.jsonl");
+        write_subagent_session_file(
+            &subagent_path,
+            subagent_session_id,
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        append_goal_status_line_for_thread(&subagent_path, subagent_session_id, "complete");
+
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+
+        assert_eq!(
+            store.goal_status_for_session_id(SESSION_ID).unwrap(),
+            Some(SessionGoalStatus::Paused)
+        );
+    }
+
     fn write_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {
         let line = serde_json::json!({
             "type": "session_meta",
             "payload": {
                 "id": session_id,
                 "cwd": cwd,
+            }
+        });
+        std::fs::write(path, format!("{line}\n")).unwrap();
+    }
+
+    fn append_goal_status_line(path: &std::path::Path, status: &str) {
+        append_goal_status_line_for_thread(path, SESSION_ID, status);
+    }
+
+    fn append_goal_status_line_for_thread(path: &std::path::Path, thread_id: &str, status: &str) {
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "threadId": thread_id,
+                "goal": {
+                    "threadId": thread_id,
+                    "status": status,
+                    "objective": "finish the task"
+                }
+            }
+        });
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn append_goal_clear_line_for_thread(path: &std::path::Path, thread_id: &str) {
+        let line = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_cleared",
+                "threadId": thread_id
+            }
+        });
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(file, "{line}").unwrap();
+    }
+
+    fn write_resumed_session_file(
+        path: &std::path::Path,
+        session_id: &str,
+        parent_thread_id: &str,
+        cwd: &str,
+    ) {
+        let line = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "cwd": cwd,
+                "forked_from_id": parent_thread_id,
+                "parent_thread_id": parent_thread_id
             }
         });
         std::fs::write(path, format!("{line}\n")).unwrap();
@@ -1759,6 +2408,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSessionStore {
         discovered: Option<String>,
+        goal_status: Option<SessionGoalStatus>,
     }
 
     impl SessionStore for FakeSessionStore {
@@ -1767,6 +2417,13 @@ mod tests {
             _invocation: &CodexInvocation,
         ) -> anyhow::Result<Option<String>> {
             Ok(self.discovered.clone())
+        }
+
+        fn goal_status_for_session_id(
+            &mut self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<SessionGoalStatus>> {
+            Ok(self.goal_status)
         }
     }
 
