@@ -1,4 +1,5 @@
 mod alias;
+pub mod codex;
 pub mod completions;
 pub mod list;
 pub mod login;

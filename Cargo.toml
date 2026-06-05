@@ -1,6 +1,6 @@
 [package]
 name = "codexctl"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Manage multiple OpenAI Codex CLI accounts"
 license = "Apache-2.0"
@@ -11,9 +11,12 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 comfy-table = "7"
+crossterm = "0.29"
 dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 dirs = "6"
 futures = "0.3"
+libc = "0.2"
+portable-pty = "0.9"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "json",
