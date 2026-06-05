@@ -151,6 +151,27 @@ fn alias_for_auth_json_prefers_exact_token_before_subject_fallback() {
 }
 
 #[test]
+fn alias_for_auth_json_rejects_ambiguous_subject_fallback() {
+    let (tmp, paths) = setup_test_env();
+    let stale_a = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old-a");
+    let stale_b = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old-b");
+    let live_same_seat = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+    write_profile(&paths, "seat-a-primary@test", &stale_a);
+    write_profile(&paths, "seat-a-copy@test", &stale_b);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(
+        &auth_json,
+        format!(r#"{{"access_token":"{live_same_seat}"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+#[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
     let active = profile::get_active_from(&paths).unwrap();

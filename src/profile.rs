@@ -172,11 +172,16 @@ pub fn alias_for_auth_json_from(
         }
     }
 
-    for (profile, profile_auth) in profile_auths {
-        let profile_sub = api::token_subject(&profile_auth.access_token);
-        if target_sub.is_some() && target_sub == profile_sub {
-            return Ok(Some(profile.meta.alias));
-        }
+    let mut sub_matches = profile_auths
+        .into_iter()
+        .filter_map(|(profile, profile_auth)| {
+            let profile_sub = api::token_subject(&profile_auth.access_token);
+            (target_sub.is_some() && target_sub == profile_sub).then_some(profile.meta.alias)
+        });
+    if let Some(alias) = sub_matches.next()
+        && sub_matches.next().is_none()
+    {
+        return Ok(Some(alias));
     }
     Ok(None)
 }

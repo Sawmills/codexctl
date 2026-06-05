@@ -462,8 +462,16 @@ impl SessionStore for FilesystemSessionStore {
             let modified = std::fs::metadata(&path)
                 .and_then(|metadata| metadata.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let Some(meta) = session_meta_from_file(&path)? else {
-                continue;
+            let meta = match session_meta_from_file(&path) {
+                Ok(Some(meta)) => meta,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to inspect codex session file {}: {e:#}",
+                        path.display()
+                    );
+                    continue;
+                }
             };
             if meta.is_subagent {
                 continue;
@@ -691,8 +699,8 @@ fn run_codex_in_pty(invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
         })
     } else {
         Some(InputThread {
-            handle: spawn_pipe_input_thread(writer),
-            join_on_stop: false,
+            handle: spawn_pipe_input_thread(writer, Arc::clone(&stop_input)),
+            join_on_stop: pipe_input_thread_is_stop_aware(),
         })
     };
 
@@ -799,7 +807,68 @@ fn spawn_output_thread(
     })
 }
 
-fn spawn_pipe_input_thread(mut writer: Box<dyn Write + Send>) -> std::thread::JoinHandle<()> {
+#[cfg(unix)]
+fn pipe_input_thread_is_stop_aware() -> bool {
+    true
+}
+
+#[cfg(not(unix))]
+fn pipe_input_thread_is_stop_aware() -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn spawn_pipe_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    stop_input: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let stdin_fd = stdin.as_raw_fd();
+        let mut buffer = [0; 8192];
+        while !stop_input.load(Ordering::SeqCst) {
+            let mut pollfd = libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, 50) };
+            if result < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if result == 0 {
+                continue;
+            }
+            if pollfd.revents & libc::POLLIN == 0 {
+                if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    break;
+                }
+                continue;
+            }
+
+            match stdin.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&buffer[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn spawn_pipe_input_thread(
+    mut writer: Box<dyn Write + Send>,
+    _stop_input: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0; 8192];
@@ -1488,6 +1557,42 @@ mod tests {
         write_subagent_session_file(
             &sessions.join("rollout-subagent.jsonl"),
             "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "/Users/amirjakoby/Code/codexctl",
+        );
+        let invocation = CodexInvocation::new(
+            vec![
+                "--cd".to_string(),
+                "/Users/amirjakoby/Code/codexctl".to_string(),
+            ],
+            PathBuf::from("/Users/amirjakoby/Code/codexctl"),
+        );
+
+        assert_eq!(
+            store
+                .discover_latest_session_id(&invocation)
+                .unwrap()
+                .as_deref(),
+            Some(SESSION_ID)
+        );
+    }
+
+    #[test]
+    fn session_discovery_skips_invalid_new_session_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        let mut store = FilesystemSessionStore::new(&paths).unwrap();
+        let sessions = paths
+            .home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("04");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("rollout-bad.jsonl"), "{not-json\n").unwrap();
+        write_session_file(
+            &sessions.join("rollout-current.jsonl"),
+            SESSION_ID,
             "/Users/amirjakoby/Code/codexctl",
         );
         let invocation = CodexInvocation::new(
