@@ -269,14 +269,10 @@ impl HerdrAgentReporter {
             let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&self.socket_path) else {
                 return;
             };
-            let timeout = Some(Duration::from_millis(500));
-            let _ = stream.set_read_timeout(timeout);
-            let _ = stream.set_write_timeout(timeout);
-            if stream.write_all(&payload).is_err() || stream.write_all(b"\n").is_err() {
-                return;
-            }
-            let mut buffer = [0; 4096];
-            let _ = stream.read(&mut buffer);
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            let _ = stream
+                .write_all(&payload)
+                .and_then(|_| stream.write_all(b"\n"));
         }
 
         #[cfg(not(unix))]
