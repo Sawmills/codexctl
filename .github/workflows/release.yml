@@ -71,7 +71,8 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             label: Darwin_arm64
-          - os: macos-13
+          # trunk-ignore(actionlint/runner-label): Current GitHub Intel macOS runner label.
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             label: Darwin_x86_64
           - os: ubuntu-latest
