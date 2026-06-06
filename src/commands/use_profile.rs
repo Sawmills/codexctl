@@ -128,27 +128,13 @@ fn selection_score(usage: &api::RateLimitResponse, mode: AutoSelectMode) -> f64 
 
     let plan = usage.plan_type.as_deref().unwrap_or("");
     if plan.contains("usage_based") {
-        return match mode {
-            AutoSelectMode::RateLimit => f64::MAX,
-            AutoSelectMode::SpendCapRecovery => usage_based_recovery_score(usage),
-        };
-    }
-
-    rate_limit_score(usage)
-}
-
-fn usage_based_recovery_score(usage: &api::RateLimitResponse) -> f64 {
-    if usage.spend_control.as_ref().is_some_and(|s| s.reached) {
+        // Never auto-select usage-based accounts: they bill real credits. Both
+        // rate-limit switching and spend-cap recovery stay on rate-limited
+        // (subscription) accounts only.
         return f64::MAX;
     }
 
-    match usage.credits.as_ref() {
-        Some(credits) if credits.overage_limit_reached => f64::MAX,
-        Some(credits) if credits.unlimited => -100.0,
-        Some(credits) if credits.has_credits => -50.0,
-        Some(_) => f64::MAX,
-        None => 0.0,
-    }
+    rate_limit_score(usage)
 }
 
 fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
@@ -241,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_mode_accepts_healthy_usage_based_profiles() {
+    fn recovery_mode_rejects_usage_based_profiles() {
         let usage = usage_based_response(
             Some(api::Credits {
                 has_credits: true,
@@ -252,9 +238,10 @@ mod tests {
             Some(api::SpendControl { reached: false }),
         );
 
-        assert!(
-            selection_score(&usage, AutoSelectMode::SpendCapRecovery) < f64::MAX,
-            "healthy usage-based profile should be selectable for spend-cap recovery"
+        assert_eq!(
+            selection_score(&usage, AutoSelectMode::SpendCapRecovery),
+            f64::MAX,
+            "usage-based profiles must never be auto-selected; recovery uses rate-limited accounts only"
         );
     }
 
