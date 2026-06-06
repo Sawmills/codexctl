@@ -22,14 +22,14 @@ const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
     "You hit your spend cap set in your workspace. Increase your spend cap to continue.";
 pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
-pub fn run(args: &[String], recovery_prompt: &str) -> Result<i32> {
+pub fn run(args: &[String], recovery_prompt: &str, allow_billing: bool) -> Result<i32> {
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());
     let failed_alias = failed_alias_for_child_auth(&paths);
     let mut switcher = CodexctlProfileSwitcher::new(&paths);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
-    let mut consent = InteractiveConsent;
+    let mut consent = InteractiveConsent { allow_billing };
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
     // The account that hit the cap is already active; never switch back to it.
@@ -794,14 +794,24 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
     }
 }
 
-struct InteractiveConsent;
+struct InteractiveConsent {
+    /// Set by `--allow-billing`: approve credit-billing accounts without asking,
+    /// for unattended runs.
+    allow_billing: bool,
+}
 
 impl RecoveryConsent for InteractiveConsent {
     fn allow_billing_account(&mut self, alias: &str) -> bool {
+        if self.allow_billing {
+            eprintln!("codexctl: --allow-billing set; switching to {alias} (may use credits)");
+            return true;
+        }
         // Only ask when a human can answer; otherwise refuse so recovery never
         // bills credits unattended.
         if !std::io::stdin().is_terminal() {
-            eprintln!("codexctl: not switching to {alias} (no terminal to approve credit billing)");
+            eprintln!(
+                "codexctl: not switching to {alias} (no terminal to approve credit billing; pass --allow-billing to allow)"
+            );
             return false;
         }
         eprint!("codexctl: switch to {alias} and allow it to use credits? [y/N] ");
@@ -3032,6 +3042,16 @@ mod tests {
 
         assert!(result.is_err(), "no usable account must stop recovery");
         assert!(switcher.switched.is_empty());
+    }
+
+    #[test]
+    fn allow_billing_flag_approves_without_prompting() {
+        // With --allow-billing the consent approves up front, so it works even
+        // with no terminal to prompt on (unattended runs).
+        let mut consent = InteractiveConsent {
+            allow_billing: true,
+        };
+        assert!(consent.allow_billing_account("amir@sawmills.ai"));
     }
 
     fn write_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {

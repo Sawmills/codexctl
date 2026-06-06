@@ -55,6 +55,10 @@ enum Commands {
         /// Prompt sent when the wrapper resumes after switching profiles
         #[arg(long, default_value = commands::codex::DEFAULT_RECOVERY_PROMPT)]
         recovery_prompt: String,
+        /// Allow recovery to switch to a credit-billing account without
+        /// prompting (use for unattended runs; it may spend credits)
+        #[arg(long)]
+        allow_billing: bool,
         /// Arguments forwarded to codex
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -98,7 +102,9 @@ fn main() {
         Commands::Codex {
             ref args,
             ref recovery_prompt,
-        } => codex_command_outcome(commands::codex::run(args, recovery_prompt)).into_result(),
+            allow_billing,
+        } => codex_command_outcome(commands::codex::run(args, recovery_prompt, allow_billing))
+            .into_result(),
         Commands::Completions { shell } => commands::completions::run(shell),
     };
 

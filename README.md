@@ -94,6 +94,7 @@ codexctl codex
 codexctl codex -- "start prompt"
 codexctl codex -- -C ~/Code/codexctl -m gpt-5
 codexctl codex resume 019e8489-aa28-7071-ab90-16b81c7cfd1d
+codexctl codex --allow-billing -- "start prompt"   # unattended: may use credits
 ```
 
 The wrapper runs `codex` in a PTY and watches for this spend-cap message:
@@ -103,11 +104,20 @@ You hit your spend cap set by the owner of your workspace. Ask an owner to incre
 ```
 
 Codex is launched from the current directory where `codexctl codex` was run. When detected, it
-terminates that Codex process, runs the same account selection as
-`codexctl use`, then resumes with `codex resume <session-id> "Continue the previous request."`.
-For a new session, it discovers the session id from the new Codex session file created under
-`~/.codex/sessions/`. For an existing session, pass `resume <session-id>` so the wrapper can
-recover without discovery.
+terminates that Codex process, switches to another account, then resumes with
+`codex resume <session-id> "Continue the previous request."`. For a new session it discovers the
+session id from the new Codex session file created under `~/.codex/sessions/`; for an existing
+session, pass `resume <session-id>` so the wrapper can recover without discovery.
+
+Account selection during recovery:
+
+- **Never** switches to usage-based accounts (they bill credits).
+- Auto-rotates only among rate-limited accounts that won't bill — spend cap reached (overage
+  closed, so they hard-stop at 100% instead of drawing credits) with rate-limit headroom —
+  preferring the most headroom, and moving to the next one each time the cap is re-hit.
+- When only credit-billing accounts remain (spend cap not reached, so they draw credits past
+  100%), it asks for confirmation before switching, and refuses on a non-interactive terminal.
+  Pass `--allow-billing` to approve those switches without prompting (e.g. for unattended runs).
 
 ### Other commands
 
