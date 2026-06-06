@@ -27,16 +27,21 @@ pub fn run(args: &[String], recovery_prompt: &str) -> Result<i32> {
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());
     let failed_alias = failed_alias_for_child_auth(&paths);
-    let mut switcher = CodexctlProfileSwitcher::new(&paths, failed_alias);
+    let mut switcher = CodexctlProfileSwitcher::new(&paths);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
+    let mut consent = InteractiveConsent;
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
+    // The account that hit the cap is already active; never switch back to it.
+    let initial_tried: Vec<String> = failed_alias.into_iter().collect();
     run_with_reporter(
         &options,
         &mut runner,
         &mut switcher,
         &mut sessions,
         &mut reporter,
+        &mut consent,
+        initial_tried,
     )
 }
 
@@ -51,7 +56,20 @@ trait CodexRunner {
 }
 
 trait ProfileSwitcher {
-    fn use_profile(&mut self) -> Result<()>;
+    /// Pick the next recovery account, excluding any `tried` aliases.
+    fn find_recovery_candidate(
+        &mut self,
+        tried: &[String],
+    ) -> Result<Option<use_profile::RecoveryCandidate>>;
+
+    /// Switch the child Codex auth to `alias`.
+    fn switch_to(&mut self, alias: &str) -> Result<()>;
+}
+
+/// Decides whether spend-cap recovery may switch to a credit-billing account
+/// (one whose overage is open, so it draws credits past 100%).
+trait RecoveryConsent {
+    fn allow_billing_account(&mut self, alias: &str) -> bool;
 }
 
 trait SessionStore {
@@ -115,7 +133,16 @@ fn run_with(
     sessions: &mut impl SessionStore,
 ) -> Result<i32> {
     let mut reporter = None;
-    run_with_reporter(options, runner, switcher, sessions, &mut reporter)
+    let mut consent = tests::DenyBillingConsent;
+    run_with_reporter(
+        options,
+        runner,
+        switcher,
+        sessions,
+        &mut reporter,
+        &mut consent,
+        Vec::new(),
+    )
 }
 
 fn run_with_reporter(
@@ -124,13 +151,23 @@ fn run_with_reporter(
     switcher: &mut impl ProfileSwitcher,
     sessions: &mut impl SessionStore,
     reporter: &mut impl AgentReporter,
+    consent: &mut impl RecoveryConsent,
+    initial_tried: Vec<String>,
 ) -> Result<i32> {
     let session_id = session_id_from_codex_args(&options.args);
     if let Some(session_id) = session_id.as_deref() {
         reporter.report_session(session_id);
     }
     reporter.report(HerdrAgentState::Unknown, session_id.as_deref());
-    let result = run_with_reporter_inner(options, runner, switcher, sessions, reporter);
+    let result = run_with_reporter_inner(
+        options,
+        runner,
+        switcher,
+        sessions,
+        reporter,
+        consent,
+        initial_tried,
+    );
     reporter.release();
     result
 }
@@ -141,34 +178,57 @@ fn run_with_reporter_inner(
     switcher: &mut impl ProfileSwitcher,
     sessions: &mut impl SessionStore,
     reporter: &mut impl AgentReporter,
+    consent: &mut impl RecoveryConsent,
+    mut tried: Vec<String>,
 ) -> Result<i32> {
-    let initial = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
-    match runner.run_codex(&initial)? {
-        CodexRunOutcome::Exited(code) => Ok(code),
-        CodexRunOutcome::SpendCap { session_id } => {
-            let recovery_plan = recovery_plan(options, session_id, sessions)?;
-            let mut recovery =
-                CodexInvocation::from_forwarded_args(&recovery_plan.args, &options.cwd);
-            let recovery_session_id = session_id_from_codex_args(&recovery.args);
-            if let Some(session_id) = recovery_session_id.as_deref() {
-                reporter.report_session(session_id);
-            }
-            reporter.report(HerdrAgentState::Unknown, recovery_session_id.as_deref());
-            if recovery_plan.continue_paused_goal_on_prompt {
-                recovery = recovery.with_continue_goal_on_start();
-            }
+    let mut invocation = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
+    // The resume invocation is built once on the first spend cap and reused for
+    // every subsequent switch, since each switch resumes the same session.
+    let mut recovery: Option<CodexInvocation> = None;
 
-            eprintln!();
-            eprintln!("codexctl: spend cap detected; running `codexctl use`");
-            switcher.use_profile()?;
-
-            eprintln!();
-            eprintln!("codexctl: running `codex {}`", recovery.args.join(" "));
-            match runner.run_codex(&recovery)? {
-                CodexRunOutcome::Exited(code) => Ok(code),
-                CodexRunOutcome::SpendCap { .. } => {
-                    bail!("spend cap detected again after switching profiles")
+    loop {
+        match runner.run_codex(&invocation)? {
+            CodexRunOutcome::Exited(code) => return Ok(code),
+            CodexRunOutcome::SpendCap { session_id } => {
+                if recovery.is_none() {
+                    let plan = recovery_plan(options, session_id, sessions)?;
+                    let mut rec = CodexInvocation::from_forwarded_args(&plan.args, &options.cwd);
+                    let recovery_session_id = session_id_from_codex_args(&rec.args);
+                    if let Some(session_id) = recovery_session_id.as_deref() {
+                        reporter.report_session(session_id);
+                    }
+                    reporter.report(HerdrAgentState::Unknown, recovery_session_id.as_deref());
+                    if plan.continue_paused_goal_on_prompt {
+                        rec = rec.with_continue_goal_on_start();
+                    }
+                    recovery = Some(rec);
                 }
+
+                let Some(candidate) = switcher.find_recovery_candidate(&tried)? else {
+                    bail!(
+                        "spend cap reached and no alternate rate-limited account is available to switch to"
+                    );
+                };
+
+                eprintln!();
+                if candidate.bills_credits {
+                    eprintln!("codexctl: spend cap reached; only credit-billing accounts remain.");
+                    if !consent.allow_billing_account(&candidate.alias) {
+                        bail!(
+                            "spend cap reached; switching to credit-billing account {} was not approved",
+                            candidate.alias
+                        );
+                    }
+                } else {
+                    eprintln!("codexctl: spend cap detected; switching to a no-overage account");
+                }
+
+                switcher.switch_to(&candidate.alias)?;
+                tried.push(candidate.alias);
+
+                let next = recovery.clone().expect("recovery invocation set above");
+                eprintln!("codexctl: running `codex {}`", next.args.join(" "));
+                invocation = next;
             }
         }
     }
@@ -709,21 +769,48 @@ fn is_session_id(candidate: &str) -> bool {
 
 struct CodexctlProfileSwitcher {
     auth_json: PathBuf,
-    excluded_alias: Option<String>,
 }
 
 impl CodexctlProfileSwitcher {
-    fn new(paths: &Paths, excluded_alias: Option<String>) -> Self {
+    fn new(paths: &Paths) -> Self {
         Self {
             auth_json: codex_auth_json_for_child(paths),
-            excluded_alias,
         }
     }
 }
 
 impl ProfileSwitcher for CodexctlProfileSwitcher {
-    fn use_profile(&mut self) -> Result<()> {
-        use_profile::run_recovery_to_auth_json(&self.auth_json, self.excluded_alias.as_deref())
+    fn find_recovery_candidate(
+        &mut self,
+        tried: &[String],
+    ) -> Result<Option<use_profile::RecoveryCandidate>> {
+        use_profile::find_recovery_candidate(tried)
+    }
+
+    fn switch_to(&mut self, alias: &str) -> Result<()> {
+        let email = profile::switch_to_auth_json(alias, &self.auth_json)?;
+        eprintln!("codexctl: switched to {alias} ({email})");
+        Ok(())
+    }
+}
+
+struct InteractiveConsent;
+
+impl RecoveryConsent for InteractiveConsent {
+    fn allow_billing_account(&mut self, alias: &str) -> bool {
+        // Only ask when a human can answer; otherwise refuse so recovery never
+        // bills credits unattended.
+        if !std::io::stdin().is_terminal() {
+            eprintln!("codexctl: not switching to {alias} (no terminal to approve credit billing)");
+            return false;
+        }
+        eprint!("codexctl: switch to {alias} and allow it to use credits? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
 }
 
@@ -2031,6 +2118,7 @@ mod tests {
         let mut switcher = FakeProfileSwitcher::default();
         let mut sessions = FakeSessionStore::default();
         let mut reporter = FakeAgentReporter::default();
+        let mut consent = DenyBillingConsent;
         let options = WrapperOptions::new(
             vec!["resume".to_string(), SESSION_ID.to_string()],
             "Continue the previous request.".to_string(),
@@ -2043,6 +2131,8 @@ mod tests {
             &mut switcher,
             &mut sessions,
             &mut reporter,
+            &mut consent,
+            Vec::new(),
         )
         .unwrap();
 
@@ -2131,7 +2221,7 @@ mod tests {
         let exit = run_with(&options, &mut runner, &mut switcher, &mut sessions).unwrap();
 
         assert_eq!(exit, 0);
-        assert_eq!(switcher.use_calls, 1);
+        assert_eq!(switcher.switched, vec!["next@test".to_string()]);
         assert!(!runner.calls[0].continue_goal_on_start);
         assert!(!runner.calls[1].continue_goal_on_start);
         assert_eq!(
@@ -2753,6 +2843,197 @@ mod tests {
         );
     }
 
+    fn no_bill(alias: &str) -> use_profile::RecoveryCandidate {
+        use_profile::RecoveryCandidate {
+            alias: alias.to_string(),
+            bills_credits: false,
+        }
+    }
+
+    fn billing(alias: &str) -> use_profile::RecoveryCandidate {
+        use_profile::RecoveryCandidate {
+            alias: alias.to_string(),
+            bills_credits: true,
+        }
+    }
+
+    fn run_with_consent(
+        options: &WrapperOptions,
+        runner: &mut impl CodexRunner,
+        switcher: &mut impl ProfileSwitcher,
+        sessions: &mut impl SessionStore,
+        consent: &mut impl RecoveryConsent,
+    ) -> Result<i32> {
+        let mut reporter = None;
+        run_with_reporter(
+            options,
+            runner,
+            switcher,
+            sessions,
+            &mut reporter,
+            consent,
+            Vec::new(),
+        )
+    }
+
+    fn resume_options() -> WrapperOptions {
+        WrapperOptions::new(
+            vec!["resume".to_string(), SESSION_ID.to_string()],
+            DEFAULT_RECOVERY_PROMPT.to_string(),
+            PathBuf::from("/Users/amirjakoby/Code/codexctl"),
+        )
+    }
+
+    #[test]
+    fn recovery_loops_through_no_bill_accounts_in_turn() {
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::new(vec![no_bill("amir+2"), no_bill("amir+3")]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = DenyBillingConsent;
+
+        let exit = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(
+            switcher.switched,
+            vec!["amir+2".to_string(), "amir+3".to_string()]
+        );
+    }
+
+    #[test]
+    fn recovery_stops_when_only_billing_account_and_consent_declined() {
+        let mut runner = FakeCodexRunner::new(vec![CodexRunOutcome::SpendCap {
+            session_id: Some(SESSION_ID.to_string()),
+        }]);
+        let mut switcher = FakeProfileSwitcher::new(vec![billing("amir@sawmills.ai")]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = RecordingConsent {
+            allow: false,
+            asked: Vec::new(),
+        };
+
+        let result = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        );
+
+        assert!(
+            result.is_err(),
+            "declined billing switch must stop recovery"
+        );
+        assert_eq!(consent.asked, vec!["amir@sawmills.ai".to_string()]);
+        assert!(
+            switcher.switched.is_empty(),
+            "must not switch to a billing account without consent"
+        );
+    }
+
+    #[test]
+    fn recovery_switches_to_billing_account_when_consent_granted() {
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::new(vec![billing("amir@sawmills.ai")]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = RecordingConsent {
+            allow: true,
+            asked: Vec::new(),
+        };
+
+        let exit = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(consent.asked, vec!["amir@sawmills.ai".to_string()]);
+        assert_eq!(switcher.switched, vec!["amir@sawmills.ai".to_string()]);
+    }
+
+    #[test]
+    fn recovery_prefers_no_bill_before_asking_for_billing_account() {
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        // No-bill candidate must be used first; the billing seat only after it.
+        let mut switcher =
+            FakeProfileSwitcher::new(vec![no_bill("amir+2"), billing("amir@sawmills.ai")]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = RecordingConsent {
+            allow: true,
+            asked: Vec::new(),
+        };
+
+        let exit = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        // amir+2 (no-bill) switched silently; amir@ asked for only after it.
+        assert_eq!(consent.asked, vec!["amir@sawmills.ai".to_string()]);
+        assert_eq!(
+            switcher.switched,
+            vec!["amir+2".to_string(), "amir@sawmills.ai".to_string()]
+        );
+    }
+
+    #[test]
+    fn recovery_bails_when_no_alternate_account_available() {
+        let mut runner = FakeCodexRunner::new(vec![CodexRunOutcome::SpendCap {
+            session_id: Some(SESSION_ID.to_string()),
+        }]);
+        let mut switcher = FakeProfileSwitcher::new(Vec::new());
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = DenyBillingConsent;
+
+        let result = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        );
+
+        assert!(result.is_err(), "no usable account must stop recovery");
+        assert!(switcher.switched.is_empty());
+    }
+
     fn write_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {
         let line = serde_json::json!({
             "type": "session_meta",
@@ -2936,15 +3217,65 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
     struct FakeProfileSwitcher {
-        use_calls: usize,
+        candidates: Vec<use_profile::RecoveryCandidate>,
+        switched: Vec<String>,
+    }
+
+    impl FakeProfileSwitcher {
+        fn new(candidates: Vec<use_profile::RecoveryCandidate>) -> Self {
+            Self {
+                candidates,
+                switched: Vec::new(),
+            }
+        }
+    }
+
+    impl Default for FakeProfileSwitcher {
+        fn default() -> Self {
+            Self::new(vec![use_profile::RecoveryCandidate {
+                alias: "next@test".to_string(),
+                bills_credits: false,
+            }])
+        }
     }
 
     impl ProfileSwitcher for FakeProfileSwitcher {
-        fn use_profile(&mut self) -> anyhow::Result<()> {
-            self.use_calls += 1;
+        fn find_recovery_candidate(
+            &mut self,
+            tried: &[String],
+        ) -> anyhow::Result<Option<use_profile::RecoveryCandidate>> {
+            Ok(self
+                .candidates
+                .iter()
+                .find(|c| !tried.iter().any(|t| t == &c.alias))
+                .cloned())
+        }
+
+        fn switch_to(&mut self, alias: &str) -> anyhow::Result<()> {
+            self.switched.push(alias.to_string());
             Ok(())
+        }
+    }
+
+    pub(super) struct DenyBillingConsent;
+
+    impl RecoveryConsent for DenyBillingConsent {
+        fn allow_billing_account(&mut self, _alias: &str) -> bool {
+            false
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingConsent {
+        allow: bool,
+        asked: Vec<String>,
+    }
+
+    impl RecoveryConsent for RecordingConsent {
+        fn allow_billing_account(&mut self, alias: &str) -> bool {
+            self.asked.push(alias.to_string());
+            self.allow
         }
     }
 

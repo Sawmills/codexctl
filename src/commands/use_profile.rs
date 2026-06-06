@@ -8,6 +8,10 @@ use crate::commands::status;
 use crate::config;
 use crate::profile;
 
+/// `rate_limit_score` returns at least this whenever a rate-limit window is at
+/// 100% — i.e. the account has no usable headroom right now.
+const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
+
 pub fn run(alias: Option<&str>) -> Result<()> {
     run_to_auth_json(alias, &config::codex_auth_json()?)
 }
@@ -16,28 +20,10 @@ pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path) -> Result<()> {
     run_to_auth_json_excluding(alias, auth_json, None)
 }
 
-pub fn run_recovery_to_auth_json(auth_json: &Path, excluded_alias: Option<&str>) -> Result<()> {
-    run_to_auth_json_with_mode(
-        None,
-        auth_json,
-        excluded_alias,
-        AutoSelectMode::SpendCapRecovery,
-    )
-}
-
 pub fn run_to_auth_json_excluding(
     alias: Option<&str>,
     auth_json: &Path,
     excluded_alias: Option<&str>,
-) -> Result<()> {
-    run_to_auth_json_with_mode(alias, auth_json, excluded_alias, AutoSelectMode::RateLimit)
-}
-
-fn run_to_auth_json_with_mode(
-    alias: Option<&str>,
-    auth_json: &Path,
-    excluded_alias: Option<&str>,
-    mode: AutoSelectMode,
 ) -> Result<()> {
     match alias::optional(alias) {
         Some(a) => {
@@ -47,7 +33,7 @@ fn run_to_auth_json_with_mode(
             status::run_focused(a)?;
         }
         None => {
-            let best = find_most_available_excluding(excluded_alias, mode)?;
+            let best = find_most_available_excluding(excluded_alias)?;
             let email = profile::switch_to_auth_json(&best, auth_json)?;
             println!("auto-selected most available: {} ({})", best, email);
             println!();
@@ -57,16 +43,7 @@ fn run_to_auth_json_with_mode(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutoSelectMode {
-    RateLimit,
-    SpendCapRecovery,
-}
-
-fn find_most_available_excluding(
-    excluded_alias: Option<&str>,
-    mode: AutoSelectMode,
-) -> Result<String> {
+fn find_most_available_excluding(excluded_alias: Option<&str>) -> Result<String> {
     let all_profiles = profile::list_profiles()?;
     let had_profiles = !all_profiles.is_empty();
     let profiles = profiles_after_excluding(all_profiles, excluded_alias);
@@ -77,39 +54,10 @@ fn find_most_available_excluding(
         bail!("no profiles saved. Use 'codexctl save' to save the current account.");
     }
 
-    let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
-
-    let results = rt.block_on(async {
-        let futs: Vec<_> = profiles
-            .iter()
-            .map(|p| {
-                let client = client.clone();
-                let alias = p.meta.alias.clone();
-                let auth = api::read_auth_json(&p.auth_json_path());
-                async move {
-                    let auth = match auth {
-                        Ok(a) => a,
-                        Err(_) => return (alias, f64::MAX),
-                    };
-                    match api::fetch_usage_async(
-                        &client,
-                        &auth.access_token,
-                        auth.account_id.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(usage) => (alias, selection_score(&usage, mode)),
-                        Err(_) => (alias, f64::MAX),
-                    }
-                }
-            })
-            .collect();
-        futures::future::join_all(futs).await
-    });
-
-    let best = results
+    let usages = fetch_usages(&profiles)?;
+    let best = usages
         .iter()
+        .map(|(alias, usage)| (alias, usage.as_ref().map_or(f64::MAX, selection_score)))
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
         .filter(|(_, score)| *score < f64::MAX);
 
@@ -119,22 +67,75 @@ fn find_most_available_excluding(
     }
 }
 
-fn selection_score(usage: &api::RateLimitResponse, mode: AutoSelectMode) -> f64 {
-    if mode == AutoSelectMode::SpendCapRecovery
-        && usage.spend_control.as_ref().is_some_and(|s| s.reached)
-    {
-        return f64::MAX;
-    }
-
+fn selection_score(usage: &api::RateLimitResponse) -> f64 {
     let plan = usage.plan_type.as_deref().unwrap_or("");
     if plan.contains("usage_based") {
-        // Never auto-select usage-based accounts: they bill real credits. Both
-        // rate-limit switching and spend-cap recovery stay on rate-limited
-        // (subscription) accounts only.
+        // Never auto-select usage-based accounts: they bill real credits.
         return f64::MAX;
     }
-
     rate_limit_score(usage)
+}
+
+/// A spend-cap recovery candidate plus whether using it can bill credits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryCandidate {
+    pub alias: String,
+    /// True when overage is open (spend cap NOT reached), so the account draws
+    /// credits ($) once it passes 100% of its rate limit. These require consent.
+    pub bills_credits: bool,
+}
+
+/// Pick the next spend-cap recovery account, excluding any `tried` aliases.
+///
+/// Prefers accounts that will not bill credits — spend cap already reached, so
+/// they hard-stop at 100% rather than drawing credits — over ones that can.
+/// Usage-based accounts are never selected, and accounts without rate-limit
+/// headroom (a window already at 100%) are skipped, since switching to them
+/// would immediately re-trigger the cap.
+pub fn find_recovery_candidate(tried: &[String]) -> Result<Option<RecoveryCandidate>> {
+    let profiles: Vec<profile::Profile> = profile::list_profiles()?
+        .into_iter()
+        .filter(|p| !tried.iter().any(|t| t.as_str() == p.meta.alias.as_str()))
+        .collect();
+    if profiles.is_empty() {
+        return Ok(None);
+    }
+
+    let usages = fetch_usages(&profiles)?;
+    let best = usages
+        .into_iter()
+        .filter_map(|(alias, usage)| {
+            let (bills_credits, score) = recovery_score(&usage?)?;
+            Some((alias, bills_credits, score))
+        })
+        // No-bill (bills_credits == false) wins over billing; then most headroom.
+        .min_by(|a, b| {
+            a.1.cmp(&b.1)
+                .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+    Ok(best.map(|(alias, bills_credits, _)| RecoveryCandidate {
+        alias,
+        bills_credits,
+    }))
+}
+
+/// Classify an account for spend-cap recovery as `(bills_credits, score)`, or
+/// `None` when it must not be used (usage-based, or no rate-limit headroom).
+fn recovery_score(usage: &api::RateLimitResponse) -> Option<(bool, f64)> {
+    let plan = usage.plan_type.as_deref().unwrap_or("");
+    if plan.contains("usage_based") {
+        return None;
+    }
+    let score = rate_limit_score(usage);
+    if score >= RATE_LIMIT_EXHAUSTED {
+        // A rate-limit window is already at 100% — not usable right now.
+        return None;
+    }
+    // Spend cap reached => overage closed => the account hard-stops at 100% and
+    // never bills. Spend cap NOT reached => overage open => it draws credits ($).
+    let bills_credits = !usage.spend_control.as_ref().is_some_and(|s| s.reached);
+    Some((bills_credits, score))
 }
 
 fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
@@ -159,6 +160,38 @@ fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
     } else {
         h5 * 2.0 + d7
     }
+}
+
+fn fetch_usages(
+    profiles: &[profile::Profile],
+) -> Result<Vec<(String, Option<api::RateLimitResponse>)>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let client = reqwest::Client::new();
+
+    Ok(rt.block_on(async {
+        let futs: Vec<_> = profiles
+            .iter()
+            .map(|p| {
+                let client = client.clone();
+                let alias = p.meta.alias.clone();
+                let auth = api::read_auth_json(&p.auth_json_path());
+                async move {
+                    let usage = match auth {
+                        Ok(a) => api::fetch_usage_async(
+                            &client,
+                            &a.access_token,
+                            a.account_id.as_deref(),
+                        )
+                        .await
+                        .ok(),
+                        Err(_) => None,
+                    };
+                    (alias, usage)
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await
+    }))
 }
 
 fn profiles_after_excluding(
@@ -187,15 +220,44 @@ mod tests {
         }
     }
 
-    fn usage_based_response(
-        credits: Option<api::Credits>,
-        spend_control: Option<api::SpendControl>,
-    ) -> api::RateLimitResponse {
+    fn window(used_percent: f64) -> api::RateLimitWindow {
+        api::RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            limit_window_seconds: None,
+            resets_at: None,
+            reset_at: None,
+            reset_after_seconds: None,
+        }
+    }
+
+    fn team_response(h5: f64, d7: f64, spend_reached: bool) -> api::RateLimitResponse {
         api::RateLimitResponse {
-            plan_type: Some("usage_based".to_string()),
+            plan_type: Some("team".to_string()),
+            rate_limit: Some(api::RateLimit {
+                primary: Some(window(h5)),
+                secondary: Some(window(d7)),
+                primary_window: None,
+                secondary_window: None,
+            }),
+            credits: None,
+            spend_control: Some(api::SpendControl {
+                reached: spend_reached,
+            }),
+        }
+    }
+
+    fn usage_based_response() -> api::RateLimitResponse {
+        api::RateLimitResponse {
+            plan_type: Some("self_serve_business_usage_based".to_string()),
             rate_limit: None,
-            credits,
-            spend_control,
+            credits: Some(api::Credits {
+                has_credits: true,
+                unlimited: false,
+                overage_limit_reached: false,
+                balance: None,
+            }),
+            spend_control: Some(api::SpendControl { reached: false }),
         }
     }
 
@@ -212,69 +274,39 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_mode_ignores_usage_based_profiles() {
-        let usage = usage_based_response(
-            Some(api::Credits {
-                has_credits: true,
-                unlimited: false,
-                overage_limit_reached: false,
-                balance: Some("10.00".to_string()),
-            }),
-            Some(api::SpendControl { reached: false }),
-        );
-
-        assert_eq!(selection_score(&usage, AutoSelectMode::RateLimit), f64::MAX);
+    fn selection_never_picks_usage_based_accounts() {
+        assert_eq!(selection_score(&usage_based_response()), f64::MAX);
     }
 
     #[test]
-    fn recovery_mode_rejects_usage_based_profiles() {
-        let usage = usage_based_response(
-            Some(api::Credits {
-                has_credits: true,
-                unlimited: false,
-                overage_limit_reached: false,
-                balance: Some("10.00".to_string()),
-            }),
-            Some(api::SpendControl { reached: false }),
-        );
+    fn recovery_skips_usage_based_accounts() {
+        assert_eq!(recovery_score(&usage_based_response()), None);
+    }
 
-        assert_eq!(
-            selection_score(&usage, AutoSelectMode::SpendCapRecovery),
-            f64::MAX,
-            "usage-based profiles must never be auto-selected; recovery uses rate-limited accounts only"
+    #[test]
+    fn recovery_skips_accounts_without_rate_limit_headroom() {
+        // 5h window already at 100% -> not usable right now, even though the
+        // spend cap is reached (no-bill).
+        assert_eq!(recovery_score(&team_response(100.0, 20.0, true)), None);
+    }
+
+    #[test]
+    fn recovery_treats_spend_capped_account_as_no_bill() {
+        // Spend cap reached + headroom -> usable and hard-stops, so won't bill.
+        let (bills_credits, _) = recovery_score(&team_response(10.0, 30.0, true)).unwrap();
+        assert!(
+            !bills_credits,
+            "spend-cap-reached accounts hard-stop at 100% and must be treated as no-bill"
         );
     }
 
     #[test]
-    fn recovery_mode_rejects_spend_capped_usage_based_profiles() {
-        let usage = usage_based_response(
-            Some(api::Credits {
-                has_credits: true,
-                unlimited: false,
-                overage_limit_reached: false,
-                balance: Some("10.00".to_string()),
-            }),
-            Some(api::SpendControl { reached: true }),
-        );
-
-        assert_eq!(
-            selection_score(&usage, AutoSelectMode::SpendCapRecovery),
-            f64::MAX
-        );
-    }
-
-    #[test]
-    fn recovery_mode_rejects_spend_capped_profiles_without_usage_plan_label() {
-        let usage = api::RateLimitResponse {
-            plan_type: Some("team".to_string()),
-            rate_limit: None,
-            credits: None,
-            spend_control: Some(api::SpendControl { reached: true }),
-        };
-
-        assert_eq!(
-            selection_score(&usage, AutoSelectMode::SpendCapRecovery),
-            f64::MAX
+    fn recovery_treats_overage_open_account_as_billing() {
+        // Spend cap NOT reached -> overage open -> draws credits past 100%.
+        let (bills_credits, _) = recovery_score(&team_response(5.0, 71.0, false)).unwrap();
+        assert!(
+            bills_credits,
+            "overage-open accounts can draw credits and must require consent"
         );
     }
 }
