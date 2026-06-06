@@ -1744,10 +1744,79 @@ fn resize_child_if_needed(
 }
 
 fn spend_cap_seen(output: &str) -> bool {
-    output.lines().any(|line| {
-        line.contains("\u{25a0} ")
-            && (line.contains(SPEND_CAP_MESSAGE) || line.contains(SELF_MANAGED_SPEND_CAP_MESSAGE))
-    })
+    // Codex renders the error inside a bordered box, so the message is wrapped
+    // across lines, padded, and interleaved with box glyphs and ANSI styling.
+    // Flatten all of that and match the `■` marker immediately followed by the
+    // message, so detection is independent of terminal width / wrapping.
+    let normalized = normalize_spend_cap_text(output);
+    [SPEND_CAP_MESSAGE, SELF_MANAGED_SPEND_CAP_MESSAGE]
+        .iter()
+        .any(|message| {
+            let needle = format!("\u{25a0}{}", normalize_spend_cap_text(message));
+            normalized.contains(&needle)
+        })
+}
+
+/// Flatten Codex's bordered error box for matching: drop ANSI escapes,
+/// box-drawing/block glyphs, and all whitespace, while keeping the `■` error
+/// marker (U+25A0, just past the block-element range).
+fn normalize_spend_cap_text(text: &str) -> String {
+    strip_ansi_escapes(text)
+        .chars()
+        .filter(|c| !c.is_whitespace() && !is_box_drawing(*c))
+        .collect()
+}
+
+fn is_box_drawing(c: char) -> bool {
+    // Box Drawing (U+2500–U+257F) and Block Elements (U+2580–U+259F), e.g. the
+    // `▕` right border. The `■` marker is U+25A0, deliberately outside this range.
+    ('\u{2500}'..='\u{259f}').contains(&c)
+}
+
+/// Remove ANSI escape sequences (CSI, OSC, and lone two-byte escapes) so styled,
+/// cursor-positioned terminal output can be matched as plain text.
+fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: parameters/intermediates until a final byte 0x40–0x7E.
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: until BEL or the ST terminator (ESC \).
+                while let Some(&next) = chars.peek() {
+                    chars.next();
+                    if next == '\u{07}' {
+                        break;
+                    }
+                    if next == '\u{1b}' {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        break;
+                    }
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 fn find_resume_hint_session_id(output: &str) -> Option<String> {
@@ -2034,6 +2103,37 @@ mod tests {
         assert!(spend_cap_seen(&format!(
             "\u{25a0} {SELF_MANAGED_SPEND_CAP_MESSAGE}"
         )));
+    }
+
+    #[test]
+    fn spend_cap_seen_detects_wrapped_bordered_box() {
+        // Codex wraps the message inside a narrow bordered box, splitting it
+        // across lines with right borders and padding.
+        let boxed = concat!(
+            "\u{25a0} You hit your spend cap set by the owner of \u{2595}\n",
+            "your workspace. Ask an owner to increase your\u{2595}\n",
+            "spend cap to continue.                       \u{2595}\n",
+        );
+
+        assert!(spend_cap_seen(boxed));
+    }
+
+    #[test]
+    fn spend_cap_seen_ignores_ansi_styling_around_box() {
+        // Same box, but with SGR color codes and a cursor move between rows.
+        let styled = concat!(
+            "\u{1b}[1;31m\u{25a0}\u{1b}[0m You hit your spend cap set by the owner of \u{2595}",
+            "\u{1b}[2;1Hyour workspace. Ask an owner to increase your\u{2595}",
+            "\u{1b}[3;1Hspend cap to continue.                       \u{2595}",
+        );
+
+        assert!(spend_cap_seen(styled));
+    }
+
+    #[test]
+    fn spend_cap_seen_still_requires_message_after_marker() {
+        // A bare marker with unrelated text must not trigger recovery.
+        assert!(!spend_cap_seen("\u{25a0} build finished with warnings"));
     }
 
     #[test]
