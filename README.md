@@ -114,10 +114,28 @@ Account selection during recovery:
 - **Never** switches to usage-based accounts (they bill credits).
 - Auto-rotates only among rate-limited accounts that won't bill — spend cap reached (overage
   closed, so they hard-stop at 100% instead of drawing credits) with rate-limit headroom —
-  preferring the most headroom, and moving to the next one each time the cap is re-hit.
+  preferring the soonest-resetting seat by default (see Reset-aware selection), and moving to the
+  next one each time the cap is re-hit.
 - When only credit-billing accounts remain (spend cap not reached, so they draw credits past
   100%), it asks for confirmation before switching, and refuses on a non-interactive terminal.
   Pass `--allow-billing` to approve those switches without prompting (e.g. for unattended runs).
+
+### Reset-aware selection (default)
+
+Both `codexctl use` (no alias) and `codexctl codex` recovery prefer, among otherwise-eligible
+accounts, the one whose **7d window resets soonest**. This drains near-reset seats first and keeps
+fresher seats in reserve, de-synchronizing the fleet so capacity refreshes gradually instead of
+filling and resetting in a single cluster (which would otherwise leave the whole fleet dry for a
+stretch before the cluster refreshes). Every other guarantee is unchanged: usage-based accounts are
+never auto-selected, exhausted windows are skipped, and no-bill accounts win over credit-billing
+ones (reset is only a tiebreak within a bill class).
+
+This is the default. To opt out and restore the legacy most-headroom-first pick:
+
+```bash
+CODEXCTL_SELECT=most-available codexctl codex -- "..."
+export CODEXCTL_SELECT=most-available   # alias: headroom / legacy
+```
 
 ### Other commands
 
