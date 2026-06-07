@@ -1887,6 +1887,13 @@ fn detect_codex_state(content: &str) -> HerdrAgentState {
         return HerdrAgentState::Blocked;
     }
 
+    // A non-active goal footer — "Goal paused/blocked/… (/goal resume)" — means
+    // Codex isn't actively pursuing, so report idle even if a working timer is
+    // still ticking on screen.
+    if lower.contains("(/goal resume)") {
+        return HerdrAgentState::Idle;
+    }
+
     if codex_interrupt_pattern(&lower) || codex_working_header(content) {
         return HerdrAgentState::Working;
     }
@@ -1906,9 +1913,11 @@ fn codex_confirmation_prompt(lower_content: &str) -> bool {
 }
 
 fn codex_interrupt_pattern(lower_content: &str) -> bool {
-    lower_content.contains("esc to interrupt")
-        || lower_content.contains("ctrl+c to interrupt")
-        || (lower_content.contains("esc") && lower_content.contains("interrupt"))
+    // Codex's live status indicator renders the interrupt hint as
+    // "… • esc to interrupt)" while a turn runs. Require the closing paren so
+    // transcript prose that merely mentions interrupting (e.g. "esc to
+    // interrupt", "I'm not interrupting") doesn't read as working.
+    lower_content.contains("to interrupt)")
 }
 
 fn codex_working_header(content: &str) -> bool {
@@ -2149,14 +2158,37 @@ mod tests {
 
     #[test]
     fn detect_codex_state_reports_working_on_interrupt_hint() {
+        // The live status indicator renders "Working (Xs • esc to interrupt)".
         assert_eq!(
             detect_codex_state("• Working (12s • Esc to interrupt)"),
             HerdrAgentState::Working
         );
-        assert_eq!(
-            detect_codex_state("thinking…   Ctrl+C to interrupt"),
-            HerdrAgentState::Working
+    }
+
+    #[test]
+    fn detect_codex_state_ignores_interrupt_mentions_in_transcript() {
+        // Idle composer whose transcript merely discusses interrupting must stay
+        // idle: no live "… to interrupt)" hint is present, only prose.
+        let idle = concat!(
+            "• The nudge is queued; I'm not interrupting the proof run.\n",
+            "  shift+tab to cycle) · esc to interrupt\n",
+            "› what is it working on\n",
+            "  gpt-5.5 · ~/Code/needle-wide · Context 32% left\n",
         );
+        assert_eq!(detect_codex_state(idle), HerdrAgentState::Idle);
+    }
+
+    #[test]
+    fn detect_codex_state_reports_idle_when_goal_is_paused() {
+        // A lingering "Working (… esc to interrupt)" timer above a paused-goal
+        // footer must read as idle — a paused goal is not actively pursuing.
+        let paused = concat!(
+            "• Working (6m 05s • esc to interrupt)\n",
+            "\n",
+            "› Run /review on my current changes\n",
+            "  gpt-5.5 xhigh · ~/Code/needle-wide · Context 91% left · Goal paused (/goal resume)\n",
+        );
+        assert_eq!(detect_codex_state(paused), HerdrAgentState::Idle);
     }
 
     #[test]
