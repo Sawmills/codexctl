@@ -55,12 +55,18 @@ fn find_most_available_excluding(excluded_alias: Option<&str>) -> Result<String>
     }
 
     let usages = fetch_usages(&profiles)?;
-    let scored: Vec<(String, f64, i64)> = usages
+    let scored: Vec<SelectionCandidate> = usages
         .iter()
         .map(|(alias, usage)| {
             let score = usage.as_ref().map_or(f64::MAX, selection_score);
+            let bills_credits = usage.as_ref().is_none_or(selection_bills_credits);
             let reset = usage.as_ref().map_or(i64::MAX, secondary_reset_ts);
-            (alias.clone(), score, reset)
+            SelectionCandidate {
+                alias: alias.clone(),
+                bills_credits,
+                score,
+                secondary_reset_ts: reset,
+            }
         })
         .collect();
 
@@ -103,31 +109,51 @@ fn secondary_reset_ts(usage: &api::RateLimitResponse) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-/// Pick the most-available alias from `(alias, score, reset_ts)` tuples.
+#[derive(Debug, Clone)]
+struct SelectionCandidate {
+    alias: String,
+    /// True when overage is open (spend cap NOT reached), so this account can
+    /// draw credits once it crosses the hard rate-limit windows.
+    bills_credits: bool,
+    score: f64,
+    secondary_reset_ts: i64,
+}
+
+/// Pick the most-available alias from scored candidates.
 ///
 /// Default (`reset_aware == false`): lowest `selection_score` (most headroom),
 /// exactly as before. Reset-aware: among accounts with usable headroom
-/// (`score < RATE_LIMIT_EXHAUSTED`) pick the soonest 7d reset, breaking ties by
-/// most headroom; if none have headroom, fall back to the default pick so the
-/// behavior degrades identically to today.
-fn select_most_available(scored: &[(String, f64, i64)], reset_aware: bool) -> Option<&str> {
+/// (`score < RATE_LIMIT_EXHAUSTED`) pick no-bill accounts first, then the
+/// soonest 7d reset, breaking ties by most headroom; if none have headroom, fall
+/// back to the default pick so the behavior degrades identically to today.
+fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
     if reset_aware {
         let staggered = scored
             .iter()
-            .filter(|(_, score, _)| *score < RATE_LIMIT_EXHAUSTED)
+            .filter(|candidate| candidate.score < RATE_LIMIT_EXHAUSTED)
             .min_by(|a, b| {
-                a.2.cmp(&b.2)
-                    .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                a.bills_credits
+                    .cmp(&b.bills_credits)
+                    .then(a.secondary_reset_ts.cmp(&b.secondary_reset_ts))
+                    .then(
+                        a.score
+                            .partial_cmp(&b.score)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
             });
-        if let Some((alias, _, _)) = staggered {
-            return Some(alias.as_str());
+        if let Some(candidate) = staggered {
+            return Some(candidate.alias.as_str());
         }
     }
     scored
         .iter()
-        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .filter(|(_, score, _)| *score < f64::MAX)
-        .map(|(alias, _, _)| alias.as_str())
+        .min_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .filter(|candidate| candidate.score < f64::MAX)
+        .map(|candidate| candidate.alias.as_str())
 }
 
 fn selection_score(usage: &api::RateLimitResponse) -> f64 {
@@ -245,6 +271,10 @@ fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
     }
 }
 
+fn selection_bills_credits(usage: &api::RateLimitResponse) -> bool {
+    !usage.spend_control.as_ref().is_some_and(|s| s.reached)
+}
+
 fn fetch_usages(
     profiles: &[profile::Profile],
 ) -> Result<Vec<(String, Option<api::RateLimitResponse>)>> {
@@ -344,6 +374,20 @@ mod tests {
         }
     }
 
+    fn selection_candidate(
+        alias: &str,
+        bills_credits: bool,
+        score: f64,
+        secondary_reset_ts: i64,
+    ) -> SelectionCandidate {
+        SelectionCandidate {
+            alias: alias.to_string(),
+            bills_credits,
+            score,
+            secondary_reset_ts,
+        }
+    }
+
     #[test]
     fn profiles_after_excluding_removes_failed_active_alias() {
         let profiles = vec![test_profile("failed@test"), test_profile("next@test")];
@@ -411,16 +455,58 @@ mod tests {
     #[test]
     fn default_selection_picks_most_headroom_ignoring_reset() {
         // a has more headroom (lower score) but a later reset than b.
-        let scored = vec![("a".to_string(), 20.0, 2000), ("b".to_string(), 60.0, 1000)];
+        let scored = vec![
+            selection_candidate("a", false, 20.0, 2000),
+            selection_candidate("b", false, 60.0, 1000),
+        ];
         assert_eq!(select_most_available(&scored, false), Some("a"));
+    }
+
+    #[test]
+    fn legacy_selection_picks_most_headroom_even_when_it_bills() {
+        // `CODEXCTL_SELECT=most-available` is the explicit legacy opt-out from
+        // reset-aware selection; it must preserve pure most-headroom ordering.
+        let scored = vec![
+            selection_candidate("billing", true, 20.0, 1000),
+            selection_candidate("no-bill", false, 60.0, 2000),
+        ];
+        assert_eq!(select_most_available(&scored, false), Some("billing"));
     }
 
     #[test]
     fn reset_aware_prefers_soonest_7d_reset_among_headroom() {
         // Same accounts; reset-aware drains the soonest-resetting one first even
         // though it has less headroom — this is what de-synchronizes the fleet.
-        let scored = vec![("a".to_string(), 20.0, 2000), ("b".to_string(), 60.0, 1000)];
+        let scored = vec![
+            selection_candidate("a", false, 20.0, 2000),
+            selection_candidate("b", false, 60.0, 1000),
+        ];
         assert_eq!(select_most_available(&scored, true), Some("b"));
+    }
+
+    #[test]
+    fn reset_aware_selection_prefers_no_bill_before_billing() {
+        // Plain `codexctl use` must keep the same billing guard as recovery:
+        // a credit-billing account with an earlier reset must not beat a
+        // no-bill account that still has usable headroom.
+        let billing = team_response(5.0, 10.0, false);
+        let no_bill = team_response(20.0, 30.0, true);
+        let scored = vec![
+            selection_candidate(
+                "billing",
+                selection_bills_credits(&billing),
+                selection_score(&billing),
+                secondary_reset_ts(&billing),
+            ),
+            selection_candidate(
+                "no-bill",
+                selection_bills_credits(&no_bill),
+                selection_score(&no_bill),
+                secondary_reset_ts(&no_bill),
+            ),
+        ];
+
+        assert_eq!(select_most_available(&scored, true), Some("no-bill"));
     }
 
     #[test]
@@ -428,8 +514,8 @@ mod tests {
         // Both windows exhausted (score >= RATE_LIMIT_EXHAUSTED): reset-aware must
         // NOT pick by reset, it falls back to the default lowest-score pick.
         let scored = vec![
-            ("a".to_string(), 700.0, 2000),
-            ("b".to_string(), 550.0, 1000),
+            selection_candidate("a", false, 700.0, 2000),
+            selection_candidate("b", false, 550.0, 1000),
         ];
         assert_eq!(select_most_available(&scored, true), Some("b"));
     }
@@ -437,7 +523,7 @@ mod tests {
     #[test]
     fn select_most_available_skips_usage_based_in_both_modes() {
         // Usage-based -> score f64::MAX -> never usable.
-        let scored = vec![("u".to_string(), f64::MAX, 100)];
+        let scored = vec![selection_candidate("u", false, f64::MAX, 100)];
         assert_eq!(select_most_available(&scored, true), None);
         assert_eq!(select_most_available(&scored, false), None);
     }
