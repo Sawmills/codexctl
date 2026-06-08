@@ -122,7 +122,7 @@ struct SelectionCandidate {
 /// Pick the most-available alias from scored candidates.
 ///
 /// Default (`reset_aware == false`): lowest `selection_score` (most headroom),
-/// after no-bill accounts. Reset-aware: among accounts with usable headroom
+/// exactly as before. Reset-aware: among accounts with usable headroom
 /// (`score < RATE_LIMIT_EXHAUSTED`) pick no-bill accounts first, then the
 /// soonest 7d reset, breaking ties by most headroom; if none have headroom, fall
 /// back to the default pick so the behavior degrades identically to today.
@@ -148,11 +148,9 @@ fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Op
     scored
         .iter()
         .min_by(|a, b| {
-            a.bills_credits.cmp(&b.bills_credits).then(
-                a.score
-                    .partial_cmp(&b.score)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })
         .filter(|candidate| candidate.score < f64::MAX)
         .map(|candidate| candidate.alias.as_str())
@@ -462,6 +460,17 @@ mod tests {
             selection_candidate("b", false, 60.0, 1000),
         ];
         assert_eq!(select_most_available(&scored, false), Some("a"));
+    }
+
+    #[test]
+    fn legacy_selection_picks_most_headroom_even_when_it_bills() {
+        // `CODEXCTL_SELECT=most-available` is the explicit legacy opt-out from
+        // reset-aware selection; it must preserve pure most-headroom ordering.
+        let scored = vec![
+            selection_candidate("billing", true, 20.0, 1000),
+            selection_candidate("no-bill", false, 60.0, 2000),
+        ];
+        assert_eq!(select_most_available(&scored, false), Some("billing"));
     }
 
     #[test]
