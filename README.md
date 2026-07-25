@@ -165,14 +165,14 @@ codexctl resets --claim --within-days 7 --yes
 └─────────────────────┴────────┴────────────┴────────────────────────┘
 ```
 
-A reset only clears an *already-exhausted* window — the backend reports zero redeemable credits
+A reset only clears an _already-exhausted_ window — the backend reports zero redeemable credits
 until an account actually hits 100%, and codexctl refuses to redeem before that rather than waste
 one. When several credits qualify, it always spends the one closest to expiring.
 
 `--claim` sweeps the whole fleet and redeems credits that are about to lapse (default: within three
 days) on accounts that are already at 100%. Those credits are the ones with nothing left to lose:
 the account cannot be used right now anyway, and the credit is about to evaporate. Note the flip
-side — a credit on an account that is *not* yet at 100% cannot be rescued at all, since the backend
+side — a credit on an account that is _not_ yet at 100% cannot be rescued at all, since the backend
 will not apply a reset to a window that has nothing to clear.
 
 ### Reset-aware recovery
