@@ -7,7 +7,11 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
-#[command(name = "codexctl", about = "Manage multiple Codex CLI accounts")]
+#[command(
+    name = "codexctl",
+    about = "Manage multiple Codex CLI accounts",
+    version
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Commands,
