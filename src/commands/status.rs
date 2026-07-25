@@ -4,6 +4,7 @@ use anyhow::Result;
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 use crate::api;
+use crate::commands::resets;
 use crate::config;
 use crate::profile;
 
@@ -27,6 +28,14 @@ struct RateLimitedAccount {
     h5_reset: String,
     d7_reset: String,
     token_expiry: Option<i64>,
+    /// Banked rate-limit resets held by this account.
+    reset_credits: i64,
+    /// How many of them can be redeemed right now (nonzero only once a window
+    /// is exhausted).
+    reset_credits_applicable: i64,
+    /// When the soonest redeemable credit lapses. An unspent credit is simply
+    /// lost, so this is the part worth acting on.
+    reset_credit_expiry: Option<i64>,
     is_active: bool,
     is_error: bool,
     error_msg: String,
@@ -213,7 +222,9 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     println!("{title}");
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec!["Account", "5h", "5h Reset", "7d", "7d Reset", "Token"]);
+    table.set_header(vec![
+        "Account", "5h", "5h Reset", "7d", "7d Reset", "Resets", "Token",
+    ]);
     for account in accounts {
         table.add_row(render_rate_limited_row(account));
     }
@@ -286,6 +297,9 @@ async fn fetch_and_split(
     let mut rate_limited = Vec::new();
     let mut usage_based = Vec::new();
     let mut ub_needing_settings: Vec<(usize, String, String)> = Vec::new();
+    // Only accounts that actually hold banked resets need their credit listing
+    // read, so the common case stays at one request per profile.
+    let mut rl_needing_credits: Vec<(usize, String, Option<String>)> = Vec::new();
 
     for (alias, plan_from_meta, is_active, auth, usage_result) in &results {
         let account_id = auth.as_ref().ok().and_then(|a| a.account_id.clone());
@@ -313,6 +327,9 @@ async fn fetch_and_split(
                         h5_reset: "-".to_string(),
                         d7_reset: "-".to_string(),
                         token_expiry: None,
+                        reset_credits: 0,
+                        reset_credits_applicable: 0,
+                        reset_credit_expiry: None,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: "bad auth.json".to_string(),
@@ -353,6 +370,9 @@ async fn fetch_and_split(
                         h5_reset: "-".to_string(),
                         d7_reset: "-".to_string(),
                         token_expiry,
+                        reset_credits: 0,
+                        reset_credits_applicable: 0,
+                        reset_credit_expiry: None,
                         is_active: *is_active,
                         is_error: true,
                         error_msg: msg.to_string(),
@@ -400,13 +420,14 @@ async fn fetch_and_split(
                 ub_needing_settings.push((idx, auth.access_token.clone(), account_id));
             }
         } else {
-            let primary = usage.rate_limit.as_ref().and_then(|r| r.primary());
-            let secondary = usage.rate_limit.as_ref().and_then(|r| r.secondary());
+            let primary = usage.rate_limit.as_ref().and_then(|r| r.short_window());
+            let secondary = usage.rate_limit.as_ref().and_then(|r| r.long_window());
             let h5_pct = primary.map(|w| w.used_percent);
             let d7_pct = secondary.map(|w| w.used_percent);
             let h5_reset = format_window_reset(primary);
             let d7_reset = format_window_reset(secondary);
 
+            let idx = rate_limited.len();
             rate_limited.push(RateLimitedAccount {
                 alias: alias.clone(),
                 h5_pct,
@@ -414,10 +435,17 @@ async fn fetch_and_split(
                 h5_reset,
                 d7_reset,
                 token_expiry,
+                reset_credits: usage.reset_credits_available(),
+                reset_credits_applicable: usage.reset_credits_applicable(),
+                reset_credit_expiry: None,
                 is_active: *is_active,
                 is_error: false,
                 error_msg: String::new(),
             });
+
+            if usage.reset_credits_available() > 0 {
+                rl_needing_credits.push((idx, auth.access_token.clone(), account_id.clone()));
+            }
         }
     }
 
@@ -460,6 +488,34 @@ async fn fetch_and_split(
         }
     }
 
+    // Phase 4: read banked-reset expiries. The usage response carries the
+    // counts but not when each credit lapses, and a credit that lapses unspent
+    // is simply lost — which is the part worth showing.
+    let credit_futures: Vec<_> = rl_needing_credits
+        .iter()
+        .map(|(idx, token, account_id)| {
+            let client = client.clone();
+            let token = token.clone();
+            let account_id = account_id.clone();
+            async move {
+                let result =
+                    api::fetch_reset_credits_async(&client, &token, account_id.as_deref()).await;
+                (*idx, result)
+            }
+        })
+        .collect();
+
+    for (idx, result) in futures::future::join_all(credit_futures).await {
+        if let Ok(details) = result {
+            rate_limited[idx].reset_credit_expiry = details
+                .credits
+                .iter()
+                .filter(|c| c.is_available())
+                .filter_map(|c| c.expires_at_timestamp())
+                .min();
+        }
+    }
+
     (rate_limited, usage_based)
 }
 
@@ -469,6 +525,7 @@ fn render_rate_limited_row(s: &RateLimitedAccount) -> Vec<Cell> {
     if s.is_error {
         return vec![
             Cell::new(alias),
+            Cell::new("-"),
             Cell::new("-"),
             Cell::new("-"),
             Cell::new("-"),
@@ -492,8 +549,33 @@ fn render_rate_limited_row(s: &RateLimitedAccount) -> Vec<Cell> {
         Cell::new(&s.h5_reset),
         colorize_usage(&d7_str),
         Cell::new(&s.d7_reset),
+        resets_cell(s),
         token_cell(s.token_expiry, false, &s.error_msg),
     ]
+}
+
+/// The "Resets" column: banked rate-limit resets, and how many of them can be
+/// redeemed right now. Green means `codexctl reset <alias>` would work this
+/// second; red means a credit lapses within [`resets::EXPIRY_WARN_SECONDS`] and
+/// would be lost unspent.
+fn resets_cell(s: &RateLimitedAccount) -> Cell {
+    if s.reset_credits <= 0 {
+        return Cell::new("-");
+    }
+    if s.reset_credits_applicable > 0 {
+        return Cell::new(format!(
+            "{} ({} now)",
+            s.reset_credits, s.reset_credits_applicable
+        ))
+        .fg(Color::Green);
+    }
+    let cell = Cell::new(s.reset_credits.to_string());
+    match s.reset_credit_expiry {
+        Some(expiry) if expiry - chrono::Utc::now().timestamp() <= resets::EXPIRY_WARN_SECONDS => {
+            cell.fg(Color::Red)
+        }
+        _ => cell,
+    }
 }
 
 fn render_usage_based_row(s: &UsageBasedAccount) -> Vec<Cell> {
@@ -666,21 +748,67 @@ mod tests {
         assert_eq!(auth_failure_label(&token), "expired");
     }
 
-    #[test]
-    fn render_rate_limited_row_has_expected_column_count() {
-        let account = RateLimitedAccount {
+    fn rate_limited_account() -> RateLimitedAccount {
+        RateLimitedAccount {
             alias: "amir+8@sawmills.ai".to_string(),
             h5_pct: Some(10.0),
             d7_pct: Some(20.0),
             h5_reset: "in 1h 00m".to_string(),
             d7_reset: "in 1d 00h".to_string(),
             token_expiry: None,
+            reset_credits: 0,
+            reset_credits_applicable: 0,
+            reset_credit_expiry: None,
             is_active: false,
             is_error: false,
             error_msg: String::new(),
+        }
+    }
+
+    #[test]
+    fn render_rate_limited_row_has_expected_column_count() {
+        assert_eq!(render_rate_limited_row(&rate_limited_account()).len(), 7);
+    }
+
+    /// The error row must line up with the normal row or the table breaks.
+    #[test]
+    fn render_rate_limited_error_row_has_expected_column_count() {
+        let account = RateLimitedAccount {
+            is_error: true,
+            error_msg: "expired".to_string(),
+            ..rate_limited_account()
         };
 
-        assert_eq!(render_rate_limited_row(&account).len(), 6);
+        assert_eq!(render_rate_limited_row(&account).len(), 7);
+    }
+
+    #[test]
+    fn resets_column_is_blank_without_banked_credits() {
+        assert_eq!(resets_cell(&rate_limited_account()).content(), "-");
+    }
+
+    #[test]
+    fn resets_column_calls_out_credits_redeemable_now() {
+        let account = RateLimitedAccount {
+            reset_credits: 3,
+            reset_credits_applicable: 2,
+            ..rate_limited_account()
+        };
+
+        assert_eq!(resets_cell(&account).content(), "3 (2 now)");
+    }
+
+    /// Held but not yet applicable: the count alone, since a reset only clears
+    /// an already-exhausted window.
+    #[test]
+    fn resets_column_shows_the_bare_count_when_nothing_applies_yet() {
+        let account = RateLimitedAccount {
+            reset_credits: 3,
+            reset_credits_applicable: 0,
+            ..rate_limited_account()
+        };
+
+        assert_eq!(resets_cell(&account).content(), "3");
     }
 
     #[test]

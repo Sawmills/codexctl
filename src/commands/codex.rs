@@ -13,6 +13,8 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+use crate::api;
+use crate::commands::resets;
 use crate::commands::use_profile;
 use crate::config::{self, Paths};
 use crate::profile;
@@ -22,14 +24,22 @@ const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
     "You hit your spend cap set in your workspace. Increase your spend cap to continue.";
 pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
-pub fn run(args: &[String], recovery_prompt: &str, allow_billing: bool) -> Result<i32> {
+pub fn run(
+    args: &[String],
+    recovery_prompt: &str,
+    allow_billing: bool,
+    allow_resets: bool,
+) -> Result<i32> {
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());
     let failed_alias = failed_alias_for_child_auth(&paths);
     let mut switcher = CodexctlProfileSwitcher::new(&paths);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
-    let mut consent = InteractiveConsent { allow_billing };
+    let mut consent = InteractiveConsent {
+        allow_billing,
+        allow_resets,
+    };
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
     // The account that hit the cap is already active; never switch back to it.
@@ -64,12 +74,17 @@ trait ProfileSwitcher {
 
     /// Switch the child Codex auth to `alias`.
     fn switch_to(&mut self, alias: &str) -> Result<()>;
+
+    /// Redeem `alias`'s banked reset so its exhausted window clears.
+    fn redeem_reset(&mut self, alias: &str, plan: &use_profile::ResetPlan) -> Result<()>;
 }
 
-/// Decides whether spend-cap recovery may switch to a credit-billing account
-/// (one whose overage is open, so it draws credits past 100%).
+/// Decides whether recovery may spend something the user cares about: credits
+/// ($) on an overage-open account, or one of a scarce pool of banked resets.
 trait RecoveryConsent {
     fn allow_billing_account(&mut self, alias: &str) -> bool;
+
+    fn allow_reset_credit(&mut self, alias: &str, plan: &use_profile::ResetPlan) -> bool;
 }
 
 trait SessionStore {
@@ -219,8 +234,24 @@ fn run_with_reporter_inner(
                             candidate.alias
                         );
                     }
-                } else {
+                } else if candidate.reset_plan().is_none() {
                     eprintln!("codexctl: spend cap detected; switching to a no-overage account");
+                }
+
+                // Every account with headroom is spoken for, so the cheapest way
+                // forward is to spend a banked reset on an exhausted one.
+                if let Some(plan) = candidate.reset_plan() {
+                    eprintln!(
+                        "codexctl: no account has rate-limit headroom left; {} can redeem a banked reset.",
+                        candidate.alias
+                    );
+                    if !consent.allow_reset_credit(&candidate.alias, plan) {
+                        bail!(
+                            "spend cap reached; redeeming a banked reset for {} was not approved",
+                            candidate.alias
+                        );
+                    }
+                    switcher.redeem_reset(&candidate.alias, plan)?;
                 }
 
                 switcher.switch_to(&candidate.alias)?;
@@ -792,15 +823,40 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
         eprintln!("codexctl: switched to {alias} ({email})");
         Ok(())
     }
+
+    fn redeem_reset(&mut self, alias: &str, plan: &use_profile::ResetPlan) -> Result<()> {
+        let response = resets::redeem(alias, plan.credit_id.as_deref())?;
+        resets::report_outcome(alias, &response);
+        if response.code != api::ConsumeResetCode::Reset {
+            bail!("redeeming a banked reset for {alias} did not clear its rate limit");
+        }
+        // Let the cleared window land before Codex restarts against it.
+        resets::settle_after_redeem(alias);
+        Ok(())
+    }
 }
 
 struct InteractiveConsent {
     /// Set by `--allow-billing`: approve credit-billing accounts without asking,
     /// for unattended runs.
     allow_billing: bool,
+    /// Set by `--allow-resets`: approve spending banked resets without asking.
+    allow_resets: bool,
 }
 
 impl RecoveryConsent for InteractiveConsent {
+    fn allow_reset_credit(&mut self, alias: &str, plan: &use_profile::ResetPlan) -> bool {
+        // The same policy `codexctl use` applies, reported on stderr so it does
+        // not land in the wrapped Codex output.
+        resets::approve_redemption(
+            alias,
+            plan.expires_at,
+            plan.expires_unused,
+            self.allow_resets,
+            &mut std::io::stderr(),
+        )
+    }
+
     fn allow_billing_account(&mut self, alias: &str) -> bool {
         if self.allow_billing {
             eprintln!("codexctl: --allow-billing set; switching to {alias} (may use credits)");
@@ -2989,6 +3045,7 @@ mod tests {
         use_profile::RecoveryCandidate {
             alias: alias.to_string(),
             bills_credits: false,
+            cost: use_profile::RecoveryCost::Headroom,
         }
     }
 
@@ -2996,6 +3053,20 @@ mod tests {
         use_profile::RecoveryCandidate {
             alias: alias.to_string(),
             bills_credits: true,
+            cost: use_profile::RecoveryCost::Headroom,
+        }
+    }
+
+    /// An exhausted account that only a banked reset can bring back.
+    fn needs_reset(alias: &str, expires_unused: bool) -> use_profile::RecoveryCandidate {
+        use_profile::RecoveryCandidate {
+            alias: alias.to_string(),
+            bills_credits: false,
+            cost: use_profile::RecoveryCost::ResetCredit(use_profile::ResetPlan {
+                credit_id: Some(format!("credit-{alias}")),
+                expires_at: None,
+                expires_unused,
+            }),
         }
     }
 
@@ -3066,7 +3137,7 @@ mod tests {
         let mut sessions = FakeSessionStore::default();
         let mut consent = RecordingConsent {
             allow: false,
-            asked: Vec::new(),
+            ..Default::default()
         };
 
         let result = run_with_consent(
@@ -3100,7 +3171,7 @@ mod tests {
         let mut sessions = FakeSessionStore::default();
         let mut consent = RecordingConsent {
             allow: true,
-            asked: Vec::new(),
+            ..Default::default()
         };
 
         let exit = run_with_consent(
@@ -3134,7 +3205,7 @@ mod tests {
         let mut sessions = FakeSessionStore::default();
         let mut consent = RecordingConsent {
             allow: true,
-            asked: Vec::new(),
+            ..Default::default()
         };
 
         let exit = run_with_consent(
@@ -3152,6 +3223,101 @@ mod tests {
         assert_eq!(
             switcher.switched,
             vec!["amir+2".to_string(), "amir@sawmills.ai".to_string()]
+        );
+    }
+
+    #[test]
+    fn recovery_redeems_a_banked_reset_when_no_account_has_headroom() {
+        // Every account is exhausted; the only way forward is to spend a reset.
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher = FakeProfileSwitcher::new(vec![needs_reset("amir+3", false)]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = RecordingConsent {
+            allow: true,
+            ..Default::default()
+        };
+
+        let exit = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(consent.asked_resets, vec!["amir+3".to_string()]);
+        assert_eq!(switcher.redeemed, vec!["amir+3".to_string()]);
+        assert_eq!(switcher.switched, vec!["amir+3".to_string()]);
+        assert!(
+            consent.asked.is_empty(),
+            "redeeming a reset must not be confused with billing consent"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_redeem_a_reset_without_approval() {
+        let mut runner = FakeCodexRunner::new(vec![CodexRunOutcome::SpendCap {
+            session_id: Some(SESSION_ID.to_string()),
+        }]);
+        let mut switcher = FakeProfileSwitcher::new(vec![needs_reset("amir+3", false)]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = DenyBillingConsent;
+
+        let result = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        );
+
+        assert!(
+            result.is_err(),
+            "an unapproved redemption must stop recovery"
+        );
+        assert!(switcher.redeemed.is_empty(), "no credit may be spent");
+        assert!(switcher.switched.is_empty());
+    }
+
+    #[test]
+    fn recovery_switches_before_it_redeems_when_headroom_exists() {
+        // A reset costs a scarce credit, so an account that just works wins —
+        // the exhausted seat is only reached on the next spend cap.
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::SpendCap {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::Exited(0),
+        ]);
+        let mut switcher =
+            FakeProfileSwitcher::new(vec![no_bill("amir+2"), needs_reset("amir+3", false)]);
+        let mut sessions = FakeSessionStore::default();
+        let mut consent = RecordingConsent {
+            allow: true,
+            ..Default::default()
+        };
+
+        let exit = run_with_consent(
+            &resume_options(),
+            &mut runner,
+            &mut switcher,
+            &mut sessions,
+            &mut consent,
+        )
+        .unwrap();
+
+        assert_eq!(exit, 0);
+        assert_eq!(switcher.switched, vec!["amir+2".to_string()]);
+        assert!(
+            switcher.redeemed.is_empty(),
+            "no credit spent while headroom remains"
         );
     }
 
@@ -3182,8 +3348,56 @@ mod tests {
         // with no terminal to prompt on (unattended runs).
         let mut consent = InteractiveConsent {
             allow_billing: true,
+            allow_resets: false,
         };
         assert!(consent.allow_billing_account("amir@sawmills.ai"));
+    }
+
+    #[test]
+    fn allow_resets_flag_approves_without_prompting() {
+        let mut consent = InteractiveConsent {
+            allow_billing: false,
+            allow_resets: true,
+        };
+        assert!(consent.allow_reset_credit("amir@sawmills.ai", &bankable_plan()));
+    }
+
+    #[test]
+    fn banked_reset_needs_approval_without_the_flag() {
+        // No flag and no terminal to prompt on: a scarce credit must not be
+        // spent behind the user's back.
+        let mut consent = InteractiveConsent {
+            allow_billing: true,
+            allow_resets: false,
+        };
+        assert!(
+            !consent.allow_reset_credit("amir@sawmills.ai", &bankable_plan()),
+            "--allow-billing must not imply permission to spend banked resets"
+        );
+    }
+
+    #[test]
+    fn lapsing_reset_is_redeemed_without_approval() {
+        // The credit expires before its window resets, so holding it back
+        // cannot pay off — there is nothing for the user to weigh.
+        let mut consent = InteractiveConsent {
+            allow_billing: false,
+            allow_resets: false,
+        };
+        let plan = use_profile::ResetPlan {
+            credit_id: Some("credit-1".to_string()),
+            expires_at: None,
+            expires_unused: true,
+        };
+        assert!(consent.allow_reset_credit("amir@sawmills.ai", &plan));
+    }
+
+    fn bankable_plan() -> use_profile::ResetPlan {
+        use_profile::ResetPlan {
+            credit_id: Some("credit-1".to_string()),
+            expires_at: None,
+            expires_unused: false,
+        }
     }
 
     fn write_session_file(path: &std::path::Path, session_id: &str, cwd: &str) {
@@ -3372,6 +3586,7 @@ mod tests {
     struct FakeProfileSwitcher {
         candidates: Vec<use_profile::RecoveryCandidate>,
         switched: Vec<String>,
+        redeemed: Vec<String>,
     }
 
     impl FakeProfileSwitcher {
@@ -3379,16 +3594,14 @@ mod tests {
             Self {
                 candidates,
                 switched: Vec::new(),
+                redeemed: Vec::new(),
             }
         }
     }
 
     impl Default for FakeProfileSwitcher {
         fn default() -> Self {
-            Self::new(vec![use_profile::RecoveryCandidate {
-                alias: "next@test".to_string(),
-                bills_credits: false,
-            }])
+            Self::new(vec![no_bill("next@test")])
         }
     }
 
@@ -3408,6 +3621,15 @@ mod tests {
             self.switched.push(alias.to_string());
             Ok(())
         }
+
+        fn redeem_reset(
+            &mut self,
+            alias: &str,
+            _plan: &use_profile::ResetPlan,
+        ) -> anyhow::Result<()> {
+            self.redeemed.push(alias.to_string());
+            Ok(())
+        }
     }
 
     pub(super) struct DenyBillingConsent;
@@ -3416,17 +3638,27 @@ mod tests {
         fn allow_billing_account(&mut self, _alias: &str) -> bool {
             false
         }
+
+        fn allow_reset_credit(&mut self, _alias: &str, _plan: &use_profile::ResetPlan) -> bool {
+            false
+        }
     }
 
     #[derive(Default)]
     struct RecordingConsent {
         allow: bool,
         asked: Vec<String>,
+        asked_resets: Vec<String>,
     }
 
     impl RecoveryConsent for RecordingConsent {
         fn allow_billing_account(&mut self, alias: &str) -> bool {
             self.asked.push(alias.to_string());
+            self.allow
+        }
+
+        fn allow_reset_credit(&mut self, alias: &str, _plan: &use_profile::ResetPlan) -> bool {
+            self.asked_resets.push(alias.to_string());
             self.allow
         }
     }

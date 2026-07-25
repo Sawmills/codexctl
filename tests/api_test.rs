@@ -73,10 +73,10 @@ fn parse_rate_limit_response_old_format() {
     let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
     assert_eq!(resp.plan_type.as_deref(), Some("pro"));
     let rl = resp.rate_limit.unwrap();
-    let primary = rl.primary().unwrap();
+    let primary = rl.short_window().unwrap();
     assert!((primary.used_percent - 27.0).abs() < f64::EPSILON);
     assert_eq!(primary.reset_timestamp(), Some(1743789600));
-    let secondary = rl.secondary().unwrap();
+    let secondary = rl.long_window().unwrap();
     assert!((secondary.used_percent - 46.0).abs() < f64::EPSILON);
 }
 
@@ -104,11 +104,123 @@ fn parse_rate_limit_response_team_format() {
     let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
     assert_eq!(resp.plan_type.as_deref(), Some("team"));
     let rl = resp.rate_limit.unwrap();
-    let primary = rl.primary().unwrap();
+    let primary = rl.short_window().unwrap();
     assert!((primary.used_percent - 0.0).abs() < f64::EPSILON);
     assert_eq!(primary.reset_timestamp(), Some(1775369763));
-    let secondary = rl.secondary().unwrap();
+    let secondary = rl.long_window().unwrap();
     assert!((secondary.used_percent - 25.0).abs() < f64::EPSILON);
+}
+
+/// Plans that publish only a weekly window return it in the `primary_window`
+/// slot. Reading windows positionally would report that weekly limit as a 5h
+/// one and leave the 7d reset unknown, which silently disables reset-aware
+/// selection.
+#[test]
+fn parse_rate_limit_response_weekly_only_maps_to_long_window() {
+    let json = r#"{
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": true,
+            "limit_reached": false,
+            "primary_window": {
+                "used_percent": 92,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 506456,
+                "reset_at": 1785453503
+            },
+            "secondary_window": null
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    let rl = resp.rate_limit.unwrap();
+    assert!(rl.short_window().is_none());
+    let long = rl.long_window().unwrap();
+    assert!((long.used_percent - 92.0).abs() < f64::EPSILON);
+    assert_eq!(long.reset_timestamp(), Some(1785453503));
+}
+
+#[test]
+fn parse_rate_limit_reset_credits() {
+    let json = r#"{
+        "plan_type": "pro",
+        "rate_limit": null,
+        "rate_limit_reset_credits": {
+            "available_count": 3,
+            "applicable_available_count": 2
+        }
+    }"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(resp.reset_credits_available(), 3);
+    assert_eq!(resp.reset_credits_applicable(), 2);
+}
+
+/// Responses predating banked resets omit the field entirely.
+#[test]
+fn parse_rate_limit_reset_credits_absent() {
+    let json = r#"{"plan_type": "pro", "rate_limit": null}"#;
+    let resp: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(resp.reset_credits_available(), 0);
+    assert_eq!(resp.reset_credits_applicable(), 0);
+}
+
+#[test]
+fn parse_reset_credits_details() {
+    let json = r#"{
+        "credits": [
+            {
+                "id": "RateLimitResetCredit_abc",
+                "reset_type": "codex_rate_limits",
+                "is_supported_by_plan": true,
+                "status": "available",
+                "granted_at": "2026-06-26T23:59:32.757458Z",
+                "expires_at": "2026-07-26T23:59:32.757458Z",
+                "redeemed_at": null,
+                "title": "Full reset",
+                "description": "Thanks for using Codex!"
+            },
+            {
+                "id": "RateLimitResetCredit_def",
+                "reset_type": "codex_rate_limits",
+                "status": "redeemed",
+                "granted_at": "2026-06-01T00:00:00Z",
+                "expires_at": null,
+                "title": null,
+                "description": null
+            }
+        ],
+        "available_count": 1
+    }"#;
+    let details: api::ResetCreditsDetails = serde_json::from_str(json).unwrap();
+    assert_eq!(details.available_count, 1);
+    assert_eq!(details.credits.len(), 2);
+    assert!(details.credits[0].is_available());
+    assert!(!details.credits[1].is_available());
+    assert_eq!(
+        details.credits[0].expires_at_timestamp(),
+        Some(1785110372),
+        "expiry parses as an RFC3339 timestamp"
+    );
+    assert_eq!(details.credits[1].expires_at_timestamp(), None);
+}
+
+#[test]
+fn parse_consume_reset_response_codes() {
+    let reset: api::ConsumeResetResponse =
+        serde_json::from_str(r#"{"code": "reset", "windows_reset": 2}"#).unwrap();
+    assert_eq!(reset.code, api::ConsumeResetCode::Reset);
+    assert_eq!(reset.windows_reset, 2);
+
+    for (raw, expected) in [
+        ("nothing_to_reset", api::ConsumeResetCode::NothingToReset),
+        ("no_credit", api::ConsumeResetCode::NoCredit),
+        ("already_redeemed", api::ConsumeResetCode::AlreadyRedeemed),
+        ("something_new", api::ConsumeResetCode::Unknown),
+    ] {
+        let resp: api::ConsumeResetResponse =
+            serde_json::from_str(&format!(r#"{{"code": "{raw}"}}"#)).unwrap();
+        assert_eq!(resp.code, expected, "code {raw}");
+        assert_eq!(resp.windows_reset, 0);
+    }
 }
 
 #[test]

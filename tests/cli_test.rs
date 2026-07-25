@@ -14,7 +14,30 @@ fn help_shows_all_subcommands() {
     assert!(stdout.contains("remove"));
     assert!(stdout.contains("whoami"));
     assert!(stdout.contains("codex"));
+    assert!(stdout.contains("resets"));
+    assert!(stdout.contains("reset"));
     assert!(stdout.contains("completions"));
+}
+
+#[test]
+fn reset_accepts_an_alias_and_unattended_flags() {
+    let mut cmd = Command::cargo_bin("codexctl").unwrap();
+    let output = cmd.args(["reset", "--help"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[ALIAS]"), "alias is optional: {stdout}");
+    assert!(stdout.contains("--yes"));
+    assert!(stdout.contains("--credit"));
+}
+
+/// Spending banked resets and spending credits are separate approvals, so the
+/// wrapper must expose a separate flag for each.
+#[test]
+fn codex_has_independent_reset_and_billing_flags() {
+    let mut cmd = Command::cargo_bin("codexctl").unwrap();
+    let output = cmd.args(["codex", "--help"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--allow-billing"));
+    assert!(stdout.contains("--allow-resets"));
 }
 
 #[test]
