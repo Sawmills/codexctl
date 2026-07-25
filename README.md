@@ -152,6 +152,8 @@ codexctl resets                     # what every account holds, and when it expi
 codexctl reset                      # redeem one for the active account
 codexctl reset amir+5@sawmills.ai   # ...or for a specific one
 codexctl reset --yes                # skip the confirmation (unattended)
+codexctl resets --claim             # redeem everything about to lapse
+codexctl resets --claim --within-days 7 --yes
 ```
 
 ```text
@@ -167,11 +169,18 @@ A reset only clears an *already-exhausted* window — the backend reports zero r
 until an account actually hits 100%, and codexctl refuses to redeem before that rather than waste
 one. When several credits qualify, it always spends the one closest to expiring.
 
+`--claim` sweeps the whole fleet and redeems credits that are about to lapse (default: within three
+days) on accounts that are already at 100%. Those credits are the ones with nothing left to lose:
+the account cannot be used right now anyway, and the credit is about to evaporate. Note the flip
+side — a credit on an account that is *not* yet at 100% cannot be rescued at all, since the backend
+will not apply a reset to a window that has nothing to clear.
+
 ### Reset-aware recovery
 
-`codexctl codex` folds banked resets into its recovery ladder, cheapest option first:
+Both `codexctl use` (no alias) and `codexctl codex` recovery pick accounts from one cost-ranked
+ladder, cheapest option first:
 
-1. A no-bill account that still has rate-limit headroom — switched to silently, as before.
+1. A no-bill account that still has rate-limit headroom — used silently, as before.
 2. A banked reset whose credit would **expire before its window resets anyway** — redeemed without
    prompting, since holding it back cannot pay off.
 3. A banked reset worth keeping — asks for confirmation, or pass `--allow-resets`.
@@ -181,9 +190,14 @@ Resets rank ahead of credit-billing accounts because they cost no money. `--allo
 **not** imply permission to spend resets; each is approved separately.
 
 ```bash
-codexctl codex --allow-resets -- "start prompt"                   # unattended: may spend resets
+codexctl use --allow-resets                                       # unattended: may spend resets
+codexctl codex --allow-resets -- "start prompt"
 codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
 ```
+
+So when every account is exhausted, `codexctl use` redeems a reset and hands back an account that
+actually works, instead of a seat sitting at 100%. Passing an explicit alias never redeems — use
+`codexctl reset <alias>` to spend a credit on a named account.
 
 ### Other commands
 
