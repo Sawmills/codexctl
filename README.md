@@ -209,6 +209,7 @@ codexctl codex -- ...  # run Codex with spend-cap recovery
 codexctl resets        # list banked rate-limit resets
 codexctl reset [alias] # redeem a banked reset
 codexctl remove <alias>
+codexctl --version     # installed version
 ```
 
 ## Shell completions
