@@ -37,6 +37,10 @@ _codexctl_profiles() {
             "':alias -- Profile alias to remove:_default'",
             "':alias -- Profile alias to remove:_codexctl_profiles'",
         );
+        script = script.replace(
+            "'::alias -- Profile alias to redeem for (defaults to the active account):_default'",
+            "'::alias -- Profile alias to redeem for (defaults to the active account):_codexctl_profiles'",
+        );
 
         // Insert profile function before the main _codexctl function
         print!("{profile_fn}{script}");
@@ -54,11 +58,12 @@ _codexctl_profiles() {
         println!(r#"}}"#);
         println!(r#"complete -F _codexctl_profiles codexctl use"#);
         println!(r#"complete -F _codexctl_profiles codexctl remove"#);
+        println!(r#"complete -F _codexctl_profiles codexctl reset"#);
     } else if shell == Shell::Fish {
         generate(shell, &mut cmd, name, &mut std::io::stdout());
         println!();
         println!(
-            r#"complete -c codexctl -n '__fish_seen_subcommand_from use remove' -xa '(ls ~/.codexctl/profiles/ 2>/dev/null)'"#
+            r#"complete -c codexctl -n '__fish_seen_subcommand_from use remove reset' -xa '(ls ~/.codexctl/profiles/ 2>/dev/null)'"#
         );
     } else {
         generate(shell, &mut cmd, name, &mut std::io::stdout());

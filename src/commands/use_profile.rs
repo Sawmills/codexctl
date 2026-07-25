@@ -1,9 +1,11 @@
+use std::cmp::Ordering;
 use std::path::Path;
 
 use anyhow::{Result, bail};
 
 use crate::api;
 use crate::commands::alias;
+use crate::commands::resets;
 use crate::commands::status;
 use crate::config;
 use crate::profile;
@@ -12,20 +14,24 @@ use crate::profile;
 /// 100% — i.e. the account has no usable headroom right now.
 const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
 
-pub fn run(alias: Option<&str>) -> Result<()> {
-    run_to_auth_json(alias, &config::codex_auth_json()?)
+pub fn run(alias: Option<&str>, allow_resets: bool) -> Result<()> {
+    run_to_auth_json(alias, &config::codex_auth_json()?, allow_resets)
 }
 
-pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path) -> Result<()> {
-    run_to_auth_json_excluding(alias, auth_json, None)
+pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path, allow_resets: bool) -> Result<()> {
+    run_to_auth_json_excluding(alias, auth_json, None, allow_resets)
 }
 
 pub fn run_to_auth_json_excluding(
     alias: Option<&str>,
     auth_json: &Path,
     excluded_alias: Option<&str>,
+    allow_resets: bool,
 ) -> Result<()> {
     match alias::optional(alias) {
+        // An explicit target is switched to as asked — never redeemed against,
+        // since `codexctl reset <alias>` is the way to spend a credit on a
+        // named account.
         Some(a) => {
             let email = profile::switch_to_auth_json(a, auth_json)?;
             println!("switched to {} ({})", a, email);
@@ -33,7 +39,7 @@ pub fn run_to_auth_json_excluding(
             status::run_focused(a)?;
         }
         None => {
-            let best = find_most_available_excluding(excluded_alias)?;
+            let best = find_most_available_excluding(excluded_alias, allow_resets)?;
             let email = profile::switch_to_auth_json(&best, auth_json)?;
             println!("auto-selected most available: {} ({})", best, email);
             println!();
@@ -43,7 +49,10 @@ pub fn run_to_auth_json_excluding(
     Ok(())
 }
 
-fn find_most_available_excluding(excluded_alias: Option<&str>) -> Result<String> {
+fn find_most_available_excluding(
+    excluded_alias: Option<&str>,
+    allow_resets: bool,
+) -> Result<String> {
     let all_profiles = profile::list_profiles()?;
     let had_profiles = !all_profiles.is_empty();
     let profiles = profiles_after_excluding(all_profiles, excluded_alias);
@@ -70,6 +79,45 @@ fn find_most_available_excluding(excluded_alias: Option<&str>) -> Result<String>
         })
         .collect();
 
+    // An account that still has headroom is always preferred and spends nothing.
+    if let Some(alias) = select_with_headroom(&scored, reset_aware()) {
+        return Ok(alias.to_string());
+    }
+
+    // Nothing is usable as-is. Redeeming a banked reset is the only way to hand
+    // back an account that actually works, so apply the same cost-ranked ladder
+    // `codexctl codex` uses on recovery.
+    if let Some(candidate) = best_candidate_from_usages(usages)?
+        && let Some(plan) = candidate.reset_plan()
+    {
+        if !resets::approve_redemption(
+            &candidate.alias,
+            plan.expires_at,
+            plan.expires_unused,
+            allow_resets,
+            &mut std::io::stdout(),
+        ) {
+            bail!(
+                "every account is out of rate-limit headroom and redeeming a banked reset for {} was not approved",
+                candidate.alias
+            );
+        }
+        let response = resets::redeem(&candidate.alias, plan.credit_id.as_deref())?;
+        resets::report_outcome(&candidate.alias, &response);
+        if response.code != api::ConsumeResetCode::Reset {
+            bail!(
+                "redeeming a banked reset for {} did not clear its rate limit",
+                candidate.alias
+            );
+        }
+        // Otherwise the status printed right after the switch still shows the
+        // old 100% and the redemption looks like it did nothing.
+        resets::settle_after_redeem(&candidate.alias);
+        return Ok(candidate.alias);
+    }
+
+    // No reset can help either: fall back to the least-bad account, exactly as
+    // before, so `use` still hands back something rather than failing outright.
     match select_most_available(&scored, reset_aware()) {
         Some(alias) => Ok(alias.to_string()),
         None => bail!("no usable accounts found (all expired or errored)"),
@@ -104,7 +152,7 @@ fn secondary_reset_ts(usage: &api::RateLimitResponse) -> i64 {
     usage
         .rate_limit
         .as_ref()
-        .and_then(|r| r.secondary())
+        .and_then(|r| r.long_window())
         .and_then(|w| w.reset_timestamp())
         .unwrap_or(i64::MAX)
 }
@@ -127,23 +175,8 @@ struct SelectionCandidate {
 /// soonest 7d reset, breaking ties by most headroom; if none have headroom, fall
 /// back to the default pick so the behavior degrades identically to today.
 fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
-    if reset_aware {
-        let staggered = scored
-            .iter()
-            .filter(|candidate| candidate.score < RATE_LIMIT_EXHAUSTED)
-            .min_by(|a, b| {
-                a.bills_credits
-                    .cmp(&b.bills_credits)
-                    .then(a.secondary_reset_ts.cmp(&b.secondary_reset_ts))
-                    .then(
-                        a.score
-                            .partial_cmp(&b.score)
-                            .unwrap_or(std::cmp::Ordering::Equal),
-                    )
-            });
-        if let Some(candidate) = staggered {
-            return Some(candidate.alias.as_str());
-        }
+    if let Some(alias) = select_with_headroom(scored, reset_aware) {
+        return Some(alias);
     }
     scored
         .iter()
@@ -153,6 +186,31 @@ fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Op
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .filter(|candidate| candidate.score < f64::MAX)
+        .map(|candidate| candidate.alias.as_str())
+}
+
+/// The best account that still has usable rate-limit headroom, or `None` when
+/// every account is exhausted (or usage-based, which is never auto-selected).
+///
+/// Reset-aware: no-bill accounts first, then the soonest 7d reset, then most
+/// headroom. Default: most headroom — which, since any exhausted account scores
+/// at least [`RATE_LIMIT_EXHAUSTED`] and any account with headroom scores below
+/// it, is the same account the legacy global-minimum pick would have chosen.
+fn select_with_headroom(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
+    scored
+        .iter()
+        .filter(|candidate| candidate.score < RATE_LIMIT_EXHAUSTED)
+        .min_by(|a, b| {
+            let by_score = a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal);
+            if reset_aware {
+                a.bills_credits
+                    .cmp(&b.bills_credits)
+                    .then(a.secondary_reset_ts.cmp(&b.secondary_reset_ts))
+                    .then(by_score)
+            } else {
+                by_score
+            }
+        })
         .map(|candidate| candidate.alias.as_str())
 }
 
@@ -172,15 +230,50 @@ pub struct RecoveryCandidate {
     /// True when overage is open (spend cap NOT reached), so the account draws
     /// credits ($) once it passes 100% of its rate limit. These require consent.
     pub bills_credits: bool,
+    /// What it costs to put this account to work.
+    pub cost: RecoveryCost,
+}
+
+impl RecoveryCandidate {
+    /// The banked reset that has to be redeemed before this account is usable,
+    /// if any.
+    pub fn reset_plan(&self) -> Option<&ResetPlan> {
+        match &self.cost {
+            RecoveryCost::Headroom => None,
+            RecoveryCost::ResetCredit(plan) => Some(plan),
+        }
+    }
+}
+
+/// What switching to a recovery candidate costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryCost {
+    /// The account still has rate-limit headroom; switching to it costs nothing.
+    Headroom,
+    /// The account is exhausted, but a banked reset credit can clear its window.
+    ResetCredit(ResetPlan),
+}
+
+/// The banked reset codexctl would redeem to make an exhausted account usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetPlan {
+    /// The soonest-expiring redeemable credit. `None` lets the backend pick,
+    /// which is the safe fallback when the credit listing could not be read.
+    pub credit_id: Option<String>,
+    pub expires_at: Option<i64>,
+    /// The credit expires before this account's window would reset on its own.
+    /// Holding it back cannot pay off — it would lapse unredeemed — so spending
+    /// it now is strictly free and needs no consent.
+    pub expires_unused: bool,
 }
 
 /// Pick the next spend-cap recovery account, excluding any `tried` aliases.
 ///
-/// Prefers accounts that will not bill credits — spend cap already reached, so
-/// they hard-stop at 100% rather than drawing credits — over ones that can.
-/// Usage-based accounts are never selected, and accounts without rate-limit
-/// headroom (a window already at 100%) are skipped, since switching to them
-/// would immediately re-trigger the cap.
+/// Candidates are ranked cheapest-first: an account with rate-limit headroom
+/// that will not bill, then one whose banked reset would expire unused anyway,
+/// then one that must spend a bankable reset, and only then accounts that draw
+/// credits ($). Usage-based accounts are never selected, and an exhausted
+/// account is skipped unless a banked reset can actually clear its window.
 pub fn find_recovery_candidate(tried: &[String]) -> Result<Option<RecoveryCandidate>> {
     let profiles: Vec<profile::Profile> = profile::list_profiles()?
         .into_iter()
@@ -191,73 +284,218 @@ pub fn find_recovery_candidate(tried: &[String]) -> Result<Option<RecoveryCandid
     }
 
     let usages = fetch_usages(&profiles)?;
-    let candidates: Vec<(String, bool, f64, i64)> = usages
+    best_candidate_from_usages(usages)
+}
+
+/// Rank already-fetched accounts cheapest-first and return the winner. Shared
+/// by `codexctl codex` recovery and by `codexctl use`, so both spend resources
+/// in the same order.
+fn best_candidate_from_usages(
+    usages: Vec<(String, Option<api::RateLimitResponse>)>,
+) -> Result<Option<RecoveryCandidate>> {
+    let classified: Vec<(String, api::RateLimitResponse, RecoveryClass)> = usages
         .into_iter()
         .filter_map(|(alias, usage)| {
             let usage = usage?;
-            let (bills_credits, score) = recovery_score(&usage)?;
-            Some((alias, bills_credits, score, secondary_reset_ts(&usage)))
+            let class = recovery_class(&usage)?;
+            Some((alias, usage, class))
+        })
+        .collect();
+
+    // Only accounts that must redeem need their credit listing read, so the
+    // common case (someone has headroom) stays at one request per profile.
+    let needs_credits: Vec<String> = classified
+        .iter()
+        .filter(|(_, _, class)| class.needs_reset)
+        .map(|(alias, _, _)| alias.clone())
+        .collect();
+    let credit_details = fetch_reset_credits(&needs_credits)?;
+
+    let candidates: Vec<ScoredRecovery> = classified
+        .into_iter()
+        .map(|(alias, usage, class)| {
+            let cost = if class.needs_reset {
+                let details = credit_details
+                    .iter()
+                    .find(|(a, _)| *a == alias)
+                    .and_then(|(_, details)| details.as_ref());
+                RecoveryCost::ResetCredit(reset_plan(details, natural_reset_ts(&usage)))
+            } else {
+                RecoveryCost::Headroom
+            };
+            let tiebreak_ts = match &cost {
+                // Spend the credit closest to lapsing first.
+                RecoveryCost::ResetCredit(plan) => plan.expires_at.unwrap_or(i64::MAX),
+                RecoveryCost::Headroom => secondary_reset_ts(&usage),
+            };
+            ScoredRecovery {
+                alias,
+                bills_credits: class.bills_credits,
+                score: class.score,
+                tiebreak_ts,
+                cost,
+            }
         })
         .collect();
 
     Ok(select_recovery(candidates, reset_aware()))
 }
 
-/// Choose the recovery candidate. No-bill accounts (`bills_credits == false`)
-/// always win over billing ones — preserved in both modes. Within a bill class,
-/// default picks most headroom; reset-aware picks the soonest 7d reset first,
-/// then most headroom.
+#[derive(Debug, Clone)]
+struct ScoredRecovery {
+    alias: String,
+    bills_credits: bool,
+    score: f64,
+    /// Soonest-first tiebreak: the 7d window reset for headroom candidates, the
+    /// credit expiry for reset candidates.
+    tiebreak_ts: i64,
+    cost: RecoveryCost,
+}
+
+impl ScoredRecovery {
+    /// Cheapest first. A banked reset costs no money, so redeeming one beats
+    /// any account that would draw credits; a reset that would lapse unredeemed
+    /// costs nothing at all, so it even beats one worth keeping in the bank.
+    fn rank(&self) -> u8 {
+        match (&self.cost, self.bills_credits) {
+            (RecoveryCost::Headroom, false) => 0,
+            (RecoveryCost::ResetCredit(plan), false) if plan.expires_unused => 1,
+            (RecoveryCost::ResetCredit(_), false) => 2,
+            // A lapsing credit is free even on an account that can bill later,
+            // and salvaging it leaves that account no worse off than simply
+            // switching to one — so it comes first among the billing options.
+            (RecoveryCost::ResetCredit(plan), true) if plan.expires_unused => 3,
+            (RecoveryCost::Headroom, true) => 4,
+            (RecoveryCost::ResetCredit(_), true) => 5,
+        }
+    }
+}
+
+/// Choose the recovery candidate. Cheapest [`ScoredRecovery::rank`] always wins
+/// — so no-bill accounts still beat billing ones in both modes. Within a rank,
+/// default picks most headroom; reset-aware picks the soonest 7d reset (or
+/// soonest-lapsing credit) first, then most headroom.
 fn select_recovery(
-    candidates: Vec<(String, bool, f64, i64)>,
+    candidates: Vec<ScoredRecovery>,
     reset_aware: bool,
 ) -> Option<RecoveryCandidate> {
     candidates
         .into_iter()
         .min_by(|a, b| {
-            let by_bill = a.1.cmp(&b.1);
+            let by_rank = a.rank().cmp(&b.rank());
             if reset_aware {
-                by_bill
-                    .then(a.3.cmp(&b.3))
-                    .then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                by_rank
+                    .then(a.tiebreak_ts.cmp(&b.tiebreak_ts))
+                    .then(a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
             } else {
-                by_bill.then(a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+                by_rank.then(a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
             }
         })
-        .map(|(alias, bills_credits, _, _)| RecoveryCandidate {
-            alias,
-            bills_credits,
+        .map(|candidate| RecoveryCandidate {
+            alias: candidate.alias,
+            bills_credits: candidate.bills_credits,
+            cost: candidate.cost,
         })
 }
 
-/// Classify an account for spend-cap recovery as `(bills_credits, score)`, or
-/// `None` when it must not be used (usage-based, or no rate-limit headroom).
-fn recovery_score(usage: &api::RateLimitResponse) -> Option<(bool, f64)> {
+#[derive(Debug, Clone, PartialEq)]
+struct RecoveryClass {
+    bills_credits: bool,
+    score: f64,
+    /// The account is out of rate-limit headroom, so only redeeming a banked
+    /// reset can make it usable.
+    needs_reset: bool,
+}
+
+/// Classify an account for spend-cap recovery, or `None` when it must not be
+/// used: usage-based (bills real credits), or out of headroom with no banked
+/// reset to clear the window.
+fn recovery_class(usage: &api::RateLimitResponse) -> Option<RecoveryClass> {
     let plan = usage.plan_type.as_deref().unwrap_or("");
     if plan.contains("usage_based") {
-        return None;
-    }
-    let score = rate_limit_score(usage);
-    if score >= RATE_LIMIT_EXHAUSTED {
-        // A rate-limit window is already at 100% — not usable right now.
         return None;
     }
     // Spend cap reached => overage closed => the account hard-stops at 100% and
     // never bills. Spend cap NOT reached => overage open => it draws credits ($).
     let bills_credits = !usage.spend_control.as_ref().is_some_and(|s| s.reached);
-    Some((bills_credits, score))
+    let score = rate_limit_score(usage);
+    if score >= RATE_LIMIT_EXHAUSTED {
+        // A rate-limit window is already at 100%. The backend only reports a
+        // credit as applicable once there is a window to clear, so this is the
+        // authoritative test for "a reset would actually make this usable".
+        if usage.reset_credits_applicable() <= 0 {
+            return None;
+        }
+        return Some(RecoveryClass {
+            bills_credits,
+            score,
+            needs_reset: true,
+        });
+    }
+    Some(RecoveryClass {
+        bills_credits,
+        score,
+        needs_reset: false,
+    })
+}
+
+/// When this account's exhausted window(s) would clear without spending a
+/// credit — the moment a banked reset stops being worth anything here.
+fn natural_reset_ts(usage: &api::RateLimitResponse) -> Option<i64> {
+    let rate_limit = usage.rate_limit.as_ref()?;
+    [rate_limit.short_window(), rate_limit.long_window()]
+        .into_iter()
+        .flatten()
+        .filter(|w| w.used_percent >= 100.0)
+        .filter_map(|w| w.reset_timestamp())
+        .max()
+}
+
+/// Plan which banked reset to spend: the soonest-expiring redeemable one.
+///
+/// A missing or unreadable listing still yields a plan with no credit id — the
+/// usage response already confirmed a credit is applicable, so the backend can
+/// pick one itself.
+fn reset_plan(
+    details: Option<&api::ResetCreditsDetails>,
+    natural_reset_ts: Option<i64>,
+) -> ResetPlan {
+    let credit = details.and_then(|d| {
+        d.credits
+            .iter()
+            .filter(|c| c.is_available())
+            .min_by_key(|c| c.expires_at_timestamp().unwrap_or(i64::MAX))
+    });
+    let Some(credit) = credit else {
+        return ResetPlan {
+            credit_id: None,
+            expires_at: None,
+            expires_unused: false,
+        };
+    };
+    let expires_at = credit.expires_at_timestamp();
+    let expires_unused = match (expires_at, natural_reset_ts) {
+        (Some(expiry), Some(reset)) => expiry < reset,
+        _ => false,
+    };
+    ResetPlan {
+        credit_id: Some(credit.id.clone()),
+        expires_at,
+        expires_unused,
+    }
 }
 
 fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
     let h5 = usage
         .rate_limit
         .as_ref()
-        .and_then(|r| r.primary())
+        .and_then(|r| r.short_window())
         .map(|w| w.used_percent)
         .unwrap_or(0.0);
     let d7 = usage
         .rate_limit
         .as_ref()
-        .and_then(|r| r.secondary())
+        .and_then(|r| r.long_window())
         .map(|w| w.used_percent)
         .unwrap_or(0.0);
     if h5 >= 100.0 && d7 >= 100.0 {
@@ -307,6 +545,45 @@ fn fetch_usages(
     }))
 }
 
+/// Read the banked-reset listing for the given aliases, in parallel. A profile
+/// whose listing cannot be read yields `None` rather than failing the pick.
+fn fetch_reset_credits(
+    aliases: &[String],
+) -> Result<Vec<(String, Option<api::ResetCreditsDetails>)>> {
+    if aliases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let client = reqwest::Client::new();
+
+    Ok(rt.block_on(async {
+        let futs: Vec<_> = aliases
+            .iter()
+            .map(|alias| {
+                let client = client.clone();
+                let alias = alias.clone();
+                let auth = profile::get_profile(&alias)
+                    .and_then(|p| api::read_auth_json(&p.auth_json_path()));
+                async move {
+                    let details = match auth {
+                        Ok(a) => api::fetch_reset_credits_async(
+                            &client,
+                            &a.access_token,
+                            a.account_id.as_deref(),
+                        )
+                        .await
+                        .ok(),
+                        Err(_) => None,
+                    };
+                    (alias, details)
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await
+    }))
+}
+
 fn profiles_after_excluding(
     mut profiles: Vec<profile::Profile>,
     excluded_alias: Option<&str>,
@@ -344,6 +621,17 @@ mod tests {
         }
     }
 
+    fn window_resetting_at(used_percent: f64, reset_at: i64) -> api::RateLimitWindow {
+        api::RateLimitWindow {
+            used_percent,
+            window_minutes: None,
+            limit_window_seconds: None,
+            resets_at: Some(reset_at),
+            reset_at: None,
+            reset_after_seconds: None,
+        }
+    }
+
     fn team_response(h5: f64, d7: f64, spend_reached: bool) -> api::RateLimitResponse {
         api::RateLimitResponse {
             plan_type: Some("team".to_string()),
@@ -357,6 +645,23 @@ mod tests {
             spend_control: Some(api::SpendControl {
                 reached: spend_reached,
             }),
+            rate_limit_reset_credits: None,
+        }
+    }
+
+    /// A team account with `applicable` banked resets redeemable right now.
+    fn team_response_with_resets(
+        h5: f64,
+        d7: f64,
+        spend_reached: bool,
+        applicable: i64,
+    ) -> api::RateLimitResponse {
+        api::RateLimitResponse {
+            rate_limit_reset_credits: Some(api::ResetCreditsSummary {
+                available_count: applicable,
+                applicable_available_count: applicable,
+            }),
+            ..team_response(h5, d7, spend_reached)
         }
     }
 
@@ -371,7 +676,60 @@ mod tests {
                 balance: None,
             }),
             spend_control: Some(api::SpendControl { reached: false }),
+            rate_limit_reset_credits: None,
         }
+    }
+
+    fn credit(id: &str, status: &str, expires_at: Option<&str>) -> api::ResetCredit {
+        api::ResetCredit {
+            id: id.to_string(),
+            status: status.to_string(),
+            reset_type: Some("codex_rate_limits".to_string()),
+            granted_at: None,
+            expires_at: expires_at.map(|e| e.to_string()),
+            title: None,
+            description: None,
+        }
+    }
+
+    fn scored(
+        alias: &str,
+        bills_credits: bool,
+        score: f64,
+        tiebreak_ts: i64,
+        cost: RecoveryCost,
+    ) -> ScoredRecovery {
+        ScoredRecovery {
+            alias: alias.to_string(),
+            bills_credits,
+            score,
+            tiebreak_ts,
+            cost,
+        }
+    }
+
+    fn headroom(alias: &str, bills_credits: bool, score: f64, ts: i64) -> ScoredRecovery {
+        scored(alias, bills_credits, score, ts, RecoveryCost::Headroom)
+    }
+
+    fn with_reset(
+        alias: &str,
+        bills_credits: bool,
+        score: f64,
+        ts: i64,
+        expires_unused: bool,
+    ) -> ScoredRecovery {
+        scored(
+            alias,
+            bills_credits,
+            score,
+            ts,
+            RecoveryCost::ResetCredit(ResetPlan {
+                credit_id: Some(format!("credit-{alias}")),
+                expires_at: Some(ts),
+                expires_unused,
+            }),
+        )
     }
 
     fn selection_candidate(
@@ -407,32 +765,56 @@ mod tests {
 
     #[test]
     fn recovery_skips_usage_based_accounts() {
-        assert_eq!(recovery_score(&usage_based_response()), None);
+        assert_eq!(recovery_class(&usage_based_response()), None);
     }
 
     #[test]
-    fn recovery_skips_accounts_without_rate_limit_headroom() {
-        // 5h window already at 100% -> not usable right now, even though the
-        // spend cap is reached (no-bill).
-        assert_eq!(recovery_score(&team_response(100.0, 20.0, true)), None);
+    fn recovery_skips_exhausted_accounts_without_a_redeemable_reset() {
+        // 5h window already at 100% and no banked reset -> nothing can make it
+        // usable right now, even though the spend cap is reached (no-bill).
+        assert_eq!(recovery_class(&team_response(100.0, 20.0, true)), None);
+    }
+
+    #[test]
+    fn recovery_keeps_exhausted_account_that_can_redeem_a_reset() {
+        // Same exhausted account, but a banked reset is applicable: it becomes
+        // usable again at the cost of one credit.
+        let class = recovery_class(&team_response_with_resets(100.0, 20.0, true, 2)).unwrap();
+        assert!(class.needs_reset);
+        assert!(!class.bills_credits);
+    }
+
+    #[test]
+    fn recovery_ignores_banked_resets_that_are_not_applicable_yet() {
+        // Credits held but none applicable — the backend reports zero until a
+        // window is actually exhausted, so redeeming would waste one.
+        let usage = api::RateLimitResponse {
+            rate_limit_reset_credits: Some(api::ResetCreditsSummary {
+                available_count: 3,
+                applicable_available_count: 0,
+            }),
+            ..team_response(100.0, 20.0, true)
+        };
+        assert_eq!(recovery_class(&usage), None);
     }
 
     #[test]
     fn recovery_treats_spend_capped_account_as_no_bill() {
         // Spend cap reached + headroom -> usable and hard-stops, so won't bill.
-        let (bills_credits, _) = recovery_score(&team_response(10.0, 30.0, true)).unwrap();
+        let class = recovery_class(&team_response(10.0, 30.0, true)).unwrap();
         assert!(
-            !bills_credits,
+            !class.bills_credits,
             "spend-cap-reached accounts hard-stop at 100% and must be treated as no-bill"
         );
+        assert!(!class.needs_reset);
     }
 
     #[test]
     fn recovery_treats_overage_open_account_as_billing() {
         // Spend cap NOT reached -> overage open -> draws credits past 100%.
-        let (bills_credits, _) = recovery_score(&team_response(5.0, 71.0, false)).unwrap();
+        let class = recovery_class(&team_response(5.0, 71.0, false)).unwrap();
         assert!(
-            bills_credits,
+            class.bills_credits,
             "overage-open accounts can draw credits and must require consent"
         );
     }
@@ -520,6 +902,38 @@ mod tests {
         assert_eq!(select_most_available(&scored, true), Some("b"));
     }
 
+    /// The gate that lets `codexctl use` reach for a banked reset: it must
+    /// report "nothing usable" rather than handing back an exhausted account.
+    #[test]
+    fn select_with_headroom_returns_nothing_when_every_account_is_exhausted() {
+        let scored = vec![
+            selection_candidate("a", false, 700.0, 2000),
+            selection_candidate("b", false, 900.0, 1000),
+        ];
+        for mode in [true, false] {
+            assert_eq!(
+                select_with_headroom(&scored, mode),
+                None,
+                "reset_aware={mode}"
+            );
+        }
+        // ...while the legacy fallback still yields the least-bad account.
+        assert_eq!(select_most_available(&scored, true), Some("a"));
+    }
+
+    /// Legacy mode is documented as pure most-headroom ordering, and the
+    /// headroom pre-pass must not change which account that picks.
+    #[test]
+    fn select_with_headroom_matches_the_legacy_pick_when_headroom_exists() {
+        let scored = vec![
+            selection_candidate("billing", true, 20.0, 1000),
+            selection_candidate("no-bill", false, 60.0, 2000),
+            selection_candidate("exhausted", false, 700.0, 500),
+        ];
+        assert_eq!(select_with_headroom(&scored, false), Some("billing"));
+        assert_eq!(select_most_available(&scored, false), Some("billing"));
+    }
+
     #[test]
     fn select_most_available_skips_usage_based_in_both_modes() {
         // Usage-based -> score f64::MAX -> never usable.
@@ -533,8 +947,8 @@ mod tests {
         // A billing account resets soonest; a no-bill account resets later.
         // No-bill must still win — reset is only a tiebreak within a bill class.
         let candidates = vec![
-            ("bills".to_string(), true, 10.0, 1000),
-            ("nobill".to_string(), false, 50.0, 5000),
+            headroom("bills", true, 10.0, 1000),
+            headroom("nobill", false, 50.0, 5000),
         ];
         assert_eq!(select_recovery(candidates, true).unwrap().alias, "nobill");
     }
@@ -542,8 +956,8 @@ mod tests {
     #[test]
     fn reset_aware_recovery_breaks_ties_by_soonest_reset() {
         let candidates = vec![
-            ("late".to_string(), false, 10.0, 5000),
-            ("soon".to_string(), false, 40.0, 1000),
+            headroom("late", false, 10.0, 5000),
+            headroom("soon", false, 40.0, 1000),
         ];
         assert_eq!(
             select_recovery(candidates.clone(), true).unwrap().alias,
@@ -551,5 +965,169 @@ mod tests {
         );
         // Default ignores reset and keeps the most-headroom pick.
         assert_eq!(select_recovery(candidates, false).unwrap().alias, "late");
+    }
+
+    #[test]
+    fn recovery_prefers_headroom_over_spending_a_banked_reset() {
+        // Redeeming is free in money but spends a scarce, expiring asset, so an
+        // account that just works must always win.
+        let candidates = vec![
+            with_reset("exhausted", false, 700.0, 1000, false),
+            headroom("free", false, 90.0, 5000),
+        ];
+        for mode in [true, false] {
+            assert_eq!(
+                select_recovery(candidates.clone(), mode).unwrap().alias,
+                "free",
+                "reset_aware={mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_prefers_a_banked_reset_over_billing_credits() {
+        // A reset costs no money; a billing account eventually does. When no
+        // free-and-ready account is left, redeem before reaching for credits.
+        let candidates = vec![
+            headroom("billing", true, 10.0, 1000),
+            with_reset("reset", false, 700.0, 5000, false),
+        ];
+        for mode in [true, false] {
+            let picked = select_recovery(candidates.clone(), mode).unwrap();
+            assert_eq!(picked.alias, "reset", "reset_aware={mode}");
+            assert!(picked.reset_plan().is_some());
+        }
+    }
+
+    #[test]
+    fn recovery_spends_a_lapsing_reset_before_a_bankable_one() {
+        // A credit that expires before its window would reset anyway is
+        // use-it-or-lose-it: spending it costs nothing.
+        let candidates = vec![
+            with_reset("bankable", false, 700.0, 1000, false),
+            with_reset("lapsing", false, 900.0, 5000, true),
+        ];
+        for mode in [true, false] {
+            assert_eq!(
+                select_recovery(candidates.clone(), mode).unwrap().alias,
+                "lapsing",
+                "reset_aware={mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_salvages_a_lapsing_credit_before_switching_to_a_billing_account() {
+        // Both options leave a billing-capable account in hand, but one also
+        // rescues a credit that would otherwise evaporate.
+        let candidates = vec![
+            headroom("billing", true, 10.0, 1000),
+            with_reset("lapsing", true, 700.0, 5000, true),
+        ];
+        for mode in [true, false] {
+            assert_eq!(
+                select_recovery(candidates.clone(), mode).unwrap().alias,
+                "lapsing",
+                "reset_aware={mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_still_prefers_billing_headroom_over_spending_a_bankable_credit() {
+        let candidates = vec![
+            headroom("billing", true, 10.0, 1000),
+            with_reset("bankable", true, 700.0, 5000, false),
+        ];
+        assert_eq!(
+            select_recovery(candidates, true).unwrap().alias,
+            "billing",
+            "a credit worth keeping must not be spent to avoid a billing switch"
+        );
+    }
+
+    #[test]
+    fn reset_aware_recovery_spends_the_soonest_expiring_credit_first() {
+        let candidates = vec![
+            with_reset("later", false, 700.0, 5000, false),
+            with_reset("sooner", false, 700.0, 1000, false),
+        ];
+        assert_eq!(
+            select_recovery(candidates, true).unwrap().alias,
+            "sooner",
+            "drain the credit closest to lapsing"
+        );
+    }
+
+    #[test]
+    fn natural_reset_ts_uses_the_latest_exhausted_window() {
+        // Only exhausted windows gate the account; the 7d one clears last.
+        let usage = api::RateLimitResponse {
+            rate_limit: Some(api::RateLimit {
+                primary: Some(window_resetting_at(100.0, 1_000)),
+                secondary: Some(window_resetting_at(100.0, 9_000)),
+                primary_window: None,
+                secondary_window: None,
+            }),
+            ..team_response(100.0, 100.0, true)
+        };
+        assert_eq!(natural_reset_ts(&usage), Some(9_000));
+    }
+
+    #[test]
+    fn natural_reset_ts_ignores_windows_with_headroom() {
+        let usage = api::RateLimitResponse {
+            rate_limit: Some(api::RateLimit {
+                primary: Some(window_resetting_at(100.0, 1_000)),
+                secondary: Some(window_resetting_at(40.0, 9_000)),
+                primary_window: None,
+                secondary_window: None,
+            }),
+            ..team_response(100.0, 40.0, true)
+        };
+        assert_eq!(natural_reset_ts(&usage), Some(1_000));
+    }
+
+    #[test]
+    fn reset_plan_picks_the_soonest_expiring_available_credit() {
+        let details = api::ResetCreditsDetails {
+            credits: vec![
+                credit("late", "available", Some("2026-08-12T00:00:00Z")),
+                credit("soon", "available", Some("2026-07-26T00:00:00Z")),
+                // Already spent, and expiring earliest — must be ignored.
+                credit("spent", "redeemed", Some("2026-07-01T00:00:00Z")),
+            ],
+            available_count: 2,
+        };
+        let plan = reset_plan(Some(&details), None);
+        assert_eq!(plan.credit_id.as_deref(), Some("soon"));
+    }
+
+    #[test]
+    fn reset_plan_flags_a_credit_that_would_lapse_before_the_window_resets() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-07-26T00:00:00Z")
+            .unwrap()
+            .timestamp();
+        let details = api::ResetCreditsDetails {
+            credits: vec![credit("c", "available", Some("2026-07-26T00:00:00Z"))],
+            available_count: 1,
+        };
+
+        // Window clears after the credit lapses -> the credit is worthless if
+        // held, so spending it is free.
+        assert!(reset_plan(Some(&details), Some(expires_at + 60)).expires_unused);
+        // Window clears first -> the credit stays bankable for a later crunch.
+        assert!(!reset_plan(Some(&details), Some(expires_at - 60)).expires_unused);
+        // Unknown reset time -> never assume the credit is free to burn.
+        assert!(!reset_plan(Some(&details), None).expires_unused);
+    }
+
+    #[test]
+    fn reset_plan_without_a_readable_listing_defers_the_pick_to_the_backend() {
+        // The usage response already confirmed a credit is applicable, so a
+        // failed listing must not block recovery.
+        let plan = reset_plan(None, Some(1_000));
+        assert_eq!(plan.credit_id, None);
+        assert!(!plan.expires_unused);
     }
 }

@@ -61,6 +61,10 @@ Usage-Based Accounts
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
 The account column is the saved profile alias, with `*` marking the active account.
 
+The `Resets` column shows banked rate-limit resets (see [Banked resets](#banked-resets)):
+`3 (2 now)` means three are held and two can be redeemed this second; a bare count turns red when
+a credit lapses within three days.
+
 The `Token` column shows how long the stored access token is good for **without re-logging in**
 (green = days left, yellow = hours, red = under an hour). An `invalidated` value means OpenAI revoked
 the grant server-side even though the token has not yet timed out — this happens when another seat
@@ -137,6 +141,64 @@ CODEXCTL_SELECT=most-available codexctl codex -- "..."
 export CODEXCTL_SELECT=most-available   # alias: headroom / legacy
 ```
 
+### Banked resets
+
+OpenAI grants **banked rate-limit resets**: credits that clear an exhausted usage window on demand
+instead of waiting for it to lapse. They are per-account, expire ~30 days after they are granted,
+and are not refundable — so codexctl treats them as scarce.
+
+```bash
+codexctl resets                     # what every account holds, and when it expires
+codexctl reset                      # redeem one for the active account
+codexctl reset amir+5@sawmills.ai   # ...or for a specific one
+codexctl reset --yes                # skip the confirmation (unattended)
+codexctl resets --claim             # redeem everything about to lapse
+codexctl resets --claim --within-days 7 --yes
+```
+
+```text
+┌─────────────────────┬────────┬────────────┬────────────────────────┐
+│ Account             ┆ Banked ┆ Redeemable ┆ Expiries               │
+╞═════════════════════╪════════╪════════════╪════════════════════════╡
+│ amir+p3@sawmills.ai ┆ 2      ┆ 2          ┆ Jul 31, Aug 12         │
+│ * amir@sawmills.ai  ┆ 3      ┆ 0          ┆ Jul 26, Jul 31, Aug 12 │
+└─────────────────────┴────────┴────────────┴────────────────────────┘
+```
+
+A reset only clears an _already-exhausted_ window — the backend reports zero redeemable credits
+until an account actually hits 100%, and codexctl refuses to redeem before that rather than waste
+one. When several credits qualify, it always spends the one closest to expiring.
+
+`--claim` sweeps the whole fleet and redeems credits that are about to lapse (default: within three
+days) on accounts that are already at 100%. Those credits are the ones with nothing left to lose:
+the account cannot be used right now anyway, and the credit is about to evaporate. Note the flip
+side — a credit on an account that is _not_ yet at 100% cannot be rescued at all, since the backend
+will not apply a reset to a window that has nothing to clear.
+
+### Reset-aware recovery
+
+Both `codexctl use` (no alias) and `codexctl codex` recovery pick accounts from one cost-ranked
+ladder, cheapest option first:
+
+1. A no-bill account that still has rate-limit headroom — used silently, as before.
+2. A banked reset whose credit would **expire before its window resets anyway** — redeemed without
+   prompting, since holding it back cannot pay off.
+3. A banked reset worth keeping — asks for confirmation, or pass `--allow-resets`.
+4. A credit-billing account — asks for confirmation, or pass `--allow-billing`.
+
+Resets rank ahead of credit-billing accounts because they cost no money. `--allow-billing` does
+**not** imply permission to spend resets; each is approved separately.
+
+```bash
+codexctl use --allow-resets                                       # unattended: may spend resets
+codexctl codex --allow-resets -- "start prompt"
+codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
+```
+
+So when every account is exhausted, `codexctl use` redeems a reset and hands back an account that
+actually works, instead of a seat sitting at 100%. Passing an explicit alias never redeems — use
+`codexctl reset <alias>` to spend a credit on a named account.
+
 ### Other commands
 
 ```bash
@@ -144,6 +206,8 @@ codexctl list          # list saved profiles
 codexctl login <alias> # isolated Codex login and save
 codexctl whoami        # show active account
 codexctl codex -- ...  # run Codex with spend-cap recovery
+codexctl resets        # list banked rate-limit resets
+codexctl reset [alias] # redeem a banked reset
 codexctl remove <alias>
 ```
 
@@ -168,7 +232,13 @@ Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a cop
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
 When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is
-scoped to the intended account/workspace.
+scoped to the intended account/workspace. Windows are matched by their declared duration rather
+than by position, since plans that publish only a weekly limit return it in the `primary_window`
+slot.
+
+Banked resets use `wham/rate-limit-reset-credits` to list credits and
+`wham/rate-limit-reset-credits/consume` to redeem one. Redemptions carry a client-generated
+idempotency key, so retrying a timed-out request never spends a second credit.
 
 Supports both Codex CLI auth formats:
 

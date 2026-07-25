@@ -38,9 +38,37 @@ enum Commands {
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
         alias: Option<String>,
+        /// When auto-selecting and no account has headroom left, redeem a
+        /// banked reset without prompting (resets are scarce and expire)
+        #[arg(long)]
+        allow_resets: bool,
     },
     /// Interactive fuzzy picker to switch accounts
     Switch,
+    /// List banked rate-limit resets across all accounts
+    Resets {
+        /// Redeem every banked reset that is about to lapse on an account
+        /// that is already rate-limited, instead of just listing them
+        #[arg(long)]
+        claim: bool,
+        /// How soon a credit must lapse to be claimed, in days
+        #[arg(long, default_value_t = 3, requires = "claim")]
+        within_days: i64,
+        /// Claim without confirming (for unattended runs)
+        #[arg(long, short = 'y', requires = "claim")]
+        yes: bool,
+    },
+    /// Redeem a banked rate-limit reset to clear an exhausted window
+    Reset {
+        /// Profile alias to redeem for (defaults to the active account)
+        alias: Option<String>,
+        /// Redeem without confirming (for unattended runs)
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Redeem a specific credit id (defaults to the soonest-expiring one)
+        #[arg(long)]
+        credit: Option<String>,
+    },
     /// List saved profiles
     List,
     /// Remove a saved profile
@@ -59,6 +87,12 @@ enum Commands {
         /// prompting (use for unattended runs; it may spend credits)
         #[arg(long)]
         allow_billing: bool,
+        /// Allow recovery to redeem a banked rate-limit reset without
+        /// prompting (use for unattended runs; resets are scarce and expire).
+        /// A reset that would lapse before its window resets anyway is always
+        /// redeemed without prompting, flag or not.
+        #[arg(long)]
+        allow_resets: bool,
         /// Arguments forwarded to codex
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -94,8 +128,27 @@ fn main() {
         }
         Commands::Login { ref alias } => commands::login::run(alias),
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
-        Commands::Use { ref alias } => commands::use_profile::run(alias.as_deref()),
+        Commands::Use {
+            ref alias,
+            allow_resets,
+        } => commands::use_profile::run(alias.as_deref(), allow_resets),
         Commands::Switch => commands::switch::run(),
+        Commands::Resets {
+            claim,
+            within_days,
+            yes,
+        } => {
+            if claim {
+                commands::resets::run_claim(within_days, yes)
+            } else {
+                commands::resets::run_list()
+            }
+        }
+        Commands::Reset {
+            ref alias,
+            yes,
+            ref credit,
+        } => commands::resets::run_redeem(alias.as_deref(), yes, credit.as_deref()),
         Commands::List => commands::list::run(),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
@@ -103,8 +156,14 @@ fn main() {
             ref args,
             ref recovery_prompt,
             allow_billing,
-        } => codex_command_outcome(commands::codex::run(args, recovery_prompt, allow_billing))
-            .into_result(),
+            allow_resets,
+        } => codex_command_outcome(commands::codex::run(
+            args,
+            recovery_prompt,
+            allow_billing,
+            allow_resets,
+        ))
+        .into_result(),
         Commands::Completions { shell } => commands::completions::run(shell),
     };
 

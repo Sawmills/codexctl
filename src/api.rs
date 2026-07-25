@@ -35,6 +35,26 @@ pub struct RateLimitResponse {
     pub rate_limit: Option<RateLimit>,
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
+    /// Banked rate-limit reset credits, when the plan has any.
+    pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
+}
+
+impl RateLimitResponse {
+    /// How many banked resets are held, redeemable or not.
+    pub fn reset_credits_available(&self) -> i64 {
+        self.rate_limit_reset_credits
+            .as_ref()
+            .map_or(0, |c| c.available_count)
+    }
+
+    /// How many banked resets can be redeemed *right now*. The backend only
+    /// counts a credit as applicable once a window is actually exhausted, so
+    /// this is the authoritative "would a redeem do anything" signal.
+    pub fn reset_credits_applicable(&self) -> i64 {
+        self.rate_limit_reset_credits
+            .as_ref()
+            .map_or(0, |c| c.applicable_available_count)
+    }
 }
 
 #[derive(Deserialize)]
@@ -46,12 +66,50 @@ pub struct RateLimit {
     pub secondary_window: Option<RateLimitWindow>,
 }
 
+/// Windows at or under this duration are the short (5h) window; longer ones are
+/// the long (7d) window.
+const SHORT_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
+
 impl RateLimit {
-    pub fn primary(&self) -> Option<&RateLimitWindow> {
+    fn first(&self) -> Option<&RateLimitWindow> {
         self.primary.as_ref().or(self.primary_window.as_ref())
     }
-    pub fn secondary(&self) -> Option<&RateLimitWindow> {
+
+    fn second(&self) -> Option<&RateLimitWindow> {
         self.secondary.as_ref().or(self.secondary_window.as_ref())
+    }
+
+    /// The short (5h) window.
+    ///
+    /// Windows are matched by their declared duration rather than by position:
+    /// plans that no longer publish a 5h window return their weekly window in
+    /// the `primary_window` slot, and reading that positionally would report a
+    /// weekly limit as a 5h one. Windows with no declared duration fall back to
+    /// the historical positional reading.
+    pub fn short_window(&self) -> Option<&RateLimitWindow> {
+        self.window_matching(|seconds| seconds <= SHORT_WINDOW_MAX_SECONDS, Self::first)
+    }
+
+    /// The long (7d) window. See [`RateLimit::short_window`] for how windows are
+    /// matched.
+    pub fn long_window(&self) -> Option<&RateLimitWindow> {
+        self.window_matching(|seconds| seconds > SHORT_WINDOW_MAX_SECONDS, Self::second)
+    }
+
+    fn window_matching(
+        &self,
+        matches: impl Fn(u64) -> bool,
+        positional: impl Fn(&Self) -> Option<&RateLimitWindow>,
+    ) -> Option<&RateLimitWindow> {
+        for window in [self.first(), self.second()].into_iter().flatten() {
+            if window.duration_seconds().is_some_and(&matches) {
+                return Some(window);
+            }
+        }
+        // Nothing declares a duration in this class. Fall back to the historical
+        // positional reading only when that window's duration is unknown, so a
+        // response that does publish durations is never misread.
+        positional(self).filter(|w| w.duration_seconds().is_none())
     }
 }
 
@@ -76,6 +134,168 @@ impl RateLimitWindow {
                 .map(|s| chrono::Utc::now().timestamp() + s)
         })
     }
+
+    /// How long this window spans, from whichever field the API published.
+    pub fn duration_seconds(&self) -> Option<u64> {
+        self.limit_window_seconds
+            .or_else(|| self.window_minutes.map(|m| m * 60))
+    }
+}
+
+/// Banked rate-limit reset credits, as summarized on the usage response.
+#[derive(Deserialize)]
+pub struct ResetCreditsSummary {
+    pub available_count: i64,
+    /// Credits redeemable right now. The backend reports this as zero until a
+    /// rate-limit window is actually exhausted — there is nothing to reset
+    /// before that, and redeeming would waste the credit.
+    #[serde(default)]
+    pub applicable_available_count: i64,
+}
+
+#[derive(Deserialize)]
+pub struct ResetCreditsDetails {
+    #[serde(default)]
+    pub credits: Vec<ResetCredit>,
+    #[serde(default)]
+    pub available_count: i64,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct ResetCredit {
+    pub id: String,
+    pub status: String,
+    #[allow(dead_code)]
+    pub reset_type: Option<String>,
+    #[allow(dead_code)]
+    pub granted_at: Option<String>,
+    pub expires_at: Option<String>,
+    pub title: Option<String>,
+    #[allow(dead_code)]
+    pub description: Option<String>,
+}
+
+impl ResetCredit {
+    /// Only `available` credits can be redeemed; the rest are already spent,
+    /// in flight, or cooling down.
+    pub fn is_available(&self) -> bool {
+        self.status == "available"
+    }
+
+    pub fn expires_at_timestamp(&self) -> Option<i64> {
+        parse_rfc3339(self.expires_at.as_deref()?)
+    }
+}
+
+fn parse_rfc3339(value: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// Outcome of redeeming a banked reset.
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumeResetCode {
+    /// The credit was spent and the window(s) cleared.
+    Reset,
+    /// No exhausted window to clear, so no credit was spent.
+    NothingToReset,
+    /// The account holds no redeemable credit.
+    NoCredit,
+    /// This redemption request was already applied.
+    AlreadyRedeemed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+pub struct ConsumeResetResponse {
+    pub code: ConsumeResetCode,
+    #[serde(default)]
+    pub windows_reset: i64,
+}
+
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+
+pub async fn fetch_reset_credits_async(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ResetCreditsDetails> {
+    let mut request = client.get(RESET_CREDITS_URL).bearer_auth(access_token);
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+
+    let resp = request
+        .send()
+        .await
+        .context("failed to reach reset credits API")?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!("expired");
+    }
+    if !status.is_success() {
+        anyhow::bail!("reset credits API returned {status}");
+    }
+
+    resp.json::<ResetCreditsDetails>()
+        .await
+        .context("failed to parse reset credits response")
+}
+
+/// Redeem one banked reset, clearing the account's exhausted rate-limit window.
+///
+/// `redeem_request_id` is the idempotency key: retrying a timed-out redemption
+/// with the same key returns `AlreadyRedeemed` instead of spending a second
+/// credit, so callers must reuse it across retries of the *same* redemption.
+pub async fn consume_reset_credit_async(
+    client: &reqwest::Client,
+    access_token: &str,
+    account_id: Option<&str>,
+    redeem_request_id: &str,
+    credit_id: Option<&str>,
+) -> Result<ConsumeResetResponse> {
+    let mut body = serde_json::json!({ "redeem_request_id": redeem_request_id });
+    if let Some(credit_id) = credit_id {
+        body["credit_id"] = serde_json::Value::String(credit_id.to_string());
+    }
+
+    let mut request = client
+        .post(format!("{RESET_CREDITS_URL}/consume"))
+        .bearer_auth(access_token)
+        .json(&body);
+    if let Some(account_id) = account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+
+    let resp = request
+        .send()
+        .await
+        .context("failed to reach reset credits API")?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        anyhow::bail!("expired");
+    }
+    if !status.is_success() {
+        anyhow::bail!("reset credits API returned {status}");
+    }
+
+    resp.json::<ConsumeResetResponse>()
+        .await
+        .context("failed to parse reset redemption response")
+}
+
+/// A unique idempotency key for one redemption attempt.
+pub fn new_redeem_request_id(alias: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("codexctl-{alias}-{nanos}")
 }
 
 #[derive(Deserialize)]
