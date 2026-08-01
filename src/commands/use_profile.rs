@@ -585,27 +585,10 @@ fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
     // General account selection uses the backward-compatible main Codex
     // bucket. Treating any model-specific additional bucket as account-wide
     // exhaustion would hide capacity that other models can still use.
-    let h5 = usage
+    usage
         .rate_limit
         .as_ref()
-        .and_then(|r| r.short_window())
-        .map(|w| w.used_percent)
-        .unwrap_or(0.0);
-    let d7 = usage
-        .rate_limit
-        .as_ref()
-        .and_then(|r| r.long_window())
-        .map(|w| w.used_percent)
-        .unwrap_or(0.0);
-    if h5 >= 100.0 && d7 >= 100.0 {
-        900.0
-    } else if d7 >= 100.0 {
-        700.0 + h5
-    } else if h5 >= 100.0 {
-        500.0 + d7
-    } else {
-        h5 * 2.0 + d7
-    }
+        .map_or(0.0, api::RateLimit::availability_score)
 }
 
 fn selection_bills_credits(usage: &api::RateLimitResponse) -> bool {

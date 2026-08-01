@@ -241,6 +241,121 @@ fn parse_rate_limit_response_weekly_only_maps_to_long_window() {
 }
 
 #[test]
+fn parse_two_subday_windows_uses_declared_duration_order() {
+    let json = r#"{
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 42,
+                "window_minutes": 60
+            },
+            "secondary_window": {
+                "used_percent": 25,
+                "window_minutes": 15
+            }
+        }
+    }"#;
+    let response: RateLimitResponse = serde_json::from_str(json).unwrap();
+    let rate_limit = response.rate_limit.unwrap();
+
+    let short = rate_limit.short_window().unwrap();
+    assert_eq!(short.duration_seconds(), Some(15 * 60));
+    assert_eq!(short.duration_label().as_deref(), Some("15m"));
+
+    let long = rate_limit.long_window().unwrap();
+    assert_eq!(long.duration_seconds(), Some(60 * 60));
+    assert_eq!(long.duration_label().as_deref(), Some("1h"));
+
+    assert_eq!(rate_limit.windows().count(), 2);
+}
+
+#[test]
+fn partial_duration_metadata_does_not_override_declared_weekly_window() {
+    let response: RateLimitResponse = serde_json::from_str(
+        r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 604800
+                },
+                "secondary_window": {"used_percent": 0}
+            }
+        }"#,
+    )
+    .unwrap();
+    let rate_limit = response.rate_limit.unwrap();
+
+    assert!(rate_limit.short_window().is_none());
+    assert_eq!(
+        rate_limit
+            .long_window()
+            .and_then(|window| window.duration_seconds()),
+        Some(604800)
+    );
+}
+
+#[test]
+fn durationless_secondary_remains_long_when_primary_declares_short_duration() {
+    let response: RateLimitResponse = serde_json::from_str(
+        r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 40,
+                    "window_minutes": 300
+                },
+                "secondary_window": {"used_percent": 100}
+            }
+        }"#,
+    )
+    .unwrap();
+    let rate_limit = response.rate_limit.unwrap();
+
+    assert_eq!(
+        rate_limit.short_window().map(|window| window.used_percent),
+        Some(40.0)
+    );
+    assert_eq!(
+        rate_limit.long_window().map(|window| window.used_percent),
+        Some(100.0)
+    );
+    assert_eq!(rate_limit.availability_score(), 740.0);
+}
+
+#[test]
+fn durationless_secondary_only_window_stays_long_term() {
+    let response: RateLimitResponse = serde_json::from_str(
+        r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "secondary_window": {
+                    "used_percent": 100,
+                    "reset_at": 1785453503
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    let rate_limit = response.rate_limit.unwrap();
+
+    assert!(rate_limit.short_window().is_none());
+    assert_eq!(
+        rate_limit
+            .long_window()
+            .and_then(|window| window.reset_timestamp()),
+        Some(1785453503)
+    );
+    assert_eq!(
+        rate_limit
+            .windows()
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>(),
+        vec![1]
+    );
+}
+
+#[test]
 fn parse_rate_limit_reset_credits() {
     let json = r#"{
         "plan_type": "pro",
