@@ -90,6 +90,25 @@ pub struct StoreLock {
 }
 
 pub fn lock(paths: &Paths) -> Result<StoreLock> {
+    let (file, lock_path) = open_lock_file(paths)?;
+    file.lock()
+        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+    Ok(StoreLock { _file: file })
+}
+
+/// Try to acquire the store lock without waiting.
+pub fn try_lock(paths: &Paths) -> Result<Option<StoreLock>> {
+    let (file, lock_path) = open_lock_file(paths)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(StoreLock { _file: file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("failed to lock {}", lock_path.display()))
+        }
+    }
+}
+
+fn open_lock_file(paths: &Paths) -> Result<(File, PathBuf)> {
     ensure_private_dir(&paths.codexctl_dir())?;
     let lock_path = paths.codexctl_dir().join("store.lock");
     let file = OpenOptions::new()
@@ -100,9 +119,7 @@ pub fn lock(paths: &Paths) -> Result<StoreLock> {
         .open(&lock_path)
         .with_context(|| format!("failed to open {}", lock_path.display()))?;
     set_private_file_permissions(&lock_path)?;
-    file.lock()
-        .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(StoreLock { _file: file })
+    Ok((file, lock_path))
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -282,5 +299,14 @@ mod tests {
 
         assert!(profile_dir(&paths, "work").is_err());
         assert!(profile_dir(&paths, "Work").is_ok());
+    }
+
+    #[test]
+    fn try_lock_returns_without_waiting_when_store_is_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(temp.path().to_path_buf());
+        let _lock = lock(&paths).unwrap();
+
+        assert!(try_lock(&paths).unwrap().is_none());
     }
 }

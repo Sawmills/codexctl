@@ -312,7 +312,10 @@ fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path) {
 
 pub fn update_meta_plan_from(paths: &Paths, alias: &str, plan: &str) -> Result<()> {
     let alias = store::validate_alias(alias)?;
-    let _lock = store::lock(paths)?;
+    let Some(_lock) = store::try_lock(paths)? else {
+        eprintln!("warning: skipped profile metadata update while the store was busy");
+        return Ok(());
+    };
     let dir = store::profile_dir(paths, alias)?;
     let meta_path = dir.join("meta.json");
     if !meta_path.exists() {
