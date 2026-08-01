@@ -183,6 +183,24 @@ fn billing_class_is_conservative_for_missing_or_changed_metadata() {
         serde_json::from_str(r#"{"plan_type":"new_plan","rate_limit":null}"#).unwrap();
     assert_eq!(unknown.billing_class(), BillingClass::Unknown);
 
+    let unknown_with_window: RateLimitResponse = serde_json::from_str(
+        r#"{"plan_type":"new_plan","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800}}}"#,
+    )
+    .unwrap();
+    assert_eq!(unknown_with_window.billing_class(), BillingClass::Unknown);
+
+    for credits in [
+        r#"{"has_credits":true}"#,
+        r#"{"has_credits":false,"unlimited":true}"#,
+        r#"{"has_credits":false,"overage_limit_reached":true}"#,
+    ] {
+        let mixed: RateLimitResponse = serde_json::from_str(&format!(
+            r#"{{"plan_type":"pro","rate_limit":{{"primary_window":{{"used_percent":1,"limit_window_seconds":604800}}}},"credits":{credits}}}"#
+        ))
+        .unwrap();
+        assert_eq!(mixed.billing_class(), BillingClass::Unknown);
+    }
+
     let empty_rate_limit: RateLimitResponse =
         serde_json::from_str(r#"{"plan_type":"new_plan","rate_limit":{}}"#).unwrap();
     assert_eq!(empty_rate_limit.billing_class(), BillingClass::Unknown);

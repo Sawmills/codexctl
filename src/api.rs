@@ -48,19 +48,23 @@ pub struct RateLimitResponse {
 impl RateLimitResponse {
     /// Classify the account before any automatic selection can spend credits.
     pub fn billing_class(&self) -> BillingClass {
-        if self
-            .plan_type
-            .as_deref()
-            .is_some_and(|plan| plan.contains("usage_based"))
-        {
+        let plan = self.plan_type.as_deref();
+        if plan.is_some_and(|plan| plan.contains("usage_based")) {
             return BillingClass::UsageBased;
         }
+        let has_credit_billing = self.credits.as_ref().is_some_and(|credits| {
+            credits.has_credits || credits.unlimited || credits.overage_limit_reached
+        });
         if self.rate_limit.as_ref().is_some_and(RateLimit::has_window) {
+            // A new plan name or mixed rate-limit and credit evidence is not
+            // proof that automatic use is free. Keep it out of selection until
+            // its contract is understood and added deliberately.
+            if has_credit_billing || !plan.is_some_and(is_known_rate_limited_plan) {
+                return BillingClass::Unknown;
+            }
             return BillingClass::RateLimited;
         }
-        if self.credits.as_ref().is_some_and(|credits| {
-            credits.has_credits || credits.unlimited || credits.overage_limit_reached
-        }) {
+        if has_credit_billing {
             return BillingClass::UsageBased;
         }
         BillingClass::Unknown
@@ -81,6 +85,13 @@ impl RateLimitResponse {
             .as_ref()
             .map_or(0, |c| c.applicable_available_count)
     }
+}
+
+fn is_known_rate_limited_plan(plan: &str) -> bool {
+    matches!(
+        plan,
+        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

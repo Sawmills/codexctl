@@ -56,9 +56,11 @@ An account is "usage-based" when:
 - `rate_limit` is `null` AND `credits` is present with `has_credits: true`, OR
 - `plan_type` contains `usage_based`
 
-All other accounts with rate limit windows are "rate-limited".
+An account is "rate-limited" only when it has rate-limit windows, its `plan_type` is in the known
+subscription allowlist, and it has no conflicting positive credit evidence.
 
-Successful responses with neither rate-limit windows nor positive credit evidence are `Unknown`.
+New plan names, mixed rate-limit and positive-credit responses, and successful responses with
+neither rate-limit windows nor positive credit evidence are `Unknown`.
 Unknown accounts can appear as status errors, but automatic selection and recovery must not use
 them. This keeps unfamiliar subscription metadata out of any path that can spend credits.
 

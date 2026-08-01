@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -14,18 +15,29 @@ use crate::profile;
 /// 100% — i.e. the account has no usable headroom right now.
 const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
 
-pub fn run(alias: Option<&str>, allow_resets: bool) -> Result<()> {
-    run_to_auth_json(alias, &config::codex_auth_json()?, allow_resets)
+pub fn run(alias: Option<&str>, allow_billing: bool, allow_resets: bool) -> Result<()> {
+    run_to_auth_json(
+        alias,
+        &config::codex_auth_json()?,
+        allow_billing,
+        allow_resets,
+    )
 }
 
-pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path, allow_resets: bool) -> Result<()> {
-    run_to_auth_json_excluding(alias, auth_json, None, allow_resets)
+pub fn run_to_auth_json(
+    alias: Option<&str>,
+    auth_json: &Path,
+    allow_billing: bool,
+    allow_resets: bool,
+) -> Result<()> {
+    run_to_auth_json_excluding(alias, auth_json, None, allow_billing, allow_resets)
 }
 
 pub fn run_to_auth_json_excluding(
     alias: Option<&str>,
     auth_json: &Path,
     excluded_alias: Option<&str>,
+    allow_billing: bool,
     allow_resets: bool,
 ) -> Result<()> {
     match alias::optional(alias)? {
@@ -39,7 +51,7 @@ pub fn run_to_auth_json_excluding(
             status::run_focused(a)?;
         }
         None => {
-            let best = find_most_available_excluding(excluded_alias, allow_resets)?;
+            let best = find_most_available_excluding(excluded_alias, allow_billing, allow_resets)?;
             let email = profile::switch_to_auth_json(&best, auth_json)?;
             println!("auto-selected most available: {} ({})", best, email);
             println!();
@@ -51,6 +63,7 @@ pub fn run_to_auth_json_excluding(
 
 fn find_most_available_excluding(
     excluded_alias: Option<&str>,
+    allow_billing: bool,
     allow_resets: bool,
 ) -> Result<String> {
     let all_profiles = profile::list_profiles()?;
@@ -79,8 +92,14 @@ fn find_most_available_excluding(
         })
         .collect();
 
-    // An account that still has headroom is always preferred and spends nothing.
+    // Prefer existing headroom before spending a banked reset. A seat that can
+    // bill after its hard window still requires separate billing consent.
     if let Some(alias) = select_with_headroom(&scored, reset_aware()) {
+        let candidate = scored
+            .iter()
+            .find(|candidate| candidate.alias == alias)
+            .expect("selected candidate must exist");
+        require_billing_approval(candidate, allow_billing)?;
         return Ok(alias.to_string());
     }
 
@@ -90,6 +109,7 @@ fn find_most_available_excluding(
     if let Some(candidate) = best_candidate_from_usages(usages)?
         && let Some(plan) = candidate.reset_plan()
     {
+        require_recovery_billing_approval(&candidate, allow_billing)?;
         if !resets::approve_redemption(
             &candidate.alias,
             plan.expires_at,
@@ -119,9 +139,84 @@ fn find_most_available_excluding(
     // No reset can help either: fall back to the least-bad account, exactly as
     // before, so `use` still hands back something rather than failing outright.
     match select_most_available(&scored, reset_aware()) {
-        Some(alias) => Ok(alias.to_string()),
+        Some(alias) => {
+            let candidate = scored
+                .iter()
+                .find(|candidate| candidate.alias == alias)
+                .expect("selected candidate must exist");
+            require_billing_approval(candidate, allow_billing)?;
+            Ok(alias.to_string())
+        }
         None => bail!("no usable accounts found (all expired or errored)"),
     }
+}
+
+fn require_billing_approval(candidate: &SelectionCandidate, allow_billing: bool) -> Result<()> {
+    if !candidate.bills_credits || approve_billing_account(&candidate.alias, allow_billing) {
+        return Ok(());
+    }
+    bail!(
+        "switching to {} may use credits and was not approved",
+        candidate.alias
+    )
+}
+
+fn require_recovery_billing_approval(
+    candidate: &RecoveryCandidate,
+    allow_billing: bool,
+) -> Result<()> {
+    if !candidate.bills_credits || approve_billing_account(&candidate.alias, allow_billing) {
+        return Ok(());
+    }
+    bail!(
+        "switching to {} may use credits and was not approved",
+        candidate.alias
+    )
+}
+
+fn approve_billing_account(alias: &str, allow_billing: bool) -> bool {
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    approve_billing_account_from(
+        alias,
+        allow_billing,
+        stdin.is_terminal(),
+        &mut input,
+        &mut std::io::stderr(),
+    )
+}
+
+fn approve_billing_account_from(
+    alias: &str,
+    allow_billing: bool,
+    is_terminal: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> bool {
+    if allow_billing {
+        let _ = writeln!(
+            output,
+            "codexctl: --allow-billing set; switching to {alias} (may use credits)"
+        );
+        return true;
+    }
+    if !is_terminal {
+        let _ = writeln!(
+            output,
+            "codexctl: not switching to {alias} (no terminal to approve credit billing; pass --allow-billing to allow)"
+        );
+        return false;
+    }
+    let _ = write!(
+        output,
+        "codexctl: switch to {alias} and allow it to use credits? [y/N] "
+    );
+    let _ = output.flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Whether selection prefers the soonest-resetting eligible account.
@@ -169,11 +264,10 @@ struct SelectionCandidate {
 
 /// Pick the most-available alias from scored candidates.
 ///
-/// Default (`reset_aware == false`): lowest `selection_score` (most headroom),
-/// exactly as before. Reset-aware: among accounts with usable headroom
-/// (`score < RATE_LIMIT_EXHAUSTED`) pick no-bill accounts first, then the
-/// soonest 7d reset, breaking ties by most headroom; if none have headroom, fall
-/// back to the default pick so the behavior degrades identically to today.
+/// Every mode keeps no-bill accounts ahead of billing accounts. Default
+/// (`reset_aware == false`) then uses the lowest `selection_score` (most
+/// headroom). Reset-aware then uses the soonest 7d reset, breaking ties by most
+/// headroom. If none have headroom, fall back to the least-bad safe class.
 fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
     if let Some(alias) = select_with_headroom(scored, reset_aware) {
         return Some(alias);
@@ -181,9 +275,11 @@ fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Op
     scored
         .iter()
         .min_by(|a, b| {
-            a.score
-                .partial_cmp(&b.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            a.bills_credits.cmp(&b.bills_credits).then(
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         })
         .filter(|candidate| candidate.score < f64::MAX)
         .map(|candidate| candidate.alias.as_str())
@@ -192,10 +288,8 @@ fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Op
 /// The best account that still has usable rate-limit headroom, or `None` when
 /// every account is exhausted (or usage-based, which is never auto-selected).
 ///
-/// Reset-aware: no-bill accounts first, then the soonest 7d reset, then most
-/// headroom. Default: most headroom — which, since any exhausted account scores
-/// at least [`RATE_LIMIT_EXHAUSTED`] and any account with headroom scores below
-/// it, is the same account the legacy global-minimum pick would have chosen.
+/// Both modes put no-bill accounts first. Reset-aware then uses the soonest 7d
+/// reset and most headroom. Default uses most headroom within the billing class.
 fn select_with_headroom(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
     scored
         .iter()
@@ -208,7 +302,7 @@ fn select_with_headroom(scored: &[SelectionCandidate], reset_aware: bool) -> Opt
                     .then(a.secondary_reset_ts.cmp(&b.secondary_reset_ts))
                     .then(by_score)
             } else {
-                by_score
+                a.bills_credits.cmp(&b.bills_credits).then(by_score)
             }
         })
         .map(|candidate| candidate.alias.as_str())
@@ -830,6 +924,24 @@ mod tests {
     }
 
     #[test]
+    fn selection_never_picks_unknown_or_mixed_billing_accounts() {
+        let mut unknown = team_response(5.0, 10.0, true);
+        unknown.plan_type = Some("new_plan".to_string());
+        assert_eq!(selection_score(&unknown), f64::MAX);
+        assert_eq!(recovery_class(&unknown), None);
+
+        let mut mixed = team_response(5.0, 10.0, true);
+        mixed.credits = Some(api::Credits {
+            has_credits: true,
+            unlimited: false,
+            overage_limit_reached: false,
+            balance: None,
+        });
+        assert_eq!(selection_score(&mixed), f64::MAX);
+        assert_eq!(recovery_class(&mixed), None);
+    }
+
+    #[test]
     fn recovery_skips_usage_based_accounts() {
         assert_eq!(recovery_class(&usage_based_response()), None);
     }
@@ -911,14 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn legacy_selection_picks_most_headroom_even_when_it_bills() {
-        // `CODEXCTL_SELECT=most-available` is the explicit legacy opt-out from
-        // reset-aware selection; it must preserve pure most-headroom ordering.
+    fn most_available_selection_keeps_no_bill_first() {
+        // The reset-order opt-out cannot disable the billing safety order.
         let scored = vec![
             selection_candidate("billing", true, 20.0, 1000),
             selection_candidate("no-bill", false, 60.0, 2000),
         ];
-        assert_eq!(select_most_available(&scored, false), Some("billing"));
+        assert_eq!(select_most_available(&scored, false), Some("no-bill"));
     }
 
     #[test]
@@ -987,17 +1098,43 @@ mod tests {
         assert_eq!(select_most_available(&scored, true), Some("a"));
     }
 
-    /// Legacy mode is documented as pure most-headroom ordering, and the
-    /// headroom pre-pass must not change which account that picks.
+    /// Most-headroom mode must not bypass the no-bill safety order.
     #[test]
-    fn select_with_headroom_matches_the_legacy_pick_when_headroom_exists() {
+    fn select_with_headroom_keeps_no_bill_first_in_most_available_mode() {
         let scored = vec![
             selection_candidate("billing", true, 20.0, 1000),
             selection_candidate("no-bill", false, 60.0, 2000),
             selection_candidate("exhausted", false, 700.0, 500),
         ];
-        assert_eq!(select_with_headroom(&scored, false), Some("billing"));
-        assert_eq!(select_most_available(&scored, false), Some("billing"));
+        assert_eq!(select_with_headroom(&scored, false), Some("no-bill"));
+        assert_eq!(select_most_available(&scored, false), Some("no-bill"));
+    }
+
+    #[test]
+    fn billing_approval_requires_a_flag_or_interactive_yes() {
+        for answer in ["y\n", "yes\n"] {
+            assert!(approve_billing_account_from(
+                "billing",
+                false,
+                true,
+                &mut answer.as_bytes(),
+                &mut Vec::new(),
+            ));
+        }
+        assert!(!approve_billing_account_from(
+            "billing",
+            false,
+            false,
+            &mut "yes\n".as_bytes(),
+            &mut Vec::new(),
+        ));
+        assert!(approve_billing_account_from(
+            "billing",
+            true,
+            false,
+            &mut "".as_bytes(),
+            &mut Vec::new(),
+        ));
     }
 
     #[test]

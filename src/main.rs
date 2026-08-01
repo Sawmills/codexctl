@@ -41,6 +41,10 @@ enum Commands {
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
         alias: Option<String>,
+        /// Allow automatic selection of a credit-billing account without
+        /// prompting (use for unattended runs; it may spend credits)
+        #[arg(long)]
+        allow_billing: bool,
         /// When auto-selecting and no account has headroom left, redeem a
         /// banked reset without prompting (resets are scarce and expire)
         #[arg(long)]
@@ -137,8 +141,9 @@ fn main() {
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use {
             ref alias,
+            allow_billing,
             allow_resets,
-        } => commands::use_profile::run(alias.as_deref(), allow_resets),
+        } => commands::use_profile::run(alias.as_deref(), allow_billing, allow_resets),
         Commands::Switch => commands::switch::run(),
         Commands::Resets {
             claim,

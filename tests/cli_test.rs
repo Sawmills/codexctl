@@ -40,6 +40,15 @@ fn codex_has_independent_reset_and_billing_flags() {
     assert!(stdout.contains("--allow-resets"));
 }
 
+#[test]
+fn use_has_independent_reset_and_billing_flags() {
+    let mut cmd = Command::cargo_bin("codexctl").unwrap();
+    let output = cmd.args(["use", "--help"]).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--allow-billing"));
+    assert!(stdout.contains("--allow-resets"));
+}
+
 /// Installed builds need to be able to report their own version, so an upgrade
 /// can be confirmed from the binary rather than from the package manager.
 #[test]

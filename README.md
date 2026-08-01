@@ -204,6 +204,7 @@ Resets rank ahead of credit-billing accounts because they cost no money. `--allo
 
 ```bash
 codexctl use --allow-resets                                       # unattended: may spend resets
+codexctl use --allow-billing                                      # unattended: may spend credits
 codexctl codex --allow-resets -- "start prompt"
 codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
 ```
@@ -242,7 +243,7 @@ Completions dynamically list profile names for `use` and `remove`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with an isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
 When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is
