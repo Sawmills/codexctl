@@ -91,7 +91,6 @@ fn status_accepts_rate_limited_flag() {
 
 #[test]
 fn informational_and_invalid_commands_do_not_create_profile_state() {
-    let tmp = tempfile::tempdir().unwrap();
     let commands: &[&[&str]] = &[
         &["--help"],
         &["--version"],
@@ -101,15 +100,20 @@ fn informational_and_invalid_commands_do_not_create_profile_state() {
     ];
 
     for args in commands {
+        let tmp = tempfile::tempdir().unwrap();
         let mut command = Command::cargo_bin("codexctl").unwrap();
         let output = command
             .env("HOME", tmp.path())
             .args(*args)
             .output()
             .unwrap();
-        if *args == ["nonexistent"] {
-            assert!(!output.status.success());
-        }
+        let expect_failure = *args == ["nonexistent"];
+        assert_eq!(
+            output.status.success(),
+            !expect_failure,
+            "unexpected status for {args:?}: {:?}",
+            output.status
+        );
         assert!(
             !tmp.path().join(".codexctl").exists(),
             "created state for {args:?}"
@@ -129,4 +133,16 @@ fn stateful_command_initializes_private_store() {
         .success();
 
     assert!(tmp.path().join(".codexctl/profiles").is_dir());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [".codexctl", ".codexctl/profiles"] {
+            let mode = std::fs::metadata(tmp.path().join(dir))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "{dir} is not private");
+        }
+    }
 }

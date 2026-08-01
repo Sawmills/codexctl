@@ -369,6 +369,30 @@ fn profile_and_live_auth_files_are_private() {
             0o600
         );
     }
+
+    write_profile(&paths, "other@test", "other-token");
+    profile::switch_to_from(&paths, "other@test").unwrap();
+    assert_eq!(
+        std::fs::metadata(paths.codex_auth_json())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn case_colliding_profile_directories_do_not_break_listing() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(&paths, "Work", "upper-token");
+    write_profile(&paths, "work", "lower-token");
+
+    let profiles = profile::list_profiles_from(&paths).unwrap();
+
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].meta.alias, "Work");
 }
 
 #[cfg(unix)]

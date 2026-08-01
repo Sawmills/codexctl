@@ -33,6 +33,8 @@ Restore dependency and release gates.
    Lock profile mutations and live-auth switches.
    Write a temporary file in the destination directory, sync it, set private Unix permissions, then rename it.
    Order a switch so the live auth file is installed before the active marker changes.
+   Accept that a crash between the two atomic files leaves the old marker.
+   In that state, never attribute the new live auth to the old alias; a repeated explicit switch reconciles both files.
    Preserve the existing active-profile token-refresh ownership checks.
 
 4. Use the live auth file for the active profile.
@@ -57,7 +59,7 @@ Restore dependency and release gates.
 8. Update rejected dependencies.
    Upgrade `anyhow` past RUSTSEC-2026-0190.
    Upgrade or remove the locked `quinn-proto` version rejected by GHSA-4w2j-m93h-cj5j.
-   Confirm the actual compiled dependency tree and the lockfile scanner result.
+   Enforce a RustSec lockfile scan in `.github/workflows/ci.yml` and confirm the compiled dependency tree.
 
 9. Harden `.github/workflows/release.yml`.
    Use least-privilege job permissions.
@@ -76,6 +78,7 @@ Restore dependency and release gates.
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 - `cargo run -- --help`
+- RustSec `Dependency Audit` CI job
 - `trunk check`
 - Read-only Claude Opus architecture review of the implementation plan and critical invariants
 - Exact worktree, branch, HEAD, and dirty-state proof

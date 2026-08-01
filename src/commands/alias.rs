@@ -23,7 +23,7 @@ mod tests {
     }
 
     #[test]
-    fn optional_drops_blank_alias() {
+    fn optional_rejects_blank_alias() {
         assert!(optional(Some("   ")).is_err());
         assert_eq!(optional(None).unwrap(), None);
     }

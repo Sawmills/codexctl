@@ -87,6 +87,7 @@ pub struct RateLimitResponse {
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
+    pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
 }
 
 pub struct Credits {

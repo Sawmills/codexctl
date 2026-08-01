@@ -4,7 +4,6 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use fs2::FileExt;
 
 use crate::config::Paths;
 
@@ -87,13 +86,7 @@ fn checked_child(root: &Path, name: &str) -> Result<PathBuf> {
 
 /// An exclusive lock for profile-store mutations and live auth switches.
 pub struct StoreLock {
-    file: File,
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
+    _file: File,
 }
 
 pub fn lock(paths: &Paths) -> Result<StoreLock> {
@@ -107,9 +100,9 @@ pub fn lock(paths: &Paths) -> Result<StoreLock> {
         .open(&lock_path)
         .with_context(|| format!("failed to open {}", lock_path.display()))?;
     set_private_file_permissions(&lock_path)?;
-    file.lock_exclusive()
+    file.lock()
         .with_context(|| format!("failed to lock {}", lock_path.display()))?;
-    Ok(StoreLock { file })
+    Ok(StoreLock { _file: file })
 }
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
@@ -160,11 +153,7 @@ fn atomic_replace(destination: &Path, write: impl FnOnce(&mut File) -> Result<()
             ".{file_name}.codexctl-{}-{nonce}-{attempt}.tmp",
             std::process::id()
         ));
-        match OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&candidate)
-        {
+        match create_private_temp(&candidate) {
             Ok(file) => {
                 temp_path = Some(candidate);
                 temp_file = Some(file);
@@ -198,6 +187,17 @@ fn atomic_replace(destination: &Path, write: impl FnOnce(&mut File) -> Result<()
         let _ = std::fs::remove_file(&temp_path);
     }
     result
+}
+
+fn create_private_temp(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(unix)]

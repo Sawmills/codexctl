@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -34,10 +35,12 @@ pub fn list_profiles_from(paths: &Paths) -> Result<Vec<Profile>> {
         return Ok(vec![]);
     }
     let mut profiles = Vec::new();
-    for entry in std::fs::read_dir(&profiles_dir)
+    let mut entries: Vec<_> = std::fs::read_dir(&profiles_dir)
         .with_context(|| format!("failed to read {}", profiles_dir.display()))?
-    {
-        let entry = entry?;
+        .collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut seen_aliases = HashSet::new();
+    for entry in entries {
         if !entry.file_type()?.is_dir() {
             continue;
         }
@@ -49,7 +52,11 @@ pub fn list_profiles_from(paths: &Paths) -> Result<Vec<Profile>> {
             eprintln!("warning: ignored profile directory with an invalid alias");
             continue;
         };
-        let path = store::profile_dir(paths, alias)?;
+        if !seen_aliases.insert(alias.to_ascii_lowercase()) {
+            eprintln!("warning: ignored profile directory with a case-colliding alias");
+            continue;
+        }
+        let path = entry.path();
         let meta_path = path.join("meta.json");
         if !meta_path.exists() {
             continue;
@@ -166,14 +173,20 @@ pub fn get_active_from(paths: &Paths) -> Result<Option<String>> {
     if !active_file.exists() {
         return Ok(None);
     }
-    if std::fs::symlink_metadata(&active_file)?
-        .file_type()
-        .is_symlink()
-    {
+    let metadata = match std::fs::symlink_metadata(&active_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
         eprintln!("warning: ignored symbolic-link active profile marker");
         return Ok(None);
     }
-    let contents = std::fs::read_to_string(&active_file)?;
+    let contents = match std::fs::read_to_string(&active_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     match store::validate_alias(&contents) {
         Ok(alias) => Ok(Some(alias.to_string())),
         Err(_) => {

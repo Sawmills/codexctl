@@ -23,7 +23,7 @@ codexctl login amir+2@example.com
 After an account is saved, switch with `codexctl use <alias>` instead of running `codex --login`
 again. A fresh Codex login can invalidate another saved seat on the same ChatGPT account/workspace;
 `codexctl login` avoids logging over `~/.codex/auth.json` by running Codex with
-`CODEX_HOME=~/.codexctl/login-homes/<alias>`, and `codexctl use` only swaps the local auth file.
+`CODEX_HOME=~/.codexctl/login-homes/<alias>/session-*`, and `codexctl use` only swaps the local auth file.
 
 If you already logged in with Codex directly, save the current `~/.codex/auth.json`:
 
@@ -31,8 +31,9 @@ If you already logged in with Codex directly, save the current `~/.codex/auth.js
 codexctl save work-main
 ```
 
-Profile aliases use printable ASCII and are unique without regard to letter case. This keeps the
-credential-store namespace identical on default macOS and Linux filesystems.
+Profile aliases use printable ASCII, hold at most 128 bytes, and are unique without regard to
+letter case. An alias cannot start with `.` or contain control characters, `/`, or `\`. This keeps
+the credential-store namespace identical on default macOS and Linux filesystems.
 
 ### Check rate limits
 
@@ -244,6 +245,11 @@ Completions dynamically list profile names for `use` and `remove`.
 ## How it works
 
 Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+
+The live auth file and active marker are separate atomic files. A switch installs auth first and
+writes the marker last. If the process stops between those writes, the marker can remain on the
+previous alias. Status reads then use saved profile auth instead of attributing the new live auth
+to the old alias. Run `codexctl use <alias>` again to reconcile both files.
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
 When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is

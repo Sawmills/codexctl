@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::api;
 use crate::commands::alias;
@@ -21,7 +21,13 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     let resolved_alias = match alias::optional(alias)? {
         Some(a) => a.to_string(),
         None => match &email {
-            Some(e) => store::validate_alias(e)?.to_string(),
+            Some(e) => store::validate_alias(e)
+                .with_context(|| {
+                    format!(
+                        "detected email '{e}' is not a usable alias; provide one: codexctl save <alias>"
+                    )
+                })?
+                .to_string(),
             None => {
                 anyhow::bail!(
                     "could not detect email (token may be expired). Provide an alias: codexctl save <alias>"

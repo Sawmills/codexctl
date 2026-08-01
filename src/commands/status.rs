@@ -274,12 +274,16 @@ struct RateLimitColumns {
 
 impl RateLimitColumns {
     fn for_accounts(accounts: &[&RateLimitedAccount]) -> Self {
+        let healthy: Vec<_> = accounts
+            .iter()
+            .filter(|account| !account.is_error)
+            .collect();
         Self {
-            named_limits: accounts.iter().any(|account| account.limits.len() > 1),
-            short: accounts
+            named_limits: healthy.iter().any(|account| account.limits.len() > 1),
+            short: healthy
                 .iter()
                 .any(|account| account.limits.iter().any(|limit| limit.h5_pct.is_some())),
-            long: accounts
+            long: healthy
                 .iter()
                 .any(|account| account.limits.iter().any(|limit| limit.d7_pct.is_some())),
         }
@@ -912,6 +916,27 @@ mod tests {
             vec!["Account", "7d", "7d Reset", "Resets", "Token"]
         );
         assert_eq!(render_rate_limited_rows(&account, columns)[0].len(), 5);
+    }
+
+    #[test]
+    fn error_rows_do_not_add_hidden_limit_columns() {
+        let mut healthy = rate_limited_account();
+        healthy.limits[0].h5_pct = None;
+        let mut error = rate_limited_account();
+        error.is_error = true;
+        error.limits.push(LimitStatus {
+            name: "Hidden".to_string(),
+            h5_pct: Some(1.0),
+            d7_pct: None,
+            h5_reset: "in 1h 00m".to_string(),
+            d7_reset: "-".to_string(),
+        });
+
+        let columns = RateLimitColumns::for_accounts(&[&healthy, &error]);
+
+        assert!(!columns.named_limits);
+        assert!(!columns.short);
+        assert!(columns.long);
     }
 
     #[test]
