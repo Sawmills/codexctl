@@ -23,13 +23,17 @@ codexctl login amir+2@example.com
 After an account is saved, switch with `codexctl use <alias>` instead of running `codex --login`
 again. A fresh Codex login can invalidate another saved seat on the same ChatGPT account/workspace;
 `codexctl login` avoids logging over `~/.codex/auth.json` by running Codex with
-`CODEX_HOME=~/.codexctl/login-homes/<alias>`, and `codexctl use` only swaps the local auth file.
+`CODEX_HOME=~/.codexctl/login-homes/<alias>/session-*`, and `codexctl use` only swaps the local auth file.
 
 If you already logged in with Codex directly, save the current `~/.codex/auth.json`:
 
 ```bash
 codexctl save work-main
 ```
+
+Profile aliases use printable ASCII, hold at most 128 bytes, and are unique without regard to
+letter case. An alias cannot start with `.` or contain control characters, `/`, or `\`. This keeps
+the credential-store namespace identical on default macOS and Linux filesystems.
 
 ### Check rate limits
 
@@ -41,13 +45,14 @@ codexctl status
 Live status fetched at Tue Apr 28 22:20:56
 
 Rate-Limited Accounts
-┌──────────────────────┬─────┬───────────┬─────┬────────────────────────────────┬─────────────┐
-│ Account              ┆ 5h  ┆ 5h Reset  ┆ 7d  ┆ 7d Reset                      ┆ Token       │
-╞══════════════════════╪═════╪═══════════╪═════╪════════════════════════════════╪═════════════╡
-│ amir+5@sawmills.ai   ┆ 0%  ┆ in 5h 00m ┆ 25% ┆ in 4d 18h (Sun May 03 16:20) ┆ 9d 23h      │
-│ * amir@sawmills.ai   ┆ 78% ┆ in 3h 54m ┆ 92% ┆ in 4d 15h (Sun May 03 13:20) ┆ 3h 20m      │
-│ amir+8@sawmills.ai   ┆ -   ┆ -         ┆ -   ┆ -                            ┆ invalidated │
-└──────────────────────┴─────┴───────────┴─────┴────────────────────────────────┴─────────────┘
+┌──────────────────────┬───────────────────────┬─────┬──────────────────────────────┬────────┬────────┐
+│ Account              ┆ Limit                 ┆ 7d  ┆ 7d Reset                     ┆ Resets ┆ Token  │
+╞══════════════════════╪═══════════════════════╪═════╪══════════════════════════════╪════════╪════════╡
+│ * amir@sawmills.ai   ┆ Codex                 ┆ 13% ┆ in 6d 23h (Fri Aug 07 15:31) ┆ -      ┆ 4d 19h │
+│ * amir@sawmills.ai   ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆ -      ┆ -      │
+│ amir+2@sawmills.ai   ┆ Codex                 ┆ 100%┆ in 6d 17h (Fri Aug 07 09:29) ┆ 1      ┆ 4d 19h │
+│ amir+2@sawmills.ai   ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆ -      ┆ -      │
+└──────────────────────┴───────────────────────┴─────┴──────────────────────────────┴────────┴────────┘
 
 Usage-Based Accounts
 ┌───────────────────────────┬─────────┬──────┬─────────┬───────┬─────────┐
@@ -60,6 +65,15 @@ Usage-Based Accounts
 
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
 The account column is the saved profile alias, with `*` marking the active account.
+
+Rate-limit windows are matched by their server-declared duration. A 5-hour or 7-day column appears
+only when at least one returned bucket contains that window. Named model or feature buckets appear
+as separate rows. `codexctl` does not show an empty 5-hour column when the service returns only a
+weekly window.
+
+Automatic account selection uses the main `Codex` bucket. Additional buckets are model-specific or
+feature-specific status. They do not block general account selection without a reliable mapping
+from the requested model or feature to that bucket.
 
 The `Resets` column shows banked rate-limit resets (see [Banked resets](#banked-resets)):
 `3 (2 now)` means three are held and two can be redeemed this second; a bare count turns red when
@@ -115,7 +129,7 @@ session, pass `resume <session-id>` so the wrapper can recover without discovery
 
 Account selection during recovery:
 
-- **Never** switches to usage-based accounts (they bill credits).
+- **Never** switches to usage-based or unknown-billing accounts.
 - Auto-rotates only among rate-limited accounts that won't bill — spend cap reached (overage
   closed, so they hard-stop at 100% instead of drawing credits) with rate-limit headroom —
   preferring the soonest-resetting seat by default (see Reset-aware selection), and moving to the
@@ -191,6 +205,7 @@ Resets rank ahead of credit-billing accounts because they cost no money. `--allo
 
 ```bash
 codexctl use --allow-resets                                       # unattended: may spend resets
+codexctl use --allow-billing                                      # unattended: may spend credits
 codexctl codex --allow-resets -- "start prompt"
 codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
 ```
@@ -229,7 +244,12 @@ Completions dynamically list profile names for `use` and `remove`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with an isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+
+The live auth file and active marker are separate atomic files. A switch installs auth first and
+writes the marker last. If the process stops between those writes, the marker can remain on the
+previous alias. Status reads then use saved profile auth instead of attributing the new live auth
+to the old alias. Run `codexctl use <alias>` again to reconcile both files.
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
 When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is

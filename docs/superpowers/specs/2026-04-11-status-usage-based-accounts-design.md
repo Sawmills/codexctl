@@ -10,7 +10,10 @@ Split the status output into two tables, one per billing model. Each table has c
 
 ### Table 1: Rate-Limited Accounts
 
-No changes to the existing table. Shown when at least one rate-limited account exists.
+Shown when at least one rate-limited account exists. Window columns are adaptive. A 5-hour or
+7-day pair appears only when the API returns a window in that duration class. The `Limit` column
+appears when the response includes additional named model or feature buckets. Each bucket gets a
+separate row.
 
 ```
 Rate-Limited Accounts
@@ -53,7 +56,13 @@ An account is "usage-based" when:
 - `rate_limit` is `null` AND `credits` is present with `has_credits: true`, OR
 - `plan_type` contains `usage_based`
 
-All other accounts with rate limit windows are "rate-limited".
+An account is "rate-limited" only when it has rate-limit windows, its `plan_type` is in the known
+subscription allowlist, and it has no conflicting positive credit evidence.
+
+New plan names, mixed rate-limit and positive-credit responses, and successful responses with
+neither rate-limit windows nor positive credit evidence are `Unknown`.
+Unknown accounts can appear as status errors, but automatic selection and recovery must not use
+them. This keeps unfamiliar subscription metadata out of any path that can spend credits.
 
 Error accounts (bad auth, expired tokens) appear in whichever table matches their last known plan type from `meta.json`. If no plan is known, they appear in the rate-limited table (legacy default).
 
@@ -77,6 +86,8 @@ pub struct RateLimitResponse {
     pub rate_limit: Option<RateLimit>,
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
+    pub additional_rate_limits: Vec<AdditionalRateLimit>,
+    pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
 }
 
 pub struct Credits {

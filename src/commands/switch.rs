@@ -2,6 +2,7 @@ use anyhow::Result;
 use dialoguer::FuzzySelect;
 
 use crate::api;
+use crate::config;
 use crate::profile;
 
 pub fn run() -> Result<()> {
@@ -11,7 +12,8 @@ pub fn run() -> Result<()> {
         return Ok(());
     }
 
-    let active = profile::get_active()?;
+    let paths = config::default_paths()?;
+    let active = profile::get_active_from(&paths)?;
 
     let items: Vec<String> = profiles
         .iter()
@@ -24,26 +26,13 @@ pub fn run() -> Result<()> {
             };
 
             // Try to fetch usage for display — fall back gracefully
-            let usage_info = api::read_auth_json(&p.auth_json_path())
+            let auth_path = profile::auth_json_path_for_profile_from(&paths, p, active.as_deref());
+            let usage_info = api::read_auth_json(&auth_path)
                 .ok()
                 .and_then(|auth| {
                     api::fetch_usage(&auth.access_token, auth.account_id.as_deref()).ok()
                 })
-                .map(|u| {
-                    let h5 = u
-                        .rate_limit
-                        .as_ref()
-                        .and_then(|r| r.short_window())
-                        .map(|w| format!("{:.0}%", w.used_percent))
-                        .unwrap_or_else(|| "-".to_string());
-                    let d7 = u
-                        .rate_limit
-                        .as_ref()
-                        .and_then(|r| r.long_window())
-                        .map(|w| format!("{:.0}%", w.used_percent))
-                        .unwrap_or_else(|| "-".to_string());
-                    format!(" — 5h: {h5}, 7d: {d7}")
-                })
+                .map(|usage| usage_summary(&usage))
                 .unwrap_or_default();
 
             let plan = p.meta.plan.as_deref().unwrap_or("-");
@@ -71,4 +60,22 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn usage_summary(usage: &api::RateLimitResponse) -> String {
+    let Some(rate_limit) = &usage.rate_limit else {
+        return String::new();
+    };
+    let mut windows = Vec::new();
+    if let Some(short) = rate_limit.short_window() {
+        windows.push(format!("5h: {:.0}%", short.used_percent));
+    }
+    if let Some(long) = rate_limit.long_window() {
+        windows.push(format!("7d: {:.0}%", long.used_percent));
+    }
+    if windows.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", windows.join(", "))
+    }
 }

@@ -1,7 +1,6 @@
-mod api;
 mod commands;
-mod config;
-mod profile;
+
+use codexctl::{api, config, profile, store};
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -42,6 +41,10 @@ enum Commands {
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
         alias: Option<String>,
+        /// Allow automatic selection of a credit-billing account without
+        /// prompting (use for unattended runs; it may spend credits)
+        #[arg(long)]
+        allow_billing: bool,
         /// When auto-selecting and no account has headroom left, redeem a
         /// banked reset without prompting (resets are scarce and expire)
         #[arg(long)]
@@ -109,12 +112,16 @@ enum Commands {
 }
 
 fn main() {
-    if let Err(e) = config::ensure_dirs() {
+    let cli = Cli::parse();
+
+    // Informational commands must work in a read-only or empty home. Clap
+    // exits while parsing help, version, and invalid commands, and shell
+    // completion generation does not need the profile store.
+    let needs_store = !matches!(&cli.command, Commands::Completions { .. });
+    if needs_store && let Err(e) = config::ensure_dirs() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
-
-    let cli = Cli::parse();
 
     let result = match cli.command {
         Commands::Status {
@@ -134,8 +141,9 @@ fn main() {
         Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
         Commands::Use {
             ref alias,
+            allow_billing,
             allow_resets,
-        } => commands::use_profile::run(alias.as_deref(), allow_resets),
+        } => commands::use_profile::run(alias.as_deref(), allow_billing, allow_resets),
         Commands::Switch => commands::switch::run(),
         Commands::Resets {
             claim,

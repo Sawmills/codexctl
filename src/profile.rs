@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api;
 use crate::config::{self, Paths};
+use crate::store;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Meta {
@@ -33,22 +35,42 @@ pub fn list_profiles_from(paths: &Paths) -> Result<Vec<Profile>> {
         return Ok(vec![]);
     }
     let mut profiles = Vec::new();
-    for entry in std::fs::read_dir(&profiles_dir)
+    let mut entries: Vec<_> = std::fs::read_dir(&profiles_dir)
         .with_context(|| format!("failed to read {}", profiles_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
+        .collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut seen_aliases = HashSet::new();
+    for entry in entries {
+        if !entry.file_type()?.is_dir() {
             continue;
         }
+        let Some(directory_alias) = entry.file_name().to_str().map(str::to_owned) else {
+            eprintln!("warning: ignored profile directory with a non-UTF-8 name");
+            continue;
+        };
+        let Ok(alias) = store::validate_alias(&directory_alias) else {
+            eprintln!("warning: ignored profile directory with an invalid alias");
+            continue;
+        };
+        if !seen_aliases.insert(alias.to_ascii_lowercase()) {
+            eprintln!("warning: ignored profile directory with a case-colliding alias");
+            continue;
+        }
+        let path = entry.path();
         let meta_path = path.join("meta.json");
         if !meta_path.exists() {
             continue;
         }
         let contents = std::fs::read_to_string(&meta_path)
             .with_context(|| format!("failed to read {}", meta_path.display()))?;
-        let meta: Meta = serde_json::from_str(&contents)
+        let mut meta: Meta = serde_json::from_str(&contents)
             .with_context(|| format!("failed to parse {}", meta_path.display()))?;
+        if meta.alias != alias {
+            eprintln!(
+                "warning: profile metadata alias did not match its directory; using the directory alias"
+            );
+            meta.alias = alias.to_string();
+        }
         profiles.push(Profile { meta, dir: path });
     }
     profiles.sort_by(|a, b| a.meta.alias.cmp(&b.meta.alias));
@@ -56,15 +78,17 @@ pub fn list_profiles_from(paths: &Paths) -> Result<Vec<Profile>> {
 }
 
 pub fn get_profile_from(paths: &Paths, alias: &str) -> Result<Profile> {
-    let dir = paths.profiles_dir().join(alias);
+    let alias = store::validate_alias(alias)?;
+    let dir = store::profile_dir(paths, alias)?;
     if !dir.exists() {
         anyhow::bail!("profile '{}' not found", alias);
     }
     let meta_path = dir.join("meta.json");
     let contents = std::fs::read_to_string(&meta_path)
         .with_context(|| format!("failed to read {}", meta_path.display()))?;
-    let meta: Meta = serde_json::from_str(&contents)
+    let mut meta: Meta = serde_json::from_str(&contents)
         .with_context(|| format!("failed to parse {}", meta_path.display()))?;
+    meta.alias = alias.to_string();
     Ok(Profile { meta, dir })
 }
 
@@ -72,28 +96,71 @@ pub fn save_profile_to(
     paths: &Paths,
     alias: &str,
     email: Option<&str>,
-    auth_json_src: &std::path::Path,
+    auth_json_src: &Path,
 ) -> Result<()> {
-    let dir = paths.profiles_dir().join(alias);
-    std::fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let _lock = store::lock(paths)?;
+    save_profile_unlocked(paths, alias, email, auth_json_src)
+}
+
+/// Save a profile and make it active under one store lock.
+///
+/// When the source is an isolated login home, install it into the live Codex
+/// home. A re-login of the already-active alias deliberately skips capturing
+/// the old live token so it cannot overwrite the new login.
+pub fn save_profile_and_activate_to(
+    paths: &Paths,
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &Path,
+) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    let _lock = store::lock(paths)?;
+    let was_active = get_active_from(paths)?.as_deref() == Some(alias);
+    save_profile_unlocked(paths, alias, email, auth_json_src)?;
+
+    let live_auth = paths.codex_auth_json();
+    if auth_json_src != live_auth {
+        if !was_active {
+            capture_auth_file_profile_tokens(paths, &live_auth);
+        }
+        let saved_auth = store::profile_dir(paths, alias)?.join("auth.json");
+        store::atomic_copy(&saved_auth, &live_auth)
+            .with_context(|| format!("failed to install {}", live_auth.display()))?;
+    }
+    set_active_unlocked(paths, alias)
+}
+
+fn save_profile_unlocked(
+    paths: &Paths,
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &Path,
+) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    store::ensure_private_dir(&paths.codexctl_dir())?;
+    store::ensure_private_dir(&paths.profiles_dir())?;
+    let dir = store::profile_dir(paths, alias)?;
+    store::ensure_private_dir(&dir)?;
 
     let dest = dir.join("auth.json");
-    std::fs::copy(auth_json_src, &dest)
-        .with_context(|| format!("failed to copy auth.json to {}", dest.display()))?;
+    store::atomic_copy(auth_json_src, &dest)
+        .with_context(|| format!("failed to save auth.json to {}", dest.display()))?;
 
     let meta = Meta {
         alias: alias.to_string(),
-        email: email.map(|s| s.to_string()),
+        email: email.map(str::to_string),
         plan: None,
         saved_at: chrono::Utc::now().to_rfc3339(),
     };
-    let meta_json = serde_json::to_string_pretty(&meta)?;
-    std::fs::write(dir.join("meta.json"), meta_json)?;
+    let meta_json = serde_json::to_vec_pretty(&meta)?;
+    store::atomic_write(&dir.join("meta.json"), &meta_json)?;
     Ok(())
 }
 
 pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
-    let dir = paths.profiles_dir().join(alias);
+    let alias = store::validate_alias(alias)?;
+    let _lock = store::lock(paths)?;
+    let dir = store::profile_dir(paths, alias)?;
     if !dir.exists() {
         anyhow::bail!("profile '{}' not found", alias);
     }
@@ -106,54 +173,94 @@ pub fn get_active_from(paths: &Paths) -> Result<Option<String>> {
     if !active_file.exists() {
         return Ok(None);
     }
-    let contents = std::fs::read_to_string(&active_file)?;
-    let alias = contents.trim().to_string();
-    if alias.is_empty() {
+    let metadata = match std::fs::symlink_metadata(&active_file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        eprintln!("warning: ignored symbolic-link active profile marker");
         return Ok(None);
     }
-    Ok(Some(alias))
+    let contents = match std::fs::read_to_string(&active_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    match store::validate_alias(&contents) {
+        Ok(alias) => Ok(Some(alias.to_string())),
+        Err(_) => {
+            eprintln!("warning: ignored invalid active profile marker");
+            Ok(None)
+        }
+    }
 }
 
 pub fn set_active_from(paths: &Paths, alias: &str) -> Result<()> {
-    let active_file = paths.active_file();
-    std::fs::write(&active_file, alias)?;
-    Ok(())
+    let _lock = store::lock(paths)?;
+    set_active_unlocked(paths, alias)
+}
+
+fn set_active_unlocked(paths: &Paths, alias: &str) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    store::ensure_private_dir(&paths.codexctl_dir())?;
+    store::atomic_write(&paths.active_file(), alias.as_bytes())
 }
 
 pub fn switch_to_from(paths: &Paths, alias: &str) -> Result<String> {
     switch_to_auth_json_from(paths, alias, &paths.codex_auth_json())
 }
 
-pub fn switch_to_auth_json_from(
-    paths: &Paths,
-    alias: &str,
-    codex_auth: &std::path::Path,
-) -> Result<String> {
+pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -> Result<String> {
+    let alias = store::validate_alias(alias)?;
+    let _lock = store::lock(paths)?;
     let profile = get_profile_from(paths, alias)?;
 
-    // Capture the outgoing active profile's live tokens before we overwrite
-    // ~/.codex/auth.json. OpenAI uses single-use rotating refresh tokens, so the
-    // Codex CLI may have rotated this profile's tokens since it was saved; if we
-    // don't fold them back into the store they're lost and the profile later
-    // looks "expired". See capture_active_profile_tokens for the safety guard.
+    // Capture the outgoing live tokens before installing the next profile.
+    // The exact-token or token-subject guard prevents a foreign live auth file
+    // from overwriting an unrelated saved profile.
     capture_auth_file_profile_tokens(paths, codex_auth);
 
-    if let Some(parent) = codex_auth.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    std::fs::copy(profile.auth_json_path(), codex_auth)
-        .with_context(|| format!("failed to copy auth.json to {}", codex_auth.display()))?;
+    store::atomic_copy(&profile.auth_json_path(), codex_auth)
+        .with_context(|| format!("failed to install auth.json at {}", codex_auth.display()))?;
     if codex_auth == paths.codex_auth_json() {
-        set_active_from(paths, alias)?;
+        // Write the marker last. A crash can leave the old marker, but it cannot
+        // claim that a new alias is active before its auth file is installed.
+        set_active_unlocked(paths, alias)?;
     }
     Ok(profile.meta.email.unwrap_or_else(|| "unknown".to_string()))
 }
 
-pub fn alias_for_auth_json_from(
+/// Pick the live auth file only when it belongs to the active saved profile.
+/// Otherwise use the stored snapshot and avoid attributing a foreign session.
+pub fn auth_json_path_for_profile_from(
     paths: &Paths,
-    auth_json: &std::path::Path,
-) -> Result<Option<String>> {
+    profile: &Profile,
+    active: Option<&str>,
+) -> PathBuf {
+    if active != Some(profile.meta.alias.as_str()) {
+        return profile.auth_json_path();
+    }
+    let live = paths.codex_auth_json();
+    if auth_files_have_same_owner(&live, &profile.auth_json_path()) {
+        live
+    } else {
+        profile.auth_json_path()
+    }
+}
+
+fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (api::read_auth_json(left), api::read_auth_json(right)) else {
+        return false;
+    };
+    if left.access_token == right.access_token {
+        return true;
+    }
+    let left_subject = api::token_subject(&left.access_token);
+    left_subject.is_some() && left_subject == api::token_subject(&right.access_token)
+}
+
+pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Option<String>> {
     let Ok(target_auth) = api::read_auth_json(auth_json) else {
         return Ok(None);
     };
@@ -186,34 +293,44 @@ pub fn alias_for_auth_json_from(
     Ok(None)
 }
 
-/// Best-effort: copy the live Codex auth file back into the saved profile that
-/// owns that auth, but only when the token matches by exact value or seat (`sub`).
-/// Failures only warn — they must not block a switch.
-fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &std::path::Path) {
+/// Best-effort: fold a live Codex auth file into the saved profile that owns it.
+/// Failures only warn because token capture must not block a requested switch.
+fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path) {
     if !codex_auth.exists() {
         return;
     }
     let Ok(Some(alias)) = alias_for_auth_json_from(paths, codex_auth) else {
         return;
     };
-    let dest = paths.profiles_dir().join(&alias).join("auth.json");
-    if let Err(e) = std::fs::copy(codex_auth, &dest) {
-        eprintln!("warning: failed to capture tokens for profile '{alias}': {e}");
+    let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
+        return;
+    };
+    if let Err(error) = store::atomic_copy(codex_auth, &dest) {
+        eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
     }
 }
 
-pub fn update_meta_plan(alias: &str, plan: &str) -> Result<()> {
-    let dir = config::profiles_dir()?.join(alias);
+pub fn update_meta_plan_from(paths: &Paths, alias: &str, plan: &str) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    let Some(_lock) = store::try_lock(paths)? else {
+        eprintln!("warning: skipped profile metadata update while the store was busy");
+        return Ok(());
+    };
+    let dir = store::profile_dir(paths, alias)?;
     let meta_path = dir.join("meta.json");
     if !meta_path.exists() {
         return Ok(());
     }
     let contents = std::fs::read_to_string(&meta_path)?;
     let mut meta: Meta = serde_json::from_str(&contents)?;
+    meta.alias = alias.to_string();
     meta.plan = Some(plan.to_string());
-    let json = serde_json::to_string_pretty(&meta)?;
-    std::fs::write(&meta_path, json)?;
-    Ok(())
+    let json = serde_json::to_vec_pretty(&meta)?;
+    store::atomic_write(&meta_path, &json)
+}
+
+pub fn update_meta_plan(alias: &str, plan: &str) -> Result<()> {
+    update_meta_plan_from(&config::default_paths()?, alias, plan)
 }
 
 // === Default-paths wrappers (used by commands) ===
@@ -224,12 +341,15 @@ pub fn list_profiles() -> Result<Vec<Profile>> {
 pub fn get_profile(alias: &str) -> Result<Profile> {
     get_profile_from(&config::default_paths()?, alias)
 }
-pub fn save_profile(
+pub fn save_profile(alias: &str, email: Option<&str>, auth_json_src: &Path) -> Result<()> {
+    save_profile_to(&config::default_paths()?, alias, email, auth_json_src)
+}
+pub fn save_profile_and_activate(
     alias: &str,
     email: Option<&str>,
-    auth_json_src: &std::path::Path,
+    auth_json_src: &Path,
 ) -> Result<()> {
-    save_profile_to(&config::default_paths()?, alias, email, auth_json_src)
+    save_profile_and_activate_to(&config::default_paths()?, alias, email, auth_json_src)
 }
 pub fn delete_profile(alias: &str) -> Result<()> {
     delete_profile_from(&config::default_paths()?, alias)
@@ -243,6 +363,6 @@ pub fn set_active(alias: &str) -> Result<()> {
 pub fn switch_to(alias: &str) -> Result<String> {
     switch_to_from(&config::default_paths()?, alias)
 }
-pub fn switch_to_auth_json(alias: &str, auth_json: &std::path::Path) -> Result<String> {
+pub fn switch_to_auth_json(alias: &str, auth_json: &Path) -> Result<String> {
     switch_to_auth_json_from(&config::default_paths()?, alias, auth_json)
 }

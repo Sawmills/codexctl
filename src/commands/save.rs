@@ -1,9 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::api;
 use crate::commands::alias;
 use crate::config;
 use crate::profile;
+use crate::store;
 
 pub fn run(alias: Option<&str>) -> Result<()> {
     let auth_path = config::codex_auth_json()?;
@@ -17,10 +18,16 @@ pub fn run(alias: Option<&str>) -> Result<()> {
     let auth = api::read_auth_json(&auth_path)?;
 
     let email = fetch_email(&auth.access_token);
-    let resolved_alias = match alias::optional(alias) {
+    let resolved_alias = match alias::optional(alias)? {
         Some(a) => a.to_string(),
         None => match &email {
-            Some(e) => e.clone(),
+            Some(e) => store::validate_alias(e)
+                .with_context(|| {
+                    format!(
+                        "detected email '{e}' is not a usable alias; provide one: codexctl save <alias>"
+                    )
+                })?
+                .to_string(),
             None => {
                 anyhow::bail!(
                     "could not detect email (token may be expired). Provide an alias: codexctl save <alias>"
@@ -29,7 +36,7 @@ pub fn run(alias: Option<&str>) -> Result<()> {
         },
     };
 
-    let existing = config::profiles_dir()?.join(&resolved_alias);
+    let existing = store::profile_dir(&config::default_paths()?, &resolved_alias)?;
     if existing.exists() {
         eprint!(
             "profile '{}' already exists. Overwrite? [y/N] ",
@@ -43,15 +50,14 @@ pub fn run(alias: Option<&str>) -> Result<()> {
         }
     }
 
-    profile::save_profile(&resolved_alias, email.as_deref(), &auth_path)?;
-    profile::set_active(&resolved_alias)?;
+    profile::save_profile_and_activate(&resolved_alias, email.as_deref(), &auth_path)?;
 
     println!("saved profile '{}'", resolved_alias);
     Ok(())
 }
 
 fn fetch_email(access_token: &str) -> Option<String> {
-    let client = reqwest::blocking::Client::new();
+    let client = api::blocking_http_client().ok()?;
     let resp = client
         .get("https://chatgpt.com/backend-api/me")
         .bearer_auth(access_token)

@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Supports both formats:
 /// - Codex CLI: `{"auth_mode": "chatgpt", "tokens": {"access_token": "...", "refresh_token": "..."}}`
 /// - Simple: `{"access_token": "...", "refresh_token": "..."}`
@@ -35,11 +38,38 @@ pub struct RateLimitResponse {
     pub rate_limit: Option<RateLimit>,
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
+    /// Extra feature or model buckets returned alongside the main Codex limit.
+    #[serde(default)]
+    pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
     pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
 }
 
 impl RateLimitResponse {
+    /// Classify the account before any automatic selection can spend credits.
+    pub fn billing_class(&self) -> BillingClass {
+        let plan = self.plan_type.as_deref();
+        if plan.is_some_and(|plan| plan.contains("usage_based")) {
+            return BillingClass::UsageBased;
+        }
+        let has_credit_billing = self.credits.as_ref().is_some_and(|credits| {
+            credits.has_credits || credits.unlimited || credits.overage_limit_reached
+        });
+        if self.rate_limit.as_ref().is_some_and(RateLimit::has_window) {
+            // A new plan name or mixed rate-limit and credit evidence is not
+            // proof that automatic use is free. Keep it out of selection until
+            // its contract is understood and added deliberately.
+            if has_credit_billing || !plan.is_some_and(is_known_rate_limited_plan) {
+                return BillingClass::Unknown;
+            }
+            return BillingClass::RateLimited;
+        }
+        if has_credit_billing {
+            return BillingClass::UsageBased;
+        }
+        BillingClass::Unknown
+    }
+
     /// How many banked resets are held, redeemable or not.
     pub fn reset_credits_available(&self) -> i64 {
         self.rate_limit_reset_credits
@@ -57,6 +87,27 @@ impl RateLimitResponse {
     }
 }
 
+fn is_known_rate_limited_plan(plan: &str) -> bool {
+    matches!(
+        plan,
+        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingClass {
+    RateLimited,
+    UsageBased,
+    Unknown,
+}
+
+#[derive(Deserialize)]
+pub struct AdditionalRateLimit {
+    pub limit_name: Option<String>,
+    pub metered_feature: Option<String>,
+    pub rate_limit: Option<RateLimit>,
+}
+
 #[derive(Deserialize)]
 pub struct RateLimit {
     // API returns both naming conventions depending on plan
@@ -71,6 +122,10 @@ pub struct RateLimit {
 const SHORT_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
 
 impl RateLimit {
+    fn has_window(&self) -> bool {
+        self.first().is_some() || self.second().is_some()
+    }
+
     fn first(&self) -> Option<&RateLimitWindow> {
         self.primary.as_ref().or(self.primary_window.as_ref())
     }
@@ -358,8 +413,24 @@ pub async fn fetch_account_settings_async(
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
+pub fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client")
+}
+
+pub fn blocking_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .context("failed to build blocking HTTP client")
+}
+
 pub fn fetch_usage(access_token: &str, account_id: Option<&str>) -> Result<RateLimitResponse> {
-    let client = reqwest::blocking::Client::new();
+    let client = blocking_http_client()?;
     let mut request = client.get(USAGE_URL).bearer_auth(access_token);
     if let Some(account_id) = account_id {
         request = request.header("chatgpt-account-id", account_id);
