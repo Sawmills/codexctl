@@ -7,7 +7,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +22,7 @@ jobs:
       checkout_ref: ${{ steps.resolve.outputs.checkout_ref }}
       target: ${{ steps.resolve.outputs.target }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
 
@@ -55,6 +55,12 @@ jobs:
             exit 1
           fi
 
+          cargo_version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+          if [[ "${tag}" != "v${cargo_version}" ]]; then
+            echo "Tag ${tag} does not match Cargo.toml version ${cargo_version}." >&2
+            exit 1
+          fi
+
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=${checkout_ref}" >> "$GITHUB_OUTPUT"
@@ -79,15 +85,15 @@ jobs:
             target: x86_64-unknown-linux-gnu
             label: Linux_x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.setup.outputs.checkout_ref }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -102,7 +108,7 @@ jobs:
           tar -czf "${archive}" -C "target/${{ matrix.target }}/release" codexctl
           shasum -a 256 "${archive}" > "${archive}.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codexctl_${{ matrix.label }}
           path: |
@@ -113,12 +119,14 @@ jobs:
     name: Publish release
     needs: [setup, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       sha_darwin_arm64: ${{ steps.shas.outputs.darwin_arm64 }}
       sha_darwin_x86_64: ${{ steps.shas.outputs.darwin_x86_64 }}
       sha_linux_x86_64: ${{ steps.shas.outputs.linux_x86_64 }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -136,15 +144,30 @@ jobs:
             echo "linux_x86_64=$(sha Linux_x86_64)"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create or update GitHub release
+      - name: Create immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           tag="${{ needs.setup.outputs.tag }}"
           if gh release view "${tag}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            gh release upload "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
-              --repo "${{ github.repository }}" --clobber
+            existing="$(mktemp -d)"
+            trap 'rm -rf "${existing}"' EXIT
+            gh release download "${tag}" --repo "${{ github.repository }}" \
+              --pattern 'codexctl_*' --dir "${existing}"
+            for local_asset in dist/codexctl_*; do
+              asset_name="$(basename "${local_asset}")"
+              remote_asset="${existing}/${asset_name}"
+              if [[ ! -f "${remote_asset}" ]]; then
+                echo "Existing release is missing ${asset_name}; refusing to mutate it." >&2
+                exit 1
+              fi
+              if ! cmp -s "${local_asset}" "${remote_asset}"; then
+                echo "Existing release asset ${asset_name} differs; refusing to replace it." >&2
+                exit 1
+              fi
+            done
+            echo "Existing release assets are byte-identical."
           else
             gh release create "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
               --repo "${{ github.repository }}" --target "${{ needs.setup.outputs.target }}" \
@@ -158,14 +181,12 @@ jobs:
     steps:
       - id: token
         name: Create token
-        continue-on-error: true
-        uses: tibdex/github-app-token@v2
+        uses: tibdex/github-app-token@3beb63f4bd073e61482598c45c71c1019b59b73a # v2
         with:
           app_id: ${{ vars.SAWMILLS_REPO_APP_ID }}
           private_key: ${{ secrets.SAWMILLS_APP_PRIVATE_KEY }}
 
       - name: Open formula PR on public tap
-        if: steps.token.outcome == 'success'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           TAG: ${{ needs.setup.outputs.tag }}
@@ -179,9 +200,7 @@ jobs:
 
           workdir="$(mktemp -d)"
           trap 'rm -rf "${workdir}"' EXIT
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/Sawmills/homebrew-tap.git" \
-            "${workdir}/tap"
+          gh repo clone Sawmills/homebrew-tap "${workdir}/tap" -- --depth 1
 
           cat > "${workdir}/tap/Formula/codexctl.rb" << EOF
           class Codexctl < Formula
@@ -247,7 +266,5 @@ jobs:
               --body "Automated formula update for codexctl ${TAG}, built from https://github.com/${{ github.repository }}/releases/tag/${TAG}."
           fi
 
-          # Best effort: queue auto-merge if the tap enables it; otherwise the
-          # PR stays open for a maintainer to merge once formula-ci is green.
           gh pr merge "${branch}" --repo Sawmills/homebrew-tap --squash --auto --delete-branch \
-            || echo "Auto-merge unavailable; PR left open for manual merge."
+            --match-head-commit "$(git rev-parse HEAD)"

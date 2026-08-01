@@ -28,7 +28,7 @@ pub fn run_to_auth_json_excluding(
     excluded_alias: Option<&str>,
     allow_resets: bool,
 ) -> Result<()> {
-    match alias::optional(alias) {
+    match alias::optional(alias)? {
         // An explicit target is switched to as asked — never redeemed against,
         // since `codexctl reset <alias>` is the way to spend a credit on a
         // named account.
@@ -215,9 +215,9 @@ fn select_with_headroom(scored: &[SelectionCandidate], reset_aware: bool) -> Opt
 }
 
 fn selection_score(usage: &api::RateLimitResponse) -> f64 {
-    let plan = usage.plan_type.as_deref().unwrap_or("");
-    if plan.contains("usage_based") {
-        // Never auto-select usage-based accounts: they bill real credits.
+    if usage.billing_class() != api::BillingClass::RateLimited {
+        // Never auto-select usage-based or unknown accounts. Unknown billing
+        // metadata is not evidence that an account is free to use.
         return f64::MAX;
     }
     rate_limit_score(usage)
@@ -411,8 +411,7 @@ struct RecoveryClass {
 /// used: usage-based (bills real credits), or out of headroom with no banked
 /// reset to clear the window.
 fn recovery_class(usage: &api::RateLimitResponse) -> Option<RecoveryClass> {
-    let plan = usage.plan_type.as_deref().unwrap_or("");
-    if plan.contains("usage_based") {
+    if usage.billing_class() != api::BillingClass::RateLimited {
         return None;
     }
     // Spend cap reached => overage closed => the account hard-stops at 100% and
@@ -442,6 +441,9 @@ fn recovery_class(usage: &api::RateLimitResponse) -> Option<RecoveryClass> {
 /// When this account's exhausted window(s) would clear without spending a
 /// credit — the moment a banked reset stops being worth anything here.
 fn natural_reset_ts(usage: &api::RateLimitResponse) -> Option<i64> {
+    // Reset credits and general recovery use the main Codex bucket. Additional
+    // buckets are model- or feature-specific and cannot be applied without a
+    // requested-model-to-bucket mapping.
     let rate_limit = usage.rate_limit.as_ref()?;
     [rate_limit.short_window(), rate_limit.long_window()]
         .into_iter()
@@ -486,6 +488,9 @@ fn reset_plan(
 }
 
 fn rate_limit_score(usage: &api::RateLimitResponse) -> f64 {
+    // General account selection uses the backward-compatible main Codex
+    // bucket. Treating any model-specific additional bucket as account-wide
+    // exhaustion would hide capacity that other models can still use.
     let h5 = usage
         .rate_limit
         .as_ref()
@@ -516,8 +521,10 @@ fn selection_bills_credits(usage: &api::RateLimitResponse) -> bool {
 fn fetch_usages(
     profiles: &[profile::Profile],
 ) -> Result<Vec<(String, Option<api::RateLimitResponse>)>> {
+    let paths = config::default_paths()?;
+    let active = profile::get_active_from(&paths)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
+    let client = api::http_client()?;
 
     Ok(rt.block_on(async {
         let futs: Vec<_> = profiles
@@ -525,7 +532,9 @@ fn fetch_usages(
             .map(|p| {
                 let client = client.clone();
                 let alias = p.meta.alias.clone();
-                let auth = api::read_auth_json(&p.auth_json_path());
+                let auth_path =
+                    profile::auth_json_path_for_profile_from(&paths, p, active.as_deref());
+                let auth = api::read_auth_json(&auth_path);
                 async move {
                     let usage = match auth {
                         Ok(a) => api::fetch_usage_async(
@@ -555,7 +564,9 @@ fn fetch_reset_credits(
     }
 
     let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
+    let client = api::http_client()?;
+    let paths = config::default_paths()?;
+    let active = profile::get_active_from(&paths)?;
 
     Ok(rt.block_on(async {
         let futs: Vec<_> = aliases
@@ -563,8 +574,11 @@ fn fetch_reset_credits(
             .map(|alias| {
                 let client = client.clone();
                 let alias = alias.clone();
-                let auth = profile::get_profile(&alias)
-                    .and_then(|p| api::read_auth_json(&p.auth_json_path()));
+                let auth = profile::get_profile_from(&paths, &alias).and_then(|p| {
+                    let path =
+                        profile::auth_json_path_for_profile_from(&paths, &p, active.as_deref());
+                    api::read_auth_json(&path)
+                });
                 async move {
                     let details = match auth {
                         Ok(a) => api::fetch_reset_credits_async(
@@ -645,6 +659,7 @@ mod tests {
             spend_control: Some(api::SpendControl {
                 reached: spend_reached,
             }),
+            additional_rate_limits: Vec::new(),
             rate_limit_reset_credits: None,
         }
     }
@@ -676,6 +691,18 @@ mod tests {
                 balance: None,
             }),
             spend_control: Some(api::SpendControl { reached: false }),
+            additional_rate_limits: Vec::new(),
+            rate_limit_reset_credits: None,
+        }
+    }
+
+    fn unknown_billing_response() -> api::RateLimitResponse {
+        api::RateLimitResponse {
+            plan_type: Some("new_subscription_tier".to_string()),
+            rate_limit: None,
+            credits: None,
+            spend_control: None,
+            additional_rate_limits: Vec::new(),
             rate_limit_reset_credits: None,
         }
     }
@@ -690,6 +717,45 @@ mod tests {
             title: None,
             description: None,
         }
+    }
+
+    #[test]
+    fn unknown_billing_is_never_auto_selected_or_recovered() {
+        let usage = unknown_billing_response();
+
+        assert_eq!(usage.billing_class(), api::BillingClass::Unknown);
+        assert_eq!(selection_score(&usage), f64::MAX);
+        assert_eq!(recovery_class(&usage), None);
+
+        let empty_rate_limit = api::RateLimitResponse {
+            rate_limit: Some(api::RateLimit {
+                primary: None,
+                secondary: None,
+                primary_window: None,
+                secondary_window: None,
+            }),
+            ..unknown_billing_response()
+        };
+        assert_eq!(empty_rate_limit.billing_class(), api::BillingClass::Unknown);
+        assert_eq!(selection_score(&empty_rate_limit), f64::MAX);
+        assert_eq!(recovery_class(&empty_rate_limit), None);
+    }
+
+    #[test]
+    fn credits_without_plan_metadata_are_treated_as_usage_based() {
+        let usage = api::RateLimitResponse {
+            credits: Some(api::Credits {
+                has_credits: true,
+                unlimited: false,
+                overage_limit_reached: false,
+                balance: Some("10".to_string()),
+            }),
+            ..unknown_billing_response()
+        };
+
+        assert_eq!(usage.billing_class(), api::BillingClass::UsageBased);
+        assert_eq!(selection_score(&usage), f64::MAX);
+        assert_eq!(recovery_class(&usage), None);
     }
 
     fn scored(

@@ -261,3 +261,184 @@ fn switch_skips_capture_for_foreign_codex_auth() {
         std::fs::read_to_string(paths.profiles_dir().join("a@test").join("auth.json")).unwrap();
     assert!(a_store.contains(".old") && !a_store.contains(".live"));
 }
+
+#[test]
+fn profile_aliases_cannot_escape_the_store() {
+    let (tmp, paths) = setup_test_env();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "safe").unwrap();
+
+    assert!(profile::get_profile_from(&paths, "../outside").is_err());
+    assert!(profile::delete_profile_from(&paths, "../outside").is_err());
+    assert!(
+        profile::save_profile_to(&paths, "/tmp/escape", None, &paths.codex_auth_json()).is_err()
+    );
+    assert!(outside.join("keep").exists());
+}
+
+#[test]
+fn directory_alias_is_authoritative_over_stored_metadata() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(&paths, "safe@test", "safe-token");
+    let meta_path = paths.profiles_dir().join("safe@test").join("meta.json");
+    let mut meta: profile::Meta =
+        serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+    meta.alias = "../../outside".to_string();
+    std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+
+    let profiles = profile::list_profiles_from(&paths).unwrap();
+
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].meta.alias, "safe@test");
+    assert_eq!(profiles[0].dir, paths.profiles_dir().join("safe@test"));
+}
+
+#[test]
+fn invalid_active_marker_is_ignored() {
+    let (_tmp, paths) = setup_test_env();
+    std::fs::write(paths.active_file(), "../../outside").unwrap();
+
+    assert_eq!(profile::get_active_from(&paths).unwrap(), None);
+}
+
+#[test]
+fn active_profile_uses_live_auth_only_for_the_same_token_subject() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.stored");
+    let rotated = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+    let foreign = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.foreign");
+    write_profile(&paths, "a@test", &stored);
+    let profile = profile::get_profile_from(&paths, "a@test").unwrap();
+
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{rotated}"}}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        profile::auth_json_path_for_profile_from(&paths, &profile, Some("a@test")),
+        paths.codex_auth_json()
+    );
+
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{foreign}"}}"#),
+    )
+    .unwrap();
+    assert_eq!(
+        profile::auth_json_path_for_profile_from(&paths, &profile, Some("a@test")),
+        profile.auth_json_path()
+    );
+    assert_eq!(
+        profile::auth_json_path_for_profile_from(&paths, &profile, Some("other@test")),
+        profile.auth_json_path()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_and_live_auth_files_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_tmp, paths) = setup_test_env();
+    profile::save_profile_and_activate_to(
+        &paths,
+        "private@test",
+        Some("private@test"),
+        &paths.codex_auth_json(),
+    )
+    .unwrap();
+
+    let profile_dir = paths.profiles_dir().join("private@test");
+    assert_eq!(
+        std::fs::metadata(&profile_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    for path in [
+        profile_dir.join("auth.json"),
+        profile_dir.join("meta.json"),
+        paths.active_file(),
+    ] {
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_link_profile_directory_is_rejected() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, paths) = setup_test_env();
+    let outside = tmp.path().join("outside-profile");
+    std::fs::create_dir_all(&outside).unwrap();
+    symlink(&outside, paths.profiles_dir().join("linked@test")).unwrap();
+
+    assert!(profile::get_profile_from(&paths, "linked@test").is_err());
+    assert!(
+        profile::save_profile_to(&paths, "linked@test", None, &paths.codex_auth_json()).is_err()
+    );
+}
+
+#[test]
+fn concurrent_switches_keep_active_marker_and_live_auth_aligned() {
+    use std::sync::{Arc, Barrier};
+
+    let (_tmp, paths) = setup_test_env();
+    write_profile(&paths, "a@test", "token-a");
+    write_profile(&paths, "b@test", "token-b");
+    let paths = Arc::new(paths);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let handles: Vec<_> = ["a@test", "b@test"]
+        .into_iter()
+        .map(|alias| {
+            let paths = Arc::clone(&paths);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                profile::switch_to_from(&paths, alias).unwrap();
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let active = profile::get_active_from(&paths).unwrap().unwrap();
+    let live = codexctl::api::read_auth_json(&paths.codex_auth_json()).unwrap();
+    let saved = codexctl::api::read_auth_json(
+        &profile::get_profile_from(&paths, &active)
+            .unwrap()
+            .auth_json_path(),
+    )
+    .unwrap();
+    assert_eq!(live.access_token, saved.access_token);
+}
+
+#[test]
+fn case_fold_alias_collision_cannot_overwrite_credentials() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(&paths, "Work", "original-token");
+    std::fs::write(paths.codex_auth_json(), r#"{"access_token":"new-token"}"#).unwrap();
+
+    let result = profile::save_profile_to(&paths, "work", None, &paths.codex_auth_json());
+
+    assert!(result.is_err());
+    let original = std::fs::read_to_string(
+        profile::get_profile_from(&paths, "Work")
+            .unwrap()
+            .auth_json_path(),
+    )
+    .unwrap();
+    assert!(original.contains("original-token"));
+    assert!(!original.contains("new-token"));
+}

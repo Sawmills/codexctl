@@ -111,6 +111,89 @@ fn parse_rate_limit_response_team_format() {
     assert!((secondary.used_percent - 25.0).abs() < f64::EPSILON);
 }
 
+#[test]
+fn parse_additional_named_rate_limit_bucket() {
+    let json = r#"{
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 13,
+                "limit_window_seconds": 604800
+            }
+        },
+        "additional_rate_limits": [{
+            "limit_name": "GPT-5.3-Codex-Spark",
+            "metered_feature": "codex_bengalfox",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 0,
+                    "limit_window_seconds": 604800
+                }
+            }
+        }]
+    }"#;
+
+    let response: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(response.additional_rate_limits.len(), 1);
+    let additional = &response.additional_rate_limits[0];
+    assert_eq!(
+        additional.limit_name.as_deref(),
+        Some("GPT-5.3-Codex-Spark")
+    );
+    assert_eq!(
+        additional.metered_feature.as_deref(),
+        Some("codex_bengalfox")
+    );
+    assert_eq!(
+        additional
+            .rate_limit
+            .as_ref()
+            .and_then(|limit| limit.long_window())
+            .map(|window| window.used_percent),
+        Some(0.0)
+    );
+}
+
+#[test]
+fn billing_class_is_conservative_for_missing_or_changed_metadata() {
+    use api::BillingClass;
+
+    let rate_limited: RateLimitResponse = serde_json::from_str(
+        r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800}}}"#,
+    )
+    .unwrap();
+    assert_eq!(rate_limited.billing_class(), BillingClass::RateLimited);
+
+    let plan_usage_based: RateLimitResponse = serde_json::from_str(
+        r#"{"plan_type":"self_serve_business_usage_based","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800}}}"#,
+    )
+    .unwrap();
+    assert_eq!(plan_usage_based.billing_class(), BillingClass::UsageBased);
+
+    let credits_usage_based: RateLimitResponse = serde_json::from_str(
+        r#"{"plan_type":null,"rate_limit":null,"credits":{"has_credits":true}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        credits_usage_based.billing_class(),
+        BillingClass::UsageBased
+    );
+
+    let unknown: RateLimitResponse =
+        serde_json::from_str(r#"{"plan_type":"new_plan","rate_limit":null}"#).unwrap();
+    assert_eq!(unknown.billing_class(), BillingClass::Unknown);
+
+    let empty_rate_limit: RateLimitResponse =
+        serde_json::from_str(r#"{"plan_type":"new_plan","rate_limit":{}}"#).unwrap();
+    assert_eq!(empty_rate_limit.billing_class(), BillingClass::Unknown);
+}
+
+#[test]
+fn bounded_http_clients_build() {
+    api::http_client().unwrap();
+    api::blocking_http_client().unwrap();
+}
+
 /// Plans that publish only a weekly window return it in the `primary_window`
 /// slot. Reading windows positionally would report that weekly limit as a 5h
 /// one and leave the 7d reset unknown, which silently disables reset-aware

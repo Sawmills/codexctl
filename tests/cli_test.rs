@@ -79,3 +79,45 @@ fn status_accepts_rate_limited_flag() {
     assert!(stdout.contains("--rate-limited"));
     assert!(stdout.contains("--usage-based"));
 }
+
+#[test]
+fn informational_and_invalid_commands_do_not_create_profile_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let commands: &[&[&str]] = &[
+        &["--help"],
+        &["--version"],
+        &["-V"],
+        &["completions", "bash"],
+        &["nonexistent"],
+    ];
+
+    for args in commands {
+        let mut command = Command::cargo_bin("codexctl").unwrap();
+        let output = command
+            .env("HOME", tmp.path())
+            .args(*args)
+            .output()
+            .unwrap();
+        if *args == ["nonexistent"] {
+            assert!(!output.status.success());
+        }
+        assert!(
+            !tmp.path().join(".codexctl").exists(),
+            "created state for {args:?}"
+        );
+    }
+}
+
+#[test]
+fn stateful_command_initializes_private_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut command = Command::cargo_bin("codexctl").unwrap();
+
+    command
+        .env("HOME", tmp.path())
+        .arg("list")
+        .assert()
+        .success();
+
+    assert!(tmp.path().join(".codexctl/profiles").is_dir());
+}

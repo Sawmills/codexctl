@@ -23,10 +23,7 @@ enum CreditsStatus {
 
 struct RateLimitedAccount {
     alias: String,
-    h5_pct: Option<f64>,
-    d7_pct: Option<f64>,
-    h5_reset: String,
-    d7_reset: String,
+    limits: Vec<LimitStatus>,
     token_expiry: Option<i64>,
     /// Banked rate-limit resets held by this account.
     reset_credits: i64,
@@ -39,6 +36,38 @@ struct RateLimitedAccount {
     is_active: bool,
     is_error: bool,
     error_msg: String,
+}
+
+struct LimitStatus {
+    name: String,
+    h5_pct: Option<f64>,
+    d7_pct: Option<f64>,
+    h5_reset: String,
+    d7_reset: String,
+}
+
+impl LimitStatus {
+    fn from_rate_limit(name: String, rate_limit: &api::RateLimit) -> Self {
+        let short = rate_limit.short_window();
+        let long = rate_limit.long_window();
+        Self {
+            name,
+            h5_pct: short.map(|window| window.used_percent),
+            d7_pct: long.map(|window| window.used_percent),
+            h5_reset: format_window_reset(short),
+            d7_reset: format_window_reset(long),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            name: "Codex".to_string(),
+            h5_pct: None,
+            d7_pct: None,
+            h5_reset: "-".to_string(),
+            d7_reset: "-".to_string(),
+        }
+    }
 }
 
 struct UsageBasedAccount {
@@ -58,8 +87,11 @@ impl RateLimitedAccount {
         if self.is_error {
             return 1000.0;
         }
-        let h5 = self.h5_pct.unwrap_or(0.0);
-        let d7 = self.d7_pct.unwrap_or(0.0);
+        let Some(main) = self.limits.first() else {
+            return 1000.0;
+        };
+        let h5 = main.h5_pct.unwrap_or(0.0);
+        let d7 = main.d7_pct.unwrap_or(0.0);
         if h5 >= 100.0 && d7 >= 100.0 {
             return 900.0;
         }
@@ -184,12 +216,12 @@ fn load_sorted_statuses() -> Result<(
         return Ok((Vec::new(), Vec::new(), fetched_at));
     }
 
-    let active = profile::get_active()?;
-    let codex_auth = config::codex_auth_json()?;
+    let paths = config::default_paths()?;
+    let active = profile::get_active_from(&paths)?;
 
     let rt = tokio::runtime::Runtime::new()?;
     let (mut rate_limited, mut usage_based) =
-        rt.block_on(fetch_and_split(&profiles, &active, &codex_auth));
+        rt.block_on(fetch_and_split(&profiles, &active, &paths))?;
 
     rate_limited.sort_by(|a, b| {
         a.availability_score()
@@ -222,14 +254,51 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     println!("{title}");
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec![
-        "Account", "5h", "5h Reset", "7d", "7d Reset", "Resets", "Token",
-    ]);
+    let columns = RateLimitColumns::for_accounts(accounts);
+    table.set_header(columns.headers());
     for account in accounts {
-        table.add_row(render_rate_limited_row(account));
+        for row in render_rate_limited_rows(account, columns) {
+            table.add_row(row);
+        }
     }
     println!("{table}");
     true
+}
+
+#[derive(Clone, Copy)]
+struct RateLimitColumns {
+    named_limits: bool,
+    short: bool,
+    long: bool,
+}
+
+impl RateLimitColumns {
+    fn for_accounts(accounts: &[&RateLimitedAccount]) -> Self {
+        Self {
+            named_limits: accounts.iter().any(|account| account.limits.len() > 1),
+            short: accounts
+                .iter()
+                .any(|account| account.limits.iter().any(|limit| limit.h5_pct.is_some())),
+            long: accounts
+                .iter()
+                .any(|account| account.limits.iter().any(|limit| limit.d7_pct.is_some())),
+        }
+    }
+
+    fn headers(self) -> Vec<&'static str> {
+        let mut headers = vec!["Account"];
+        if self.named_limits {
+            headers.push("Limit");
+        }
+        if self.short {
+            headers.extend(["5h", "5h Reset"]);
+        }
+        if self.long {
+            headers.extend(["7d", "7d Reset"]);
+        }
+        headers.extend(["Resets", "Token"]);
+        headers
+    }
 }
 
 fn print_usage_based_table(title: &str, accounts: &[&UsageBasedAccount]) -> bool {
@@ -257,9 +326,9 @@ fn is_usage_based_plan(plan: &str) -> bool {
 async fn fetch_and_split(
     profiles: &[profile::Profile],
     active: &Option<String>,
-    codex_auth_path: &std::path::Path,
-) -> (Vec<RateLimitedAccount>, Vec<UsageBasedAccount>) {
-    let client = reqwest::Client::new();
+    paths: &config::Paths,
+) -> Result<(Vec<RateLimitedAccount>, Vec<UsageBasedAccount>)> {
+    let client = api::http_client()?;
 
     // Phase 1: fetch wham/usage for all accounts in parallel
     let futures: Vec<_> = profiles
@@ -269,13 +338,7 @@ async fn fetch_and_split(
             let alias = p.meta.alias.clone();
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
-            // The active profile's live, Codex-maintained tokens are the source of
-            // truth; the stored snapshot can be stale until the next switch/save.
-            let auth_path = if is_active {
-                codex_auth_path.to_path_buf()
-            } else {
-                p.auth_json_path()
-            };
+            let auth_path = profile::auth_json_path_for_profile_from(paths, p, active.as_deref());
             let auth = api::read_auth_json(&auth_path);
 
             async move {
@@ -322,10 +385,7 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
-                        h5_pct: None,
-                        d7_pct: None,
-                        h5_reset: "-".to_string(),
-                        d7_reset: "-".to_string(),
+                        limits: vec![LimitStatus::unavailable()],
                         token_expiry: None,
                         reset_credits: 0,
                         reset_credits_applicable: 0,
@@ -365,10 +425,7 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
-                        h5_pct: None,
-                        d7_pct: None,
-                        h5_reset: "-".to_string(),
-                        d7_reset: "-".to_string(),
+                        limits: vec![LimitStatus::unavailable()],
                         token_expiry,
                         reset_credits: 0,
                         reset_credits_applicable: 0,
@@ -387,10 +444,9 @@ async fn fetch_and_split(
             let _ = profile::update_meta_plan(alias, plan);
         }
 
-        let plan_str = usage.plan_type.as_deref().unwrap_or("-");
-        let is_ub = usage.rate_limit.is_none() && is_usage_based_plan(plan_str);
+        let billing_class = usage.billing_class();
 
-        if is_ub {
+        if billing_class == api::BillingClass::UsageBased {
             let credits = &usage.credits;
             let credits_status = match credits {
                 Some(c) if c.unlimited => CreditsStatus::Unlimited,
@@ -420,27 +476,23 @@ async fn fetch_and_split(
                 ub_needing_settings.push((idx, auth.access_token.clone(), account_id));
             }
         } else {
-            let primary = usage.rate_limit.as_ref().and_then(|r| r.short_window());
-            let secondary = usage.rate_limit.as_ref().and_then(|r| r.long_window());
-            let h5_pct = primary.map(|w| w.used_percent);
-            let d7_pct = secondary.map(|w| w.used_percent);
-            let h5_reset = format_window_reset(primary);
-            let d7_reset = format_window_reset(secondary);
+            let is_unknown = billing_class == api::BillingClass::Unknown;
 
             let idx = rate_limited.len();
             rate_limited.push(RateLimitedAccount {
                 alias: alias.clone(),
-                h5_pct,
-                d7_pct,
-                h5_reset,
-                d7_reset,
+                limits: rate_limit_statuses(usage),
                 token_expiry,
                 reset_credits: usage.reset_credits_available(),
                 reset_credits_applicable: usage.reset_credits_applicable(),
                 reset_credit_expiry: None,
                 is_active: *is_active,
-                is_error: false,
-                error_msg: String::new(),
+                is_error: is_unknown,
+                error_msg: if is_unknown {
+                    "unknown billing".to_string()
+                } else {
+                    String::new()
+                },
             });
 
             if usage.reset_credits_available() > 0 {
@@ -516,42 +568,93 @@ async fn fetch_and_split(
         }
     }
 
-    (rate_limited, usage_based)
+    Ok((rate_limited, usage_based))
 }
 
-fn render_rate_limited_row(s: &RateLimitedAccount) -> Vec<Cell> {
-    let alias = display_alias(&s.alias, s.is_active);
+fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
+    let mut limits = Vec::new();
+    if let Some(rate_limit) = &usage.rate_limit {
+        limits.push(LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            rate_limit,
+        ));
+    }
+    for additional in &usage.additional_rate_limits {
+        let Some(rate_limit) = &additional.rate_limit else {
+            continue;
+        };
+        let raw_name = additional
+            .limit_name
+            .as_deref()
+            .or(additional.metered_feature.as_deref())
+            .unwrap_or("Additional");
+        let name: String = raw_name
+            .trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(80)
+            .collect();
+        limits.push(LimitStatus::from_rate_limit(
+            if name.is_empty() {
+                "Additional".to_string()
+            } else {
+                name
+            },
+            rate_limit,
+        ));
+    }
+    if limits.is_empty() {
+        limits.push(LimitStatus::unavailable());
+    }
+    limits
+}
 
-    if s.is_error {
-        return vec![
-            Cell::new(alias),
-            Cell::new("-"),
-            Cell::new("-"),
-            Cell::new("-"),
-            Cell::new("-"),
-            Cell::new("-"),
-            token_cell(s.token_expiry, true, &s.error_msg),
-        ];
+fn render_rate_limited_rows(
+    account: &RateLimitedAccount,
+    columns: RateLimitColumns,
+) -> Vec<Vec<Cell>> {
+    if account.is_error {
+        let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
+        if columns.named_limits {
+            row.push(Cell::new("-"));
+        }
+        if columns.short {
+            row.extend([Cell::new("-"), Cell::new("-")]);
+        }
+        if columns.long {
+            row.extend([Cell::new("-"), Cell::new("-")]);
+        }
+        row.push(Cell::new("-"));
+        row.push(token_cell(account.token_expiry, true, &account.error_msg));
+        return vec![row];
     }
 
-    let h5_str = s
-        .h5_pct
-        .map(|p| format!("{:.0}%", p))
-        .unwrap_or_else(|| "-".to_string());
-    let d7_str = s
-        .d7_pct
-        .map(|p| format!("{:.0}%", p))
-        .unwrap_or_else(|| "-".to_string());
-
-    vec![
-        Cell::new(alias),
-        colorize_usage(&h5_str),
-        Cell::new(&s.h5_reset),
-        colorize_usage(&d7_str),
-        Cell::new(&s.d7_reset),
-        resets_cell(s),
-        token_cell(s.token_expiry, false, &s.error_msg),
-    ]
+    account
+        .limits
+        .iter()
+        .enumerate()
+        .map(|(index, limit)| {
+            let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
+            if columns.named_limits {
+                row.push(Cell::new(&limit.name));
+            }
+            if columns.short {
+                row.push(colorize_usage(limit.h5_pct));
+                row.push(Cell::new(&limit.h5_reset));
+            }
+            if columns.long {
+                row.push(colorize_usage(limit.d7_pct));
+                row.push(Cell::new(&limit.d7_reset));
+            }
+            if index == 0 {
+                row.push(resets_cell(account));
+                row.push(token_cell(account.token_expiry, false, &account.error_msg));
+            } else {
+                row.extend([Cell::new("-"), Cell::new("-")]);
+            }
+            row
+        })
+        .collect()
 }
 
 /// The "Resets" column: banked rate-limit resets, and how many of them can be
@@ -716,8 +819,10 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
-fn colorize_usage(usage_str: &str) -> Cell {
-    let pct: f64 = usage_str.trim_end_matches('%').parse().unwrap_or(0.0);
+fn colorize_usage(used_percent: Option<f64>) -> Cell {
+    let Some(pct) = used_percent else {
+        return Cell::new("-");
+    };
     let color = if pct >= 80.0 {
         Color::Red
     } else if pct >= 50.0 {
@@ -725,7 +830,7 @@ fn colorize_usage(usage_str: &str) -> Cell {
     } else {
         Color::Green
     };
-    Cell::new(usage_str).fg(color)
+    Cell::new(format!("{pct:.0}%")).fg(color)
 }
 
 #[cfg(test)]
@@ -751,10 +856,13 @@ mod tests {
     fn rate_limited_account() -> RateLimitedAccount {
         RateLimitedAccount {
             alias: "amir+8@sawmills.ai".to_string(),
-            h5_pct: Some(10.0),
-            d7_pct: Some(20.0),
-            h5_reset: "in 1h 00m".to_string(),
-            d7_reset: "in 1d 00h".to_string(),
+            limits: vec![LimitStatus {
+                name: "Codex".to_string(),
+                h5_pct: Some(10.0),
+                d7_pct: Some(20.0),
+                h5_reset: "in 1h 00m".to_string(),
+                d7_reset: "in 1d 00h".to_string(),
+            }],
             token_expiry: None,
             reset_credits: 0,
             reset_credits_applicable: 0,
@@ -767,7 +875,12 @@ mod tests {
 
     #[test]
     fn render_rate_limited_row_has_expected_column_count() {
-        assert_eq!(render_rate_limited_row(&rate_limited_account()).len(), 7);
+        let account = rate_limited_account();
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let rows = render_rate_limited_rows(&account, columns);
+        assert_eq!(columns.headers().len(), 7);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), 7);
     }
 
     /// The error row must line up with the normal row or the table breaks.
@@ -779,7 +892,53 @@ mod tests {
             ..rate_limited_account()
         };
 
-        assert_eq!(render_rate_limited_row(&account).len(), 7);
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let rows = render_rate_limited_rows(&account, columns);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].len(), columns.headers().len());
+    }
+
+    #[test]
+    fn weekly_only_accounts_omit_empty_five_hour_columns() {
+        let mut account = rate_limited_account();
+        account.limits[0].h5_pct = None;
+        account.limits[0].h5_reset = "-".to_string();
+
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+
+        assert!(!columns.short);
+        assert_eq!(
+            columns.headers(),
+            vec!["Account", "7d", "7d Reset", "Resets", "Token"]
+        );
+        assert_eq!(render_rate_limited_rows(&account, columns)[0].len(), 5);
+    }
+
+    #[test]
+    fn named_additional_limits_render_as_separate_rows() {
+        let mut account = rate_limited_account();
+        account.limits[0].h5_pct = None;
+        account.limits.push(LimitStatus {
+            name: "GPT-5.3-Codex-Spark".to_string(),
+            h5_pct: None,
+            d7_pct: Some(0.0),
+            h5_reset: "-".to_string(),
+            d7_reset: "in 6d 00h".to_string(),
+        });
+
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let rows = render_rate_limited_rows(&account, columns);
+
+        assert!(columns.named_limits);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.len() == columns.headers().len()));
+        assert_eq!(rows[1][1].content(), "GPT-5.3-Codex-Spark");
+    }
+
+    #[test]
+    fn unavailable_usage_is_not_colored_green() {
+        let cell = colorize_usage(None);
+        assert_eq!(cell.content(), "-");
     }
 
     #[test]

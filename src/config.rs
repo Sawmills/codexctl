@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::store;
+
 /// All paths codexctl uses. Testable: construct with a custom root.
 #[derive(Clone)]
 pub struct Paths {
@@ -34,9 +36,10 @@ impl Paths {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
+        store::ensure_private_dir(&self.codexctl_dir())?;
         let profiles = self.profiles_dir();
-        std::fs::create_dir_all(&profiles)
-            .with_context(|| format!("failed to create {}", profiles.display()))?;
+        store::ensure_private_dir(&profiles)
+            .with_context(|| format!("failed to initialize {}", profiles.display()))?;
         Ok(())
     }
 }

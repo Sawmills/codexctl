@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use crate::commands::{alias, status};
 use crate::config::{self, Paths};
 use crate::profile;
+use crate::store;
 
 trait CodexLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()>;
@@ -15,8 +16,7 @@ struct CodexCliLoginRunner;
 
 impl CodexLoginRunner for CodexCliLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()> {
-        std::fs::create_dir_all(codex_home)
-            .with_context(|| format!("failed to create {}", codex_home.display()))?;
+        store::ensure_private_dir(codex_home)?;
 
         let status = Command::new("codex")
             .arg("login")
@@ -47,7 +47,12 @@ pub fn run(alias: &str) -> Result<()> {
 
 fn run_from(paths: &Paths, alias: &str, runner: &mut impl CodexLoginRunner) -> Result<()> {
     let alias = alias::required(alias)?;
-    let codex_home = isolated_login_home(paths, alias);
+    let codex_home = {
+        let _lock = store::lock(paths)?;
+        let home = isolated_login_home(paths, alias)?;
+        store::ensure_private_dir(&home)?;
+        home
+    };
     runner.run_codex_login(&codex_home)?;
 
     let auth_path = codex_home.join("auth.json");
@@ -56,14 +61,13 @@ fn run_from(paths: &Paths, alias: &str, runner: &mut impl CodexLoginRunner) -> R
     }
 
     let email = email_from_alias(alias);
-    profile::save_profile_to(paths, alias, email.as_deref(), &auth_path)?;
-    activate_imported_profile(paths, alias)?;
+    profile::save_profile_and_activate_to(paths, alias, email.as_deref(), &auth_path)?;
 
     Ok(())
 }
 
-fn isolated_login_home(paths: &Paths, alias: &str) -> PathBuf {
-    paths.login_homes_dir().join(alias)
+fn isolated_login_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
+    store::login_home(paths, alias)
 }
 
 fn email_from_alias(alias: &str) -> Option<String> {
@@ -72,25 +76,6 @@ fn email_from_alias(alias: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-fn activate_imported_profile(paths: &Paths, alias: &str) -> Result<()> {
-    let codex_auth = paths.codex_auth_json();
-    if let Some(parent) = codex_auth.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    if profile::get_active_from(paths)?.as_deref() == Some(alias) {
-        let profile = profile::get_profile_from(paths, alias)?;
-        std::fs::copy(profile.auth_json_path(), &codex_auth)
-            .with_context(|| "failed to copy auth.json to ~/.codex/")?;
-        profile::set_active_from(paths, alias)?;
-        return Ok(());
-    }
-
-    profile::switch_to_from(paths, alias)?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -134,7 +119,7 @@ mod tests {
         let (_tmp, paths) = setup_test_env();
 
         assert_eq!(
-            isolated_login_home(&paths, "amir+8@sawmills.ai"),
+            isolated_login_home(&paths, "amir+8@sawmills.ai").unwrap(),
             paths
                 .codexctl_dir()
                 .join("login-homes")
@@ -151,7 +136,11 @@ mod tests {
 
         assert_eq!(
             runner.seen_home.as_deref(),
-            Some(isolated_login_home(&paths, "amir+8@sawmills.ai").as_path())
+            Some(
+                isolated_login_home(&paths, "amir+8@sawmills.ai")
+                    .unwrap()
+                    .as_path()
+            )
         );
         let saved = std::fs::read_to_string(
             paths

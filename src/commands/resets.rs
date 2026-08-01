@@ -211,7 +211,7 @@ pub fn redeem(alias: &str, credit_id: Option<&str>) -> Result<api::ConsumeResetR
     let auth = auth_for(alias, is_active(alias)?)?;
     let request_id = api::new_redeem_request_id(alias);
     let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
+    let client = api::http_client()?;
     rt.block_on(api::consume_reset_credit_async(
         &client,
         &auth.access_token,
@@ -298,7 +298,9 @@ pub fn settle_after_redeem(alias: &str) {
     let Ok(rt) = tokio::runtime::Runtime::new() else {
         return;
     };
-    let client = reqwest::Client::new();
+    let Ok(client) = api::http_client() else {
+        return;
+    };
 
     for _ in 0..ATTEMPTS {
         std::thread::sleep(DELAY);
@@ -351,9 +353,9 @@ struct ResetsRow {
 }
 
 fn fetch_all(profiles: &[profile::Profile], active: &Option<String>) -> Result<Vec<ResetsRow>> {
-    let codex_auth = config::codex_auth_json()?;
+    let paths = config::default_paths()?;
     let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
+    let client = api::http_client()?;
 
     Ok(rt.block_on(async {
         let futs: Vec<_> = profiles
@@ -362,11 +364,8 @@ fn fetch_all(profiles: &[profile::Profile], active: &Option<String>) -> Result<V
                 let client = client.clone();
                 let alias = p.meta.alias.clone();
                 let is_active = active.as_deref() == Some(&p.meta.alias);
-                let auth_path = if is_active {
-                    codex_auth.clone()
-                } else {
-                    p.auth_json_path()
-                };
+                let auth_path =
+                    profile::auth_json_path_for_profile_from(&paths, p, active.as_deref());
                 async move {
                     match api::read_auth_json(&auth_path) {
                         Ok(auth) => fetch_row(&client, alias, is_active, &auth).await,
@@ -432,7 +431,7 @@ async fn fetch_row(
 fn fetch_one(alias: &str, is_active: bool) -> Result<ResetsRow> {
     let auth = auth_for(alias, is_active)?;
     let rt = tokio::runtime::Runtime::new()?;
-    let client = reqwest::Client::new();
+    let client = api::http_client()?;
     let row = rt.block_on(fetch_row(&client, alias.to_string(), is_active, &auth));
     if let Some(error) = &row.error {
         bail!("could not read reset credits for {alias}: {error}");
@@ -443,11 +442,10 @@ fn fetch_one(alias: &str, is_active: bool) -> Result<ResetsRow> {
 /// The active profile's live tokens are Codex-maintained and authoritative; the
 /// stored snapshot can be stale until the next switch or save.
 fn auth_for(alias: &str, is_active: bool) -> Result<api::AuthJson> {
-    let path = if is_active {
-        config::codex_auth_json()?
-    } else {
-        profile::get_profile(alias)?.auth_json_path()
-    };
+    let paths = config::default_paths()?;
+    let profile = profile::get_profile_from(&paths, alias)?;
+    let active = is_active.then_some(alias);
+    let path = profile::auth_json_path_for_profile_from(&paths, &profile, active);
     api::read_auth_json(&path)
 }
 
