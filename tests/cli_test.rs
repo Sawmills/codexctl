@@ -41,12 +41,19 @@ fn codex_has_independent_reset_and_billing_flags() {
 }
 
 #[test]
-fn use_has_independent_reset_and_billing_flags() {
+fn use_keeps_reset_approval_but_hides_obsolete_billing_approval() {
     let mut cmd = Command::cargo_bin("codexctl").unwrap();
     let output = cmd.args(["use", "--help"]).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("--allow-billing"));
     assert!(stdout.contains("--allow-resets"));
+    assert!(!stdout.contains("--allow-billing"));
+
+    let mut compatibility_cmd = Command::cargo_bin("codexctl").unwrap();
+    let output = compatibility_cmd
+        .args(["use", "--allow-billing", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
 }
 
 /// Installed builds need to be able to report their own version, so an upgrade

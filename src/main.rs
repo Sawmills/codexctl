@@ -41,9 +41,9 @@ enum Commands {
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
         alias: Option<String>,
-        /// Allow automatic selection of a credit-billing account without
-        /// prompting (use for unattended runs; it may spend credits)
-        #[arg(long)]
+        /// Deprecated compatibility flag. Automatic selection now warns and
+        /// continues without prompting.
+        #[arg(long, hide = true)]
         allow_billing: bool,
         /// When auto-selecting and no account has headroom left, redeem a
         /// banked reset without prompting (resets are scarce and expire)

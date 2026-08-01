@@ -12,8 +12,9 @@ Split the status output into two tables, one per billing model. Each table has c
 
 Shown when at least one rate-limited account exists. Window columns are adaptive. A 5-hour or
 7-day pair appears only when the API returns a window in that duration class. The `Limit` column
-appears when the response includes additional named model or feature buckets. Each bucket gets a
-separate row.
+appears when the response includes additional named model or feature buckets. Each account gets one
+table row. Multiple buckets use aligned lines within the `Limit`, usage, and reset cells. Account
+level reset-credit and token data appears once.
 
 ```
 Rate-Limited Accounts

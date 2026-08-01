@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -15,29 +15,18 @@ use crate::profile;
 /// 100% — i.e. the account has no usable headroom right now.
 const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
 
-pub fn run(alias: Option<&str>, allow_billing: bool, allow_resets: bool) -> Result<()> {
-    run_to_auth_json(
-        alias,
-        &config::codex_auth_json()?,
-        allow_billing,
-        allow_resets,
-    )
+pub fn run(alias: Option<&str>, _allow_billing: bool, allow_resets: bool) -> Result<()> {
+    run_to_auth_json(alias, &config::codex_auth_json()?, allow_resets)
 }
 
-pub fn run_to_auth_json(
-    alias: Option<&str>,
-    auth_json: &Path,
-    allow_billing: bool,
-    allow_resets: bool,
-) -> Result<()> {
-    run_to_auth_json_excluding(alias, auth_json, None, allow_billing, allow_resets)
+pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path, allow_resets: bool) -> Result<()> {
+    run_to_auth_json_excluding(alias, auth_json, None, allow_resets)
 }
 
 pub fn run_to_auth_json_excluding(
     alias: Option<&str>,
     auth_json: &Path,
     excluded_alias: Option<&str>,
-    allow_billing: bool,
     allow_resets: bool,
 ) -> Result<()> {
     match alias::optional(alias)? {
@@ -51,7 +40,7 @@ pub fn run_to_auth_json_excluding(
             status::run_focused(a)?;
         }
         None => {
-            let best = find_most_available_excluding(excluded_alias, allow_billing, allow_resets)?;
+            let best = find_most_available_excluding(excluded_alias, allow_resets)?;
             let email = profile::switch_to_auth_json(&best, auth_json)?;
             println!("auto-selected most available: {} ({})", best, email);
             println!();
@@ -63,7 +52,6 @@ pub fn run_to_auth_json_excluding(
 
 fn find_most_available_excluding(
     excluded_alias: Option<&str>,
-    allow_billing: bool,
     allow_resets: bool,
 ) -> Result<String> {
     let all_profiles = profile::list_profiles()?;
@@ -93,13 +81,13 @@ fn find_most_available_excluding(
         .collect();
 
     // Prefer existing headroom before spending a banked reset. A seat that can
-    // bill after its hard window still requires separate billing consent.
+    // bill after its hard window produces a warning before selection.
     if let Some(alias) = select_with_headroom(&scored, reset_aware()) {
         let candidate = scored
             .iter()
             .find(|candidate| candidate.alias == alias)
             .expect("selected candidate must exist");
-        require_billing_approval(candidate, allow_billing)?;
+        notify_billing_account(&candidate.alias, candidate.bills_credits);
         return Ok(alias.to_string());
     }
 
@@ -109,7 +97,6 @@ fn find_most_available_excluding(
     if let Some(candidate) = best_candidate_from_usages(usages)?
         && let Some(plan) = candidate.reset_plan()
     {
-        require_recovery_billing_approval(&candidate, allow_billing)?;
         if !resets::approve_redemption(
             &candidate.alias,
             plan.expires_at,
@@ -122,6 +109,9 @@ fn find_most_available_excluding(
                 candidate.alias
             );
         }
+        // Warn only after reset approval makes the switch actionable, but
+        // before redeeming the scarce reset.
+        notify_billing_account(&candidate.alias, candidate.bills_credits);
         let response = resets::redeem(&candidate.alias, plan.credit_id.as_deref())?;
         resets::report_outcome(&candidate.alias, &response);
         if response.code != api::ConsumeResetCode::Reset {
@@ -144,79 +134,24 @@ fn find_most_available_excluding(
                 .iter()
                 .find(|candidate| candidate.alias == alias)
                 .expect("selected candidate must exist");
-            require_billing_approval(candidate, allow_billing)?;
+            notify_billing_account(&candidate.alias, candidate.bills_credits);
             Ok(alias.to_string())
         }
         None => bail!("no usable accounts found (all expired or errored)"),
     }
 }
 
-fn require_billing_approval(candidate: &SelectionCandidate, allow_billing: bool) -> Result<()> {
-    if !candidate.bills_credits || approve_billing_account(&candidate.alias, allow_billing) {
-        return Ok(());
-    }
-    bail!(
-        "switching to {} may use credits and was not approved",
-        candidate.alias
-    )
+fn notify_billing_account(alias: &str, bills_credits: bool) {
+    notify_billing_account_to(alias, bills_credits, &mut std::io::stderr());
 }
 
-fn require_recovery_billing_approval(
-    candidate: &RecoveryCandidate,
-    allow_billing: bool,
-) -> Result<()> {
-    if !candidate.bills_credits || approve_billing_account(&candidate.alias, allow_billing) {
-        return Ok(());
-    }
-    bail!(
-        "switching to {} may use credits and was not approved",
-        candidate.alias
-    )
-}
-
-fn approve_billing_account(alias: &str, allow_billing: bool) -> bool {
-    let stdin = std::io::stdin();
-    let mut input = stdin.lock();
-    approve_billing_account_from(
-        alias,
-        allow_billing,
-        stdin.is_terminal(),
-        &mut input,
-        &mut std::io::stderr(),
-    )
-}
-
-fn approve_billing_account_from(
-    alias: &str,
-    allow_billing: bool,
-    is_terminal: bool,
-    input: &mut impl BufRead,
-    output: &mut impl Write,
-) -> bool {
-    if allow_billing {
+fn notify_billing_account_to(alias: &str, bills_credits: bool, output: &mut impl Write) {
+    if bills_credits {
         let _ = writeln!(
             output,
-            "codexctl: --allow-billing set; switching to {alias} (may use credits)"
+            "codexctl: {alias} can use paid credits after its included usage; no billing confirmation is required"
         );
-        return true;
     }
-    if !is_terminal {
-        let _ = writeln!(
-            output,
-            "codexctl: not switching to {alias} (no terminal to approve credit billing; pass --allow-billing to allow)"
-        );
-        return false;
-    }
-    let _ = write!(
-        output,
-        "codexctl: switch to {alias} and allow it to use credits? [y/N] "
-    );
-    let _ = output.flush();
-    let mut line = String::new();
-    if input.read_line(&mut line).is_err() {
-        return false;
-    }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Whether selection prefers the soonest-resetting eligible account.
@@ -1094,30 +1029,22 @@ mod tests {
     }
 
     #[test]
-    fn billing_approval_requires_a_flag_or_interactive_yes() {
-        for answer in ["y\n", "yes\n"] {
-            assert!(approve_billing_account_from(
-                "billing",
-                false,
-                true,
-                &mut answer.as_bytes(),
-                &mut Vec::new(),
-            ));
-        }
-        assert!(!approve_billing_account_from(
-            "billing",
-            false,
-            false,
-            &mut "yes\n".as_bytes(),
-            &mut Vec::new(),
-        ));
-        assert!(approve_billing_account_from(
-            "billing",
-            true,
-            false,
-            &mut "".as_bytes(),
-            &mut Vec::new(),
-        ));
+    fn billing_selection_warns_and_does_not_ask_for_permission() {
+        let mut output = Vec::new();
+        notify_billing_account_to("billing", true, &mut output);
+
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "codexctl: billing can use paid credits after its included usage; no billing confirmation is required\n"
+        );
+    }
+
+    #[test]
+    fn no_bill_selection_does_not_warn() {
+        let mut output = Vec::new();
+        notify_billing_account_to("no-bill", false, &mut output);
+
+        assert!(output.is_empty());
     }
 
     #[test]

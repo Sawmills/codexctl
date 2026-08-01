@@ -49,9 +49,9 @@ Rate-Limited Accounts
 │ Account              ┆ Limit                 ┆ 7d  ┆ 7d Reset                     ┆ Resets ┆ Token  │
 ╞══════════════════════╪═══════════════════════╪═════╪══════════════════════════════╪════════╪════════╡
 │ * amir@sawmills.ai   ┆ Codex                 ┆ 13% ┆ in 6d 23h (Fri Aug 07 15:31) ┆ -      ┆ 4d 19h │
-│ * amir@sawmills.ai   ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆ -      ┆ -      │
+│                      ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆        │
 │ amir+2@sawmills.ai   ┆ Codex                 ┆ 100%┆ in 6d 17h (Fri Aug 07 09:29) ┆ 1      ┆ 4d 19h │
-│ amir+2@sawmills.ai   ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆ -      ┆ -      │
+│                      ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆        │
 └──────────────────────┴───────────────────────┴─────┴──────────────────────────────┴────────┴────────┘
 
 Usage-Based Accounts
@@ -68,8 +68,9 @@ The account column is the saved profile alias, with `*` marking the active accou
 
 Rate-limit windows are matched and labeled by their server-declared duration. For example, the
 table can show `15m`, `1h`, `5h`, or `7d` columns. A column appears only when at least one returned
-bucket contains that duration. Named model or feature buckets appear as separate rows. `codexctl`
-does not invent a 5-hour window when the service returns only a weekly window.
+bucket contains that duration. Each account has one table row. Named model or feature buckets use
+aligned lines inside that row. `codexctl` does not invent a 5-hour window when the service returns
+only a weekly window.
 
 OpenAI's current [subscription documentation](https://learn.chatgpt.com/docs/pricing) describes one
 shared agentic usage and credit pool, with plan and model-specific allowances. It does not promise
@@ -204,21 +205,25 @@ ladder, cheapest option first:
 2. A banked reset whose credit would **expire before its window resets anyway** — redeemed without
    prompting, since holding it back cannot pay off.
 3. A banked reset worth keeping — asks for confirmation, or pass `--allow-resets`.
-4. A credit-billing account — asks for confirmation, or pass `--allow-billing`.
+4. A credit-billing account.
 
-Resets rank ahead of credit-billing accounts because they cost no money. `--allow-billing` does
-**not** imply permission to spend resets; each is approved separately.
+Resets rank ahead of credit-billing accounts because they cost no money. `codexctl use` warns when
+the selected account can use paid credits, then continues without confirmation. It still asks
+before it redeems a banked reset. The `codexctl codex` active-session recovery path keeps the
+stronger billing confirmation because that path can resume work and spend credits immediately.
+Its `--allow-billing` flag does **not** imply permission to spend resets; each is approved
+separately.
 
 ```bash
 codexctl use --allow-resets                                       # unattended: may spend resets
-codexctl use --allow-billing                                      # unattended: may spend credits
 codexctl codex --allow-resets -- "start prompt"
 codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
 ```
 
-So when every account is exhausted, `codexctl use` redeems a reset and hands back an account that
-actually works, instead of a seat sitting at 100%. Passing an explicit alias never redeems — use
-`codexctl reset <alias>` to spend a credit on a named account.
+So when every account is exhausted, `codexctl use` redeems a reset only after confirmation, with
+`--allow-resets`, or when the reset would otherwise lapse before the natural window reset. It then
+hands back an account that works instead of a seat at 100%. Passing an explicit alias never
+redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 
 ### Other commands
 
