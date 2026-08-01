@@ -939,6 +939,11 @@ fn colorize_usage_lines(used_percent: &[Option<f64>]) -> Cell {
         .map(|pct| pct.map_or_else(|| "-".to_string(), |pct| format!("{pct:.0}%")))
         .collect::<Vec<_>>()
         .join("\n");
+    // A comfy-table cell has one foreground color. Leave multi-bucket cells
+    // uncolored so a severe bucket does not falsely color a healthy one.
+    if used_percent.len() != 1 {
+        return Cell::new(content);
+    }
     let Some(pct) = used_percent.iter().flatten().copied().reduce(f64::max) else {
         return Cell::new(content);
     };
@@ -1422,7 +1427,14 @@ mod tests {
     #[test]
     fn unavailable_usage_is_not_colored_green() {
         let cell = colorize_usage_lines(&[None]);
-        assert_eq!(cell.content(), "-");
+        assert_eq!(cell, Cell::new("-"));
+    }
+
+    #[test]
+    fn mixed_severity_bucket_lines_do_not_share_one_color() {
+        let cell = colorize_usage_lines(&[Some(100.0), Some(0.0)]);
+
+        assert_eq!(cell, Cell::new("100%\n0%"));
     }
 
     #[test]
