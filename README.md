@@ -220,9 +220,10 @@ codexctl codex --allow-resets -- "start prompt"
 codexctl codex --allow-resets --allow-billing -- "start prompt"   # ...and may spend credits
 ```
 
-So when every account is exhausted, `codexctl use` redeems a reset and hands back an account that
-actually works, instead of a seat sitting at 100%. Passing an explicit alias never redeems — use
-`codexctl reset <alias>` to spend a credit on a named account.
+So when every account is exhausted, `codexctl use` redeems a reset only after confirmation, with
+`--allow-resets`, or when the reset would otherwise lapse before the natural window reset. It then
+hands back an account that works instead of a seat at 100%. Passing an explicit alias never
+redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 
 ### Other commands
 
