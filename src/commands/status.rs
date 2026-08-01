@@ -290,9 +290,7 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     let columns = RateLimitColumns::for_accounts(accounts);
     table.set_header(columns.headers());
     for account in accounts {
-        for row in render_rate_limited_rows(account, &columns) {
-            table.add_row(row);
-        }
+        table.add_row(render_rate_limited_row(account, &columns));
     }
     println!("{table}");
     true
@@ -718,10 +716,7 @@ fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
     limits
 }
 
-fn render_rate_limited_rows(
-    account: &RateLimitedAccount,
-    columns: &RateLimitColumns,
-) -> Vec<Vec<Cell>> {
+fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColumns) -> Vec<Cell> {
     if account.is_error {
         let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
         if columns.named_limits {
@@ -732,37 +727,48 @@ fn render_rate_limited_rows(
         }
         row.push(Cell::new("-"));
         row.push(token_cell(account.token_expiry, true, &account.error_msg));
-        return vec![row];
+        return row;
     }
 
-    account
-        .limits
-        .iter()
-        .enumerate()
-        .map(|(index, limit)| {
-            let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
-            if columns.named_limits {
-                row.push(Cell::new(&limit.name));
-            }
-            for column in &columns.windows {
-                let window = limit
+    let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
+    if columns.named_limits {
+        row.push(Cell::new(
+            account
+                .limits
+                .iter()
+                .map(|limit| limit.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    for column in &columns.windows {
+        let windows: Vec<_> = account
+            .limits
+            .iter()
+            .map(|limit| {
+                limit
                     .windows
                     .iter()
-                    .find(|window| column.keys.contains(&window.key));
-                row.push(colorize_usage(window.map(|window| window.used_pct)));
-                row.push(Cell::new(
-                    window.map_or("-", |window| window.reset.as_str()),
-                ));
-            }
-            if index == 0 {
-                row.push(resets_cell(account));
-                row.push(token_cell(account.token_expiry, false, &account.error_msg));
-            } else {
-                row.extend([Cell::new("-"), Cell::new("-")]);
-            }
-            row
-        })
-        .collect()
+                    .find(|window| column.keys.contains(&window.key))
+            })
+            .collect();
+        row.push(colorize_usage_lines(
+            &windows
+                .iter()
+                .map(|window| window.map(|window| window.used_pct))
+                .collect::<Vec<_>>(),
+        ));
+        row.push(Cell::new(
+            windows
+                .iter()
+                .map(|window| window.map_or("-", |window| window.reset.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    row.push(resets_cell(account));
+    row.push(token_cell(account.token_expiry, false, &account.error_msg));
+    row
 }
 
 /// The "Resets" column: banked rate-limit resets, and how many of them can be
@@ -927,9 +933,14 @@ fn format_duration(secs: i64) -> String {
     }
 }
 
-fn colorize_usage(used_percent: Option<f64>) -> Cell {
-    let Some(pct) = used_percent else {
-        return Cell::new("-");
+fn colorize_usage_lines(used_percent: &[Option<f64>]) -> Cell {
+    let content = used_percent
+        .iter()
+        .map(|pct| pct.map_or_else(|| "-".to_string(), |pct| format!("{pct:.0}%")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(pct) = used_percent.iter().flatten().copied().reduce(f64::max) else {
+        return Cell::new(content);
     };
     let color = if pct >= 80.0 {
         Color::Red
@@ -938,7 +949,7 @@ fn colorize_usage(used_percent: Option<f64>) -> Cell {
     } else {
         Color::Green
     };
-    Cell::new(format!("{pct:.0}%")).fg(color)
+    Cell::new(content).fg(color)
 }
 
 #[cfg(test)]
@@ -996,10 +1007,9 @@ mod tests {
     fn render_rate_limited_row_has_expected_column_count() {
         let account = rate_limited_account();
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, &columns);
+        let row = render_rate_limited_row(&account, &columns);
         assert_eq!(columns.headers().len(), 7);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].len(), 7);
+        assert_eq!(row.len(), 7);
     }
 
     /// The error row must line up with the normal row or the table breaks.
@@ -1012,9 +1022,8 @@ mod tests {
         };
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, &columns);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].len(), columns.headers().len());
+        let row = render_rate_limited_row(&account, &columns);
+        assert_eq!(row.len(), columns.headers().len());
     }
 
     #[test]
@@ -1031,7 +1040,7 @@ mod tests {
             columns.headers(),
             vec!["Account", "7d", "7d Reset", "Resets", "Token"]
         );
-        assert_eq!(render_rate_limited_rows(&account, &columns)[0].len(), 5);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 5);
     }
 
     #[test]
@@ -1062,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn named_additional_limits_render_as_separate_rows() {
+    fn named_additional_limits_render_in_one_account_row() {
         let mut account = rate_limited_account();
         account.limits[0]
             .windows
@@ -1080,12 +1089,14 @@ mod tests {
         });
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, &columns);
+        let row = render_rate_limited_row(&account, &columns);
 
         assert!(columns.named_limits);
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|row| row.len() == columns.headers().len()));
-        assert_eq!(rows[1][1].content(), "GPT-5.3-Codex-Spark");
+        assert_eq!(row.len(), columns.headers().len());
+        assert_eq!(row[0].content(), "amir+8@sawmills.ai");
+        assert_eq!(row[1].content(), "Codex\nGPT-5.3-Codex-Spark");
+        assert_eq!(row[2].content(), "20%\n0%");
+        assert_eq!(row[3].content(), "in 1d 00h\nin 6d 00h");
     }
 
     #[test]
@@ -1117,7 +1128,7 @@ mod tests {
                 "Token",
             ]
         );
-        assert_eq!(render_rate_limited_rows(&account, &columns)[0].len(), 7);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 7);
     }
 
     #[test]
@@ -1136,7 +1147,7 @@ mod tests {
         )];
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let row = &render_rate_limited_rows(&account, &columns)[0];
+        let row = render_rate_limited_row(&account, &columns);
 
         assert_eq!(
             columns.headers(),
@@ -1178,7 +1189,7 @@ mod tests {
         legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
 
         let columns = RateLimitColumns::for_accounts(&[&declared_account, &legacy_account]);
-        let legacy_row = &render_rate_limited_rows(&legacy_account, &columns)[0];
+        let legacy_row = render_rate_limited_row(&legacy_account, &columns);
 
         assert_eq!(
             columns.headers(),
@@ -1229,7 +1240,7 @@ mod tests {
             &conflicting_account,
             &secondary_account,
         ]);
-        let secondary_row = &render_rate_limited_rows(&secondary_account, &columns)[0];
+        let secondary_row = render_rate_limited_row(&secondary_account, &columns);
 
         assert_eq!(
             columns.headers(),
@@ -1269,7 +1280,7 @@ mod tests {
         legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
 
         let columns = RateLimitColumns::for_accounts(&[&declared_account, &legacy_account]);
-        let legacy_row = &render_rate_limited_rows(&legacy_account, &columns)[0];
+        let legacy_row = render_rate_limited_row(&legacy_account, &columns);
 
         assert_eq!(
             columns.headers(),
@@ -1410,7 +1421,7 @@ mod tests {
 
     #[test]
     fn unavailable_usage_is_not_colored_green() {
-        let cell = colorize_usage(None);
+        let cell = colorize_usage_lines(&[None]);
         assert_eq!(cell.content(), "-");
     }
 
