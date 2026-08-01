@@ -66,16 +66,51 @@ fn usage_summary(usage: &api::RateLimitResponse) -> String {
     let Some(rate_limit) = &usage.rate_limit else {
         return String::new();
     };
-    let mut windows = Vec::new();
-    if let Some(short) = rate_limit.short_window() {
-        windows.push(format!("5h: {:.0}%", short.used_percent));
-    }
-    if let Some(long) = rate_limit.long_window() {
-        windows.push(format!("7d: {:.0}%", long.used_percent));
-    }
+    let windows: Vec<_> = rate_limit
+        .windows()
+        .map(|(position, window)| {
+            let label = window.duration_label().unwrap_or_else(|| {
+                if position == 0 {
+                    "primary".to_string()
+                } else {
+                    "secondary".to_string()
+                }
+            });
+            format!("{label}: {:.0}%", window.used_percent)
+        })
+        .collect();
     if windows.is_empty() {
         String::new()
     } else {
         format!(" — {}", windows.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_summary_uses_declared_durations() {
+        let usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{
+                "rate_limit": {
+                    "primary_window": {"used_percent": 25, "window_minutes": 15},
+                    "secondary_window": {"used_percent": 42, "window_minutes": 60}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage_summary(&usage), " — 15m: 25%, 1h: 42%");
+    }
+
+    #[test]
+    fn usage_summary_keeps_secondary_only_position() {
+        let usage: api::RateLimitResponse =
+            serde_json::from_str(r#"{"rate_limit": {"secondary_window": {"used_percent": 42}}}"#)
+                .unwrap();
+
+        assert_eq!(usage_summary(&usage), " — secondary: 42%");
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
@@ -40,33 +40,77 @@ struct RateLimitedAccount {
 
 struct LimitStatus {
     name: String,
-    h5_pct: Option<f64>,
-    d7_pct: Option<f64>,
-    h5_reset: String,
-    d7_reset: String,
+    windows: Vec<WindowStatus>,
+    availability_score: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WindowKey {
+    Duration(u64, usize),
+    Position(usize),
+}
+
+struct WindowStatus {
+    key: WindowKey,
+    label: String,
+    used_pct: f64,
+    reset: String,
 }
 
 impl LimitStatus {
     fn from_rate_limit(name: String, rate_limit: &api::RateLimit) -> Self {
-        let short = rate_limit.short_window();
-        let long = rate_limit.long_window();
+        let mut duration_occurrences = HashMap::new();
+        let mut windows: Vec<_> = rate_limit
+            .windows()
+            .map(|(position, window)| {
+                let (key, label) = match window.duration_seconds() {
+                    Some(seconds) => {
+                        let occurrence = duration_occurrences.entry(seconds).or_insert(0);
+                        let key = WindowKey::Duration(seconds, *occurrence);
+                        *occurrence += 1;
+                        let mut label = window
+                            .duration_label()
+                            .unwrap_or_else(|| seconds.to_string());
+                        if *occurrence > 1 {
+                            label = format!("{label} #{}", *occurrence);
+                        }
+                        (key, label)
+                    }
+                    None => (
+                        WindowKey::Position(position),
+                        positional_window_label(position).to_string(),
+                    ),
+                };
+                WindowStatus {
+                    key,
+                    label,
+                    used_pct: window.used_percent,
+                    reset: format_window_reset(Some(window)),
+                }
+            })
+            .collect();
+        windows.sort_by_key(|window| window.key);
         Self {
             name,
-            h5_pct: short.map(|window| window.used_percent),
-            d7_pct: long.map(|window| window.used_percent),
-            h5_reset: format_window_reset(short),
-            d7_reset: format_window_reset(long),
+            windows,
+            availability_score: rate_limit.availability_score(),
         }
     }
 
     fn unavailable() -> Self {
         Self {
             name: "Codex".to_string(),
-            h5_pct: None,
-            d7_pct: None,
-            h5_reset: "-".to_string(),
-            d7_reset: "-".to_string(),
+            windows: Vec::new(),
+            availability_score: 0.0,
         }
+    }
+}
+
+fn positional_window_label(position: usize) -> &'static str {
+    if position == 0 {
+        "Primary"
+    } else {
+        "Secondary"
     }
 }
 
@@ -90,18 +134,7 @@ impl RateLimitedAccount {
         let Some(main) = self.limits.first() else {
             return 1000.0;
         };
-        let h5 = main.h5_pct.unwrap_or(0.0);
-        let d7 = main.d7_pct.unwrap_or(0.0);
-        if h5 >= 100.0 && d7 >= 100.0 {
-            return 900.0;
-        }
-        if d7 >= 100.0 {
-            return 700.0 + h5;
-        }
-        if h5 >= 100.0 {
-            return 500.0 + d7;
-        }
-        h5 * 2.0 + d7
+        main.availability_score
     }
 }
 
@@ -257,7 +290,7 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     let columns = RateLimitColumns::for_accounts(accounts);
     table.set_header(columns.headers());
     for account in accounts {
-        for row in render_rate_limited_rows(account, columns) {
+        for row in render_rate_limited_rows(account, &columns) {
             table.add_row(row);
         }
     }
@@ -265,11 +298,14 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     true
 }
 
-#[derive(Clone, Copy)]
 struct RateLimitColumns {
     named_limits: bool,
-    short: bool,
-    long: bool,
+    windows: Vec<WindowColumn>,
+}
+
+struct WindowColumn {
+    keys: Vec<WindowKey>,
+    label: String,
 }
 
 impl RateLimitColumns {
@@ -278,29 +314,98 @@ impl RateLimitColumns {
             .iter()
             .filter(|account| !account.is_error)
             .collect();
+        let mut declared = BTreeMap::new();
+        let mut positional = BTreeMap::new();
+        for account in &healthy {
+            for limit in &account.limits {
+                for window in &limit.windows {
+                    match window.key {
+                        WindowKey::Duration(_, _) => {
+                            declared
+                                .entry(window.key)
+                                .or_insert_with(|| window.label.clone());
+                        }
+                        WindowKey::Position(position) => {
+                            positional
+                                .entry(position)
+                                .or_insert_with(|| window.label.clone());
+                        }
+                    }
+                }
+            }
+        }
+        let mut windows: Vec<_> = declared
+            .into_iter()
+            .map(|(key, label)| WindowColumn {
+                keys: vec![key],
+                label,
+            })
+            .collect();
+        let historical_pair = if windows.len() == 2 {
+            let five_hour = windows
+                .iter()
+                .any(|column| column.keys[0] == WindowKey::Duration(5 * 60 * 60, 0));
+            let seven_day = windows
+                .iter()
+                .any(|column| column.keys[0] == WindowKey::Duration(7 * 24 * 60 * 60, 0));
+            (five_hour && seven_day).then_some((
+                WindowKey::Duration(5 * 60 * 60, 0),
+                WindowKey::Duration(7 * 24 * 60 * 60, 0),
+            ))
+        } else {
+            None
+        };
+        for (position, label) in positional {
+            let target = match (position, historical_pair) {
+                (0, Some((five_hour, _))) => Some(five_hour),
+                (1, Some((_, seven_day))) => Some(seven_day),
+                _ => None,
+            };
+            let can_alias = target.is_some_and(|target| {
+                healthy.iter().all(|account| {
+                    account.limits.iter().all(|limit| {
+                        let has_position = limit
+                            .windows
+                            .iter()
+                            .any(|window| window.key == WindowKey::Position(position));
+                        let has_target = limit.windows.iter().any(|window| window.key == target);
+                        !(has_position && has_target)
+                    })
+                })
+            });
+            let target_index = target
+                .filter(|_| can_alias)
+                .and_then(|target| windows.iter().position(|column| column.keys[0] == target));
+            if let Some(index) = target_index {
+                windows[index].keys.push(WindowKey::Position(position));
+            } else {
+                let column = WindowColumn {
+                    keys: vec![WindowKey::Position(position)],
+                    label,
+                };
+                if position == 0 {
+                    windows.insert(0, column);
+                } else {
+                    windows.push(column);
+                }
+            }
+        }
         Self {
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
-            short: healthy
-                .iter()
-                .any(|account| account.limits.iter().any(|limit| limit.h5_pct.is_some())),
-            long: healthy
-                .iter()
-                .any(|account| account.limits.iter().any(|limit| limit.d7_pct.is_some())),
+            windows,
         }
     }
 
-    fn headers(self) -> Vec<&'static str> {
-        let mut headers = vec!["Account"];
+    fn headers(&self) -> Vec<String> {
+        let mut headers = vec!["Account".to_string()];
         if self.named_limits {
-            headers.push("Limit");
+            headers.push("Limit".to_string());
         }
-        if self.short {
-            headers.extend(["5h", "5h Reset"]);
+        for window in &self.windows {
+            headers.push(window.label.clone());
+            headers.push(format!("{} Reset", window.label));
         }
-        if self.long {
-            headers.extend(["7d", "7d Reset"]);
-        }
-        headers.extend(["Resets", "Token"]);
+        headers.extend(["Resets".to_string(), "Token".to_string()]);
         headers
     }
 }
@@ -615,17 +720,14 @@ fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
 
 fn render_rate_limited_rows(
     account: &RateLimitedAccount,
-    columns: RateLimitColumns,
+    columns: &RateLimitColumns,
 ) -> Vec<Vec<Cell>> {
     if account.is_error {
         let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
         if columns.named_limits {
             row.push(Cell::new("-"));
         }
-        if columns.short {
-            row.extend([Cell::new("-"), Cell::new("-")]);
-        }
-        if columns.long {
+        for _ in &columns.windows {
             row.extend([Cell::new("-"), Cell::new("-")]);
         }
         row.push(Cell::new("-"));
@@ -642,13 +744,15 @@ fn render_rate_limited_rows(
             if columns.named_limits {
                 row.push(Cell::new(&limit.name));
             }
-            if columns.short {
-                row.push(colorize_usage(limit.h5_pct));
-                row.push(Cell::new(&limit.h5_reset));
-            }
-            if columns.long {
-                row.push(colorize_usage(limit.d7_pct));
-                row.push(Cell::new(&limit.d7_reset));
+            for column in &columns.windows {
+                let window = limit
+                    .windows
+                    .iter()
+                    .find(|window| column.keys.contains(&window.key));
+                row.push(colorize_usage(window.map(|window| window.used_pct)));
+                row.push(Cell::new(
+                    window.map_or("-", |window| window.reset.as_str()),
+                ));
             }
             if index == 0 {
                 row.push(resets_cell(account));
@@ -862,10 +966,21 @@ mod tests {
             alias: "amir+8@sawmills.ai".to_string(),
             limits: vec![LimitStatus {
                 name: "Codex".to_string(),
-                h5_pct: Some(10.0),
-                d7_pct: Some(20.0),
-                h5_reset: "in 1h 00m".to_string(),
-                d7_reset: "in 1d 00h".to_string(),
+                windows: vec![
+                    WindowStatus {
+                        key: WindowKey::Duration(5 * 60 * 60, 0),
+                        label: "5h".to_string(),
+                        used_pct: 10.0,
+                        reset: "in 1h 00m".to_string(),
+                    },
+                    WindowStatus {
+                        key: WindowKey::Duration(7 * 24 * 60 * 60, 0),
+                        label: "7d".to_string(),
+                        used_pct: 20.0,
+                        reset: "in 1d 00h".to_string(),
+                    },
+                ],
+                availability_score: 40.0,
             }],
             token_expiry: None,
             reset_credits: 0,
@@ -881,7 +996,7 @@ mod tests {
     fn render_rate_limited_row_has_expected_column_count() {
         let account = rate_limited_account();
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, columns);
+        let rows = render_rate_limited_rows(&account, &columns);
         assert_eq!(columns.headers().len(), 7);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), 7);
@@ -897,7 +1012,7 @@ mod tests {
         };
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, columns);
+        let rows = render_rate_limited_rows(&account, &columns);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].len(), columns.headers().len());
     }
@@ -905,59 +1020,392 @@ mod tests {
     #[test]
     fn weekly_only_accounts_omit_empty_five_hour_columns() {
         let mut account = rate_limited_account();
-        account.limits[0].h5_pct = None;
-        account.limits[0].h5_reset = "-".to_string();
+        account.limits[0]
+            .windows
+            .retain(|window| window.label == "7d");
+        account.limits[0].availability_score = 20.0;
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
 
-        assert!(!columns.short);
         assert_eq!(
             columns.headers(),
             vec!["Account", "7d", "7d Reset", "Resets", "Token"]
         );
-        assert_eq!(render_rate_limited_rows(&account, columns)[0].len(), 5);
+        assert_eq!(render_rate_limited_rows(&account, &columns)[0].len(), 5);
     }
 
     #[test]
     fn error_rows_do_not_add_hidden_limit_columns() {
         let mut healthy = rate_limited_account();
-        healthy.limits[0].h5_pct = None;
+        healthy.limits[0]
+            .windows
+            .retain(|window| window.label == "7d");
+        healthy.limits[0].availability_score = 20.0;
         let mut error = rate_limited_account();
         error.is_error = true;
         error.limits.push(LimitStatus {
             name: "Hidden".to_string(),
-            h5_pct: Some(1.0),
-            d7_pct: None,
-            h5_reset: "in 1h 00m".to_string(),
-            d7_reset: "-".to_string(),
+            windows: vec![WindowStatus {
+                key: WindowKey::Duration(60 * 60, 0),
+                label: "1h".to_string(),
+                used_pct: 1.0,
+                reset: "in 1h 00m".to_string(),
+            }],
+            availability_score: 2.0,
         });
 
         let columns = RateLimitColumns::for_accounts(&[&healthy, &error]);
 
         assert!(!columns.named_limits);
-        assert!(!columns.short);
-        assert!(columns.long);
+        assert_eq!(columns.windows.len(), 1);
+        assert_eq!(columns.windows[0].label, "7d");
     }
 
     #[test]
     fn named_additional_limits_render_as_separate_rows() {
         let mut account = rate_limited_account();
-        account.limits[0].h5_pct = None;
+        account.limits[0]
+            .windows
+            .retain(|window| window.label == "7d");
+        account.limits[0].availability_score = 20.0;
         account.limits.push(LimitStatus {
             name: "GPT-5.3-Codex-Spark".to_string(),
-            h5_pct: None,
-            d7_pct: Some(0.0),
-            h5_reset: "-".to_string(),
-            d7_reset: "in 6d 00h".to_string(),
+            windows: vec![WindowStatus {
+                key: WindowKey::Duration(7 * 24 * 60 * 60, 0),
+                label: "7d".to_string(),
+                used_pct: 0.0,
+                reset: "in 6d 00h".to_string(),
+            }],
+            availability_score: 0.0,
         });
 
         let columns = RateLimitColumns::for_accounts(&[&account]);
-        let rows = render_rate_limited_rows(&account, columns);
+        let rows = render_rate_limited_rows(&account, &columns);
 
         assert!(columns.named_limits);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.len() == columns.headers().len()));
         assert_eq!(rows[1][1].content(), "GPT-5.3-Codex-Spark");
+    }
+
+    #[test]
+    fn server_declared_durations_drive_window_headers() {
+        let rate_limit: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 25, "window_minutes": 15},
+                "secondary_window": {"used_percent": 42, "window_minutes": 60}
+            }"#,
+        )
+        .unwrap();
+        let mut account = rate_limited_account();
+        account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &rate_limit,
+        )];
+
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "15m",
+                "15m Reset",
+                "1h",
+                "1h Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+        assert_eq!(render_rate_limited_rows(&account, &columns)[0].len(), 7);
+    }
+
+    #[test]
+    fn equal_duration_windows_remain_separate() {
+        let rate_limit: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 25, "window_minutes": 60},
+                "secondary_window": {"used_percent": 42, "window_minutes": 60}
+            }"#,
+        )
+        .unwrap();
+        let mut account = rate_limited_account();
+        account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &rate_limit,
+        )];
+
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let row = &render_rate_limited_rows(&account, &columns)[0];
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "1h",
+                "1h Reset",
+                "1h #2",
+                "1h #2 Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+        assert_eq!(row[1].content(), "25%");
+        assert_eq!(row[3].content(), "42%");
+    }
+
+    #[test]
+    fn durationless_legacy_windows_align_with_declared_fleet_columns() {
+        let declared: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 10, "window_minutes": 300},
+                "secondary_window": {"used_percent": 20, "window_minutes": 10080}
+            }"#,
+        )
+        .unwrap();
+        let legacy: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30},
+                "secondary_window": {"used_percent": 40}
+            }"#,
+        )
+        .unwrap();
+        let mut declared_account = rate_limited_account();
+        declared_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &declared)];
+        let mut legacy_account = rate_limited_account();
+        legacy_account.alias = "legacy@sawmills.ai".to_string();
+        legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
+
+        let columns = RateLimitColumns::for_accounts(&[&declared_account, &legacy_account]);
+        let legacy_row = &render_rate_limited_rows(&legacy_account, &columns)[0];
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account", "5h", "5h Reset", "7d", "7d Reset", "Resets", "Token"
+            ]
+        );
+        assert_eq!(legacy_row[1].content(), "30%");
+        assert_eq!(legacy_row[3].content(), "40%");
+    }
+
+    #[test]
+    fn legacy_secondary_alignment_survives_primary_column_insertion() {
+        let declared: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 10, "window_minutes": 300},
+                "secondary_window": {"used_percent": 20, "window_minutes": 10080}
+            }"#,
+        )
+        .unwrap();
+        let conflicting_primary: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30},
+                "secondary_window": {"used_percent": 40, "window_minutes": 300}
+            }"#,
+        )
+        .unwrap();
+        let legacy_secondary: api::RateLimit =
+            serde_json::from_str(r#"{"secondary_window": {"used_percent": 50}}"#).unwrap();
+        let mut declared_account = rate_limited_account();
+        declared_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &declared)];
+        let mut conflicting_account = rate_limited_account();
+        conflicting_account.alias = "conflict@sawmills.ai".to_string();
+        conflicting_account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &conflicting_primary,
+        )];
+        let mut secondary_account = rate_limited_account();
+        secondary_account.alias = "secondary@sawmills.ai".to_string();
+        secondary_account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &legacy_secondary,
+        )];
+
+        let columns = RateLimitColumns::for_accounts(&[
+            &declared_account,
+            &conflicting_account,
+            &secondary_account,
+        ]);
+        let secondary_row = &render_rate_limited_rows(&secondary_account, &columns)[0];
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "Primary",
+                "Primary Reset",
+                "5h",
+                "5h Reset",
+                "7d",
+                "7d Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+        assert_eq!(secondary_row[5].content(), "50%");
+    }
+
+    #[test]
+    fn weekly_only_declared_window_does_not_absorb_legacy_primary() {
+        let declared: api::RateLimit = serde_json::from_str(
+            r#"{"primary_window": {"used_percent": 20, "window_minutes": 10080}}"#,
+        )
+        .unwrap();
+        let legacy: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30},
+                "secondary_window": {"used_percent": 40}
+            }"#,
+        )
+        .unwrap();
+        let mut declared_account = rate_limited_account();
+        declared_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &declared)];
+        let mut legacy_account = rate_limited_account();
+        legacy_account.alias = "legacy@sawmills.ai".to_string();
+        legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
+
+        let columns = RateLimitColumns::for_accounts(&[&declared_account, &legacy_account]);
+        let legacy_row = &render_rate_limited_rows(&legacy_account, &columns)[0];
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "Primary",
+                "Primary Reset",
+                "7d",
+                "7d Reset",
+                "Secondary",
+                "Secondary Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+        assert_eq!(legacy_row[1].content(), "30%");
+        assert_eq!(legacy_row[5].content(), "40%");
+    }
+
+    #[test]
+    fn arbitrary_declared_pair_does_not_absorb_legacy_windows() {
+        let declared: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 10, "window_minutes": 15},
+                "secondary_window": {"used_percent": 20, "window_minutes": 60}
+            }"#,
+        )
+        .unwrap();
+        let legacy: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30},
+                "secondary_window": {"used_percent": 40}
+            }"#,
+        )
+        .unwrap();
+        let mut declared_account = rate_limited_account();
+        declared_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &declared)];
+        let mut legacy_account = rate_limited_account();
+        legacy_account.alias = "legacy@sawmills.ai".to_string();
+        legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
+
+        let columns = RateLimitColumns::for_accounts(&[&declared_account, &legacy_account]);
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "Primary",
+                "Primary Reset",
+                "15m",
+                "15m Reset",
+                "1h",
+                "1h Reset",
+                "Secondary",
+                "Secondary Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+    }
+
+    #[test]
+    fn ambiguous_legacy_windows_do_not_alias_into_large_declared_fleet() {
+        let fast: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 10, "window_minutes": 15},
+                "secondary_window": {"used_percent": 20, "window_minutes": 60}
+            }"#,
+        )
+        .unwrap();
+        let standard: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30, "window_minutes": 300},
+                "secondary_window": {"used_percent": 40, "window_minutes": 10080}
+            }"#,
+        )
+        .unwrap();
+        let legacy: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 50},
+                "secondary_window": {"used_percent": 60}
+            }"#,
+        )
+        .unwrap();
+        let mut fast_account = rate_limited_account();
+        fast_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &fast)];
+        let mut standard_account = rate_limited_account();
+        standard_account.alias = "standard@sawmills.ai".to_string();
+        standard_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &standard)];
+        let mut legacy_account = rate_limited_account();
+        legacy_account.alias = "legacy@sawmills.ai".to_string();
+        legacy_account.limits = vec![LimitStatus::from_rate_limit("Codex".to_string(), &legacy)];
+
+        let columns =
+            RateLimitColumns::for_accounts(&[&fast_account, &standard_account, &legacy_account]);
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "Primary",
+                "Primary Reset",
+                "15m",
+                "15m Reset",
+                "1h",
+                "1h Reset",
+                "5h",
+                "5h Reset",
+                "7d",
+                "7d Reset",
+                "Secondary",
+                "Secondary Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+    }
+
+    #[test]
+    fn durationless_secondary_only_window_keeps_its_slot_label() {
+        let rate_limit: api::RateLimit =
+            serde_json::from_str(r#"{"secondary_window": {"used_percent": 42}}"#).unwrap();
+        let mut account = rate_limited_account();
+        account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &rate_limit,
+        )];
+
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+
+        assert_eq!(
+            columns.headers(),
+            vec!["Account", "Secondary", "Secondary Reset", "Resets", "Token"]
+        );
     }
 
     #[test]

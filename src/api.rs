@@ -117,8 +117,9 @@ pub struct RateLimit {
     pub secondary_window: Option<RateLimitWindow>,
 }
 
-/// Windows at or under this duration are the short (5h) window; longer ones are
-/// the long (7d) window.
+/// A single window at or under this duration is the short-term window. A single
+/// longer window is the long-term window. When the server returns two windows,
+/// their declared durations determine which is shorter and which is longer.
 const SHORT_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
 
 impl RateLimit {
@@ -134,37 +135,110 @@ impl RateLimit {
         self.secondary.as_ref().or(self.secondary_window.as_ref())
     }
 
-    /// The short (5h) window.
+    /// Every server-returned window, with `0` for primary and `1` for
+    /// secondary. Keep the slot before filtering so a secondary-only response
+    /// cannot be mislabeled as primary.
+    pub fn windows(&self) -> impl Iterator<Item = (usize, &RateLimitWindow)> {
+        [(0, self.first()), (1, self.second())]
+            .into_iter()
+            .filter_map(|(position, window)| window.map(|window| (position, window)))
+    }
+
+    /// The shorter-term window.
     ///
     /// Windows are matched by their declared duration rather than by position:
-    /// plans that no longer publish a 5h window return their weekly window in
-    /// the `primary_window` slot, and reading that positionally would report a
-    /// weekly limit as a 5h one. Windows with no declared duration fall back to
-    /// the historical positional reading.
+    /// a weekly-only plan can return its window in the `primary_window` slot,
+    /// while newer contracts can return two sub-day windows. Windows with no
+    /// declared duration fall back to the historical positional reading.
     pub fn short_window(&self) -> Option<&RateLimitWindow> {
-        self.window_matching(|seconds| seconds <= SHORT_WINDOW_MAX_SECONDS, Self::first)
-    }
-
-    /// The long (7d) window. See [`RateLimit::short_window`] for how windows are
-    /// matched.
-    pub fn long_window(&self) -> Option<&RateLimitWindow> {
-        self.window_matching(|seconds| seconds > SHORT_WINDOW_MAX_SECONDS, Self::second)
-    }
-
-    fn window_matching(
-        &self,
-        matches: impl Fn(u64) -> bool,
-        positional: impl Fn(&Self) -> Option<&RateLimitWindow>,
-    ) -> Option<&RateLimitWindow> {
-        for window in [self.first(), self.second()].into_iter().flatten() {
-            if window.duration_seconds().is_some_and(&matches) {
-                return Some(window);
+        match (self.first(), self.second()) {
+            (Some(first), Some(second)) => {
+                match (first.duration_seconds(), second.duration_seconds()) {
+                    (Some(first_seconds), Some(second_seconds)) => {
+                        Some(if first_seconds <= second_seconds {
+                            first
+                        } else {
+                            second
+                        })
+                    }
+                    (Some(seconds), None) => (seconds <= SHORT_WINDOW_MAX_SECONDS).then_some(first),
+                    (None, Some(seconds)) => {
+                        if seconds <= SHORT_WINDOW_MAX_SECONDS {
+                            Some(second)
+                        } else {
+                            Some(first)
+                        }
+                    }
+                    (None, None) => Some(first),
+                }
             }
+            (Some(window), None) => window.duration_seconds().map_or(Some(window), |seconds| {
+                (seconds <= SHORT_WINDOW_MAX_SECONDS).then_some(window)
+            }),
+            (None, Some(window)) => window
+                .duration_seconds()
+                .and_then(|seconds| (seconds <= SHORT_WINDOW_MAX_SECONDS).then_some(window)),
+            (None, None) => None,
         }
-        // Nothing declares a duration in this class. Fall back to the historical
-        // positional reading only when that window's duration is unknown, so a
-        // response that does publish durations is never misread.
-        positional(self).filter(|w| w.duration_seconds().is_none())
+    }
+
+    /// The longer-term window. See [`RateLimit::short_window`] for matching.
+    pub fn long_window(&self) -> Option<&RateLimitWindow> {
+        match (self.first(), self.second()) {
+            (Some(first), Some(second)) => {
+                match (first.duration_seconds(), second.duration_seconds()) {
+                    (Some(first_seconds), Some(second_seconds)) => {
+                        Some(if first_seconds > second_seconds {
+                            first
+                        } else {
+                            second
+                        })
+                    }
+                    (Some(seconds), None) => {
+                        if seconds > SHORT_WINDOW_MAX_SECONDS {
+                            Some(first)
+                        } else {
+                            Some(second)
+                        }
+                    }
+                    (None, Some(seconds)) => (seconds > SHORT_WINDOW_MAX_SECONDS).then_some(second),
+                    (None, None) => Some(second),
+                }
+            }
+            (Some(window), None) => window
+                .duration_seconds()
+                .and_then(|seconds| (seconds > SHORT_WINDOW_MAX_SECONDS).then_some(window)),
+            (None, Some(window)) => window.duration_seconds().map_or(Some(window), |seconds| {
+                (seconds > SHORT_WINDOW_MAX_SECONDS).then_some(window)
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// Availability score used by status sorting and automatic selection.
+    /// Exhausting either returned window makes the account unavailable.
+    pub fn availability_score(&self) -> f64 {
+        let short = self
+            .short_window()
+            .map_or(0.0, |window| window.used_percent);
+        let long = self.long_window().map_or(0.0, |window| window.used_percent);
+        let score = if short >= 100.0 && long >= 100.0 {
+            900.0
+        } else if long >= 100.0 {
+            700.0 + short
+        } else if short >= 100.0 {
+            500.0 + long
+        } else {
+            short * 2.0 + long
+        };
+        if self
+            .windows()
+            .any(|(_, window)| window.used_percent >= 100.0)
+        {
+            score.max(500.0)
+        } else {
+            score
+        }
     }
 }
 
@@ -194,6 +268,30 @@ impl RateLimitWindow {
     pub fn duration_seconds(&self) -> Option<u64> {
         self.limit_window_seconds
             .or_else(|| self.window_minutes.map(|m| m * 60))
+    }
+
+    /// A compact label derived from the server-declared window duration.
+    pub fn duration_label(&self) -> Option<String> {
+        self.duration_seconds().map(format_duration_label)
+    }
+}
+
+fn format_duration_label(seconds: u64) -> String {
+    if seconds == 0 {
+        return "0s".to_string();
+    }
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    if seconds.is_multiple_of(DAY) {
+        format!("{}d", seconds / DAY)
+    } else if seconds.is_multiple_of(HOUR) {
+        format!("{}h", seconds / HOUR)
+    } else if seconds.is_multiple_of(MINUTE) {
+        format!("{}m", seconds / MINUTE)
+    } else {
+        format!("{seconds}s")
     }
 }
 

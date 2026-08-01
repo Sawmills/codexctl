@@ -66,10 +66,16 @@ Usage-Based Accounts
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
 The account column is the saved profile alias, with `*` marking the active account.
 
-Rate-limit windows are matched by their server-declared duration. A 5-hour or 7-day column appears
-only when at least one returned bucket contains that window. Named model or feature buckets appear
-as separate rows. `codexctl` does not show an empty 5-hour column when the service returns only a
-weekly window.
+Rate-limit windows are matched and labeled by their server-declared duration. For example, the
+table can show `15m`, `1h`, `5h`, or `7d` columns. A column appears only when at least one returned
+bucket contains that duration. Named model or feature buckets appear as separate rows. `codexctl`
+does not invent a 5-hour window when the service returns only a weekly window.
+
+OpenAI's current [subscription documentation](https://learn.chatgpt.com/docs/pricing) describes one
+shared agentic usage and credit pool, with plan and model-specific allowances. It does not promise
+one universal window layout. The live [multi-bucket rate-limit
+response](https://developers.openai.com/codex/app-server#6-rate-limits-chatgpt) is therefore
+authoritative for the columns that `codexctl` shows.
 
 Automatic account selection uses the main `Codex` bucket. Additional buckets are model-specific or
 feature-specific status. They do not block general account selection without a reliable mapping
