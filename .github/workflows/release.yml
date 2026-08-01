@@ -196,7 +196,6 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           TAG: ${{ needs.setup.outputs.tag }}
-          VERSION: ${{ needs.setup.outputs.version }}
           SHA_DARWIN_ARM64: ${{ needs.release.outputs.sha_darwin_arm64 }}
           SHA_DARWIN_X86_64: ${{ needs.release.outputs.sha_darwin_x86_64 }}
           SHA_LINUX_X86_64: ${{ needs.release.outputs.sha_linux_x86_64 }}
@@ -206,13 +205,13 @@ jobs:
 
           workdir="$(mktemp -d)"
           trap 'rm -rf "${workdir}"' EXIT
+          gh auth setup-git --hostname github.com
           gh repo clone Sawmills/homebrew-tap "${workdir}/tap" -- --depth 1
 
           cat > "${workdir}/tap/Formula/codexctl.rb" << EOF
           class Codexctl < Formula
             desc "Manage multiple OpenAI Codex CLI accounts"
             homepage "https://github.com/Sawmills/codexctl"
-            version "${VERSION}"
             license "Apache-2.0"
 
             on_macos do
