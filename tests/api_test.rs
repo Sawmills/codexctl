@@ -293,6 +293,27 @@ fn partial_duration_metadata_does_not_override_declared_weekly_window() {
             .and_then(|window| window.duration_seconds()),
         Some(604800)
     );
+    assert_eq!(rate_limit.availability_score(), 700.0);
+}
+
+#[test]
+fn durationless_exhausted_window_always_makes_account_unavailable() {
+    let response: RateLimitResponse = serde_json::from_str(
+        r#"{
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 20,
+                    "limit_window_seconds": 604800
+                },
+                "secondary_window": {"used_percent": 100}
+            }
+        }"#,
+    )
+    .unwrap();
+    let rate_limit = response.rate_limit.unwrap();
+
+    assert_eq!(rate_limit.availability_score(), 500.0);
 }
 
 #[test]

@@ -344,22 +344,24 @@ impl RateLimitColumns {
         let historical_pair = if windows.len() == 2 {
             let five_hour = windows
                 .iter()
-                .position(|column| column.keys[0] == WindowKey::Duration(5 * 60 * 60, 0));
+                .any(|column| column.keys[0] == WindowKey::Duration(5 * 60 * 60, 0));
             let seven_day = windows
                 .iter()
-                .position(|column| column.keys[0] == WindowKey::Duration(7 * 24 * 60 * 60, 0));
-            five_hour.zip(seven_day)
+                .any(|column| column.keys[0] == WindowKey::Duration(7 * 24 * 60 * 60, 0));
+            (five_hour && seven_day).then_some((
+                WindowKey::Duration(5 * 60 * 60, 0),
+                WindowKey::Duration(7 * 24 * 60 * 60, 0),
+            ))
         } else {
             None
         };
         for (position, label) in positional {
-            let target_index = match (position, historical_pair) {
+            let target = match (position, historical_pair) {
                 (0, Some((five_hour, _))) => Some(five_hour),
                 (1, Some((_, seven_day))) => Some(seven_day),
                 _ => None,
             };
-            let can_alias = target_index.is_some_and(|index| {
-                let target = windows[index].keys[0];
+            let can_alias = target.is_some_and(|target| {
                 healthy.iter().all(|account| {
                     account.limits.iter().all(|limit| {
                         let has_position = limit
@@ -371,7 +373,10 @@ impl RateLimitColumns {
                     })
                 })
             });
-            if let Some(index) = target_index.filter(|_| can_alias) {
+            let target_index = target
+                .filter(|_| can_alias)
+                .and_then(|target| windows.iter().position(|column| column.keys[0] == target));
+            if let Some(index) = target_index {
                 windows[index].keys.push(WindowKey::Position(position));
             } else {
                 let column = WindowColumn {
@@ -1183,6 +1188,64 @@ mod tests {
         );
         assert_eq!(legacy_row[1].content(), "30%");
         assert_eq!(legacy_row[3].content(), "40%");
+    }
+
+    #[test]
+    fn legacy_secondary_alignment_survives_primary_column_insertion() {
+        let declared: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 10, "window_minutes": 300},
+                "secondary_window": {"used_percent": 20, "window_minutes": 10080}
+            }"#,
+        )
+        .unwrap();
+        let conflicting_primary: api::RateLimit = serde_json::from_str(
+            r#"{
+                "primary_window": {"used_percent": 30},
+                "secondary_window": {"used_percent": 40, "window_minutes": 300}
+            }"#,
+        )
+        .unwrap();
+        let legacy_secondary: api::RateLimit =
+            serde_json::from_str(r#"{"secondary_window": {"used_percent": 50}}"#).unwrap();
+        let mut declared_account = rate_limited_account();
+        declared_account.limits =
+            vec![LimitStatus::from_rate_limit("Codex".to_string(), &declared)];
+        let mut conflicting_account = rate_limited_account();
+        conflicting_account.alias = "conflict@sawmills.ai".to_string();
+        conflicting_account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &conflicting_primary,
+        )];
+        let mut secondary_account = rate_limited_account();
+        secondary_account.alias = "secondary@sawmills.ai".to_string();
+        secondary_account.limits = vec![LimitStatus::from_rate_limit(
+            "Codex".to_string(),
+            &legacy_secondary,
+        )];
+
+        let columns = RateLimitColumns::for_accounts(&[
+            &declared_account,
+            &conflicting_account,
+            &secondary_account,
+        ]);
+        let secondary_row = &render_rate_limited_rows(&secondary_account, &columns)[0];
+
+        assert_eq!(
+            columns.headers(),
+            vec![
+                "Account",
+                "Primary",
+                "Primary Reset",
+                "5h",
+                "5h Reset",
+                "7d",
+                "7d Reset",
+                "Resets",
+                "Token",
+            ]
+        );
+        assert_eq!(secondary_row[5].content(), "50%");
     }
 
     #[test]

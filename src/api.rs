@@ -222,7 +222,7 @@ impl RateLimit {
             .short_window()
             .map_or(0.0, |window| window.used_percent);
         let long = self.long_window().map_or(0.0, |window| window.used_percent);
-        if short >= 100.0 && long >= 100.0 {
+        let score = if short >= 100.0 && long >= 100.0 {
             900.0
         } else if long >= 100.0 {
             700.0 + short
@@ -230,6 +230,14 @@ impl RateLimit {
             500.0 + long
         } else {
             short * 2.0 + long
+        };
+        if self
+            .windows()
+            .any(|(_, window)| window.used_percent >= 100.0)
+        {
+            score.max(500.0)
+        } else {
+            score
         }
     }
 }

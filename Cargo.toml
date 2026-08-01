@@ -2,6 +2,7 @@
 name = "codexctl"
 version = "0.1.18"
 edition = "2024"
+rust-version = "1.89"
 description = "Manage multiple OpenAI Codex CLI accounts"
 license = "Apache-2.0"
 
