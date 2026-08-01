@@ -97,7 +97,6 @@ fn find_most_available_excluding(
     if let Some(candidate) = best_candidate_from_usages(usages)?
         && let Some(plan) = candidate.reset_plan()
     {
-        notify_billing_account(&candidate.alias, candidate.bills_credits);
         if !resets::approve_redemption(
             &candidate.alias,
             plan.expires_at,
@@ -110,6 +109,9 @@ fn find_most_available_excluding(
                 candidate.alias
             );
         }
+        // Warn only after reset approval makes the switch actionable, but
+        // before redeeming the scarce reset.
+        notify_billing_account(&candidate.alias, candidate.bills_credits);
         let response = resets::redeem(&candidate.alias, plan.credit_id.as_deref())?;
         resets::report_outcome(&candidate.alias, &response);
         if response.code != api::ConsumeResetCode::Reset {
