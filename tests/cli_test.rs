@@ -16,7 +16,221 @@ fn help_shows_all_subcommands() {
     assert!(stdout.contains("codex"));
     assert!(stdout.contains("resets"));
     assert!(stdout.contains("reset"));
+    assert!(stdout.contains("label"));
     assert!(stdout.contains("completions"));
+}
+
+// === Labels ===
+
+const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+/// Build an unsigned JWT carrying `claims`. Every claim is synthetic; no real
+/// token value enters a fixture.
+fn synthetic_token(claims: &str) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    format!("{JWT_HDR}.{payload}.sig")
+}
+
+fn seat_token(email: &str, account_id: &str, plan: &str) -> String {
+    synthetic_token(&format!(
+        r#"{{"sub":"seat-{account_id}",
+             "https://api.openai.com/profile":{{"email":"{email}"}},
+             "https://api.openai.com/auth":{{
+                "chatgpt_account_id":"{account_id}",
+                "chatgpt_user_id":"user-1",
+                "chatgpt_plan_type":"{plan}"}}}}"#
+    ))
+}
+
+fn write_profile(home: &std::path::Path, alias: &str, token: &str, meta: &str) {
+    let dir = home.join(".codexctl/profiles").join(alias);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(dir.join("meta.json"), meta).unwrap();
+}
+
+fn run(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8(output.stdout.clone()).unwrap()
+}
+
+#[test]
+fn label_sets_and_clears_a_profile_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let token = seat_token("amir@sawmills.ai", "acct-team", "business");
+    write_profile(
+        tmp.path(),
+        "amir-team",
+        &token,
+        r#"{"alias":"amir-team","email":"amir@sawmills.ai","plan":"business","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+
+    assert!(
+        run(tmp.path(), &["label", "amir-team", "team"])
+            .status
+            .success()
+    );
+    let listed = stdout_of(&run(tmp.path(), &["list"]));
+    assert!(listed.contains("team"), "label missing from list: {listed}");
+
+    // Omitting the text clears the label.
+    assert!(run(tmp.path(), &["label", "amir-team"]).status.success());
+    let cleared = stdout_of(&run(tmp.path(), &["list"]));
+    assert!(
+        !cleared.contains("Label"),
+        "cleared label still shown: {cleared}"
+    );
+}
+
+#[test]
+fn label_fails_for_an_unknown_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    assert!(
+        !run(tmp.path(), &["label", "missing", "team"])
+            .status
+            .success()
+    );
+}
+
+/// Until a label exists the tables must look exactly as they did before, so an
+/// operator who never labels anything sees no new empty column.
+#[test]
+fn list_hides_the_label_column_until_a_label_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let token = seat_token("amir@sawmills.ai", "acct-personal", "pro");
+    write_profile(
+        tmp.path(),
+        "amir@sawmills.ai",
+        &token,
+        r#"{"alias":"amir@sawmills.ai","email":"amir@sawmills.ai","plan":"pro","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+
+    let bare = stdout_of(&run(tmp.path(), &["list"]));
+    assert!(bare.contains("Account"), "list is not a table: {bare}");
+    assert!(!bare.contains("Label"), "empty label column shown: {bare}");
+
+    run(tmp.path(), &["label", "amir@sawmills.ai", "personal"]);
+
+    let labeled = stdout_of(&run(tmp.path(), &["list"]));
+    assert!(labeled.contains("Label"), "label column missing: {labeled}");
+    assert!(labeled.contains("personal"), "label missing: {labeled}");
+}
+
+/// Two profiles on one email are the case this whole feature exists for: the
+/// email cannot tell them apart, so the label has to.
+#[test]
+fn list_distinguishes_two_profiles_that_share_one_email() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Label text deliberately shares no substring with the alias, so matching
+    // it proves the label column is rendered rather than the alias.
+    for (alias, account, plan, label) in [
+        ("amir-1", "acct-personal", "pro", "my own"),
+        ("amir-2", "acct-team", "business", "sawmills seat"),
+    ] {
+        let token = seat_token("amir@sawmills.ai", account, plan);
+        write_profile(
+            tmp.path(),
+            alias,
+            &token,
+            &format!(
+                r#"{{"alias":"{alias}","email":"amir@sawmills.ai","plan":"{plan}","account_id":"{account}","saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        );
+        run(tmp.path(), &["label", alias, label]);
+    }
+
+    let listed = stdout_of(&run(tmp.path(), &["list"]));
+
+    assert!(listed.contains("Label"), "{listed}");
+    assert!(listed.contains("my own"), "{listed}");
+    assert!(listed.contains("sawmills seat"), "{listed}");
+    // One email, two rows: the address alone cannot separate them.
+    assert_eq!(listed.matches("amir@sawmills.ai").count(), 2, "{listed}");
+}
+
+#[test]
+fn whoami_shows_the_label_of_the_active_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_profile(
+        tmp.path(),
+        "amir-2",
+        &seat_token("amir@sawmills.ai", "acct-team", "business"),
+        r#"{"alias":"amir-2","label":"sawmills seat","email":"amir@sawmills.ai","plan":"business","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    std::fs::write(tmp.path().join(".codexctl/active"), "amir-2").unwrap();
+
+    let out = stdout_of(&run(tmp.path(), &["whoami"]));
+
+    assert!(out.contains("sawmills seat"), "label missing: {out}");
+    assert!(out.contains("amir@sawmills.ai"), "email missing: {out}");
+}
+
+#[test]
+fn save_and_login_accept_a_label() {
+    for command in ["save", "login"] {
+        let output = Command::cargo_bin("codexctl")
+            .unwrap()
+            .args([command, "--help"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("--label"), "{command} lacks --label");
+    }
+}
+
+/// The hazard that makes a duplicate-email account dangerous: `save` with no
+/// alias targets the existing profile, and one keystroke at the overwrite
+/// prompt would destroy the other account's tokens.
+#[test]
+fn save_refuses_to_overwrite_a_profile_holding_a_different_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_profile(
+        tmp.path(),
+        "amir@sawmills.ai",
+        &seat_token("amir@sawmills.ai", "acct-personal", "pro"),
+        r#"{"alias":"amir@sawmills.ai","email":"amir@sawmills.ai","plan":"pro","account_id":"acct-personal","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    let incoming = seat_token("amir@sawmills.ai", "acct-team", "business");
+    std::fs::write(
+        codex_dir.join("auth.json"),
+        format!(r#"{{"access_token":"{incoming}"}}"#),
+    )
+    .unwrap();
+
+    let output = run(tmp.path(), &["save"]);
+
+    assert!(!output.status.success(), "save did not refuse");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("different account"),
+        "unhelpful refusal: {stderr}"
+    );
+    // The stored tokens must be untouched.
+    let stored = std::fs::read_to_string(
+        tmp.path()
+            .join(".codexctl/profiles/amir@sawmills.ai/auth.json"),
+    )
+    .unwrap();
+    assert!(
+        !stored.contains(&incoming),
+        "personal profile was clobbered"
+    );
 }
 
 #[test]

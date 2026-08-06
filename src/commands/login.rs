@@ -34,11 +34,14 @@ impl CodexLoginRunner for CodexCliLoginRunner {
     }
 }
 
-pub fn run(alias: &str) -> Result<()> {
+pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
     let alias = alias::required(alias)?;
     let paths = config::default_paths()?;
     let mut runner = CodexCliLoginRunner;
     run_from(&paths, alias, &mut runner)?;
+    if let Some(label) = label {
+        profile::set_label_from(&paths, alias, Some(label))?;
+    }
 
     println!("logged in and saved profile '{alias}'");
     println!();
@@ -103,6 +106,9 @@ fn remove_isolated_login_home(codex_home: &Path) -> Result<()> {
         .with_context(|| format!("failed to remove {}", codex_home.display()))
 }
 
+/// Fallback address only. The saved profile prefers the token's own profile
+/// claim, so this matters solely for a token that carries no claim at all —
+/// where an alias that looks like an address is the best guess available.
 fn email_from_alias(alias: &str) -> Option<String> {
     if alias.contains('@') {
         Some(alias.to_string())
