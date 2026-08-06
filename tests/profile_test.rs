@@ -275,6 +275,56 @@ fn alias_for_auth_json_still_matches_a_claimless_profile_with_no_rival() {
     );
 }
 
+/// Displaying the active profile picks the live auth file only when it belongs
+/// to that profile. Two workspace seats of one login share a subject, so the
+/// subject alone is not ownership — otherwise the live seat's usage renders
+/// under the other seat's row.
+#[test]
+fn active_profile_ignores_live_auth_from_a_different_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = synthetic_token(
+        r#"{"sub":"seatA","jti":"stored","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    write_profile(&paths, "team@test", &stored);
+    // Live file: same login, other workspace.
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"live","https://api.openai.com/auth":{"chatgpt_account_id":"acct-personal"}}"#,
+    );
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{live}"}}"#),
+    )
+    .unwrap();
+
+    let profile = profile::get_profile_from(&paths, "team@test").unwrap();
+    let chosen = profile::auth_json_path_for_profile_from(&paths, &profile, Some("team@test"));
+
+    assert_eq!(chosen, profile.auth_json_path());
+}
+
+/// The same login and the same workspace is genuine ownership, so the live file
+/// still wins — that is what keeps the active row showing current usage.
+#[test]
+fn active_profile_uses_live_auth_from_the_same_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    let seat = |jti: &str| {
+        synthetic_token(&format!(
+            r#"{{"sub":"seatA","jti":"{jti}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-team"}}}}"#
+        ))
+    };
+    write_profile(&paths, "team@test", &seat("stored"));
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{}"}}"#, seat("live")),
+    )
+    .unwrap();
+
+    let profile = profile::get_profile_from(&paths, "team@test").unwrap();
+    let chosen = profile::auth_json_path_for_profile_from(&paths, &profile, Some("team@test"));
+
+    assert_eq!(chosen, paths.codex_auth_json());
+}
+
 /// A real Codex auth.json declares `tokens.account_id` directly. The saved
 /// workspace must come from the same resolution the rest of the code uses, or
 /// the save guard silently degrades to the plain overwrite prompt.

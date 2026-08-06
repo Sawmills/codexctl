@@ -311,7 +311,16 @@ fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
         return true;
     }
     let left_subject = api::token_subject(&left.access_token);
-    left_subject.is_some() && left_subject == api::token_subject(&right.access_token)
+    if left_subject.is_none() || left_subject != api::token_subject(&right.access_token) {
+        return false;
+    }
+    // The same login is not the same account. Two workspace seats of one human
+    // share a subject, so a declared workspace has to agree as well — otherwise
+    // the live seat's usage renders under the other seat's row.
+    match (&left.account_id, &right.account_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Option<String>> {
