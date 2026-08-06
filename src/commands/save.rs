@@ -92,18 +92,9 @@ fn refuse_a_different_account(
     incoming_account: Option<&str>,
     alias_was_explicit: bool,
 ) -> Result<()> {
-    let Some(incoming) = incoming_account else {
+    let Some(stored) = profile::conflicting_workspace(paths, alias, incoming_account) else {
         return Ok(());
     };
-    let Ok(existing) = profile::get_profile_from(paths, alias) else {
-        return Ok(());
-    };
-    let Some(stored) = existing.meta.account_id.as_deref() else {
-        return Ok(());
-    };
-    if stored == incoming {
-        return Ok(());
-    }
     // Naming the remedy matters: an operator who already chose this alias
     // cannot act on "pass an explicit alias".
     let remedy = if alias_was_explicit {
@@ -114,16 +105,11 @@ fn refuse_a_different_account(
     anyhow::bail!(
         "profile '{alias}' holds a different account \
          (stored workspace {}, incoming {}). {remedy}",
-        short_workspace(stored),
-        short_workspace(incoming)
+        profile::short_workspace(&stored),
+        incoming_account
+            .map(profile::short_workspace)
+            .unwrap_or_default()
     )
-}
-
-fn short_workspace(account_id: &str) -> String {
-    match account_id.char_indices().nth(8) {
-        Some((index, _)) => format!("{}…", &account_id[..index]),
-        None => account_id.to_string(),
-    }
 }
 
 fn fetch_email(access_token: &str) -> Option<String> {

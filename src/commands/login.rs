@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 
+use crate::api;
 use crate::commands::{alias, status};
 use crate::config::{self, Paths};
 use crate::profile;
@@ -64,6 +65,27 @@ fn run_from(
         let auth_path = codex_home.join("auth.json");
         if !auth_path.exists() {
             bail!("codex login did not create {}", auth_path.display());
+        }
+
+        // The incoming account is only knowable once the login has produced a
+        // token, so this is checked here rather than up front. Refusing costs a
+        // repeated login; not refusing costs the other account's credentials.
+        let incoming = api::read_auth_json(&auth_path)
+            .ok()
+            .and_then(|auth| auth.account_id);
+        if let Some(stored) = profile::conflicting_workspace(paths, alias, incoming.as_deref()) {
+            // `conflicting_workspace` only reports a conflict when it saw an
+            // incoming workspace, so the empty fallback is unreachable here.
+            let arriving = incoming
+                .as_deref()
+                .map(profile::short_workspace)
+                .unwrap_or_default();
+            bail!(
+                "profile '{alias}' holds a different account \
+                 (stored workspace {}, this login {arriving}). \
+                 Log in under another alias so both stay saved.",
+                profile::short_workspace(&stored)
+            );
         }
 
         let email = email_from_alias(alias);
@@ -168,6 +190,16 @@ mod tests {
             )?;
             bail!("simulated login failure")
         }
+    }
+
+    /// Unsigned JWT declaring a workspace. Synthetic claims only.
+    fn synthetic_token(account_id: &str) -> String {
+        use base64::Engine;
+        let claims = format!(
+            r#"{{"sub":"seatA","https://api.openai.com/auth":{{"chatgpt_account_id":"{account_id}"}}}}"#
+        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        format!("eyJhbGciOiJub25lIn0.{payload}.sig")
     }
 
     fn setup_test_env() -> (tempfile::TempDir, Paths) {
@@ -290,6 +322,68 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// Logging a second workspace into an alias that already holds another
+    /// account must not replace its stored credentials. `save` already refuses
+    /// this; `login` reaches the same store by a different path.
+    #[test]
+    fn run_from_refuses_to_overwrite_a_profile_holding_a_different_account() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("amir@sawmills.ai")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(kept.contains(&stored), "stored credentials were replaced");
+        assert!(!kept.contains(&incoming));
+    }
+
+    /// Re-logging the same account into its own alias is the normal refresh
+    /// path and must keep working.
+    #[test]
+    fn run_from_allows_relogin_of_the_same_account() {
+        let (_tmp, paths) = setup_test_env();
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{}"}}"#, synthetic_token("acct-team")),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        let refreshed = format!("{}x", synthetic_token("acct-team"));
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        run_from(&paths, "team", None, &mut runner).unwrap();
+
+        let saved =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json")).unwrap();
+        assert!(saved.contains(&refreshed));
     }
 
     /// A bad label must cost nothing. Failing after the device-auth flow would

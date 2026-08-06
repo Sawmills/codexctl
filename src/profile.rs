@@ -113,8 +113,10 @@ pub fn save_profile_to(
 /// Save a profile and make it active under one store lock.
 ///
 /// When the source is an isolated login home, install it into the live Codex
-/// home. A re-login of the already-active alias deliberately skips capturing
-/// the old live token so it cannot overwrite the new login.
+/// home. Capturing the outgoing live token deliberately skips the alias being
+/// saved, so a stale live token cannot overwrite the login that just replaced
+/// it. Being active is only one way the live file can belong to this alias —
+/// the token itself is the authority.
 pub fn save_profile_and_activate_to(
     paths: &Paths,
     alias: &str,
@@ -123,12 +125,14 @@ pub fn save_profile_and_activate_to(
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
-    let was_active = get_active_from(paths)?.as_deref() == Some(alias);
+    let live_auth = paths.codex_auth_json();
+    // Resolve ownership before the save rewrites the profile, or the freshly
+    // stored token would make every re-login look like it owns the live file.
+    let live_owner = alias_for_auth_json_from(paths, &live_auth).unwrap_or(None);
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
 
-    let live_auth = paths.codex_auth_json();
     if auth_json_src != live_auth {
-        if !was_active {
+        if live_owner.as_deref() != Some(alias) {
             capture_auth_file_profile_tokens(paths, &live_auth);
         }
         let saved_auth = store::profile_dir(paths, alias)?.join("auth.json");
@@ -192,6 +196,31 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
     // the recorded workspace matches what every other call path resolves.
     identity.account_id = auth.account_id.or(identity.account_id);
     identity
+}
+
+/// The workspace `alias` already holds, when that is positively a *different*
+/// account than `incoming_account`.
+///
+/// `None` means saving is safe, or there is not enough evidence to refuse: a
+/// missing identifier on either side is not proof of a conflict. Both `save`
+/// and `login` gate on this, because either one can replace the credentials of
+/// a profile that belongs to another account on the same login.
+pub fn conflicting_workspace(
+    paths: &Paths,
+    alias: &str,
+    incoming_account: Option<&str>,
+) -> Option<String> {
+    let incoming = incoming_account?;
+    let stored = get_profile_from(paths, alias).ok()?.meta.account_id?;
+    (stored != incoming).then_some(stored)
+}
+
+/// Short workspace id for an error message; the full uuid is noise.
+pub fn short_workspace(account_id: &str) -> String {
+    match account_id.char_indices().nth(8) {
+        Some((index, _)) => format!("{}…", &account_id[..index]),
+        None => account_id.to_string(),
+    }
 }
 
 /// Set or clear a profile's display label. `None`, or text that is blank once

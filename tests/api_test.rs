@@ -599,6 +599,31 @@ fn parse_account_settings_missing_limits() {
     assert!(settings.seat_type_credit_limits.is_none());
 }
 
+/// A `team` plan returns `additional_rate_limits: null` rather than omitting
+/// the key or sending `[]`. Serde's `default` only covers a missing key, so an
+/// explicit null failed the whole response and the account rendered as `error`.
+#[test]
+fn parse_rate_limit_response_with_explicit_null_collections() {
+    let json = r#"{
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": true,
+            "primary_window": {"used_percent": 79, "limit_window_seconds": 604800}
+        },
+        "secondary_window": null,
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false},
+        "rate_limit_reset_credits": {"available_count": 0, "applicable_available_count": 0}
+    }"#;
+
+    let usage: RateLimitResponse = serde_json::from_str(json).expect("team response must parse");
+
+    assert_eq!(usage.plan_type.as_deref(), Some("team"));
+    assert!(usage.additional_rate_limits.is_empty());
+    assert_eq!(usage.billing_class(), api::BillingClass::RateLimited);
+}
+
 // Fake JWT header `{"alg":"none"}`; only the (unverified) claims payload is read.
 const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
 
