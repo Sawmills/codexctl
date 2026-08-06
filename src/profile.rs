@@ -126,15 +126,14 @@ pub fn save_profile_and_activate_to(
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
     let live_auth = paths.codex_auth_json();
-    // Resolve ownership before the save rewrites the profile, or the freshly
-    // stored token would make every re-login look like it owns the live file.
-    let live_owner = alias_for_auth_json_from(paths, &live_auth).unwrap_or(None);
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
 
     if auth_json_src != live_auth {
-        if live_owner.as_deref() != Some(alias) {
-            capture_auth_file_profile_tokens(paths, &live_auth);
-        }
+        // Capture protects the *outgoing* profile's rotated tokens. The alias
+        // being written is never outgoing, so it is excluded outright rather
+        // than by inferring ownership — an unreadable or absent stored token
+        // must not be able to route the stale live file back over this login.
+        capture_auth_file_profile_tokens(paths, &live_auth, Some(alias));
         let saved_auth = store::profile_dir(paths, alias)?.join("auth.json");
         store::atomic_copy(&saved_auth, &live_auth)
             .with_context(|| format!("failed to install {}", live_auth.display()))?;
@@ -301,8 +300,11 @@ pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -
 
     // Capture the outgoing live tokens before installing the next profile.
     // The exact-token or token-subject guard prevents a foreign live auth file
-    // from overwriting an unrelated saved profile.
-    capture_auth_file_profile_tokens(paths, codex_auth);
+    // from overwriting an unrelated saved profile. Nothing is excluded here:
+    // when the live file belongs to the profile being switched to, folding its
+    // rotated tokens in first is exactly right, since the install then copies
+    // that same freshly-updated file back out.
+    capture_auth_file_profile_tokens(paths, codex_auth, None);
 
     store::atomic_copy(&profile.auth_json_path(), codex_auth)
         .with_context(|| format!("failed to install auth.json at {}", codex_auth.display()))?;
@@ -422,13 +424,16 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
 
 /// Best-effort: fold a live Codex auth file into the saved profile that owns it.
 /// Failures only warn because token capture must not block a requested switch.
-fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path) {
+fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias: Option<&str>) {
     if !codex_auth.exists() {
         return;
     }
     let Ok(Some(alias)) = alias_for_auth_json_from(paths, codex_auth) else {
         return;
     };
+    if skip_alias == Some(alias.as_str()) {
+        return;
+    }
     let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
         return;
     };

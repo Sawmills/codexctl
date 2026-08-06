@@ -386,6 +386,39 @@ mod tests {
         assert!(saved.contains(&refreshed));
     }
 
+    /// An unreadable stored token is a likely reason to re-run login, so it
+    /// must not be the reason the fresh login is discarded. Capture may never
+    /// route the stale live file back over the alias being written.
+    #[test]
+    fn run_from_keeps_the_new_login_when_the_stored_auth_is_unreadable() {
+        let (_tmp, paths) = setup_test_env();
+        let live = synthetic_token("acct-team");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{live}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+        profile::set_active_from(&paths, "team").unwrap();
+        // Corrupt the stored token, which is what sends an operator back to login.
+        std::fs::write(
+            paths.profiles_dir().join("team").join("auth.json"),
+            "{ not json",
+        )
+        .unwrap();
+
+        let fresh = format!("{}fresh", synthetic_token("acct-team"));
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{fresh}"}}"#));
+
+        run_from(&paths, "team", None, &mut runner).unwrap();
+
+        let saved =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json")).unwrap();
+        assert!(saved.contains(&fresh), "fresh login was discarded");
+        let installed = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
+        assert!(installed.contains(&fresh), "stale token was reinstalled");
+    }
+
     /// A bad label must cost nothing. Failing after the device-auth flow would
     /// make a completed login read as a failure.
     #[test]
