@@ -71,8 +71,8 @@ fn switch_copies_auth_json() {
     let meta = codexctl::profile::Meta {
         alias: "acct@test.com".to_string(),
         email: Some("acct@test.com".to_string()),
-        plan: None,
         saved_at: "2026-01-01T00:00:00Z".to_string(),
+        ..codexctl::profile::Meta::default()
     };
     std::fs::write(
         profile_dir.join("meta.json"),
@@ -171,6 +171,55 @@ fn alias_for_auth_json_rejects_ambiguous_subject_fallback() {
     );
 }
 
+/// The case adding a team seat on an existing email creates: one login, two
+/// workspaces. The subject alone is ambiguous, so the workspace has to settle
+/// it — otherwise a rotated token is never captured back and the profile later
+/// reports `expired` for no visible reason.
+#[test]
+fn alias_for_auth_json_separates_one_login_across_two_workspaces() {
+    let (tmp, paths) = setup_test_env();
+    let seat = |account: &str, jti: &str| {
+        synthetic_token(&format!(
+            r#"{{"sub":"seatA","jti":"{jti}","https://api.openai.com/auth":{{"chatgpt_account_id":"{account}"}}}}"#
+        ))
+    };
+    write_profile(&paths, "personal@test", &seat("acct-personal", "stored"));
+    write_profile(&paths, "team@test", &seat("acct-team", "stored"));
+
+    // Same seat and workspace as the team profile, but a rotated token value,
+    // so the exact-token pass cannot resolve it.
+    let live = seat("acct-team", "rotated");
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        Some("team@test".to_string())
+    );
+}
+
+/// Two profiles holding the same seat *and* the same workspace stay ambiguous.
+/// Guessing between them could overwrite the wrong profile's tokens.
+#[test]
+fn alias_for_auth_json_rejects_two_profiles_on_one_workspace() {
+    let (tmp, paths) = setup_test_env();
+    let seat = |jti: &str| {
+        synthetic_token(&format!(
+            r#"{{"sub":"seatA","jti":"{jti}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-one"}}}}"#
+        ))
+    };
+    write_profile(&paths, "copy-a@test", &seat("a"));
+    write_profile(&paths, "copy-b@test", &seat("b"));
+    let auth_json = tmp.path().join("auth.json");
+    let live = seat("live");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
@@ -178,8 +227,16 @@ fn active_starts_as_none() {
     assert!(active.is_none());
 }
 
-// Fake JWT header `{"alg":"none"}`; profile capture only reads the `sub` claim.
+// Fake JWT header `{"alg":"none"}`; profile capture only reads the claims payload.
 const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+/// Build an unsigned JWT carrying `claims`. Every claim here is synthetic; no
+/// real token value enters a fixture.
+fn synthetic_token(claims: &str) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    format!("{JWT_HDR}.{payload}.sig")
+}
 
 fn write_profile(paths: &Paths, alias: &str, access_token: &str) {
     let dir = paths.profiles_dir().join(alias);
@@ -191,15 +248,100 @@ fn write_profile(paths: &Paths, alias: &str, access_token: &str) {
     .unwrap();
     let meta = profile::Meta {
         alias: alias.to_string(),
-        email: None,
-        plan: None,
         saved_at: "2026-01-01T00:00:00Z".to_string(),
+        ..profile::Meta::default()
     };
     std::fs::write(
         dir.join("meta.json"),
         serde_json::to_string_pretty(&meta).unwrap(),
     )
     .unwrap();
+}
+
+/// A `meta.json` written before labels existed must keep loading unchanged.
+/// No migration runs, so this is the format most stores are still in.
+#[test]
+fn meta_json_without_label_fields_still_parses() {
+    let (_tmp, paths) = setup_test_env();
+    let dir = paths.profiles_dir().join("legacy@test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("auth.json"), r#"{"access_token":"tok"}"#).unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"legacy@test","email":"legacy@test","plan":"pro","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let profiles = profile::list_profiles_from(&paths).unwrap();
+
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].meta.plan.as_deref(), Some("pro"));
+    assert!(profiles[0].meta.label.is_none());
+    assert!(profiles[0].meta.account_id.is_none());
+    assert!(profiles[0].meta.user_id.is_none());
+}
+
+#[test]
+fn save_profile_records_identity_from_token_claims() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(
+        r#"{
+            "https://api.openai.com/profile": {"email": "claim@example.com"},
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-team",
+                "chatgpt_user_id": "user-1",
+                "chatgpt_plan_type": "business"
+            }
+        }"#,
+    );
+    let auth_src = paths.codex_auth_json();
+    std::fs::write(&auth_src, format!(r#"{{"access_token":"{token}"}}"#)).unwrap();
+
+    profile::save_profile_to(&paths, "team", None, &auth_src).unwrap();
+
+    let profile = profile::get_profile_from(&paths, "team").unwrap();
+    assert_eq!(profile.meta.account_id.as_deref(), Some("acct-team"));
+    assert_eq!(profile.meta.user_id.as_deref(), Some("user-1"));
+    assert_eq!(profile.meta.plan.as_deref(), Some("business"));
+    // The claim is authoritative for the address, so no alias guess is needed.
+    assert_eq!(profile.meta.email.as_deref(), Some("claim@example.com"));
+}
+
+#[test]
+fn set_label_trims_clears_and_rejects_invalid_text() {
+    let (_tmp, paths) = setup_test_env();
+    let auth_src = paths.codex_auth_json();
+    profile::save_profile_to(&paths, "team", None, &auth_src).unwrap();
+    let label_of = |paths: &Paths| profile::get_profile_from(paths, "team").unwrap().meta.label;
+
+    profile::set_label_from(&paths, "team", Some("  team  ")).unwrap();
+    assert_eq!(label_of(&paths).as_deref(), Some("team"));
+
+    profile::set_label_from(&paths, "team", Some("   ")).unwrap();
+    assert_eq!(label_of(&paths), None);
+
+    assert!(profile::set_label_from(&paths, "team", Some("two\nlines")).is_err());
+}
+
+#[test]
+fn set_label_fails_for_an_unknown_alias() {
+    let (_tmp, paths) = setup_test_env();
+
+    assert!(profile::set_label_from(&paths, "missing", Some("team")).is_err());
+}
+
+/// Re-saving an account must not silently erase the name the operator gave it.
+#[test]
+fn save_profile_preserves_an_existing_label() {
+    let (_tmp, paths) = setup_test_env();
+    let auth_src = paths.codex_auth_json();
+    profile::save_profile_to(&paths, "team", None, &auth_src).unwrap();
+    profile::set_label_from(&paths, "team", Some("team")).unwrap();
+
+    profile::save_profile_to(&paths, "team", None, &auth_src).unwrap();
+
+    let profile = profile::get_profile_from(&paths, "team").unwrap();
+    assert_eq!(profile.meta.label.as_deref(), Some("team"));
 }
 
 #[test]

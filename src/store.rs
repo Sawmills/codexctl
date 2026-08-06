@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use crate::config::Paths;
 
 const MAX_ALIAS_BYTES: usize = 128;
+const MAX_LABEL_BYTES: usize = 40;
 
 /// Validate one profile-store path component.
 ///
@@ -39,6 +40,28 @@ pub fn validate_alias(alias: &str) -> Result<&str> {
         bail!("profile alias must be one path component");
     }
     Ok(alias)
+}
+
+/// Validate a profile's display label.
+///
+/// A label never becomes a path component, so it carries none of the path rules
+/// an alias needs. It only has to render as one readable line inside a table.
+/// Blank input returns `Ok(None)`, which is how a label is cleared.
+pub fn validate_label(label: &str) -> Result<Option<&str>> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Ok(None);
+    }
+    if label.len() > MAX_LABEL_BYTES {
+        bail!("profile label cannot exceed {MAX_LABEL_BYTES} bytes");
+    }
+    if !label.is_ascii() {
+        bail!("profile label must contain only ASCII characters");
+    }
+    if label.chars().any(char::is_control) {
+        bail!("profile label cannot contain control characters");
+    }
+    Ok(Some(label))
 }
 
 /// Return a checked profile directory below the profile-store root.
@@ -263,6 +286,41 @@ mod tests {
             validate_alias("  amir+8@sawmills.ai  ").unwrap(),
             "amir+8@sawmills.ai"
         );
+    }
+
+    #[test]
+    fn label_validation_trims_and_keeps_ordinary_text() {
+        assert_eq!(validate_label("  team  ").unwrap(), Some("team"));
+        assert_eq!(
+            validate_label("Sawmills team").unwrap(),
+            Some("Sawmills team")
+        );
+    }
+
+    /// A blank label is how the operator clears one, not an error.
+    #[test]
+    fn label_validation_treats_blank_as_a_clear() {
+        assert_eq!(validate_label("").unwrap(), None);
+        assert_eq!(validate_label("   ").unwrap(), None);
+    }
+
+    #[test]
+    fn label_validation_rejects_unrenderable_text() {
+        for label in [
+            "a".repeat(MAX_LABEL_BYTES + 1).as_str(),
+            "téam",
+            "two\nlines",
+        ] {
+            assert!(validate_label(label).is_err(), "accepted {label:?}");
+        }
+    }
+
+    /// A label is display text, never a path component, so path syntax that an
+    /// alias must reject is perfectly fine here.
+    #[test]
+    fn label_validation_allows_path_like_text() {
+        assert_eq!(validate_label("a/b").unwrap(), Some("a/b"));
+        assert_eq!(validate_label(".hidden").unwrap(), Some(".hidden"));
     }
 
     #[test]

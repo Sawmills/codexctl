@@ -610,6 +610,54 @@ fn token_subject_reads_sub_claim() {
     assert_eq!(api::token_subject("not-a-jwt"), None);
 }
 
+/// Build an unsigned JWT carrying `claims`. No real token value ever enters a
+/// fixture; every claim here is synthetic.
+fn synthetic_token(claims: &str) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    format!("{JWT_HDR}.{payload}.sig")
+}
+
+#[test]
+fn token_identity_reads_profile_and_auth_claims() {
+    let token = synthetic_token(
+        r#"{
+            "sub": "seatA",
+            "https://api.openai.com/profile": {"email": "a@example.com", "name": "A Example"},
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-1",
+                "chatgpt_user_id": "user-1",
+                "chatgpt_plan_type": "business"
+            }
+        }"#,
+    );
+
+    let identity = api::token_identity(&token).unwrap();
+
+    assert_eq!(identity.email.as_deref(), Some("a@example.com"));
+    assert_eq!(identity.name.as_deref(), Some("A Example"));
+    assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
+    assert_eq!(identity.user_id.as_deref(), Some("user-1"));
+    assert_eq!(identity.plan.as_deref(), Some("business"));
+}
+
+#[test]
+fn token_identity_returns_none_for_an_unreadable_token() {
+    assert!(api::token_identity("not-a-jwt").is_none());
+}
+
+/// A token that decodes but carries neither claim object still yields an
+/// identity — every field simply stays empty, so callers keep one code path.
+#[test]
+fn token_identity_tolerates_missing_claim_objects() {
+    let identity = api::token_identity(&synthetic_token(r#"{"sub":"seatA"}"#)).unwrap();
+
+    assert!(identity.email.is_none());
+    assert!(identity.account_id.is_none());
+    assert!(identity.user_id.is_none());
+    assert!(identity.plan.is_none());
+}
+
 #[test]
 fn is_token_expired_distinguishes_exp_claim() {
     let future = format!("{JWT_HDR}.eyJleHAiOjk5OTk5OTk5OTl9.sig"); // exp 9999999999

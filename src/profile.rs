@@ -8,11 +8,19 @@ use crate::api;
 use crate::config::{self, Paths};
 use crate::store;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Meta {
     pub alias: String,
+    /// Operator-set display name. The one field here a human writes; everything
+    /// else is re-derived from the stored token on each save.
+    pub label: Option<String>,
     pub email: Option<String>,
     pub plan: Option<String>,
+    /// `chatgpt_account_id`: which workspace this profile holds. This is what
+    /// separates two profiles that share one email address.
+    pub account_id: Option<String>,
+    /// `chatgpt_user_id`: which login. Two workspace seats for one human share it.
+    pub user_id: Option<String>,
     pub saved_at: String,
 }
 
@@ -146,15 +154,56 @@ fn save_profile_unlocked(
     store::atomic_copy(auth_json_src, &dest)
         .with_context(|| format!("failed to save auth.json to {}", dest.display()))?;
 
+    let meta_path = dir.join("meta.json");
+    // The label is the operator's, so a re-save carries it over. Every other
+    // field is re-derived from the token that was just stored.
+    let previous_label = read_meta(&meta_path).and_then(|meta| meta.label);
+    let identity = identity_of_auth_file(&dest);
+
     let meta = Meta {
         alias: alias.to_string(),
-        email: email.map(str::to_string),
-        plan: None,
+        label: previous_label,
+        email: identity.email.or_else(|| email.map(str::to_string)),
+        plan: identity.plan,
+        account_id: identity.account_id,
+        user_id: identity.user_id,
         saved_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_json = serde_json::to_vec_pretty(&meta)?;
-    store::atomic_write(&dir.join("meta.json"), &meta_json)?;
+    store::atomic_write(&meta_path, &meta_json)?;
     Ok(())
+}
+
+fn read_meta(meta_path: &Path) -> Option<Meta> {
+    let contents = std::fs::read_to_string(meta_path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Identity asserted by the token in an auth file. An unreadable file or a
+/// non-JWT token yields an empty identity rather than an error, because a
+/// profile must remain saveable even when its token cannot be understood.
+fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
+    api::read_auth_json(auth_json)
+        .ok()
+        .and_then(|auth| api::token_identity(&auth.access_token))
+        .unwrap_or_default()
+}
+
+/// Set or clear a profile's display label. `None`, or text that is blank once
+/// trimmed, clears it.
+pub fn set_label_from(paths: &Paths, alias: &str, label: Option<&str>) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    let label = label.map(store::validate_label).transpose()?.flatten();
+    let _lock = store::lock(paths)?;
+    let dir = store::profile_dir(paths, alias)?;
+    let meta_path = dir.join("meta.json");
+    let Some(mut meta) = read_meta(&meta_path) else {
+        anyhow::bail!("profile '{}' not found", alias);
+    };
+    meta.alias = alias.to_string();
+    meta.label = label.map(str::to_string);
+    let meta_json = serde_json::to_vec_pretty(&meta)?;
+    store::atomic_write(&meta_path, &meta_json)
 }
 
 pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
@@ -265,6 +314,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         return Ok(None);
     };
     let target_sub = api::token_subject(&target_auth.access_token);
+    let target_account = target_auth.account_id.clone();
     let mut profile_auths = Vec::new();
     for profile in list_profiles_from(paths)? {
         let Ok(profile_auth) = api::read_auth_json(&profile.auth_json_path()) else {
@@ -283,7 +333,16 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         .into_iter()
         .filter_map(|(profile, profile_auth)| {
             let profile_sub = api::token_subject(&profile_auth.access_token);
-            (target_sub.is_some() && target_sub == profile_sub).then_some(profile.meta.alias)
+            let same_seat = target_sub.is_some() && target_sub == profile_sub;
+            // One human holding two workspace seats produces two profiles with
+            // the same subject. The workspace is what tells them apart. Only
+            // compare it when both sides declare one, so a token without the
+            // claim keeps the previous behavior instead of excluding itself.
+            let same_workspace = match (&target_account, &profile_auth.account_id) {
+                (Some(target), Some(candidate)) => target == candidate,
+                _ => true,
+            };
+            (same_seat && same_workspace).then_some(profile.meta.alias)
         });
     if let Some(alias) = sub_matches.next()
         && sub_matches.next().is_none()

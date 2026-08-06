@@ -3491,9 +3491,8 @@ mod tests {
         .unwrap();
         let meta = profile::Meta {
             alias: alias.to_string(),
-            email: None,
-            plan: None,
             saved_at: "2026-01-01T00:00:00Z".to_string(),
+            ..profile::Meta::default()
         };
         std::fs::write(
             dir.join("meta.json"),

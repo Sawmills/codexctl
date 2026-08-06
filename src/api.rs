@@ -620,14 +620,49 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const PROFILE_CLAIM: &str = "https://api.openai.com/profile";
+
+/// What a Codex access token asserts about the account behind it.
+///
+/// Every field is read from the token's own claims, so resolving an identity
+/// needs no network call and still works once the token has expired — which is
+/// precisely when a profile most needs to stay identifiable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// `chatgpt_account_id`: the workspace. Two profiles for one login differ here.
+    pub account_id: Option<String>,
+    /// `chatgpt_user_id`: the login. Two seats for one human share this.
+    pub user_id: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// Read the identity claims out of an access token. `None` only when the token
+/// is not a decodable JWT; a decodable token missing every claim yields an
+/// empty identity so callers keep a single code path.
+pub fn token_identity(token: &str) -> Option<TokenIdentity> {
+    let value = decode_jwt_payload(token)?;
+    let profile = value.get(PROFILE_CLAIM);
+    let auth = value.get(AUTH_CLAIM);
+    Some(TokenIdentity {
+        email: string_claim(profile, "email"),
+        name: string_claim(profile, "name"),
+        account_id: string_claim(auth, "chatgpt_account_id")
+            .or_else(|| string_claim(auth, "account_id")),
+        user_id: string_claim(auth, "chatgpt_user_id"),
+        plan: string_claim(auth, "chatgpt_plan_type"),
+    })
+}
+
+fn string_claim(object: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    object?.get(key)?.as_str().map(str::to_string)
+}
+
 /// Extract account_id from JWT access_token claims when auth.json does not store it directly.
 pub fn extract_account_id(token: &str) -> Option<String> {
-    let value = decode_jwt_payload(token)?;
-    let auth = value.get("https://api.openai.com/auth")?;
-    auth.get("chatgpt_account_id")
-        .or_else(|| auth.get("account_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    token_identity(token)?.account_id
 }
 
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.
