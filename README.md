@@ -228,14 +228,68 @@ redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 ### Other commands
 
 ```bash
-codexctl list          # list saved profiles
-codexctl login <alias> # isolated Codex login and save
-codexctl whoami        # show active account
-codexctl codex -- ...  # run Codex with spend-cap recovery
-codexctl resets        # list banked rate-limit resets
-codexctl reset [alias] # redeem a banked reset
+codexctl list                # list saved profiles
+codexctl login <alias>       # isolated Codex login and save
+codexctl whoami              # show active account
+codexctl label <alias> [text] # name an account (omit text to clear)
+codexctl codex -- ...        # run Codex with spend-cap recovery
+codexctl resets              # list banked rate-limit resets
+codexctl reset [alias]       # redeem a banked reset
 codexctl remove <alias>
-codexctl --version     # installed version
+codexctl --version           # installed version
+```
+
+## Two accounts on one email
+
+A personal account and a workspace seat can share one address, so the email
+cannot tell them apart. Give each profile its own alias and a label:
+
+```bash
+codexctl login --label personal amir-personal
+codexctl login --label team     amir-team
+```
+
+Or keep using the address and let the label separate the seats. When the alias
+you asked for already holds a _different_ account, the label qualifies it
+instead of overwriting:
+
+```bash
+codexctl login amir@sawmills.ai --label personal   # saves 'amir@sawmills.ai'
+codexctl login amir@sawmills.ai --label team       # saves 'amir@sawmills.ai+team'
+```
+
+Logging the same seat in again refreshes whichever alias it already occupies,
+so this is stable across re-logins. Without `--label` there is nothing to
+qualify with, and a login onto an alias held by another account is refused
+rather than allowed to replace its credentials.
+
+`--label` also works on `codexctl save`, and `codexctl label <alias> [text]`
+sets or clears one later.
+
+```
+$ codexctl list
+┌──────────────────┬──────────┬──────────┬──────────────────┬────────┐
+│ Account          ┆ Label    ┆ Plan     ┆ Email            ┆ Active │
+╞══════════════════╪══════════╪══════════╪══════════════════╪════════╡
+│ amir-personal    ┆ personal ┆ pro      ┆ amir@sawmills.ai ┆        │
+│ amir-team        ┆ team     ┆ business ┆ amir@sawmills.ai ┆ *      │
+└──────────────────┴──────────┴──────────┴──────────────────┴────────┘
+```
+
+The label is display text. The alias stays the only selector for `use`,
+`remove`, and `reset`; `codexctl switch` also matches the label as you type.
+The `Label` column appears in `list` and `status` only once some profile has
+one.
+
+`codexctl save` without an alias defaults to the detected email. When that
+profile already holds a _different_ workspace, the save is refused rather than
+offering an overwrite prompt that would replace the other account's tokens:
+
+```
+$ codexctl save
+error: profile 'amir@sawmills.ai' holds a different account
+       (stored workspace 033569a0…, incoming 6df34c28…).
+       Pass an explicit alias: codexctl save <alias>
 ```
 
 ## Shell completions

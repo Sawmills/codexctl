@@ -39,7 +39,12 @@ pub struct RateLimitResponse {
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
     /// Extra feature or model buckets returned alongside the main Codex limit.
-    #[serde(default)]
+    ///
+    /// Some plans send an explicit `null` here instead of omitting the key or
+    /// sending `[]`. `serde(default)` only covers a missing key, so the null
+    /// has to be absorbed too — otherwise the whole response fails to parse and
+    /// the account renders as an unexplained error.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
     pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
@@ -85,6 +90,18 @@ impl RateLimitResponse {
             .as_ref()
             .map_or(0, |c| c.applicable_available_count)
     }
+}
+
+/// Treat an explicit JSON `null` as the type's default.
+///
+/// The usage API uses `null` and "key absent" interchangeably for optional
+/// collections, and which one arrives varies by plan.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn is_known_rate_limited_plan(plan: &str) -> bool {
@@ -620,14 +637,49 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const PROFILE_CLAIM: &str = "https://api.openai.com/profile";
+
+/// What a Codex access token asserts about the account behind it.
+///
+/// Every field is read from the token's own claims, so resolving an identity
+/// needs no network call and still works once the token has expired — which is
+/// precisely when a profile most needs to stay identifiable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// `chatgpt_account_id`: the workspace. Two profiles for one login differ here.
+    pub account_id: Option<String>,
+    /// `chatgpt_user_id`: the login. Two seats for one human share this.
+    pub user_id: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// Read the identity claims out of an access token. `None` only when the token
+/// is not a decodable JWT; a decodable token missing every claim yields an
+/// empty identity so callers keep a single code path.
+pub fn token_identity(token: &str) -> Option<TokenIdentity> {
+    let value = decode_jwt_payload(token)?;
+    let profile = value.get(PROFILE_CLAIM);
+    let auth = value.get(AUTH_CLAIM);
+    Some(TokenIdentity {
+        email: string_claim(profile, "email"),
+        name: string_claim(profile, "name"),
+        account_id: string_claim(auth, "chatgpt_account_id")
+            .or_else(|| string_claim(auth, "account_id")),
+        user_id: string_claim(auth, "chatgpt_user_id"),
+        plan: string_claim(auth, "chatgpt_plan_type"),
+    })
+}
+
+fn string_claim(object: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    object?.get(key)?.as_str().map(str::to_string)
+}
+
 /// Extract account_id from JWT access_token claims when auth.json does not store it directly.
 pub fn extract_account_id(token: &str) -> Option<String> {
-    let value = decode_jwt_payload(token)?;
-    let auth = value.get("https://api.openai.com/auth")?;
-    auth.get("chatgpt_account_id")
-        .or_else(|| auth.get("account_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    token_identity(token)?.account_id
 }
 
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.

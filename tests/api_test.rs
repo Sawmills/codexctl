@@ -599,6 +599,31 @@ fn parse_account_settings_missing_limits() {
     assert!(settings.seat_type_credit_limits.is_none());
 }
 
+/// A `team` plan returns `additional_rate_limits: null` rather than omitting
+/// the key or sending `[]`. Serde's `default` only covers a missing key, so an
+/// explicit null failed the whole response and the account rendered as `error`.
+#[test]
+fn parse_rate_limit_response_with_explicit_null_collections() {
+    let json = r#"{
+        "plan_type": "team",
+        "rate_limit": {
+            "allowed": true,
+            "primary_window": {"used_percent": 79, "limit_window_seconds": 604800}
+        },
+        "secondary_window": null,
+        "code_review_rate_limit": null,
+        "additional_rate_limits": null,
+        "credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false},
+        "rate_limit_reset_credits": {"available_count": 0, "applicable_available_count": 0}
+    }"#;
+
+    let usage: RateLimitResponse = serde_json::from_str(json).expect("team response must parse");
+
+    assert_eq!(usage.plan_type.as_deref(), Some("team"));
+    assert!(usage.additional_rate_limits.is_empty());
+    assert_eq!(usage.billing_class(), api::BillingClass::RateLimited);
+}
+
 // Fake JWT header `{"alg":"none"}`; only the (unverified) claims payload is read.
 const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
 
@@ -608,6 +633,54 @@ fn token_subject_reads_sub_claim() {
     let tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig");
     assert_eq!(api::token_subject(&tok).as_deref(), Some("seatA"));
     assert_eq!(api::token_subject("not-a-jwt"), None);
+}
+
+/// Build an unsigned JWT carrying `claims`. No real token value ever enters a
+/// fixture; every claim here is synthetic.
+fn synthetic_token(claims: &str) -> String {
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    format!("{JWT_HDR}.{payload}.sig")
+}
+
+#[test]
+fn token_identity_reads_profile_and_auth_claims() {
+    let token = synthetic_token(
+        r#"{
+            "sub": "seatA",
+            "https://api.openai.com/profile": {"email": "a@example.com", "name": "A Example"},
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "acct-1",
+                "chatgpt_user_id": "user-1",
+                "chatgpt_plan_type": "business"
+            }
+        }"#,
+    );
+
+    let identity = api::token_identity(&token).unwrap();
+
+    assert_eq!(identity.email.as_deref(), Some("a@example.com"));
+    assert_eq!(identity.name.as_deref(), Some("A Example"));
+    assert_eq!(identity.account_id.as_deref(), Some("acct-1"));
+    assert_eq!(identity.user_id.as_deref(), Some("user-1"));
+    assert_eq!(identity.plan.as_deref(), Some("business"));
+}
+
+#[test]
+fn token_identity_returns_none_for_an_unreadable_token() {
+    assert!(api::token_identity("not-a-jwt").is_none());
+}
+
+/// A token that decodes but carries neither claim object still yields an
+/// identity — every field simply stays empty, so callers keep one code path.
+#[test]
+fn token_identity_tolerates_missing_claim_objects() {
+    let identity = api::token_identity(&synthetic_token(r#"{"sub":"seatA"}"#)).unwrap();
+
+    assert!(identity.email.is_none());
+    assert!(identity.account_id.is_none());
+    assert!(identity.user_id.is_none());
+    assert!(identity.plan.is_none());
 }
 
 #[test]

@@ -18,13 +18,6 @@ pub fn run() -> Result<()> {
     let items: Vec<String> = profiles
         .iter()
         .map(|p| {
-            let email = p.meta.email.as_deref().unwrap_or("-");
-            let marker = if active.as_deref() == Some(&p.meta.alias) {
-                " *"
-            } else {
-                ""
-            };
-
             // Try to fetch usage for display — fall back gracefully
             let auth_path = profile::auth_json_path_for_profile_from(&paths, p, active.as_deref());
             let usage_info = api::read_auth_json(&auth_path)
@@ -35,11 +28,7 @@ pub fn run() -> Result<()> {
                 .map(|usage| usage_summary(&usage))
                 .unwrap_or_default();
 
-            let plan = p.meta.plan.as_deref().unwrap_or("-");
-            format!(
-                "{} ({}) [{}]{}{}",
-                p.meta.alias, email, plan, usage_info, marker
-            )
+            picker_row(p, &usage_info, active.as_deref() == Some(&p.meta.alias))
         })
         .collect();
 
@@ -60,6 +49,27 @@ pub fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One row of the fuzzy picker.
+///
+/// The label goes in the text because the picker matches on it: typing `team`
+/// has to find the profile labeled `team`. This is the only place a label
+/// influences selection, and the operator still confirms the highlighted row.
+fn picker_row(p: &profile::Profile, usage_info: &str, is_active: bool) -> String {
+    let email = p.meta.email.as_deref().unwrap_or("-");
+    let plan = p.meta.plan.as_deref().unwrap_or("-");
+    let label = p
+        .meta
+        .label
+        .as_deref()
+        .map(|label| format!(" — {label}"))
+        .unwrap_or_default();
+    let marker = if is_active { " *" } else { "" };
+    format!(
+        "{}{label} ({email}) [{plan}]{usage_info}{marker}",
+        p.meta.alias
+    )
 }
 
 fn usage_summary(usage: &api::RateLimitResponse) -> String {
@@ -89,6 +99,44 @@ fn usage_summary(usage: &api::RateLimitResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn profile_with(alias: &str, label: Option<&str>) -> profile::Profile {
+        profile::Profile {
+            meta: profile::Meta {
+                alias: alias.to_string(),
+                label: label.map(str::to_string),
+                email: Some("amir@sawmills.ai".to_string()),
+                plan: Some("business".to_string()),
+                saved_at: "2026-01-01T00:00:00Z".to_string(),
+                ..profile::Meta::default()
+            },
+            dir: std::path::PathBuf::from("/tmp").join(alias),
+        }
+    }
+
+    /// The picker is the one place a label reaches selection: typing it has to
+    /// match, which means it has to be in the row text.
+    #[test]
+    fn picker_row_carries_the_label_for_fuzzy_matching() {
+        let row = picker_row(&profile_with("amir-2", Some("sawmills seat")), "", false);
+
+        assert!(row.contains("sawmills seat"), "{row}");
+        assert!(row.contains("amir-2"), "{row}");
+    }
+
+    #[test]
+    fn picker_row_omits_the_label_segment_when_unset() {
+        let row = picker_row(&profile_with("amir-2", None), "", false);
+
+        assert_eq!(row, "amir-2 (amir@sawmills.ai) [business]");
+    }
+
+    #[test]
+    fn picker_row_marks_the_active_profile() {
+        let row = picker_row(&profile_with("amir-2", None), "", true);
+
+        assert!(row.ends_with(" *"), "{row}");
+    }
 
     #[test]
     fn usage_summary_uses_declared_durations() {

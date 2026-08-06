@@ -31,11 +31,24 @@ enum Commands {
     Login {
         /// Profile alias to save the login as
         alias: String,
+        /// Display label for the account, e.g. "personal" or "team"
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Save current ~/.codex/auth.json as a profile
     Save {
         /// Custom alias (defaults to email)
         alias: Option<String>,
+        /// Display label for the account, e.g. "personal" or "team"
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Set or clear a profile's display label
+    Label {
+        /// Profile alias to label
+        alias: String,
+        /// Label text (omit to clear the label)
+        text: Option<String>,
     },
     /// Switch to a profile by alias (or most available if omitted)
     Use {
@@ -137,8 +150,18 @@ fn main() {
             };
             commands::status::run(filter)
         }
-        Commands::Login { ref alias } => commands::login::run(alias),
-        Commands::Save { ref alias } => commands::save::run(alias.as_deref()),
+        Commands::Login {
+            ref alias,
+            ref label,
+        } => commands::login::run(alias, label.as_deref()),
+        Commands::Save {
+            ref alias,
+            ref label,
+        } => commands::save::run(alias.as_deref(), label.as_deref()),
+        Commands::Label {
+            ref alias,
+            ref text,
+        } => commands::label::run(alias, text.as_deref()),
         Commands::Use {
             ref alias,
             allow_billing,

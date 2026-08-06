@@ -8,11 +8,19 @@ use crate::api;
 use crate::config::{self, Paths};
 use crate::store;
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Meta {
     pub alias: String,
+    /// Operator-set display name. The one field here a human writes; everything
+    /// else is re-derived from the stored token on each save.
+    pub label: Option<String>,
     pub email: Option<String>,
     pub plan: Option<String>,
+    /// `chatgpt_account_id`: which workspace this profile holds. This is what
+    /// separates two profiles that share one email address.
+    pub account_id: Option<String>,
+    /// `chatgpt_user_id`: which login. Two workspace seats for one human share it.
+    pub user_id: Option<String>,
     pub saved_at: String,
 }
 
@@ -105,8 +113,10 @@ pub fn save_profile_to(
 /// Save a profile and make it active under one store lock.
 ///
 /// When the source is an isolated login home, install it into the live Codex
-/// home. A re-login of the already-active alias deliberately skips capturing
-/// the old live token so it cannot overwrite the new login.
+/// home. Capturing the outgoing live token deliberately skips the alias being
+/// saved, so a stale live token cannot overwrite the login that just replaced
+/// it. Being active is only one way the live file can belong to this alias —
+/// the token itself is the authority.
 pub fn save_profile_and_activate_to(
     paths: &Paths,
     alias: &str,
@@ -115,14 +125,15 @@ pub fn save_profile_and_activate_to(
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
-    let was_active = get_active_from(paths)?.as_deref() == Some(alias);
+    let live_auth = paths.codex_auth_json();
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
 
-    let live_auth = paths.codex_auth_json();
     if auth_json_src != live_auth {
-        if !was_active {
-            capture_auth_file_profile_tokens(paths, &live_auth);
-        }
+        // Capture protects the *outgoing* profile's rotated tokens. The alias
+        // being written is never outgoing, so it is excluded outright rather
+        // than by inferring ownership — an unreadable or absent stored token
+        // must not be able to route the stale live file back over this login.
+        capture_auth_file_profile_tokens(paths, &live_auth, Some(alias));
         let saved_auth = store::profile_dir(paths, alias)?.join("auth.json");
         store::atomic_copy(&saved_auth, &live_auth)
             .with_context(|| format!("failed to install {}", live_auth.display()))?;
@@ -146,15 +157,86 @@ fn save_profile_unlocked(
     store::atomic_copy(auth_json_src, &dest)
         .with_context(|| format!("failed to save auth.json to {}", dest.display()))?;
 
+    let meta_path = dir.join("meta.json");
+    // The label is the operator's, so a re-save carries it over. Every other
+    // field is re-derived from the token that was just stored.
+    let previous_label = read_meta(&meta_path).and_then(|meta| meta.label);
+    let identity = identity_of_auth_file(&dest);
+
     let meta = Meta {
         alias: alias.to_string(),
-        email: email.map(str::to_string),
-        plan: None,
+        label: previous_label,
+        email: identity.email.or_else(|| email.map(str::to_string)),
+        plan: identity.plan,
+        account_id: identity.account_id,
+        user_id: identity.user_id,
         saved_at: chrono::Utc::now().to_rfc3339(),
     };
     let meta_json = serde_json::to_vec_pretty(&meta)?;
-    store::atomic_write(&dir.join("meta.json"), &meta_json)?;
+    store::atomic_write(&meta_path, &meta_json)?;
     Ok(())
+}
+
+fn read_meta(meta_path: &Path) -> Option<Meta> {
+    let contents = std::fs::read_to_string(meta_path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Identity asserted by the token in an auth file. An unreadable file or a
+/// non-JWT token yields an empty identity rather than an error, because a
+/// profile must remain saveable even when its token cannot be understood.
+fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
+    let Ok(auth) = api::read_auth_json(auth_json) else {
+        return api::TokenIdentity::default();
+    };
+    let mut identity = api::token_identity(&auth.access_token).unwrap_or_default();
+    // `read_auth_json` already applies the documented precedence: the explicit
+    // auth.json field first, the JWT claim only as a fallback. Use its answer so
+    // the recorded workspace matches what every other call path resolves.
+    identity.account_id = auth.account_id.or(identity.account_id);
+    identity
+}
+
+/// The workspace `alias` already holds, when that is positively a *different*
+/// account than `incoming_account`.
+///
+/// `None` means saving is safe, or there is not enough evidence to refuse: a
+/// missing identifier on either side is not proof of a conflict. Both `save`
+/// and `login` gate on this, because either one can replace the credentials of
+/// a profile that belongs to another account on the same login.
+pub fn conflicting_workspace(
+    paths: &Paths,
+    alias: &str,
+    incoming_account: Option<&str>,
+) -> Option<String> {
+    let incoming = incoming_account?;
+    let stored = get_profile_from(paths, alias).ok()?.meta.account_id?;
+    (stored != incoming).then_some(stored)
+}
+
+/// Short workspace id for an error message; the full uuid is noise.
+pub fn short_workspace(account_id: &str) -> String {
+    match account_id.char_indices().nth(8) {
+        Some((index, _)) => format!("{}…", &account_id[..index]),
+        None => account_id.to_string(),
+    }
+}
+
+/// Set or clear a profile's display label. `None`, or text that is blank once
+/// trimmed, clears it.
+pub fn set_label_from(paths: &Paths, alias: &str, label: Option<&str>) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    let label = label.map(store::validate_label).transpose()?.flatten();
+    let _lock = store::lock(paths)?;
+    let dir = store::profile_dir(paths, alias)?;
+    let meta_path = dir.join("meta.json");
+    let Some(mut meta) = read_meta(&meta_path) else {
+        anyhow::bail!("profile '{}' not found", alias);
+    };
+    meta.alias = alias.to_string();
+    meta.label = label.map(str::to_string);
+    let meta_json = serde_json::to_vec_pretty(&meta)?;
+    store::atomic_write(&meta_path, &meta_json)
 }
 
 pub fn delete_profile_from(paths: &Paths, alias: &str) -> Result<()> {
@@ -218,8 +300,11 @@ pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -
 
     // Capture the outgoing live tokens before installing the next profile.
     // The exact-token or token-subject guard prevents a foreign live auth file
-    // from overwriting an unrelated saved profile.
-    capture_auth_file_profile_tokens(paths, codex_auth);
+    // from overwriting an unrelated saved profile. Nothing is excluded here:
+    // when the live file belongs to the profile being switched to, folding its
+    // rotated tokens in first is exactly right, since the install then copies
+    // that same freshly-updated file back out.
+    capture_auth_file_profile_tokens(paths, codex_auth, None);
 
     store::atomic_copy(&profile.auth_json_path(), codex_auth)
         .with_context(|| format!("failed to install auth.json at {}", codex_auth.display()))?;
@@ -257,7 +342,16 @@ fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
         return true;
     }
     let left_subject = api::token_subject(&left.access_token);
-    left_subject.is_some() && left_subject == api::token_subject(&right.access_token)
+    if left_subject.is_none() || left_subject != api::token_subject(&right.access_token) {
+        return false;
+    }
+    // The same login is not the same account. Two workspace seats of one human
+    // share a subject, so a declared workspace has to agree as well — otherwise
+    // the live seat's usage renders under the other seat's row.
+    match (&left.account_id, &right.account_id) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Option<String>> {
@@ -265,6 +359,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         return Ok(None);
     };
     let target_sub = api::token_subject(&target_auth.access_token);
+    let target_account = target_auth.account_id.clone();
     let mut profile_auths = Vec::new();
     for profile in list_profiles_from(paths)? {
         let Ok(profile_auth) = api::read_auth_json(&profile.auth_json_path()) else {
@@ -279,29 +374,66 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         }
     }
 
-    let mut sub_matches = profile_auths
+    let same_seat: Vec<(String, Option<String>)> = profile_auths
         .into_iter()
         .filter_map(|(profile, profile_auth)| {
             let profile_sub = api::token_subject(&profile_auth.access_token);
-            (target_sub.is_some() && target_sub == profile_sub).then_some(profile.meta.alias)
-        });
-    if let Some(alias) = sub_matches.next()
-        && sub_matches.next().is_none()
-    {
-        return Ok(Some(alias));
+            (target_sub.is_some() && target_sub == profile_sub)
+                .then_some((profile.meta.alias, profile_auth.account_id))
+        })
+        .collect();
+
+    // One human holding two workspace seats produces two profiles with the same
+    // subject, so the workspace is what tells them apart.
+    //
+    // A candidate that declares a *different* workspace is positively not the
+    // owner. It can never win, and it must not be quietly dropped either: once
+    // some candidate contradicts the live workspace, a claimless sibling has no
+    // better claim to the tokens, and returning either would overwrite a saved
+    // profile's credentials with an unrelated account's.
+    let candidates: Vec<&String> = match &target_account {
+        Some(target) => {
+            let declares = |account: &Option<String>| account.as_deref() == Some(target.as_str());
+            let same_workspace: Vec<&String> = same_seat
+                .iter()
+                .filter(|(_, account)| declares(account))
+                .map(|(alias, _)| alias)
+                .collect();
+            let contradicted = same_seat
+                .iter()
+                .any(|(_, account)| account.is_some() && !declares(account));
+
+            if !same_workspace.is_empty() {
+                same_workspace
+            } else if contradicted {
+                Vec::new()
+            } else {
+                // Nothing declares a workspace at all: a profile saved before
+                // the claim was recorded still owns its own rotated tokens.
+                same_seat.iter().map(|(alias, _)| alias).collect()
+            }
+        }
+        None => same_seat.iter().map(|(alias, _)| alias).collect(),
+    };
+
+    if let [alias] = candidates.as_slice() {
+        return Ok(Some((*alias).clone()));
     }
     Ok(None)
 }
 
 /// Best-effort: fold a live Codex auth file into the saved profile that owns it.
 /// Failures only warn because token capture must not block a requested switch.
-fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path) {
+fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias: Option<&str>) {
     if !codex_auth.exists() {
         return;
     }
     let Ok(Some(alias)) = alias_for_auth_json_from(paths, codex_auth) else {
         return;
     };
+    if skip_alias == Some(alias.as_str()) {
+        return;
+    }
     let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
         return;
     };
