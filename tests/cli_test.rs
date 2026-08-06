@@ -78,13 +78,19 @@ fn label_sets_and_clears_a_profile_label() {
         r#"{"alias":"amir-team","email":"amir@sawmills.ai","plan":"business","saved_at":"2026-01-01T00:00:00Z"}"#,
     );
 
+    // Label text shares no substring with the alias, so matching it proves the
+    // label was rendered rather than the Account column.
     assert!(
-        run(tmp.path(), &["label", "amir-team", "team"])
+        run(tmp.path(), &["label", "amir-team", "sawmills seat"])
             .status
             .success()
     );
     let listed = stdout_of(&run(tmp.path(), &["list"]));
-    assert!(listed.contains("team"), "label missing from list: {listed}");
+    assert!(listed.contains("Label"), "label column missing: {listed}");
+    assert!(
+        listed.contains("sawmills seat"),
+        "label missing from list: {listed}"
+    );
 
     // Omitting the text clears the label.
     assert!(run(tmp.path(), &["label", "amir-team"]).status.success());
