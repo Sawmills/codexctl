@@ -226,6 +226,55 @@ fn alias_for_auth_json_does_not_let_a_claimless_profile_absorb_a_new_workspace()
     );
 }
 
+/// The simplest shape of the same hazard: one saved profile, and a live token
+/// for a second workspace on that login which was never saved. A candidate that
+/// positively declares a *different* workspace is not the owner, so being the
+/// only candidate must not make it one.
+#[test]
+fn alias_for_auth_json_refuses_a_lone_profile_declaring_another_workspace() {
+    let (tmp, paths) = setup_test_env();
+    let stored = synthetic_token(
+        r#"{"sub":"seatA","jti":"stored","https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"}}"#,
+    );
+    write_profile(&paths, "work@test", &stored);
+
+    // A second workspace on the same login, never saved as a profile.
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"live","https://api.openai.com/auth":{"chatgpt_account_id":"acct-2"}}"#,
+    );
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+/// A profile saved before workspace claims existed still captures its own
+/// rotated tokens: with nothing declaring a conflicting workspace, a lone
+/// claimless candidate remains the owner.
+#[test]
+fn alias_for_auth_json_still_matches_a_claimless_profile_with_no_rival() {
+    let (tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy@test",
+        &synthetic_token(r#"{"sub":"seatA"}"#),
+    );
+
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"live","https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"}}"#,
+    );
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        Some("legacy@test".to_string())
+    );
+}
+
 /// A real Codex auth.json declares `tokens.account_id` directly. The saved
 /// workspace must come from the same resolution the rest of the code uses, or
 /// the save guard silently degrades to the plain overwrite prompt.

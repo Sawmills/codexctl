@@ -344,22 +344,33 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         .collect();
 
     // One human holding two workspace seats produces two profiles with the same
-    // subject, so the workspace is what tells them apart. Narrow to it only when
-    // some candidate actually declares that workspace. A candidate that declares
-    // no workspace is not evidence of a match, so it must never inherit the win
-    // simply because its rival was filtered out — that would defeat the
-    // ambiguity guard and overwrite an unrelated profile's credentials.
+    // subject, so the workspace is what tells them apart.
+    //
+    // A candidate that declares a *different* workspace is positively not the
+    // owner. It can never win, and it must not be quietly dropped either: once
+    // some candidate contradicts the live workspace, a claimless sibling has no
+    // better claim to the tokens, and returning either would overwrite a saved
+    // profile's credentials with an unrelated account's.
     let candidates: Vec<&String> = match &target_account {
         Some(target) => {
+            let declares = |account: &Option<String>| account.as_deref() == Some(target.as_str());
             let same_workspace: Vec<&String> = same_seat
                 .iter()
-                .filter(|(_, account)| account.as_ref() == Some(target))
+                .filter(|(_, account)| declares(account))
                 .map(|(alias, _)| alias)
                 .collect();
-            if same_workspace.is_empty() {
-                same_seat.iter().map(|(alias, _)| alias).collect()
-            } else {
+            let contradicted = same_seat
+                .iter()
+                .any(|(_, account)| account.is_some() && !declares(account));
+
+            if !same_workspace.is_empty() {
                 same_workspace
+            } else if contradicted {
+                Vec::new()
+            } else {
+                // Nothing declares a workspace at all: a profile saved before
+                // the claim was recorded still owns its own rotated tokens.
+                same_seat.iter().map(|(alias, _)| alias).collect()
             }
         }
         None => same_seat.iter().map(|(alias, _)| alias).collect(),
