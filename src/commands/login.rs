@@ -38,10 +38,7 @@ pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
     let alias = alias::required(alias)?;
     let paths = config::default_paths()?;
     let mut runner = CodexCliLoginRunner;
-    run_from(&paths, alias, &mut runner)?;
-    if let Some(label) = label {
-        profile::set_label_from(&paths, alias, Some(label))?;
-    }
+    run_from(&paths, alias, label, &mut runner)?;
 
     println!("logged in and saved profile '{alias}'");
     println!();
@@ -49,8 +46,17 @@ pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn run_from(paths: &Paths, alias: &str, runner: &mut impl CodexLoginRunner) -> Result<()> {
+fn run_from(
+    paths: &Paths,
+    alias: &str,
+    label: Option<&str>,
+    runner: &mut impl CodexLoginRunner,
+) -> Result<()> {
     let alias = alias::required(alias)?;
+    // Validate before the device-auth flow starts. Failing after the operator
+    // completed a browser login would read as a failed login even though the
+    // profile was saved and made active.
+    label.map(store::validate_label).transpose()?;
     let codex_home = create_isolated_login_home(paths, alias)?;
     let result = (|| {
         runner.run_codex_login(&codex_home)?;
@@ -61,7 +67,11 @@ fn run_from(paths: &Paths, alias: &str, runner: &mut impl CodexLoginRunner) -> R
         }
 
         let email = email_from_alias(alias);
-        profile::save_profile_and_activate_to(paths, alias, email.as_deref(), &auth_path)
+        profile::save_profile_and_activate_to(paths, alias, email.as_deref(), &auth_path)?;
+        if let Some(label) = label {
+            profile::set_label_from(paths, alias, Some(label))?;
+        }
+        Ok(())
     })();
     let cleanup = remove_isolated_login_home(&codex_home);
 
@@ -224,7 +234,7 @@ mod tests {
         let (_tmp, paths) = setup_test_env();
         let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_tok"}"#);
 
-        run_from(&paths, "  amir+8@sawmills.ai  ", &mut runner).unwrap();
+        run_from(&paths, "  amir+8@sawmills.ai  ", None, &mut runner).unwrap();
 
         let seen_home = runner.seen_home.as_deref().unwrap();
         assert_eq!(
@@ -266,7 +276,7 @@ mod tests {
         .unwrap();
         let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_active_tok"}"#);
 
-        run_from(&paths, "amir+8@sawmills.ai", &mut runner).unwrap();
+        run_from(&paths, "amir+8@sawmills.ai", None, &mut runner).unwrap();
 
         let saved = std::fs::read_to_string(
             paths
@@ -282,12 +292,49 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// A bad label must cost nothing. Failing after the device-auth flow would
+    /// make a completed login read as a failure.
+    #[test]
+    fn run_from_rejects_an_invalid_label_before_running_login() {
+        let (_tmp, paths) = setup_test_env();
+        let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_tok"}"#);
+
+        let error = run_from(
+            &paths,
+            "amir+8@sawmills.ai",
+            Some("two\nlines"),
+            &mut runner,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("label"), "{error}");
+        assert!(runner.seen_home.is_none(), "login ran anyway");
+        assert!(!paths.profiles_dir().join("amir+8@sawmills.ai").exists());
+    }
+
+    #[test]
+    fn run_from_stores_a_valid_label() {
+        let (_tmp, paths) = setup_test_env();
+        let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_tok"}"#);
+
+        run_from(&paths, "amir-team", Some("  team  "), &mut runner).unwrap();
+
+        assert_eq!(
+            profile::get_profile_from(&paths, "amir-team")
+                .unwrap()
+                .meta
+                .label
+                .as_deref(),
+            Some("team")
+        );
+    }
+
     #[test]
     fn run_from_removes_isolated_home_after_login_failure() {
         let (_tmp, paths) = setup_test_env();
         let mut runner = FailingLoginRunner::default();
 
-        let error = run_from(&paths, "amir+8@sawmills.ai", &mut runner).unwrap_err();
+        let error = run_from(&paths, "amir+8@sawmills.ai", None, &mut runner).unwrap_err();
 
         assert!(error.to_string().contains("simulated login failure"));
         assert!(!runner.seen_home.unwrap().exists());

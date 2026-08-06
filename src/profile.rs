@@ -183,10 +183,15 @@ fn read_meta(meta_path: &Path) -> Option<Meta> {
 /// non-JWT token yields an empty identity rather than an error, because a
 /// profile must remain saveable even when its token cannot be understood.
 fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
-    api::read_auth_json(auth_json)
-        .ok()
-        .and_then(|auth| api::token_identity(&auth.access_token))
-        .unwrap_or_default()
+    let Ok(auth) = api::read_auth_json(auth_json) else {
+        return api::TokenIdentity::default();
+    };
+    let mut identity = api::token_identity(&auth.access_token).unwrap_or_default();
+    // `read_auth_json` already applies the documented precedence: the explicit
+    // auth.json field first, the JWT claim only as a fallback. Use its answer so
+    // the recorded workspace matches what every other call path resolves.
+    identity.account_id = auth.account_id.or(identity.account_id);
+    identity
 }
 
 /// Set or clear a profile's display label. `None`, or text that is blank once
@@ -329,25 +334,39 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         }
     }
 
-    let mut sub_matches = profile_auths
+    let same_seat: Vec<(String, Option<String>)> = profile_auths
         .into_iter()
         .filter_map(|(profile, profile_auth)| {
             let profile_sub = api::token_subject(&profile_auth.access_token);
-            let same_seat = target_sub.is_some() && target_sub == profile_sub;
-            // One human holding two workspace seats produces two profiles with
-            // the same subject. The workspace is what tells them apart. Only
-            // compare it when both sides declare one, so a token without the
-            // claim keeps the previous behavior instead of excluding itself.
-            let same_workspace = match (&target_account, &profile_auth.account_id) {
-                (Some(target), Some(candidate)) => target == candidate,
-                _ => true,
-            };
-            (same_seat && same_workspace).then_some(profile.meta.alias)
-        });
-    if let Some(alias) = sub_matches.next()
-        && sub_matches.next().is_none()
-    {
-        return Ok(Some(alias));
+            (target_sub.is_some() && target_sub == profile_sub)
+                .then_some((profile.meta.alias, profile_auth.account_id))
+        })
+        .collect();
+
+    // One human holding two workspace seats produces two profiles with the same
+    // subject, so the workspace is what tells them apart. Narrow to it only when
+    // some candidate actually declares that workspace. A candidate that declares
+    // no workspace is not evidence of a match, so it must never inherit the win
+    // simply because its rival was filtered out — that would defeat the
+    // ambiguity guard and overwrite an unrelated profile's credentials.
+    let candidates: Vec<&String> = match &target_account {
+        Some(target) => {
+            let same_workspace: Vec<&String> = same_seat
+                .iter()
+                .filter(|(_, account)| account.as_ref() == Some(target))
+                .map(|(alias, _)| alias)
+                .collect();
+            if same_workspace.is_empty() {
+                same_seat.iter().map(|(alias, _)| alias).collect()
+            } else {
+                same_workspace
+            }
+        }
+        None => same_seat.iter().map(|(alias, _)| alias).collect(),
+    };
+
+    if let [alias] = candidates.as_slice() {
+        return Ok(Some((*alias).clone()));
     }
     Ok(None)
 }

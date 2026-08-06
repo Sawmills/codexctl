@@ -179,6 +179,76 @@ fn whoami_shows_the_label_of_the_active_profile() {
     assert!(out.contains("amir@sawmills.ai"), "email missing: {out}");
 }
 
+/// An invalid label must fail before the save switches the live auth file,
+/// otherwise the active account changes under an error exit.
+#[test]
+fn save_rejects_an_invalid_label_without_touching_the_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("auth.json"),
+        format!(
+            r#"{{"access_token":"{}"}}"#,
+            seat_token("amir@sawmills.ai", "acct-team", "business")
+        ),
+    )
+    .unwrap();
+
+    let output = run(
+        tmp.path(),
+        &[
+            "save",
+            "--label",
+            "wildly over the forty byte limit for a label",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        !tmp.path()
+            .join(".codexctl/profiles/amir@sawmills.ai")
+            .exists()
+    );
+    assert!(!tmp.path().join(".codexctl/active").exists());
+}
+
+/// Telling an operator who already chose an alias to "pass an explicit alias"
+/// describes what they just did.
+#[test]
+fn save_refusal_names_a_usable_remedy_for_an_explicit_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_profile(
+        tmp.path(),
+        "work",
+        &seat_token("amir@sawmills.ai", "acct-personal", "pro"),
+        r#"{"alias":"work","email":"amir@sawmills.ai","plan":"pro","account_id":"acct-personal","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    let codex_dir = tmp.path().join(".codex");
+    std::fs::create_dir_all(&codex_dir).unwrap();
+    std::fs::write(
+        codex_dir.join("auth.json"),
+        format!(
+            r#"{{"access_token":"{}"}}"#,
+            seat_token("amir@sawmills.ai", "acct-team", "business")
+        ),
+    )
+    .unwrap();
+
+    let output = run(tmp.path(), &["save", "work"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("codexctl remove work"),
+        "no usable remedy: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Pass an explicit alias"),
+        "advice repeats what was already done: {stderr}"
+    );
+}
+
 #[test]
 fn save_and_login_accept_a_label() {
     for command in ["save", "login"] {

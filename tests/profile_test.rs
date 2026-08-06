@@ -198,6 +198,61 @@ fn alias_for_auth_json_separates_one_login_across_two_workspaces() {
     );
 }
 
+/// Excluding a candidate by workspace must not promote a *claimless* sibling to
+/// a unique win. Otherwise a seat whose workspace was never saved would capture
+/// its tokens into an unrelated profile and overwrite that profile's
+/// credentials — the ambiguity guard exists to prevent exactly that guess.
+#[test]
+fn alias_for_auth_json_does_not_let_a_claimless_profile_absorb_a_new_workspace() {
+    let (tmp, paths) = setup_test_env();
+    let with_workspace = synthetic_token(
+        r#"{"sub":"seatA","jti":"x","https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"}}"#,
+    );
+    // Same seat, but its stored token declares no workspace at all.
+    let claimless = synthetic_token(r#"{"sub":"seatA","jti":"y"}"#);
+    write_profile(&paths, "has-workspace@test", &with_workspace);
+    write_profile(&paths, "claimless@test", &claimless);
+
+    // A third workspace on the same seat, matching neither stored profile.
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"live","https://api.openai.com/auth":{"chatgpt_account_id":"acct-2"}}"#,
+    );
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+/// A real Codex auth.json declares `tokens.account_id` directly. The saved
+/// workspace must come from the same resolution the rest of the code uses, or
+/// the save guard silently degrades to the plain overwrite prompt.
+#[test]
+fn save_profile_records_the_account_id_declared_by_the_auth_file() {
+    let (_tmp, paths) = setup_test_env();
+    // Token payload carries a subject but no workspace claim.
+    let token = synthetic_token(r#"{"sub":"seatA"}"#);
+    let auth_src = paths.codex_auth_json();
+    std::fs::write(
+        &auth_src,
+        format!(r#"{{"tokens":{{"access_token":"{token}","account_id":"acct-from-file"}}}}"#),
+    )
+    .unwrap();
+
+    profile::save_profile_to(&paths, "team", None, &auth_src).unwrap();
+
+    assert_eq!(
+        profile::get_profile_from(&paths, "team")
+            .unwrap()
+            .meta
+            .account_id
+            .as_deref(),
+        Some("acct-from-file")
+    );
+}
+
 /// Two profiles holding the same seat *and* the same workspace stay ambiguous.
 /// Guessing between them could overwrite the wrong profile's tokens.
 #[test]

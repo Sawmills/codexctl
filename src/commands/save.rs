@@ -7,6 +7,10 @@ use crate::profile;
 use crate::store;
 
 pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
+    // Reject a bad label before the save switches the live auth file. Failing
+    // afterwards would leave the active account changed under an error exit.
+    label.map(store::validate_label).transpose()?;
+
     let paths = config::default_paths()?;
     let auth_path = paths.codex_auth_json();
     if !auth_path.exists() {
@@ -45,7 +49,12 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
 
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     if existing.exists() {
-        refuse_a_different_account(&paths, &resolved_alias, identity.account_id.as_deref())?;
+        refuse_a_different_account(
+            &paths,
+            &resolved_alias,
+            auth.account_id.as_deref(),
+            alias::optional(alias)?.is_some(),
+        )?;
         eprint!(
             "profile '{}' already exists. Overwrite? [y/N] ",
             resolved_alias
@@ -81,6 +90,7 @@ fn refuse_a_different_account(
     paths: &config::Paths,
     alias: &str,
     incoming_account: Option<&str>,
+    alias_was_explicit: bool,
 ) -> Result<()> {
     let Some(incoming) = incoming_account else {
         return Ok(());
@@ -94,10 +104,16 @@ fn refuse_a_different_account(
     if stored == incoming {
         return Ok(());
     }
+    // Naming the remedy matters: an operator who already chose this alias
+    // cannot act on "pass an explicit alias".
+    let remedy = if alias_was_explicit {
+        format!("Choose another alias, or remove it first: codexctl remove {alias}")
+    } else {
+        "Pass an explicit alias: codexctl save <alias>".to_string()
+    };
     anyhow::bail!(
         "profile '{alias}' holds a different account \
-         (stored workspace {}, incoming {}). \
-         Pass an explicit alias: codexctl save <alias>",
+         (stored workspace {}, incoming {}). {remedy}",
         short_workspace(stored),
         short_workspace(incoming)
     )
