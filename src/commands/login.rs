@@ -39,11 +39,12 @@ pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
     let alias = alias::required(alias)?;
     let paths = config::default_paths()?;
     let mut runner = CodexCliLoginRunner;
-    run_from(&paths, alias, label, &mut runner)?;
+    // The alias actually written may be label-qualified, so report that one.
+    let saved = run_from(&paths, alias, label, &mut runner)?;
 
-    println!("logged in and saved profile '{alias}'");
+    println!("logged in and saved profile '{saved}'");
     println!();
-    status::run_focused(alias)?;
+    status::run_focused(&saved)?;
     Ok(())
 }
 
@@ -52,7 +53,7 @@ fn run_from(
     alias: &str,
     label: Option<&str>,
     runner: &mut impl CodexLoginRunner,
-) -> Result<()> {
+) -> Result<String> {
     let alias = alias::required(alias)?;
     // Validate before the device-auth flow starts. Failing after the operator
     // completed a browser login would read as a failed login even though the
@@ -68,43 +69,96 @@ fn run_from(
         }
 
         // The incoming account is only knowable once the login has produced a
-        // token, so this is checked here rather than up front. Refusing costs a
-        // repeated login; not refusing costs the other account's credentials.
+        // token, so the target alias is resolved here rather than up front.
         let incoming = api::read_auth_json(&auth_path)
             .ok()
             .and_then(|auth| auth.account_id);
-        if let Some(stored) = profile::conflicting_workspace(paths, alias, incoming.as_deref()) {
-            // `conflicting_workspace` only reports a conflict when it saw an
-            // incoming workspace, so the empty fallback is unreachable here.
-            let arriving = incoming
-                .as_deref()
-                .map(profile::short_workspace)
-                .unwrap_or_default();
-            bail!(
-                "profile '{alias}' holds a different account \
-                 (stored workspace {}, this login {arriving}). \
-                 Log in under another alias so both stay saved.",
-                profile::short_workspace(&stored)
-            );
-        }
+        let target = resolve_target_alias(paths, alias, label, incoming.as_deref())?;
 
-        let email = email_from_alias(alias);
-        profile::save_profile_and_activate_to(paths, alias, email.as_deref(), &auth_path)?;
+        let email = email_from_alias(&target).or_else(|| email_from_alias(alias));
+        profile::save_profile_and_activate_to(paths, &target, email.as_deref(), &auth_path)?;
         if let Some(label) = label {
-            profile::set_label_from(paths, alias, Some(label))?;
+            profile::set_label_from(paths, &target, Some(label))?;
         }
-        Ok(())
+        Ok(target)
     })();
     let cleanup = remove_isolated_login_home(&codex_home);
 
     match (result, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(saved), Ok(())) => Ok(saved),
         (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(cleanup_error)) => Err(cleanup_error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "also failed to remove isolated login home: {cleanup_error:#}"
         ))),
     }
+}
+
+/// Where this login should land.
+///
+/// The requested alias wins whenever it is free or already holds this same
+/// account. When it holds a *different* account the label qualifies it, so a
+/// second seat on one address lands beside the first rather than replacing it.
+/// Without a label there is nothing to qualify with, so the login is refused
+/// rather than allowed to overwrite.
+fn resolve_target_alias(
+    paths: &Paths,
+    alias: &str,
+    label: Option<&str>,
+    incoming_account: Option<&str>,
+) -> Result<String> {
+    let Some(stored) = profile::conflicting_workspace(paths, alias, incoming_account) else {
+        return Ok(alias.to_string());
+    };
+    let arriving = incoming_account
+        .map(profile::short_workspace)
+        .unwrap_or_default();
+
+    let Some(label) = label else {
+        bail!(
+            "profile '{alias}' holds a different account \
+             (stored workspace {}, this login {arriving}). \
+             Re-run with --label <name> to save it alongside, \
+             or choose another alias.",
+            profile::short_workspace(&stored)
+        );
+    };
+
+    let slug = alias_safe(label);
+    if slug.is_empty() {
+        bail!("label '{label}' has no characters usable in an alias; choose another alias");
+    }
+    let qualified = format!("{alias}+{slug}");
+    store::validate_alias(&qualified).with_context(|| {
+        format!("label '{label}' does not produce a usable alias for '{alias}'")
+    })?;
+
+    if let Some(also_taken) = profile::conflicting_workspace(paths, &qualified, incoming_account) {
+        bail!(
+            "'{alias}' and '{qualified}' both hold other accounts \
+             ({} and {}, this login {arriving}). Choose another alias.",
+            profile::short_workspace(&stored),
+            profile::short_workspace(&also_taken)
+        );
+    }
+    Ok(qualified)
+}
+
+/// Reduce a display label to something usable as one path component.
+///
+/// Labels permit spaces and path syntax that an alias cannot carry, so anything
+/// outside a conservative set collapses to `-`.
+fn alias_safe(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for character in label.trim().chars() {
+        let keep = character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-');
+        match (keep, out.ends_with('-')) {
+            (true, _) => out.push(character.to_ascii_lowercase()),
+            (false, false) => out.push('-'),
+            (false, true) => {}
+        }
+    }
+    out.trim_matches(['-', '.']).to_string()
 }
 
 fn create_isolated_login_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
@@ -362,6 +416,94 @@ mod tests {
         .unwrap();
         assert!(kept.contains(&stored), "stored credentials were replaced");
         assert!(!kept.contains(&incoming));
+    }
+
+    fn save_existing(paths: &Paths, alias: &str, account: &str) {
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{}"}}"#, synthetic_token(account)),
+        )
+        .unwrap();
+        profile::save_profile_to(paths, alias, None, &paths.codex_auth_json().clone()).unwrap();
+    }
+
+    fn stored_auth(paths: &Paths, alias: &str) -> String {
+        std::fs::read_to_string(paths.profiles_dir().join(alias).join("auth.json")).unwrap()
+    }
+
+    /// The email names the account; the label separates its seats. A second
+    /// workspace on one address lands beside the first instead of on top of it.
+    #[test]
+    fn run_from_derives_an_alias_from_the_label_when_the_alias_holds_another_account() {
+        let (_tmp, paths) = setup_test_env();
+        save_existing(&paths, "amir@sawmills.ai", "acct-personal");
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let saved = run_from(&paths, "amir@sawmills.ai", Some("work"), &mut runner).unwrap();
+
+        assert_eq!(saved, "amir@sawmills.ai+work");
+        assert!(stored_auth(&paths, "amir@sawmills.ai+work").contains(&incoming));
+        assert!(
+            !stored_auth(&paths, "amir@sawmills.ai").contains(&incoming),
+            "the first account was overwritten"
+        );
+    }
+
+    /// Logging the same seat again refreshes the alias the label already
+    /// produced, rather than inventing another one.
+    #[test]
+    fn run_from_refreshes_the_derived_alias_on_a_later_login() {
+        let (_tmp, paths) = setup_test_env();
+        save_existing(&paths, "amir@sawmills.ai", "acct-personal");
+        save_existing(&paths, "amir@sawmills.ai+work", "acct-team");
+
+        let refreshed = format!("{}refreshed", synthetic_token("acct-team"));
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "amir@sawmills.ai", Some("work"), &mut runner).unwrap();
+
+        assert_eq!(saved, "amir@sawmills.ai+work");
+        assert!(stored_auth(&paths, "amir@sawmills.ai+work").contains(&refreshed));
+    }
+
+    /// A label is display text and may hold characters an alias cannot.
+    #[test]
+    fn run_from_makes_a_label_alias_safe_before_deriving() {
+        let (_tmp, paths) = setup_test_env();
+        save_existing(&paths, "amir@sawmills.ai", "acct-personal");
+
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{}"}}"#,
+            synthetic_token("acct-team")
+        ));
+
+        let saved = run_from(&paths, "amir@sawmills.ai", Some("Team / Prod"), &mut runner).unwrap();
+
+        assert_eq!(saved, "amir@sawmills.ai+team-prod");
+    }
+
+    /// Both the requested alias and the derived one already hold other
+    /// accounts, so there is no safe place to land.
+    #[test]
+    fn run_from_refuses_when_the_derived_alias_also_holds_another_account() {
+        let (_tmp, paths) = setup_test_env();
+        save_existing(&paths, "amir@sawmills.ai", "acct-personal");
+        save_existing(&paths, "amir@sawmills.ai+work", "acct-other");
+
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{}"}}"#,
+            synthetic_token("acct-team")
+        ));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("work"), &mut runner).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("both hold other accounts"), "{message}");
+        // Both candidate aliases must be named so the operator knows what to avoid.
+        assert!(message.contains("amir@sawmills.ai+work"), "{message}");
+        assert!(!stored_auth(&paths, "amir@sawmills.ai+work").contains("acct-team"));
     }
 
     /// Re-logging the same account into its own alias is the normal refresh

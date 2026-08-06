@@ -249,6 +249,20 @@ codexctl login --label personal amir-personal
 codexctl login --label team     amir-team
 ```
 
+Or keep using the address and let the label separate the seats. When the alias
+you asked for already holds a _different_ account, the label qualifies it
+instead of overwriting:
+
+```bash
+codexctl login amir@sawmills.ai --label personal   # saves 'amir@sawmills.ai'
+codexctl login amir@sawmills.ai --label team       # saves 'amir@sawmills.ai+team'
+```
+
+Logging the same seat in again refreshes whichever alias it already occupies,
+so this is stable across re-logins. Without `--label` there is nothing to
+qualify with, and a login onto an alias held by another account is refused
+rather than allowed to replace its credentials.
+
 `--label` also works on `codexctl save`, and `codexctl label <alias> [text]`
 sets or clears one later.
 
