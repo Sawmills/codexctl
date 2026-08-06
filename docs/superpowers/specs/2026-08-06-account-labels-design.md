@@ -4,7 +4,7 @@
 
 A profile is a directory named by its alias under `~/.codexctl/profiles/<alias>/`, and `meta.json`
 records only `alias`, `email`, `plan`, and `saved_at`. The alias is already arbitrary, so two
-accounts can already coexist. Nothing, however, records *which account is which*.
+accounts can already coexist. Nothing, however, records _which account is which_.
 
 This breaks down when one person holds two accounts on one email address — a personal account and a
 seat in a team or business workspace. Both profiles report the same `email`. `codexctl list` prints
@@ -14,7 +14,7 @@ not say "team" or "personal".
 Two existing behaviors turn that from an inconvenience into a hazard:
 
 1. `codexctl save` with no alias defaults the alias to the detected email. For a second account on
-   the same email, that targets the *existing* profile and offers `Overwrite? [y/N]`. Answering `y`
+   the same email, that targets the _existing_ profile and offers `Overwrite? [y/N]`. Answering `y`
    destroys the stored tokens of the first account.
 2. `profile::alias_for_auth_json_from` identifies the live `~/.codex/auth.json` by exact token value
    and, when the token has rotated, falls back to the `sub` claim alone. Two profiles that share one
@@ -30,12 +30,12 @@ it. Keep the alias as the only key and the only selector.
 
 The Codex access token is a JWT whose claims already carry every fact needed:
 
-| Claim                                         | Field                 | Meaning                        |
-| --------------------------------------------- | --------------------- | ------------------------------ |
-| `https://api.openai.com/profile`              | `email`, `name`       | who the human is               |
-| `https://api.openai.com/auth`                 | `chatgpt_account_id`  | which workspace                |
-| `https://api.openai.com/auth`                 | `chatgpt_user_id`     | which login                    |
-| `https://api.openai.com/auth`                 | `chatgpt_plan_type`   | the plan                       |
+| Claim                            | Field                | Meaning          |
+| -------------------------------- | -------------------- | ---------------- |
+| `https://api.openai.com/profile` | `email`, `name`      | who the human is |
+| `https://api.openai.com/auth`    | `chatgpt_account_id` | which workspace  |
+| `https://api.openai.com/auth`    | `chatgpt_user_id`    | which login      |
+| `https://api.openai.com/auth`    | `chatgpt_plan_type`  | the plan         |
 
 A new `api::token_identity(token) -> Option<TokenIdentity>` decodes the payload once and returns
 these together. It reuses the existing private `decode_jwt_payload`.
@@ -66,13 +66,13 @@ exactly when a profile most needs to stay identifiable.
 }
 ```
 
-| Field        | Source                    | Written by                       |
-| ------------ | ------------------------- | -------------------------------- |
-| `label`      | the operator              | `label`, `--label`               |
-| `account_id` | `chatgpt_account_id`      | `save`, `login`                  |
-| `user_id`    | `chatgpt_user_id`         | `save`, `login`                  |
-| `email`      | profile claim, then `/me` | `save`, `login`                  |
-| `plan`       | unchanged                 | `save`, `login`, `status`        |
+| Field        | Source                    | Written by                |
+| ------------ | ------------------------- | ------------------------- |
+| `label`      | the operator              | `label`, `--label`        |
+| `account_id` | `chatgpt_account_id`      | `save`, `login`           |
+| `user_id`    | `chatgpt_user_id`         | `save`, `login`           |
+| `email`      | profile claim, then `/me` | `save`, `login`           |
+| `plan`       | unchanged                 | `save`, `login`, `status` |
 
 Every new field is `Option<T>` with `#[serde(default)]`, so a `meta.json` written by an earlier
 version parses unchanged and simply reports no label. No migration step runs, and no existing
@@ -161,7 +161,7 @@ stored in the target profile's `meta.json`:
 | equal                | equal    | today's `Overwrite? [y/N]` prompt          |
 | different            | known    | refuse, and name an explicit alias to pass |
 
-A refusal needs positive evidence of a *different* account. Whenever either identifier is missing,
+A refusal needs positive evidence of a _different_ account. Whenever either identifier is missing,
 the command falls back to the existing prompt rather than blocking a legitimate re-save.
 
 The refusal is an error, not a prompt, because the destructive answer is a single keystroke and the

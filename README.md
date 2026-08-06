@@ -268,7 +268,7 @@ The `Label` column appears in `list` and `status` only once some profile has
 one.
 
 `codexctl save` without an alias defaults to the detected email. When that
-profile already holds a *different* workspace, the save is refused rather than
+profile already holds a _different_ workspace, the save is refused rather than
 offering an overwrite prompt that would replace the other account's tokens:
 
 ```
