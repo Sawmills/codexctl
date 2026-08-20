@@ -432,6 +432,9 @@ fn simultaneous_pinned_launches_never_cross_credentials() {
             let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("codexctl"));
             command
                 .env("HOME", &paths.home)
+                // `exec` refuses an inherited Codex home, so the developer's
+                // own CODEX_HOME must not decide whether this test runs.
+                .env_remove("CODEX_HOME")
                 .args([
                     "exec",
                     "--account",

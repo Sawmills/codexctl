@@ -7,14 +7,14 @@ that injects credentials per child process and never touches global state. `use`
 
 ## 1. Chosen CLI shape
 
-```
+```text
 codexctl exec --account <alias> [--] <command> [args...]
 ```
 
 Runs `<command>` with `CODEX_HOME` pointed at a per-alias exec home seeded with the pinned
 profile's credentials. Propagates the child's exit code. Examples:
 
-```
+```bash
 codexctl exec --account amir+2@sawmills.ai -- codex -m gpt-5 "prompt"
 codexctl exec --account amir+2@sawmills.ai -- codexctl codex -- "prompt"   # pinned + recovery
 ```
@@ -26,6 +26,7 @@ skips the active marker for non-global paths (`src/profile.rs:226-230`). So reco
 pinned lane rotates accounts privately without ever mutating `~/.codex` or the marker.
 
 Alternatives considered:
+
 - `codexctl codex --account <alias>`: sugar over the same provisioning; conflates pinning with
   recovery policy in one flag surface. Deferred (open question 1); `exec` composition covers it.
 - `codexctl use --print-env <alias>` (eval-style exporter): no lifecycle — nothing captures
@@ -36,6 +37,7 @@ Alternatives considered:
 ## 2. Credential injection mechanism
 
 What the Codex CLI actually supports:
+
 - **`CODEX_HOME` env (chosen)**: relocates the whole home — `auth.json`, `config.toml`,
   `sessions/`, logs. This repo already relies on it for isolated logins
   (`src/commands/login.rs:25`) and the wrapper already honors it (above). Supported and proven.
@@ -47,8 +49,9 @@ What the Codex CLI actually supports:
 
 Exec home layout — persistent per alias at `~/.codexctl/exec-homes/<alias>/` (sibling of
 `login-homes`, same `store::checked_child` validation):
+
 - `auth.json`: real file, seeded at every launch via `profile::switch_to_auth_json_from(paths,
-  alias, exec_auth)` — which first folds any leftover exec-home token back into its owning
+alias, exec_auth)` — which first folds any leftover exec-home token back into its owning
   profile (subject-matched capture), then installs the profile copy, and skips the marker.
 - Every other top-level entry of `~/.codex` (`config.toml`, `AGENTS.md`, `sessions/`,
   `history.jsonl`, ...): symlinked into the exec home at seed time when absent. Config and global
@@ -70,7 +73,7 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
 - Token refresh mid-run: codex rewrites `$CODEX_HOME/auth.json` in the exec home. On child exit,
   `exec` captures it back into the owning profile (matched by JWT subject via
   `profile::alias_for_auth_json_from`, copied with `store::atomic_copy` under `store::lock`),
-  guarded so it never replaces a profile token with a *strictly earlier-expiring* same-subject
+  guarded so it never replaces a profile token with a _strictly earlier-expiring_ same-subject
   token (`api::token_expiry` compare). A crash before capture is healed by the capture built into
   the next seed. Mid-run recovery switches (wrapped form) already capture on every switch.
 - All profile-store mutations (seed capture, install, exit capture) run under the existing
@@ -82,10 +85,11 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
   is provisioned or spawned. Non-zero exit, no exec home created.
 - **Expired access token at launch**: `exec` stays offline (same contract as `use`). It warns via
   `api::is_token_expired` and launches anyway — codex refreshes with the stored refresh token. If
-  refresh fails, codex prompts for login *inside the exec home*; a foreign login there is folded
+  refresh fails, codex prompts for login _inside the exec home_; a foreign login there is folded
   back only if its subject matches a saved profile, so the store cannot be corrupted.
-- **Refresh mid-run writing back**: covered above; the exp-guard prevents an old exec-home copy
-  from clobbering a newer profile token (e.g. after a re-login during the run).
+- **Refresh mid-run writing back**: covered above; the freshness guard (issued-at, then expiry)
+  prevents an old exec-home copy from clobbering a newer profile token (e.g. after a re-login
+  during the run).
 - **Two runs, same alias**: shared exec home, same credentials; seeds serialize on the store
   lock; last refresh wins — same account, no cross-account risk.
 - **Codex replaces a symlink** (atomic rename of `config.toml`): file materializes in the exec
@@ -108,7 +112,7 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
      (preserves the AGENTS.md cwd rule); wait; `capture_exec_auth_from`; return status code.
    - Unit tests with `Paths::from_home(tempdir)` and `/bin/sh -c` children.
 5. `src/main.rs`: add `Exec { account: String, #[arg(trailing_var_arg, allow_hyphen_values,
-   num_args(1..))] args: Vec<String> }`; route through `codex_command_outcome` so the child exit
+num_args(1..))] args: Vec<String> }`; route through `codex_command_outcome` so the child exit
    code becomes the process exit code.
 6. `src/commands/mod.rs`: register `pub mod exec;`.
 7. `src/commands/completions.rs`: alias completion for `exec --account` (zsh/bash/fish blocks).
@@ -120,6 +124,7 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
 
 Integration (`tests/exec_test.rs`, `assert_cmd` + temp `HOME`, unsigned JWTs with distinct `sub`
 claims as tokens):
+
 1. `exec --help` shows `--account` and requires a trailing command.
 2. Unknown alias: non-zero exit, stderr names the alias, no `exec-homes/<alias>` created.
 3. Seeding: exec-home `auth.json` equals the profile's; pre-existing `~/.codex` entries are

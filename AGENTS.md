@@ -37,8 +37,8 @@
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
 - Capture a token back to the alias the caller named. Fall back to token inspection only when the file does not belong to that alias.
 - Pass the pinned alias to children in `CODEXCTL_PINNED_ALIAS`. Recovery must exclude the account a pinned launch already selected.
-- Never overwrite a saved token with an earlier-expiring copy of the same seat.
-- Pin a launch with `CODEX_HOME=~/.codexctl/exec-homes/<alias>`. Keep `auth.json` the only real file in that home and share every other `~/.codex` entry by symbolic link.
+- Order captured tokens by issued-at and fall back to expiry. Never overwrite a saved token with an older copy of the same seat.
+- Pin a launch with `CODEX_HOME=~/.codexctl/exec-homes/<alias>`. Seed `auth.json` as a real file and share every other `~/.codex` entry by symbolic link. Never replace an entry that already exists, so an entry Codex turned into a real file stays as it left it until the home is deleted.
 - Never auto-select usage-based accounts during recovery.
 - Require confirmation before a switch can bill credits. Refuse that switch on a non-interactive terminal unless `--allow-billing` is set.
 - Keep reset approval separate from billing approval. `--allow-billing` must not imply `--allow-resets`.

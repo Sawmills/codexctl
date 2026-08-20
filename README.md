@@ -280,8 +280,9 @@ codexctl completions bash >> ~/.bashrc
 codexctl completions fish > ~/.config/fish/completions/codexctl.fish
 ```
 
-Completions dynamically list profile names for `use` and `remove`, and for `exec --account` in
-zsh and fish.
+Completions dynamically list profile names for `use` and `remove`. zsh and fish also complete
+`exec --account`; bash leaves it out on purpose, because its rules bind by command name and would
+take over completion for the shell's own `exec`.
 
 ## How it works
 
