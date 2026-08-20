@@ -1,6 +1,7 @@
 mod alias;
 pub mod codex;
 pub mod completions;
+pub mod exec;
 pub mod list;
 pub mod login;
 pub mod remove;

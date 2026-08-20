@@ -819,6 +819,19 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
     }
 
     fn switch_to(&mut self, alias: &str) -> Result<()> {
+        // Inside a pinned lane the outgoing token is this lane's own account,
+        // and the switch is about to overwrite it. Fold it back under the alias
+        // the launch named first: subject alone cannot name it when one seat is
+        // saved under two aliases, and by the time `exec` captures on exit the
+        // home already holds the recovered account instead.
+        if let Ok(pinned_alias) = std::env::var(super::exec::PINNED_ALIAS_ENV)
+            && !pinned_alias.is_empty()
+            && let Ok(paths) = config::default_paths()
+            && let Err(error) =
+                profile::capture_exec_auth_from(&paths, &self.auth_json, &pinned_alias)
+        {
+            eprintln!("warning: failed to capture tokens for profile '{pinned_alias}': {error:#}");
+        }
         let email = profile::switch_to_auth_json(alias, &self.auth_json)?;
         eprintln!("codexctl: switched to {alias} ({email})");
         Ok(())
@@ -985,16 +998,20 @@ fn codex_home_for_child(paths: &Paths) -> PathBuf {
 
 fn failed_alias_for_child_auth(paths: &Paths) -> Option<String> {
     let auth_json = codex_auth_json_for_child(paths);
-    profile::alias_for_auth_json_from(paths, &auth_json)
-        .ok()
-        .flatten()
-        .or_else(|| {
+    // A pinned launch names the account it selected. Reading it back beats
+    // inferring it from the token, which is ambiguous when one seat is saved
+    // under two aliases — and an alias recovery cannot identify is an alias it
+    // will happily switch back to after that account just failed.
+    let pinned_alias = std::env::var(super::exec::PINNED_ALIAS_ENV).ok();
+    profile::alias_for_auth_json_with_hint(paths, &auth_json, pinned_alias.as_deref()).or_else(
+        || {
             if auth_json == paths.codex_auth_json() {
                 profile::get_active_from(paths).ok().flatten()
             } else {
                 None
             }
-        })
+        },
+    )
 }
 
 fn invocation_session_cwd(invocation: &CodexInvocation) -> PathBuf {

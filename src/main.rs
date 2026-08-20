@@ -104,6 +104,16 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run a command with its Codex credentials pinned to one account,
+    /// without switching the active profile
+    Exec {
+        /// Profile alias the command runs as
+        #[arg(long)]
+        account: String,
+        /// Command to run, followed by its arguments
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
@@ -176,6 +186,10 @@ fn main() {
             allow_resets,
         ))
         .into_result(),
+        Commands::Exec {
+            ref account,
+            ref args,
+        } => codex_command_outcome(commands::exec::run(account, args)).into_result(),
         Commands::Completions { shell } => commands::completions::run(shell),
     };
 
@@ -230,6 +244,32 @@ mod tests {
                 );
             }
             _ => panic!("expected codex command"),
+        }
+    }
+
+    /// A pinned child owns everything after `--`, including words that look
+    /// like codexctl's own flags.
+    #[test]
+    fn exec_subcommand_forwards_the_whole_child_command() {
+        let cli = Cli::parse_from([
+            "codexctl",
+            "exec",
+            "--account",
+            "amir@example.com",
+            "--",
+            "codex",
+            "--allow-billing",
+        ]);
+
+        match cli.command {
+            Commands::Exec { account, args } => {
+                assert_eq!(account, "amir@example.com");
+                assert_eq!(
+                    args,
+                    vec!["codex".to_string(), "--allow-billing".to_string()]
+                );
+            }
+            _ => panic!("expected exec command"),
         }
     }
 

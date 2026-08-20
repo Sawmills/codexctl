@@ -53,6 +53,12 @@ pub fn login_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
     checked_child(&paths.login_homes_dir(), alias)
 }
 
+/// Return a checked pinned Codex home below the exec-home root.
+pub fn exec_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
+    let alias = validate_alias(alias)?;
+    checked_child(&paths.exec_homes_dir(), alias)
+}
+
 fn checked_child(root: &Path, name: &str) -> Result<PathBuf> {
     if root.exists() {
         for entry in

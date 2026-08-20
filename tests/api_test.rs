@@ -603,6 +603,21 @@ fn parse_account_settings_missing_limits() {
 const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
 
 #[test]
+fn token_issued_at_reads_iat_claim() {
+    // `{"sub":"seatA","iat":1900000000,"exp":2000000000}`
+    let tok =
+        format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTkwMDAwMDAwMCwiZXhwIjoyMDAwMDAwMDAwfQ.sig");
+
+    assert_eq!(api::token_issued_at(&tok), Some(1900000000));
+    // `{"exp":9999999999}` — no `iat` to read.
+    assert_eq!(
+        api::token_issued_at(&format!("{JWT_HDR}.eyJleHAiOjk5OTk5OTk5OTl9.sig")),
+        None
+    );
+    assert_eq!(api::token_issued_at("not-a-jwt"), None);
+}
+
+#[test]
 fn token_subject_reads_sub_claim() {
     // payload {"sub":"seatA"}
     let tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig");

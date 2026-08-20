@@ -171,6 +171,271 @@ fn alias_for_auth_json_rejects_ambiguous_subject_fallback() {
     );
 }
 
+/// One seat can be saved under two aliases. Subject matching is ambiguous
+/// there, so the capture would drop the rotation; the alias the launch was
+/// pinned to is the fact that settles it.
+#[test]
+fn exec_capture_prefers_the_pinned_alias_over_an_ambiguous_subject() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.stored");
+    let rotated = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.rotated");
+    write_profile(&paths, "primary", &stored);
+    write_profile(&paths, "duplicate", &stored);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{rotated}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "primary").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("primary").join("auth.json"))
+            .unwrap()
+            .contains(&rotated)
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("duplicate").join("auth.json"))
+            .unwrap()
+            .contains(&stored),
+        "an unrelated alias must not be rewritten"
+    );
+}
+
+/// Recovery inside a pinned lane rotates the home to another account, so a
+/// token that is not the pinned alias's still has to reach its real owner.
+#[test]
+fn exec_capture_falls_back_to_the_real_owner_after_a_recovery_switch() {
+    let (_tmp, paths) = setup_test_env();
+    let pinned_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.pinned");
+    let recovered_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.old");
+    let recovered_live = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.live");
+    write_profile(&paths, "pinned", &pinned_tok);
+    write_profile(&paths, "recovered", &recovered_old);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{recovered_live}"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "pinned").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("recovered").join("auth.json"))
+            .unwrap()
+            .contains(&recovered_live)
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("pinned").join("auth.json"))
+            .unwrap()
+            .contains(&pinned_tok),
+        "the pinned alias must keep its own token"
+    );
+}
+
+/// A pinned run folds its rotated token into the profile while the live Codex
+/// file still holds the older one. The next switch must not copy that stale
+/// file back over the rotation.
+#[test]
+fn switch_capture_does_not_regress_a_profile_to_an_older_live_token() {
+    let (_tmp, paths) = setup_test_env();
+    // sub seatA, exp 2000000000 (fresh) and exp 1900000000 (older).
+    let rotated = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImV4cCI6MjAwMDAwMDAwMH0.rotated");
+    let stale = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImV4cCI6MTkwMDAwMDAwMH0.stale");
+    write_profile(&paths, "a", &rotated);
+    write_profile(&paths, "b", &format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.b"));
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{stale}"}}"#),
+    )
+    .unwrap();
+    profile::set_active_from(&paths, "a").unwrap();
+
+    profile::switch_to_from(&paths, "b").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("a").join("auth.json"))
+            .unwrap()
+            .contains(&rotated),
+        "the switch capture overwrote a newer token with an older live copy"
+    );
+}
+
+/// The active marker is only a hint. It decides which alias owns a live token
+/// when two aliases hold the same seat, but it never overrides the token: a
+/// marker left stale by an interrupted switch cannot claim a foreign seat,
+/// which `switch_skips_capture_for_foreign_codex_auth` proves from the other
+/// side.
+#[test]
+fn switch_capture_uses_the_active_marker_only_to_break_a_tie() {
+    let (_tmp, paths) = setup_test_env();
+    let shared_old = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.old");
+    let shared_live = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.live");
+    // One seat, saved twice — ambiguous by subject alone.
+    write_profile(&paths, "marked", &shared_old);
+    write_profile(&paths, "duplicate", &shared_old);
+    write_profile(
+        &paths,
+        "next",
+        &format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QiJ9.next"),
+    );
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{shared_live}"}}"#),
+    )
+    .unwrap();
+    profile::set_active_from(&paths, "marked").unwrap();
+
+    profile::switch_to_from(&paths, "next").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("marked").join("auth.json"))
+            .unwrap()
+            .contains(&shared_live),
+        "the marked alias should receive the rotation instead of it being dropped"
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("duplicate").join("auth.json"))
+            .unwrap()
+            .contains(&shared_old),
+        "an unmarked duplicate must not be rewritten"
+    );
+}
+
+/// A shortened token lifetime makes the newer token expire first, so expiry
+/// alone would refuse a genuine rotation and strand the profile on a refresh
+/// token the server has already replaced.
+#[test]
+fn exec_capture_orders_tokens_by_issued_at_not_expiry() {
+    let (_tmp, paths) = setup_test_env();
+    // iat 1900000000 / exp 2000000000 — issued earlier, longer lifetime.
+    let older =
+        format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTkwMDAwMDAwMCwiZXhwIjoyMDAwMDAwMDAwfQ.old");
+    // iat 1950000000 / exp 1960000000 — issued later, shorter lifetime.
+    let newer =
+        format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTk1MDAwMDAwMCwiZXhwIjoxOTYwMDAwMDAwfQ.new");
+    write_profile(&paths, "a", &older);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{newer}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "a").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("a").join("auth.json"))
+            .unwrap()
+            .contains(&newer),
+        "a later-issued token was refused because it expires sooner"
+    );
+}
+
+/// A token saved verbatim under one alias belongs to that alias, whatever the
+/// caller's hint says. The hint only settles what the token cannot.
+#[test]
+fn exec_capture_prefers_an_exact_token_owner_over_the_hint() {
+    let (_tmp, paths) = setup_test_env();
+    let hinted_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.hinted");
+    let owner_tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.owner");
+    // One seat, two aliases holding different tokens for it.
+    write_profile(&paths, "hinted", &hinted_tok);
+    write_profile(&paths, "owner", &owner_tok);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{owner_tok}","refresh_token":"rotated"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "hinted").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("owner").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "the exact-token owner should receive the capture"
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("hinted").join("auth.json"))
+            .unwrap()
+            .contains(&hinted_tok),
+        "the hinted alias must not absorb another alias's token"
+    );
+}
+
+/// Two tokens issued in the same second still have to be ordered, and the one
+/// that expires sooner is not the newer one.
+#[test]
+fn exec_capture_falls_back_to_expiry_when_issued_at_ties() {
+    let (_tmp, paths) = setup_test_env();
+    // Both iat 1900000000; exp 2000000000 stored, exp 1950000000 captured.
+    let stored = format!(
+        "{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTkwMDAwMDAwMCwiZXhwIjoyMDAwMDAwMDAwfQ.stored"
+    );
+    let sooner = format!(
+        "{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTkwMDAwMDAwMCwiZXhwIjoxOTUwMDAwMDAwfQ.sooner"
+    );
+    write_profile(&paths, "a", &stored);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{sooner}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "a").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("a").join("auth.json"))
+            .unwrap()
+            .contains(&stored),
+        "an earlier-expiring token from the same second must not win"
+    );
+}
+
+/// Two aliases saved from one login are byte-identical, so a store-wide scan
+/// answers by directory order. A refresh-only rotation still has the original
+/// access token, so only the launch label can say which alias earned it.
+#[test]
+fn exec_capture_keeps_a_refresh_rotation_on_the_pinned_identical_duplicate() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.shared");
+    for alias in ["a-dup", "z-pin"] {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{shared}","refresh_token":"old"}}"#),
+        )
+        .unwrap();
+        let meta = profile::Meta {
+            alias: alias.to_string(),
+            email: None,
+            plan: None,
+            saved_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        std::fs::write(
+            dir.join("meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{shared}","refresh_token":"new"}}"#),
+    )
+    .unwrap();
+
+    // Pinned to the alias that sorts last, so directory order cannot supply it.
+    profile::capture_exec_auth_from(&paths, &exec_auth, "z-pin").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("z-pin").join("auth.json"))
+            .unwrap()
+            .contains("new"),
+        "the pinned alias lost its own refresh rotation"
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("a-dup").join("auth.json"))
+            .unwrap()
+            .contains("old"),
+        "an identical duplicate must not absorb the rotation"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
