@@ -71,10 +71,13 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
   back into the profile store (below), so the `Token` column stays accurate.
 - `login`, `save`: untouched; login-homes and exec-homes are separate trees.
 - Token refresh mid-run: codex rewrites `$CODEX_HOME/auth.json` in the exec home. On child exit,
-  `exec` captures it back into the owning profile (matched by JWT subject via
-  `profile::alias_for_auth_json_from`, copied with `store::atomic_copy` under `store::lock`),
-  guarded so it never replaces a profile token with a _strictly earlier-expiring_ same-subject
-  token (`api::token_expiry` compare). A crash before capture is healed by the capture built into
+  `exec` captures it back into the owning profile (copied with `store::atomic_copy` under
+  `store::lock`), guarded so it never replaces a profile token with an older copy: captures are
+  ordered by `api::token_issued_at` and fall back to `api::token_expiry` when either token omits
+  `iat`. **As implemented**, ownership is resolved by evidence strength rather than by subject
+  alone — an exact token match on the alias the caller named, then a store-wide exact match, then
+  the verified alias hint, then the token subject — because one seat saved under two aliases is
+  ambiguous by subject. A crash before capture is healed by the capture built into
   the next seed. Mid-run recovery switches (wrapped form) already capture on every switch.
 - All profile-store mutations (seed capture, install, exit capture) run under the existing
   `store.lock`, so concurrent execs serialize their store writes.
@@ -101,13 +104,14 @@ login-homes precedent. Different aliases get disjoint homes — that is the isol
 
 1. `src/config.rs`: add `Paths::exec_homes_dir()` → `.codexctl/exec-homes`.
 2. `src/store.rs`: add `pub fn exec_home(paths, alias)` mirroring `login_home` (checked child).
-3. `src/profile.rs`: add `pub fn capture_exec_auth_from(paths, auth_path)` — subject-matched,
-   exp-guarded fold into the owning profile under the store lock (reuses
-   `alias_for_auth_json_from`; leaves the existing switch-path capture semantics unchanged).
+3. `src/profile.rs`: add `pub fn capture_exec_auth_from(paths, auth_path, pinned_alias)` — a
+   freshness-guarded fold into the owning profile under the store lock. **As implemented**, it
+   takes the pinned alias and resolves ownership through `alias_for_auth_json_with_hint`, and the
+   guard was extended to the switch-path capture as well, which this plan had left unchanged.
 4. New `src/commands/exec.rs`:
    - `pub fn run(account: &str, args: &[String]) -> Result<i32>`.
    - `provision_exec_home(paths, alias) -> Result<PathBuf>`: validate alias + profile exists,
-     seed auth via `switch_to_auth_json_from`, symlink missing top-level `~/.codex` entries.
+     seed auth via `seed_exec_auth_from`, symlink missing top-level `~/.codex` entries.
    - Spawn `std::process::Command` with `.env("CODEX_HOME", home)`, inherited stdio and cwd
      (preserves the AGENTS.md cwd rule); wait; `capture_exec_auth_from`; return status code.
    - Unit tests with `Paths::from_home(tempdir)` and `/bin/sh -c` children.
