@@ -9,7 +9,6 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// - Simple: `{"access_token": "...", "refresh_token": "..."}`
 pub struct AuthJson {
     pub access_token: String,
-    #[allow(dead_code)]
     pub refresh_token: Option<String>,
     pub account_id: Option<String>,
 }
@@ -637,6 +636,16 @@ pub fn token_subject(token: &str) -> Option<String> {
         .get("sub")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// The `iat` (issued-at) claim as a unix timestamp, if present.
+///
+/// This orders two tokens even when the newer one expires first, which happens
+/// whenever the issued lifetime is shortened between two logins.
+pub fn token_issued_at(token: &str) -> Option<i64> {
+    decode_jwt_payload(token)?
+        .get("iat")
+        .and_then(|v| v.as_i64())
 }
 
 /// The `exp` (expiry) claim as a unix timestamp, if present.
