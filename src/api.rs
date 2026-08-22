@@ -31,6 +31,14 @@ struct CodexTokens {
     chatgpt_account_id: Option<String>,
 }
 
+fn deserialize_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 #[derive(Deserialize)]
 pub struct RateLimitResponse {
     pub plan_type: Option<String>,
@@ -38,7 +46,7 @@ pub struct RateLimitResponse {
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
     /// Extra feature or model buckets returned alongside the main Codex limit.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
     pub rate_limit_reset_credits: Option<ResetCreditsSummary>,

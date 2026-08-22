@@ -638,3 +638,15 @@ fn is_token_expired_distinguishes_exp_claim() {
         "{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig"
     )));
 }
+
+#[test]
+fn parse_null_additional_rate_limits_as_empty() {
+    let json = r#"{
+        "plan_type": "plus",
+        "rate_limit": null,
+        "additional_rate_limits": null
+    }"#;
+
+    let response: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert!(response.additional_rate_limits.is_empty());
+}
