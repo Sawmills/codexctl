@@ -138,6 +138,13 @@ fn resolve_target_alias(
     else {
         return Ok(alias.to_string());
     };
+    // The requested alias holds someone else, but this seat may already be
+    // saved under another one. Refreshing that profile keeps a re-login stable
+    // and, more importantly, avoids a second profile for one account — which is
+    // exactly what makes ownership ambiguous later.
+    if let Some(existing) = profile::alias_for_account(paths, incoming_account, incoming_user) {
+        return Ok(existing);
+    }
     let arriving = incoming_account
         .map(profile::short_workspace)
         .unwrap_or_default();
@@ -417,6 +424,43 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A seat already saved under one label is refreshed, not duplicated, when
+    /// the operator logs in again with a different one. Two profiles for one
+    /// account are what make ownership ambiguous later.
+    #[test]
+    fn run_from_reuses_an_existing_seat_when_the_label_changes() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The team seat is already saved under an earlier label.
+        let team = synthetic_token("acct-team");
+        let existing = paths.home.join("team-auth.json");
+        std::fs::write(&existing, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+work", None, &existing).unwrap();
+
+        // Same seat, new label.
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{team}"}}"#));
+        let target = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap();
+
+        assert_eq!(target, "amir@sawmills.ai+work", "the seat was duplicated");
+        assert!(
+            !paths.profiles_dir().join("amir@sawmills.ai+team").exists(),
+            "a second profile was created for one account"
+        );
     }
 
     /// Damaged metadata is not an empty profile. The stored token still proves

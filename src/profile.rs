@@ -277,6 +277,34 @@ fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     claim_permits(candidate, stored)
 }
 
+/// The one saved profile holding exactly this account, if there is exactly one.
+///
+/// The alias is the store key, not the account, so a seat already saved under
+/// some alias should be refreshed rather than duplicated when the operator
+/// gives it a different label. Duplicates are also what make ownership
+/// ambiguous later, which is the failure this whole guard exists to avoid.
+pub fn alias_for_account(
+    paths: &Paths,
+    workspace: Option<&str>,
+    user: Option<&str>,
+) -> Option<String> {
+    // With nothing claimed there is nothing to match on, and every profile
+    // would look equally like the owner.
+    if workspace.is_none() && user.is_none() {
+        return None;
+    }
+    let mut matching = list_profiles_from(paths)
+        .ok()?
+        .into_iter()
+        .filter(|profile| {
+            let alias = profile.meta.alias.as_str();
+            workspace_of_profile(paths, alias).as_deref() == workspace
+                && user_of_profile(paths, alias).as_deref() == user
+        });
+    let first = matching.next()?;
+    matching.next().is_none().then_some(first.meta.alias)
+}
+
 /// Whether `alias` holds a profile whose account cannot be identified at all —
 /// no workspace in its metadata and none in the token it stored.
 ///
