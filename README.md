@@ -145,6 +145,34 @@ Account selection during recovery:
   100%), it asks for confirmation before switching, and refuses on a non-interactive terminal.
   Pass `--allow-billing` to approve those switches without prompting (e.g. for unattended runs).
 
+### Pinned launches
+
+`codexctl use` changes the account for the whole machine. When two agent lanes start at the same
+time, the second `use` can take the first lane's account before it launches. `codexctl exec` pins
+credentials to one child process instead, and never touches `~/.codex/auth.json` or the active
+marker:
+
+```bash
+codexctl exec --account amir+2@sawmills.ai -- codex -m gpt-5 "start prompt"
+codexctl exec --account amir+2@sawmills.ai -- codexctl codex -- "start prompt"
+```
+
+`exec` owns `CODEX_HOME`, so it refuses to run when one is already set rather than replacing it
+silently. Unset it first, or launch the pinned command from a shell that never exported it.
+
+The second form composes pinning with spend-cap recovery: the wrapper reads its account from
+`CODEX_HOME`, so its recovery switches stay inside the pinned home and remain invisible to every
+other lane. `exec` also names the pinned account to its children in `CODEXCTL_PINNED_ALIAS`, so
+recovery knows which account just failed and never switches straight back to it. `codexctl whoami` still reports whatever `codexctl use` last selected.
+
+Each alias gets a persistent pinned home at `~/.codexctl/exec-homes/<alias>/`. Only `auth.json` is
+a real per-account file there. Every other entry of `~/.codex` — `config.toml`, `AGENTS.md`,
+`sessions/` — is symlinked, so settings stay shared and session rollouts land in the real
+`~/.codex/sessions/` where `codex resume` looks for them. A refreshed token is folded back into
+the saved profile when the child exits, and an older token never overwrites a newer one. If Codex
+ever replaces a symlink with a real file, that copy stops tracking the shared one; delete
+`~/.codexctl/exec-homes/<alias>` to start clean. The child's exit code becomes codexctl's.
+
 ### Reset-aware selection (default)
 
 Both `codexctl use` (no alias) and `codexctl codex` recovery prefer, among otherwise-eligible
@@ -228,15 +256,16 @@ redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 ### Other commands
 
 ```bash
-codexctl list                # list saved profiles
-codexctl login <alias>       # isolated Codex login and save
-codexctl whoami              # show active account
+codexctl list                 # list saved profiles
+codexctl login <alias>        # isolated Codex login and save
+codexctl whoami               # show active account
 codexctl label <alias> [text] # name an account (omit text to clear)
-codexctl codex -- ...        # run Codex with spend-cap recovery
-codexctl resets              # list banked rate-limit resets
-codexctl reset [alias]       # redeem a banked reset
+codexctl codex -- ...         # run Codex with spend-cap recovery
+codexctl exec --account <alias> -- <command>  # pinned, non-mutating launch
+codexctl resets               # list banked rate-limit resets
+codexctl reset [alias]        # redeem a banked reset
 codexctl remove <alias>
-codexctl --version           # installed version
+codexctl --version            # installed version
 ```
 
 ## Two accounts on one email
@@ -305,11 +334,13 @@ codexctl completions bash >> ~/.bashrc
 codexctl completions fish > ~/.config/fish/completions/codexctl.fish
 ```
 
-Completions dynamically list profile names for `use` and `remove`.
+Completions dynamically list profile names for `use` and `remove`. zsh and fish also complete
+`exec --account`; bash leaves it out on purpose, because its rules bind by command name and would
+take over completion for the shell's own `exec`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`. `codexctl exec` copies it into `~/.codexctl/exec-homes/<alias>/auth.json` instead and passes that directory to the child as `CODEX_HOME`, so a pinned launch changes no shared state at all.
 
 The live auth file and active marker are separate atomic files. A switch installs auth first and
 writes the marker last. If the process stops between those writes, the marker can remain on the

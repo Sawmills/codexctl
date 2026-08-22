@@ -9,7 +9,6 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// - Simple: `{"access_token": "...", "refresh_token": "..."}`
 pub struct AuthJson {
     pub access_token: String,
-    #[allow(dead_code)]
     pub refresh_token: Option<String>,
     pub account_id: Option<String>,
 }
@@ -32,6 +31,14 @@ struct CodexTokens {
     chatgpt_account_id: Option<String>,
 }
 
+fn deserialize_null_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 #[derive(Deserialize)]
 pub struct RateLimitResponse {
     pub plan_type: Option<String>,
@@ -44,7 +51,7 @@ pub struct RateLimitResponse {
     /// sending `[]`. `serde(default)` only covers a missing key, so the null
     /// has to be absorbed too — otherwise the whole response fails to parse and
     /// the account renders as an unexplained error.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
     pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
@@ -90,18 +97,6 @@ impl RateLimitResponse {
             .as_ref()
             .map_or(0, |c| c.applicable_available_count)
     }
-}
-
-/// Treat an explicit JSON `null` as the type's default.
-///
-/// The usage API uses `null` and "key absent" interchangeably for optional
-/// collections, and which one arrives varies by plan.
-fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + Deserialize<'de>,
-{
-    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
 }
 
 fn is_known_rate_limited_plan(plan: &str) -> bool {
@@ -689,6 +684,16 @@ pub fn token_subject(token: &str) -> Option<String> {
         .get("sub")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// The `iat` (issued-at) claim as a unix timestamp, if present.
+///
+/// This orders two tokens even when the newer one expires first, which happens
+/// whenever the issued lifetime is shortened between two logins.
+pub fn token_issued_at(token: &str) -> Option<i64> {
+    decode_jwt_payload(token)?
+        .get("iat")
+        .and_then(|v| v.as_i64())
 }
 
 /// The `exp` (expiry) claim as a unix timestamp, if present.

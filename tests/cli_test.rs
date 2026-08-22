@@ -14,6 +14,7 @@ fn help_shows_all_subcommands() {
     assert!(stdout.contains("remove"));
     assert!(stdout.contains("whoami"));
     assert!(stdout.contains("codex"));
+    assert!(stdout.contains("exec"));
     assert!(stdout.contains("resets"));
     assert!(stdout.contains("reset"));
     assert!(stdout.contains("label"));

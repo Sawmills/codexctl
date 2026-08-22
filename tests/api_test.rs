@@ -628,6 +628,21 @@ fn parse_rate_limit_response_with_explicit_null_collections() {
 const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
 
 #[test]
+fn token_issued_at_reads_iat_claim() {
+    // `{"sub":"seatA","iat":1900000000,"exp":2000000000}`
+    let tok =
+        format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSIsImlhdCI6MTkwMDAwMDAwMCwiZXhwIjoyMDAwMDAwMDAwfQ.sig");
+
+    assert_eq!(api::token_issued_at(&tok), Some(1900000000));
+    // `{"exp":9999999999}` — no `iat` to read.
+    assert_eq!(
+        api::token_issued_at(&format!("{JWT_HDR}.eyJleHAiOjk5OTk5OTk5OTl9.sig")),
+        None
+    );
+    assert_eq!(api::token_issued_at("not-a-jwt"), None);
+}
+
+#[test]
 fn token_subject_reads_sub_claim() {
     // payload {"sub":"seatA"}
     let tok = format!("{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig");
@@ -695,4 +710,16 @@ fn is_token_expired_distinguishes_exp_claim() {
     assert!(!api::is_token_expired(&format!(
         "{JWT_HDR}.eyJzdWIiOiJzZWF0QSJ9.sig"
     )));
+}
+
+#[test]
+fn parse_null_additional_rate_limits_as_empty() {
+    let json = r#"{
+        "plan_type": "plus",
+        "rate_limit": null,
+        "additional_rate_limits": null
+    }"#;
+
+    let response: RateLimitResponse = serde_json::from_str(json).unwrap();
+    assert!(response.additional_rate_limits.is_empty());
 }

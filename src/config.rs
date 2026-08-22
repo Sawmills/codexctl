@@ -27,12 +27,21 @@ impl Paths {
         self.codexctl_dir().join("login-homes")
     }
 
+    /// Root of the per-alias Codex homes that `codexctl exec` pins a child to.
+    pub fn exec_homes_dir(&self) -> PathBuf {
+        self.codexctl_dir().join("exec-homes")
+    }
+
     pub fn active_file(&self) -> PathBuf {
         self.codexctl_dir().join("active")
     }
 
+    pub fn codex_home(&self) -> PathBuf {
+        self.home.join(".codex")
+    }
+
     pub fn codex_auth_json(&self) -> PathBuf {
-        self.home.join(".codex").join("auth.json")
+        self.codex_home().join("auth.json")
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {

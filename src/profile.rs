@@ -316,6 +316,150 @@ pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -
     Ok(profile.meta.email.unwrap_or_else(|| "unknown".to_string()))
 }
 
+/// Seed a pinned exec home's auth file from its saved profile.
+///
+/// This is deliberately not a switch: it never installs into the live Codex
+/// home and never writes the active profile marker, so a pinned launch leaves
+/// global state alone. A token left behind by an earlier pinned run is folded
+/// back into its owning profile first, which heals a run that was killed before
+/// it could capture its own refreshed token.
+pub fn seed_exec_auth_from(paths: &Paths, alias: &str, exec_auth: &Path) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    let _lock = store::lock(paths)?;
+    let profile = get_profile_from(paths, alias)?;
+    capture_exec_auth_unlocked(paths, exec_auth, Some(alias));
+    store::atomic_copy(&profile.auth_json_path(), exec_auth)
+        .with_context(|| format!("failed to install auth.json at {}", exec_auth.display()))
+}
+
+/// Fold a pinned exec home's auth file back into the profile that owns it.
+///
+/// `pinned_alias` is the account the launch asked for. It settles the one case
+/// token inspection cannot: one seat saved under two aliases is ambiguous by
+/// subject, but the label the caller launched with is not.
+pub fn capture_exec_auth_from(paths: &Paths, exec_auth: &Path, pinned_alias: &str) -> Result<()> {
+    let pinned_alias = store::validate_alias(pinned_alias)?;
+    let _lock = store::lock(paths)?;
+    capture_exec_auth_unlocked(paths, exec_auth, Some(pinned_alias));
+    Ok(())
+}
+
+/// Best-effort capture of a pinned exec home's tokens. Failures only warn,
+/// because a capture problem must not fail a child run that already succeeded.
+///
+/// Subject matching keeps a foreign login inside an exec home out of the store.
+/// The expiry guard keeps a stale exec-home copy from replacing a newer profile
+/// token, which is what a re-login of the same alias during a long pinned run
+/// would otherwise cause.
+fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Option<&str>) {
+    if !exec_auth.exists() {
+        return;
+    }
+    let Some(alias) = alias_for_auth_json_with_hint(paths, exec_auth, pinned_alias) else {
+        return;
+    };
+    let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
+        return;
+    };
+    if !captured_auth_supersedes_profile(exec_auth, &dest) {
+        return;
+    }
+    if let Err(error) = store::atomic_copy(exec_auth, &dest) {
+        eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
+    }
+}
+
+/// Which saved profile an auth file belongs to, given the alias the caller
+/// already knows.
+///
+/// Evidence outranks the hint, but only evidence that discriminates. The named
+/// alias wins first when it holds this exact token, because a store-wide scan
+/// cannot tell two aliases saved from one login apart and would answer by
+/// directory order. Failing that, an exact match elsewhere names its owner
+/// outright. The hint then breaks the tie token inspection cannot: one seat
+/// saved under two aliases matches both by subject. Recovery inside a pinned
+/// lane can rotate the file to a different account, so a file that matches
+/// nothing still falls back to a store-wide search.
+/// The profile holding this exact access token, if any.
+fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String> {
+    let target = api::read_auth_json(auth_json).ok()?;
+    list_profiles_from(paths)
+        .ok()?
+        .into_iter()
+        .find_map(|profile| {
+            let stored = api::read_auth_json(&profile.auth_json_path()).ok()?;
+            (stored.access_token == target.access_token).then_some(profile.meta.alias)
+        })
+}
+
+pub fn alias_for_auth_json_with_hint(
+    paths: &Paths,
+    auth_json: &Path,
+    known_alias: Option<&str>,
+) -> Option<String> {
+    let hinted = known_alias.and_then(|alias| get_profile_from(paths, alias).ok());
+    // The named alias holding this very token is the strongest confirmation the
+    // hint can get. It outranks the store-wide scan, which would otherwise let
+    // directory order pick between two aliases saved from the same login.
+    if let Some(profile) = &hinted
+        && auth_files_have_same_access_token(auth_json, &profile.auth_json_path())
+    {
+        return Some(profile.meta.alias.clone());
+    }
+    if let Some(alias) = alias_for_exact_token_from(paths, auth_json) {
+        return Some(alias);
+    }
+    if let Some(profile) = hinted
+        && auth_files_have_same_owner(auth_json, &profile.auth_json_path())
+    {
+        return Some(profile.meta.alias);
+    }
+    alias_for_auth_json_from(paths, auth_json).ok().flatten()
+}
+
+/// Whether captured credentials are worth writing over the saved profile.
+///
+/// Identical credentials are not worth a write. Otherwise the newer access
+/// token wins, judged by its issued-at claim and falling back to its expiry:
+/// an older snapshot carries an older refresh token too, so taking either would
+/// undo a newer login.
+///
+/// A refresh token that rotates on its own is still captured: the access token
+/// is unchanged in that case, so both sides report the same expiry and the
+/// comparison passes. The expiry only ever refuses a file whose access token
+/// also changed — that is, a whole older copy.
+fn captured_auth_supersedes_profile(captured_auth: &Path, profile_auth: &Path) -> bool {
+    let Ok(candidate) = api::read_auth_json(captured_auth) else {
+        return false;
+    };
+    let Ok(current) = api::read_auth_json(profile_auth) else {
+        return true;
+    };
+    if candidate.access_token == current.access_token
+        && candidate.refresh_token == current.refresh_token
+    {
+        return false;
+    }
+    // Issued-at orders the two tokens directly. Expiry only stands in for it,
+    // and stops being a proxy for recency the moment a shortened lifetime makes
+    // the newer token expire first.
+    if let (Some(candidate_iat), Some(current_iat)) = (
+        api::token_issued_at(&candidate.access_token),
+        api::token_issued_at(&current.access_token),
+    ) && candidate_iat != current_iat
+    {
+        return candidate_iat > current_iat;
+    }
+    // Same issuance instant, or no issued-at to compare: let expiry decide.
+    match (
+        api::token_expiry(&candidate.access_token),
+        api::token_expiry(&current.access_token),
+    ) {
+        (Some(candidate_exp), Some(current_exp)) => candidate_exp >= current_exp,
+        _ => true,
+    }
+}
+
 /// Pick the live auth file only when it belongs to the active saved profile.
 /// Otherwise use the stored snapshot and avoid attributing a foreign session.
 pub fn auth_json_path_for_profile_from(
@@ -332,6 +476,13 @@ pub fn auth_json_path_for_profile_from(
     } else {
         profile.auth_json_path()
     }
+}
+
+fn auth_files_have_same_access_token(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (api::read_auth_json(left), api::read_auth_json(right)) else {
+        return false;
+    };
+    left.access_token == right.access_token
 }
 
 fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
@@ -428,7 +579,17 @@ fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias
     if !codex_auth.exists() {
         return;
     }
-    let Ok(Some(alias)) = alias_for_auth_json_from(paths, codex_auth) else {
+    // The active marker names the account that installed the live auth file, so
+    // it settles a seat saved under two aliases exactly as the pinned alias does
+    // for an exec home. It is only a hint: a file that does not match the marked
+    // profile is still resolved by inspecting the token.
+    let known_alias = if codex_auth == paths.codex_auth_json() {
+        get_active_from(paths).ok().flatten()
+    } else {
+        None
+    };
+    let Some(alias) = alias_for_auth_json_with_hint(paths, codex_auth, known_alias.as_deref())
+    else {
         return;
     };
     if skip_alias == Some(alias.as_str()) {
@@ -437,6 +598,12 @@ fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias
     let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
         return;
     };
+    // The live file is not always the newer copy. A pinned run that already
+    // folded a rotated token into this profile leaves the live file behind, and
+    // copying it now would undo that rotation.
+    if !captured_auth_supersedes_profile(codex_auth, &dest) {
+        return;
+    }
     if let Err(error) = store::atomic_copy(codex_auth, &dest) {
         eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
     }
