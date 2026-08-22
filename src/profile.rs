@@ -277,32 +277,52 @@ fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     claim_permits(candidate, stored)
 }
 
-/// The one saved profile holding exactly this account, if there is exactly one.
+/// What the store already holds for one account.
 ///
-/// The alias is the store key, not the account, so a seat already saved under
-/// some alias should be refreshed rather than duplicated when the operator
-/// gives it a different label. Duplicates are also what make ownership
-/// ambiguous later, which is the failure this whole guard exists to avoid.
-pub fn alias_for_account(
+/// Three outcomes, kept apart on purpose: an `Option` would collapse "nothing
+/// matched" together with "the store could not be read" and "several aliases
+/// matched", and a caller reading either of those as "nothing" adds yet another
+/// copy of an account that is already saved.
+pub enum ExistingSeat {
+    /// No saved profile holds this account.
+    None,
+    /// Exactly one does, and it is the profile to refresh.
+    One(String),
+    /// Several do. The store is already ambiguous about this account, and
+    /// guessing between them is what would make it worse.
+    Ambiguous(Vec<String>),
+}
+
+/// Which saved profile, if any, already holds exactly this account.
+///
+/// The alias is the store key, not the account, so a seat saved under some
+/// alias should be refreshed rather than duplicated when the operator gives it
+/// a different label. A store that cannot be scanned is an error rather than an
+/// answer, because "no match" and "could not look" are not the same thing.
+pub fn existing_seat(
     paths: &Paths,
     workspace: Option<&str>,
     user: Option<&str>,
-) -> Option<String> {
+) -> Result<ExistingSeat> {
     // With nothing claimed there is nothing to match on, and every profile
     // would look equally like the owner.
     if workspace.is_none() && user.is_none() {
-        return None;
+        return Ok(ExistingSeat::None);
     }
-    let mut matching = list_profiles_from(paths)
-        .ok()?
+    let matching: Vec<String> = list_profiles_from(paths)?
         .into_iter()
         .filter(|profile| {
             let alias = profile.meta.alias.as_str();
             workspace_of_profile(paths, alias).as_deref() == workspace
                 && user_of_profile(paths, alias).as_deref() == user
-        });
-    let first = matching.next()?;
-    matching.next().is_none().then_some(first.meta.alias)
+        })
+        .map(|profile| profile.meta.alias)
+        .collect();
+    Ok(match matching.len() {
+        0 => ExistingSeat::None,
+        1 => ExistingSeat::One(matching.into_iter().next().expect("one match")),
+        _ => ExistingSeat::Ambiguous(matching),
+    })
 }
 
 /// Whether `alias` holds a profile whose account cannot be identified at all —

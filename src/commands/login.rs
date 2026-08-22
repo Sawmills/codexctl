@@ -138,13 +138,6 @@ fn resolve_target_alias(
     else {
         return Ok(alias.to_string());
     };
-    // The requested alias holds someone else, but this seat may already be
-    // saved under another one. Refreshing that profile keeps a re-login stable
-    // and, more importantly, avoids a second profile for one account — which is
-    // exactly what makes ownership ambiguous later.
-    if let Some(existing) = profile::alias_for_account(paths, incoming_account, incoming_user) {
-        return Ok(existing);
-    }
     let arriving = incoming_account
         .map(profile::short_workspace)
         .unwrap_or_default();
@@ -158,6 +151,22 @@ fn resolve_target_alias(
             profile::short_workspace(&stored)
         );
     };
+
+    // About to derive an alias — but this seat may already be saved under
+    // another one. Refreshing that profile keeps a re-login stable and avoids a
+    // second profile for one account, which is what makes ownership ambiguous
+    // later. A store that cannot be scanned is not an answer of "no".
+    match profile::existing_seat(paths, incoming_account, incoming_user)
+        .context("could not check whether this account is already saved")?
+    {
+        profile::ExistingSeat::One(existing) => return Ok(existing),
+        profile::ExistingSeat::Ambiguous(aliases) => bail!(
+            "this account is already saved under more than one alias ({}). \
+             Remove the duplicates, or log in with one of them directly.",
+            aliases.join(", ")
+        ),
+        profile::ExistingSeat::None => {}
+    }
 
     let slug = alias_safe(label);
     if slug.is_empty() {
@@ -426,6 +435,47 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// Two aliases already holding one account is an ambiguous store. Deriving
+    /// a third copy would deepen exactly the ambiguity that later stops tokens
+    /// being attributed at all, so the login stops and says so.
+    #[test]
+    fn run_from_refuses_when_the_seat_is_already_saved_twice() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The same team seat saved under two aliases already.
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+work", None, &source).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+team-old", None, &source).unwrap();
+
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{team}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias"),
+            "unhelpful refusal: {error}"
+        );
+        assert!(
+            !paths.profiles_dir().join("amir@sawmills.ai+team").exists(),
+            "a third copy of one account was created"
+        );
+    }
+
     /// A seat already saved under one label is refreshed, not duplicated, when
     /// the operator logs in again with a different one. Two profiles for one
     /// account are what make ownership ambiguous later.
@@ -567,9 +617,10 @@ mod tests {
 
         let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
 
+        let message = format!("{error:#}");
         assert!(
-            error.to_string().contains("cannot be identified"),
-            "unhelpful refusal: {error}"
+            message.contains("cannot be identified") || message.contains("already saved"),
+            "unhelpful refusal: {message}"
         );
         assert!(
             std::fs::read_to_string(dir.join("auth.json"))
