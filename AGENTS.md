@@ -4,7 +4,7 @@
 
 - `codexctl` is a Rust 2024 CLI for managing multiple OpenAI Codex CLI accounts.
 - It saves profiles, switches accounts, reports rate limits, manages banked resets, launches Codex with account recovery, and runs account-pinned commands.
-- The package version is `0.1.20`.
+- The package version is `0.1.21`.
 - The license is Apache-2.0.
 
 ## Map
