@@ -54,7 +54,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
-            identity.user_id.as_deref(),
+            api::token_login(&auth.access_token).as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
         eprint!(
@@ -96,7 +96,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
-            identity.user_id.as_deref(),
+            api::token_login(&auth.access_token).as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
         // The profile appeared while this command was deciding, so nobody

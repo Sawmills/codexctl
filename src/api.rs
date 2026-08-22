@@ -677,6 +677,19 @@ pub fn extract_account_id(token: &str) -> Option<String> {
     token_identity(token)?.account_id
 }
 
+/// Who a token belongs to, for deciding whether two credentials are the same
+/// account.
+///
+/// `chatgpt_user_id` names the login when the token carries it. `sub` is the
+/// same fact by another name and every token has one, so it is the fallback —
+/// without it two seats in one workspace both resolve to "unknown" and an
+/// ownership guard reads that as agreement.
+pub fn token_login(token: &str) -> Option<String> {
+    token_identity(token)
+        .and_then(|identity| identity.user_id)
+        .or_else(|| token_subject(token))
+}
+
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.
 /// Distinct per seat even when many seats share one `chatgpt_account_id`.
 pub fn token_subject(token: &str) -> Option<String> {

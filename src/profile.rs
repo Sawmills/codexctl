@@ -227,9 +227,10 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// workspace, so the login is what separates their credentials.
 pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
     let profile = get_profile_from(paths, alias).ok()?;
-    identity_of_auth_file(&profile.auth_json_path())
-        .user_id
-        .or(profile.meta.user_id)
+    let stored_login = api::read_auth_json(&profile.auth_json_path())
+        .ok()
+        .and_then(|auth| api::token_login(&auth.access_token));
+    stored_login.or(profile.meta.user_id)
 }
 
 /// Which workspace a saved profile holds.

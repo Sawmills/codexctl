@@ -78,8 +78,7 @@ fn run_from(
             .and_then(|a| a.account_id.clone());
         let incoming_user = incoming_identity
             .as_ref()
-            .and_then(|a| api::token_identity(&a.access_token))
-            .and_then(|identity| identity.user_id);
+            .and_then(|a| api::token_login(&a.access_token));
         // Resolve and write under one lock. Which alias this login lands on is
         // read out of the store, so releasing the lock in between would let a
         // concurrent login change the answer before the write lands.
@@ -504,8 +503,9 @@ mod tests {
     }
 
     /// The operator names the base alias; codexctl derives the qualified one.
-    /// Overwriting a profile nobody named, on the strength of an identity that
-    /// could not be read, is not an approval anyone gave.
+    /// Whichever guard fires — a positively different login, or an identity
+    /// that cannot be read at all — overwriting a profile nobody named is not
+    /// an approval anyone gave.
     #[test]
     fn run_from_refuses_a_derived_alias_holding_an_unidentifiable_profile() {
         let (_tmp, paths) = setup_test_env();
@@ -544,9 +544,10 @@ mod tests {
 
         let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
 
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("cannot be identified"),
-            "unhelpful refusal: {error}"
+            message.contains("Choose another alias") || message.contains("cannot be identified"),
+            "unhelpful refusal: {message}"
         );
         let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
         assert!(kept.contains(opaque), "the derived alias was overwritten");
