@@ -123,8 +123,25 @@ pub fn save_profile_and_activate_to(
     email: Option<&str>,
     auth_json_src: &Path,
 ) -> Result<()> {
+    let lock = store::lock(paths)?;
+    save_profile_and_activate_locked(&lock, paths, alias, email, auth_json_src)
+}
+
+/// [`save_profile_and_activate_to`] for a caller that already holds the store
+/// lock, so it can decide *and* write without releasing it in between.
+///
+/// The lock is taken by reference as proof rather than for use: which alias a
+/// save lands on depends on what the store already holds, and a decision made
+/// outside the lock answers for a store another writer can still change before
+/// the write lands.
+pub fn save_profile_and_activate_locked(
+    _lock: &store::StoreLock,
+    paths: &Paths,
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &Path,
+) -> Result<()> {
     let alias = store::validate_alias(alias)?;
-    let _lock = store::lock(paths)?;
     let live_auth = paths.codex_auth_json();
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
 
@@ -209,9 +226,16 @@ pub fn conflicting_workspace(
     alias: &str,
     incoming_account: Option<&str>,
 ) -> Option<String> {
-    let incoming = incoming_account?;
     let stored = get_profile_from(paths, alias).ok()?.meta.account_id?;
-    (stored != incoming).then_some(stored)
+    match incoming_account {
+        // A token naming a different workspace is a different account.
+        Some(incoming) => (stored != incoming).then_some(stored),
+        // A token naming no workspace cannot prove it is the same account, and
+        // this profile positively declares one. Treating "unprovable" as "same"
+        // is what lets a second seat overwrite the first's credentials, so the
+        // claim is required once the stored profile has one.
+        None => Some(stored),
+    }
 }
 
 /// Short workspace id for an error message; the full uuid is noise.
@@ -225,9 +249,20 @@ pub fn short_workspace(account_id: &str) -> String {
 /// Set or clear a profile's display label. `None`, or text that is blank once
 /// trimmed, clears it.
 pub fn set_label_from(paths: &Paths, alias: &str, label: Option<&str>) -> Result<()> {
+    let lock = store::lock(paths)?;
+    set_label_locked(&lock, paths, alias, label)
+}
+
+/// [`set_label_from`] for a caller already holding the store lock, so a save
+/// and its label land as one locked sequence instead of two.
+pub fn set_label_locked(
+    _lock: &store::StoreLock,
+    paths: &Paths,
+    alias: &str,
+    label: Option<&str>,
+) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let label = label.map(store::validate_label).transpose()?.flatten();
-    let _lock = store::lock(paths)?;
     let dir = store::profile_dir(paths, alias)?;
     let meta_path = dir.join("meta.json");
     let Some(mut meta) = read_meta(&meta_path) else {

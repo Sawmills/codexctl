@@ -67,9 +67,28 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
         }
     }
 
-    profile::save_profile_and_activate(&resolved_alias, email.as_deref(), &auth_path)?;
+    // The lock is taken only now: holding it across the prompt above would
+    // block every other codexctl process for as long as the operator takes to
+    // answer. That makes the checks so far advisory, so they are re-run here
+    // against the store as it actually stands at write time.
+    let lock = store::lock(&paths)?;
+    if store::profile_dir(&paths, &resolved_alias)?.exists() {
+        refuse_a_different_account(
+            &paths,
+            &resolved_alias,
+            auth.account_id.as_deref(),
+            alias::optional(alias)?.is_some(),
+        )?;
+    }
+    profile::save_profile_and_activate_locked(
+        &lock,
+        &paths,
+        &resolved_alias,
+        email.as_deref(),
+        &auth_path,
+    )?;
     if let Some(label) = label {
-        profile::set_label_from(&paths, &resolved_alias, Some(label))?;
+        profile::set_label_locked(&lock, &paths, &resolved_alias, Some(label))?;
     }
 
     println!("saved profile '{}'", resolved_alias);

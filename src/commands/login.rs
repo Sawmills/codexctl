@@ -73,12 +73,22 @@ fn run_from(
         let incoming = api::read_auth_json(&auth_path)
             .ok()
             .and_then(|auth| auth.account_id);
+        // Resolve and write under one lock. Which alias this login lands on is
+        // read out of the store, so releasing the lock in between would let a
+        // concurrent login change the answer before the write lands.
+        let lock = store::lock(paths)?;
         let target = resolve_target_alias(paths, alias, label, incoming.as_deref())?;
 
         let email = email_from_alias(&target).or_else(|| email_from_alias(alias));
-        profile::save_profile_and_activate_to(paths, &target, email.as_deref(), &auth_path)?;
+        profile::save_profile_and_activate_locked(
+            &lock,
+            paths,
+            &target,
+            email.as_deref(),
+            &auth_path,
+        )?;
         if let Some(label) = label {
-            profile::set_label_from(paths, &target, Some(label))?;
+            profile::set_label_locked(&lock, paths, &target, Some(label))?;
         }
         Ok(target)
     })();
@@ -376,6 +386,47 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A token that declares no workspace cannot prove it belongs to the seat
+    /// already stored, so it must not be allowed to write over it. Treating
+    /// "no claim" as "same account" is what let a second seat replace the
+    /// first's credentials.
+    #[test]
+    fn run_from_refuses_a_claimless_login_against_a_stored_workspace() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-team");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // No `chatgpt_account_id` claim at all.
+        let claimless = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{claimless}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("amir@sawmills.ai")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(kept.contains(&stored), "stored credentials were replaced");
     }
 
     /// Logging a second workspace into an alias that already holds another
