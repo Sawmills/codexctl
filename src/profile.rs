@@ -228,8 +228,18 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// so an alias codexctl *derived* rather than the operator naming it must not
 /// be reused: the overwrite would rest on an unprovable match.
 pub fn unidentifiable_profile(paths: &Paths, alias: &str) -> bool {
-    let Ok(profile) = get_profile_from(paths, alias) else {
+    let Ok(dir) = store::profile_dir(paths, alias) else {
         return false;
+    };
+    if !dir.exists() {
+        // Nothing is there to overwrite.
+        return false;
+    }
+    // Something is there. Metadata that cannot be read is the strongest reason
+    // to treat it as unidentifiable, not a reason to treat it as absent — an
+    // interrupted save or a damaged file leaves exactly this shape.
+    let Ok(profile) = get_profile_from(paths, alias) else {
+        return true;
     };
     profile
         .meta
@@ -635,7 +645,15 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
                 same_seat.iter().map(|(alias, _)| alias).collect()
             }
         }
-        None => same_seat.iter().map(|(alias, _)| alias).collect(),
+        // The target declares no workspace, so it cannot prove it belongs to a
+        // profile that declares one — the same reasoning `auth_files_have_same_owner`
+        // applies, and this resolver is the other way credentials reach a profile.
+        // Profiles that declare nothing either remain plausible owners.
+        None => same_seat
+            .iter()
+            .filter(|(_, account)| account.is_none())
+            .map(|(alias, _)| alias)
+            .collect(),
     };
 
     if let [alias] = candidates.as_slice() {

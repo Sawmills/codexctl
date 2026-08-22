@@ -402,6 +402,49 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// An interrupted save or a damaged metadata file leaves a directory that
+    /// cannot be read. That is the strongest reason to leave it alone, not a
+    /// reason to treat the alias as free.
+    #[test]
+    fn run_from_refuses_a_derived_alias_whose_profile_cannot_be_read() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The derived alias exists on disk but its metadata is unreadable.
+        let dir = paths.profiles_dir().join("amir@sawmills.ai+team");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), r#"{"access_token":"salvageable"}"#).unwrap();
+        std::fs::write(dir.join("meta.json"), "{ this is not json").unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot be identified"),
+            "unhelpful refusal: {error}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains("salvageable"),
+            "credentials behind unreadable metadata were destroyed"
+        );
+    }
+
     /// The operator names the base alias; codexctl derives the qualified one.
     /// Overwriting a profile nobody named, on the strength of an identity that
     /// could not be read, is not an approval anyone gave.

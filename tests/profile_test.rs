@@ -694,6 +694,31 @@ fn active_profile_still_uses_live_auth_for_a_claimless_stored_profile() {
     assert_eq!(chosen, paths.codex_auth_json());
 }
 
+/// The store-wide resolver is the other route credentials reach a profile, so
+/// it needs the same rule as ownership matching: a token declaring no workspace
+/// cannot be attributed to the one profile that declares one, even when it is
+/// the only candidate on that login.
+#[test]
+fn alias_for_auth_json_refuses_a_claimless_token_against_a_lone_claimed_profile() {
+    let (tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "team@test",
+        &synthetic_token(
+            r#"{"sub":"seatA","jti":"stored","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+        ),
+    );
+    // Same login, rotated, declaring no workspace.
+    let live = synthetic_token(r#"{"sub":"seatA","jti":"live"}"#);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
