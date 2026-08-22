@@ -435,6 +435,52 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// The headline case, from the other side: a legacy profile whose stored
+    /// token declares no workspace, and its own owner signing into a second
+    /// one. The logins match, so a rule that reads "stored declares nothing" as
+    /// "same account" hands the personal profile to the team seat.
+    #[test]
+    fn run_from_refuses_a_second_workspace_for_one_login_on_a_claimless_profile() {
+        let (_tmp, paths) = setup_test_env();
+        // Stored: a readable token with a subject but no workspace claim.
+        let legacy = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{legacy}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The same human, now authenticating into a workspace.
+        use base64::Engine;
+        let claims =
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        let incoming = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("amir@sawmills.ai")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(kept.contains(legacy), "the legacy profile was overwritten");
+    }
+
     /// Two aliases already holding one account is an ambiguous store. Deriving
     /// a third copy would deepen exactly the ambiguity that later stops tokens
     /// being attributed at all, so the login stops and says so.

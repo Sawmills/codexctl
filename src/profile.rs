@@ -270,6 +270,24 @@ fn claim_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     }
 }
 
+/// Whether two claims positively agree, for a write that destroys what is
+/// already stored.
+///
+/// [`claim_permits`] is deliberately lenient where a claim is missing, because
+/// capturing a rotation into a profile that never recorded one loses nothing.
+/// An overwrite is the opposite: a profile whose workspace was never recorded
+/// cannot confirm that an arriving workspace is the same account, and reading
+/// "cannot confirm" as "yes" is what destroys a legacy profile when its owner
+/// signs into a second workspace. Only a claim that matches, or the absence of
+/// any claim on both sides, is agreement.
+fn claims_agree(candidate: Option<&str>, stored: Option<&str>) -> bool {
+    match (candidate, stored) {
+        (Some(candidate), Some(stored)) => candidate == stored,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 /// The same rule over a whole account identity. Both claims have to permit the
 /// attribution: one workspace holds many logins, and one login holds seats in
 /// many workspaces, so neither alone identifies whose credentials these are.
@@ -354,16 +372,27 @@ pub fn conflicting_workspace(
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
 ) -> Option<String> {
+    let dir = store::profile_dir(paths, alias).ok()?;
+    if api::read_auth_json(&dir.join("auth.json")).is_err() {
+        // No readable token: nothing here can be identified, and nothing here
+        // can be used either. An operator whose stored token is corrupt is sent
+        // back to `login` precisely to replace it, so this is a repair rather
+        // than a loss. Every other path treats an unreadable profile as
+        // occupied; this one is the deliberate exception.
+        return None;
+    }
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
     if stored_workspace.is_none() && stored_user.is_none() {
         return None;
     }
-    let workspace_ok = claim_permits(incoming_account, stored_workspace.as_deref());
+    // This guard gates `login` and `save`, which replace what is stored, so it
+    // requires positive agreement rather than the absence of contradiction.
+    let workspace_ok = claims_agree(incoming_account, stored_workspace.as_deref());
     // A workspace is shared: two people with seats in one team workspace agree
     // on it and are still different accounts. The login has to agree as well
     // before this alias may be written over.
-    let user_ok = claim_permits(incoming_user, stored_user.as_deref());
+    let user_ok = claims_agree(incoming_user, stored_user.as_deref());
     if workspace_ok && user_ok {
         return None;
     }
