@@ -221,6 +221,17 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// missing identifier on either side is not proof of a conflict. Both `save`
 /// and `login` gate on this, because either one can replace the credentials of
 /// a profile that belongs to another account on the same login.
+/// Which login a saved profile holds, by the same precedence as its workspace.
+///
+/// A workspace is not an owner: several people hold seats in one team
+/// workspace, so the login is what separates their credentials.
+pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
+    let profile = get_profile_from(paths, alias).ok()?;
+    identity_of_auth_file(&profile.auth_json_path())
+        .user_id
+        .or(profile.meta.user_id)
+}
+
 /// Which workspace a saved profile holds.
 ///
 /// The stored token is asked first because it *is* the credential; metadata is
@@ -245,12 +256,19 @@ pub fn workspace_of_profile(paths: &Paths, alias: &str) -> Option<String> {
 /// first seat's profile. The reverse is safe — a profile saved before
 /// workspaces were recorded still owns its own login's rotations, and a
 /// claimed candidate contradicts nothing about it.
-fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
+fn claim_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     match (candidate, stored) {
         (Some(candidate), Some(stored)) => candidate == stored,
         (None, Some(_)) => false,
         (Some(_), None) | (None, None) => true,
     }
+}
+
+/// The same rule over a whole account identity. Both claims have to permit the
+/// attribution: one workspace holds many logins, and one login holds seats in
+/// many workspaces, so neither alone identifies whose credentials these are.
+fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
+    claim_permits(candidate, stored)
 }
 
 /// Whether `alias` holds a profile whose account cannot be identified at all —
@@ -280,9 +298,26 @@ pub fn conflicting_workspace(
     paths: &Paths,
     alias: &str,
     incoming_account: Option<&str>,
+    incoming_user: Option<&str>,
 ) -> Option<String> {
-    let stored = workspace_of_profile(paths, alias)?;
-    (!workspace_permits(incoming_account, Some(stored.as_str()))).then_some(stored)
+    let stored_workspace = workspace_of_profile(paths, alias);
+    let stored_user = user_of_profile(paths, alias);
+    if stored_workspace.is_none() && stored_user.is_none() {
+        return None;
+    }
+    let workspace_ok = claim_permits(incoming_account, stored_workspace.as_deref());
+    // A workspace is shared: two people with seats in one team workspace agree
+    // on it and are still different accounts. The login has to agree as well
+    // before this alias may be written over.
+    let user_ok = claim_permits(incoming_user, stored_user.as_deref());
+    if workspace_ok && user_ok {
+        return None;
+    }
+    Some(
+        stored_workspace
+            .or(stored_user)
+            .unwrap_or_else(|| "unknown".to_string()),
+    )
 }
 
 /// Short workspace id for an error message; the full uuid is noise.

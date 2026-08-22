@@ -70,14 +70,27 @@ fn run_from(
 
         // The incoming account is only knowable once the login has produced a
         // token, so the target alias is resolved here rather than up front.
-        let incoming = api::read_auth_json(&auth_path)
-            .ok()
-            .and_then(|auth| auth.account_id);
+        // Workspace and login together: a team workspace is shared, so it
+        // does not by itself say whose credentials these are.
+        let incoming_identity = api::read_auth_json(&auth_path).ok();
+        let incoming = incoming_identity
+            .as_ref()
+            .and_then(|a| a.account_id.clone());
+        let incoming_user = incoming_identity
+            .as_ref()
+            .and_then(|a| api::token_identity(&a.access_token))
+            .and_then(|identity| identity.user_id);
         // Resolve and write under one lock. Which alias this login lands on is
         // read out of the store, so releasing the lock in between would let a
         // concurrent login change the answer before the write lands.
         let lock = store::lock(paths)?;
-        let target = resolve_target_alias(paths, alias, label, incoming.as_deref())?;
+        let target = resolve_target_alias(
+            paths,
+            alias,
+            label,
+            incoming.as_deref(),
+            incoming_user.as_deref(),
+        )?;
 
         // The address is the alias the operator asked for; a label-qualified
         // target like `a@b.com+work` is a store key, not an email. This is only
@@ -119,8 +132,11 @@ fn resolve_target_alias(
     alias: &str,
     label: Option<&str>,
     incoming_account: Option<&str>,
+    incoming_user: Option<&str>,
 ) -> Result<String> {
-    let Some(stored) = profile::conflicting_workspace(paths, alias, incoming_account) else {
+    let Some(stored) =
+        profile::conflicting_workspace(paths, alias, incoming_account, incoming_user)
+    else {
         return Ok(alias.to_string());
     };
     let arriving = incoming_account
@@ -146,7 +162,9 @@ fn resolve_target_alias(
         format!("label '{label}' does not produce a usable alias for '{alias}'")
     })?;
 
-    if let Some(also_taken) = profile::conflicting_workspace(paths, &qualified, incoming_account) {
+    if let Some(also_taken) =
+        profile::conflicting_workspace(paths, &qualified, incoming_account, incoming_user)
+    {
         bail!(
             "'{alias}' and '{qualified}' both hold other accounts \
              ({} and {}, this login {arriving}). Choose another alias.",
@@ -400,6 +418,46 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A team workspace holds many people. Two colleagues therefore agree on
+    /// `chatgpt_account_id` and are still different accounts, so the workspace
+    /// alone cannot say whose credentials an alias holds.
+    #[test]
+    fn run_from_refuses_a_different_login_in_the_same_workspace() {
+        let (_tmp, paths) = setup_test_env();
+        let colleague = |user: &str| {
+            use base64::Engine;
+            let claims = format!(
+                r#"{{"sub":"{user}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-team","chatgpt_user_id":"{user}"}}}}"#
+            );
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let stored = colleague("user-a");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // Same workspace, different person.
+        let incoming = colleague("user-b");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json")).unwrap();
+        assert!(
+            kept.contains(&stored),
+            "a colleague's login replaced these credentials"
+        );
     }
 
     /// An interrupted save or a damaged metadata file leaves a directory that

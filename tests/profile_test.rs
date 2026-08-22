@@ -782,12 +782,12 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     );
     // So a login for the account actually stored can repair the profile...
     assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new")),
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), None),
         None
     );
     // ...while the stale metadata's workspace is still refused.
     assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-old")).as_deref(),
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), None).as_deref(),
         Some("acct-new")
     );
 }

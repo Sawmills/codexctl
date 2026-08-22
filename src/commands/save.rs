@@ -54,6 +54,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
+            identity.user_id.as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
         eprint!(
@@ -95,6 +96,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
+            identity.user_id.as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
         // The profile appeared while this command was deciding, so nobody
@@ -137,9 +139,12 @@ fn refuse_a_different_account(
     paths: &config::Paths,
     alias: &str,
     incoming_account: Option<&str>,
+    incoming_user: Option<&str>,
     alias_was_explicit: bool,
 ) -> Result<()> {
-    let Some(stored) = profile::conflicting_workspace(paths, alias, incoming_account) else {
+    let Some(stored) =
+        profile::conflicting_workspace(paths, alias, incoming_account, incoming_user)
+    else {
         return Ok(());
     };
     // Naming the remedy matters: an operator who already chose this alias
