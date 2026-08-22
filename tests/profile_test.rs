@@ -792,6 +792,47 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     );
 }
 
+/// The pinned-alias capture takes an exact-token shortcut before the ownership
+/// rule. One access token can name two workspaces through an explicit
+/// `account_id`, so that shortcut has to honour the rule too — otherwise a
+/// pinned run copies a foreign workspace's whole auth file over the profile.
+#[test]
+fn exec_capture_refuses_a_foreign_workspace_sharing_the_access_token() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    let dir = paths.profiles_dir().join("pinned");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-pinned"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"pinned","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same access token, different workspace, and a rotated refresh token.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(
+            r#"{{"access_token":"{shared}","refresh_token":"foreign","account_id":"acct-other"}}"#
+        ),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "pinned").unwrap();
+
+    let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
+    assert!(
+        !kept.contains("foreign"),
+        "a foreign workspace was captured over the pinned profile"
+    );
+    assert!(kept.contains("acct-pinned"));
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

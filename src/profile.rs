@@ -470,7 +470,11 @@ fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String>
         .into_iter()
         .find_map(|profile| {
             let stored = api::read_auth_json(&profile.auth_json_path()).ok()?;
-            (stored.access_token == target.access_token).then_some(profile.meta.alias)
+            // Token equality is a strong signal but not identity on its own,
+            // so it goes through the same rule as every other attribution.
+            (stored.access_token == target.access_token
+                && workspace_permits(target.account_id.as_deref(), stored.account_id.as_deref()))
+            .then_some(profile.meta.alias)
         })
 }
 
@@ -565,6 +569,7 @@ fn auth_files_have_same_access_token(left: &Path, right: &Path) -> bool {
         return false;
     };
     left.access_token == right.access_token
+        && workspace_permits(left.account_id.as_deref(), right.account_id.as_deref())
 }
 
 fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
