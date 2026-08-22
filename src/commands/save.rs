@@ -74,6 +74,18 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     // answer. That makes the checks so far advisory, so they are re-run here
     // against the store as it actually stands at write time.
     let lock = store::lock(&paths)?;
+    // Everything above was decided from the auth file as it read at the start,
+    // and `codexctl use` can rewrite that file while the prompt waits. The alias
+    // and email were derived from that token, so a changed file invalidates the
+    // decision itself, not just the checks — copying it now would store one
+    // account's credentials under another's alias and email.
+    let live_now = api::read_auth_json(&auth_path)?;
+    if live_now.access_token != auth.access_token {
+        anyhow::bail!(
+            "the active account changed while this save was preparing. \
+             Re-run the command to save the account that is active now."
+        );
+    }
     if store::profile_dir(&paths, &resolved_alias)?.exists() {
         refuse_a_different_account(
             &paths,

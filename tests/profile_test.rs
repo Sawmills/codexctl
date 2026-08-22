@@ -640,6 +640,60 @@ fn exec_capture_keeps_a_refresh_rotation_on_the_pinned_identical_duplicate() {
     );
 }
 
+/// A token declaring no workspace cannot prove it belongs to a profile that
+/// declares one. Accepting it is how the other seat's rotated token gets
+/// attributed to — and captured over — this profile's credentials.
+#[test]
+fn active_profile_ignores_a_claimless_live_token_against_a_claimed_profile() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = synthetic_token(
+        r#"{"sub":"seatA","jti":"stored","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    write_profile(&paths, "team@test", &stored);
+    // Same login, rotated, and declaring no workspace at all.
+    let live = synthetic_token(r#"{"sub":"seatA","jti":"live"}"#);
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{live}"}}"#),
+    )
+    .unwrap();
+
+    let profile = profile::get_profile_from(&paths, "team@test").unwrap();
+    let chosen = profile::auth_json_path_for_profile_from(&paths, &profile, Some("team@test"));
+
+    assert_eq!(
+        chosen,
+        profile.auth_json_path(),
+        "an unprovable live token was treated as this profile's own"
+    );
+}
+
+/// The reverse is deliberately still allowed: a profile saved before workspaces
+/// were recorded owns the rotations of its own login, and a claimed live token
+/// contradicts nothing about it.
+#[test]
+fn active_profile_still_uses_live_auth_for_a_claimless_stored_profile() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy@test",
+        &synthetic_token(r#"{"sub":"seatA"}"#),
+    );
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"live","https://api.openai.com/auth":{"chatgpt_account_id":"acct-1"}}"#,
+    );
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{live}"}}"#),
+    )
+    .unwrap();
+
+    let profile = profile::get_profile_from(&paths, "legacy@test").unwrap();
+    let chosen = profile::auth_json_path_for_profile_from(&paths, &profile, Some("legacy@test"));
+
+    assert_eq!(chosen, paths.codex_auth_json());
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

@@ -221,6 +221,24 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// missing identifier on either side is not proof of a conflict. Both `save`
 /// and `login` gate on this, because either one can replace the credentials of
 /// a profile that belongs to another account on the same login.
+/// Whether `alias` holds a profile whose account cannot be identified at all —
+/// no workspace in its metadata and none in the token it stored.
+///
+/// Such a profile cannot be shown to be the same account as an incoming login,
+/// so an alias codexctl *derived* rather than the operator naming it must not
+/// be reused: the overwrite would rest on an unprovable match.
+pub fn unidentifiable_profile(paths: &Paths, alias: &str) -> bool {
+    let Ok(profile) = get_profile_from(paths, alias) else {
+        return false;
+    };
+    profile
+        .meta
+        .account_id
+        .clone()
+        .or_else(|| identity_of_auth_file(&profile.auth_json_path()).account_id)
+        .is_none()
+}
+
 pub fn conflicting_workspace(
     paths: &Paths,
     alias: &str,
@@ -543,9 +561,18 @@ fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
     // The same login is not the same account. Two workspace seats of one human
     // share a subject, so a declared workspace has to agree as well — otherwise
     // the live seat's usage renders under the other seat's row.
+    //
+    // `right` is always the saved profile and `left` the file being attributed
+    // to it, which makes the missing-claim cases asymmetric. A candidate that
+    // declares nothing cannot prove it belongs to a profile that declares a
+    // workspace, and treating it as proof is how a second seat's token gets
+    // captured over the first's. The reverse is safe: a profile saved before
+    // workspaces were recorded still owns the rotations of its own login, and
+    // nothing about them contradicts it.
     match (&left.account_id, &right.account_id) {
         (Some(left), Some(right)) => left == right,
-        _ => true,
+        (None, Some(_)) => false,
+        (Some(_), None) | (None, None) => true,
     }
 }
 

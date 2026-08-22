@@ -154,6 +154,17 @@ fn resolve_target_alias(
             profile::short_workspace(&also_taken)
         );
     }
+    // No conflict can also mean no evidence: a profile with no workspace in its
+    // metadata or its stored token is unprovable, not proven safe. The operator
+    // never named this alias — it was derived from the label — so overwriting
+    // its occupant on that basis is not theirs to have approved.
+    if profile::unidentifiable_profile(paths, &qualified) {
+        bail!(
+            "'{qualified}' already holds a profile whose account cannot be identified, \
+             so this login would overwrite it. Save or re-login that profile first, \
+             or choose another label."
+        );
+    }
     Ok(qualified)
 }
 
@@ -389,6 +400,55 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// The operator names the base alias; codexctl derives the qualified one.
+    /// Overwriting a profile nobody named, on the strength of an identity that
+    /// could not be read, is not an approval anyone gave.
+    #[test]
+    fn run_from_refuses_a_derived_alias_holding_an_unidentifiable_profile() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // `amir@sawmills.ai+team` exists but declares no workspace anywhere:
+        // no metadata claim, and a stored token that carries none either.
+        let dir = paths.profiles_dir().join("amir@sawmills.ai+team");
+        std::fs::create_dir_all(&dir).unwrap();
+        let opaque = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0WiJ9.sig";
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{opaque}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"amir@sawmills.ai+team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot be identified"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
+        assert!(kept.contains(opaque), "the derived alias was overwritten");
     }
 
     /// Every profile written before this release has no `account_id` in its
