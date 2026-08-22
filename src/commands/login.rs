@@ -79,7 +79,10 @@ fn run_from(
         let lock = store::lock(paths)?;
         let target = resolve_target_alias(paths, alias, label, incoming.as_deref())?;
 
-        let email = email_from_alias(&target).or_else(|| email_from_alias(alias));
+        // The address is the alias the operator asked for; a label-qualified
+        // target like `a@b.com+work` is a store key, not an email. This is only
+        // a fallback — a token carrying an email claim still wins.
+        let email = email_from_alias(alias).or_else(|| email_from_alias(&target));
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -386,6 +389,59 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// Every profile written before this release has no `account_id` in its
+    /// metadata, so a guard reading metadata alone is inert for exactly the
+    /// profiles an upgrade brings with it. The stored token still carries the
+    /// claim, so the guard has to read that.
+    #[test]
+    fn run_from_refuses_a_second_workspace_against_a_legacy_profile() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+        // Rewrite meta.json the way an older codexctl left it: no workspace.
+        let meta_path = paths
+            .profiles_dir()
+            .join("amir@sawmills.ai")
+            .join("meta.json");
+        std::fs::write(
+            &meta_path,
+            r#"{"alias":"amir@sawmills.ai","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("amir@sawmills.ai")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(
+            kept.contains(&stored),
+            "a legacy profile's credentials were replaced"
+        );
     }
 
     /// A token that declares no workspace cannot prove it belongs to the seat

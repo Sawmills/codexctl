@@ -226,7 +226,16 @@ pub fn conflicting_workspace(
     alias: &str,
     incoming_account: Option<&str>,
 ) -> Option<String> {
-    let stored = get_profile_from(paths, alias).ok()?.meta.account_id?;
+    let profile = get_profile_from(paths, alias).ok()?;
+    // A profile saved before workspaces were recorded has no `account_id` in
+    // its metadata, but the token it stored still carries the claim. Reading it
+    // keeps the guard working the moment this version ships, instead of only
+    // for profiles that happen to have been re-saved since.
+    let stored = profile
+        .meta
+        .account_id
+        .clone()
+        .or_else(|| identity_of_auth_file(&profile.auth_json_path()).account_id)?;
     match incoming_account {
         // A token naming a different workspace is a different account.
         Some(incoming) => (stored != incoming).then_some(stored),

@@ -48,6 +48,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     };
 
     let existing = store::profile_dir(&paths, &resolved_alias)?;
+    let mut overwrite_confirmed = false;
     if existing.exists() {
         refuse_a_different_account(
             &paths,
@@ -65,6 +66,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             println!("aborted");
             return Ok(());
         }
+        overwrite_confirmed = true;
     }
 
     // The lock is taken only now: holding it across the prompt above would
@@ -79,6 +81,16 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             auth.account_id.as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
+        // The profile appeared while this command was deciding, so nobody
+        // approved overwriting it. Re-prompting is not an option with the lock
+        // held, so stop and let the operator run the command again against the
+        // store as it now stands.
+        if !overwrite_confirmed {
+            anyhow::bail!(
+                "profile '{resolved_alias}' was created by another process while this save was \
+                 preparing. Re-run the command to confirm overwriting it."
+            );
+        }
     }
     profile::save_profile_and_activate_locked(
         &lock,
