@@ -419,6 +419,39 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// Damaged metadata is not an empty profile. The stored token still proves
+    /// which account these credentials belong to, so an alias the operator did
+    /// name is still protected from a different login.
+    #[test]
+    fn run_from_refuses_a_different_account_behind_unreadable_metadata() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-personal");
+        let dir = paths.profiles_dir().join("amir@sawmills.ai");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        // A valid token behind metadata that will not parse.
+        std::fs::write(dir.join("meta.json"), "{ truncated").unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
+        assert!(
+            kept.contains(&stored),
+            "credentials behind damaged metadata were destroyed"
+        );
+    }
+
     /// A team workspace holds many people. Two colleagues therefore agree on
     /// `chatgpt_account_id` and are still different accounts, so the workspace
     /// alone cannot say whose credentials an alias holds.

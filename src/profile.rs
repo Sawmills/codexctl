@@ -223,14 +223,19 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// a profile that belongs to another account on the same login.
 /// Which login a saved profile holds, by the same precedence as its workspace.
 ///
+/// Like [`workspace_of_profile`], this reads the stored files directly: a
+/// profile whose `meta.json` will not parse still has credentials worth
+/// protecting, and refusing to look at them is what lets a damaged profile be
+/// overwritten as though it held nothing.
+///
 /// A workspace is not an owner: several people hold seats in one team
 /// workspace, so the login is what separates their credentials.
 pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
-    let profile = get_profile_from(paths, alias).ok()?;
-    let stored_login = api::read_auth_json(&profile.auth_json_path())
+    let dir = store::profile_dir(paths, alias).ok()?;
+    let stored_login = api::read_auth_json(&dir.join("auth.json"))
         .ok()
         .and_then(|auth| api::token_login(&auth.access_token));
-    stored_login.or(profile.meta.user_id)
+    stored_login.or_else(|| read_meta(&dir.join("meta.json")).and_then(|meta| meta.user_id))
 }
 
 /// Which workspace a saved profile holds.
@@ -242,10 +247,10 @@ pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
 /// unrepairable without deleting it. Metadata still answers for a profile whose
 /// token carries no claim.
 pub fn workspace_of_profile(paths: &Paths, alias: &str) -> Option<String> {
-    let profile = get_profile_from(paths, alias).ok()?;
-    identity_of_auth_file(&profile.auth_json_path())
+    let dir = store::profile_dir(paths, alias).ok()?;
+    identity_of_auth_file(&dir.join("auth.json"))
         .account_id
-        .or(profile.meta.account_id)
+        .or_else(|| read_meta(&dir.join("meta.json")).and_then(|meta| meta.account_id))
 }
 
 /// Whether a candidate auth file may be attributed to a profile's workspace.
