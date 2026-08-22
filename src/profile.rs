@@ -221,6 +221,38 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 /// missing identifier on either side is not proof of a conflict. Both `save`
 /// and `login` gate on this, because either one can replace the credentials of
 /// a profile that belongs to another account on the same login.
+/// Which workspace a saved profile holds.
+///
+/// The stored token is asked first because it *is* the credential; metadata is
+/// a derived copy of it. A save writes `auth.json` before `meta.json`, so an
+/// interrupted one leaves metadata describing the previous workspace — trusting
+/// it there would reject the account actually stored and leave the profile
+/// unrepairable without deleting it. Metadata still answers for a profile whose
+/// token carries no claim.
+pub fn workspace_of_profile(paths: &Paths, alias: &str) -> Option<String> {
+    let profile = get_profile_from(paths, alias).ok()?;
+    identity_of_auth_file(&profile.auth_json_path())
+        .account_id
+        .or(profile.meta.account_id)
+}
+
+/// Whether a candidate auth file may be attributed to a profile's workspace.
+///
+/// This is the single rule every attribution path shares, because each path
+/// that reimplemented it left a different way in. It is deliberately not
+/// symmetric: a candidate declaring no workspace cannot prove it belongs to a
+/// profile that declares one, which is how a second seat's token lands on the
+/// first seat's profile. The reverse is safe — a profile saved before
+/// workspaces were recorded still owns its own login's rotations, and a
+/// claimed candidate contradicts nothing about it.
+fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
+    match (candidate, stored) {
+        (Some(candidate), Some(stored)) => candidate == stored,
+        (None, Some(_)) => false,
+        (Some(_), None) | (None, None) => true,
+    }
+}
+
 /// Whether `alias` holds a profile whose account cannot be identified at all —
 /// no workspace in its metadata and none in the token it stored.
 ///
@@ -238,15 +270,10 @@ pub fn unidentifiable_profile(paths: &Paths, alias: &str) -> bool {
     // Something is there. Metadata that cannot be read is the strongest reason
     // to treat it as unidentifiable, not a reason to treat it as absent — an
     // interrupted save or a damaged file leaves exactly this shape.
-    let Ok(profile) = get_profile_from(paths, alias) else {
+    if get_profile_from(paths, alias).is_err() {
         return true;
-    };
-    profile
-        .meta
-        .account_id
-        .clone()
-        .or_else(|| identity_of_auth_file(&profile.auth_json_path()).account_id)
-        .is_none()
+    }
+    workspace_of_profile(paths, alias).is_none()
 }
 
 pub fn conflicting_workspace(
@@ -254,25 +281,8 @@ pub fn conflicting_workspace(
     alias: &str,
     incoming_account: Option<&str>,
 ) -> Option<String> {
-    let profile = get_profile_from(paths, alias).ok()?;
-    // A profile saved before workspaces were recorded has no `account_id` in
-    // its metadata, but the token it stored still carries the claim. Reading it
-    // keeps the guard working the moment this version ships, instead of only
-    // for profiles that happen to have been re-saved since.
-    let stored = profile
-        .meta
-        .account_id
-        .clone()
-        .or_else(|| identity_of_auth_file(&profile.auth_json_path()).account_id)?;
-    match incoming_account {
-        // A token naming a different workspace is a different account.
-        Some(incoming) => (stored != incoming).then_some(stored),
-        // A token naming no workspace cannot prove it is the same account, and
-        // this profile positively declares one. Treating "unprovable" as "same"
-        // is what lets a second seat overwrite the first's credentials, so the
-        // claim is required once the stored profile has one.
-        None => Some(stored),
-    }
+    let stored = workspace_of_profile(paths, alias)?;
+    (!workspace_permits(incoming_account, Some(stored.as_str()))).then_some(stored)
 }
 
 /// Short workspace id for an error message; the full uuid is noise.
@@ -561,6 +571,12 @@ fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
     let (Ok(left), Ok(right)) = (api::read_auth_json(left), api::read_auth_json(right)) else {
         return false;
     };
+    // An identical access token is not identity on its own: `read_auth_json`
+    // takes an explicit `account_id` from the file ahead of the JWT claim, so
+    // two files can carry one token and name different workspaces.
+    if !workspace_permits(left.account_id.as_deref(), right.account_id.as_deref()) {
+        return false;
+    }
     if left.access_token == right.access_token {
         return true;
     }
@@ -579,11 +595,7 @@ fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
     // captured over the first's. The reverse is safe: a profile saved before
     // workspaces were recorded still owns the rotations of its own login, and
     // nothing about them contradicts it.
-    match (&left.account_id, &right.account_id) {
-        (Some(left), Some(right)) => left == right,
-        (None, Some(_)) => false,
-        (Some(_), None) | (None, None) => true,
-    }
+    true
 }
 
 pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Option<String>> {
@@ -601,7 +613,12 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     }
 
     for (profile, profile_auth) in &profile_auths {
-        if profile_auth.access_token == target_auth.access_token {
+        if profile_auth.access_token == target_auth.access_token
+            && workspace_permits(
+                target_account.as_deref(),
+                profile_auth.account_id.as_deref(),
+            )
+        {
             return Ok(Some(profile.meta.alias.clone()));
         }
     }

@@ -719,6 +719,79 @@ fn alias_for_auth_json_refuses_a_claimless_token_against_a_lone_claimed_profile(
     );
 }
 
+/// `auth.json` may carry an explicit `account_id`, which `read_auth_json`
+/// prefers over the JWT claim. Two files can therefore share one access token
+/// and still name different workspaces, so token equality alone is not identity.
+#[test]
+fn alias_for_auth_json_refuses_one_token_naming_two_workspaces() {
+    let (tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    let dir = paths.profiles_dir().join("team@test");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team@test","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same token, explicitly a different workspace.
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(
+        &auth_json,
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-personal"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+/// A save writes `auth.json` before `meta.json`. If it stops in between, the
+/// stored credential is the newer fact — trusting metadata there would reject
+/// the account actually stored and leave the profile unrepairable.
+#[test]
+fn workspace_comes_from_the_stored_token_when_metadata_lags() {
+    let (_tmp, paths) = setup_test_env();
+    let dir = paths.profiles_dir().join("work@test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stored = synthetic_token(
+        r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-new"}}"#,
+    );
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{stored}"}}"#),
+    )
+    .unwrap();
+    // Metadata still describes the workspace held before the interrupted save.
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"work@test","email":null,"plan":null,"account_id":"acct-old","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::workspace_of_profile(&paths, "work@test").as_deref(),
+        Some("acct-new")
+    );
+    // So a login for the account actually stored can repair the profile...
+    assert_eq!(
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new")),
+        None
+    );
+    // ...while the stale metadata's workspace is still refused.
+    assert_eq!(
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-old")).as_deref(),
+        Some("acct-new")
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

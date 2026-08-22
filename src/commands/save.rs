@@ -80,7 +80,11 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     // decision itself, not just the checks — copying it now would store one
     // account's credentials under another's alias and email.
     let live_now = api::read_auth_json(&auth_path)?;
-    if live_now.access_token != auth.access_token {
+    // The workspace can change without the token changing: `auth.json` carries
+    // an explicit `account_id` that `read_auth_json` prefers over the JWT claim,
+    // so comparing tokens alone would let a switched workspace through under the
+    // alias and email resolved for the previous one.
+    if live_now.access_token != auth.access_token || live_now.account_id != auth.account_id {
         anyhow::bail!(
             "the active account changed while this save was preparing. \
              Re-run the command to save the account that is active now."
