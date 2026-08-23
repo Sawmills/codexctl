@@ -421,12 +421,33 @@ pub fn credentials_unreadable(paths: &Paths, alias: &str) -> bool {
     dir.exists() && api::read_auth_json(&dir.join("auth.json")).is_err()
 }
 
+/// Why a profile may not simply be written over.
+pub enum AccountConflict {
+    /// A claim on each side positively disagrees. No answer makes this the same
+    /// account, so it is never adoptable.
+    Different(String),
+    /// One side declares nothing, so the claims cannot be compared. The store
+    /// cannot settle this — but the operator usually can, which is why this is
+    /// offered for confirmation rather than refused outright.
+    Unprovable(Option<String>),
+}
+
+impl AccountConflict {
+    /// What the profile is understood to hold, for an operator-facing message.
+    pub fn stored(&self) -> Option<&str> {
+        match self {
+            Self::Different(stored) => Some(stored.as_str()),
+            Self::Unprovable(stored) => stored.as_deref(),
+        }
+    }
+}
+
 pub fn conflicting_workspace(
     paths: &Paths,
     alias: &str,
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
-) -> Option<String> {
+) -> Option<AccountConflict> {
     let dir = store::profile_dir(paths, alias).ok()?;
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
@@ -463,11 +484,24 @@ pub fn conflicting_workspace(
     if workspace_settled && !user_contradicts {
         return None;
     }
-    Some(
-        stored_workspace
-            .or(stored_user)
-            .unwrap_or_else(|| "unknown".to_string()),
-    )
+    // A claim that positively disagrees is different in kind from one that is
+    // merely missing. The first can never be talked round; the second is a
+    // question the operator can answer and the store cannot.
+    let workspace_differs = matches!(
+        (incoming_account, stored_workspace.as_deref()),
+        (Some(incoming), Some(stored)) if incoming != stored
+    );
+    let user_differs = matches!(
+        (incoming_user, stored_user.as_deref()),
+        (Some(incoming), Some(stored)) if incoming != stored
+    );
+    let described = stored_workspace.clone().or_else(|| stored_user.clone());
+    if workspace_differs || user_differs {
+        return Some(AccountConflict::Different(
+            described.unwrap_or_else(|| "unknown".to_string()),
+        ));
+    }
+    Some(AccountConflict::Unprovable(described))
 }
 
 /// Short workspace id for an error message; the full uuid is noise.

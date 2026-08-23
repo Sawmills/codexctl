@@ -328,46 +328,50 @@ alone, because a workspace holds many people and one login holds seats in many
 workspaces. Profiles saved before this release recorded neither, so `codexctl`
 reads them out of the stored token and remembers what it finds.
 
-Where it cannot prove two credentials are the same account, it now refuses
-rather than overwriting. Three cases can surprise a store that predates this
-release. All three are recoverable, and each error names its own remedy.
-
-**A second workspace on a profile that never recorded one.** Logging into a
-different workspace under an alias whose stored token carries no workspace
-claim is refused: the profile cannot confirm the arriving account is its own.
+Two credentials that positively disagree are never the same account, and
+`codexctl` refuses to overwrite one with the other. A profile that declares
+*nothing* is a different situation: the store cannot tell whether the account
+arriving is the one it holds, but the operator who just logged in can. Those
+cases ask rather than refuse — on a terminal with a prompt, and elsewhere with
+`--allow-adopt`, the same shape `use` applies to billing and to banked resets.
 
 ```
 $ codexctl login amir@sawmills.ai
-error: profile 'amir@sawmills.ai' holds a different account
-       (stored workspace unknown, this login 6df34c28…).
-       Re-run with --label <name> to save it alongside, choose another alias,
-       or remove it first: codexctl remove amir@sawmills.ai
+codexctl: profile 'amir@sawmills.ai' does not record which account it holds,
+          so this login cannot be matched to it. this login is 6df34c28….
+          Replace it? Its saved credentials are overwritten. [y/N]
 ```
+
+Answering `y` records the workspace, so the profile can answer for itself and
+the question is not asked again. Declining changes nothing. Without a terminal
+the answer defaults to no:
+
+```
+error: profile 'amir@sawmills.ai' does not record which account it holds, so
+       replacing it needs approval and none was given. Re-run on a terminal to
+       confirm, pass --allow-adopt, or choose another alias.
+```
+
+`--allow-adopt` settles only what the store could not work out. It has no
+effect on a conflict the store *did* work out: a stored workspace that
+positively differs from the arriving one stays refused with or without it.
+
+Two habits of a pre-release store change as a result.
 
 **A claimless profile stops absorbing rotations that name a workspace.** Codex
 refreshes tokens in place, and `codexctl` folds those back into the profile
 that owns them. A profile whose stored token declares no workspace no longer
 receives a rotation that declares one — that token may belong to another seat
 of the same login. The profile keeps working; its stored copy goes stale, and
-`status` shows the token ageing. `codexctl save` or a re-login refreshes it and
-records the workspace, after which rotations are captured normally again.
+`status` shows the token ageing. `codexctl save` or a re-login brings it
+forward and records the workspace, after which rotations are captured normally
+again.
 
-**A profile whose token no longer parses.** If its metadata still records the
-workspace, a re-login is refused for the same reason — the stored login cannot
-be read, so nothing proves the arriving one is its owner. Remove it and log in
-again:
-
-```
-$ codexctl remove amir-team && codexctl login amir-team --label team
-```
-
-A profile with nothing left to identify it — no readable token and no recorded
-account — is repaired by `codexctl login <alias>` directly, since there is no
-identity left to protect.
-
-Nothing runs at upgrade time. No profile is rewritten until its next `save`,
-`login`, or `status`, and a `meta.json` written by an earlier version parses
-unchanged.
+**A profile whose token no longer parses.** Its metadata may still record the
+workspace, but the stored login cannot be read, so nothing proves the arriving
+credential is its owner. This asks the same question. Answering `y` replaces it
+in place — which is what `remove` followed by a fresh login would do anyway,
+except that `remove` first destroys the metadata describing what was there.
 
 ## Shell completions
 

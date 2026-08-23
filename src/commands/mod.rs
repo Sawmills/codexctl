@@ -1,3 +1,4 @@
+pub mod adopt;
 mod alias;
 pub mod codex;
 pub mod completions;

@@ -163,29 +163,48 @@ equal on a coincidental value.
 `login` and `save` replace what is stored, so they require positive agreement rather than the mere
 absence of contradiction:
 
-| Stored workspace | Incoming workspace | Result                                             |
-| ---------------- | ------------------ | -------------------------------------------------- |
-| equal            | equal              | allowed (`save` still prompts before overwriting)  |
-| different        | known              | refuse, and name an explicit alias to pass         |
-| absent           | known              | refuse — the profile cannot confirm this account   |
-| known            | absent             | refuse — the token cannot prove it is this account |
-| absent           | absent             | allowed                                            |
+| Stored workspace | Incoming workspace | Result                                              |
+| ---------------- | ------------------ | --------------------------------------------------- |
+| equal            | equal              | allowed (`save` still prompts before overwriting)   |
+| different        | known              | refuse, and name an explicit alias to pass          |
+| absent           | known              | ask — the profile cannot confirm or deny this account |
+| known            | absent             | ask — the token cannot prove it is this account      |
+| absent           | absent             | allowed                                             |
 
-The login is checked alongside it, and unprovable in either direction is a refusal: a token naming
-no login cannot overwrite a profile that names one, and a profile whose stored login cannot be
-recovered is not open to a token that happens to name one — otherwise anyone in a shared workspace
-could replace a damaged profile by naming its alias.
-
-The single deliberate exception is a profile with **no readable token and no recorded account**:
-nothing there can be identified or used, so an explicit re-login repairs it rather than destroying
-it. A damaged profile that still records its workspace does not qualify — it is refused, and the
-error names `codexctl remove <alias>` as the way through.
+The login is checked alongside it, and unprovable in either direction is never read as agreement: a
+token naming no login does not silently overwrite a profile that names one, and a profile whose
+stored login cannot be recovered is not open to a token that happens to name one — otherwise anyone
+in a shared workspace could replace a damaged profile by naming its alias.
 
 **This is fail-closed by design.** "Cannot confirm" is not "yes"; reading it as yes is what let a
 second workspace replace the first seat's credentials.
 
-The refusal is an error, not a prompt, because the destructive answer is a single keystroke and the
-correct action is always to choose a different alias:
+But "cannot confirm" is not "no" either, and the two failures need different answers. A workspace
+that positively differs is never this account, so it is refused outright and no flag overrides it.
+A profile that declares *nothing* — which is precisely what every profile predating this design
+looks like — is a question the store cannot settle and the operator usually can. Refusing those
+outright leaves `codexctl remove` as the only way forward: it destroys the metadata that could have
+identified the profile and then performs the same replacement with nothing checked at all. The
+guard would be strictly weaker than the act it forbids.
+
+So an unprovable conflict is an approval, following the consent idiom `use` already applies to
+billing and to banked resets: prompt on a terminal, refuse without one unless `--allow-adopt` says
+the operator already decided. Approval settles only what could not be worked out; it has no effect
+on a conflict that was.
+
+One case still needs no approval: a profile with **no readable token and no recorded account**.
+Nothing there can be identified or used, so there is no occupant to consult the operator about and
+an explicit re-login simply repairs it. A damaged profile that still records its workspace does have
+an occupant, and is asked about like any other.
+
+```
+$ codexctl login amir@sawmills.ai
+codexctl: profile 'amir@sawmills.ai' does not record which account it holds,
+          so this login cannot be matched to it. Replace it? [y/N]
+```
+
+A proven conflict stays an error, not a prompt, because the destructive answer is a single keystroke
+and the correct action is always to choose a different alias:
 
 ```
 $ codexctl save
@@ -193,6 +212,11 @@ error: profile 'amir@sawmills.ai' holds a different account
        (stored workspace 033569a0…, incoming 6df34c28…).
        Pass an explicit alias: codexctl save <alias>
 ```
+
+Adoption also closes a loop the refusal opened. A claimless profile stops absorbing rotations that
+name a workspace, and the documented way to bring it forward is `save` or a re-login — both of which
+route through this same check. Were that check an unconditional refusal, the remedy would be refused
+by the rule it is meant to escape.
 
 This is the check that makes adding a second account on one email safe, so it belongs to this work
 rather than to a later cleanup.
@@ -238,9 +262,12 @@ CLI tests:
 - `label` sets, overwrites, and clears; it fails on an unknown alias.
 - `login --label` and `save --label` persist the label.
 - `list` and `status` omit the `Label` column with no labels present and include it once one is set.
-- `save` refuses when the target profile holds a different `account_id`, when either side's
-  workspace claim is missing, and when a concurrent write changes the profile or the live file
-  after the operator has confirmed the overwrite.
+- `save` refuses when the target profile holds a different `account_id`, asks for approval when
+  either side's workspace claim is missing, refuses that same case with no terminal and no
+  `--allow-adopt`, and refuses when a concurrent write changes the profile or the live file after
+  the operator has confirmed the overwrite.
+- `--allow-adopt` does not override a proven conflict, and an approval given for one profile is not
+  reused after the store changes underneath it.
 
 Per `AGENTS.md`, no real token value enters a fixture. Test tokens are unsigned JWTs carrying only
 synthetic claims, following the existing `JWT_HDR` pattern in `commands/status.rs`.

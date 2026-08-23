@@ -37,7 +37,9 @@
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
 - Identify an account by its workspace and its login together. Neither identifies it alone: a workspace holds many logins, and a login holds seats in many workspaces.
 - Read a profile's identity from its stored token first and its metadata second, and keep what has been proven when a captured file omits it.
-- Require positive agreement before `login` or `save` replaces stored credentials. "Cannot confirm" is not "yes". The one exception is a profile with no readable token and no recorded account, which is what a repair re-login is for.
+- Require positive agreement before `login` or `save` replaces stored credentials. "Cannot confirm" is not "yes".
+- Separate a conflict that is proven from one that is merely unprovable. Refuse claims that positively disagree; no flag may override that. Where neither side declares enough to compare, ask the operator: prompt on a terminal, refuse without one unless `--allow-adopt` is set.
+- Do not make `remove` the only remedy for a profile the store cannot identify. Deleting the evidence and replacing it unchecked is weaker than the replacement it guards.
 - Capture a token back to the alias the caller named. Fall back to token inspection only when the file does not belong to that alias.
 - Let an exact access token decide ownership on its own; anything rotated needs the claims to agree. Resolve undecidable ownership to no owner rather than a guess.
 - Pass the pinned alias to children in `CODEXCTL_PINNED_ALIAS`. Recovery must exclude the account a pinned launch already selected.

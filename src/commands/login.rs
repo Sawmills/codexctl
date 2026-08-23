@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 
 use crate::api;
-use crate::commands::{alias, status};
+use crate::commands::{adopt, alias, status};
 use crate::config::{self, Paths};
 use crate::profile;
 use crate::store;
@@ -35,12 +35,12 @@ impl CodexLoginRunner for CodexCliLoginRunner {
     }
 }
 
-pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
+pub fn run(alias: &str, label: Option<&str>, allow_adopt: bool) -> Result<()> {
     let alias = alias::required(alias)?;
     let paths = config::default_paths()?;
     let mut runner = CodexCliLoginRunner;
     // The alias actually written may be label-qualified, so report that one.
-    let saved = run_from(&paths, alias, label, &mut runner)?;
+    let saved = run_from_with_consent(&paths, alias, label, allow_adopt, &mut runner)?;
 
     println!("logged in and saved profile '{saved}'");
     println!();
@@ -48,10 +48,26 @@ pub fn run(alias: &str, label: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `run_from` with adoption never pre-approved.
+///
+/// Every caller is a test, and tests have no terminal, so the consent prompt
+/// declines on its own — this only spares them an argument that is always the
+/// same.
+#[cfg(test)]
 fn run_from(
     paths: &Paths,
     alias: &str,
     label: Option<&str>,
+    runner: &mut impl CodexLoginRunner,
+) -> Result<String> {
+    run_from_with_consent(paths, alias, label, false, runner)
+}
+
+fn run_from_with_consent(
+    paths: &Paths,
+    alias: &str,
+    label: Option<&str>,
+    allow_adopt: bool,
     runner: &mut impl CodexLoginRunner,
 ) -> Result<String> {
     let alias = alias::required(alias)?;
@@ -83,13 +99,52 @@ fn run_from(
         // read out of the store, so releasing the lock in between would let a
         // concurrent login change the answer before the write lands.
         let lock = store::lock(paths)?;
-        let target = resolve_target_alias(
-            paths,
-            alias,
-            label,
-            incoming.as_deref(),
-            incoming_user.as_deref(),
-        )?;
+        let resolve = |_: &store::StoreLock| {
+            resolve_target_alias(
+                paths,
+                alias,
+                label,
+                incoming.as_deref(),
+                incoming_user.as_deref(),
+            )
+        };
+        let (lock, target) = match resolve(&lock)? {
+            Resolution::Ready(target) => (lock, target),
+            Resolution::NeedsConsent {
+                alias: pending,
+                stored,
+            } => {
+                // Never ask while holding the store lock: `store::lock` waits
+                // without a timeout, so a question left unanswered would stall
+                // every other codexctl process, not just this one.
+                drop(lock);
+                if !adopt::approve_adoption(
+                    &pending,
+                    stored.as_deref(),
+                    incoming.as_deref(),
+                    allow_adopt,
+                    &mut std::io::stderr(),
+                ) {
+                    return Err(adopt::refusal(&pending, stored.as_deref()));
+                }
+                let lock = store::lock(paths)?;
+                // The answer approved one specific replacement. Resolving again
+                // under the new lock keeps it from being applied to whatever the
+                // store looks like now, which may be something nobody was asked
+                // about.
+                match resolve(&lock)? {
+                    Resolution::Ready(target) => (lock, target),
+                    Resolution::NeedsConsent {
+                        alias: again,
+                        stored: stored_again,
+                    } if again == pending && stored_again == stored => (lock, pending),
+                    Resolution::NeedsConsent { .. } => bail!(
+                        "the store changed while waiting for an answer, so the approval no \
+                         longer describes what would be replaced. Re-run the login."
+                    ),
+                }
+            }
+        };
 
         // Only a fallback either way: a token carrying an email claim wins.
         //
@@ -126,22 +181,34 @@ fn run_from(
     }
 }
 
+/// Where a login should land, once the store has said everything it can.
+enum Resolution {
+    /// Settled. Write here.
+    Ready(String),
+    /// This alias holds something the store can neither match to this account
+    /// nor rule out, so only the operator can settle it. See `commands::adopt`.
+    NeedsConsent {
+        alias: String,
+        stored: Option<String>,
+    },
+}
+
 /// Where this login should land.
 ///
 /// The requested alias wins whenever it is free or already holds this same
 /// account. When it holds a *different* account the label qualifies it, so a
 /// second seat on one address lands beside the first rather than replacing it.
-/// Without a label there is nothing to qualify with, so the login is refused
-/// rather than allowed to overwrite.
+/// Without a label there is nothing to qualify with — and nothing the store can
+/// decide either, so the operator is asked rather than refused.
 fn resolve_target_alias(
     paths: &Paths,
     alias: &str,
     label: Option<&str>,
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
-) -> Result<String> {
+) -> Result<Resolution> {
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
-    let Some(stored) = conflict else {
+    let Some(conflict) = conflict else {
         // The requested alias is usable. When a label was given, this seat may
         // still be saved under a label-derived alias from an earlier run — and
         // saving it here too would fork one account across two profiles, which
@@ -151,7 +218,7 @@ fn resolve_target_alias(
                 .context("could not check whether this account is already saved")?
             {
                 profile::ExistingSeat::One(existing) if existing != alias => {
-                    return Ok(existing);
+                    return Ok(Resolution::Ready(existing));
                 }
                 // Already ambiguous. A free alias is room for a third copy,
                 // not permission to make one — unless the operator named one of
@@ -159,7 +226,7 @@ fn resolve_target_alias(
                 // the very remedy this error recommends.
                 profile::ExistingSeat::Ambiguous(aliases) => {
                     if aliases.iter().any(|existing| existing == alias) {
-                        return Ok(alias.to_string());
+                        return Ok(Resolution::Ready(alias.to_string()));
                     }
                     bail!(
                         "this account is already saved under more than one alias ({}). \
@@ -170,19 +237,29 @@ fn resolve_target_alias(
                 _ => {}
             }
         }
-        return Ok(alias.to_string());
+        return Ok(Resolution::Ready(alias.to_string()));
     };
     let arriving = incoming_account
         .map(profile::short_workspace)
         .unwrap_or_default();
+    let stored = conflict.stored().map(str::to_string);
 
     let Some(label) = label else {
+        // A claim that positively disagrees is never this account, so no answer
+        // could make replacing it right. One that simply cannot be compared is a
+        // question, and the operator is the only one who can answer it.
+        let profile::AccountConflict::Different(different) = &conflict else {
+            return Ok(Resolution::NeedsConsent {
+                alias: alias.to_string(),
+                stored,
+            });
+        };
         bail!(
             "profile '{alias}' holds a different account \
              (stored workspace {}, this login {arriving}). \
              Re-run with --label <name> to save it alongside, choose another \
              alias, or remove it first: codexctl remove {alias}",
-            profile::short_workspace(&stored)
+            profile::short_workspace(different)
         );
     };
 
@@ -193,11 +270,11 @@ fn resolve_target_alias(
     match profile::existing_seat(paths, incoming_account, incoming_user)
         .context("could not check whether this account is already saved")?
     {
-        profile::ExistingSeat::One(existing) => return Ok(existing),
+        profile::ExistingSeat::One(existing) => return Ok(Resolution::Ready(existing)),
         profile::ExistingSeat::Ambiguous(aliases) => {
             // Naming one of the duplicates is refreshing it, not adding to them.
             if aliases.iter().any(|existing| existing == alias) {
-                return Ok(alias.to_string());
+                return Ok(Resolution::Ready(alias.to_string()));
             }
             bail!(
                 "this account is already saved under more than one alias ({}). \
@@ -220,26 +297,36 @@ fn resolve_target_alias(
     if let Some(also_taken) =
         profile::conflicting_workspace(paths, &qualified, incoming_account, incoming_user)
     {
-        bail!(
-            "'{alias}' and '{qualified}' both hold other accounts \
-             ({} and {}, this login {arriving}). Choose another alias.",
-            profile::short_workspace(&stored),
-            profile::short_workspace(&also_taken)
-        );
+        if let profile::AccountConflict::Different(also_taken) = &also_taken {
+            bail!(
+                "'{alias}' and '{qualified}' both hold other accounts \
+                 ({} and {}, this login {arriving}). Choose another alias.",
+                stored
+                    .as_deref()
+                    .map(profile::short_workspace)
+                    .unwrap_or_default(),
+                profile::short_workspace(also_taken)
+            );
+        }
+        return Ok(Resolution::NeedsConsent {
+            stored: also_taken.stored().map(str::to_string),
+            alias: qualified,
+        });
     }
     // The agreement rule above has vouched for this pair, including two sides
     // that both declare nothing — which is a claimless profile being refreshed
     // by the command that created it. What it cannot vouch for is a profile
-    // whose credentials will not read at all: the operator never named this
-    // alias, so replacing its occupant on no evidence is not theirs to approve.
+    // whose credentials will not read at all. The operator never named this
+    // alias, so replacing its occupant is not something the store may decide on
+    // its own — but the only remedy left otherwise is `remove`, which destroys
+    // the metadata that identifies it and then replaces it anyway. Ask instead.
     if profile::credentials_unreadable(paths, &qualified) {
-        bail!(
-            "'{qualified}' already holds a profile whose credentials cannot be read, \
-             so this login would overwrite it. Save or re-login that profile first, \
-             or choose another label."
-        );
+        return Ok(Resolution::NeedsConsent {
+            stored: profile::workspace_of_profile(paths, &qualified),
+            alias: qualified,
+        });
     }
-    Ok(qualified)
+    Ok(Resolution::Ready(qualified))
 }
 
 /// Reduce a display label to something usable as one path component.
@@ -520,7 +607,7 @@ mod tests {
         // unproven owner outright — but the credentials must survive.
         let message = error.to_string();
         assert!(
-            message.contains("cannot be identified") || message.contains("Choose another alias"),
+            message.contains("--allow-adopt"),
             "unhelpful refusal: {message}"
         );
         assert!(
@@ -528,6 +615,100 @@ mod tests {
                 .unwrap()
                 .contains("opaque-not-a-jwt"),
             "the derived alias was overwritten"
+        );
+    }
+
+    /// The other half of the headline case: the refusal above is a default, not
+    /// a wall. A legacy profile that declares no workspace is exactly what an
+    /// upgrade leaves behind, and the operator is the one who knows whether the
+    /// account arriving is the one it held. With that answer given, the login
+    /// lands and the profile stops being claimless — which is what makes a
+    /// re-login the documented way to bring an old profile forward.
+    #[test]
+    fn run_from_adopts_a_claimless_profile_when_approved() {
+        let (_tmp, paths) = setup_test_env();
+        let legacy = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{legacy}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        use base64::Engine;
+        let claims =
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        let incoming = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let saved =
+            run_from_with_consent(&paths, "amir@sawmills.ai", None, true, &mut runner).unwrap();
+
+        assert_eq!(saved, "amir@sawmills.ai");
+        let dir = paths.profiles_dir().join("amir@sawmills.ai");
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains(&incoming),
+            "the approved login did not land"
+        );
+        // The profile can now answer for itself, so the next login needs no
+        // approval at all. Without this the adoption would have to be repeated
+        // forever, which is the circularity the refusal alone created.
+        assert_eq!(
+            profile::workspace_of_profile(&paths, "amir@sawmills.ai").as_deref(),
+            Some("acct-team"),
+            "the adopted profile still records no workspace"
+        );
+    }
+
+    /// Approval settles what the store could not work out. It does not overrule
+    /// what the store worked out and got a negative answer to: two workspaces
+    /// that positively disagree are not one account, and no flag makes them one.
+    #[test]
+    fn allow_adopt_does_not_override_a_proven_different_account() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error =
+            run_from_with_consent(&paths, "amir@sawmills.ai", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "--allow-adopt bypassed a proven conflict: {error}"
+        );
+        assert!(
+            std::fs::read_to_string(
+                paths
+                    .profiles_dir()
+                    .join("amir@sawmills.ai")
+                    .join("auth.json"),
+            )
+            .unwrap()
+            .contains(&stored),
+            "a proven different account was overwritten"
         );
     }
 
@@ -564,7 +745,7 @@ mod tests {
         let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
 
         assert!(
-            error.to_string().contains("different account"),
+            error.to_string().contains("--allow-adopt"),
             "unhelpful refusal: {error}"
         );
         let kept = std::fs::read_to_string(
@@ -756,7 +937,7 @@ mod tests {
         let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
 
         assert!(
-            error.to_string().contains("different account"),
+            error.to_string().contains("--allow-adopt"),
             "unhelpful refusal: {error}"
         );
         let kept =
@@ -790,7 +971,7 @@ mod tests {
         let error = run_from(&paths, "work", None, &mut runner).unwrap_err();
 
         assert!(
-            error.to_string().contains("different account"),
+            error.to_string().contains("--allow-adopt"),
             "unhelpful refusal: {error}"
         );
         assert!(
@@ -1139,7 +1320,7 @@ mod tests {
         let error = run_from(&paths, "amir@sawmills.ai", None, &mut runner).unwrap_err();
 
         assert!(
-            error.to_string().contains("different account"),
+            error.to_string().contains("--allow-adopt"),
             "unhelpful refusal: {error}"
         );
         let kept = std::fs::read_to_string(
@@ -1330,7 +1511,7 @@ mod tests {
         let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
 
         assert!(
-            error.to_string().contains("codexctl remove team"),
+            error.to_string().contains("--allow-adopt"),
             "the refusal does not name the remedy: {error}"
         );
         let saved =

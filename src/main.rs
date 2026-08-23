@@ -34,6 +34,10 @@ enum Commands {
         /// Display label for the account, e.g. "personal" or "team"
         #[arg(long)]
         label: Option<String>,
+        /// Replace a profile that records no account of its own, without
+        /// prompting (needed on a terminal that cannot answer)
+        #[arg(long)]
+        allow_adopt: bool,
     },
     /// Save current ~/.codex/auth.json as a profile
     Save {
@@ -42,6 +46,10 @@ enum Commands {
         /// Display label for the account, e.g. "personal" or "team"
         #[arg(long)]
         label: Option<String>,
+        /// Replace a profile that records no account of its own, without
+        /// prompting (needed on a terminal that cannot answer)
+        #[arg(long)]
+        allow_adopt: bool,
     },
     /// Set or clear a profile's display label
     Label {
@@ -163,11 +171,13 @@ fn main() {
         Commands::Login {
             ref alias,
             ref label,
-        } => commands::login::run(alias, label.as_deref()),
+            allow_adopt,
+        } => commands::login::run(alias, label.as_deref(), allow_adopt),
         Commands::Save {
             ref alias,
             ref label,
-        } => commands::save::run(alias.as_deref(), label.as_deref()),
+            allow_adopt,
+        } => commands::save::run(alias.as_deref(), label.as_deref(), allow_adopt),
         Commands::Label {
             ref alias,
             ref text,

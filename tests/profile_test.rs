@@ -787,22 +787,22 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     // So the same login re-saving the account actually stored can repair the
     // profile. (`seatA` is the stored token's subject, which is the login claim
     // a real incoming token always carries.)
-    assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatA")),
-        None
+    assert!(
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatA"))
+            .is_none()
     );
-    // ...while the stale metadata's workspace is still refused.
-    assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("sub:seatA"))
-            .as_deref(),
-        Some("acct-new")
-    );
+    // ...while the stale metadata's workspace is still refused. Both sides make
+    // a claim and the claims disagree, so no answer could reconcile them: this
+    // is a refusal, not a question for the operator.
+    assert!(matches!(
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("sub:seatA")),
+        Some(profile::AccountConflict::Different(stored)) if stored == "acct-new"
+    ));
     // A different login in the workspace actually stored is refused too.
-    assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatB"))
-            .as_deref(),
-        Some("acct-new")
-    );
+    assert!(matches!(
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatB")),
+        Some(profile::AccountConflict::Different(stored)) if stored == "acct-new"
+    ));
 }
 
 /// The pinned-alias capture takes an exact-token shortcut before the ownership

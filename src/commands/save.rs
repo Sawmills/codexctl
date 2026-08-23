@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 
 use crate::api;
+use crate::commands::adopt;
 use crate::commands::alias;
 use crate::config;
 use crate::profile;
 use crate::store;
 
-pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
+pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Result<()> {
     // Reject a bad label before the save switches the live auth file. Failing
     // afterwards would leave the active account changed under an error exit.
     label.map(store::validate_label).transpose()?;
@@ -51,8 +52,9 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     // What the operator is agreeing to replace, so the approval cannot be
     // applied to some other credential that lands there while they answer.
     let mut confirmed_state: Option<Option<Vec<u8>>> = None;
+    let mut adoption_approved = false;
     if existing.exists() {
-        refuse_a_different_account(
+        let adoption = classify_overwrite(
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
@@ -63,13 +65,30 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
         // is being shown and agreeing to replace. Reading it afterwards would
         // silently adopt whatever landed there while they were deciding.
         let shown = stored_credentials(&existing);
-        eprint!(
-            "profile '{}' already exists. Overwrite? [y/N] ",
-            resolved_alias
-        );
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
+        let approved = match adoption {
+            Adoption::Unneeded => {
+                eprint!(
+                    "profile '{}' already exists. Overwrite? [y/N] ",
+                    resolved_alias
+                );
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                input.trim().eq_ignore_ascii_case("y")
+            }
+            // The adoption question already asks to replace these credentials,
+            // so it stands in for the overwrite prompt rather than following it.
+            Adoption::AskOperator { stored } => {
+                adoption_approved = adopt::approve_adoption(
+                    &resolved_alias,
+                    stored.as_deref(),
+                    auth.account_id.as_deref(),
+                    allow_adopt,
+                    &mut std::io::stderr(),
+                );
+                adoption_approved
+            }
+        };
+        if !approved {
             println!("aborted");
             return Ok(());
         }
@@ -104,6 +123,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
         &auth,
         alias::optional(alias)?.is_some(),
         confirmed_state,
+        adoption_approved,
     );
     let _ = std::fs::remove_file(&snapshot);
     saved?;
@@ -124,6 +144,7 @@ fn save_verified_snapshot(
     verified: &api::AuthJson,
     alias_was_explicit: bool,
     confirmed_state: Option<Option<Vec<u8>>>,
+    adoption_approved: bool,
 ) -> Result<()> {
     let live_now = api::read_auth_json(snapshot)?;
     // The workspace can change without the token changing: `auth.json` carries
@@ -138,13 +159,19 @@ fn save_verified_snapshot(
         );
     }
     if store::profile_dir(paths, resolved_alias)?.exists() {
-        refuse_a_different_account(
+        // Re-run under the lock against the store as it actually stands. An
+        // adoption the operator already approved carries over; one that only
+        // became necessary since does not, because nobody was asked about it.
+        if let Adoption::AskOperator { stored } = classify_overwrite(
             paths,
             resolved_alias,
             live_now.account_id.as_deref(),
             api::token_login(&live_now.access_token).as_deref(),
             alias_was_explicit,
-        )?;
+        )? && !adoption_approved
+        {
+            return Err(adopt::refusal(resolved_alias, stored.as_deref()));
+        }
         // Re-prompting is not an option with the lock held, so an approval that
         // no longer describes what is stored is refused instead of reused.
         let dir = store::profile_dir(paths, resolved_alias)?;
@@ -180,27 +207,40 @@ fn stored_credentials(dir: &std::path::Path) -> Option<Vec<u8>> {
     std::fs::read(dir.join("auth.json")).ok()
 }
 
-/// Stop before the overwrite prompt when the target profile holds a *different*
-/// workspace.
+/// What must be settled before this save may overwrite the target profile.
+enum Adoption {
+    /// Nothing. The profile is free, or it holds this same account.
+    Unneeded,
+    /// The profile neither matches nor contradicts this account, so the store
+    /// has no way to decide. Only the operator can say whether replacing it is
+    /// right, so this is a question rather than a refusal.
+    AskOperator { stored: Option<String> },
+}
+
+/// Decide how the target profile stands against the account being saved.
 ///
-/// Without an explicit alias `save` defaults to the detected email, so a second
-/// account on one address lands on the first account's profile. There the
-/// destructive answer is a single keystroke, and the right action is always to
-/// pick another alias — so this is an error rather than another prompt.
+/// A profile whose claims positively disagree is refused outright: without an
+/// explicit alias `save` defaults to the detected email, so a second account on
+/// one address lands on the first account's profile, where the destructive
+/// answer is a single keystroke. No answer makes those the same account.
 ///
-/// A refusal needs positive evidence of a different account. When either side
-/// has no workspace identifier the command falls through to the usual prompt.
-fn refuse_a_different_account(
+/// A profile that declares nothing is a different case and is returned for the
+/// operator to settle. See `commands::adopt`.
+fn classify_overwrite(
     paths: &config::Paths,
     alias: &str,
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
     alias_was_explicit: bool,
-) -> Result<()> {
-    let Some(stored) =
+) -> Result<Adoption> {
+    let Some(conflict) =
         profile::conflicting_workspace(paths, alias, incoming_account, incoming_user)
     else {
-        return Ok(());
+        return Ok(Adoption::Unneeded);
+    };
+    let stored = conflict.stored().map(str::to_string);
+    let profile::AccountConflict::Different(stored) = conflict else {
+        return Ok(Adoption::AskOperator { stored });
     };
     // Naming the remedy matters: an operator who already chose this alias
     // cannot act on "pass an explicit alias".
@@ -280,6 +320,63 @@ mod tests {
         std::fs::read_to_string(paths.profiles_dir().join("work").join("auth.json")).unwrap()
     }
 
+    /// A token that names a workspace, unlike `token`.
+    fn workspace_token(account: &str) -> String {
+        use base64::Engine;
+        let claims = format!(
+            r#"{{"sub":"seatA","https://api.openai.com/auth":{{"chatgpt_account_id":"{account}"}}}}"#
+        );
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        format!("{JWT_HDR}.{payload}.sig")
+    }
+
+    /// The stored profile declares no workspace, so it can be neither matched
+    /// to the arriving account nor ruled out. Without an answer the save keeps
+    /// what is there, and says which flag supplies one.
+    #[test]
+    fn refuses_an_unidentifiable_profile_without_approval() {
+        let (_tmp, paths, snapshot) = setup(&token("legacy"));
+        let arriving = auth_bytes(&workspace_token("acct-team"));
+        std::fs::write(&snapshot, &arriving).unwrap();
+        let approved = Some(Some(auth_bytes(&token("legacy")).into_bytes()));
+
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("--allow-adopt"), "{error}");
+        assert!(
+            stored(&paths).contains(&token("legacy")),
+            "the unidentifiable profile was replaced without approval"
+        );
+    }
+
+    /// The same situation with the answer given. The refusal above is a
+    /// default, not a wall: `remove` followed by a fresh save would perform this
+    /// very replacement after destroying the metadata that describes it.
+    #[test]
+    fn adopts_an_unidentifiable_profile_when_approved() {
+        let (_tmp, paths, snapshot) = setup(&token("legacy"));
+        let incoming = workspace_token("acct-team");
+        std::fs::write(&snapshot, auth_bytes(&incoming)).unwrap();
+        let approved = Some(Some(auth_bytes(&token("legacy")).into_bytes()));
+
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, true,
+        )
+        .unwrap();
+
+        assert!(
+            stored(&paths).contains(&incoming),
+            "the approved save did not land"
+        );
+    }
+
     /// The operator approved replacing one credential. Another process replaced
     /// it while they were answering, so the approval no longer describes what
     /// is there and the save must not proceed on it.
@@ -294,7 +391,7 @@ mod tests {
         let lock = store::lock(&paths).unwrap();
         let verified = api::read_auth_json(&snapshot).unwrap();
         let error = save_verified_snapshot(
-            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, false,
         )
         .unwrap_err();
 
@@ -314,7 +411,7 @@ mod tests {
         let lock = store::lock(&paths).unwrap();
         let verified = api::read_auth_json(&snapshot).unwrap();
         let error = save_verified_snapshot(
-            &lock, &paths, "work", None, None, &snapshot, &verified, true, None,
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, None, false,
         )
         .unwrap_err();
 
@@ -338,7 +435,7 @@ mod tests {
 
         let lock = store::lock(&paths).unwrap();
         let error = save_verified_snapshot(
-            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, false,
         )
         .unwrap_err();
 
@@ -358,7 +455,7 @@ mod tests {
         let lock = store::lock(&paths).unwrap();
         let verified = api::read_auth_json(&snapshot).unwrap();
         save_verified_snapshot(
-            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, false,
         )
         .unwrap();
 
