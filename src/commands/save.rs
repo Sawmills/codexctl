@@ -239,3 +239,132 @@ fn fetch_email(access_token: &str) -> Option<String> {
     let me: MeResponse = resp.json().ok()?;
     me.email
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Paths;
+
+    const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+    fn token(jti: &str) -> String {
+        use base64::Engine;
+        let claims = format!(r#"{{"sub":"seatA","jti":"{jti}"}}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        format!("{JWT_HDR}.{payload}.sig")
+    }
+
+    fn auth_bytes(access: &str) -> String {
+        format!(r#"{{"access_token":"{access}"}}"#)
+    }
+
+    /// A store with `alias` holding `access`, plus a snapshot of the live file.
+    fn setup(access: &str) -> (tempfile::TempDir, Paths, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let dir = paths.profiles_dir().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth_bytes(access)).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"work","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let snapshot = tmp.path().join("snapshot.json");
+        std::fs::write(&snapshot, auth_bytes(&token("live"))).unwrap();
+        (tmp, paths, snapshot)
+    }
+
+    fn stored(paths: &Paths) -> String {
+        std::fs::read_to_string(paths.profiles_dir().join("work").join("auth.json")).unwrap()
+    }
+
+    /// The operator approved replacing one credential. Another process replaced
+    /// it while they were answering, so the approval no longer describes what
+    /// is there and the save must not proceed on it.
+    #[test]
+    fn refuses_when_the_profile_changed_after_confirmation() {
+        let (_tmp, paths, snapshot) = setup(&token("approved"));
+        let approved = Some(Some(auth_bytes(&token("approved")).into_bytes()));
+        // A concurrent write lands between the prompt and the lock.
+        let newer = auth_bytes(&token("newer"));
+        std::fs::write(paths.profiles_dir().join("work").join("auth.json"), &newer).unwrap();
+
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed while this save"),
+            "{error}"
+        );
+        assert_eq!(stored(&paths), newer, "the newer credential was replaced");
+    }
+
+    /// The profile did not exist when the command decided, so nobody approved
+    /// overwriting it.
+    #[test]
+    fn refuses_an_unconfirmed_profile_that_appeared() {
+        let (_tmp, paths, snapshot) = setup(&token("existing"));
+
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, None,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("created by another process"),
+            "{error}"
+        );
+    }
+
+    /// The live file moved to another account while the prompt was open, so the
+    /// alias and email resolved earlier no longer describe it.
+    #[test]
+    fn refuses_when_the_live_credential_changed() {
+        let (_tmp, paths, snapshot) = setup(&token("approved"));
+        let approved = Some(Some(auth_bytes(&token("approved")).into_bytes()));
+        // `verified` describes what was read before the prompt; the snapshot
+        // holds what is there now.
+        let before = _tmp.path().join("before.json");
+        std::fs::write(&before, auth_bytes(&token("before"))).unwrap();
+        let verified = api::read_auth_json(&before).unwrap();
+
+        let lock = store::lock(&paths).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("active account changed"),
+            "{error}"
+        );
+    }
+
+    /// Nothing changed: the approval still describes the profile, so the save
+    /// goes through.
+    #[test]
+    fn saves_when_nothing_changed_after_confirmation() {
+        let (_tmp, paths, snapshot) = setup(&token("approved"));
+        let approved = Some(Some(auth_bytes(&token("approved")).into_bytes()));
+
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved,
+        )
+        .unwrap();
+
+        assert!(
+            stored(&paths).contains(&token("live")),
+            "the snapshot was not saved"
+        );
+    }
+}
