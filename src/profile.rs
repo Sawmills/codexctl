@@ -284,7 +284,8 @@ pub fn workspace_of_profile(paths: &Paths, alias: &str) -> Option<String> {
 fn claim_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     match (candidate, stored) {
         (Some(candidate), Some(stored)) => candidate == stored,
-        (None, Some(_)) => true,
+        // Declaring nothing cannot prove membership of a declared account.
+        (None, Some(_)) => false,
         (Some(_), None) | (None, None) => true,
     }
 }
@@ -455,7 +456,7 @@ pub fn conflicting_workspace(
         // The arriving token names no login at all. A workspace is shared, so
         // agreeing on it proves nothing about whose credentials these are, and
         // the profile does name someone.
-        (None, Some(_)) => false,
+        (None, Some(_)) => true,
         (None, None) => false,
     };
     if workspace_settled && !user_contradicts {
