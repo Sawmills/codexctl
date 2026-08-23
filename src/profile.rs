@@ -633,14 +633,26 @@ fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Opt
     let Some(alias) = alias_for_auth_json_with_hint(paths, exec_auth, pinned_alias) else {
         return;
     };
-    let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
+    capture_into_owner(paths, exec_auth, &alias);
+}
+
+/// Fold `source` into the profile that owns it, once ownership is settled.
+///
+/// Both capture paths share this so neither can drift: the freshness guard, the
+/// copy, and the preservation of a workspace the incoming file omits all belong
+/// together.
+fn capture_into_owner(paths: &Paths, source: &Path, alias: &str) {
+    let Ok(dest) = store::profile_dir(paths, alias).map(|dir| dir.join("auth.json")) else {
         return;
     };
-    if !captured_auth_supersedes_profile(exec_auth, &dest) {
+    // The source is not always the newer copy. A pinned run that already folded
+    // a rotated token into this profile leaves the live file behind, and copying
+    // it now would undo that rotation.
+    if !captured_auth_supersedes_profile(source, &dest) {
         return;
     }
-    let proven_workspace = workspace_of_profile(paths, &alias);
-    if let Err(error) = store::atomic_copy(exec_auth, &dest) {
+    let proven_workspace = workspace_of_profile(paths, alias);
+    if let Err(error) = store::atomic_copy(source, &dest) {
         eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
         return;
     }
@@ -649,9 +661,9 @@ fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Opt
     // evidence a profile written before the metadata field has, and leave every
     // later rotation unattributable — so it is kept in metadata instead.
     if let Some(workspace) = proven_workspace
-        && workspace_of_profile(paths, &alias).is_none()
+        && workspace_of_profile(paths, alias).is_none()
     {
-        record_workspace(paths, &alias, &workspace);
+        record_workspace(paths, alias, &workspace);
     }
 }
 
@@ -695,7 +707,7 @@ fn record_workspace(paths: &Paths, alias: &str, workspace: &str) {
 /// Equally strong matches are genuinely ambiguous and get no answer.
 fn strongest_exact_match(
     target_workspace: Option<&str>,
-    candidates: &[(String, Option<String>)],
+    candidates: &[AliasWorkspace],
 ) -> Option<String> {
     if let [only] = candidates {
         // An identical access token is the same credential, so a lone holder of
@@ -740,12 +752,15 @@ fn strongest_exact_match(
     None
 }
 
+/// A profile alias beside the workspace it effectively holds.
+type AliasWorkspace = (String, Option<String>);
+
+/// The workspace a file declares, and every profile holding its access token.
+type ExactTokenCandidates = (Option<String>, Vec<AliasWorkspace>);
+
 /// The profiles holding this exact access token, with the target's own
 /// workspace, so callers can weigh them rather than take the first that fits.
-fn exact_token_candidates(
-    paths: &Paths,
-    auth_json: &Path,
-) -> Option<(Option<String>, Vec<(String, Option<String>)>)> {
+fn exact_token_candidates(paths: &Paths, auth_json: &Path) -> Option<ExactTokenCandidates> {
     let target = api::read_auth_json(auth_json).ok()?;
     // Enumerated from the store's directories rather than `list_profiles_from`,
     // which skips a profile with no `meta.json`. A save writes `auth.json`
@@ -1102,18 +1117,7 @@ fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias
     if skip_alias == Some(alias.as_str()) {
         return;
     }
-    let Ok(dest) = store::profile_dir(paths, &alias).map(|dir| dir.join("auth.json")) else {
-        return;
-    };
-    // The live file is not always the newer copy. A pinned run that already
-    // folded a rotated token into this profile leaves the live file behind, and
-    // copying it now would undo that rotation.
-    if !captured_auth_supersedes_profile(codex_auth, &dest) {
-        return;
-    }
-    if let Err(error) = store::atomic_copy(codex_auth, &dest) {
-        eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
-    }
+    capture_into_owner(paths, codex_auth, &alias);
 }
 
 pub fn update_meta_plan_from(paths: &Paths, alias: &str, plan: &str) -> Result<()> {

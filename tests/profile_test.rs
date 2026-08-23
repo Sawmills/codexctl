@@ -1522,6 +1522,54 @@ fn rotated_token_resolution_sees_a_profile_left_without_metadata() {
     );
 }
 
+/// The live-file capture that `use` performs preserves a proven workspace just
+/// as the pinned one does — both go through the same step, so neither can
+/// erase the evidence the other protects.
+#[test]
+fn switch_capture_keeps_the_workspace_through_a_claimless_rotation() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(r#"{"sub":"seatA","jti":"stable"}"#);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}","refresh_token":"old","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    write_profile(
+        &paths,
+        "next",
+        &synthetic_token(r#"{"sub":"seatB","jti":"next"}"#),
+    );
+    profile::set_active_from(&paths, "team").unwrap();
+
+    // The live file rotated its refresh token and carries no workspace claim.
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{token}","refresh_token":"new"}}"#),
+    )
+    .unwrap();
+
+    profile::switch_to_from(&paths, "next").unwrap();
+
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("new"),
+        "the outgoing rotation was not captured"
+    );
+    assert_eq!(
+        profile::workspace_of_profile(&paths, "team").as_deref(),
+        Some("acct-team"),
+        "the outgoing profile's proven workspace was erased"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
