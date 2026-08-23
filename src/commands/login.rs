@@ -126,7 +126,14 @@ fn run_from_with_consent(
         // concurrent login change the answer before the write lands.
         let lock = store::lock(paths)?;
         let resolve = |_: &store::StoreLock| {
-            resolve_target_alias(paths, alias, label, incoming.as_deref(), &incoming_user)
+            resolve_target_alias(
+                paths,
+                alias,
+                label,
+                incoming.as_deref(),
+                &incoming_user,
+                &auth_path,
+            )
         };
         let (lock, target) = match resolve(&lock)? {
             Resolution::Ready(target) => (lock, target),
@@ -254,6 +261,7 @@ fn resolve_target_alias(
     label: Option<&str>,
     incoming_account: Option<&str>,
     incoming_user: &api::Logins,
+    incoming_auth: &Path,
 ) -> Result<Resolution> {
     // Where this account already lives, if anywhere. Consulted before every
     // decision below rather than only when the requested alias is empty: the
@@ -261,8 +269,15 @@ fn resolve_target_alias(
     // for. Saving a second copy forks it, which every later lookup reports as
     // ambiguous — and the fresh login revokes the older grant server-side,
     // leaving the duplicate dead as well as confusing.
-    let seat = profile::existing_seat(paths, incoming_account, incoming_user)
+    let mut seat = profile::existing_seat(paths, incoming_account, incoming_user)
         .context("could not check whether this account is already saved")?;
+    // A device login can return an opaque or pre-claims credential, which offers
+    // the lookup above nothing to match on. Being byte-identical to one already
+    // stored still proves whose it is.
+    if matches!(seat, profile::ExistingSeat::None) {
+        seat = profile::exact_token_seat(paths, incoming_auth)
+            .context("could not check which profile holds this credential")?;
+    }
 
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {
@@ -1060,6 +1075,31 @@ mod tests {
         assert!(
             !meta.contains("personal@example.com"),
             "the requested alias was recorded as another account's address: {meta}"
+        );
+    }
+
+    /// A device login can return an opaque or pre-claims credential, which the
+    /// claim-based seat lookup cannot match. Byte-identical to one already
+    /// stored still proves whose it is, and without consulting that the login
+    /// writes a second profile for the same credential.
+    #[test]
+    fn run_from_reuses_a_saved_seat_for_an_identical_opaque_credential() {
+        let (_tmp, paths) = setup_test_env();
+        let opaque = r#"{"access_token":"opaque-not-a-jwt"}"#;
+        std::fs::write(paths.codex_auth_json(), opaque).unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        let mut runner = FakeLoginRunner::new(opaque);
+
+        let saved = run_from(&paths, "typo", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "real",
+            "an identical credential forked a new profile"
+        );
+        assert!(
+            !paths.profiles_dir().join("typo").exists(),
+            "a second profile was created for one credential"
         );
     }
 

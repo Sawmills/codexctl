@@ -723,3 +723,51 @@ fn save_refuses_a_second_alias_for_an_identical_opaque_credential() {
     aliases.sort();
     assert_eq!(aliases, vec!["alias-a"], "one credential was saved twice");
 }
+
+/// Two profiles already holding one credential is a reason to refuse a third,
+/// not a reason to behave as though none held it. A lookup that reports "no
+/// single owner" for both cases loses exactly that distinction.
+#[test]
+fn save_refuses_a_third_alias_for_an_already_duplicated_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    let auth = r#"{"access_token":"opaque-not-a-jwt"}"#;
+    std::fs::write(home.join(".codex").join("auth.json"), auth).unwrap();
+    // Two aliases already hold it, as an older codexctl could leave them.
+    for alias in ["alias-a", "alias-b"] {
+        let dir = home.join(".codexctl").join("profiles").join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"alias":"{alias}","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .args(["save", "alias-c"])
+        .write_stdin("y\n")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("more than one alias"), "{stderr}");
+    assert!(
+        !home
+            .join(".codexctl")
+            .join("profiles")
+            .join("alias-c")
+            .exists(),
+        "a third copy was created"
+    );
+}

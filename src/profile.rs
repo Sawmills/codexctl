@@ -460,6 +460,33 @@ fn identity_of_profile(
     )
 }
 
+/// Which profile holds this exact access token.
+///
+/// Claims are not the only proof of ownership, and an opaque or pre-claims
+/// credential offers no others — so without this a byte-identical token can be
+/// stored under a second alias. Reports ambiguity rather than collapsing it: two
+/// profiles already holding the token is a reason to refuse a third, not a
+/// reason to proceed as though none did.
+pub fn exact_token_seat(paths: &Paths, auth_json: &Path) -> Result<ExistingSeat> {
+    let Ok(target) = api::read_auth_json(auth_json) else {
+        return Ok(ExistingSeat::None);
+    };
+    let holders: Vec<String> = stored_aliases(paths)?
+        .into_iter()
+        .filter(|alias| {
+            store::profile_dir(paths, alias)
+                .ok()
+                .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
+                .is_some_and(|stored| stored.access_token == target.access_token)
+        })
+        .collect();
+    Ok(match holders.len() {
+        0 => ExistingSeat::None,
+        1 => ExistingSeat::One(holders.into_iter().next().expect("one holder")),
+        _ => ExistingSeat::Ambiguous(holders),
+    })
+}
+
 pub fn existing_seat(
     paths: &Paths,
     workspace: Option<&str>,

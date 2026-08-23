@@ -100,15 +100,11 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // saved under a second alias — while being byte-identical to what the first
     // profile holds, which the store already treats as conclusive everywhere
     // else.
-    if let Some(owner) = profile::alias_for_auth_json_from(&paths, &auth_path)
-        .context("could not check which profile holds this credential")?
-        && owner != resolved_alias
-    {
-        anyhow::bail!(
-            "this credential is already saved as '{owner}'. Save to that alias instead: \
-             codexctl save {owner}"
-        );
-    }
+    refuse_a_duplicate_of(
+        &profile::exact_token_seat(&paths, &auth_path)
+            .context("could not check which profile holds this credential")?,
+        &resolved_alias,
+    )?;
 
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
@@ -272,6 +268,14 @@ fn save_verified_snapshot(
         }
         _ => {}
     }
+    // Repeated under the lock for the same reason as the seat check above, and
+    // against the snapshot rather than the live file, since that is what will be
+    // written.
+    refuse_a_duplicate_of(
+        &profile::exact_token_seat(paths, snapshot)
+            .context("could not check which profile holds this credential")?,
+        resolved_alias,
+    )?;
     if store::profile_dir(paths, resolved_alias)?.exists() {
         // Re-run under the lock against the store as it actually stands. An
         // adoption the operator already approved carries over; one that only
@@ -320,6 +324,26 @@ enum Adoption {
     /// has no way to decide. Only the operator can say whether replacing it is
     /// right, so this is a question rather than a refusal.
     AskOperator { stored: Option<String> },
+}
+
+/// Stop a credential already stored elsewhere from being saved again here.
+fn refuse_a_duplicate_of(seat: &profile::ExistingSeat, resolved_alias: &str) -> Result<()> {
+    match seat {
+        profile::ExistingSeat::One(owner) if owner != resolved_alias => anyhow::bail!(
+            "this credential is already saved as '{owner}'. Save to that alias instead: \
+             codexctl save {owner}"
+        ),
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|owner| owner == resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this credential is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The address to keep when the arriving token names none.
