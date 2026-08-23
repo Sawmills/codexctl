@@ -2284,3 +2284,56 @@ fn a_user_id_never_matches_a_subject_by_coincidence() {
     assert!(uid_only.differs(&other_uid));
     assert!(uid_only.same(&uid_only.clone()));
 }
+
+/// One access token recorded under two profiles that declare different
+/// workspaces — which an explicit `account_id` makes possible.
+///
+/// The file's own declaration decides, and it decides positively: the profile
+/// agreeing on both the token and the workspace owns it. A sibling declaring
+/// some *other* workspace does not disqualify that agreement, or a stale
+/// duplicate anywhere in the store would stop a healthy profile receiving its
+/// own rotation — the way an unrelated damaged profile once did.
+///
+/// Fail-closed still applies where it is actually undecided: a file naming no
+/// workspace has nothing to agree with, and resolves to no owner rather than
+/// the lenient match.
+#[test]
+fn an_exact_token_in_two_workspaces_is_owned_by_the_one_it_declares() {
+    let case = |declared: Option<&str>| {
+        let (_tmp, paths) = setup_test_env();
+        let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+        for (alias, workspace) in [("a", "acct-one"), ("b", "acct-two")] {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null,"account_id":"{workspace}","saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let file = paths.home.join("incoming.json");
+        let body = match declared {
+            Some(workspace) => {
+                format!(r#"{{"access_token":"{shared}","account_id":"{workspace}"}}"#)
+            }
+            None => format!(r#"{{"access_token":"{shared}"}}"#),
+        };
+        std::fs::write(&file, body).unwrap();
+        profile::alias_for_auth_json_from(&paths, &file).unwrap()
+    };
+
+    assert_eq!(case(Some("acct-one")).as_deref(), Some("a"));
+    assert_eq!(case(Some("acct-two")).as_deref(), Some("b"));
+    assert_eq!(
+        case(None),
+        None,
+        "a file declaring no workspace picked an owner out of two"
+    );
+}
