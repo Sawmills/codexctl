@@ -842,6 +842,55 @@ fn exec_capture_refuses_a_foreign_workspace_sharing_the_access_token() {
     assert!(kept.contains("acct-pinned"));
 }
 
+/// Two profiles can hold one access token: a legacy one declaring no workspace
+/// and the real owner declaring it. The one that declares it is the stronger
+/// match, and directory order must not hand the credentials to the other.
+#[test]
+fn exact_token_resolution_prefers_the_declared_workspace_over_directory_order() {
+    let (tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    // Sorts first, declares nothing.
+    let legacy = paths.profiles_dir().join("aaa-legacy");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        legacy.join("meta.json"),
+        r#"{"alias":"aaa-legacy","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+    // Sorts later, declares the workspace the target names.
+    let owner = paths.profiles_dir().join("zzz-owner");
+    std::fs::create_dir_all(&owner).unwrap();
+    std::fs::write(
+        owner.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        owner.join("meta.json"),
+        r#"{"alias":"zzz-owner","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(
+        &auth_json,
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json)
+            .unwrap()
+            .as_deref(),
+        Some("zzz-owner")
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

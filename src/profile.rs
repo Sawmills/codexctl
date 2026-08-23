@@ -372,28 +372,28 @@ pub fn conflicting_workspace(
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
 ) -> Option<String> {
-    let dir = store::profile_dir(paths, alias).ok()?;
-    if api::read_auth_json(&dir.join("auth.json")).is_err() {
-        // No readable token: nothing here can be identified, and nothing here
-        // can be used either. An operator whose stored token is corrupt is sent
-        // back to `login` precisely to replace it, so this is a repair rather
-        // than a loss. Every other path treats an unreadable profile as
-        // occupied; this one is the deliberate exception.
-        return None;
-    }
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
     if stored_workspace.is_none() && stored_user.is_none() {
         return None;
     }
-    // This guard gates `login` and `save`, which replace what is stored, so it
-    // requires positive agreement rather than the absence of contradiction.
-    let workspace_ok = claims_agree(incoming_account, stored_workspace.as_deref());
-    // A workspace is shared: two people with seats in one team workspace agree
-    // on it and are still different accounts. The login has to agree as well
-    // before this alias may be written over.
-    let user_ok = claims_agree(incoming_user, stored_user.as_deref());
-    if workspace_ok && user_ok {
+    // This guard gates `login` and `save`, which replace what is stored.
+    //
+    // The workspace has to be settled before anything may be written over it:
+    // the same claim on both sides, or no claim on either. "Stored declares
+    // nothing" is not agreement — one login holds seats in several workspaces,
+    // so a legacy profile that never recorded one cannot confirm that an
+    // arriving workspace is the same account.
+    let workspace_settled = claims_agree(incoming_account, stored_workspace.as_deref());
+    // The login only has to not contradict. A workspace is shared, so a
+    // different login in it is a different account; but a stored login that was
+    // never recorded blocks nothing on its own, which is what keeps a profile
+    // repairable when its token is unreadable and only metadata remains.
+    let user_contradicts = matches!(
+        (incoming_user, stored_user.as_deref()),
+        (Some(incoming), Some(stored)) if incoming != stored
+    );
+    if workspace_settled && !user_contradicts {
         return None;
     }
     Some(
@@ -581,19 +581,50 @@ fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Opt
 /// lane can rotate the file to a different account, so a file that matches
 /// nothing still falls back to a store-wide search.
 /// The profile holding this exact access token, if any.
+/// Choose the owner among profiles holding one access token.
+///
+/// A profile declaring the same workspace is a stronger match than one
+/// declaring none, so directory order must not decide between them — the
+/// weaker match would take the credentials and leave the real owner stale.
+/// Equally strong matches are genuinely ambiguous and get no answer.
+fn strongest_exact_match(
+    target_workspace: Option<&str>,
+    candidates: &[(String, Option<String>)],
+) -> Option<String> {
+    let declared: Vec<&(String, Option<String>)> = candidates
+        .iter()
+        .filter(|(_, workspace)| {
+            target_workspace.is_some() && workspace.as_deref() == target_workspace
+        })
+        .collect();
+    if let [only] = declared.as_slice() {
+        return Some(only.0.clone());
+    }
+    if !declared.is_empty() {
+        return None;
+    }
+    let permitted: Vec<&(String, Option<String>)> = candidates
+        .iter()
+        .filter(|(_, workspace)| workspace_permits(target_workspace, workspace.as_deref()))
+        .collect();
+    if let [only] = permitted.as_slice() {
+        return Some(only.0.clone());
+    }
+    None
+}
+
 fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String> {
     let target = api::read_auth_json(auth_json).ok()?;
-    list_profiles_from(paths)
+    let candidates: Vec<(String, Option<String>)> = list_profiles_from(paths)
         .ok()?
         .into_iter()
-        .find_map(|profile| {
+        .filter_map(|profile| {
             let stored = api::read_auth_json(&profile.auth_json_path()).ok()?;
-            // Token equality is a strong signal but not identity on its own,
-            // so it goes through the same rule as every other attribution.
-            (stored.access_token == target.access_token
-                && workspace_permits(target.account_id.as_deref(), stored.account_id.as_deref()))
-            .then_some(profile.meta.alias)
+            (stored.access_token == target.access_token)
+                .then_some((profile.meta.alias, stored.account_id))
         })
+        .collect();
+    strongest_exact_match(target.account_id.as_deref(), &candidates)
 }
 
 pub fn alias_for_auth_json_with_hint(
@@ -735,15 +766,15 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         profile_auths.push((profile, profile_auth));
     }
 
-    for (profile, profile_auth) in &profile_auths {
-        if profile_auth.access_token == target_auth.access_token
-            && workspace_permits(
-                target_account.as_deref(),
-                profile_auth.account_id.as_deref(),
-            )
-        {
-            return Ok(Some(profile.meta.alias.clone()));
-        }
+    let exact: Vec<(String, Option<String>)> = profile_auths
+        .iter()
+        .filter(|(_, profile_auth)| profile_auth.access_token == target_auth.access_token)
+        .map(|(profile, profile_auth)| {
+            (profile.meta.alias.clone(), profile_auth.account_id.clone())
+        })
+        .collect();
+    if !exact.is_empty() {
+        return Ok(strongest_exact_match(target_account.as_deref(), &exact));
     }
 
     let same_seat: Vec<(String, Option<String>)> = profile_auths
