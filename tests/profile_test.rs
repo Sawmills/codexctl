@@ -929,6 +929,70 @@ fn capture_records_a_workspace_that_appears_without_a_token_change() {
     );
 }
 
+/// One token held by a claimless profile and by a profile declaring another
+/// workspace is demonstrably ambiguous. The claimless one is not the safe
+/// default there — it is simply the one that declares nothing.
+#[test]
+fn exact_token_resolution_refuses_when_a_sibling_declares_another_workspace() {
+    let (tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    for (alias, account) in [("legacy", None), ("other", Some("acct-other"))] {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = match account {
+            Some(account) => format!(r#"{{"access_token":"{shared}","account_id":"{account}"}}"#),
+            None => format!(r#"{{"access_token":"{shared}"}}"#),
+        };
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"alias":"{alias}","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // The live file names a third workspace nobody declared.
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(
+        &auth_json,
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-target"}}"#),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
+/// A save writes `auth.json` before `meta.json`, so an interrupted one leaves a
+/// real seat with no metadata. Reading that as "not saved" is how a second
+/// alias gets created for an account already in the store.
+#[test]
+fn existing_seat_sees_a_profile_left_without_metadata() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(
+        r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    let dir = paths.profiles_dir().join("half-written");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+    // No meta.json: the save stopped between the two writes.
+
+    let seat = profile::existing_seat(&paths, Some("acct-team"), Some("seatA")).unwrap();
+
+    assert!(
+        matches!(seat, profile::ExistingSeat::One(alias) if alias == "half-written"),
+        "an interrupted save was treated as no seat at all"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

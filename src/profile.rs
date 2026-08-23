@@ -295,6 +295,36 @@ fn workspace_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     claim_permits(candidate, stored)
 }
 
+/// Every alias the store holds a directory for.
+///
+/// Deliberately not `list_profiles_from`, which skips a directory with no
+/// `meta.json`: a save writes `auth.json` first, so an interrupted one leaves a
+/// real seat in exactly that shape. Treating it as absent is how a second alias
+/// gets created for an account that is already saved.
+fn stored_aliases(paths: &Paths) -> Result<Vec<String>> {
+    let profiles_dir = paths.profiles_dir();
+    if !profiles_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut aliases = Vec::new();
+    for entry in std::fs::read_dir(&profiles_dir)
+        .with_context(|| format!("failed to read {}", profiles_dir.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if store::validate_alias(&name).is_ok() {
+            aliases.push(name);
+        }
+    }
+    aliases.sort();
+    Ok(aliases)
+}
+
 /// What the store already holds for one account.
 ///
 /// Three outcomes, kept apart on purpose: an `Option` would collapse "nothing
@@ -327,14 +357,12 @@ pub fn existing_seat(
     if workspace.is_none() && user.is_none() {
         return Ok(ExistingSeat::None);
     }
-    let matching: Vec<String> = list_profiles_from(paths)?
+    let matching: Vec<String> = stored_aliases(paths)?
         .into_iter()
-        .filter(|profile| {
-            let alias = profile.meta.alias.as_str();
+        .filter(|alias| {
             workspace_of_profile(paths, alias).as_deref() == workspace
                 && user_of_profile(paths, alias).as_deref() == user
         })
-        .map(|profile| profile.meta.alias)
         .collect();
     Ok(match matching.len() {
         0 => ExistingSeat::None,
@@ -601,6 +629,16 @@ fn strongest_exact_match(
         return Some(only.0.clone());
     }
     if !declared.is_empty() {
+        return None;
+    }
+    // Nothing declares the target's workspace, but if something declares
+    // another one then this token demonstrably spans workspaces. A claimless
+    // sibling has no better claim to it than the contradicting one, so the
+    // answer is ambiguity rather than the lenient match.
+    let contradicted = candidates
+        .iter()
+        .any(|(_, workspace)| workspace.is_some() && workspace.as_deref() != target_workspace);
+    if contradicted {
         return None;
     }
     let permitted: Vec<&(String, Option<String>)> = candidates

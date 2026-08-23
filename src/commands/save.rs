@@ -48,7 +48,9 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     };
 
     let existing = store::profile_dir(&paths, &resolved_alias)?;
-    let mut overwrite_confirmed = false;
+    // What the operator is agreeing to replace, so the approval cannot be
+    // applied to some other credential that lands there while they answer.
+    let mut confirmed_state: Option<Option<String>> = None;
     if existing.exists() {
         refuse_a_different_account(
             &paths,
@@ -67,7 +69,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             println!("aborted");
             return Ok(());
         }
-        overwrite_confirmed = true;
+        confirmed_state = Some(stored_access_token(&existing));
     }
 
     // The lock is taken only now: holding it across the prompt above would
@@ -97,7 +99,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
         &snapshot,
         &auth,
         alias::optional(alias)?.is_some(),
-        overwrite_confirmed,
+        confirmed_state,
     );
     let _ = std::fs::remove_file(&snapshot);
     saved?;
@@ -117,7 +119,7 @@ fn save_verified_snapshot(
     snapshot: &std::path::Path,
     verified: &api::AuthJson,
     alias_was_explicit: bool,
-    overwrite_confirmed: bool,
+    confirmed_state: Option<Option<String>>,
 ) -> Result<()> {
     let live_now = api::read_auth_json(snapshot)?;
     // The workspace can change without the token changing: `auth.json` carries
@@ -139,15 +141,23 @@ fn save_verified_snapshot(
             api::token_login(&live_now.access_token).as_deref(),
             alias_was_explicit,
         )?;
-        // The profile appeared while this command was deciding, so nobody
-        // approved overwriting it. Re-prompting is not an option with the lock
-        // held, so stop and let the operator run the command again against the
-        // store as it now stands.
-        if !overwrite_confirmed {
-            anyhow::bail!(
+        // Re-prompting is not an option with the lock held, so an approval that
+        // no longer describes what is stored is refused instead of reused.
+        let dir = store::profile_dir(paths, resolved_alias)?;
+        match &confirmed_state {
+            // The profile appeared while this command was deciding, so nobody
+            // approved overwriting it.
+            None => anyhow::bail!(
                 "profile '{resolved_alias}' was created by another process while this save was \
                  preparing. Re-run the command to confirm overwriting it."
-            );
+            ),
+            // It was approved, but something replaced its credentials since —
+            // and the approval was for what used to be there.
+            Some(approved) if *approved != stored_access_token(&dir) => anyhow::bail!(
+                "profile '{resolved_alias}' changed while this save was preparing, so the \
+                 confirmation no longer applies to what it holds. Re-run the command."
+            ),
+            Some(_) => {}
         }
     }
     profile::save_profile_and_activate_locked(lock, paths, resolved_alias, email, snapshot)?;
@@ -155,6 +165,15 @@ fn save_verified_snapshot(
         profile::set_label_locked(lock, paths, resolved_alias, Some(label))?;
     }
     Ok(())
+}
+
+/// The access token a profile directory currently holds, if any is readable.
+/// Used only to tell whether the thing an operator approved replacing is still
+/// the thing about to be replaced.
+fn stored_access_token(dir: &std::path::Path) -> Option<String> {
+    api::read_auth_json(&dir.join("auth.json"))
+        .ok()
+        .map(|auth| auth.access_token)
 }
 
 /// Stop before the overwrite prompt when the target profile holds a *different*
