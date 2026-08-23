@@ -119,15 +119,12 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         // is being shown and agreeing to replace. Reading it afterwards would
         // silently adopt whatever landed there while they were deciding.
         let shown = adopt::stored_credentials(&existing);
-        let adoption_kind = match &adoption {
-            Adoption::Unneeded => Adoption::Unneeded,
-            Adoption::AskOperator { stored } => Adoption::AskOperator {
-                stored: stored.clone(),
-            },
-        };
+        // Decided here, once, for whichever way the overwrite goes — leaving it
+        // to one arm of the match below would make the rule the call site's
+        // rather than the rule's, and a later arm could quietly not apply it.
+        keep_email = established_email(&paths, &resolved_alias, &adoption);
         let approved = match adoption {
             Adoption::Unneeded => {
-                keep_email = established_email(&paths, &resolved_alias, &adoption_kind);
                 eprint!(
                     "profile '{}' already exists. Overwrite? [y/N] ",
                     resolved_alias

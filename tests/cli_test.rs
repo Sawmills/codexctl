@@ -605,3 +605,68 @@ fn save_refuses_a_second_alias_for_an_account_it_already_holds() {
         "one account was saved twice under different aliases"
     );
 }
+
+/// End-to-end cover for what `save` writes into `meta.json` when the arriving
+/// token names no address: the profile's established one survives a same-account
+/// save, and never follows an adoption onto a different account.
+///
+/// The `/me` fallback is what makes this case reachable, so the proxy is pointed
+/// at a closed port: the lookup fails at once instead of reaching the real
+/// service, which would make the suite slow and dependent on it.
+#[test]
+fn save_writes_the_right_email_when_the_token_names_none() {
+    use base64::Engine;
+    // Deliberately no profile/email claim — that is the case under test.
+    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+
+    let run = |stored_auth: String, meta: &str, args: &[&str]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            format!(r#"{{"access_token":"{token}"}}"#),
+        )
+        .unwrap();
+        let dir = home.join(".codexctl").join("profiles").join("real");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), stored_auth).unwrap();
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
+        Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", &home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .args(args)
+            .write_stdin("y\n")
+            .output()
+            .unwrap();
+        std::fs::read_to_string(dir.join("meta.json")).unwrap()
+    };
+
+    // Settled as the same account: the established address survives the write.
+    let meta = run(
+        format!(r#"{{"access_token":"{token}"}}"#),
+        r#"{"alias":"real","email":"amir@sawmills.ai","plan":"team","account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
+        &["save", "real"],
+    );
+    assert!(
+        meta.contains("amir@sawmills.ai"),
+        "the established email was erased: {meta}"
+    );
+
+    // Adopted: the previous occupant cannot be shown to be this account, so its
+    // address must not label the arriving credential.
+    let meta = run(
+        "{ not json".to_string(),
+        r#"{"alias":"real","email":"someone-else@example.com","plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        &["save", "real", "--allow-adopt"],
+    );
+    assert!(
+        !meta.contains("someone-else@example.com"),
+        "an adopted account inherited the old occupant's address: {meta}"
+    );
+}
