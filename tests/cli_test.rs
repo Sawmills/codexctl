@@ -645,3 +645,50 @@ fn a_redirect_never_carries_pre_approved_adoption() {
     );
     assert_eq!(damaged, "{ not json", "an unidentified profile was adopted");
 }
+
+/// A redirected save lands on a profile with its own established address. The
+/// write rebuilds metadata, so without carrying that address forward it is
+/// erased from everything `list` and `whoami` show.
+#[test]
+fn a_redirected_save_keeps_the_profile_email() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    // A token with no email claim, so nothing can re-derive the address.
+    use base64::Engine;
+    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    std::fs::write(
+        home.join(".codex").join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+
+    let real = home.join(".codexctl").join("profiles").join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(
+        real.join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        real.join("meta.json"),
+        r#"{"alias":"real","email":"amir@sawmills.ai","plan":"team","account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "typo"])
+        .write_stdin("y\n")
+        .assert()
+        .success();
+
+    let meta = std::fs::read_to_string(real.join("meta.json")).unwrap();
+    assert!(
+        meta.contains("amir@sawmills.ai"),
+        "the redirected save erased the profile's email: {meta}"
+    );
+}

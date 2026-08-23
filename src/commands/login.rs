@@ -296,10 +296,23 @@ fn resolve_target_alias(
             // identify. It is not permission to make a second copy of an
             // account the store can already point to, so a saved seat wins
             // over the question rather than being asked around.
-            if let profile::ExistingSeat::One(existing) = &seat
-                && existing != alias
-            {
-                return Ok(Resolution::Ready(existing.clone()));
+            match &seat {
+                profile::ExistingSeat::One(existing) if existing != alias => {
+                    return Ok(Resolution::Ready(existing.clone()));
+                }
+                // Already saved more than once. Consent to replace an
+                // unidentifiable profile is not consent to add a third copy.
+                profile::ExistingSeat::Ambiguous(aliases) => {
+                    if aliases.iter().any(|existing| existing == alias) {
+                        return Ok(Resolution::Ready(alias.to_string()));
+                    }
+                    bail!(
+                        "this account is already saved under more than one alias ({}). \
+                         Remove the duplicates, or log in with one of them directly.",
+                        aliases.join(", ")
+                    )
+                }
+                _ => {}
             }
             return Ok(Resolution::NeedsConsent {
                 alias: alias.to_string(),
@@ -902,6 +915,53 @@ mod tests {
             std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
             "{ not json",
             "the unidentifiable profile was replaced anyway"
+        );
+    }
+
+    /// Consent to replace a profile nothing can identify is not consent to add
+    /// a third copy of an account already saved twice.
+    #[test]
+    fn adoption_does_not_add_a_third_copy_of_an_ambiguous_account() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        for alias in ["one", "two"] {
+            profile::save_profile_to(&paths, alias, None, &paths.codex_auth_json().clone())
+                .unwrap();
+        }
+        // A third alias holding something nothing can identify.
+        let damaged = paths.profiles_dir().join("damaged");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            damaged.join("meta.json"),
+            r#"{"alias":"damaged","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let error = run_from_with_consent(&paths, "damaged", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias"),
+            "adoption added a third copy: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
+            "{ not json",
+            "the damaged profile was replaced"
         );
     }
 

@@ -73,7 +73,19 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     )
     .context("could not check whether this account is already saved")?
     {
-        profile::ExistingSeat::One(saved) if saved != resolved_alias => saved,
+        profile::ExistingSeat::One(saved) if saved != resolved_alias => {
+            // The redirect writes to a profile the operator did not name, so it
+            // must not undo a newer login that profile already holds.
+            if profile::write_would_regress(&paths, &saved, &auth_path) {
+                anyhow::bail!(
+                    "this account is saved as '{saved}', which holds a newer credential than \
+                     {}. Saving would undo it; switch to '{saved}' and save from there, or \
+                     remove it first.",
+                    auth_path.display()
+                );
+            }
+            saved
+        }
         profile::ExistingSeat::Ambiguous(aliases)
             if !aliases.iter().any(|saved| saved == &resolved_alias) =>
         {
@@ -85,6 +97,16 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         }
         _ => resolved_alias,
     };
+
+    // A redirected save lands on a profile with its own established address.
+    // The token's claim still wins when it has one; this only stops the write
+    // rebuilding metadata with no email at all and erasing what `list` and
+    // `whoami` show.
+    let email = email.or_else(|| {
+        profile::get_profile_from(&paths, &resolved_alias)
+            .ok()
+            .and_then(|existing| existing.meta.email)
+    });
 
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
@@ -476,6 +498,46 @@ mod tests {
         assert!(
             stored(&paths).contains(&token("legacy")),
             "the duplicate was written anyway"
+        );
+    }
+
+    /// A redirect writes to a profile the operator did not name, so it must not
+    /// undo a newer login that profile already holds — the live file can be an
+    /// older copy of a seat a pinned run has since refreshed.
+    #[test]
+    fn write_would_regress_spots_an_older_live_copy() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::from_home(tmp.path().to_path_buf());
+        paths.ensure_dirs().unwrap();
+        let at = |iat: i64, jti: &str| {
+            use base64::Engine;
+            let claims = format!(
+                r#"{{"sub":"seatA","iat":{iat},"exp":{},"jti":"{jti}"}}"#,
+                iat + 3600
+            );
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("{JWT_HDR}.{payload}.sig")
+        };
+        let dir = paths.profiles_dir().join("real");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The profile holds the newer token.
+        std::fs::write(dir.join("auth.json"), auth_bytes(&at(2000, "newer"))).unwrap();
+
+        let older = tmp.path().join("older.json");
+        let mut f = std::fs::File::create(&older).unwrap();
+        f.write_all(auth_bytes(&at(1000, "older")).as_bytes())
+            .unwrap();
+        assert!(
+            profile::write_would_regress(&paths, "real", &older),
+            "an older live copy was not recognised"
+        );
+
+        let newer = tmp.path().join("newer.json");
+        std::fs::write(&newer, auth_bytes(&at(3000, "newest"))).unwrap();
+        assert!(
+            !profile::write_would_regress(&paths, "real", &newer),
+            "a newer credential was refused"
         );
     }
 
