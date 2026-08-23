@@ -15,13 +15,16 @@ trait CodexLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()>;
 
     /// Called once the store lock has been released and the operator is being
-    /// asked to approve replacing a profile.
+    /// asked to approve replacing the profile saved as `pending`.
     ///
     /// Nothing happens here in production; it exists because the window is real
     /// — the lock is down, and another process may write to the store before the
     /// answer arrives — and a guard against that window can only be tested by
-    /// something that can act inside it.
-    fn while_awaiting_approval(&mut self) {}
+    /// something that can act inside it. `pending` is the alias the question
+    /// names, so a test can also check that it is the alias actually written.
+    fn while_awaiting_approval(&mut self, pending: &str) {
+        let _ = pending;
+    }
 }
 
 struct CodexCliLoginRunner;
@@ -135,7 +138,7 @@ fn run_from_with_consent(
                 // without a timeout, so a question left unanswered would stall
                 // every other codexctl process, not just this one.
                 drop(lock);
-                runner.while_awaiting_approval();
+                runner.while_awaiting_approval(&pending);
                 // Either way nothing is saved, and the login has already
                 // happened — so neither outcome is a success.
                 match adopt::approve_adoption(
@@ -430,6 +433,8 @@ mod tests {
         /// Applied while the approval prompt is open, standing in for another
         /// process writing to the store.
         concurrent_write: Option<(PathBuf, String)>,
+        /// The alias the approval question named.
+        asked_about: Option<String>,
     }
 
     impl FakeLoginRunner {
@@ -438,6 +443,7 @@ mod tests {
                 auth_json: auth_json.to_string(),
                 seen_home: None,
                 concurrent_write: None,
+                asked_about: None,
             }
         }
 
@@ -455,7 +461,8 @@ mod tests {
             Ok(())
         }
 
-        fn while_awaiting_approval(&mut self) {
+        fn while_awaiting_approval(&mut self, pending: &str) {
+            self.asked_about = Some(pending.to_string());
             if let Some((path, contents)) = self.concurrent_write.take() {
                 std::fs::write(path, contents).unwrap();
             }
@@ -608,6 +615,64 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// The label path writes to an alias the operator did not type — it is
+    /// derived from the alias and the label together. That is acceptable only
+    /// while the question names the profile that is actually replaced, because
+    /// the announcement is the only thing tying the approval to its object.
+    /// Pin the two together so a refactor cannot let them drift apart.
+    #[test]
+    fn the_approval_names_the_profile_that_gets_written() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The derived alias holds a profile whose token cannot be read, so the
+        // login lands on the consent path rather than a plain write.
+        let dir = paths.profiles_dir().join("amir@sawmills.ai+team");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"access_token":"opaque-not-a-jwt"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"amir@sawmills.ai+team","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let saved =
+            run_from_with_consent(&paths, "amir@sawmills.ai", Some("team"), true, &mut runner)
+                .unwrap();
+
+        assert_eq!(
+            runner.asked_about.as_deref(),
+            Some(saved.as_str()),
+            "the approval named a different profile than the one written"
+        );
+        assert_eq!(saved, "amir@sawmills.ai+team");
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains(&incoming),
+            "the approved login did not land on the alias it named"
+        );
     }
 
     /// A derived alias whose workspace is known but whose login is not does not
