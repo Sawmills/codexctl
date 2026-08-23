@@ -1161,6 +1161,43 @@ fn exact_token_shortcut_honours_a_metadata_only_workspace() {
     );
 }
 
+/// Adding a second workspace for one login creates a declared sibling. If that
+/// happens before the outgoing credential is captured, the outgoing token —
+/// claimless, rotated, and the only copy — looks ownerless and is lost when the
+/// new profile is installed over the live file.
+#[test]
+fn saving_a_sibling_workspace_captures_the_outgoing_rotation_first() {
+    let (_tmp, paths) = setup_test_env();
+    // Active legacy profile: same login, no workspace claim.
+    let stored = synthetic_token(r#"{"sub":"seatA","jti":"stored"}"#);
+    write_profile(&paths, "personal", &stored);
+    profile::set_active_from(&paths, "personal").unwrap();
+
+    // Its live token rotated, still claimless — this is the only copy.
+    let rotated = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{rotated}"}}"#),
+    )
+    .unwrap();
+
+    // Now save a second workspace for the same login from an isolated home.
+    let incoming = synthetic_token(
+        r#"{"sub":"seatA","jti":"team","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    let login_home = paths.home.join("login-auth.json");
+    std::fs::write(&login_home, format!(r#"{{"access_token":"{incoming}"}}"#)).unwrap();
+
+    profile::save_profile_and_activate_to(&paths, "team", None, &login_home).unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("personal").join("auth.json"))
+            .unwrap()
+            .contains(&rotated),
+        "the outgoing rotation was lost when the sibling workspace was added"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

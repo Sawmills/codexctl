@@ -162,14 +162,23 @@ pub fn save_profile_and_activate_locked(
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let live_auth = paths.codex_auth_json();
+
+    if auth_json_src != live_auth {
+        // Capture protects the *outgoing* profile's rotated tokens, and it runs
+        // before the incoming profile is written. Saving first would add a
+        // same-login sibling that declares a workspace, which is exactly what
+        // makes a claimless outgoing token look ownerless — capture would then
+        // decline it and the install below would destroy the only copy.
+        //
+        // The alias being written is excluded outright rather than by inferring
+        // ownership: an unreadable or absent stored token must not be able to
+        // route the stale live file back over this login.
+        capture_auth_file_profile_tokens(paths, &live_auth, Some(alias));
+    }
+
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
 
     if auth_json_src != live_auth {
-        // Capture protects the *outgoing* profile's rotated tokens. The alias
-        // being written is never outgoing, so it is excluded outright rather
-        // than by inferring ownership — an unreadable or absent stored token
-        // must not be able to route the stale live file back over this login.
-        capture_auth_file_profile_tokens(paths, &live_auth, Some(alias));
         let saved_auth = store::profile_dir(paths, alias)?.join("auth.json");
         store::atomic_copy(&saved_auth, &live_auth)
             .with_context(|| format!("failed to install {}", live_auth.display()))?;
