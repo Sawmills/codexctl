@@ -449,15 +449,23 @@ pub fn conflicting_workspace(
     incoming_user: Option<&str>,
 ) -> Option<AccountConflict> {
     let dir = store::profile_dir(paths, alias).ok()?;
+    // No profile here at all. There is no occupant to identify, protect, or ask
+    // about — this is a first login to a free alias.
+    if !dir.exists() {
+        return None;
+    }
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
     let stored_auth_readable = api::read_auth_json(&dir.join("auth.json")).is_ok();
     if stored_workspace.is_none() && stored_user.is_none() && !stored_auth_readable {
-        // Nothing identifiable *and* nothing usable: this is the profile an
-        // operator is sent back to `login` to repair, so replacing it loses
-        // nothing. A readable token that merely names nobody is intact, and
-        // overwriting it needs the same proof as any other profile.
-        return None;
+        // A profile that exists but cannot be identified *or* used. Replacing it
+        // plausibly loses nothing, but that judgement rests on `read_auth_json`
+        // having failed — so a future parser regression would silently reclassify
+        // every metadata-less legacy profile as free to overwrite, across exactly
+        // the population this upgrade exists to migrate. Ask instead: it costs one
+        // answer in the rarest case, and a parser bug then widens the questions
+        // rather than the permissions.
+        return Some(AccountConflict::Unprovable(None));
     }
     // This guard gates `login` and `save`, which replace what is stored.
     //
@@ -475,6 +483,14 @@ pub fn conflicting_workspace(
     // anyone who names one. The only profile safe to replace on no evidence is
     // one with no identity at all, and that case has already returned above —
     // reaching here means this profile still has something worth protecting.
+    // Neither side naming a login is settlement, not a question — deliberately.
+    // A matching workspace with both sides silent is two pre-`chatgpt_user_id`
+    // tokens, and asking about them would not help: adopting records no login
+    // either, so the same question would return on every refresh. A prompt that
+    // its own answer cannot satisfy is noise rather than consent, and a matching
+    // workspace with nothing contradicting it is the strongest evidence such a
+    // token can offer. Two seats in one workspace behind tokens that old are the
+    // residual exposure; a token carrying the claim closes it permanently.
     let user_contradicts = match (incoming_user, stored_user.as_deref()) {
         (Some(incoming), Some(stored)) => incoming != stored,
         (Some(_), None) => true,
@@ -497,8 +513,17 @@ pub fn conflicting_workspace(
     );
     let described = stored_workspace.clone().or_else(|| stored_user.clone());
     if workspace_differs || user_differs {
+        // Describe the claim that actually disagrees. Preferring the workspace
+        // unconditionally makes a same-workspace login conflict report "stored
+        // workspace W, incoming W" — two identical values offered as the reason
+        // they differ.
+        let culprit = if workspace_differs {
+            described
+        } else {
+            stored_user.clone().or(described)
+        };
         return Some(AccountConflict::Different(
-            described.unwrap_or_else(|| "unknown".to_string()),
+            culprit.unwrap_or_else(|| "unknown".to_string()),
         ));
     }
     Some(AccountConflict::Unprovable(described))

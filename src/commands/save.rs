@@ -9,6 +9,17 @@ use crate::store;
 use std::io::IsTerminal;
 
 pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Result<()> {
+    // Consent has to name what it consents to. Without an alias, `save` derives
+    // one from the token's email claim, so the flag would pre-approve replacing
+    // whichever profile that resolves to — and one login can hold seats in
+    // several workspaces behind a single address. The operator would be
+    // approving a target they never saw.
+    if allow_adopt && alias.is_none() {
+        anyhow::bail!(
+            "--allow-adopt replaces a saved profile, so name the one you are approving: \
+             codexctl save <alias> --allow-adopt"
+        );
+    }
     // Reject a bad label before the save switches the live auth file. Failing
     // afterwards would leave the active account changed under an error exit.
     label.map(store::validate_label).transpose()?;

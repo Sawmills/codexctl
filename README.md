@@ -354,7 +354,10 @@ error: profile 'amir@sawmills.ai' does not record which account it holds, so
 
 `--allow-adopt` settles only what the store could not work out. It has no
 effect on a conflict the store *did* work out: a stored workspace that
-positively differs from the arriving one stays refused with or without it.
+positively differs from the arriving one stays refused with or without it. It
+also has to name its target — `codexctl save --allow-adopt` without an alias is
+refused, because `save` would otherwise derive the alias from the token's email
+claim and the flag would approve replacing a profile the operator never saw.
 
 Two habits of a pre-release store change as a result.
 
@@ -371,7 +374,11 @@ again.
 workspace, but the stored login cannot be read, so nothing proves the arriving
 credential is its owner. This asks the same question. Answering `y` replaces it
 in place — which is what `remove` followed by a fresh login would do anyway,
-except that `remove` first destroys the metadata describing what was there.
+except that `remove` first destroys the metadata describing what was there. A
+profile with nothing left at all — no readable token and no recorded account —
+is asked about too, rather than quietly replaced: that verdict rests on the
+token having failed to parse, and a future parser change must widen the
+questions rather than the permissions.
 
 ## Shell completions
 

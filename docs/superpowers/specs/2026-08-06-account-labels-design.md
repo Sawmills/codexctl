@@ -192,10 +192,14 @@ billing and to banked resets: prompt on a terminal, refuse without one unless `-
 the operator already decided. Approval settles only what could not be worked out; it has no effect
 on a conflict that was.
 
-One case still needs no approval: a profile with **no readable token and no recorded account**.
-Nothing there can be identified or used, so there is no occupant to consult the operator about and
-an explicit re-login simply repairs it. A damaged profile that still records its workspace does have
-an occupant, and is asked about like any other.
+One case is settled rather than asked about, deliberately: a workspace that matches with **neither
+side naming a login**. Both tokens predate `chatgpt_user_id`, and adopting would record no login
+either — so the question would return on every refresh, and a prompt its own answer cannot satisfy is
+noise rather than consent. A matching workspace with nothing contradicting it is the strongest
+evidence such a token can offer. Two seats in one workspace behind tokens that old are the residual
+exposure, and a token carrying the claim closes it permanently.
+
+A profile with **no readable token and no recorded account** is asked about like any other.
 
 ```
 $ codexctl login amir@sawmills.ai

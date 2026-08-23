@@ -518,3 +518,27 @@ fn save_without_a_terminal_fails_rather_than_reporting_success() {
         "the approved save did not land"
     );
 }
+
+/// `--allow-adopt` approves replacing a profile. Without an alias, `save`
+/// derives one from the token's email claim, so the flag would consent to
+/// whatever that resolves to — a target the operator never named. One login can
+/// hold seats in several workspaces behind one address, so that is the same
+/// hazard the prompt exists to prevent, re-entered through the flag.
+#[test]
+fn save_requires_an_explicit_alias_to_pre_approve_adoption() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .args(["save", "--allow-adopt"])
+        .write_stdin("")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("name the one you are approving"),
+        "{stderr}"
+    );
+}

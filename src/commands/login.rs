@@ -1623,30 +1623,61 @@ mod tests {
 
     /// A profile with nothing left to identify it — no readable token and no
     /// recorded account — is the one an operator is sent back to `login` to
-    /// repair, and that still works.
+    /// repair. It is still repairable, but it is asked about rather than
+    /// silently replaced: "nothing identifiable" is a conclusion drawn from the
+    /// token failing to parse, and a parser regression must widen the questions
+    /// rather than the permissions.
     #[test]
-    fn run_from_repairs_a_profile_with_no_identity_at_all() {
-        let (_tmp, paths) = setup_test_env();
-        let dir = paths.profiles_dir().join("broken");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("auth.json"), "{ not json").unwrap();
-        std::fs::write(
-            dir.join("meta.json"),
-            r#"{"alias":"broken","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
-        )
-        .unwrap();
-
+    fn run_from_repairs_a_profile_with_no_identity_at_all_once_approved() {
+        let broken = |paths: &Paths| {
+            let dir = paths.profiles_dir().join("broken");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("auth.json"), "{ not json").unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                r#"{"alias":"broken","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+            )
+            .unwrap();
+            dir
+        };
         let fresh = synthetic_token("acct-team");
-        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{fresh}"}}"#));
+        let auth = format!(r#"{{"access_token":"{fresh}"}}"#);
 
-        run_from(&paths, "broken", None, &mut runner).unwrap();
+        let (_tmp, paths) = setup_test_env();
+        let dir = broken(&paths);
+        let mut runner = FakeLoginRunner::new(&auth);
+        let error = run_from(&paths, "broken", None, &mut runner).unwrap_err();
+        assert!(error.to_string().contains("--allow-adopt"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "{ not json",
+            "a profile was replaced without approval"
+        );
 
+        let (_tmp, paths) = setup_test_env();
+        let dir = broken(&paths);
+        let mut runner = FakeLoginRunner::new(&auth);
+        run_from_with_consent(&paths, "broken", None, true, &mut runner).unwrap();
         assert!(
             std::fs::read_to_string(dir.join("auth.json"))
                 .unwrap()
                 .contains(&fresh),
             "an unidentifiable profile could not be repaired"
         );
+    }
+
+    /// The exception above must not swallow the ordinary case: an alias with no
+    /// profile directory has no occupant to ask about, so a first login to a
+    /// free alias is never a question.
+    #[test]
+    fn run_from_does_not_ask_about_an_alias_with_no_profile() {
+        let (_tmp, paths) = setup_test_env();
+        let fresh = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{fresh}"}}"#));
+
+        let saved = run_from(&paths, "brand-new", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "brand-new");
     }
 
     /// A bad label must cost nothing. Failing after the device-auth flow would

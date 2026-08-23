@@ -798,10 +798,13 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
         profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("sub:seatA")),
         Some(profile::AccountConflict::Different(stored)) if stored == "acct-new"
     ));
-    // A different login in the workspace actually stored is refused too.
+    // A different login in the workspace actually stored is refused too — and
+    // the refusal names the login, since that is the claim that disagrees.
+    // Naming the workspace here would report "stored acct-new, incoming
+    // acct-new" as the reason the two differ.
     assert!(matches!(
         profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatB")),
-        Some(profile::AccountConflict::Different(stored)) if stored == "acct-new"
+        Some(profile::AccountConflict::Different(stored)) if stored == "sub:seatA"
     ));
 }
 
