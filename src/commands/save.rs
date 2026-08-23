@@ -80,8 +80,8 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         // whether the approval they gave covers it. Naming the alias answers
         // all of that at once, and the error says which alias to name.
         profile::ExistingSeat::One(saved) if saved != resolved_alias => anyhow::bail!(
-            "this account is already saved as '{saved}'. Save to that alias instead: \
-             codexctl save {saved}"
+            "this account is already saved as '{saved}'. Save to that alias instead: {}",
+            save_command_for(&saved)
         ),
         profile::ExistingSeat::Ambiguous(aliases)
             if !aliases.iter().any(|saved| saved == &resolved_alias) =>
@@ -326,12 +326,35 @@ enum Adoption {
     AskOperator { stored: Option<String> },
 }
 
+/// A `codexctl save` command the operator can actually paste.
+///
+/// `validate_alias` accepts spaces and shell metacharacters, and these messages
+/// name an alias the operator never typed — it was found in the store. Inserting
+/// it raw turns `team account` into two arguments, an alias containing shell
+/// syntax into something else entirely, and one starting with `-` into a flag.
+fn save_command_for(alias: &str) -> String {
+    let plain = !alias.is_empty()
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@' | '+'));
+    let quoted = if plain {
+        alias.to_string()
+    } else {
+        format!("'{}'", alias.replace('\'', r"'\''"))
+    };
+    if alias.starts_with('-') {
+        format!("codexctl save -- {quoted}")
+    } else {
+        format!("codexctl save {quoted}")
+    }
+}
+
 /// Stop a credential already stored elsewhere from being saved again here.
 fn refuse_a_duplicate_of(seat: &profile::ExistingSeat, resolved_alias: &str) -> Result<()> {
     match seat {
         profile::ExistingSeat::One(owner) if owner != resolved_alias => anyhow::bail!(
-            "this credential is already saved as '{owner}'. Save to that alias instead: \
-             codexctl save {owner}"
+            "this credential is already saved as '{owner}'. Save to that alias instead: {}",
+            save_command_for(owner)
         ),
         profile::ExistingSeat::Ambiguous(aliases)
             if !aliases.iter().any(|owner| owner == resolved_alias) =>
@@ -574,6 +597,23 @@ mod tests {
             None,
             "an adopted account inherited the old occupant's address"
         );
+    }
+
+    /// The alias in these messages came from the store, not from the operator,
+    /// and `validate_alias` accepts spaces, shell syntax and a leading dash.
+    #[test]
+    fn a_suggested_save_command_can_be_pasted() {
+        assert_eq!(
+            save_command_for("amir@sawmills.ai"),
+            "codexctl save amir@sawmills.ai"
+        );
+        assert_eq!(
+            save_command_for("team account"),
+            "codexctl save 'team account'"
+        );
+        assert_eq!(save_command_for("a;rm -rf b"), "codexctl save 'a;rm -rf b'");
+        assert_eq!(save_command_for("it's"), r"codexctl save 'it'\''s'");
+        assert_eq!(save_command_for("-weird"), "codexctl save -- -weird");
     }
 
     /// The operator approved replacing one credential. Another process replaced
