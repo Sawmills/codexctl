@@ -101,13 +101,20 @@ fn run_from_with_consent(
         // token, so the target alias is resolved here rather than up front.
         // Workspace and login together: a team workspace is shared, so it
         // does not by itself say whose credentials these are.
-        let incoming_identity = api::read_auth_json(&auth_path).ok();
-        let incoming = incoming_identity
-            .as_ref()
-            .and_then(|a| a.account_id.clone());
-        let incoming_user = incoming_identity
-            .as_ref()
-            .and_then(|a| api::token_login(&a.access_token));
+        //
+        // A file that will not parse is a failed login, not a login by an
+        // account that happens to declare nothing. Read as the latter, its empty
+        // identity would agree with any profile that also declares nothing, and
+        // the broken file would be copied over that profile and made active —
+        // destroying a working credential and the live one together.
+        let incoming_identity = api::read_auth_json(&auth_path).with_context(|| {
+            format!(
+                "codex login wrote credentials that cannot be read at {}",
+                auth_path.display()
+            )
+        })?;
+        let incoming = incoming_identity.account_id.clone();
+        let incoming_user = api::token_login(&incoming_identity.access_token);
         // Resolve and write under one lock. Which alias this login lands on is
         // read out of the store, so releasing the lock in between would let a
         // concurrent login change the answer before the write lands.
@@ -615,6 +622,59 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A login that produced an unreadable `auth.json` is a failed login, not a
+    /// login by an account that declares nothing. Read as the latter, its empty
+    /// identity agrees with any profile that also declares nothing — so the
+    /// broken file would be copied over a working legacy profile and made the
+    /// active credential, destroying both.
+    #[test]
+    fn run_from_refuses_a_login_whose_auth_file_cannot_be_read() {
+        let (_tmp, paths) = setup_test_env();
+        // A readable legacy credential: a subject, no workspace.
+        let legacy = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{legacy}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The login writes a file that cannot be parsed.
+        let mut runner = FakeLoginRunner::new("{ not json");
+
+        let error =
+            run_from_with_consent(&paths, "amir@sawmills.ai", None, true, &mut runner).unwrap_err();
+
+        let reported = format!("{error:#}");
+        assert!(
+            reported.contains("cannot be read") && reported.contains("failed to parse"),
+            "the unreadable login was not reported: {reported}"
+        );
+        assert!(
+            std::fs::read_to_string(
+                paths
+                    .profiles_dir()
+                    .join("amir@sawmills.ai")
+                    .join("auth.json"),
+            )
+            .unwrap()
+            .contains(legacy),
+            "a working profile was replaced with an unreadable credential"
+        );
+        assert!(
+            std::fs::read_to_string(paths.codex_auth_json())
+                .unwrap()
+                .contains(legacy),
+            "the live credential was replaced with an unreadable one"
+        );
     }
 
     /// The label path writes to an alias the operator did not type — it is
