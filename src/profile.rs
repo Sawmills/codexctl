@@ -639,8 +639,39 @@ fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Opt
     if !captured_auth_supersedes_profile(exec_auth, &dest) {
         return;
     }
+    let proven_workspace = workspace_of_profile(paths, &alias);
     if let Err(error) = store::atomic_copy(exec_auth, &dest) {
         eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
+        return;
+    }
+    // The captured file may carry no workspace claim while the profile had
+    // proven one. Losing it with the copy would erase the only ownership
+    // evidence a profile written before the metadata field has, and leave every
+    // later rotation unattributable — so it is kept in metadata instead.
+    if let Some(workspace) = proven_workspace
+        && workspace_of_profile(paths, &alias).is_none()
+    {
+        record_workspace(paths, &alias, &workspace);
+    }
+}
+
+/// Persist a workspace the profile has already proven, without touching its
+/// credentials.
+fn record_workspace(paths: &Paths, alias: &str, workspace: &str) {
+    let Ok(dir) = store::profile_dir(paths, alias) else {
+        return;
+    };
+    let meta_path = dir.join("meta.json");
+    let Some(mut meta) = read_meta(&meta_path) else {
+        return;
+    };
+    meta.alias = alias.to_string();
+    meta.account_id = Some(workspace.to_string());
+    let Ok(json) = serde_json::to_vec_pretty(&meta) else {
+        return;
+    };
+    if let Err(error) = store::atomic_write(&meta_path, &json) {
+        eprintln!("warning: failed to record the workspace for profile '{alias}': {error}");
     }
 }
 
@@ -962,20 +993,26 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     };
     let target_sub = api::token_subject(&target_auth.access_token);
     let target_account = target_auth.account_id.clone();
+    // Enumerated from the store's directories: `list_profiles_from` skips a
+    // profile with no `meta.json`, and an interrupted save leaves a real one in
+    // that shape whose claim still belongs in this decision.
     let mut profile_auths = Vec::new();
-    for profile in list_profiles_from(paths)? {
-        let Ok(profile_auth) = api::read_auth_json(&profile.auth_json_path()) else {
+    for alias in stored_aliases(paths)? {
+        let Ok(dir) = store::profile_dir(paths, &alias) else {
             continue;
         };
-        profile_auths.push((profile, profile_auth));
+        let Ok(profile_auth) = api::read_auth_json(&dir.join("auth.json")) else {
+            continue;
+        };
+        profile_auths.push((alias, profile_auth));
     }
 
     let exact: Vec<(String, Option<String>)> = profile_auths
         .iter()
         .filter(|(_, profile_auth)| profile_auth.access_token == target_auth.access_token)
-        .map(|(profile, _)| {
-            let workspace = workspace_of_profile(paths, &profile.meta.alias);
-            (profile.meta.alias.clone(), workspace)
+        .map(|(alias, _)| {
+            let workspace = workspace_of_profile(paths, alias);
+            (alias.clone(), workspace)
         })
         .collect();
     if !exact.is_empty() {
@@ -984,11 +1021,11 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
 
     let same_seat: Vec<(String, Option<String>)> = profile_auths
         .into_iter()
-        .filter_map(|(profile, profile_auth)| {
+        .filter_map(|(alias, profile_auth)| {
             let profile_sub = api::token_subject(&profile_auth.access_token);
             (target_sub.is_some() && target_sub == profile_sub).then_some({
-                let workspace = workspace_of_profile(paths, &profile.meta.alias);
-                (profile.meta.alias, workspace)
+                let workspace = workspace_of_profile(paths, &alias);
+                (alias, workspace)
             })
         })
         .collect();

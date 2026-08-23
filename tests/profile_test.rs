@@ -1442,6 +1442,86 @@ fn active_profile_defers_to_a_stronger_exact_token_sibling() {
     );
 }
 
+/// A refresh-only rotation whose file omits the workspace still captures — but
+/// the profile's proven workspace has to survive it, or a pre-0.1.22 profile
+/// loses its only ownership evidence and later rotations become unattributable.
+#[test]
+fn capture_keeps_the_workspace_through_a_claimless_refresh_rotation() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(r#"{"sub":"seatA","jti":"stable"}"#);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}","refresh_token":"old","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same access token, rotated refresh, and no workspace claim in the file.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{token}","refresh_token":"new"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "team").unwrap();
+
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("new"),
+        "the refresh rotation was not captured"
+    );
+    assert_eq!(
+        profile::workspace_of_profile(&paths, "team").as_deref(),
+        Some("acct-team"),
+        "the profile's proven workspace was lost with the copy"
+    );
+}
+
+/// The rotated-token pass must see interrupted profiles too: a half-written
+/// sibling declaring a workspace makes a claimless rotation ambiguous rather
+/// than leaving the visible profile as its sole owner.
+#[test]
+fn rotated_token_resolution_sees_a_profile_left_without_metadata() {
+    let (tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy",
+        &synthetic_token(r#"{"sub":"seatA","jti":"legacy"}"#),
+    );
+    // Half-written sibling on the same login, declaring a workspace.
+    let dir = paths.profiles_dir().join("half-written");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(
+            r#"{{"access_token":"{}"}}"#,
+            synthetic_token(
+                r#"{"sub":"seatA","jti":"team","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#
+            )
+        ),
+    )
+    .unwrap();
+
+    // A claimless rotation on that login.
+    let live = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None,
+        "an interrupted sibling was ignored, making an ambiguous token look owned"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
