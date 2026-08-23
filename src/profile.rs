@@ -284,7 +284,7 @@ pub fn workspace_of_profile(paths: &Paths, alias: &str) -> Option<String> {
 fn claim_permits(candidate: Option<&str>, stored: Option<&str>) -> bool {
     match (candidate, stored) {
         (Some(candidate), Some(stored)) => candidate == stored,
-        (None, Some(_)) => false,
+        (None, Some(_)) => true,
         (Some(_), None) | (None, None) => true,
     }
 }
@@ -452,7 +452,11 @@ pub fn conflicting_workspace(
     let user_contradicts = match (incoming_user, stored_user.as_deref()) {
         (Some(incoming), Some(stored)) => incoming != stored,
         (Some(_), None) => stored_auth_readable,
-        _ => false,
+        // The arriving token names no login at all. A workspace is shared, so
+        // agreeing on it proves nothing about whose credentials these are, and
+        // the profile does name someone.
+        (None, Some(_)) => false,
+        (None, None) => false,
     };
     if workspace_settled && !user_contradicts {
         return None;
@@ -766,8 +770,14 @@ pub fn alias_for_auth_json_with_hint(
     }
     if let Some(profile) = hinted
         && auth_belongs_to_profile(paths, auth_json, &profile)
-        && !claimless_match_is_ambiguous(paths, auth_json, &profile)
     {
+        // Undecided means no owner. Falling through to the store-wide resolver
+        // would undo this: it enumerates through `list_profiles_from`, which
+        // skips the very half-written and unreadable profiles that made this
+        // ambiguous, and could then rediscover the hint as a lone candidate.
+        if claimless_match_is_ambiguous(paths, auth_json, &profile) {
+            return None;
+        }
         return Some(profile.meta.alias);
     }
     alias_for_auth_json_from(paths, auth_json).ok().flatten()

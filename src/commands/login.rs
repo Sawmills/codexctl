@@ -715,6 +715,34 @@ mod tests {
         );
     }
 
+    /// A token that names no login at all cannot prove ownership by agreeing on
+    /// the workspace: workspaces are shared, and the profile does name someone.
+    #[test]
+    fn run_from_refuses_a_login_with_no_identity_against_a_named_profile() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-team");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // Same workspace declared in the file, but the token names nobody.
+        let mut runner =
+            FakeLoginRunner::new(r#"{"access_token":"opaque-not-a-jwt","account_id":"acct-team"}"#);
+
+        let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json")).unwrap();
+        assert!(kept.contains(&stored), "stored credentials were replaced");
+    }
+
     /// A team workspace holds many people. Two colleagues therefore agree on
     /// `chatgpt_account_id` and are still different accounts, so the workspace
     /// alone cannot say whose credentials an alias holds.
