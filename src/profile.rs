@@ -474,10 +474,20 @@ pub fn exact_token_seat(paths: &Paths, auth_json: &Path) -> Result<ExistingSeat>
     let holders: Vec<String> = stored_aliases(paths)?
         .into_iter()
         .filter(|alias| {
-            store::profile_dir(paths, alias)
+            let holds = store::profile_dir(paths, alias)
                 .ok()
                 .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
-                .is_some_and(|stored| stored.access_token == target.access_token)
+                .is_some_and(|stored| stored.access_token == target.access_token);
+            // Holding the token is not the whole answer. One access token can
+            // name two workspaces through an explicit `account_id`, so a holder
+            // declaring a different one is a different account — and redirecting
+            // there would overwrite it with credentials for another workspace.
+            // The same rule `strongest_exact_match` applies to attribution.
+            holds
+                && !workspace_contradicts(
+                    target.account_id.as_deref(),
+                    workspace_of_profile(paths, alias).as_deref(),
+                )
         })
         .collect();
     Ok(match holders.len() {

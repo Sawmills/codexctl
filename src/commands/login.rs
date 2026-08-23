@@ -1103,6 +1103,48 @@ mod tests {
         );
     }
 
+    /// One access token can name two workspaces through an explicit
+    /// `account_id`. A holder declaring a different one is a different account,
+    /// so redirecting there would overwrite it with another workspace's
+    /// credentials — the opposite of what the reuse rule is for.
+    #[test]
+    fn an_identical_token_in_another_workspace_is_not_the_same_seat() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        // The saved profile holds this token for workspace A.
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{shared}","account_id":"acct-a"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "workspace-a",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The login returns the same token, declaring workspace B.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-b"}}"#
+        ));
+
+        let saved = run_from(&paths, "workspace-b", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "workspace-b",
+            "a second workspace was folded into the first"
+        );
+        let kept =
+            std::fs::read_to_string(paths.profiles_dir().join("workspace-a").join("auth.json"))
+                .unwrap();
+        assert!(
+            kept.contains("acct-a"),
+            "the first workspace's profile was overwritten: {kept}"
+        );
+    }
+
     /// The label path writes to an alias the operator did not type — it is
     /// derived from the alias and the label together. That is acceptable only
     /// while the question names the profile that is actually replaced, because
