@@ -666,6 +666,17 @@ fn strongest_exact_match(
     target_workspace: Option<&str>,
     candidates: &[(String, Option<String>)],
 ) -> Option<String> {
+    if let [only] = candidates {
+        // An identical access token is the same credential, so a lone holder of
+        // it owns the file. Only a workspace both sides declare *differently*
+        // disqualifies it — a claim on one side alone is what lets a profile
+        // record its own workspace, or receive its own refresh rotation.
+        let mismatch = matches!(
+            (target_workspace, only.1.as_deref()),
+            (Some(target), Some(stored)) if target != stored
+        );
+        return (!mismatch).then(|| only.0.clone());
+    }
     let declared: Vec<&(String, Option<String>)> = candidates
         .iter()
         .filter(|(_, workspace)| {
@@ -698,7 +709,12 @@ fn strongest_exact_match(
     None
 }
 
-fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String> {
+/// The profiles holding this exact access token, with the target's own
+/// workspace, so callers can weigh them rather than take the first that fits.
+fn exact_token_candidates(
+    paths: &Paths,
+    auth_json: &Path,
+) -> Option<(Option<String>, Vec<(String, Option<String>)>)> {
     let target = api::read_auth_json(auth_json).ok()?;
     let candidates: Vec<(String, Option<String>)> = list_profiles_from(paths)
         .ok()?
@@ -711,7 +727,7 @@ fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String>
             })
         })
         .collect();
-    strongest_exact_match(target.account_id.as_deref(), &candidates)
+    Some((target.account_id, candidates))
 }
 
 /// Whether a subject-only match on a claimless pair is really undecided.
@@ -767,16 +783,32 @@ pub fn alias_for_auth_json_with_hint(
     known_alias: Option<&str>,
 ) -> Option<String> {
     let hinted = known_alias.and_then(|alias| get_profile_from(paths, alias).ok());
-    // The named alias holding this very token is the strongest confirmation the
-    // hint can get. It outranks the store-wide scan, which would otherwise let
-    // directory order pick between two aliases saved from the same login.
+    // Every profile holding this exact token is weighed first: one that declares
+    // the target's workspace is a stronger owner than the hinted alias, and the
+    // hint must not outrank evidence.
+    let exact = exact_token_candidates(paths, auth_json);
+    if let Some((target_workspace, candidates)) = &exact
+        && let Some(alias) = strongest_exact_match(target_workspace.as_deref(), candidates)
+    {
+        return Some(alias);
+    }
+    // Exact matching was undecided. The hint settles it only when the hinted
+    // profile is itself one of those equally strong candidates — that is the
+    // duplicate-alias case it exists for.
     if let Some(profile) = &hinted
-        && auth_has_profile_access_token(paths, auth_json, profile)
+        && let Some((target_workspace, candidates)) = &exact
+        && candidates.iter().any(|(alias, workspace)| {
+            // Only among candidates the evidence left standing: a profile whose
+            // workspace positively differs is disqualified, and naming it is not
+            // a tie-break but an override.
+            alias == &profile.meta.alias
+                && !matches!(
+                    (target_workspace.as_deref(), workspace.as_deref()),
+                    (Some(target), Some(stored)) if target != stored
+                )
+        })
     {
         return Some(profile.meta.alias.clone());
-    }
-    if let Some(alias) = alias_for_exact_token_from(paths, auth_json) {
-        return Some(alias);
     }
     if let Some(profile) = hinted
         && auth_belongs_to_profile(paths, auth_json, &profile)
@@ -856,23 +888,6 @@ pub fn auth_json_path_for_profile_from(
     } else {
         profile.auth_json_path()
     }
-}
-
-fn auth_has_profile_access_token(paths: &Paths, auth_json: &Path, profile: &Profile) -> bool {
-    let (Ok(left), Ok(stored)) = (
-        api::read_auth_json(auth_json),
-        api::read_auth_json(&profile.auth_json_path()),
-    ) else {
-        return false;
-    };
-    // Against the profile's *effective* workspace, metadata included: a stored
-    // token with no claim does not make the profile anonymous, and this
-    // shortcut runs before the fuller ownership check gets a say.
-    left.access_token == stored.access_token
-        && workspace_permits(
-            left.account_id.as_deref(),
-            workspace_of_profile(paths, &profile.meta.alias).as_deref(),
-        )
 }
 
 fn auth_belongs_to_profile(paths: &Paths, auth_json: &Path, profile: &Profile) -> bool {

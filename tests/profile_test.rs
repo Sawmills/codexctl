@@ -1202,6 +1202,95 @@ fn saving_a_sibling_workspace_captures_the_outgoing_rotation_first() {
     );
 }
 
+/// The hint must not outrank evidence: when another profile holds the same
+/// access token *and* declares the arriving workspace, it is the stronger
+/// owner even though the caller named a different alias.
+#[test]
+fn hint_does_not_outrank_a_stronger_exact_token_owner() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    for (alias, account) in [("legacy", None), ("team", Some("acct-team"))] {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = match account {
+            Some(account) => format!(r#"{{"access_token":"{shared}","account_id":"{account}"}}"#),
+            None => format!(r#"{{"access_token":"{shared}"}}"#),
+        };
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"alias":"{alias}","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // Same token, declaring the team workspace, with a rotated refresh token.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(
+            r#"{{"access_token":"{shared}","refresh_token":"rotated","account_id":"acct-team"}}"#
+        ),
+    )
+    .unwrap();
+
+    // The caller names the legacy profile; the declared one is stronger.
+    profile::capture_exec_auth_from(&paths, &exec_auth, "legacy").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("legacy").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "the hint took a credential belonging to a stronger owner"
+    );
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "the declared owner did not receive its rotation"
+    );
+}
+
+/// A lone holder of an exact access token owns it even when only the profile
+/// declares a workspace — otherwise a refresh-only rotation is discarded and
+/// the profile keeps stale credentials.
+#[test]
+fn a_sole_exact_token_owner_receives_a_claimless_rotation() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same token, refresh rotated, and this file declares no workspace.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{shared}","refresh_token":"rotated"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "team").unwrap();
+
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "a sole exact-token owner lost its refresh rotation"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
