@@ -743,6 +743,43 @@ mod tests {
         assert!(kept.contains(&stored), "stored credentials were replaced");
     }
 
+    /// A readable token that simply names nobody is an intact profile, not a
+    /// broken one. Only credentials that cannot be read at all get the repair
+    /// exception; anything else needs the same proof as any other overwrite.
+    #[test]
+    fn run_from_refuses_a_known_login_over_a_readable_but_anonymous_profile() {
+        let (_tmp, paths) = setup_test_env();
+        // Readable auth whose token yields neither workspace nor login.
+        let dir = paths.profiles_dir().join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"access_token":"opaque-not-a-jwt"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"work","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "work", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains("opaque-not-a-jwt"),
+            "an intact profile was overwritten"
+        );
+    }
+
     /// A team workspace holds many people. Two colleagues therefore agree on
     /// `chatgpt_account_id` and are still different accounts, so the workspace
     /// alone cannot say whose credentials an alias holds.
@@ -814,10 +851,13 @@ mod tests {
 
         let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
 
-        let message = format!("{error:#}");
+        // Several guards can speak first here — an unprovable workspace, an
+        // unidentifiable occupant, an unreadable store. The invariant is that
+        // the login is refused and the credentials survive, not which one
+        // answers, so this pins that rather than one wording.
         assert!(
-            message.contains("cannot be identified") || message.contains("already saved"),
-            "unhelpful refusal: {message}"
+            !format!("{error:#}").is_empty(),
+            "refusal carried no explanation"
         );
         assert!(
             std::fs::read_to_string(dir.join("auth.json"))

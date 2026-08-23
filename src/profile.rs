@@ -438,7 +438,12 @@ pub fn conflicting_workspace(
     let dir = store::profile_dir(paths, alias).ok()?;
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
-    if stored_workspace.is_none() && stored_user.is_none() {
+    let stored_auth_readable = api::read_auth_json(&dir.join("auth.json")).is_ok();
+    if stored_workspace.is_none() && stored_user.is_none() && !stored_auth_readable {
+        // Nothing identifiable *and* nothing usable: this is the profile an
+        // operator is sent back to `login` to repair, so replacing it loses
+        // nothing. A readable token that merely names nobody is intact, and
+        // overwriting it needs the same proof as any other profile.
         return None;
     }
     // This guard gates `login` and `save`, which replace what is stored.
@@ -458,7 +463,6 @@ pub fn conflicting_workspace(
     // back to `login` to repair the profile. A *readable* token that yields no
     // login is different: the profile is intact, its owner is simply unproven,
     // and a workspace does not identify its owner.
-    let stored_auth_readable = api::read_auth_json(&dir.join("auth.json")).is_ok();
     let user_contradicts = match (incoming_user, stored_user.as_deref()) {
         (Some(incoming), Some(stored)) => incoming != stored,
         (Some(_), None) => stored_auth_readable,
@@ -1039,8 +1043,18 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
             // look like the sole owner of a credential this one may hold, so an
             // identified one makes the decision undecidable instead.
             let meta = read_meta(&dir.join("meta.json")).unwrap_or_default();
-            let identifies = (meta.user_id.is_some() && meta.user_id == target_login)
-                || (meta.account_id.is_some() && meta.account_id == target_account);
+            // A field that positively disagrees rules the profile out, whatever
+            // the other one says: a damaged profile for another login in the
+            // same workspace is not a candidate, and letting it block would
+            // discard a rotation belonging to the healthy profile that is.
+            let contradicts =
+                (meta.user_id.is_some() && target_login.is_some() && meta.user_id != target_login)
+                    || (meta.account_id.is_some()
+                        && target_account.is_some()
+                        && meta.account_id != target_account);
+            let identifies = !contradicts
+                && ((meta.user_id.is_some() && meta.user_id == target_login)
+                    || (meta.account_id.is_some() && meta.account_id == target_account));
             if identifies {
                 return Ok(None);
             }
