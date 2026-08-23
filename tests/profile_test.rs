@@ -1648,6 +1648,72 @@ fn capture_replaces_stale_metadata_with_the_proven_workspace() {
     );
 }
 
+/// An interrupted save leaves credentials with no metadata. That profile's
+/// workspace lives only in its stored token, so a claimless capture must write
+/// the evidence out before replacing the file that carries it.
+#[test]
+fn capture_preserves_a_workspace_for_a_profile_with_no_metadata() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(
+        r#"{"sub":"seatA","jti":"stable","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    let dir = paths.profiles_dir().join("half-written");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}","refresh_token":"old"}}"#),
+    )
+    .unwrap();
+    // No meta.json at all.
+
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{token}","refresh_token":"new"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "half-written").unwrap();
+
+    assert_eq!(
+        profile::workspace_of_profile(&paths, "half-written").as_deref(),
+        Some("acct-team"),
+        "the workspace was lost with the file that carried it"
+    );
+}
+
+/// A profile whose credentials are unreadable can still be identified by its
+/// metadata. Dropping it from the vote would let a readable sibling look like
+/// the sole owner of a credential this one may hold.
+#[test]
+fn resolution_stops_when_an_unreadable_profile_still_identifies_the_seat() {
+    let (tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy",
+        &synthetic_token(r#"{"sub":"seatA","jti":"legacy"}"#),
+    );
+    // Damaged credentials, but metadata names this login.
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("auth.json"), "{ truncated").unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"account_id":"acct-team","user_id":"seatA","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let live = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None,
+        "a damaged but identified profile was dropped from the decision"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

@@ -651,44 +651,48 @@ fn capture_into_owner(paths: &Paths, source: &Path, alias: &str) {
     if !captured_auth_supersedes_profile(source, &dest) {
         return;
     }
+    // The incoming file may carry no workspace claim while the profile has
+    // proven one. That evidence is written to metadata *before* the copy: once
+    // the auth file is replaced it is gone, and a preservation failure
+    // afterwards would leave the profile unattributable. It also corrects
+    // metadata naming an older workspace, which an interrupted save can leave.
     let proven_workspace = workspace_of_profile(paths, alias);
+    if let Some(workspace) = &proven_workspace {
+        let incoming = api::read_auth_json(source)
+            .ok()
+            .and_then(|auth| auth.account_id);
+        if incoming.as_deref() != Some(workspace.as_str())
+            && let Err(error) = record_workspace(paths, alias, workspace)
+        {
+            eprintln!(
+                "warning: not capturing tokens for profile '{alias}': \
+                 its workspace could not be preserved first: {error}"
+            );
+            return;
+        }
+    }
     if let Err(error) = store::atomic_copy(source, &dest) {
         eprintln!("warning: failed to capture tokens for profile '{alias}': {error}");
-        return;
-    }
-    // The captured file may carry no workspace claim while the profile had
-    // proven one. Losing it with the copy would erase the only ownership
-    // evidence a profile written before the metadata field has, and leave every
-    // later rotation unattributable — so it is kept in metadata instead.
-    if let Some(workspace) = proven_workspace
-        && workspace_of_profile(paths, alias).as_deref() != Some(workspace.as_str())
-    {
-        // Not only when the lookup comes back empty: an interrupted save can
-        // leave metadata naming an older workspace, and after the copy that
-        // stale name would answer for the profile — misidentifying it and
-        // refusing the re-login that would repair it.
-        record_workspace(paths, alias, &workspace);
     }
 }
 
 /// Persist a workspace the profile has already proven, without touching its
 /// credentials.
-fn record_workspace(paths: &Paths, alias: &str, workspace: &str) {
-    let Ok(dir) = store::profile_dir(paths, alias) else {
-        return;
-    };
+///
+/// Metadata is written even when there is none to read: an interrupted save
+/// leaves a profile with credentials and no `meta.json`, and that is exactly
+/// the profile whose only workspace evidence a capture is about to replace.
+fn record_workspace(paths: &Paths, alias: &str, workspace: &str) -> Result<()> {
+    let dir = store::profile_dir(paths, alias)?;
     let meta_path = dir.join("meta.json");
-    let Some(mut meta) = read_meta(&meta_path) else {
-        return;
-    };
+    let mut meta = read_meta(&meta_path).unwrap_or_default();
     meta.alias = alias.to_string();
     meta.account_id = Some(workspace.to_string());
-    let Ok(json) = serde_json::to_vec_pretty(&meta) else {
-        return;
-    };
-    if let Err(error) = store::atomic_write(&meta_path, &json) {
-        eprintln!("warning: failed to record the workspace for profile '{alias}': {error}");
+    if meta.saved_at.is_empty() {
+        meta.saved_at = chrono::Utc::now().to_rfc3339();
     }
+    let json = serde_json::to_vec_pretty(&meta)?;
+    store::atomic_write(&meta_path, &json)
 }
 
 /// Which saved profile an auth file belongs to, given the alias the caller
@@ -1023,12 +1027,23 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     // Enumerated from the store's directories: `list_profiles_from` skips a
     // profile with no `meta.json`, and an interrupted save leaves a real one in
     // that shape whose claim still belongs in this decision.
+    let target_login = api::token_login(&target_auth.access_token);
     let mut profile_auths = Vec::new();
     for alias in stored_aliases(paths)? {
         let Ok(dir) = store::profile_dir(paths, &alias) else {
             continue;
         };
         let Ok(profile_auth) = api::read_auth_json(&dir.join("auth.json")) else {
+            // Unreadable credentials, but metadata may still identify the seat.
+            // Dropping such a profile from the vote would let a readable sibling
+            // look like the sole owner of a credential this one may hold, so an
+            // identified one makes the decision undecidable instead.
+            let meta = read_meta(&dir.join("meta.json")).unwrap_or_default();
+            let identifies = (meta.user_id.is_some() && meta.user_id == target_login)
+                || (meta.account_id.is_some() && meta.account_id == target_account);
+            if identifies {
+                return Ok(None);
+            }
             continue;
         };
         profile_auths.push((alias, profile_auth));
