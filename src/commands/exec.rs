@@ -221,6 +221,7 @@ mod tests {
             email: None,
             plan: None,
             saved_at: "2026-01-01T00:00:00Z".to_string(),
+            ..Default::default()
         };
         std::fs::write(
             dir.join("meta.json"),

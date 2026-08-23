@@ -23,6 +23,9 @@ enum CreditsStatus {
 
 struct RateLimitedAccount {
     alias: String,
+    /// Operator-set display name. Present only when they set one, which is what
+    /// keeps the column out of a table that has nothing to put in it.
+    label: Option<String>,
     limits: Vec<LimitStatus>,
     token_expiry: Option<i64>,
     /// Banked rate-limit resets held by this account.
@@ -116,6 +119,7 @@ fn positional_window_label(position: usize) -> &'static str {
 
 struct UsageBasedAccount {
     alias: String,
+    label: Option<String>,
     credit_balance: Option<String>,
     seat_limit_cents: Option<u64>,
     credits_status: CreditsStatus,
@@ -298,6 +302,7 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
 
 struct RateLimitColumns {
     named_limits: bool,
+    labeled: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -390,12 +395,18 @@ impl RateLimitColumns {
         }
         Self {
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
+            // An error row still carries its label, so consider every account
+            // here rather than only the healthy ones.
+            labeled: accounts.iter().any(|account| account.label.is_some()),
             windows,
         }
     }
 
     fn headers(&self) -> Vec<String> {
         let mut headers = vec!["Account".to_string()];
+        if self.labeled {
+            headers.push("Label".to_string());
+        }
         if self.named_limits {
             headers.push("Limit".to_string());
         }
@@ -416,14 +427,37 @@ fn print_usage_based_table(title: &str, accounts: &[&UsageBasedAccount]) -> bool
     println!("{title}");
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
-    table.set_header(vec![
-        "Account", "Balance", "Seat", "Credits", "Spend", "Token",
-    ]);
+    let headers = usage_based_headers(accounts);
+    let labeled = headers.get(1).is_some_and(|header| header == "Label");
+    table.set_header(headers);
     for account in accounts {
-        table.add_row(render_usage_based_row(account));
+        table.add_row(render_usage_based_row(account, labeled));
     }
     println!("{table}");
     true
+}
+
+fn usage_based_headers(accounts: &[&UsageBasedAccount]) -> Vec<String> {
+    let mut headers = vec!["Account".to_string()];
+    if accounts.iter().any(|account| account.label.is_some()) {
+        headers.push("Label".to_string());
+    }
+    headers.extend(
+        ["Balance", "Seat", "Credits", "Spend", "Token"]
+            .into_iter()
+            .map(str::to_string),
+    );
+    headers
+}
+
+/// Cyan marks the cell that answers "which account is this". It is the same
+/// treatment the active marker gets, and no other cell here is colored unless
+/// its color carries a severity.
+fn label_cell(label: Option<&str>) -> Cell {
+    match label {
+        Some(label) => Cell::new(label).fg(Color::Cyan),
+        None => Cell::new("-"),
+    }
 }
 
 fn is_usage_based_plan(plan: &str) -> bool {
@@ -443,6 +477,7 @@ async fn fetch_and_split(
         .map(|p| {
             let client = client.clone();
             let alias = p.meta.alias.clone();
+            let label = p.meta.label.clone();
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active.as_deref());
@@ -456,7 +491,7 @@ async fn fetch_and_split(
                     ),
                     Err(_) => None,
                 };
-                (alias, plan_from_meta, is_active, auth, usage_result)
+                (alias, label, plan_from_meta, is_active, auth, usage_result)
             }
         })
         .collect();
@@ -471,7 +506,7 @@ async fn fetch_and_split(
     // read, so the common case stays at one request per profile.
     let mut rl_needing_credits: Vec<(usize, String, Option<String>)> = Vec::new();
 
-    for (alias, plan_from_meta, is_active, auth, usage_result) in &results {
+    for (alias, label, plan_from_meta, is_active, auth, usage_result) in &results {
         let account_id = auth.as_ref().ok().and_then(|a| a.account_id.clone());
         let auth = match auth {
             Ok(a) => a,
@@ -480,6 +515,7 @@ async fn fetch_and_split(
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
+                        label: label.clone(),
                         credit_balance: None,
                         seat_limit_cents: None,
                         credits_status: CreditsStatus::None,
@@ -492,6 +528,7 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
+                        label: label.clone(),
                         limits: vec![LimitStatus::unavailable()],
                         token_expiry: None,
                         reset_credits: 0,
@@ -520,6 +557,7 @@ async fn fetch_and_split(
                 if is_ub {
                     usage_based.push(UsageBasedAccount {
                         alias: alias.clone(),
+                        label: label.clone(),
                         credit_balance: None,
                         seat_limit_cents: None,
                         credits_status: CreditsStatus::None,
@@ -532,6 +570,7 @@ async fn fetch_and_split(
                 } else {
                     rate_limited.push(RateLimitedAccount {
                         alias: alias.clone(),
+                        label: label.clone(),
                         limits: vec![LimitStatus::unavailable()],
                         token_expiry,
                         reset_credits: 0,
@@ -567,6 +606,7 @@ async fn fetch_and_split(
             let idx = usage_based.len();
             usage_based.push(UsageBasedAccount {
                 alias: alias.clone(),
+                label: label.clone(),
                 credit_balance,
                 seat_limit_cents: None,
                 credits_status,
@@ -588,6 +628,7 @@ async fn fetch_and_split(
             let idx = rate_limited.len();
             rate_limited.push(RateLimitedAccount {
                 alias: alias.clone(),
+                label: label.clone(),
                 limits: rate_limit_statuses(usage),
                 token_expiry,
                 reset_credits: usage.reset_credits_available(),
@@ -719,6 +760,9 @@ fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
 fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColumns) -> Vec<Cell> {
     if account.is_error {
         let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
+        if columns.labeled {
+            row.push(label_cell(account.label.as_deref()));
+        }
         if columns.named_limits {
             row.push(Cell::new("-"));
         }
@@ -731,6 +775,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
     }
 
     let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
+    if columns.labeled {
+        row.push(label_cell(account.label.as_deref()));
+    }
     if columns.named_limits {
         row.push(Cell::new(
             account
@@ -795,18 +842,22 @@ fn resets_cell(s: &RateLimitedAccount) -> Cell {
     }
 }
 
-fn render_usage_based_row(s: &UsageBasedAccount) -> Vec<Cell> {
+fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool) -> Vec<Cell> {
     let alias = display_alias(&s.alias, s.is_active);
+    let mut row = vec![Cell::new(alias)];
+    if labeled {
+        row.push(label_cell(s.label.as_deref()));
+    }
 
     if s.is_error {
-        return vec![
-            Cell::new(alias),
+        row.extend([
             Cell::new("-"),
             Cell::new("-"),
             Cell::new("-"),
             Cell::new("-"),
             token_cell(s.token_expiry, true, &s.error_msg),
-        ];
+        ]);
+        return row;
     }
 
     let balance_str = s
@@ -833,14 +884,14 @@ fn render_usage_based_row(s: &UsageBasedAccount) -> Vec<Cell> {
         ("ok", Color::Green)
     };
 
-    vec![
-        Cell::new(alias),
+    row.extend([
         Cell::new(&balance_str),
         Cell::new(&seat_limit_str),
         Cell::new(credits_str).fg(credits_color),
         Cell::new(spend_str).fg(spend_color),
         token_cell(s.token_expiry, false, &s.error_msg),
-    ]
+    ]);
+    row
 }
 
 /// The "Token" column: how long the stored access token is good for without a
@@ -980,6 +1031,7 @@ mod tests {
     fn rate_limited_account() -> RateLimitedAccount {
         RateLimitedAccount {
             alias: "amir+8@sawmills.ai".to_string(),
+            label: None,
             limits: vec![LimitStatus {
                 name: "Codex".to_string(),
                 windows: vec![
@@ -1015,6 +1067,60 @@ mod tests {
         let row = render_rate_limited_row(&account, &columns);
         assert_eq!(columns.headers().len(), 7);
         assert_eq!(row.len(), 7);
+    }
+
+    /// A store with no labels must render exactly the table it rendered before
+    /// labels existed — no new column full of dashes.
+    #[test]
+    fn rate_limited_table_gains_a_label_column_only_when_labels_exist() {
+        let bare = rate_limited_account();
+        let columns = RateLimitColumns::for_accounts(&[&bare]);
+        assert!(!columns.headers().contains(&"Label".to_string()));
+
+        let labeled = RateLimitedAccount {
+            label: Some("team".to_string()),
+            ..rate_limited_account()
+        };
+        let columns = RateLimitColumns::for_accounts(&[&labeled]);
+        let row = render_rate_limited_row(&labeled, &columns);
+
+        assert_eq!(columns.headers()[1], "Label");
+        assert_eq!(row[1].content(), "team");
+        assert_eq!(row.len(), columns.headers().len());
+    }
+
+    /// The error row must stay aligned once the label column appears.
+    #[test]
+    fn rate_limited_error_row_keeps_its_width_with_labels() {
+        let labeled = RateLimitedAccount {
+            label: Some("team".to_string()),
+            ..rate_limited_account()
+        };
+        let errored = RateLimitedAccount {
+            is_error: true,
+            error_msg: "expired".to_string(),
+            label: Some("personal".to_string()),
+            ..rate_limited_account()
+        };
+
+        let columns = RateLimitColumns::for_accounts(&[&labeled, &errored]);
+
+        assert_eq!(
+            render_rate_limited_row(&errored, &columns).len(),
+            columns.headers().len()
+        );
+    }
+
+    #[test]
+    fn usage_based_table_gains_a_label_column_only_when_labels_exist() {
+        let bare = usage_based_account(None);
+        assert!(!usage_based_headers(&[&bare]).contains(&"Label".to_string()));
+
+        let labeled = usage_based_account(Some("team"));
+        let headers = usage_based_headers(&[&labeled]);
+
+        assert_eq!(headers[1], "Label");
+        assert_eq!(render_usage_based_row(&labeled, true).len(), headers.len());
     }
 
     /// The error row must line up with the normal row or the table breaks.
@@ -1466,10 +1572,10 @@ mod tests {
         assert_eq!(resets_cell(&account).content(), "3");
     }
 
-    #[test]
-    fn render_usage_based_row_has_expected_column_count() {
-        let account = UsageBasedAccount {
+    fn usage_based_account(label: Option<&str>) -> UsageBasedAccount {
+        UsageBasedAccount {
             alias: "amir+11@sawmills.ai".to_string(),
+            label: label.map(str::to_string),
             credit_balance: Some("10.00".to_string()),
             seat_limit_cents: Some(2000),
             credits_status: CreditsStatus::Ok,
@@ -1478,8 +1584,13 @@ mod tests {
             is_active: false,
             is_error: false,
             error_msg: String::new(),
-        };
+        }
+    }
 
-        assert_eq!(render_usage_based_row(&account).len(), 6);
+    #[test]
+    fn render_usage_based_row_has_expected_column_count() {
+        let account = usage_based_account(None);
+
+        assert_eq!(render_usage_based_row(&account, false).len(), 6);
     }
 }

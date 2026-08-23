@@ -256,16 +256,129 @@ redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 ### Other commands
 
 ```bash
-codexctl list          # list saved profiles
-codexctl login <alias> # isolated Codex login and save
-codexctl whoami        # show active account
-codexctl codex -- ...  # run Codex with spend-cap recovery
+codexctl list                 # list saved profiles
+codexctl login <alias>        # isolated Codex login and save
+codexctl whoami               # show active account
+codexctl label <alias> [text] # name an account (omit text to clear)
+codexctl codex -- ...         # run Codex with spend-cap recovery
 codexctl exec --account <alias> -- <command>  # pinned, non-mutating launch
-codexctl resets        # list banked rate-limit resets
-codexctl reset [alias] # redeem a banked reset
+codexctl resets               # list banked rate-limit resets
+codexctl reset [alias]        # redeem a banked reset
 codexctl remove <alias>
-codexctl --version     # installed version
+codexctl --version            # installed version
 ```
+
+## Two accounts on one email
+
+A personal account and a workspace seat can share one address, so the email
+cannot tell them apart. Give each profile its own alias and a label:
+
+```bash
+codexctl login --label personal amir-personal
+codexctl login --label team     amir-team
+```
+
+Or keep using the address and let the label separate the seats. When the alias
+you asked for already holds a _different_ account, the label qualifies it
+instead of overwriting:
+
+```bash
+codexctl login amir@sawmills.ai --label personal   # saves 'amir@sawmills.ai'
+codexctl login amir@sawmills.ai --label team       # saves 'amir@sawmills.ai+team'
+```
+
+Logging the same seat in again refreshes whichever alias it already occupies,
+so this is stable across re-logins. Without `--label` there is nothing to
+qualify with, and a login onto an alias held by another account is refused
+rather than allowed to replace its credentials.
+
+`--label` also works on `codexctl save`, and `codexctl label <alias> [text]`
+sets or clears one later.
+
+```
+$ codexctl list
+┌──────────────────┬──────────┬──────────┬──────────────────┬────────┐
+│ Account          ┆ Label    ┆ Plan     ┆ Email            ┆ Active │
+╞══════════════════╪══════════╪══════════╪══════════════════╪════════╡
+│ amir-personal    ┆ personal ┆ pro      ┆ amir@sawmills.ai ┆        │
+│ amir-team        ┆ team     ┆ business ┆ amir@sawmills.ai ┆ *      │
+└──────────────────┴──────────┴──────────┴──────────────────┴────────┘
+```
+
+The label is display text. The alias stays the only selector for `use`,
+`remove`, and `reset`; `codexctl switch` also matches the label as you type.
+The `Label` column appears in `list` and `status` only once some profile has
+one.
+
+`codexctl save` without an alias defaults to the detected email. When that
+profile already holds a _different_ workspace, the save is refused rather than
+offering an overwrite prompt that would replace the other account's tokens:
+
+```
+$ codexctl save
+error: profile 'amir@sawmills.ai' holds a different account
+       (stored workspace 033569a0…, incoming 6df34c28…).
+       Pass an explicit alias: codexctl save <alias>
+```
+
+## Upgrading an existing store
+
+An account is identified by its workspace and its login together — neither
+alone, because a workspace holds many people and one login holds seats in many
+workspaces. Profiles saved before this release recorded neither, so `codexctl`
+reads them out of the stored token and remembers what it finds.
+
+Two credentials that positively disagree are never the same account, and
+`codexctl` refuses to overwrite one with the other. A profile that declares
+_nothing_ is a different situation: the store cannot tell whether the account
+arriving is the one it holds, but the operator who just logged in can. Those
+cases ask rather than refuse — on a terminal with a prompt, and elsewhere with
+`--allow-adopt`, the same shape `use` applies to billing and to banked resets.
+
+```
+$ codexctl login amir@sawmills.ai
+codexctl: profile 'amir@sawmills.ai' does not record which account it holds,
+          so this login cannot be matched to it. this login is 6df34c28….
+          Replace it? Its saved credentials are overwritten. [y/N]
+```
+
+Answering `y` records the workspace, so the profile can answer for itself and
+the question is not asked again. Declining changes nothing. Without a terminal
+the answer defaults to no:
+
+```
+error: profile 'amir@sawmills.ai' does not record which account it holds, so
+       replacing it needs approval and none was given. Re-run on a terminal to
+       confirm, pass --allow-adopt, or choose another alias.
+```
+
+`--allow-adopt` settles only what the store could not work out. It has no
+effect on a conflict the store _did_ work out: a stored workspace that
+positively differs from the arriving one stays refused with or without it. It
+also has to name its target — `codexctl save --allow-adopt` without an alias is
+refused, because `save` would otherwise derive the alias from the token's email
+claim and the flag would approve replacing a profile the operator never saw.
+
+Two habits of a pre-release store change as a result.
+
+**A claimless profile stops absorbing rotations that name a workspace.** Codex
+refreshes tokens in place, and `codexctl` folds those back into the profile
+that owns them. A profile whose stored token declares no workspace no longer
+receives a rotation that declares one — that token may belong to another seat
+of the same login. The profile keeps working; its stored copy goes stale, and
+`status` shows the token ageing. `codexctl save` or a re-login brings it
+forward and records the workspace, after which rotations are captured normally
+again.
+
+**A profile whose token no longer parses.** Its metadata may still record the
+workspace, but the stored login cannot be read, so nothing proves the arriving
+credential is its owner. This asks the same question. Answering `y` replaces it
+in place — which is what `remove` followed by a fresh login would do anyway,
+except that `remove` first destroys the metadata describing what was there. A
+profile with nothing left at all — no readable token and no recorded account —
+is asked about too, rather than quietly replaced: that verdict rests on the
+token having failed to parse, and a future parser change must widen the
+questions rather than the permissions.
 
 ## Shell completions
 

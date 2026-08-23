@@ -9,7 +9,13 @@ pub fn run() -> Result<()> {
             let p = profile::get_profile(&alias)?;
             let email = p.meta.email.as_deref().unwrap_or("-");
             let plan = p.meta.plan.as_deref().unwrap_or("-");
-            println!("{} ({}) [{}]", alias, email, plan);
+            let label = p
+                .meta
+                .label
+                .as_deref()
+                .map(|label| format!(" — {label}"))
+                .unwrap_or_default();
+            println!("{alias}{label} ({email}) [{plan}]");
         }
         None => {
             println!("no active profile. Use 'codexctl save' or 'codexctl use <alias>'.");

@@ -46,6 +46,11 @@ pub struct RateLimitResponse {
     pub credits: Option<Credits>,
     pub spend_control: Option<SpendControl>,
     /// Extra feature or model buckets returned alongside the main Codex limit.
+    ///
+    /// Some plans send an explicit `null` here instead of omitting the key or
+    /// sending `[]`. `serde(default)` only covers a missing key, so the null
+    /// has to be absorbed too — otherwise the whole response fails to parse and
+    /// the account renders as an unexplained error.
     #[serde(default, deserialize_with = "deserialize_null_vec")]
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
@@ -627,14 +632,147 @@ fn decode_jwt_payload(token: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const PROFILE_CLAIM: &str = "https://api.openai.com/profile";
+
+/// What a Codex access token asserts about the account behind it.
+///
+/// Every field is read from the token's own claims, so resolving an identity
+/// needs no network call and still works once the token has expired — which is
+/// precisely when a profile most needs to stay identifiable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TokenIdentity {
+    pub email: Option<String>,
+    pub name: Option<String>,
+    /// `chatgpt_account_id`: the workspace. Two profiles for one login differ here.
+    pub account_id: Option<String>,
+    /// `chatgpt_user_id`: the login. Two seats for one human share this.
+    pub user_id: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// Read the identity claims out of an access token. `None` only when the token
+/// is not a decodable JWT; a decodable token missing every claim yields an
+/// empty identity so callers keep a single code path.
+pub fn token_identity(token: &str) -> Option<TokenIdentity> {
+    let value = decode_jwt_payload(token)?;
+    let profile = value.get(PROFILE_CLAIM);
+    let auth = value.get(AUTH_CLAIM);
+    Some(TokenIdentity {
+        email: string_claim(profile, "email"),
+        name: string_claim(profile, "name"),
+        account_id: string_claim(auth, "chatgpt_account_id")
+            .or_else(|| string_claim(auth, "account_id")),
+        user_id: string_claim(auth, "chatgpt_user_id"),
+        plan: string_claim(auth, "chatgpt_plan_type"),
+    })
+}
+
+fn string_claim(object: Option<&serde_json::Value>, key: &str) -> Option<String> {
+    object?.get(key)?.as_str().map(str::to_string)
+}
+
 /// Extract account_id from JWT access_token claims when auth.json does not store it directly.
 pub fn extract_account_id(token: &str) -> Option<String> {
-    let value = decode_jwt_payload(token)?;
-    let auth = value.get("https://api.openai.com/auth")?;
-    auth.get("chatgpt_account_id")
-        .or_else(|| auth.get("account_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+    token_identity(token)?.account_id
+}
+
+/// Who a token belongs to, for deciding whether two credentials are the same
+/// account.
+///
+/// `chatgpt_user_id` names the login when the token carries it. `sub` is the
+/// same fact by another name and every token has one, so it is the fallback —
+/// without it two seats in one workspace both resolve to "unknown" and an
+/// ownership guard reads that as agreement.
+pub fn token_login(token: &str) -> Option<String> {
+    token_logins(token).canonical()
+}
+
+/// Every login claim a token makes, kept apart by the claim it came from.
+///
+/// Both are retained rather than one chosen, because a token gaining
+/// `chatgpt_user_id` is the ordinary legacy-to-current transition: the same seat
+/// keeps its `sub` and adds a `uid`. Collapsing to a single preferred claim
+/// makes the before and after look like two different people, which breaks the
+/// one migration this design exists to serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Logins {
+    /// From `chatgpt_user_id`.
+    pub uid: Option<String>,
+    /// From the JWT subject.
+    pub sub: Option<String>,
+}
+
+impl Logins {
+    pub fn is_empty(&self) -> bool {
+        self.uid.is_none() && self.sub.is_none()
+    }
+
+    /// The identifier to record or show, tagged with where it came from so the
+    /// two namespaces never read as one value.
+    pub fn canonical(&self) -> Option<String> {
+        if let Some(uid) = &self.uid {
+            return Some(format!("uid:{uid}"));
+        }
+        self.sub.as_ref().map(|sub| format!("sub:{sub}"))
+    }
+
+    /// The claim both sides make, if there is one. Comparison only ever happens
+    /// inside a single namespace — `uid:X` and `sub:X` are unrelated facts that
+    /// happen to share a string, and must never match by coincidence.
+    fn shared<'a>(&'a self, other: &'a Logins) -> Option<(&'a str, &'a str)> {
+        if let (Some(mine), Some(theirs)) = (&self.uid, &other.uid) {
+            return Some((mine, theirs));
+        }
+        match (&self.sub, &other.sub) {
+            (Some(mine), Some(theirs)) => Some((mine, theirs)),
+            _ => None,
+        }
+    }
+
+    /// Whether these two make claims that can be weighed against each other at
+    /// all. Without a shared namespace neither confirms nor denies the other,
+    /// and a caller that reads silence as a rival claim will block on profiles
+    /// that say nothing about the token in hand.
+    pub fn comparable(&self, other: &Logins) -> bool {
+        self.shared(other).is_some()
+    }
+
+    /// Positive proof of the same login.
+    pub fn same(&self, other: &Logins) -> bool {
+        self.shared(other)
+            .is_some_and(|(mine, theirs)| mine == theirs)
+    }
+
+    /// Positive proof of a different login. Sharing no namespace proves
+    /// nothing, so it is neither the same nor different — the caller decides
+    /// what to do about not knowing.
+    pub fn differs(&self, other: &Logins) -> bool {
+        self.shared(other)
+            .is_some_and(|(mine, theirs)| mine != theirs)
+    }
+}
+
+/// Every login claim a token makes.
+pub fn token_logins(token: &str) -> Logins {
+    Logins {
+        uid: token_identity(token).and_then(|identity| identity.user_id),
+        sub: token_subject(token),
+    }
+}
+
+/// The same tag for a `chatgpt_user_id` already recorded in metadata.
+pub fn recorded_login(user_id: &str) -> String {
+    format!("uid:{user_id}")
+}
+
+/// What metadata alone can say about the login: a recorded `chatgpt_user_id`
+/// and nothing else, since no subject is stored.
+pub fn recorded_logins(user_id: &str) -> Logins {
+    Logins {
+        uid: Some(user_id.to_string()),
+        sub: None,
+    }
 }
 
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.
