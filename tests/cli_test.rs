@@ -634,7 +634,7 @@ fn save_writes_the_right_email_when_the_token_names_none() {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("auth.json"), stored_auth).unwrap();
         std::fs::write(dir.join("meta.json"), meta).unwrap();
-        Command::cargo_bin("codexctl")
+        let output = Command::cargo_bin("codexctl")
             .unwrap()
             .env("HOME", &home)
             .env("HTTPS_PROXY", "http://127.0.0.1:1")
@@ -644,6 +644,16 @@ fn save_writes_the_right_email_when_the_token_names_none() {
             .write_stdin("y\n")
             .output()
             .unwrap();
+        // Without this the assertions read a file the command never touched: the
+        // starting metadata already satisfies one of them, so a save that failed
+        // early would pass for the wrong reason.
+        assert!(output.status.success(), "{args:?} failed: {output:?}");
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains(&token),
+            "{args:?} did not write the credential"
+        );
         std::fs::read_to_string(dir.join("meta.json")).unwrap()
     };
 

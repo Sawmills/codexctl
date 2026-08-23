@@ -198,7 +198,13 @@ fn run_from_with_consent(
         let email = profile::get_profile_from(paths, &target)
             .ok()
             .and_then(|existing| existing.meta.email)
-            .or_else(|| email_from_alias(alias));
+            .or_else(|| {
+                // The requested alias is an address for the profile it names and
+                // no other. Resolution can redirect to the profile that already
+                // holds this account, and deriving from the alias there would
+                // stamp the name typed for one account onto another's profile.
+                (target == alias).then(|| email_from_alias(alias)).flatten()
+            });
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -1019,6 +1025,41 @@ mod tests {
                 .unwrap()
                 .contains(&other),
             "the unrelated profile was overwritten"
+        );
+    }
+
+    /// The requested alias is an address for the profile it names and no other.
+    /// A redirect lands on a different profile, so deriving an address from that
+    /// alias would record one account's name against another's credentials.
+    #[test]
+    fn a_redirected_login_does_not_take_its_email_from_the_requested_alias() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        // No email claim anywhere, so only the alias could supply one.
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let mine = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{mine}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "personal@example.com", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "team");
+        let meta =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("meta.json")).unwrap();
+        assert!(
+            !meta.contains("personal@example.com"),
+            "the requested alias was recorded as another account's address: {meta}"
         );
     }
 
