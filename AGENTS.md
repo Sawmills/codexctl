@@ -35,7 +35,11 @@
 - Keep `codexctl use` as a local auth-file swap that does not contact OpenAI.
 - Keep `codexctl exec` non-mutating. It must never write `~/.codex/auth.json` or the active marker.
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
+- Identify an account by its workspace and its login together. Neither identifies it alone: a workspace holds many logins, and a login holds seats in many workspaces.
+- Read a profile's identity from its stored token first and its metadata second, and keep what has been proven when a captured file omits it.
+- Require positive agreement before `login` or `save` replaces stored credentials. "Cannot confirm" is not "yes". The one exception is a profile with no readable token and no recorded account, which is what a repair re-login is for.
 - Capture a token back to the alias the caller named. Fall back to token inspection only when the file does not belong to that alias.
+- Let an exact access token decide ownership on its own; anything rotated needs the claims to agree. Resolve undecidable ownership to no owner rather than a guess.
 - Pass the pinned alias to children in `CODEXCTL_PINNED_ALIAS`. Recovery must exclude the account a pinned launch already selected.
 - Order captured tokens by issued-at and fall back to expiry. Never overwrite a saved token with an older copy of the same seat.
 - Pin a launch with `CODEX_HOME=~/.codexctl/exec-homes/<alias>`. Seed `auth.json` as a real file and share every other `~/.codex` entry by symbolic link. Never replace an entry that already exists, so an entry Codex turned into a real file stays as it left it until the home is deleted.

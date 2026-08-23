@@ -321,6 +321,54 @@ error: profile 'amir@sawmills.ai' holds a different account
        Pass an explicit alias: codexctl save <alias>
 ```
 
+## Upgrading an existing store
+
+An account is identified by its workspace and its login together — neither
+alone, because a workspace holds many people and one login holds seats in many
+workspaces. Profiles saved before this release recorded neither, so `codexctl`
+reads them out of the stored token and remembers what it finds.
+
+Where it cannot prove two credentials are the same account, it now refuses
+rather than overwriting. Three cases can surprise a store that predates this
+release. All three are recoverable, and each error names its own remedy.
+
+**A second workspace on a profile that never recorded one.** Logging into a
+different workspace under an alias whose stored token carries no workspace
+claim is refused: the profile cannot confirm the arriving account is its own.
+
+```
+$ codexctl login amir@sawmills.ai
+error: profile 'amir@sawmills.ai' holds a different account
+       (stored workspace unknown, this login 6df34c28…).
+       Re-run with --label <name> to save it alongside, choose another alias,
+       or remove it first: codexctl remove amir@sawmills.ai
+```
+
+**A claimless profile stops absorbing rotations that name a workspace.** Codex
+refreshes tokens in place, and `codexctl` folds those back into the profile
+that owns them. A profile whose stored token declares no workspace no longer
+receives a rotation that declares one — that token may belong to another seat
+of the same login. The profile keeps working; its stored copy goes stale, and
+`status` shows the token ageing. `codexctl save` or a re-login refreshes it and
+records the workspace, after which rotations are captured normally again.
+
+**A profile whose token no longer parses.** If its metadata still records the
+workspace, a re-login is refused for the same reason — the stored login cannot
+be read, so nothing proves the arriving one is its owner. Remove it and log in
+again:
+
+```
+$ codexctl remove amir-team && codexctl login amir-team --label team
+```
+
+A profile with nothing left to identify it — no readable token and no recorded
+account — is repaired by `codexctl login <alias>` directly, since there is no
+identity left to protect.
+
+Nothing runs at upgrade time. No profile is rewritten until its next `save`,
+`login`, or `status`, and a `meta.json` written by an earlier version parses
+unchanged.
+
 ## Shell completions
 
 ```bash
