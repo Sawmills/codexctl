@@ -391,6 +391,35 @@ pub enum ExistingSeat {
 /// alias should be refreshed rather than duplicated when the operator gives it
 /// a different label. A store that cannot be scanned is an error rather than an
 /// answer, because "no match" and "could not look" are not the same thing.
+/// Whether another holder of the live access token declares a workspace the
+/// live file does not.
+///
+/// One token recorded under two profiles with different workspaces demonstrably
+/// spans workspaces, so the live copy's `account_id` is one claim among several
+/// rather than the answer. `strongest_exact_match` already calls that shape
+/// undecidable; inferring from the live file anyway would contradict it, and
+/// would hand a claimless profile a workspace it never recorded — enough to make
+/// it look like the unique seat for that workspace and be overwritten without
+/// consent.
+fn live_workspace_is_contested(paths: &Paths, live: &api::AuthJson) -> bool {
+    let Ok(aliases) = stored_aliases(paths) else {
+        // The store cannot be read, so nothing confirms the live file is
+        // uncontested. Withhold the inference rather than assume it.
+        return true;
+    };
+    aliases.into_iter().any(|alias| {
+        let holds_token = store::profile_dir(paths, &alias)
+            .ok()
+            .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
+            .is_some_and(|stored| stored.access_token == live.access_token);
+        holds_token
+            && workspace_contradicts(
+                live.account_id.as_deref(),
+                workspace_of_profile(paths, &alias).as_deref(),
+            )
+    })
+}
+
 /// What a profile holds, using the live file when it proves to be this
 /// profile's own credential.
 ///
@@ -443,8 +472,11 @@ pub fn existing_seat(
     if workspace.is_none() || user.is_empty() {
         return Ok(ExistingSeat::None);
     }
-    // The live file is read once, not per alias.
-    let live = api::read_auth_json(&paths.codex_auth_json()).ok();
+    // The live file is read once, not per alias — and only while it can speak
+    // for the profiles holding it.
+    let live = api::read_auth_json(&paths.codex_auth_json())
+        .ok()
+        .filter(|live| !live_workspace_is_contested(paths, live));
     let matching: Vec<String> = stored_aliases(paths)?
         .into_iter()
         .filter(|alias| {

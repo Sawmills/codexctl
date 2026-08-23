@@ -2337,3 +2337,61 @@ fn an_exact_token_in_two_workspaces_is_owned_by_the_one_it_declares() {
         "a file declaring no workspace picked an owner out of two"
     );
 }
+
+/// The live file identifies a profile holding its token — but only while its own
+/// workspace is not in dispute.
+///
+/// A is claimless and holds token T. B holds the same T and declares another
+/// workspace, so T demonstrably spans workspaces and the live copy's
+/// `account_id` is one claim among several. Copying it onto A would invent a
+/// workspace A never recorded, make A look like the unique seat for it, and let
+/// a labelled login redirect onto A and overwrite it with no consent asked.
+/// `strongest_exact_match` already calls this shape undecidable; seat lookup
+/// must not disagree with it.
+#[test]
+fn a_contested_live_workspace_is_not_inferred_onto_a_claimless_profile() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    let write = |alias: &str, meta: &str| {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{shared}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
+    };
+    write(
+        "a",
+        r#"{"alias":"a","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    write(
+        "b",
+        r#"{"alias":"b","email":null,"plan":null,"account_id":"acct-bee","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-see"}}"#),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(
+            profile::existing_seat(&paths, Some("acct-see"), &sub("seatA")).unwrap(),
+            profile::ExistingSeat::None
+        ),
+        "a contested live workspace was inferred onto a claimless profile"
+    );
+
+    // The uncontested case still works: with B gone, nothing disputes the live
+    // file and A is identified as its seat.
+    std::fs::remove_dir_all(paths.profiles_dir().join("b")).unwrap();
+    assert!(
+        matches!(
+            profile::existing_seat(&paths, Some("acct-see"), &sub("seatA")).unwrap(),
+            profile::ExistingSeat::One(ref alias) if alias == "a"
+        ),
+        "an uncontested live workspace stopped identifying its own profile"
+    );
+}
