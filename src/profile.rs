@@ -524,10 +524,25 @@ fn exact_token_holder(target_workspace: Option<&str>, holders: &[AliasWorkspace]
     if let Some(seat) = named(declared) {
         return seat;
     }
-    // Nothing declares the target's workspace, and something declares another:
-    // the token demonstrably spans workspaces, so no holder is proven to own
-    // this one. Reported as ambiguous rather than absent — several profiles
-    // already hold this credential, which is a reason to refuse another copy.
+    // Every holder naming some *other* workspace means none of them is this
+    // account. The token spans workspaces and this is simply another seat of
+    // it — which the lone-holder case above already allows, so refusing it here
+    // would block a workspace from being recorded at all once two others share
+    // the token.
+    if target_workspace.is_some()
+        && holders.iter().all(|(_, workspace)| {
+            workspace
+                .as_deref()
+                .is_some_and(|held| Some(held) != target_workspace)
+        })
+    {
+        return ExistingSeat::None;
+    }
+    // Something declares another workspace while something else could still be
+    // this account — a claimless holder beside a contradicting one. No holder is
+    // proven to own this credential, and reporting that as ambiguous rather than
+    // absent matters: several profiles already hold it, which is a reason to
+    // refuse another copy.
     if holders
         .iter()
         .any(|(_, workspace)| workspace_contradicts(target_workspace, workspace.as_deref()))

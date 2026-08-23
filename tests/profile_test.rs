@@ -2468,4 +2468,14 @@ fn exact_token_ownership_weighs_the_whole_holder_set() {
     );
     // Two copies with nothing to tell them apart stay ambiguous.
     assert_eq!(case(None, &[("a", None), ("b", None)]), "ambiguous:a,b");
+    // Every holder naming some other workspace means none of them is this
+    // account, so a seat for the arriving one can still be recorded — the same
+    // answer the lone-holder case gives.
+    assert_eq!(
+        case(
+            Some("acct-c"),
+            &[("a", Some("acct-a")), ("b", Some("acct-b"))]
+        ),
+        "none"
+    );
 }
