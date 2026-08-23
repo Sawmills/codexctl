@@ -114,19 +114,13 @@ fn run_from_with_consent(
             )
         })?;
         let incoming = incoming_identity.account_id.clone();
-        let incoming_user = api::token_login(&incoming_identity.access_token);
+        let incoming_user = api::token_logins(&incoming_identity.access_token);
         // Resolve and write under one lock. Which alias this login lands on is
         // read out of the store, so releasing the lock in between would let a
         // concurrent login change the answer before the write lands.
         let lock = store::lock(paths)?;
         let resolve = |_: &store::StoreLock| {
-            resolve_target_alias(
-                paths,
-                alias,
-                label,
-                incoming.as_deref(),
-                incoming_user.as_deref(),
-            )
+            resolve_target_alias(paths, alias, label, incoming.as_deref(), &incoming_user)
         };
         let (lock, target) = match resolve(&lock)? {
             Resolution::Ready(target) => (lock, target),
@@ -247,7 +241,7 @@ fn resolve_target_alias(
     alias: &str,
     label: Option<&str>,
     incoming_account: Option<&str>,
-    incoming_user: Option<&str>,
+    incoming_user: &api::Logins,
 ) -> Result<Resolution> {
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {

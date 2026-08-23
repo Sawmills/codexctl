@@ -158,7 +158,13 @@ read from its stored token first and its `meta.json` second, so a profile writte
 existed is still identified.
 
 The login carries the claim it came from — `uid:` or `sub:` — so the two namespaces never compare
-equal on a coincidental value.
+equal on a coincidental value. Both claims are kept rather than one chosen: a token gaining
+`chatgpt_user_id` is the ordinary legacy-to-current transition, and preferring a single claim makes
+the same seat before and after look like two people — which refuses the refresh, drops the rotation,
+and splits the profile in two on the next labelled login. Comparison happens inside whichever
+namespace both sides supply. Sharing none proves nothing in either direction, so such a pair is
+neither the same nor different, and each caller decides what to do about not knowing: the
+replacement guards ask, while capture and seat lookup require positive agreement.
 
 `login` and `save` replace what is stored, so they require positive agreement rather than the mere
 absence of contradiction:

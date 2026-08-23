@@ -1,6 +1,15 @@
 use codexctl::config::Paths;
 use codexctl::profile;
 
+/// A login known only by its JWT subject, as every pre-`chatgpt_user_id` token
+/// is.
+fn sub(subject: &str) -> codexctl::api::Logins {
+    codexctl::api::Logins {
+        uid: None,
+        sub: Some(subject.to_string()),
+    }
+}
+
 fn setup_test_env() -> (tempfile::TempDir, Paths) {
     let tmp = tempfile::tempdir().unwrap();
     let paths = Paths::from_home(tmp.path().to_path_buf());
@@ -788,14 +797,14 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     // profile. (`seatA` is the stored token's subject, which is the login claim
     // a real incoming token always carries.)
     assert!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatA"))
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), &sub("seatA"))
             .is_none()
     );
     // ...while the stale metadata's workspace is still refused. Both sides make
     // a claim and the claims disagree, so no answer could reconcile them: this
     // is a refusal, not a question for the operator.
     assert!(matches!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("sub:seatA")),
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), &sub("seatA")),
         Some(profile::AccountConflict::Different(stored)) if stored == "acct-new"
     ));
     // A different login in the workspace actually stored is refused too — and
@@ -803,7 +812,7 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     // Naming the workspace here would report "stored acct-new, incoming
     // acct-new" as the reason the two differ.
     assert!(matches!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatB")),
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), &sub("seatB")),
         Some(profile::AccountConflict::Different(stored)) if stored == "sub:seatA"
     ));
 }
@@ -992,7 +1001,7 @@ fn existing_seat_sees_a_profile_left_without_metadata() {
     .unwrap();
     // No meta.json: the save stopped between the two writes.
 
-    let seat = profile::existing_seat(&paths, Some("acct-team"), Some("sub:seatA")).unwrap();
+    let seat = profile::existing_seat(&paths, Some("acct-team"), &sub("seatA")).unwrap();
 
     assert!(
         matches!(seat, profile::ExistingSeat::One(alias) if alias == "half-written"),
@@ -1077,7 +1086,7 @@ fn existing_seat_requires_both_identity_halves() {
     );
 
     // The incoming token names a login but no workspace.
-    let seat = profile::existing_seat(&paths, None, Some("sub:seatA")).unwrap();
+    let seat = profile::existing_seat(&paths, None, &sub("seatA")).unwrap();
 
     assert!(
         matches!(seat, profile::ExistingSeat::None),
@@ -2214,4 +2223,64 @@ fn a_claim_is_described_as_what_it_is() {
     let workspace = profile::describe_claim("acct-team");
     assert!(workspace.starts_with("workspace "), "{workspace}");
     assert!(!workspace.contains("login"), "{workspace}");
+}
+
+/// The ordinary legacy-to-current token transition: one seat keeps its subject
+/// and gains a `chatgpt_user_id`. Identifying a token by a single preferred
+/// claim makes the before and after look like two different people, so the
+/// profile stops absorbing its own rotations and its saved token ages out.
+#[test]
+fn capture_absorbs_a_rotation_that_adds_a_user_id_claim() {
+    let (_tmp, paths) = setup_test_env();
+    // Saved before `chatgpt_user_id` existed: a subject and a workspace.
+    let stored = synthetic_token(
+        r#"{"sub":"seatA","jti":"stored","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+    );
+    write_profile(&paths, "mine", &stored);
+
+    // The same seat, refreshed: same subject and workspace, now also a user id.
+    let rotated = synthetic_token(
+        r#"{"sub":"seatA","jti":"rotated","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#,
+    );
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{rotated}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "mine").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("mine").join("auth.json"))
+            .unwrap()
+            .contains(&rotated),
+        "the profile refused its own refreshed token, so its saved copy will expire"
+    );
+}
+
+/// The guard the rule above must not weaken: two claims in different namespaces
+/// are unrelated facts, so a `uid` must never match a `sub` that happens to
+/// carry the same string.
+#[test]
+fn a_user_id_never_matches_a_subject_by_coincidence() {
+    let shared = "collision";
+    let uid_only = codexctl::api::Logins {
+        uid: Some(shared.to_string()),
+        sub: None,
+    };
+    let sub_only = codexctl::api::Logins {
+        uid: None,
+        sub: Some(shared.to_string()),
+    };
+    assert!(!uid_only.same(&sub_only), "a uid matched a sub");
+    assert!(
+        !uid_only.differs(&sub_only),
+        "unrelated claims proved a difference"
+    );
+    assert!(!uid_only.comparable(&sub_only));
+
+    // Within one namespace both verdicts are available as usual.
+    let other_uid = codexctl::api::Logins {
+        uid: Some("someone-else".to_string()),
+        sub: None,
+    };
+    assert!(uid_only.differs(&other_uid));
+    assert!(uid_only.same(&uid_only.clone()));
 }

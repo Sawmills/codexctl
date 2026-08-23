@@ -70,7 +70,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
             &paths,
             &resolved_alias,
             auth.account_id.as_deref(),
-            api::token_login(&auth.access_token).as_deref(),
+            &api::token_logins(&auth.access_token),
             alias::optional(alias)?.is_some(),
         )?;
         // Read before the question is asked: this is the credential the operator
@@ -190,7 +190,7 @@ fn save_verified_snapshot(
             paths,
             resolved_alias,
             live_now.account_id.as_deref(),
-            api::token_login(&live_now.access_token).as_deref(),
+            &api::token_logins(&live_now.access_token),
             alias_was_explicit,
         )? && !adoption_approved
         {
@@ -245,7 +245,7 @@ fn classify_overwrite(
     paths: &config::Paths,
     alias: &str,
     incoming_account: Option<&str>,
-    incoming_user: Option<&str>,
+    incoming_user: &api::Logins,
     alias_was_explicit: bool,
 ) -> Result<Adoption> {
     let Some(conflict) =

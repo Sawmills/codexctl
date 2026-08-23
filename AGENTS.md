@@ -36,6 +36,8 @@
 - Keep `codexctl exec` non-mutating. It must never write `~/.codex/auth.json` or the active marker.
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
 - Identify an account by its workspace and its login together. Neither identifies it alone: a workspace holds many logins, and a login holds seats in many workspaces.
+- Keep every login claim a token makes. A token gaining `chatgpt_user_id` is the ordinary legacy-to-current transition, and collapsing to one preferred claim makes the same seat look like two people.
+- Compare logins only inside one namespace. `uid:` and `sub:` are unrelated facts, so they must never match by coincidence and never prove a difference either.
 - Read a profile's identity from its stored token first and its metadata second, and keep what has been proven when a captured file omits it.
 - Require positive agreement before `login` or `save` replaces stored credentials. "Cannot confirm" is not "yes".
 - Separate a conflict that is proven from one that is merely unprovable. Refuse claims that positively disagree; no flag may override that. Where neither side declares enough to compare, ask the operator: prompt on a terminal, refuse without one unless `--allow-adopt` is set.

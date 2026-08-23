@@ -685,18 +685,94 @@ pub fn extract_account_id(token: &str) -> Option<String> {
 /// without it two seats in one workspace both resolve to "unknown" and an
 /// ownership guard reads that as agreement.
 pub fn token_login(token: &str) -> Option<String> {
-    // Tagged with the claim it came from, so the two never compare equal by
-    // accident: `chatgpt_user_id` and `sub` are different namespaces, and a
-    // token naming one must not match a profile identified by the other.
-    if let Some(user_id) = token_identity(token).and_then(|identity| identity.user_id) {
-        return Some(format!("uid:{user_id}"));
+    token_logins(token).canonical()
+}
+
+/// Every login claim a token makes, kept apart by the claim it came from.
+///
+/// Both are retained rather than one chosen, because a token gaining
+/// `chatgpt_user_id` is the ordinary legacy-to-current transition: the same seat
+/// keeps its `sub` and adds a `uid`. Collapsing to a single preferred claim
+/// makes the before and after look like two different people, which breaks the
+/// one migration this design exists to serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Logins {
+    /// From `chatgpt_user_id`.
+    pub uid: Option<String>,
+    /// From the JWT subject.
+    pub sub: Option<String>,
+}
+
+impl Logins {
+    pub fn is_empty(&self) -> bool {
+        self.uid.is_none() && self.sub.is_none()
     }
-    token_subject(token).map(|subject| format!("sub:{subject}"))
+
+    /// The identifier to record or show, tagged with where it came from so the
+    /// two namespaces never read as one value.
+    pub fn canonical(&self) -> Option<String> {
+        if let Some(uid) = &self.uid {
+            return Some(format!("uid:{uid}"));
+        }
+        self.sub.as_ref().map(|sub| format!("sub:{sub}"))
+    }
+
+    /// The claim both sides make, if there is one. Comparison only ever happens
+    /// inside a single namespace — `uid:X` and `sub:X` are unrelated facts that
+    /// happen to share a string, and must never match by coincidence.
+    fn shared<'a>(&'a self, other: &'a Logins) -> Option<(&'a str, &'a str)> {
+        if let (Some(mine), Some(theirs)) = (&self.uid, &other.uid) {
+            return Some((mine, theirs));
+        }
+        match (&self.sub, &other.sub) {
+            (Some(mine), Some(theirs)) => Some((mine, theirs)),
+            _ => None,
+        }
+    }
+
+    /// Whether these two make claims that can be weighed against each other at
+    /// all. Without a shared namespace neither confirms nor denies the other,
+    /// and a caller that reads silence as a rival claim will block on profiles
+    /// that say nothing about the token in hand.
+    pub fn comparable(&self, other: &Logins) -> bool {
+        self.shared(other).is_some()
+    }
+
+    /// Positive proof of the same login.
+    pub fn same(&self, other: &Logins) -> bool {
+        self.shared(other)
+            .is_some_and(|(mine, theirs)| mine == theirs)
+    }
+
+    /// Positive proof of a different login. Sharing no namespace proves
+    /// nothing, so it is neither the same nor different — the caller decides
+    /// what to do about not knowing.
+    pub fn differs(&self, other: &Logins) -> bool {
+        self.shared(other)
+            .is_some_and(|(mine, theirs)| mine != theirs)
+    }
+}
+
+/// Every login claim a token makes.
+pub fn token_logins(token: &str) -> Logins {
+    Logins {
+        uid: token_identity(token).and_then(|identity| identity.user_id),
+        sub: token_subject(token),
+    }
 }
 
 /// The same tag for a `chatgpt_user_id` already recorded in metadata.
 pub fn recorded_login(user_id: &str) -> String {
     format!("uid:{user_id}")
+}
+
+/// What metadata alone can say about the login: a recorded `chatgpt_user_id`
+/// and nothing else, since no subject is stored.
+pub fn recorded_logins(user_id: &str) -> Logins {
+    Logins {
+        uid: Some(user_id.to_string()),
+        sub: None,
+    }
 }
 
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.

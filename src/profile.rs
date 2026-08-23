@@ -258,17 +258,27 @@ fn identity_of_auth_file(auth_json: &Path) -> api::TokenIdentity {
 ///
 /// A workspace is not an owner: several people hold seats in one team
 /// workspace, so the login is what separates their credentials.
-pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
-    let dir = store::profile_dir(paths, alias).ok()?;
-    let stored_login = api::read_auth_json(&dir.join("auth.json"))
+pub fn logins_of_profile(paths: &Paths, alias: &str) -> api::Logins {
+    let Ok(dir) = store::profile_dir(paths, alias) else {
+        return api::Logins::default();
+    };
+    let stored = api::read_auth_json(&dir.join("auth.json"))
         .ok()
-        .and_then(|auth| api::token_login(&auth.access_token));
-    stored_login.or_else(|| {
-        read_meta(&dir.join("meta.json"))
-            .and_then(|meta| meta.user_id)
-            .as_deref()
-            .map(api::recorded_login)
-    })
+        .map(|auth| api::token_logins(&auth.access_token))
+        .unwrap_or_default();
+    if !stored.is_empty() {
+        return stored;
+    }
+    read_meta(&dir.join("meta.json"))
+        .and_then(|meta| meta.user_id)
+        .as_deref()
+        .map(api::recorded_logins)
+        .unwrap_or_default()
+}
+
+/// The single identifier for this profile's login, for display and metadata.
+pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
+    logins_of_profile(paths, alias).canonical()
 }
 
 /// Which workspace a saved profile holds.
@@ -396,37 +406,41 @@ fn identity_of_profile(
     paths: &Paths,
     alias: &str,
     live: Option<&api::AuthJson>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, api::Logins) {
     let stored_workspace = workspace_of_profile(paths, alias);
-    let stored_user = user_of_profile(paths, alias);
+    let stored_logins = logins_of_profile(paths, alias);
     let Some(live) = live else {
-        return (stored_workspace, stored_user);
+        return (stored_workspace, stored_logins);
     };
     let holds_live_token = store::profile_dir(paths, alias)
         .ok()
         .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
         .is_some_and(|stored| stored.access_token == live.access_token);
     if !holds_live_token {
-        return (stored_workspace, stored_user);
+        return (stored_workspace, stored_logins);
     }
     // Only ever adds what the profile could not say for itself. A stored claim
     // that disagrees is left to the conflict rules rather than overwritten here.
+    let live_logins = api::token_logins(&live.access_token);
     (
         stored_workspace.or_else(|| live.account_id.clone()),
-        stored_user.or_else(|| api::token_login(&live.access_token)),
+        api::Logins {
+            uid: stored_logins.uid.or(live_logins.uid),
+            sub: stored_logins.sub.or(live_logins.sub),
+        },
     )
 }
 
 pub fn existing_seat(
     paths: &Paths,
     workspace: Option<&str>,
-    user: Option<&str>,
+    user: &api::Logins,
 ) -> Result<ExistingSeat> {
     // Reuse replaces a profile, so it needs both halves positively matched.
     // Comparing the claims as options would let `None == None` stand in for
     // identity, and every legacy profile would look like the same seat as any
     // token that happens to omit a claim.
-    if workspace.is_none() || user.is_none() {
+    if workspace.is_none() || user.is_empty() {
         return Ok(ExistingSeat::None);
     }
     // The live file is read once, not per alias.
@@ -434,8 +448,9 @@ pub fn existing_seat(
     let matching: Vec<String> = stored_aliases(paths)?
         .into_iter()
         .filter(|alias| {
-            let (stored_workspace, stored_user) = identity_of_profile(paths, alias, live.as_ref());
-            stored_workspace.as_deref() == workspace && stored_user.as_deref() == user
+            let (stored_workspace, stored_logins) =
+                identity_of_profile(paths, alias, live.as_ref());
+            stored_workspace.as_deref() == workspace && user.same(&stored_logins)
         })
         .collect();
     Ok(match matching.len() {
@@ -484,7 +499,7 @@ pub fn conflicting_workspace(
     paths: &Paths,
     alias: &str,
     incoming_account: Option<&str>,
-    incoming_user: Option<&str>,
+    incoming_user: &api::Logins,
 ) -> Option<AccountConflict> {
     let dir = store::profile_dir(paths, alias).ok()?;
     // No profile here at all. There is no occupant to identify, protect, or ask
@@ -493,9 +508,10 @@ pub fn conflicting_workspace(
         return None;
     }
     let stored_workspace = workspace_of_profile(paths, alias);
-    let stored_user = user_of_profile(paths, alias);
+    let stored_logins = logins_of_profile(paths, alias);
+    let stored_user = stored_logins.canonical();
     let stored_auth_readable = api::read_auth_json(&dir.join("auth.json")).is_ok();
-    if stored_workspace.is_none() && stored_user.is_none() && !stored_auth_readable {
+    if stored_workspace.is_none() && stored_logins.is_empty() && !stored_auth_readable {
         // A profile that exists but cannot be identified *or* used. Replacing it
         // plausibly loses nothing, but that judgement rests on `read_auth_json`
         // having failed — so a future parser regression would silently reclassify
@@ -529,11 +545,12 @@ pub fn conflicting_workspace(
     // workspace with nothing contradicting it is the strongest evidence such a
     // token can offer. Two seats in one workspace behind tokens that old are the
     // residual exposure; a token carrying the claim closes it permanently.
-    let user_contradicts = match (incoming_user, stored_user.as_deref()) {
-        (Some(incoming), Some(stored)) => incoming != stored,
-        (Some(_), None) => true,
-        (None, Some(_)) => true,
-        (None, None) => false,
+    let user_contradicts = if incoming_user.is_empty() && stored_logins.is_empty() {
+        false
+    } else {
+        // Anything short of positive proof of the same login is unsettled: one
+        // side silent, or two claims that share no namespace to compare in.
+        !incoming_user.same(&stored_logins)
     };
     if workspace_settled && !user_contradicts {
         return None;
@@ -545,7 +562,7 @@ pub fn conflicting_workspace(
         (incoming_account, stored_workspace.as_deref()),
         (Some(incoming), Some(stored)) if incoming != stored
     );
-    let user_differs = logins_disagree(incoming_user, stored_user.as_deref());
+    let user_differs = incoming_user.differs(&stored_logins);
     let described = stored_workspace.clone().or_else(|| stored_user.clone());
     if workspace_differs || user_differs {
         // Describe the claim that actually disagrees. Preferring the workspace
@@ -892,7 +909,7 @@ fn metadata_contradicts(
     paths: &Paths,
     alias: &str,
     target_workspace: Option<&str>,
-    target_login: Option<&str>,
+    target_login: &api::Logins,
 ) -> bool {
     let Ok(dir) = store::profile_dir(paths, alias) else {
         return false;
@@ -901,9 +918,13 @@ fn metadata_contradicts(
     let workspace_disagrees = meta.account_id.is_some()
         && target_workspace.is_some()
         && meta.account_id.as_deref() != target_workspace;
-    let recorded = meta.user_id.as_deref().map(api::recorded_login);
-    let login_disagrees =
-        recorded.is_some() && target_login.is_some() && recorded.as_deref() != target_login;
+    // Metadata records a `chatgpt_user_id` and nothing else, so it can only
+    // disagree with a token that names one too. A token identified by its
+    // subject alone shares no namespace with it and settles nothing.
+    let login_disagrees = meta
+        .user_id
+        .as_deref()
+        .is_some_and(|recorded| api::recorded_logins(recorded).differs(target_login));
     workspace_disagrees || login_disagrees
 }
 
@@ -945,29 +966,6 @@ fn exact_token_candidates(paths: &Paths, auth_json: &Path) -> Option<ExactTokenC
     Some((target.account_id, candidates))
 }
 
-/// Whether two login identifiers *prove* they are different people.
-///
-/// Difference is only provable inside one namespace. `uid:` comes from
-/// `chatgpt_user_id` and `sub:` from the JWT subject, and a token gaining the
-/// former does not stop it being the same login — a legacy profile identified as
-/// `sub:S` meeting its own refreshed token, now reporting `uid:U`, is the same
-/// person. Reading that as proof of difference makes the refusal absolute, so
-/// the one population this design exists to migrate would be left with no way
-/// through at all. Unequal across namespaces is unproven, not different: the
-/// caller still treats it as unsettled, so it becomes a question instead.
-fn logins_disagree(incoming: Option<&str>, stored: Option<&str>) -> bool {
-    let (Some(incoming), Some(stored)) = (incoming, stored) else {
-        return false;
-    };
-    let namespace = |login: &str| login.split_once(':').map(|(tag, _)| tag.to_string());
-    match (namespace(incoming), namespace(stored)) {
-        (Some(a), Some(b)) if a == b => incoming != stored,
-        // An untagged value on both sides is a single namespace by default.
-        (None, None) => incoming != stored,
-        _ => false,
-    }
-}
-
 /// Whether a subject-only match on a claimless pair is really undecided.
 ///
 /// When neither the file nor the hinted profile declares a workspace, the only
@@ -990,10 +988,10 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
     {
         return false;
     }
-    let Some(login) = api::token_login(&target.access_token) else {
+    let target_login = api::token_logins(&target.access_token);
+    if target_login.is_empty() {
         return false;
-    };
-    let target_login = Some(login.clone());
+    }
     // A store that cannot be read is not evidence that no sibling declares a
     // workspace, and a half-written profile is still a profile — both count as
     // ambiguity rather than permission for the hint. Siblings are judged by
@@ -1009,14 +1007,29 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
                 return true;
             };
             let Ok(sibling) = api::read_auth_json(&dir.join("auth.json")) else {
-                // Unreadable credentials leave only the recorded identity. It
-                // blocks unless it proves this is somebody else's profile —
-                // otherwise an unrelated damaged profile would suppress a
-                // healthy one's rotation and let it expire.
-                return !metadata_contradicts(paths, &alias, None, target_login.as_deref());
+                // Unreadable credentials leave only the recorded identity,
+                // which is a `chatgpt_user_id` and never a subject.
+                let recorded = read_meta(&dir.join("meta.json"))
+                    .and_then(|meta| meta.user_id)
+                    .map(|user_id| api::recorded_logins(&user_id));
+                return match recorded {
+                    // A claim that can be weighed competes only if it matches.
+                    Some(recorded) if recorded.comparable(&target_login) => {
+                        recorded.same(&target_login)
+                    }
+                    // A claim in the other namespace weighs nothing either way,
+                    // while the hinted profile positively holds this login — so
+                    // this is not a rival. Reading it as one is how an unrelated
+                    // damaged profile suppresses a healthy profile's rotation and
+                    // lets its token expire.
+                    Some(_) => false,
+                    // Nothing recorded at all: it could still be anyone, so it
+                    // blocks unless its workspace rules it out.
+                    None => !metadata_contradicts(paths, &alias, None, &target_login),
+                };
             };
             workspace_of_profile(paths, &alias).is_some()
-                && api::token_login(&sibling.access_token).as_deref() == Some(login.as_str())
+                && target_login.same(&api::token_logins(&sibling.access_token))
         })
 }
 
@@ -1176,10 +1189,11 @@ fn auth_belongs_to_profile(paths: &Paths, auth_json: &Path, profile: &Profile) -
         return false;
     }
     // The same login identity `login` and `save` compare, so a file is not one
-    // seat to capture and two accounts to an overwrite: `token_login` prefers
-    // `chatgpt_user_id` and only falls back to `sub`.
-    let left_login = api::token_login(&left.access_token);
-    if left_login.is_none() || left_login != api::token_login(&right.access_token) {
+    // seat to capture and two accounts to an overwrite. Compared inside a shared
+    // namespace: a rotation that adds `chatgpt_user_id` to a token the profile
+    // knows only by its subject is the same seat, and reading it as a stranger
+    // would leave the profile holding a token that never refreshes again.
+    if !api::token_logins(&left.access_token).same(&api::token_logins(&right.access_token)) {
         return false;
     }
     // The same login is not the same account. Two workspace seats of one human
@@ -1200,12 +1214,12 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     let Ok(target_auth) = api::read_auth_json(auth_json) else {
         return Ok(None);
     };
-    let target_seat = api::token_login(&target_auth.access_token);
+    let target_seat = api::token_logins(&target_auth.access_token);
     let target_account = target_auth.account_id.clone();
     // Enumerated from the store's directories: `list_profiles_from` skips a
     // profile with no `meta.json`, and an interrupted save leaves a real one in
     // that shape whose claim still belongs in this decision.
-    let target_login = api::token_login(&target_auth.access_token);
+    let target_login = api::token_logins(&target_auth.access_token);
     let mut profile_auths = Vec::new();
     for alias in stored_aliases(paths)? {
         let Ok(dir) = store::profile_dir(paths, &alias) else {
@@ -1217,18 +1231,17 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
             // look like the sole owner of a credential this one may hold, so an
             // identified one makes the decision undecidable instead.
             let meta = read_meta(&dir.join("meta.json")).unwrap_or_default();
-            let recorded_login = meta.user_id.as_deref().map(api::recorded_login);
+            let recorded_login = meta.user_id.as_deref().map(api::recorded_logins);
             // A field that positively disagrees rules the profile out, whatever
             // the other one says: a damaged profile for another login in the
             // same workspace is not a candidate, and letting it block would
             // discard a rotation belonging to the healthy profile that is.
-            let identifies = !metadata_contradicts(
-                paths,
-                &alias,
-                target_account.as_deref(),
-                target_login.as_deref(),
-            ) && ((recorded_login.is_some() && recorded_login == target_login)
-                || (meta.account_id.is_some() && meta.account_id == target_account));
+            let identifies =
+                !metadata_contradicts(paths, &alias, target_account.as_deref(), &target_login)
+                    && (recorded_login
+                        .as_ref()
+                        .is_some_and(|recorded| recorded.same(&target_login))
+                        || (meta.account_id.is_some() && meta.account_id == target_account));
             if identifies {
                 return Ok(None);
             }
@@ -1252,8 +1265,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     let same_seat: Vec<(String, Option<String>)> = profile_auths
         .into_iter()
         .filter_map(|(alias, profile_auth)| {
-            let profile_seat = api::token_login(&profile_auth.access_token);
-            (target_seat.is_some() && target_seat == profile_seat).then_some({
+            (target_seat.same(&api::token_logins(&profile_auth.access_token))).then_some({
                 let workspace = workspace_of_profile(paths, &alias);
                 (alias, workspace)
             })
