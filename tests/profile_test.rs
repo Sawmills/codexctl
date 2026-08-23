@@ -1370,6 +1370,78 @@ fn exact_token_candidates_include_a_profile_left_without_metadata() {
     );
 }
 
+/// A capture that simply omits the workspace is not an update. Erasing it
+/// would destroy a legacy profile's only ownership evidence and make every
+/// later rotation unattributable.
+#[test]
+fn capture_does_not_erase_a_stored_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(r#"{"sub":"seatA","jti":"stable"}"#);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Identical credential, but this copy names no workspace.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{token}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "team").unwrap();
+
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("acct-team"),
+        "the stored workspace was erased by a claimless copy"
+    );
+}
+
+/// The active row reads the live file only when it truly belongs to the active
+/// profile. A sibling holding the same token and declaring the live workspace
+/// is the stronger owner, so its usage must not render under this alias.
+#[test]
+fn active_profile_defers_to_a_stronger_exact_token_sibling() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    write_profile(&paths, "legacy", &shared);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // The live file is that team seat.
+    std::fs::write(
+        paths.codex_auth_json(),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+
+    let legacy = profile::get_profile_from(&paths, "legacy").unwrap();
+    let chosen = profile::auth_json_path_for_profile_from(&paths, &legacy, Some("legacy"));
+
+    assert_eq!(
+        chosen,
+        legacy.auth_json_path(),
+        "another seat's live usage would render under this alias"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

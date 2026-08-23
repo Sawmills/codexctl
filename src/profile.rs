@@ -859,9 +859,12 @@ fn captured_auth_supersedes_profile(captured_auth: &Path, profile_auth: &Path) -
     // discarding that leaves the profile claimless and its ownership ambiguous.
     if candidate.access_token == current.access_token
         && candidate.refresh_token == current.refresh_token
-        && candidate.account_id == current.account_id
     {
-        return false;
+        // Same credential. Only a workspace claim that *appears or changes* is
+        // an update worth writing; one that is merely absent must not erase the
+        // profile's stored claim, which for a pre-0.1.22 profile is the only
+        // ownership evidence it has.
+        return candidate.account_id.is_some() && candidate.account_id != current.account_id;
     }
     // Issued-at orders the two tokens directly. Expiry only stands in for it,
     // and stops being a proxy for recency the moment a shortened lifetime makes
@@ -894,7 +897,13 @@ pub fn auth_json_path_for_profile_from(
         return profile.auth_json_path();
     }
     let live = paths.codex_auth_json();
-    if auth_belongs_to_profile(paths, &live, profile) {
+    // Through the same resolution capture uses, rather than a local check: a
+    // sibling holding this exact token and declaring the live workspace is the
+    // stronger owner, and reading the live file here would report that seat's
+    // usage — and its capacity — under this alias.
+    if alias_for_auth_json_with_hint(paths, &live, Some(&profile.meta.alias)).as_deref()
+        == Some(profile.meta.alias.as_str())
+    {
         live
     } else {
         profile.auth_json_path()
