@@ -139,13 +139,22 @@ fn resolve_target_alias(
         // still be saved under a label-derived alias from an earlier run — and
         // saving it here too would fork one account across two profiles, which
         // is what makes ownership ambiguous later.
-        if label.is_some()
-            && let profile::ExistingSeat::One(existing) =
-                profile::existing_seat(paths, incoming_account, incoming_user)
-                    .context("could not check whether this account is already saved")?
-            && existing != alias
-        {
-            return Ok(existing);
+        if label.is_some() {
+            match profile::existing_seat(paths, incoming_account, incoming_user)
+                .context("could not check whether this account is already saved")?
+            {
+                profile::ExistingSeat::One(existing) if existing != alias => {
+                    return Ok(existing);
+                }
+                // Already ambiguous. A free alias is room for a third copy, not
+                // permission to make one.
+                profile::ExistingSeat::Ambiguous(aliases) => bail!(
+                    "this account is already saved under more than one alias ({}). \
+                     Remove the duplicates, or log in with one of them directly.",
+                    aliases.join(", ")
+                ),
+                _ => {}
+            }
         }
         return Ok(alias.to_string());
     };
@@ -584,6 +593,32 @@ mod tests {
         );
         assert!(
             !paths.profiles_dir().join("amir@sawmills.ai+team").exists(),
+            "a third copy of one account was created"
+        );
+    }
+
+    /// A free alias is room for a third copy, not permission to make one: if a
+    /// seat is already saved twice, the store is ambiguous and adding to it is
+    /// what stops tokens being attributed at all.
+    #[test]
+    fn run_from_refuses_an_ambiguous_seat_even_when_the_base_alias_is_free() {
+        let (_tmp, paths) = setup_test_env();
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+work", None, &source).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+old", None, &source).unwrap();
+
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{team}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias"),
+            "unhelpful refusal: {error}"
+        );
+        assert!(
+            !paths.profiles_dir().join("amir@sawmills.ai").exists(),
             "a third copy of one account was created"
         );
     }

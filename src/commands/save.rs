@@ -59,6 +59,10 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             api::token_login(&auth.access_token).as_deref(),
             alias::optional(alias)?.is_some(),
         )?;
+        // Read before the question is asked: this is the credential the operator
+        // is being shown and agreeing to replace. Reading it afterwards would
+        // silently adopt whatever landed there while they were deciding.
+        let shown = stored_credentials(&existing);
         eprint!(
             "profile '{}' already exists. Overwrite? [y/N] ",
             resolved_alias
@@ -69,7 +73,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             println!("aborted");
             return Ok(());
         }
-        confirmed_state = Some(stored_credentials(&existing));
+        confirmed_state = Some(shown);
     }
 
     // The lock is taken only now: holding it across the prompt above would
