@@ -321,12 +321,14 @@ fn resolve_target_alias(
             profile::ExistingSeat::One(existing) if existing != alias => {
                 return Ok(Resolution::Ready(existing.clone()));
             }
-            // Already saved more than once. Nothing here is permission to add a
-            // third copy.
+            // Already saved more than once. Nothing here is permission to add
+            // a third copy — and naming one of them is not permission either,
+            // because reaching this branch means the requested alias holds
+            // something this account cannot be matched to. Membership in the
+            // set proves only that the credential is stored there, which for an
+            // exact-token match can mean a profile for another workspace
+            // entirely.
             profile::ExistingSeat::Ambiguous(aliases) => {
-                if aliases.iter().any(|existing| existing == alias) {
-                    return Ok(Resolution::Ready(alias.to_string()));
-                }
                 bail!(
                     "this account is already saved under more than one alias ({}). \
                      Remove the duplicates, or log in with one of them directly.",
@@ -360,10 +362,10 @@ fn resolve_target_alias(
     match seat {
         profile::ExistingSeat::One(existing) => return Ok(Resolution::Ready(existing)),
         profile::ExistingSeat::Ambiguous(aliases) => {
-            // Naming one of the duplicates is refreshing it, not adding to them.
-            if aliases.iter().any(|existing| existing == alias) {
-                return Ok(Resolution::Ready(alias.to_string()));
-            }
+            // Naming one of them is not refreshing it here: the requested alias
+            // holds something this account cannot be matched to, so membership
+            // says only that the credential is stored there — which for an
+            // exact-token match can mean a profile for another workspace.
             bail!(
                 "this account is already saved under more than one alias ({}). \
                  Remove the duplicates, or log in with one of them directly.",
@@ -1142,6 +1144,58 @@ mod tests {
         assert!(
             kept.contains("acct-a"),
             "the first workspace's profile was overwritten: {kept}"
+        );
+    }
+
+    /// Being listed among the holders of a credential is not proof of owning
+    /// the arriving account. One token stored for two workspaces makes every
+    /// holder ambiguous, so naming one of them must not be read as refreshing
+    /// it — that would overwrite a profile for another workspace outright,
+    /// past the conflict that proves it is another workspace.
+    #[test]
+    fn membership_in_an_ambiguous_holder_set_is_not_ownership() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        for (alias, workspace) in [("acct-a-profile", "acct-a"), ("acct-b-profile", "acct-b")] {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}","account_id":"{workspace}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null,"account_id":"{workspace}","saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        // The same token arriving for a third workspace.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-c"}}"#
+        ));
+
+        let error =
+            run_from_with_consent(&paths, "acct-a-profile", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias")
+                || error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("acct-a-profile")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(
+            kept.contains("acct-a"),
+            "a profile for another workspace was overwritten: {kept}"
         );
     }
 
