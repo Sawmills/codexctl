@@ -269,15 +269,21 @@ fn resolve_target_alias(
     // for. Saving a second copy forks it, which every later lookup reports as
     // ambiguous — and the fresh login revokes the older grant server-side,
     // leaving the duplicate dead as well as confusing.
-    let mut seat = profile::existing_seat(paths, incoming_account, incoming_user)
-        .context("could not check whether this account is already saved")?;
-    // A device login can return an opaque or pre-claims credential, which offers
-    // the lookup above nothing to match on. Being byte-identical to one already
-    // stored still proves whose it is.
-    if matches!(seat, profile::ExistingSeat::None) {
-        seat = profile::exact_token_seat(paths, incoming_auth)
-            .context("could not check which profile holds this credential")?;
-    }
+    // An exact access token decides ownership on its own; claims are what a
+    // *rotated* credential has to fall back on. Asking the weaker question first
+    // and only consulting the stronger one when it came up empty inverts that:
+    // two profiles carrying the same claims read as ambiguous even when just one
+    // of them holds the credential that arrived, and the login is refused or
+    // written to the wrong one.
+    let seat = match profile::exact_token_seat(paths, incoming_auth)
+        .context("could not check which profile holds this credential")?
+    {
+        profile::ExistingSeat::None => {
+            profile::existing_seat(paths, incoming_account, incoming_user)
+                .context("could not check whether this account is already saved")?
+        }
+        exact => exact,
+    };
 
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {
@@ -1196,6 +1202,47 @@ mod tests {
         assert!(
             kept.contains("acct-a"),
             "a profile for another workspace was overwritten: {kept}"
+        );
+    }
+
+    /// An exact access token decides ownership on its own. Two profiles can
+    /// carry the same claims while only one holds the credential that arrived —
+    /// asking the claims first reads that as ambiguous and either refuses a
+    /// resolvable login or refreshes the wrong copy.
+    #[test]
+    fn exact_token_ownership_outranks_ambiguous_claims() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let held = encode(claims);
+        let other = encode(claims).replace(".sig", ".sig-other");
+
+        // Both profiles claim the same account; only `holder` has the token.
+        for (alias, token) in [("holder", &held), ("twin", &other)] {
+            std::fs::write(
+                paths.codex_auth_json(),
+                format!(r#"{{"access_token":"{token}"}}"#),
+            )
+            .unwrap();
+            profile::save_profile_to(&paths, alias, None, &paths.codex_auth_json().clone())
+                .unwrap();
+        }
+
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{held}"}}"#));
+
+        let saved = run_from(&paths, "fresh-alias", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "holder",
+            "claims ambiguity hid the profile that actually holds this credential"
+        );
+        assert!(
+            !paths.profiles_dir().join("fresh-alias").exists(),
+            "a resolvable login created a new profile"
         );
     }
 
