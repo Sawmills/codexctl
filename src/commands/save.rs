@@ -6,6 +6,7 @@ use crate::commands::alias;
 use crate::config;
 use crate::profile;
 use crate::store;
+use std::io::IsTerminal;
 
 pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Result<()> {
     // Reject a bad label before the save switches the live auth file. Failing
@@ -64,7 +65,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         // Read before the question is asked: this is the credential the operator
         // is being shown and agreeing to replace. Reading it afterwards would
         // silently adopt whatever landed there while they were deciding.
-        let shown = stored_credentials(&existing);
+        let shown = adopt::stored_credentials(&existing);
         let approved = match adoption {
             Adoption::Unneeded => {
                 eprint!(
@@ -83,6 +84,8 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
                     stored.as_deref(),
                     auth.account_id.as_deref(),
                     allow_adopt,
+                    std::io::stdin().is_terminal(),
+                    &mut std::io::stdin().lock(),
                     &mut std::io::stderr(),
                 ) {
                     adopt::Approval::Granted => {
@@ -194,7 +197,7 @@ fn save_verified_snapshot(
             ),
             // It was approved, but something replaced its credentials since —
             // and the approval was for what used to be there.
-            Some(approved) if *approved != stored_credentials(&dir) => anyhow::bail!(
+            Some(approved) if *approved != adopt::stored_credentials(&dir) => anyhow::bail!(
                 "profile '{resolved_alias}' changed while this save was preparing, so the \
                  confirmation no longer applies to what it holds. Re-run the command."
             ),
@@ -206,15 +209,6 @@ fn save_verified_snapshot(
         profile::set_label_locked(lock, paths, resolved_alias, Some(label))?;
     }
     Ok(())
-}
-
-/// Exactly what a profile directory currently stores, if anything readable.
-///
-/// The raw bytes rather than one parsed field: a refresh can rotate the refresh
-/// token while the access token stays put, and an approval given for the old
-/// credential must not be honoured against the new one.
-fn stored_credentials(dir: &std::path::Path) -> Option<Vec<u8>> {
-    std::fs::read(dir.join("auth.json")).ok()
 }
 
 /// What must be settled before this save may overwrite the target profile.

@@ -9,9 +9,19 @@ use crate::commands::{adopt, alias, status};
 use crate::config::{self, Paths};
 use crate::profile;
 use crate::store;
+use std::io::IsTerminal;
 
 trait CodexLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()>;
+
+    /// Called once the store lock has been released and the operator is being
+    /// asked to approve replacing a profile.
+    ///
+    /// Nothing happens here in production; it exists because the window is real
+    /// — the lock is down, and another process may write to the store before the
+    /// answer arrives — and a guard against that window can only be tested by
+    /// something that can act inside it.
+    fn while_awaiting_approval(&mut self) {}
 }
 
 struct CodexCliLoginRunner;
@@ -114,10 +124,18 @@ fn run_from_with_consent(
                 alias: pending,
                 stored,
             } => {
+                // Read before the question is asked: these are the bytes the
+                // operator is agreeing to replace. The description alone cannot
+                // stand in for them — two claimless tokens for one login
+                // describe themselves identically.
+                let shown = store::profile_dir(paths, &pending)
+                    .ok()
+                    .and_then(|dir| adopt::stored_credentials(&dir));
                 // Never ask while holding the store lock: `store::lock` waits
                 // without a timeout, so a question left unanswered would stall
                 // every other codexctl process, not just this one.
                 drop(lock);
+                runner.while_awaiting_approval();
                 // Either way nothing is saved, and the login has already
                 // happened — so neither outcome is a success.
                 match adopt::approve_adoption(
@@ -125,6 +143,8 @@ fn run_from_with_consent(
                     stored.as_deref(),
                     incoming.as_deref(),
                     allow_adopt,
+                    std::io::stdin().is_terminal(),
+                    &mut std::io::stdin().lock(),
                     &mut std::io::stderr(),
                 ) {
                     adopt::Approval::Granted => {}
@@ -140,12 +160,16 @@ fn run_from_with_consent(
                 // under the new lock keeps it from being applied to whatever the
                 // store looks like now, which may be something nobody was asked
                 // about.
+                let unchanged = store::profile_dir(paths, &pending)
+                    .ok()
+                    .and_then(|dir| adopt::stored_credentials(&dir))
+                    == shown;
                 match resolve(&lock)? {
                     Resolution::Ready(target) => (lock, target),
                     Resolution::NeedsConsent {
                         alias: again,
                         stored: stored_again,
-                    } if again == pending && stored_again == stored => (lock, pending),
+                    } if again == pending && stored_again == stored && unchanged => (lock, pending),
                     Resolution::NeedsConsent { .. } => bail!(
                         "the store changed while waiting for an answer, so the approval no \
                          longer describes what would be replaced. Re-run the login."
@@ -403,6 +427,9 @@ mod tests {
     struct FakeLoginRunner {
         auth_json: String,
         seen_home: Option<PathBuf>,
+        /// Applied while the approval prompt is open, standing in for another
+        /// process writing to the store.
+        concurrent_write: Option<(PathBuf, String)>,
     }
 
     impl FakeLoginRunner {
@@ -410,7 +437,13 @@ mod tests {
             Self {
                 auth_json: auth_json.to_string(),
                 seen_home: None,
+                concurrent_write: None,
             }
+        }
+
+        fn writing_during_approval(mut self, path: PathBuf, contents: String) -> Self {
+            self.concurrent_write = Some((path, contents));
+            self
         }
     }
 
@@ -420,6 +453,12 @@ mod tests {
             std::fs::create_dir_all(codex_home)?;
             std::fs::write(codex_home.join("auth.json"), &self.auth_json)?;
             Ok(())
+        }
+
+        fn while_awaiting_approval(&mut self) {
+            if let Some((path, contents)) = self.concurrent_write.take() {
+                std::fs::write(path, contents).unwrap();
+            }
         }
     }
 
@@ -623,6 +662,61 @@ mod tests {
                 .unwrap()
                 .contains("opaque-not-a-jwt"),
             "the derived alias was overwritten"
+        );
+    }
+
+    /// The approval names one specific credential, and the lock is down while
+    /// the operator answers. Another process replacing the profile in that
+    /// window produces a profile that still *describes* itself identically —
+    /// same login, still no workspace — so nothing but the stored bytes can tell
+    /// the two apart. The approval must not carry over to the new one.
+    #[test]
+    fn an_approval_does_not_survive_a_concurrent_replacement() {
+        let (_tmp, paths) = setup_test_env();
+        let legacy = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{legacy}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // A different credential that describes itself exactly as the first
+        // does: same login claim, still no workspace.
+        let usurper = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSIsImp0aSI6Im90aGVyIn0.sig";
+        let profile_auth = paths
+            .profiles_dir()
+            .join("amir@sawmills.ai")
+            .join("auth.json");
+
+        use base64::Engine;
+        let claims =
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+        let incoming = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#))
+            .writing_during_approval(
+                profile_auth.clone(),
+                format!(r#"{{"access_token":"{usurper}"}}"#),
+            );
+
+        let error =
+            run_from_with_consent(&paths, "amir@sawmills.ai", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed while waiting"),
+            "approval was reused after the profile changed: {error}"
+        );
+        let kept = std::fs::read_to_string(&profile_auth).unwrap();
+        assert!(
+            kept.contains(usurper),
+            "a credential nobody approved replacing was overwritten"
         );
     }
 

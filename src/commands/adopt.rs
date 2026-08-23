@@ -32,20 +32,25 @@ pub enum Approval {
 ///
 /// `stored` is what the profile is understood to hold, when it declares
 /// anything at all.
+///
+/// `interactive` and `input` are supplied rather than read from the process, so
+/// that a test can exercise the prompt without depending on whether the test
+/// runner happened to be started from a terminal — which decides, for a global
+/// `stdin().is_terminal()`, between passing and blocking the whole suite.
 pub fn approve_adoption(
     alias: &str,
     stored: Option<&str>,
     arriving: Option<&str>,
     assume_yes: bool,
+    interactive: bool,
+    input: &mut impl std::io::BufRead,
     out: &mut impl std::io::Write,
 ) -> Approval {
-    use std::io::IsTerminal;
-
     if assume_yes {
         let _ = writeln!(out, "codexctl: replacing the profile saved as {alias}");
         return Approval::Granted;
     }
-    if !std::io::stdin().is_terminal() {
+    if !interactive {
         return Approval::NoTerminal;
     }
 
@@ -61,13 +66,24 @@ pub fn approve_adoption(
     let _ = out.flush();
 
     let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
+    if input.read_line(&mut answer).is_err() {
         return Approval::Declined;
     }
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Approval::Granted,
         _ => Approval::Declined,
     }
+}
+
+/// Exactly what a profile directory currently stores, if anything readable.
+///
+/// The raw bytes rather than one parsed field: a refresh can rotate the refresh
+/// token while the access token stays put, and an approval given for the old
+/// credential must not be honoured against the new one. Two distinct tokens can
+/// also describe themselves identically — same login, no workspace — so
+/// comparing descriptions is not enough to tell them apart.
+pub fn stored_credentials(dir: &std::path::Path) -> Option<Vec<u8>> {
+    std::fs::read(dir.join("auth.json")).ok()
 }
 
 /// What a profile is known to hold, phrased for an operator.
@@ -104,14 +120,39 @@ mod tests {
 
     /// The flag is the operator's answer given ahead of time, so it needs no
     /// terminal — that is the whole point of having one.
+    /// Drive the prompt with a fixed answer and no terminal question begged.
+    fn ask(assume_yes: bool, interactive: bool, answer: &str) -> (Approval, String) {
+        let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+        let mut out = Vec::new();
+        let approval = approve_adoption(
+            "work",
+            None,
+            Some("acct-team"),
+            assume_yes,
+            interactive,
+            &mut input,
+            &mut out,
+        );
+        (approval, String::from_utf8(out).unwrap())
+    }
+
     #[test]
     fn the_flag_answers_without_a_terminal() {
-        let mut out = Vec::new();
-        assert_eq!(
-            approve_adoption("work", None, Some("acct-team"), true, &mut out),
-            Approval::Granted
-        );
-        assert!(String::from_utf8(out).unwrap().contains("work"));
+        let (approval, printed) = ask(true, false, "");
+        assert_eq!(approval, Approval::Granted);
+        assert!(printed.contains("work"), "{printed}");
+    }
+
+    /// Only an explicit yes is a yes. Anything else, empty input included,
+    /// leaves the profile alone.
+    #[test]
+    fn only_an_explicit_yes_approves() {
+        for answer in ["y\n", "Y\n", "yes\n"] {
+            assert_eq!(ask(false, true, answer).0, Approval::Granted, "{answer:?}");
+        }
+        for answer in ["n\n", "\n", "", "no\n", "sure\n"] {
+            assert_eq!(ask(false, true, answer).0, Approval::Declined, "{answer:?}");
+        }
     }
 
     /// Tests have no terminal, which is exactly the condition being checked.
@@ -119,11 +160,8 @@ mod tests {
     /// treat it as the operator saying no.
     #[test]
     fn no_terminal_is_distinct_from_a_decline() {
-        let mut out = Vec::new();
-        assert_eq!(
-            approve_adoption("work", Some("acct-team"), None, false, &mut out),
-            Approval::NoTerminal
-        );
+        assert_eq!(ask(false, false, "").0, Approval::NoTerminal);
+        assert_eq!(ask(false, true, "n\n").0, Approval::Declined);
     }
 
     /// The refusal reports only what is known. Claiming a different account
