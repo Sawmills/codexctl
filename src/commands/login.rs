@@ -249,21 +249,18 @@ fn resolve_target_alias(
     incoming_account: Option<&str>,
     incoming_user: &api::Logins,
 ) -> Result<Resolution> {
+    // Where this account already lives, if anywhere. Consulted before every
+    // decision below rather than only when the requested alias is empty: the
+    // account identifies the profile, and the alias is only the name reached
+    // for. Saving a second copy forks it, which every later lookup reports as
+    // ambiguous — and the fresh login revokes the older grant server-side,
+    // leaving the duplicate dead as well as confusing.
+    let seat = profile::existing_seat(paths, incoming_account, incoming_user)
+        .context("could not check whether this account is already saved")?;
+
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {
-        // The requested alias is usable, but this seat may already be saved
-        // under another one — and saving it here too would fork one account
-        // across two profiles, which is what makes ownership ambiguous later.
-        //
-        // Checked whatever the operator typed, label or not. The account
-        // identifies the profile; the alias is only the name reached for. A
-        // mistyped alias is free by definition, so gating this on anything the
-        // operator got right is gating it on the case that never needed it —
-        // and the fresh login revokes the older grant server-side, leaving the
-        // duplicate dead as well as confusing.
-        match profile::existing_seat(paths, incoming_account, incoming_user)
-            .context("could not check whether this account is already saved")?
-        {
+        match seat {
             profile::ExistingSeat::One(existing) if existing != alias => {
                 return Ok(Resolution::Ready(existing));
             }
@@ -295,6 +292,15 @@ fn resolve_target_alias(
         // could make replacing it right. One that simply cannot be compared is a
         // question, and the operator is the only one who can answer it.
         let profile::AccountConflict::Different(different) = &conflict else {
+            // Adoption consent is permission to replace a profile nothing can
+            // identify. It is not permission to make a second copy of an
+            // account the store can already point to, so a saved seat wins
+            // over the question rather than being asked around.
+            if let profile::ExistingSeat::One(existing) = &seat
+                && existing != alias
+            {
+                return Ok(Resolution::Ready(existing.clone()));
+            }
             return Ok(Resolution::NeedsConsent {
                 alias: alias.to_string(),
                 stored,
@@ -313,9 +319,7 @@ fn resolve_target_alias(
     // another one. Refreshing that profile keeps a re-login stable and avoids a
     // second profile for one account, which is what makes ownership ambiguous
     // later. A store that cannot be scanned is not an answer of "no".
-    match profile::existing_seat(paths, incoming_account, incoming_user)
-        .context("could not check whether this account is already saved")?
-    {
+    match seat {
         profile::ExistingSeat::One(existing) => return Ok(Resolution::Ready(existing)),
         profile::ExistingSeat::Ambiguous(aliases) => {
             // Naming one of the duplicates is refreshing it, not adding to them.
@@ -850,6 +854,54 @@ mod tests {
             aliases,
             vec!["amir@sawmills.ai"],
             "one account was forked across two profiles"
+        );
+    }
+
+    /// The reuse check must not depend on the requested alias being empty.
+    ///
+    /// An alias whose occupant cannot be identified is a question, and answering
+    /// it replaces that occupant — but if the arriving account is already saved
+    /// elsewhere, replacing anything forks it. Adoption consent is permission to
+    /// overwrite an unidentifiable profile, not permission to make a second copy
+    /// of an account the store can already point to.
+    #[test]
+    fn run_from_reuses_a_saved_seat_over_an_unprovable_occupant() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // A profile nothing can identify: unreadable credentials, no claims.
+        let damaged = paths.profiles_dir().join("damaged");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            damaged.join("meta.json"),
+            r#"{"alias":"damaged","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        // Even with adoption pre-approved, the account is already saved.
+        let saved = run_from_with_consent(&paths, "damaged", None, true, &mut runner).unwrap();
+
+        assert_eq!(saved, "real", "the login forked an already-saved account");
+        assert_eq!(
+            std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
+            "{ not json",
+            "the unidentifiable profile was replaced anyway"
         );
     }
 
