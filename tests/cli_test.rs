@@ -546,8 +546,13 @@ fn save_requires_an_explicit_alias_to_pre_approve_adoption() {
 /// One account, one profile. A mistyped alias is free by definition, so nothing
 /// about the name stops a second copy being written — and the fork it leaves is
 /// what every later lookup reports as ambiguous.
+///
+/// `save` refuses rather than writing to the profile that holds the account:
+/// that profile has its own state — a possibly newer credential, its own
+/// recorded address — and deciding all of that on the operator's behalf is what
+/// naming the alias settles.
 #[test]
-fn save_reuses_the_profile_that_already_holds_this_account() {
+fn save_refuses_a_second_alias_for_an_account_it_already_holds() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path();
     std::fs::create_dir_all(home.join(".codex")).unwrap();
@@ -570,13 +575,20 @@ fn save_reuses_the_profile_that_already_holds_this_account() {
         .success();
 
     // The same account again, under a mistyped alias.
-    Command::cargo_bin("codexctl")
+    let output = Command::cargo_bin("codexctl")
         .unwrap()
         .env("HOME", home)
         .args(["save", "amir@sawmils.ai"])
         .write_stdin("y\n")
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("already saved as 'amir@sawmills.ai'"),
+        "{stderr}"
+    );
 
     let mut aliases: Vec<String> = std::fs::read_dir(home.join(".codexctl").join("profiles"))
         .unwrap()
@@ -588,107 +600,5 @@ fn save_reuses_the_profile_that_already_holds_this_account() {
         aliases,
         vec!["amir@sawmills.ai"],
         "one account was saved twice under different aliases"
-    );
-}
-
-/// Review read a redirect as able to carry `--allow-adopt` onto a profile the
-/// operator never named. The two are mutually exclusive and this pins why: a
-/// redirect needs `existing_seat` to positively match both the workspace and
-/// the login, and that is exactly the state in which nothing needs adopting.
-/// If the preconditions ever stop excluding each other, this fails.
-#[test]
-fn a_redirect_never_carries_pre_approved_adoption() {
-    use base64::Engine;
-    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
-    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
-
-    // `real` is damaged but fully identified, so a redirect is possible.
-    let case = |meta: &str| {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::write(
-            home.join(".codex").join("auth.json"),
-            format!(r#"{{"access_token":"{token}"}}"#),
-        )
-        .unwrap();
-        let real = home.join(".codexctl").join("profiles").join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::write(real.join("auth.json"), "{ not json").unwrap();
-        std::fs::write(real.join("meta.json"), meta).unwrap();
-
-        let output = Command::cargo_bin("codexctl")
-            .unwrap()
-            .env("HOME", &home)
-            .args(["save", "typo", "--allow-adopt"])
-            .write_stdin("")
-            .output()
-            .unwrap();
-        let damaged = std::fs::read_to_string(real.join("auth.json")).unwrap();
-        (String::from_utf8_lossy(&output.stdout).to_string(), damaged)
-    };
-
-    // Identified on both halves: the save redirects to `real`, and because the
-    // account is settled it takes the ordinary overwrite prompt — the adoption
-    // flag never applies, so an unanswered prompt aborts.
-    let (out, damaged) = case(
-        r#"{"alias":"real","email":null,"plan":null,"account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
-    );
-    assert!(out.contains("aborted"), "{out}");
-    assert_eq!(damaged, "{ not json", "a redirect adopted without approval");
-
-    // Workspace only: adoption would be required, and precisely because the
-    // login cannot be matched there is no redirect to carry it.
-    let (_out, damaged) = case(
-        r#"{"alias":"real","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
-    );
-    assert_eq!(damaged, "{ not json", "an unidentified profile was adopted");
-}
-
-/// A redirected save lands on a profile with its own established address. The
-/// write rebuilds metadata, so without carrying that address forward it is
-/// erased from everything `list` and `whoami` show.
-#[test]
-fn a_redirected_save_keeps_the_profile_email() {
-    let tmp = tempfile::tempdir().unwrap();
-    let home = tmp.path();
-    std::fs::create_dir_all(home.join(".codex")).unwrap();
-    // A token with no email claim, so nothing can re-derive the address.
-    use base64::Engine;
-    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
-    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
-    std::fs::write(
-        home.join(".codex").join("auth.json"),
-        format!(r#"{{"access_token":"{token}"}}"#),
-    )
-    .unwrap();
-
-    let real = home.join(".codexctl").join("profiles").join("real");
-    std::fs::create_dir_all(&real).unwrap();
-    std::fs::write(
-        real.join("auth.json"),
-        format!(r#"{{"access_token":"{token}"}}"#),
-    )
-    .unwrap();
-    std::fs::write(
-        real.join("meta.json"),
-        r#"{"alias":"real","email":"amir@sawmills.ai","plan":"team","account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
-    )
-    .unwrap();
-
-    Command::cargo_bin("codexctl")
-        .unwrap()
-        .env("HOME", home)
-        .args(["save", "typo"])
-        .write_stdin("y\n")
-        .assert()
-        .success();
-
-    let meta = std::fs::read_to_string(real.join("meta.json")).unwrap();
-    assert!(
-        meta.contains("amir@sawmills.ai"),
-        "the redirected save erased the profile's email: {meta}"
     );
 }

@@ -1127,44 +1127,6 @@ pub fn alias_for_auth_json_with_hint(
 
 /// Whether captured credentials are worth writing over the saved profile.
 ///
-/// Whether writing `candidate` over `alias` would replace a newer credential.
-///
-/// `save` is an explicit act, so it may overwrite what a profile holds. But a
-/// redirected save writes to a profile the operator did not name, and the live
-/// file can be an older copy of a seat some pinned run has since refreshed —
-/// so the ordering capture already applies has to apply here too, or the
-/// redirect quietly destroys a newer grant.
-pub fn write_would_regress(paths: &Paths, alias: &str, candidate: &Path) -> bool {
-    let Ok(dir) = store::profile_dir(paths, alias) else {
-        return false;
-    };
-    let (Ok(incoming), Ok(stored)) = (
-        api::read_auth_json(candidate),
-        api::read_auth_json(&dir.join("auth.json")),
-    ) else {
-        return false;
-    };
-    if incoming.access_token == stored.access_token
-        && incoming.refresh_token == stored.refresh_token
-    {
-        return false;
-    }
-    if let (Some(incoming_iat), Some(stored_iat)) = (
-        api::token_issued_at(&incoming.access_token),
-        api::token_issued_at(&stored.access_token),
-    ) && incoming_iat != stored_iat
-    {
-        return incoming_iat < stored_iat;
-    }
-    match (
-        api::token_expiry(&incoming.access_token),
-        api::token_expiry(&stored.access_token),
-    ) {
-        (Some(incoming_exp), Some(stored_exp)) => incoming_exp < stored_exp,
-        _ => false,
-    }
-}
-
 /// Identical credentials are not worth a write. Otherwise the newer access
 /// token wins, judged by its issued-at claim and falling back to its expiry:
 /// an older snapshot carries an older refresh token too, so taking either would
