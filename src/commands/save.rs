@@ -100,6 +100,13 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // applied to some other credential that lands there while they answer.
     let mut confirmed_state: Option<Option<Vec<u8>>> = None;
     let mut adoption_approved = false;
+    // An address the profile established, kept only when the profile is settled
+    // as this same account. A token carrying no email claim, with the `/me`
+    // lookup unavailable, would otherwise rebuild metadata with none and erase
+    // what `list` and `whoami` show. Never kept across an adoption: there the
+    // occupant is a different or unidentifiable account, and its address would
+    // label the arriving credential as somebody else.
+    let mut established_email: Option<String> = None;
     if existing.exists() {
         let adoption = classify_overwrite(
             &paths,
@@ -114,6 +121,9 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         let shown = adopt::stored_credentials(&existing);
         let approved = match adoption {
             Adoption::Unneeded => {
+                established_email = profile::get_profile_from(&paths, &resolved_alias)
+                    .ok()
+                    .and_then(|profile| profile.meta.email);
                 eprint!(
                     "profile '{}' already exists. Overwrite? [y/N] ",
                     resolved_alias
@@ -158,6 +168,8 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // block every other codexctl process for as long as the operator takes to
     // answer. That makes the checks so far advisory, so they are re-run here
     // against the store as it actually stands at write time.
+    let email = email.or(established_email);
+
     let lock = store::lock(&paths)?;
     // Everything above was decided from the auth file as it read at the start,
     // and `codexctl use` can rewrite that file while the prompt waits. The alias
