@@ -1740,6 +1740,38 @@ fn capture_cleans_up_its_snapshot() {
     );
 }
 
+/// A damaged profile belonging to somebody else must not suppress a healthy
+/// profile's capture. Failing closed against every unreadable sibling would
+/// let a valid rotation be discarded and the healthy profile expire.
+#[test]
+fn capture_proceeds_despite_an_unrelated_damaged_profile() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = synthetic_token(r#"{"sub":"seatA","jti":"stored"}"#);
+    write_profile(&paths, "mine", &stored);
+    // Damaged credentials, and its metadata names a different login.
+    let other = paths.profiles_dir().join("someone-else");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("auth.json"), "{ truncated").unwrap();
+    std::fs::write(
+        other.join("meta.json"),
+        r#"{"alias":"someone-else","email":null,"plan":null,"user_id":"seatZ","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let rotated = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{rotated}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "mine").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("mine").join("auth.json"))
+            .unwrap()
+            .contains(&rotated),
+        "an unrelated damaged profile suppressed a valid rotation"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

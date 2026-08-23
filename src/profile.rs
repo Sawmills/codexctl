@@ -788,6 +788,29 @@ fn strongest_exact_match(
     None
 }
 
+/// Whether a profile's *metadata* proves it is not the owner of this file.
+///
+/// Used where credentials cannot be read: the recorded identity is all that is
+/// left, and a field that positively disagrees is enough to rule the profile
+/// out of the decision entirely.
+fn metadata_contradicts(
+    paths: &Paths,
+    alias: &str,
+    target_workspace: Option<&str>,
+    target_login: Option<&str>,
+) -> bool {
+    let Ok(dir) = store::profile_dir(paths, alias) else {
+        return false;
+    };
+    let meta = read_meta(&dir.join("meta.json")).unwrap_or_default();
+    let workspace_disagrees = meta.account_id.is_some()
+        && target_workspace.is_some()
+        && meta.account_id.as_deref() != target_workspace;
+    let login_disagrees =
+        meta.user_id.is_some() && target_login.is_some() && meta.user_id.as_deref() != target_login;
+    workspace_disagrees || login_disagrees
+}
+
 /// Whether a stored workspace positively rules a file out.
 ///
 /// A profile declaring a workspace the file does not name is not its owner —
@@ -851,6 +874,7 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
     let Some(subject) = api::token_subject(&target.access_token) else {
         return false;
     };
+    let target_login = api::token_login(&target.access_token);
     // A store that cannot be read is not evidence that no sibling declares a
     // workspace, and a half-written profile is still a profile — both count as
     // ambiguity rather than permission for the hint. Siblings are judged by
@@ -866,7 +890,11 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
                 return true;
             };
             let Ok(sibling) = api::read_auth_json(&dir.join("auth.json")) else {
-                return true;
+                // Unreadable credentials leave only the recorded identity. It
+                // blocks unless it proves this is somebody else's profile —
+                // otherwise an unrelated damaged profile would suppress a
+                // healthy one's rotation and let it expire.
+                return !metadata_contradicts(paths, &alias, None, target_login.as_deref());
             };
             workspace_of_profile(paths, &alias).is_some()
                 && api::token_subject(&sibling.access_token).as_deref() == Some(subject.as_str())
@@ -1071,14 +1099,13 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
             // the other one says: a damaged profile for another login in the
             // same workspace is not a candidate, and letting it block would
             // discard a rotation belonging to the healthy profile that is.
-            let contradicts =
-                (meta.user_id.is_some() && target_login.is_some() && meta.user_id != target_login)
-                    || (meta.account_id.is_some()
-                        && target_account.is_some()
-                        && meta.account_id != target_account);
-            let identifies = !contradicts
-                && ((meta.user_id.is_some() && meta.user_id == target_login)
-                    || (meta.account_id.is_some() && meta.account_id == target_account));
+            let identifies = !metadata_contradicts(
+                paths,
+                &alias,
+                target_account.as_deref(),
+                target_login.as_deref(),
+            ) && ((meta.user_id.is_some() && meta.user_id == target_login)
+                || (meta.account_id.is_some() && meta.account_id == target_account));
             if identifies {
                 return Ok(None);
             }
