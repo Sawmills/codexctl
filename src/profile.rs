@@ -371,9 +371,11 @@ pub fn existing_seat(
     workspace: Option<&str>,
     user: Option<&str>,
 ) -> Result<ExistingSeat> {
-    // With nothing claimed there is nothing to match on, and every profile
-    // would look equally like the owner.
-    if workspace.is_none() && user.is_none() {
+    // Reuse replaces a profile, so it needs both halves positively matched.
+    // Comparing the claims as options would let `None == None` stand in for
+    // identity, and every legacy profile would look like the same seat as any
+    // token that happens to omit a claim.
+    if workspace.is_none() || user.is_none() {
         return Ok(ExistingSeat::None);
     }
     let matching: Vec<String> = stored_aliases(paths)?
@@ -696,6 +698,39 @@ fn alias_for_exact_token_from(paths: &Paths, auth_json: &Path) -> Option<String>
     strongest_exact_match(target.account_id.as_deref(), &candidates)
 }
 
+/// Whether a subject-only match on a claimless pair is really undecided.
+///
+/// When neither the file nor the hinted profile declares a workspace, the only
+/// evidence is the shared login — and a claimless file can equally be a
+/// rotation of a *declared* sibling on that same login, which need not carry
+/// the claim. The hint settles ties between equals; it does not settle this,
+/// so the store-wide resolver gets to answer (and refuses).
+fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profile) -> bool {
+    let (Ok(target), Ok(stored)) = (
+        api::read_auth_json(auth_json),
+        api::read_auth_json(&hinted.auth_json_path()),
+    ) else {
+        return false;
+    };
+    if target.account_id.is_some() || stored.account_id.is_some() {
+        return false;
+    }
+    let Some(subject) = api::token_subject(&target.access_token) else {
+        return false;
+    };
+    list_profiles_from(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|profile| profile.meta.alias != hinted.meta.alias)
+        .any(|profile| {
+            let Ok(sibling) = api::read_auth_json(&profile.auth_json_path()) else {
+                return false;
+            };
+            sibling.account_id.is_some()
+                && api::token_subject(&sibling.access_token).as_deref() == Some(subject.as_str())
+        })
+}
+
 pub fn alias_for_auth_json_with_hint(
     paths: &Paths,
     auth_json: &Path,
@@ -715,6 +750,7 @@ pub fn alias_for_auth_json_with_hint(
     }
     if let Some(profile) = hinted
         && auth_files_have_same_owner(auth_json, &profile.auth_json_path())
+        && !claimless_match_is_ambiguous(paths, auth_json, &profile)
     {
         return Some(profile.meta.alias);
     }

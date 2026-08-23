@@ -1024,6 +1024,60 @@ fn subject_fallback_refuses_a_claimless_token_when_a_sibling_declares_a_workspac
     );
 }
 
+/// The pinned-alias hint settles ties between equals. It does not settle a
+/// claimless file against a login that also has a declared profile: that file
+/// may be the declared sibling's rotation, so the hint must not claim it.
+#[test]
+fn hint_does_not_claim_a_claimless_token_when_a_sibling_declares_a_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy@test",
+        &synthetic_token(r#"{"sub":"seatA","jti":"legacy"}"#),
+    );
+    write_profile(
+        &paths,
+        "team@test",
+        &synthetic_token(
+            r#"{"sub":"seatA","jti":"team","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+        ),
+    );
+
+    let rotated = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{rotated}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "legacy@test").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("legacy@test").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "an undecided token was captured into the hinted profile"
+    );
+}
+
+/// Automatic seat reuse replaces a profile, so a missing claim on either side
+/// is not a match. Otherwise a claimless token would look like the same seat as
+/// any legacy profile on that login.
+#[test]
+fn existing_seat_requires_both_identity_halves() {
+    let (_tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy@test",
+        &synthetic_token(r#"{"sub":"seatA","jti":"legacy"}"#),
+    );
+
+    // The incoming token names a login but no workspace.
+    let seat = profile::existing_seat(&paths, None, Some("seatA")).unwrap();
+
+    assert!(
+        matches!(seat, profile::ExistingSeat::None),
+        "a partial identity was accepted as an exact saved seat"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
