@@ -80,24 +80,64 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     // and email were derived from that token, so a changed file invalidates the
     // decision itself, not just the checks — copying it now would store one
     // account's credentials under another's alias and email.
-    let live_now = api::read_auth_json(&auth_path)?;
+    // Snapshot the live file and work from the snapshot for the rest of this
+    // command. A native `codex login` or refresh does not take this lock, so
+    // re-reading the path later — as the profile writer would — could copy
+    // different bytes than the ones checked here.
+    let snapshot = paths.codexctl_dir().join(".save-snapshot.json");
+    let live_bytes = std::fs::read(&auth_path)
+        .with_context(|| format!("failed to read {}", auth_path.display()))?;
+    store::atomic_write(&snapshot, &live_bytes)?;
+    let saved = save_verified_snapshot(
+        &lock,
+        &paths,
+        &resolved_alias,
+        label,
+        email.as_deref(),
+        &snapshot,
+        &auth,
+        alias::optional(alias)?.is_some(),
+        overwrite_confirmed,
+    );
+    let _ = std::fs::remove_file(&snapshot);
+    saved?;
+
+    println!("saved profile '{}'", resolved_alias);
+    Ok(())
+}
+
+/// The locked half of `save`, working only from the snapshot taken above.
+#[allow(clippy::too_many_arguments)]
+fn save_verified_snapshot(
+    lock: &store::StoreLock,
+    paths: &config::Paths,
+    resolved_alias: &str,
+    label: Option<&str>,
+    email: Option<&str>,
+    snapshot: &std::path::Path,
+    verified: &api::AuthJson,
+    alias_was_explicit: bool,
+    overwrite_confirmed: bool,
+) -> Result<()> {
+    let live_now = api::read_auth_json(snapshot)?;
     // The workspace can change without the token changing: `auth.json` carries
     // an explicit `account_id` that `read_auth_json` prefers over the JWT claim,
     // so comparing tokens alone would let a switched workspace through under the
     // alias and email resolved for the previous one.
-    if live_now.access_token != auth.access_token || live_now.account_id != auth.account_id {
+    if live_now.access_token != verified.access_token || live_now.account_id != verified.account_id
+    {
         anyhow::bail!(
             "the active account changed while this save was preparing. \
              Re-run the command to save the account that is active now."
         );
     }
-    if store::profile_dir(&paths, &resolved_alias)?.exists() {
+    if store::profile_dir(paths, resolved_alias)?.exists() {
         refuse_a_different_account(
-            &paths,
-            &resolved_alias,
-            auth.account_id.as_deref(),
-            api::token_login(&auth.access_token).as_deref(),
-            alias::optional(alias)?.is_some(),
+            paths,
+            resolved_alias,
+            live_now.account_id.as_deref(),
+            api::token_login(&live_now.access_token).as_deref(),
+            alias_was_explicit,
         )?;
         // The profile appeared while this command was deciding, so nobody
         // approved overwriting it. Re-prompting is not an option with the lock
@@ -110,18 +150,10 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             );
         }
     }
-    profile::save_profile_and_activate_locked(
-        &lock,
-        &paths,
-        &resolved_alias,
-        email.as_deref(),
-        &auth_path,
-    )?;
+    profile::save_profile_and_activate_locked(lock, paths, resolved_alias, email, snapshot)?;
     if let Some(label) = label {
-        profile::set_label_locked(&lock, &paths, &resolved_alias, Some(label))?;
+        profile::set_label_locked(lock, paths, resolved_alias, Some(label))?;
     }
-
-    println!("saved profile '{}'", resolved_alias);
     Ok(())
 }
 

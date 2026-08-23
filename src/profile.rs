@@ -670,8 +670,12 @@ fn captured_auth_supersedes_profile(captured_auth: &Path, profile_auth: &Path) -
     let Ok(current) = api::read_auth_json(profile_auth) else {
         return true;
     };
+    // The workspace counts as part of the credential state: Codex can add or
+    // change an explicit `account_id` without touching either token, and
+    // discarding that leaves the profile claimless and its ownership ambiguous.
     if candidate.access_token == current.access_token
         && candidate.refresh_token == current.refresh_token
+        && candidate.account_id == current.account_id
     {
         return false;
     }

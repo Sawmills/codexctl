@@ -891,6 +891,44 @@ fn exact_token_resolution_prefers_the_declared_workspace_over_directory_order() 
     );
 }
 
+/// Codex can add an explicit `account_id` without changing either token. That
+/// is a real credential update: discarding it leaves the profile claimless, and
+/// a claimless profile is what keeps duplicate-email ownership ambiguous.
+#[test]
+fn capture_records_a_workspace_that_appears_without_a_token_change() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(r#"{"sub":"seatA","jti":"stable"}"#);
+    let dir = paths.profiles_dir().join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"work","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same token, now naming its workspace.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{token}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "work").unwrap();
+
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("acct-team"),
+        "the workspace claim was discarded"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
