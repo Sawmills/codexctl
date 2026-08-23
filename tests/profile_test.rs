@@ -993,6 +993,37 @@ fn existing_seat_sees_a_profile_left_without_metadata() {
     );
 }
 
+/// A rotated token need not carry the workspace claim, so a claimless token on
+/// a login that also has a declared profile could belong to either. Handing it
+/// to the claimless one would capture the declared account's rotation into the
+/// wrong profile.
+#[test]
+fn subject_fallback_refuses_a_claimless_token_when_a_sibling_declares_a_workspace() {
+    let (tmp, paths) = setup_test_env();
+    write_profile(
+        &paths,
+        "legacy@test",
+        &synthetic_token(r#"{"sub":"seatA","jti":"legacy"}"#),
+    );
+    write_profile(
+        &paths,
+        "team@test",
+        &synthetic_token(
+            r#"{"sub":"seatA","jti":"team","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+        ),
+    );
+
+    // Rotated, same login, declaring no workspace.
+    let live = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let auth_json = tmp.path().join("auth.json");
+    std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
+
+    assert_eq!(
+        profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
+        None
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

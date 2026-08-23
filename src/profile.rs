@@ -892,12 +892,18 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         // The target declares no workspace, so it cannot prove it belongs to a
         // profile that declares one — the same reasoning `auth_files_have_same_owner`
         // applies, and this resolver is the other way credentials reach a profile.
-        // Profiles that declare nothing either remain plausible owners.
-        None => same_seat
-            .iter()
-            .filter(|(_, account)| account.is_none())
-            .map(|(alias, _)| alias)
-            .collect(),
+        //
+        // Nor is a claimless sibling then the answer by default: a rotation of
+        // the declared account need not carry the claim either, so both remain
+        // possible owners and neither is provable. Only a field where nothing
+        // declares a workspace leaves a claimless profile as the owner.
+        None => {
+            if same_seat.iter().any(|(_, account)| account.is_some()) {
+                Vec::new()
+            } else {
+                same_seat.iter().map(|(alias, _)| alias).collect()
+            }
+        }
     };
 
     if let [alias] = candidates.as_slice() {
