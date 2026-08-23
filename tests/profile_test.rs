@@ -1570,6 +1570,84 @@ fn switch_capture_keeps_the_workspace_through_a_claimless_rotation() {
     );
 }
 
+/// The weighing rules out a claimless file against a declared sibling. The
+/// hint must apply the same rule, or it revives a candidate already ruled out.
+#[test]
+fn hint_does_not_revive_a_claimless_candidate_against_a_declared_sibling() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    write_profile(&paths, "legacy", &shared);
+    let dir = paths.profiles_dir().join("team");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same token, rotated refresh, declaring no workspace.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{shared}","refresh_token":"rotated"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "legacy").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("legacy").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "the hint revived a candidate the weighing had ruled out"
+    );
+}
+
+/// Preservation has to correct stale metadata, not merely fill an empty field:
+/// an interrupted save can leave metadata naming the previous workspace, and
+/// after a claimless capture that stale name would answer for the profile.
+#[test]
+fn capture_replaces_stale_metadata_with_the_proven_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    let token = synthetic_token(
+        r#"{"sub":"seatA","jti":"stable","https://api.openai.com/auth":{"chatgpt_account_id":"acct-new"}}"#,
+    );
+    let dir = paths.profiles_dir().join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{token}","refresh_token":"old"}}"#),
+    )
+    .unwrap();
+    // Metadata still names the workspace held before the interrupted save.
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"work","email":null,"plan":null,"account_id":"acct-old","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // A refresh rotation whose file carries no claim at all.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{token}","refresh_token":"new"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "work").unwrap();
+
+    assert_eq!(
+        profile::workspace_of_profile(&paths, "work").as_deref(),
+        Some("acct-new"),
+        "stale metadata answered for the profile after capture"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

@@ -661,8 +661,12 @@ fn capture_into_owner(paths: &Paths, source: &Path, alias: &str) {
     // evidence a profile written before the metadata field has, and leave every
     // later rotation unattributable — so it is kept in metadata instead.
     if let Some(workspace) = proven_workspace
-        && workspace_of_profile(paths, alias).is_none()
+        && workspace_of_profile(paths, alias).as_deref() != Some(workspace.as_str())
     {
+        // Not only when the lookup comes back empty: an interrupted save can
+        // leave metadata naming an older workspace, and after the copy that
+        // stale name would answer for the profile — misidentifying it and
+        // refusing the re-login that would repair it.
         record_workspace(paths, alias, &workspace);
     }
 }
@@ -738,7 +742,7 @@ fn strongest_exact_match(
     // answer is ambiguity rather than the lenient match.
     let contradicted = candidates
         .iter()
-        .any(|(_, workspace)| workspace.is_some() && workspace.as_deref() != target_workspace);
+        .any(|(_, workspace)| workspace_contradicts(target_workspace, workspace.as_deref()));
     if contradicted {
         return None;
     }
@@ -750,6 +754,15 @@ fn strongest_exact_match(
         return Some(only.0.clone());
     }
     None
+}
+
+/// Whether a stored workspace positively rules a file out.
+///
+/// A profile declaring a workspace the file does not name is not its owner —
+/// and that includes a file naming none at all, since a rotation of the
+/// declared account need not carry the claim.
+fn workspace_contradicts(target: Option<&str>, stored: Option<&str>) -> bool {
+    stored.is_some() && stored != target
 }
 
 /// A profile alias beside the workspace it effectively holds.
@@ -851,11 +864,10 @@ pub fn alias_for_auth_json_with_hint(
         // a contradiction anywhere in the set means this token demonstrably
         // spans workspaces — naming one holder would be an override, not a
         // tie-break.
+        // The same rule the weighing used: anything less would revive a
+        // candidate it had already ruled out.
         let contradicted = candidates.iter().any(|(_, workspace)| {
-            matches!(
-                (target_workspace.as_deref(), workspace.as_deref()),
-                (Some(target), Some(stored)) if target != stored
-            )
+            workspace_contradicts(target_workspace.as_deref(), workspace.as_deref())
         });
         if !contradicted
             && let Some(profile) = &hinted
