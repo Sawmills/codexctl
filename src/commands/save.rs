@@ -62,11 +62,62 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         },
     };
 
+    // One account, one profile. If this account is already saved, refresh that
+    // profile rather than adding a second copy under whatever name was reached
+    // for — a mistyped alias is free by definition, and the fork it leaves is
+    // what every later lookup reports as ambiguous.
+    let resolved_alias = match profile::existing_seat(
+        &paths,
+        auth.account_id.as_deref(),
+        &api::token_logins(&auth.access_token),
+    )
+    .context("could not check whether this account is already saved")?
+    {
+        // Refused rather than redirected. Writing credentials into a profile
+        // the operator did not name means deciding on their behalf what to do
+        // about that profile's own state — whether its saved credential is
+        // newer than the live one, which address its metadata should keep,
+        // whether the approval they gave covers it. Naming the alias answers
+        // all of that at once, and the error says which alias to name.
+        profile::ExistingSeat::One(saved) if saved != resolved_alias => anyhow::bail!(
+            "this account is already saved as '{saved}'. Save to that alias instead: {}",
+            save_command_for(&saved)
+        ),
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|saved| saved == &resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this account is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => resolved_alias,
+    };
+
+    // Claims are not the only proof of ownership. An opaque or pre-claims token
+    // gives `existing_seat` nothing to match on, so the same credential could be
+    // saved under a second alias — while being byte-identical to what the first
+    // profile holds, which the store already treats as conclusive everywhere
+    // else.
+    refuse_a_duplicate_of(
+        &profile::exact_token_seat(&paths, &auth_path)
+            .context("could not check which profile holds this credential")?,
+        &resolved_alias,
+    )?;
+
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
     // applied to some other credential that lands there while they answer.
     let mut confirmed_state: Option<Option<Vec<u8>>> = None;
     let mut adoption_approved = false;
+    // An address the profile established, kept only when the profile is settled
+    // as this same account. A token carrying no email claim, with the `/me`
+    // lookup unavailable, would otherwise rebuild metadata with none and erase
+    // what `list` and `whoami` show. Never kept across an adoption: there the
+    // occupant is a different or unidentifiable account, and its address would
+    // label the arriving credential as somebody else.
+    let mut keep_email: Option<String> = None;
     if existing.exists() {
         let adoption = classify_overwrite(
             &paths,
@@ -79,6 +130,10 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         // is being shown and agreeing to replace. Reading it afterwards would
         // silently adopt whatever landed there while they were deciding.
         let shown = adopt::stored_credentials(&existing);
+        // Decided here, once, for whichever way the overwrite goes — leaving it
+        // to one arm of the match below would make the rule the call site's
+        // rather than the rule's, and a later arm could quietly not apply it.
+        keep_email = established_email(&paths, &resolved_alias, &adoption);
         let approved = match adoption {
             Adoption::Unneeded => {
                 eprint!(
@@ -125,6 +180,8 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // block every other codexctl process for as long as the operator takes to
     // answer. That makes the checks so far advisory, so they are re-run here
     // against the store as it actually stands at write time.
+    let email = email.or(keep_email);
+
     let lock = store::lock(&paths)?;
     // Everything above was decided from the auth file as it read at the start,
     // and `codexctl use` can rewrite that file while the prompt waits. The alias
@@ -184,6 +241,41 @@ fn save_verified_snapshot(
              Re-run the command to save the account that is active now."
         );
     }
+    // The seat was resolved before the lock, because the prompt must not be held
+    // under it. A concurrent save can create the profile this one should have
+    // reused in that window, which would rebuild the duplicate this check
+    // exists to prevent. Refuse rather than redirect: the operator already
+    // answered about a specific profile, and this is not it.
+    match profile::existing_seat(
+        paths,
+        live_now.account_id.as_deref(),
+        &api::token_logins(&live_now.access_token),
+    )
+    .context("could not check whether this account is already saved")?
+    {
+        profile::ExistingSeat::One(saved) if saved != resolved_alias => anyhow::bail!(
+            "this account was saved as '{saved}' while this command was preparing. \
+             Re-run it to refresh that profile."
+        ),
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|saved| saved == resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this account is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => {}
+    }
+    // Repeated under the lock for the same reason as the seat check above, and
+    // against the snapshot rather than the live file, since that is what will be
+    // written.
+    refuse_a_duplicate_of(
+        &profile::exact_token_seat(paths, snapshot)
+            .context("could not check which profile holds this credential")?,
+        resolved_alias,
+    )?;
     if store::profile_dir(paths, resolved_alias)?.exists() {
         // Re-run under the lock against the store as it actually stands. An
         // adoption the operator already approved carries over; one that only
@@ -232,6 +324,63 @@ enum Adoption {
     /// has no way to decide. Only the operator can say whether replacing it is
     /// right, so this is a question rather than a refusal.
     AskOperator { stored: Option<String> },
+}
+
+/// A `codexctl save` command the operator can actually paste.
+///
+/// `validate_alias` accepts spaces and shell metacharacters, and these messages
+/// name an alias the operator never typed — it was found in the store. Inserting
+/// it raw turns `team account` into two arguments, an alias containing shell
+/// syntax into something else entirely, and one starting with `-` into a flag.
+fn save_command_for(alias: &str) -> String {
+    let plain = !alias.is_empty()
+        && alias
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@' | '+'));
+    let quoted = if plain {
+        alias.to_string()
+    } else {
+        format!("'{}'", alias.replace('\'', r"'\''"))
+    };
+    if alias.starts_with('-') {
+        format!("codexctl save -- {quoted}")
+    } else {
+        format!("codexctl save {quoted}")
+    }
+}
+
+/// Stop a credential already stored elsewhere from being saved again here.
+fn refuse_a_duplicate_of(seat: &profile::ExistingSeat, resolved_alias: &str) -> Result<()> {
+    match seat {
+        profile::ExistingSeat::One(owner) if owner != resolved_alias => anyhow::bail!(
+            "this credential is already saved as '{owner}'. Save to that alias instead: {}",
+            save_command_for(owner)
+        ),
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|owner| owner == resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this credential is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The address to keep when the arriving token names none.
+///
+/// Only a profile settled as this same account has an address worth keeping.
+/// Across an adoption the occupant is a different or unidentifiable account, and
+/// its address would label the arriving credential as somebody else.
+fn established_email(paths: &config::Paths, alias: &str, adoption: &Adoption) -> Option<String> {
+    match adoption {
+        Adoption::Unneeded => profile::get_profile_from(paths, alias)
+            .ok()
+            .and_then(|profile| profile.meta.email),
+        Adoption::AskOperator { .. } => None,
+    }
 }
 
 /// Decide how the target profile stands against the account being saved.
@@ -392,6 +541,79 @@ mod tests {
             stored(&paths).contains(&incoming),
             "the approved save did not land"
         );
+    }
+
+    /// The seat is resolved before the lock, so a concurrent save can create
+    /// the profile this one should have reused while the prompt is open.
+    /// Writing anyway rebuilds the duplicate the reuse check exists to prevent.
+    #[test]
+    fn refuses_when_another_alias_took_this_account_first() {
+        let (_tmp, paths, snapshot) = setup(&token("legacy"));
+        let arriving = workspace_token("acct-team");
+        std::fs::write(&snapshot, auth_bytes(&arriving)).unwrap();
+
+        // A concurrent save landed this very account under another alias.
+        let other = paths.profiles_dir().join("winner");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("auth.json"), auth_bytes(&arriving)).unwrap();
+        std::fs::write(
+            other.join("meta.json"),
+            r#"{"alias":"winner","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let approved = Some(Some(auth_bytes(&token("legacy")).into_bytes()));
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("winner"), "{error}");
+        assert!(
+            stored(&paths).contains(&token("legacy")),
+            "the duplicate was written anyway"
+        );
+    }
+
+    /// The address a profile established survives a token that names none —
+    /// but only where the profile is settled as this same account.
+    #[test]
+    fn an_established_email_is_kept_only_without_an_adoption() {
+        let (_tmp, paths, _snapshot) = setup(&token("stored"));
+        std::fs::write(
+            paths.profiles_dir().join("work").join("meta.json"),
+            r#"{"alias":"work","email":"amir@sawmills.ai","plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            established_email(&paths, "work", &Adoption::Unneeded).as_deref(),
+            Some("amir@sawmills.ai")
+        );
+        assert_eq!(
+            established_email(&paths, "work", &Adoption::AskOperator { stored: None }),
+            None,
+            "an adopted account inherited the old occupant's address"
+        );
+    }
+
+    /// The alias in these messages came from the store, not from the operator,
+    /// and `validate_alias` accepts spaces, shell syntax and a leading dash.
+    #[test]
+    fn a_suggested_save_command_can_be_pasted() {
+        assert_eq!(
+            save_command_for("amir@sawmills.ai"),
+            "codexctl save amir@sawmills.ai"
+        );
+        assert_eq!(
+            save_command_for("team account"),
+            "codexctl save 'team account'"
+        );
+        assert_eq!(save_command_for("a;rm -rf b"), "codexctl save 'a;rm -rf b'");
+        assert_eq!(save_command_for("it's"), r"codexctl save 'it'\''s'");
+        assert_eq!(save_command_for("-weird"), "codexctl save -- -weird");
     }
 
     /// The operator approved replacing one credential. Another process replaced

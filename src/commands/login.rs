@@ -126,7 +126,14 @@ fn run_from_with_consent(
         // concurrent login change the answer before the write lands.
         let lock = store::lock(paths)?;
         let resolve = |_: &store::StoreLock| {
-            resolve_target_alias(paths, alias, label, incoming.as_deref(), &incoming_user)
+            resolve_target_alias(
+                paths,
+                alias,
+                label,
+                incoming.as_deref(),
+                &incoming_user,
+                &auth_path,
+            )
         };
         let (lock, target) = match resolve(&lock)? {
             Resolution::Ready(target) => (lock, target),
@@ -198,7 +205,13 @@ fn run_from_with_consent(
         let email = profile::get_profile_from(paths, &target)
             .ok()
             .and_then(|existing| existing.meta.email)
-            .or_else(|| email_from_alias(alias));
+            .or_else(|| {
+                // The requested alias is an address for the profile it names and
+                // no other. Resolution can redirect to the profile that already
+                // holds this account, and deriving from the alias there would
+                // stamp the name typed for one account onto another's profile.
+                (target == alias).then(|| email_from_alias(alias)).flatten()
+            });
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -248,36 +261,51 @@ fn resolve_target_alias(
     label: Option<&str>,
     incoming_account: Option<&str>,
     incoming_user: &api::Logins,
+    incoming_auth: &Path,
 ) -> Result<Resolution> {
+    // Where this account already lives, if anywhere. Consulted before every
+    // decision below rather than only when the requested alias is empty: the
+    // account identifies the profile, and the alias is only the name reached
+    // for. Saving a second copy forks it, which every later lookup reports as
+    // ambiguous — and the fresh login revokes the older grant server-side,
+    // leaving the duplicate dead as well as confusing.
+    // An exact access token decides ownership on its own; claims are what a
+    // *rotated* credential has to fall back on. Asking the weaker question first
+    // and only consulting the stronger one when it came up empty inverts that:
+    // two profiles carrying the same claims read as ambiguous even when just one
+    // of them holds the credential that arrived, and the login is refused or
+    // written to the wrong one.
+    let seat = match profile::exact_token_seat(paths, incoming_auth)
+        .context("could not check which profile holds this credential")?
+    {
+        profile::ExistingSeat::None => {
+            profile::existing_seat(paths, incoming_account, incoming_user)
+                .context("could not check whether this account is already saved")?
+        }
+        exact => exact,
+    };
+
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {
-        // The requested alias is usable. When a label was given, this seat may
-        // still be saved under a label-derived alias from an earlier run — and
-        // saving it here too would fork one account across two profiles, which
-        // is what makes ownership ambiguous later.
-        if label.is_some() {
-            match profile::existing_seat(paths, incoming_account, incoming_user)
-                .context("could not check whether this account is already saved")?
-            {
-                profile::ExistingSeat::One(existing) if existing != alias => {
-                    return Ok(Resolution::Ready(existing));
-                }
-                // Already ambiguous. A free alias is room for a third copy,
-                // not permission to make one — unless the operator named one of
-                // the duplicates, which is refreshing an existing profile and
-                // the very remedy this error recommends.
-                profile::ExistingSeat::Ambiguous(aliases) => {
-                    if aliases.iter().any(|existing| existing == alias) {
-                        return Ok(Resolution::Ready(alias.to_string()));
-                    }
-                    bail!(
-                        "this account is already saved under more than one alias ({}). \
-                         Remove the duplicates, or log in with one of them directly.",
-                        aliases.join(", ")
-                    )
-                }
-                _ => {}
+        match seat {
+            profile::ExistingSeat::One(existing) if existing != alias => {
+                return Ok(Resolution::Ready(existing));
             }
+            // Already ambiguous. A free alias is room for a third copy,
+            // not permission to make one — unless the operator named one of
+            // the duplicates, which is refreshing an existing profile and
+            // the very remedy this error recommends.
+            profile::ExistingSeat::Ambiguous(aliases) => {
+                if aliases.iter().any(|existing| existing == alias) {
+                    return Ok(Resolution::Ready(alias.to_string()));
+                }
+                bail!(
+                    "this account is already saved under more than one alias ({}). \
+                     Remove the duplicates, or log in with one of them directly.",
+                    aliases.join(", ")
+                )
+            }
+            _ => {}
         }
         return Ok(Resolution::Ready(alias.to_string()));
     };
@@ -287,6 +315,39 @@ fn resolve_target_alias(
     let stored = conflict.stored().map(str::to_string);
 
     let Some(label) = label else {
+        // Wherever this account is already saved, that profile is where the
+        // login belongs — whatever the requested alias turned out to hold.
+        // Consent to replace an unidentifiable profile is not permission to make
+        // a second copy of an account the store can already point to, and a
+        // proven conflict on the requested alias is no reason to fail either:
+        // the browser login has already refreshed this grant, so stopping here
+        // discards the new token and leaves the saved profile holding the one
+        // this login just revoked.
+        match &seat {
+            // Conclusive, including when it names the alias that was asked for:
+            // reaching here only means the *claims* could not settle it, and an
+            // exact token does not need them to. Falling through would demand
+            // consent to overwrite a profile with its own credential, and refuse
+            // outright where nobody can answer.
+            profile::ExistingSeat::One(existing) => {
+                return Ok(Resolution::Ready(existing.clone()));
+            }
+            // Held under several aliases, so nothing here permits a third copy.
+            // Naming one of them is different: replacing that profile adds
+            // nothing. It falls through to the ordinary handling below, where a
+            // proven conflict still fails and an unprovable one is asked about —
+            // rather than being refused with `remove` as its only way forward.
+            profile::ExistingSeat::Ambiguous(aliases)
+                if !aliases.iter().any(|existing| existing == alias) =>
+            {
+                bail!(
+                    "this account is already saved under more than one alias ({}). \
+                     Remove the duplicates, or log in with one of them directly.",
+                    aliases.join(", ")
+                )
+            }
+            _ => {}
+        }
         // A claim that positively disagrees is never this account, so no answer
         // could make replacing it right. One that simply cannot be compared is a
         // question, and the operator is the only one who can answer it.
@@ -309,15 +370,13 @@ fn resolve_target_alias(
     // another one. Refreshing that profile keeps a re-login stable and avoids a
     // second profile for one account, which is what makes ownership ambiguous
     // later. A store that cannot be scanned is not an answer of "no".
-    match profile::existing_seat(paths, incoming_account, incoming_user)
-        .context("could not check whether this account is already saved")?
-    {
+    match seat {
         profile::ExistingSeat::One(existing) => return Ok(Resolution::Ready(existing)),
         profile::ExistingSeat::Ambiguous(aliases) => {
-            // Naming one of the duplicates is refreshing it, not adding to them.
-            if aliases.iter().any(|existing| existing == alias) {
-                return Ok(Resolution::Ready(alias.to_string()));
-            }
+            // Naming one of them is not refreshing it here: the requested alias
+            // holds something this account cannot be matched to, so membership
+            // says only that the credential is stored there — which for an
+            // exact-token match can mean a profile for another workspace.
             bail!(
                 "this account is already saved under more than one alias ({}). \
                  Remove the duplicates, or log in with one of them directly.",
@@ -792,6 +851,479 @@ mod tests {
                 .unwrap()
                 .contains(legacy),
             "the live credential was replaced with an unreadable one"
+        );
+    }
+
+    /// A login to a free alias for an account that is already saved.
+    ///
+    /// A mistyped alias is the everyday way to reach this, and the alias being
+    /// free is exactly why nothing stops it. Saving here anyway forks one
+    /// account across two profiles, which every later lookup reports as
+    /// ambiguous — and the fresh login revokes the older profile's grant
+    /// server-side, so the duplicate left behind is dead as well as confusing.
+    /// The account is what identifies the profile, not the string typed for it.
+    #[test]
+    fn run_from_reuses_a_saved_seat_when_the_alias_is_a_typo() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The same account signing in again, under a mistyped alias.
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "amir@sawmils.ai", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "amir@sawmills.ai",
+            "a login for an already-saved account landed on a second alias"
+        );
+        let mut aliases: Vec<String> = std::fs::read_dir(paths.profiles_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        aliases.sort();
+        assert_eq!(
+            aliases,
+            vec!["amir@sawmills.ai"],
+            "one account was forked across two profiles"
+        );
+    }
+
+    /// The reuse check must not depend on the requested alias being empty.
+    ///
+    /// An alias whose occupant cannot be identified is a question, and answering
+    /// it replaces that occupant — but if the arriving account is already saved
+    /// elsewhere, replacing anything forks it. Adoption consent is permission to
+    /// overwrite an unidentifiable profile, not permission to make a second copy
+    /// of an account the store can already point to.
+    #[test]
+    fn run_from_reuses_a_saved_seat_over_an_unprovable_occupant() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // A profile nothing can identify: unreadable credentials, no claims.
+        let damaged = paths.profiles_dir().join("damaged");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            damaged.join("meta.json"),
+            r#"{"alias":"damaged","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        // Even with adoption pre-approved, the account is already saved.
+        let saved = run_from_with_consent(&paths, "damaged", None, true, &mut runner).unwrap();
+
+        assert_eq!(saved, "real", "the login forked an already-saved account");
+        assert_eq!(
+            std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
+            "{ not json",
+            "the unidentifiable profile was replaced anyway"
+        );
+    }
+
+    /// Consent to replace a profile nothing can identify is not consent to add
+    /// a third copy of an account already saved twice.
+    #[test]
+    fn adoption_does_not_add_a_third_copy_of_an_ambiguous_account() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        for alias in ["one", "two"] {
+            profile::save_profile_to(&paths, alias, None, &paths.codex_auth_json().clone())
+                .unwrap();
+        }
+        // A third alias holding something nothing can identify.
+        let damaged = paths.profiles_dir().join("damaged");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            damaged.join("meta.json"),
+            r#"{"alias":"damaged","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let error = run_from_with_consent(&paths, "damaged", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias"),
+            "adoption added a third copy: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
+            "{ not json",
+            "the damaged profile was replaced"
+        );
+    }
+
+    /// The requested alias holds a proven different account, and this account
+    /// is saved elsewhere. Failing here would be worse than useless: the
+    /// browser login has already run and revoked the grant the saved profile
+    /// holds, and the fresh token then goes in the bin with the isolated home.
+    #[test]
+    fn run_from_saves_to_the_known_seat_when_the_named_alias_holds_another() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let mine = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{mine}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // A different account occupies the alias about to be typed.
+        let other = encode(
+            r#"{"sub":"seatB","https://api.openai.com/auth":{"chatgpt_account_id":"acct-personal","chatgpt_user_id":"user-b"}}"#,
+        );
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{other}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "personal", None, &paths.codex_auth_json().clone())
+            .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "personal", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "team", "the refreshed credential was discarded");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json"))
+                .unwrap()
+                .contains(&refreshed),
+            "the known seat did not receive its refreshed token"
+        );
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("personal").join("auth.json"))
+                .unwrap()
+                .contains(&other),
+            "the unrelated profile was overwritten"
+        );
+    }
+
+    /// The requested alias is an address for the profile it names and no other.
+    /// A redirect lands on a different profile, so deriving an address from that
+    /// alias would record one account's name against another's credentials.
+    #[test]
+    fn a_redirected_login_does_not_take_its_email_from_the_requested_alias() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        // No email claim anywhere, so only the alias could supply one.
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let mine = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{mine}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "personal@example.com", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "team");
+        let meta =
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("meta.json")).unwrap();
+        assert!(
+            !meta.contains("personal@example.com"),
+            "the requested alias was recorded as another account's address: {meta}"
+        );
+    }
+
+    /// A device login can return an opaque or pre-claims credential, which the
+    /// claim-based seat lookup cannot match. Byte-identical to one already
+    /// stored still proves whose it is, and without consulting that the login
+    /// writes a second profile for the same credential.
+    #[test]
+    fn run_from_reuses_a_saved_seat_for_an_identical_opaque_credential() {
+        let (_tmp, paths) = setup_test_env();
+        let opaque = r#"{"access_token":"opaque-not-a-jwt"}"#;
+        std::fs::write(paths.codex_auth_json(), opaque).unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        let mut runner = FakeLoginRunner::new(opaque);
+
+        let saved = run_from(&paths, "typo", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "real",
+            "an identical credential forked a new profile"
+        );
+        assert!(
+            !paths.profiles_dir().join("typo").exists(),
+            "a second profile was created for one credential"
+        );
+    }
+
+    /// One access token can name two workspaces through an explicit
+    /// `account_id`. A holder declaring a different one is a different account,
+    /// so redirecting there would overwrite it with another workspace's
+    /// credentials — the opposite of what the reuse rule is for.
+    #[test]
+    fn an_identical_token_in_another_workspace_is_not_the_same_seat() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        // The saved profile holds this token for workspace A.
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{shared}","account_id":"acct-a"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "workspace-a",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The login returns the same token, declaring workspace B.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-b"}}"#
+        ));
+
+        let saved = run_from(&paths, "workspace-b", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "workspace-b",
+            "a second workspace was folded into the first"
+        );
+        let kept =
+            std::fs::read_to_string(paths.profiles_dir().join("workspace-a").join("auth.json"))
+                .unwrap();
+        assert!(
+            kept.contains("acct-a"),
+            "the first workspace's profile was overwritten: {kept}"
+        );
+    }
+
+    /// Being listed among the holders of a credential is not proof of owning
+    /// the arriving account. One token stored for two workspaces makes every
+    /// holder ambiguous, so naming one of them must not be read as refreshing
+    /// it — that would overwrite a profile for another workspace outright,
+    /// past the conflict that proves it is another workspace.
+    #[test]
+    fn membership_in_an_ambiguous_holder_set_is_not_ownership() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        for (alias, workspace) in [("acct-a-profile", "acct-a"), ("acct-b-profile", "acct-b")] {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}","account_id":"{workspace}"}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null,"account_id":"{workspace}","saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        // The same token arriving for a third workspace.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-c"}}"#
+        ));
+
+        let error =
+            run_from_with_consent(&paths, "acct-a-profile", None, true, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than one alias")
+                || error.to_string().contains("different account"),
+            "unhelpful refusal: {error}"
+        );
+        let kept = std::fs::read_to_string(
+            paths
+                .profiles_dir()
+                .join("acct-a-profile")
+                .join("auth.json"),
+        )
+        .unwrap();
+        assert!(
+            kept.contains("acct-a"),
+            "a profile for another workspace was overwritten: {kept}"
+        );
+    }
+
+    /// An exact access token decides ownership on its own. Two profiles can
+    /// carry the same claims while only one holds the credential that arrived —
+    /// asking the claims first reads that as ambiguous and either refuses a
+    /// resolvable login or refreshes the wrong copy.
+    #[test]
+    fn exact_token_ownership_outranks_ambiguous_claims() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let held = encode(claims);
+        let other = encode(claims).replace(".sig", ".sig-other");
+
+        // Both profiles claim the same account; only `holder` has the token.
+        for (alias, token) in [("holder", &held), ("twin", &other)] {
+            std::fs::write(
+                paths.codex_auth_json(),
+                format!(r#"{{"access_token":"{token}"}}"#),
+            )
+            .unwrap();
+            profile::save_profile_to(&paths, alias, None, &paths.codex_auth_json().clone())
+                .unwrap();
+        }
+
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{held}"}}"#));
+
+        let saved = run_from(&paths, "fresh-alias", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "holder",
+            "claims ambiguity hid the profile that actually holds this credential"
+        );
+        assert!(
+            !paths.profiles_dir().join("fresh-alias").exists(),
+            "a resolvable login created a new profile"
+        );
+    }
+
+    /// A profile refreshing its own credential must not be asked to approve
+    /// replacing itself. The claims cannot settle it when only one side names a
+    /// workspace, but the token is identical — and an unattended run would fail
+    /// and throw away a login that already completed.
+    #[test]
+    fn an_exact_token_settles_the_alias_that_was_asked_for() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{shared}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // The same token, now naming a workspace the stored copy never did.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-a"}}"#
+        ));
+
+        // No approval available, and none should be needed.
+        let saved = run_from(&paths, "real", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "real");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("real").join("auth.json"))
+                .unwrap()
+                .contains("acct-a"),
+            "the profile did not take its own refreshed credential"
+        );
+    }
+
+    /// Naming one of several holders is not adding a copy — replacing it leaves
+    /// the same number of profiles. Refusing outright would leave `remove` as
+    /// the only way forward, which is the shape this design exists to avoid.
+    #[test]
+    fn a_named_ambiguous_holder_can_still_be_adopted() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        let write = |alias: &str, account: Option<&str>| {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            let field = account
+                .map(|a| format!(r#","account_id":"{a}""#))
+                .unwrap_or_default();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}"{field}}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null{field},"saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write("claimless", None);
+        write("other", Some("acct-b"));
+
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-c"}}"#
+        ));
+
+        let saved = run_from_with_consent(&paths, "claimless", None, true, &mut runner).unwrap();
+
+        assert_eq!(saved, "claimless");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("other").join("auth.json"))
+                .unwrap()
+                .contains("acct-b"),
+            "the other holder was touched"
         );
     }
 

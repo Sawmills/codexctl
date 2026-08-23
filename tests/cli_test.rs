@@ -542,3 +542,232 @@ fn save_requires_an_explicit_alias_to_pre_approve_adoption() {
         "{stderr}"
     );
 }
+
+/// One account, one profile. A mistyped alias is free by definition, so nothing
+/// about the name stops a second copy being written — and the fork it leaves is
+/// what every later lookup reports as ambiguous.
+///
+/// `save` refuses rather than writing to the profile that holds the account:
+/// that profile has its own state — a possibly newer credential, its own
+/// recorded address — and deciding all of that on the operator's behalf is what
+/// naming the alias settles.
+#[test]
+fn save_refuses_a_second_alias_for_an_account_it_already_holds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    use base64::Engine;
+    // The email claim is present so `save` never falls back to the `/me`
+    // endpoint: a test that reaches the network is slow offline and depends on
+    // a service it is not trying to exercise.
+    let claims = r#"{"sub":"seatA","https://api.openai.com/profile":{"email":"amir@sawmills.ai"},"https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    std::fs::write(
+        home.join(".codex").join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "amir@sawmills.ai"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    // The same account again, under a mistyped alias.
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "amir@sawmils.ai"])
+        .write_stdin("y\n")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("already saved as 'amir@sawmills.ai'"),
+        "{stderr}"
+    );
+
+    let mut aliases: Vec<String> = std::fs::read_dir(home.join(".codexctl").join("profiles"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    aliases.sort();
+    assert_eq!(
+        aliases,
+        vec!["amir@sawmills.ai"],
+        "one account was saved twice under different aliases"
+    );
+}
+
+/// End-to-end cover for what `save` writes into `meta.json` when the arriving
+/// token names no address: the profile's established one survives a same-account
+/// save, and never follows an adoption onto a different account.
+///
+/// The `/me` fallback is what makes this case reachable, so the proxy is pointed
+/// at a closed port: the lookup fails at once instead of reaching the real
+/// service, which would make the suite slow and dependent on it.
+#[test]
+fn save_writes_the_right_email_when_the_token_names_none() {
+    use base64::Engine;
+    // Deliberately no profile/email claim — that is the case under test.
+    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+
+    let run = |stored_auth: String, meta: &str, args: &[&str]| {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            format!(r#"{{"access_token":"{token}"}}"#),
+        )
+        .unwrap();
+        let dir = home.join(".codexctl").join("profiles").join("real");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), stored_auth).unwrap();
+        std::fs::write(dir.join("meta.json"), meta).unwrap();
+        let output = Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", &home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .args(args)
+            .write_stdin("y\n")
+            .output()
+            .unwrap();
+        // Without this the assertions read a file the command never touched: the
+        // starting metadata already satisfies one of them, so a save that failed
+        // early would pass for the wrong reason.
+        assert!(output.status.success(), "{args:?} failed: {output:?}");
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains(&token),
+            "{args:?} did not write the credential"
+        );
+        std::fs::read_to_string(dir.join("meta.json")).unwrap()
+    };
+
+    // Settled as the same account: the established address survives the write.
+    let meta = run(
+        format!(r#"{{"access_token":"{token}"}}"#),
+        r#"{"alias":"real","email":"amir@sawmills.ai","plan":"team","account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
+        &["save", "real"],
+    );
+    assert!(
+        meta.contains("amir@sawmills.ai"),
+        "the established email was erased: {meta}"
+    );
+
+    // Adopted: the previous occupant cannot be shown to be this account, so its
+    // address must not label the arriving credential.
+    let meta = run(
+        "{ not json".to_string(),
+        r#"{"alias":"real","email":"someone-else@example.com","plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        &["save", "real", "--allow-adopt"],
+    );
+    assert!(
+        !meta.contains("someone-else@example.com"),
+        "an adopted account inherited the old occupant's address: {meta}"
+    );
+}
+
+/// Claims are not the only proof of ownership. An opaque or pre-claims token
+/// gives the seat lookup nothing to match on, so without honouring the exact
+/// token the same credential lands under a second alias — the duplicate this
+/// whole change exists to prevent.
+#[test]
+fn save_refuses_a_second_alias_for_an_identical_opaque_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex").join("auth.json"),
+        r#"{"access_token":"opaque-not-a-jwt"}"#,
+    )
+    .unwrap();
+
+    let save = |alias: &str| {
+        Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .args(["save", alias])
+            .write_stdin("y\n")
+            .output()
+            .unwrap()
+    };
+
+    assert!(save("alias-a").status.success());
+    let second = save("alias-b");
+    assert!(!second.status.success(), "{second:?}");
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(stderr.contains("already saved as 'alias-a'"), "{stderr}");
+
+    let mut aliases: Vec<String> = std::fs::read_dir(home.join(".codexctl").join("profiles"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    aliases.sort();
+    assert_eq!(aliases, vec!["alias-a"], "one credential was saved twice");
+}
+
+/// Two profiles already holding one credential is a reason to refuse a third,
+/// not a reason to behave as though none held it. A lookup that reports "no
+/// single owner" for both cases loses exactly that distinction.
+#[test]
+fn save_refuses_a_third_alias_for_an_already_duplicated_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    let auth = r#"{"access_token":"opaque-not-a-jwt"}"#;
+    std::fs::write(home.join(".codex").join("auth.json"), auth).unwrap();
+    // Two aliases already hold it, as an older codexctl could leave them.
+    for alias in ["alias-a", "alias-b"] {
+        let dir = home.join(".codexctl").join("profiles").join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"alias":"{alias}","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .args(["save", "alias-c"])
+        .write_stdin("y\n")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("more than one alias"), "{stderr}");
+    assert!(
+        !home
+            .join(".codexctl")
+            .join("profiles")
+            .join("alias-c")
+            .exists(),
+        "a third copy was created"
+    );
+}
