@@ -91,12 +91,20 @@ fn run_from(
             incoming_user.as_deref(),
         )?;
 
-        // The address is the alias the operator asked for. A resolved target —
-        // label-qualified, or an existing alias this seat was matched to — is a
-        // store key, and `email_from_alias` would happily read `a@b.com+work`
-        // as an address. This is only a fallback either way: a token carrying an
-        // email claim still wins.
-        let email = email_from_alias(alias);
+        // Only a fallback either way: a token carrying an email claim wins.
+        //
+        // When the login lands on the alias that was asked for, that alias is
+        // the address. When it is redirected to a profile that already exists,
+        // the address is whatever that profile already recorded — deriving one
+        // from the requested alias would overwrite an established email with an
+        // unrelated string, or with nothing at all.
+        let email = if target == alias {
+            email_from_alias(alias)
+        } else {
+            profile::get_profile_from(paths, &target)
+                .ok()
+                .and_then(|existing| existing.meta.email)
+        };
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -148,13 +156,20 @@ fn resolve_target_alias(
                 profile::ExistingSeat::One(existing) if existing != alias => {
                     return Ok(existing);
                 }
-                // Already ambiguous. A free alias is room for a third copy, not
-                // permission to make one.
-                profile::ExistingSeat::Ambiguous(aliases) => bail!(
-                    "this account is already saved under more than one alias ({}). \
-                     Remove the duplicates, or log in with one of them directly.",
-                    aliases.join(", ")
-                ),
+                // Already ambiguous. A free alias is room for a third copy,
+                // not permission to make one — unless the operator named one of
+                // the duplicates, which is refreshing an existing profile and
+                // the very remedy this error recommends.
+                profile::ExistingSeat::Ambiguous(aliases) => {
+                    if aliases.iter().any(|existing| existing == alias) {
+                        return Ok(alias.to_string());
+                    }
+                    bail!(
+                        "this account is already saved under more than one alias ({}). \
+                         Remove the duplicates, or log in with one of them directly.",
+                        aliases.join(", ")
+                    )
+                }
                 _ => {}
             }
         }
@@ -182,11 +197,17 @@ fn resolve_target_alias(
         .context("could not check whether this account is already saved")?
     {
         profile::ExistingSeat::One(existing) => return Ok(existing),
-        profile::ExistingSeat::Ambiguous(aliases) => bail!(
-            "this account is already saved under more than one alias ({}). \
-             Remove the duplicates, or log in with one of them directly.",
-            aliases.join(", ")
-        ),
+        profile::ExistingSeat::Ambiguous(aliases) => {
+            // Naming one of the duplicates is refreshing it, not adding to them.
+            if aliases.iter().any(|existing| existing == alias) {
+                return Ok(alias.to_string());
+            }
+            bail!(
+                "this account is already saved under more than one alias ({}). \
+                 Remove the duplicates, or log in with one of them directly.",
+                aliases.join(", ")
+            )
+        }
         profile::ExistingSeat::None => {}
     }
 
@@ -779,6 +800,53 @@ mod tests {
                 .unwrap()
                 .contains("opaque-not-a-jwt"),
             "an intact profile was overwritten"
+        );
+    }
+
+    /// Naming one of the duplicates is refreshing it, not adding a third — and
+    /// it is the remedy the ambiguity error itself recommends.
+    #[test]
+    fn run_from_refreshes_a_named_alias_from_an_ambiguous_set() {
+        let (_tmp, paths) = setup_test_env();
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "work", None, &source).unwrap();
+        profile::save_profile_to(&paths, "work-copy", None, &source).unwrap();
+
+        let refreshed = format!("{}refreshed", synthetic_token("acct-team"));
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let target = run_from(&paths, "work", Some("team"), &mut runner).unwrap();
+
+        assert_eq!(target, "work", "a named duplicate could not be refreshed");
+        assert!(
+            !paths.profiles_dir().join("work+team").exists(),
+            "a third copy was created"
+        );
+    }
+
+    /// A login redirected to an existing profile keeps the address that profile
+    /// already recorded, rather than replacing it from an unrelated alias.
+    #[test]
+    fn run_from_keeps_the_existing_email_when_redirected_to_a_seat() {
+        let (_tmp, paths) = setup_test_env();
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir-team", Some("amir@sawmills.ai"), &source).unwrap();
+
+        // Requested under an unrelated alias; the token carries no email claim.
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{team}"}}"#));
+        let target = run_from(&paths, "temporary", Some("team"), &mut runner).unwrap();
+
+        assert_eq!(target, "amir-team", "the existing seat was not reused");
+        let meta =
+            std::fs::read_to_string(paths.profiles_dir().join("amir-team").join("meta.json"))
+                .unwrap();
+        assert!(
+            meta.contains("amir@sawmills.ai"),
+            "the established email was discarded: {meta}"
         );
     }
 
