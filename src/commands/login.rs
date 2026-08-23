@@ -180,8 +180,8 @@ fn resolve_target_alias(
         bail!(
             "profile '{alias}' holds a different account \
              (stored workspace {}, this login {arriving}). \
-             Re-run with --label <name> to save it alongside, \
-             or choose another alias.",
+             Re-run with --label <name> to save it alongside, choose another \
+             alias, or remove it first: codexctl remove {alias}",
             profile::short_workspace(&stored)
         );
     };
@@ -1302,11 +1302,12 @@ mod tests {
         assert!(saved.contains(&refreshed));
     }
 
-    /// An unreadable stored token is a likely reason to re-run login, so it
-    /// must not be the reason the fresh login is discarded. Capture may never
-    /// route the stale live file back over the alias being written.
+    /// A damaged profile that still records *which account* it holds is not
+    /// open to anyone who names a login. Its own login cannot be recovered from
+    /// the broken token, so a colleague in the same workspace would otherwise
+    /// replace it. Repair means removing it first, which the error says.
     #[test]
-    fn run_from_keeps_the_new_login_when_the_stored_auth_is_unreadable() {
+    fn run_from_refuses_to_replace_an_identified_profile_with_unreadable_auth() {
         let (_tmp, paths) = setup_test_env();
         let live = synthetic_token("acct-team");
         std::fs::write(
@@ -1316,7 +1317,7 @@ mod tests {
         .unwrap();
         profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
         profile::set_active_from(&paths, "team").unwrap();
-        // Corrupt the stored token, which is what sends an operator back to login.
+        // Metadata still records the workspace; only the token is corrupt.
         std::fs::write(
             paths.profiles_dir().join("team").join("auth.json"),
             "{ not json",
@@ -1326,13 +1327,43 @@ mod tests {
         let fresh = format!("{}fresh", synthetic_token("acct-team"));
         let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{fresh}"}}"#));
 
-        run_from(&paths, "team", None, &mut runner).unwrap();
+        let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
 
+        assert!(
+            error.to_string().contains("codexctl remove team"),
+            "the refusal does not name the remedy: {error}"
+        );
         let saved =
             std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json")).unwrap();
-        assert!(saved.contains(&fresh), "fresh login was discarded");
-        let installed = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
-        assert!(installed.contains(&fresh), "stale token was reinstalled");
+        assert!(!saved.contains(&fresh), "the damaged profile was replaced");
+    }
+
+    /// A profile with nothing left to identify it — no readable token and no
+    /// recorded account — is the one an operator is sent back to `login` to
+    /// repair, and that still works.
+    #[test]
+    fn run_from_repairs_a_profile_with_no_identity_at_all() {
+        let (_tmp, paths) = setup_test_env();
+        let dir = paths.profiles_dir().join("broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"broken","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let fresh = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{fresh}"}}"#));
+
+        run_from(&paths, "broken", None, &mut runner).unwrap();
+
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains(&fresh),
+            "an unidentifiable profile could not be repaired"
+        );
     }
 
     /// A bad label must cost nothing. Failing after the device-auth flow would

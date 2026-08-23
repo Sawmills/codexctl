@@ -446,21 +446,17 @@ pub fn conflicting_workspace(
     // so a legacy profile that never recorded one cannot confirm that an
     // arriving workspace is the same account.
     let workspace_settled = claims_agree(incoming_account, stored_workspace.as_deref());
-    // The login only has to not contradict. A workspace is shared, so a
-    // different login in it is a different account; but a stored login that was
-    // never recorded blocks nothing on its own, which is what keeps a profile
-    // repairable when its token is unreadable and only metadata remains.
-    // A stored login that is merely absent blocks nothing only when there is
-    // genuinely nothing to read — an unreadable token is what sends an operator
-    // back to `login` to repair the profile. A *readable* token that yields no
-    // login is different: the profile is intact, its owner is simply unproven,
-    // and a workspace does not identify its owner.
+    // The login must be settled too, and a workspace does not settle it: a team
+    // workspace holds many people, so agreeing on it says nothing about whose
+    // credentials these are.
+    //
+    // A profile whose stored login cannot be recovered is not thereby open to
+    // anyone who names one. The only profile safe to replace on no evidence is
+    // one with no identity at all, and that case has already returned above —
+    // reaching here means this profile still has something worth protecting.
     let user_contradicts = match (incoming_user, stored_user.as_deref()) {
         (Some(incoming), Some(stored)) => incoming != stored,
-        (Some(_), None) => stored_auth_readable,
-        // The arriving token names no login at all. A workspace is shared, so
-        // agreeing on it proves nothing about whose credentials these are, and
-        // the profile does name someone.
+        (Some(_), None) => true,
         (None, Some(_)) => true,
         (None, None) => false,
     };
