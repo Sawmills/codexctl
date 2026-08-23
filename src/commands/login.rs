@@ -324,17 +324,22 @@ fn resolve_target_alias(
         // discards the new token and leaves the saved profile holding the one
         // this login just revoked.
         match &seat {
-            profile::ExistingSeat::One(existing) if existing != alias => {
+            // Conclusive, including when it names the alias that was asked for:
+            // reaching here only means the *claims* could not settle it, and an
+            // exact token does not need them to. Falling through would demand
+            // consent to overwrite a profile with its own credential, and refuse
+            // outright where nobody can answer.
+            profile::ExistingSeat::One(existing) => {
                 return Ok(Resolution::Ready(existing.clone()));
             }
-            // Already saved more than once. Nothing here is permission to add
-            // a third copy — and naming one of them is not permission either,
-            // because reaching this branch means the requested alias holds
-            // something this account cannot be matched to. Membership in the
-            // set proves only that the credential is stored there, which for an
-            // exact-token match can mean a profile for another workspace
-            // entirely.
-            profile::ExistingSeat::Ambiguous(aliases) => {
+            // Held under several aliases, so nothing here permits a third copy.
+            // Naming one of them is different: replacing that profile adds
+            // nothing. It falls through to the ordinary handling below, where a
+            // proven conflict still fails and an unprovable one is asked about —
+            // rather than being refused with `remove` as its only way forward.
+            profile::ExistingSeat::Ambiguous(aliases)
+                if !aliases.iter().any(|existing| existing == alias) =>
+            {
                 bail!(
                     "this account is already saved under more than one alias ({}). \
                      Remove the duplicates, or log in with one of them directly.",
@@ -1243,6 +1248,82 @@ mod tests {
         assert!(
             !paths.profiles_dir().join("fresh-alias").exists(),
             "a resolvable login created a new profile"
+        );
+    }
+
+    /// A profile refreshing its own credential must not be asked to approve
+    /// replacing itself. The claims cannot settle it when only one side names a
+    /// workspace, but the token is identical — and an unattended run would fail
+    /// and throw away a login that already completed.
+    #[test]
+    fn an_exact_token_settles_the_alias_that_was_asked_for() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{shared}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "real", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // The same token, now naming a workspace the stored copy never did.
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-a"}}"#
+        ));
+
+        // No approval available, and none should be needed.
+        let saved = run_from(&paths, "real", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "real");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("real").join("auth.json"))
+                .unwrap()
+                .contains("acct-a"),
+            "the profile did not take its own refreshed credential"
+        );
+    }
+
+    /// Naming one of several holders is not adding a copy — replacing it leaves
+    /// the same number of profiles. Refusing outright would leave `remove` as
+    /// the only way forward, which is the shape this design exists to avoid.
+    #[test]
+    fn a_named_ambiguous_holder_can_still_be_adopted() {
+        let (_tmp, paths) = setup_test_env();
+        let shared = "opaque-not-a-jwt";
+        let write = |alias: &str, account: Option<&str>| {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            let field = account
+                .map(|a| format!(r#","account_id":"{a}""#))
+                .unwrap_or_default();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}"{field}}}"#),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null{field},"saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        };
+        write("claimless", None);
+        write("other", Some("acct-b"));
+
+        let mut runner = FakeLoginRunner::new(&format!(
+            r#"{{"access_token":"{shared}","account_id":"acct-c"}}"#
+        ));
+
+        let saved = run_from_with_consent(&paths, "claimless", None, true, &mut runner).unwrap();
+
+        assert_eq!(saved, "claimless");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("other").join("auth.json"))
+                .unwrap()
+                .contains("acct-b"),
+            "the other holder was touched"
         );
     }
 
