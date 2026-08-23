@@ -55,12 +55,19 @@ pub fn approve_adoption(
     }
 
     let held = describes(stored);
+    // `arriving` is the incoming workspace, not a login. Calling it one names
+    // the wrong half of the identity in the one message that has to be exact.
     let arriving = arriving
-        .map(|arriving| format!(" this login is {}.", profile::short_workspace(arriving)))
+        .map(|arriving| {
+            format!(
+                " That account is in workspace {}.",
+                profile::short_workspace(arriving)
+            )
+        })
         .unwrap_or_default();
     let _ = write!(
         out,
-        "codexctl: profile '{alias}' {held} cannot be matched to this login.{arriving} \
+        "codexctl: profile '{alias}' {held} cannot be matched to the account signing in.{arriving} \
          Replace it? Its saved credentials are overwritten. [y/N] "
     );
     let _ = out.flush();
