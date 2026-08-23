@@ -685,9 +685,18 @@ pub fn extract_account_id(token: &str) -> Option<String> {
 /// without it two seats in one workspace both resolve to "unknown" and an
 /// ownership guard reads that as agreement.
 pub fn token_login(token: &str) -> Option<String> {
-    token_identity(token)
-        .and_then(|identity| identity.user_id)
-        .or_else(|| token_subject(token))
+    // Tagged with the claim it came from, so the two never compare equal by
+    // accident: `chatgpt_user_id` and `sub` are different namespaces, and a
+    // token naming one must not match a profile identified by the other.
+    if let Some(user_id) = token_identity(token).and_then(|identity| identity.user_id) {
+        return Some(format!("uid:{user_id}"));
+    }
+    token_subject(token).map(|subject| format!("sub:{subject}"))
+}
+
+/// The same tag for a `chatgpt_user_id` already recorded in metadata.
+pub fn recorded_login(user_id: &str) -> String {
+    format!("uid:{user_id}")
 }
 
 /// The `sub` (subject) claim — identifies the individual seat/user behind a token.

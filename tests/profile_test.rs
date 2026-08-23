@@ -788,18 +788,18 @@ fn workspace_comes_from_the_stored_token_when_metadata_lags() {
     // profile. (`seatA` is the stored token's subject, which is the login claim
     // a real incoming token always carries.)
     assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("seatA")),
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatA")),
         None
     );
     // ...while the stale metadata's workspace is still refused.
     assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("seatA"))
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-old"), Some("sub:seatA"))
             .as_deref(),
         Some("acct-new")
     );
     // A different login in the workspace actually stored is refused too.
     assert_eq!(
-        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("seatB"))
+        profile::conflicting_workspace(&paths, "work@test", Some("acct-new"), Some("sub:seatB"))
             .as_deref(),
         Some("acct-new")
     );
@@ -989,7 +989,7 @@ fn existing_seat_sees_a_profile_left_without_metadata() {
     .unwrap();
     // No meta.json: the save stopped between the two writes.
 
-    let seat = profile::existing_seat(&paths, Some("acct-team"), Some("seatA")).unwrap();
+    let seat = profile::existing_seat(&paths, Some("acct-team"), Some("sub:seatA")).unwrap();
 
     assert!(
         matches!(seat, profile::ExistingSeat::One(alias) if alias == "half-written"),
@@ -1074,7 +1074,7 @@ fn existing_seat_requires_both_identity_halves() {
     );
 
     // The incoming token names a login but no workspace.
-    let seat = profile::existing_seat(&paths, None, Some("seatA")).unwrap();
+    let seat = profile::existing_seat(&paths, None, Some("sub:seatA")).unwrap();
 
     assert!(
         matches!(seat, profile::ExistingSeat::None),
@@ -1699,11 +1699,14 @@ fn resolution_stops_when_an_unreadable_profile_still_identifies_the_seat() {
     std::fs::write(dir.join("auth.json"), "{ truncated").unwrap();
     std::fs::write(
         dir.join("meta.json"),
-        r#"{"alias":"team","email":null,"plan":null,"account_id":"acct-team","user_id":"seatA","saved_at":"2026-01-01T00:00:00Z"}"#,
+        r#"{"alias":"team","email":null,"plan":null,"account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
     )
     .unwrap();
 
-    let live = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    // The arriving token names the same `chatgpt_user_id` the metadata records.
+    let live = synthetic_token(
+        r#"{"sub":"seatA","jti":"rotated","https://api.openai.com/auth":{"chatgpt_user_id":"user-a"}}"#,
+    );
     let auth_json = tmp.path().join("auth.json");
     std::fs::write(&auth_json, format!(r#"{{"access_token":"{live}"}}"#)).unwrap();
 
@@ -1772,26 +1775,28 @@ fn capture_proceeds_despite_an_unrelated_damaged_profile() {
     );
 }
 
-/// Two colleagues can share a `sub` while differing on `chatgpt_user_id`, and
-/// `login` already treats those as different accounts. Capture has to agree,
-/// or a file is one seat to attribution and two accounts to an overwrite.
+/// `chatgpt_user_id` and `sub` are different namespaces. A profile identified
+/// by one must not match a token carrying the other, or a foreign credential
+/// could be attributed to it by a coincidental string match.
 #[test]
-fn capture_uses_the_same_login_identity_as_login_does() {
+fn login_identity_does_not_match_across_claim_namespaces() {
     let (_tmp, paths) = setup_test_env();
-    let seat = |user: &str, jti: &str| {
-        synthetic_token(&format!(
-            r#"{{"sub":"shared","jti":"{jti}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-team","chatgpt_user_id":"{user}"}}}}"#
-        ))
-    };
-    write_profile(&paths, "mine", &seat("user-a", "stored"));
+    // Stored: identified by its `chatgpt_user_id`.
+    write_profile(
+        &paths,
+        "mine",
+        &synthetic_token(
+            r#"{"sub":"seat-1","jti":"stored","https://api.openai.com/auth":{"chatgpt_user_id":"shared-value"}}"#,
+        ),
+    );
 
-    // Same subject and workspace, a different login, rotated.
+    // Arriving: no `chatgpt_user_id`, and a subject that happens to read the same.
     let exec_auth = paths.home.join("exec-auth.json");
     std::fs::write(
         &exec_auth,
         format!(
             r#"{{"access_token":"{}","refresh_token":"rotated"}}"#,
-            seat("user-b", "live")
+            synthetic_token(r#"{"sub":"shared-value","jti":"live"}"#)
         ),
     )
     .unwrap();
@@ -1802,7 +1807,7 @@ fn capture_uses_the_same_login_identity_as_login_does() {
         !std::fs::read_to_string(paths.profiles_dir().join("mine").join("auth.json"))
             .unwrap()
             .contains("rotated"),
-        "a colleague's credential was captured over this profile"
+        "a subject matched a user id and carried a foreign credential in"
     );
 }
 

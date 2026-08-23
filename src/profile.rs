@@ -263,7 +263,12 @@ pub fn user_of_profile(paths: &Paths, alias: &str) -> Option<String> {
     let stored_login = api::read_auth_json(&dir.join("auth.json"))
         .ok()
         .and_then(|auth| api::token_login(&auth.access_token));
-    stored_login.or_else(|| read_meta(&dir.join("meta.json")).and_then(|meta| meta.user_id))
+    stored_login.or_else(|| {
+        read_meta(&dir.join("meta.json"))
+            .and_then(|meta| meta.user_id)
+            .as_deref()
+            .map(api::recorded_login)
+    })
 }
 
 /// Which workspace a saved profile holds.
@@ -793,8 +798,9 @@ fn metadata_contradicts(
     let workspace_disagrees = meta.account_id.is_some()
         && target_workspace.is_some()
         && meta.account_id.as_deref() != target_workspace;
+    let recorded = meta.user_id.as_deref().map(api::recorded_login);
     let login_disagrees =
-        meta.user_id.is_some() && target_login.is_some() && meta.user_id.as_deref() != target_login;
+        recorded.is_some() && target_login.is_some() && recorded.as_deref() != target_login;
     workspace_disagrees || login_disagrees
 }
 
@@ -1085,6 +1091,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
             // look like the sole owner of a credential this one may hold, so an
             // identified one makes the decision undecidable instead.
             let meta = read_meta(&dir.join("meta.json")).unwrap_or_default();
+            let recorded_login = meta.user_id.as_deref().map(api::recorded_login);
             // A field that positively disagrees rules the profile out, whatever
             // the other one says: a damaged profile for another login in the
             // same workspace is not a candidate, and letting it block would
@@ -1094,7 +1101,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
                 &alias,
                 target_account.as_deref(),
                 target_login.as_deref(),
-            ) && ((meta.user_id.is_some() && meta.user_id == target_login)
+            ) && ((recorded_login.is_some() && recorded_login == target_login)
                 || (meta.account_id.is_some() && meta.account_id == target_account));
             if identifies {
                 return Ok(None);
