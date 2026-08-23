@@ -718,15 +718,24 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
     let Some(subject) = api::token_subject(&target.access_token) else {
         return false;
     };
-    list_profiles_from(paths)
-        .unwrap_or_default()
+    // A store that cannot be read is not evidence that no sibling declares a
+    // workspace, and a half-written profile is still a profile — both count as
+    // ambiguity rather than permission for the hint. Siblings are judged by
+    // their effective workspace, metadata included.
+    let Ok(aliases) = stored_aliases(paths) else {
+        return true;
+    };
+    aliases
         .into_iter()
-        .filter(|profile| profile.meta.alias != hinted.meta.alias)
-        .any(|profile| {
-            let Ok(sibling) = api::read_auth_json(&profile.auth_json_path()) else {
-                return false;
+        .filter(|alias| alias != &hinted.meta.alias)
+        .any(|alias| {
+            let Ok(dir) = store::profile_dir(paths, &alias) else {
+                return true;
             };
-            sibling.account_id.is_some()
+            let Ok(sibling) = api::read_auth_json(&dir.join("auth.json")) else {
+                return true;
+            };
+            workspace_of_profile(paths, &alias).is_some()
                 && api::token_subject(&sibling.access_token).as_deref() == Some(subject.as_str())
         })
 }
@@ -749,7 +758,7 @@ pub fn alias_for_auth_json_with_hint(
         return Some(alias);
     }
     if let Some(profile) = hinted
-        && auth_files_have_same_owner(auth_json, &profile.auth_json_path())
+        && auth_belongs_to_profile(paths, auth_json, &profile)
         && !claimless_match_is_ambiguous(paths, auth_json, &profile)
     {
         return Some(profile.meta.alias);
@@ -815,7 +824,7 @@ pub fn auth_json_path_for_profile_from(
         return profile.auth_json_path();
     }
     let live = paths.codex_auth_json();
-    if auth_files_have_same_owner(&live, &profile.auth_json_path()) {
+    if auth_belongs_to_profile(paths, &live, profile) {
         live
     } else {
         profile.auth_json_path()
@@ -830,9 +839,19 @@ fn auth_files_have_same_access_token(left: &Path, right: &Path) -> bool {
         && workspace_permits(left.account_id.as_deref(), right.account_id.as_deref())
 }
 
-fn auth_files_have_same_owner(left: &Path, right: &Path) -> bool {
-    let (Ok(left), Ok(right)) = (api::read_auth_json(left), api::read_auth_json(right)) else {
+fn auth_belongs_to_profile(paths: &Paths, auth_json: &Path, profile: &Profile) -> bool {
+    let (Ok(left), Ok(stored)) = (
+        api::read_auth_json(auth_json),
+        api::read_auth_json(&profile.auth_json_path()),
+    ) else {
         return false;
+    };
+    // The profile's workspace is what it *effectively* holds, metadata fallback
+    // included: a stored token carrying no claim does not make the profile
+    // anonymous when `meta.json` records the account.
+    let right = api::AuthJson {
+        account_id: workspace_of_profile(paths, &profile.meta.alias),
+        ..stored
     };
     // An identical access token is not identity on its own: `read_auth_json`
     // takes an explicit `account_id` from the file ahead of the JWT claim, so
@@ -929,7 +948,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
             }
         }
         // The target declares no workspace, so it cannot prove it belongs to a
-        // profile that declares one — the same reasoning `auth_files_have_same_owner`
+        // profile that declares one — the same reasoning `auth_belongs_to_profile`
         // applies, and this resolver is the other way credentials reach a profile.
         //
         // Nor is a claimless sibling then the answer by default: a rotation of

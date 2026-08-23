@@ -1108,10 +1108,15 @@ fn attribution_honours_a_workspace_recorded_only_in_metadata() {
 
     profile::capture_exec_auth_from(&paths, &exec_auth, "team@test").unwrap();
 
+    // Assert on the token itself: the workspace name lives inside a base64
+    // payload, so searching the file for it would match nothing either way.
+    let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
     assert!(
-        !std::fs::read_to_string(dir.join("auth.json"))
-            .unwrap()
-            .contains("other"),
+        kept.contains(&stored),
+        "the profile's own credential was replaced"
+    );
+    assert!(
+        !kept.contains(&foreign),
         "a foreign workspace was captured over a profile identified by metadata"
     );
 }
