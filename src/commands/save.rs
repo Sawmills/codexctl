@@ -50,7 +50,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
     // applied to some other credential that lands there while they answer.
-    let mut confirmed_state: Option<Option<String>> = None;
+    let mut confirmed_state: Option<Option<Vec<u8>>> = None;
     if existing.exists() {
         refuse_a_different_account(
             &paths,
@@ -69,7 +69,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>) -> Result<()> {
             println!("aborted");
             return Ok(());
         }
-        confirmed_state = Some(stored_access_token(&existing));
+        confirmed_state = Some(stored_credentials(&existing));
     }
 
     // The lock is taken only now: holding it across the prompt above would
@@ -119,7 +119,7 @@ fn save_verified_snapshot(
     snapshot: &std::path::Path,
     verified: &api::AuthJson,
     alias_was_explicit: bool,
-    confirmed_state: Option<Option<String>>,
+    confirmed_state: Option<Option<Vec<u8>>>,
 ) -> Result<()> {
     let live_now = api::read_auth_json(snapshot)?;
     // The workspace can change without the token changing: `auth.json` carries
@@ -153,7 +153,7 @@ fn save_verified_snapshot(
             ),
             // It was approved, but something replaced its credentials since —
             // and the approval was for what used to be there.
-            Some(approved) if *approved != stored_access_token(&dir) => anyhow::bail!(
+            Some(approved) if *approved != stored_credentials(&dir) => anyhow::bail!(
                 "profile '{resolved_alias}' changed while this save was preparing, so the \
                  confirmation no longer applies to what it holds. Re-run the command."
             ),
@@ -167,13 +167,13 @@ fn save_verified_snapshot(
     Ok(())
 }
 
-/// The access token a profile directory currently holds, if any is readable.
-/// Used only to tell whether the thing an operator approved replacing is still
-/// the thing about to be replaced.
-fn stored_access_token(dir: &std::path::Path) -> Option<String> {
-    api::read_auth_json(&dir.join("auth.json"))
-        .ok()
-        .map(|auth| auth.access_token)
+/// Exactly what a profile directory currently stores, if anything readable.
+///
+/// The raw bytes rather than one parsed field: a refresh can rotate the refresh
+/// token while the access token stays put, and an approval given for the old
+/// credential must not be honoured against the new one.
+fn stored_credentials(dir: &std::path::Path) -> Option<Vec<u8>> {
+    std::fs::read(dir.join("auth.json")).ok()
 }
 
 /// Stop before the overwrite prompt when the target profile holds a *different*

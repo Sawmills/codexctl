@@ -435,6 +435,58 @@ mod tests {
         assert!(!active.contains("old_active_tok"));
     }
 
+    /// A derived alias whose workspace is known but whose login is not does not
+    /// identify an account: workspaces hold many people. The operator never
+    /// named this alias, so "not proven different" is not enough to replace it.
+    #[test]
+    fn run_from_refuses_a_derived_alias_with_a_workspace_but_no_login() {
+        let (_tmp, paths) = setup_test_env();
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The derived alias declares the workspace in metadata only, with a
+        // token that yields no login identity at all.
+        let dir = paths.profiles_dir().join("amir@sawmills.ai+team");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"access_token":"opaque-not-a-jwt"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"amir@sawmills.ai+team","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot be identified"),
+            "unhelpful refusal: {error}"
+        );
+        assert!(
+            std::fs::read_to_string(dir.join("auth.json"))
+                .unwrap()
+                .contains("opaque-not-a-jwt"),
+            "the derived alias was overwritten"
+        );
+    }
+
     /// The headline case, from the other side: a legacy profile whose stored
     /// token declares no workspace, and its own owner signing into a second
     /// one. The logins match, so a rule that reads "stored declares nothing" as

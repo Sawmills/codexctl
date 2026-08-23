@@ -391,7 +391,11 @@ pub fn unidentifiable_profile(paths: &Paths, alias: &str) -> bool {
     if get_profile_from(paths, alias).is_err() {
         return true;
     }
-    workspace_of_profile(paths, alias).is_none()
+    // Both halves are required. A workspace holds many logins, so knowing only
+    // the workspace does not say whose credentials these are — and this guard
+    // protects an alias the operator never named, where "not proven different"
+    // is not good enough to overwrite.
+    workspace_of_profile(paths, alias).is_none() || user_of_profile(paths, alias).is_none()
 }
 
 pub fn conflicting_workspace(
