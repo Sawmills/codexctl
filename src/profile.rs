@@ -631,13 +631,37 @@ pub fn capture_exec_auth_from(paths: &Paths, exec_auth: &Path, pinned_alias: &st
 /// token, which is what a re-login of the same alias during a long pinned run
 /// would otherwise cause.
 fn capture_exec_auth_unlocked(paths: &Paths, exec_auth: &Path, pinned_alias: Option<&str>) {
-    if !exec_auth.exists() {
-        return;
-    }
-    let Some(alias) = alias_for_auth_json_with_hint(paths, exec_auth, pinned_alias) else {
+    capture_from_snapshot(paths, exec_auth, |snapshot| {
+        alias_for_auth_json_with_hint(paths, snapshot, pinned_alias)
+    });
+}
+
+/// Capture `source`, deciding and writing from a single snapshot of it.
+///
+/// Codex rewrites these files without taking the store lock, so reading the
+/// path more than once can resolve ownership from one account and copy the
+/// bytes of another. Everything downstream — ownership, freshness, workspace
+/// preservation, and the write itself — sees the same bytes.
+fn capture_from_snapshot(
+    paths: &Paths,
+    source: &Path,
+    resolve: impl FnOnce(&Path) -> Option<String>,
+) {
+    let Ok(bytes) = std::fs::read(source) else {
         return;
     };
-    capture_into_owner(paths, exec_auth, &alias);
+    let snapshot = paths.codexctl_dir().join(".capture-snapshot.json");
+    if let Err(error) = store::atomic_write(&snapshot, &bytes) {
+        eprintln!(
+            "warning: could not snapshot {} to capture it: {error}",
+            source.display()
+        );
+        return;
+    }
+    if let Some(alias) = resolve(&snapshot) {
+        capture_into_owner(paths, &snapshot, &alias);
+    }
+    let _ = std::fs::remove_file(&snapshot);
 }
 
 /// Fold `source` into the profile that owns it, once ownership is settled.
@@ -1151,14 +1175,10 @@ fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias
     } else {
         None
     };
-    let Some(alias) = alias_for_auth_json_with_hint(paths, codex_auth, known_alias.as_deref())
-    else {
-        return;
-    };
-    if skip_alias == Some(alias.as_str()) {
-        return;
-    }
-    capture_into_owner(paths, codex_auth, &alias);
+    capture_from_snapshot(paths, codex_auth, |snapshot| {
+        let alias = alias_for_auth_json_with_hint(paths, snapshot, known_alias.as_deref())?;
+        (skip_alias != Some(alias.as_str())).then_some(alias)
+    });
 }
 
 pub fn update_meta_plan_from(paths: &Paths, alias: &str, plan: &str) -> Result<()> {

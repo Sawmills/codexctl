@@ -1714,6 +1714,32 @@ fn resolution_stops_when_an_unreadable_profile_still_identifies_the_seat() {
     );
 }
 
+/// Capture leaves no snapshot behind, and the snapshot it works from is the
+/// file it decided on: the source is read once, so ownership and the bytes
+/// written can never come from different accounts.
+#[test]
+fn capture_cleans_up_its_snapshot() {
+    let (_tmp, paths) = setup_test_env();
+    let stored = synthetic_token(r#"{"sub":"seatA","jti":"stored"}"#);
+    write_profile(&paths, "work", &stored);
+    let rotated = synthetic_token(r#"{"sub":"seatA","jti":"rotated"}"#);
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{rotated}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "work").unwrap();
+
+    assert!(
+        std::fs::read_to_string(paths.profiles_dir().join("work").join("auth.json"))
+            .unwrap()
+            .contains(&rotated),
+        "the rotation was not captured"
+    );
+    assert!(
+        !paths.codexctl_dir().join(".capture-snapshot.json").exists(),
+        "the capture snapshot was left in the store"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

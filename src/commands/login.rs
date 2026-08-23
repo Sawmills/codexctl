@@ -91,10 +91,12 @@ fn run_from(
             incoming_user.as_deref(),
         )?;
 
-        // The address is the alias the operator asked for; a label-qualified
-        // target like `a@b.com+work` is a store key, not an email. This is only
-        // a fallback — a token carrying an email claim still wins.
-        let email = email_from_alias(alias).or_else(|| email_from_alias(&target));
+        // The address is the alias the operator asked for. A resolved target —
+        // label-qualified, or an existing alias this seat was matched to — is a
+        // store key, and `email_from_alias` would happily read `a@b.com+work`
+        // as an address. This is only a fallback either way: a token carrying an
+        // email claim still wins.
+        let email = email_from_alias(alias);
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
