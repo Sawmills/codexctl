@@ -87,7 +87,13 @@ fn run_from_with_consent(
     // Validate before the device-auth flow starts. Failing after the operator
     // completed a browser login would read as a failed login even though the
     // profile was saved and made active.
-    label.map(store::validate_label).transpose()?;
+    //
+    // Keep what validation returns rather than only its verdict: it trims, and
+    // reports a blank label as no label at all. Carrying the raw text on would
+    // send a whitespace-only label down the qualifying path, where it produces
+    // an empty slug and fails — after the browser login, which is precisely
+    // what checking here is meant to prevent.
+    let label = label.map(store::validate_label).transpose()?.flatten();
     let codex_home = create_isolated_login_home(paths, alias)?;
     let result = (|| {
         runner.run_codex_login(&codex_home)?;
@@ -616,6 +622,44 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A whitespace-only label is no label, and validation already says so.
+    /// Carrying the raw text on instead sent it down the qualifying path, where
+    /// it slugs to nothing and fails — after the browser login, which is the one
+    /// outcome validating up front exists to prevent.
+    #[test]
+    fn a_blank_label_behaves_as_no_label() {
+        let (_tmp, paths) = setup_test_env();
+        let stored = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        let incoming = synthetic_token("acct-team");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let error = run_from(&paths, "amir@sawmills.ai", Some("   "), &mut runner).unwrap_err();
+
+        // The unlabeled refusal, not the empty-slug failure.
+        let message = error.to_string();
+        assert!(
+            message.contains("different account"),
+            "a blank label took the qualifying path: {message}"
+        );
+        assert!(
+            !message.contains("no characters usable"),
+            "the failure came from slugging a blank label: {message}"
+        );
     }
 
     /// A legacy profile identified only by the JWT subject, meeting its own

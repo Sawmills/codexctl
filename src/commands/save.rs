@@ -22,7 +22,9 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     }
     // Reject a bad label before the save switches the live auth file. Failing
     // afterwards would leave the active account changed under an error exit.
-    label.map(store::validate_label).transpose()?;
+    // Validation also trims and reads a blank label as none, so keep its result
+    // rather than storing the raw text.
+    let label = label.map(store::validate_label).transpose()?.flatten();
 
     let paths = config::default_paths()?;
     let auth_path = paths.codex_auth_json();
