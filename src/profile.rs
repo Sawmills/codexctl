@@ -878,8 +878,9 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     let exact: Vec<(String, Option<String>)> = profile_auths
         .iter()
         .filter(|(_, profile_auth)| profile_auth.access_token == target_auth.access_token)
-        .map(|(profile, profile_auth)| {
-            (profile.meta.alias.clone(), profile_auth.account_id.clone())
+        .map(|(profile, _)| {
+            let workspace = workspace_of_profile(paths, &profile.meta.alias);
+            (profile.meta.alias.clone(), workspace)
         })
         .collect();
     if !exact.is_empty() {
@@ -890,8 +891,10 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         .into_iter()
         .filter_map(|(profile, profile_auth)| {
             let profile_sub = api::token_subject(&profile_auth.access_token);
-            (target_sub.is_some() && target_sub == profile_sub)
-                .then_some((profile.meta.alias, profile_auth.account_id))
+            (target_sub.is_some() && target_sub == profile_sub).then_some({
+                let workspace = workspace_of_profile(paths, &profile.meta.alias);
+                (profile.meta.alias, workspace)
+            })
         })
         .collect();
 

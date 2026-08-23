@@ -1078,6 +1078,44 @@ fn existing_seat_requires_both_identity_halves() {
     );
 }
 
+/// A stored token with no claim does not make a profile anonymous when its
+/// metadata records the account. Ignoring that fallback during attribution lets
+/// another workspace's token be captured over it.
+#[test]
+fn attribution_honours_a_workspace_recorded_only_in_metadata() {
+    let (_tmp, paths) = setup_test_env();
+    // Stored token is claimless; metadata knows the workspace.
+    let dir = paths.profiles_dir().join("team@test");
+    std::fs::create_dir_all(&dir).unwrap();
+    let stored = synthetic_token(r#"{"sub":"seatA","jti":"stored"}"#);
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{stored}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team@test","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same login, a different workspace, rotated.
+    let foreign = synthetic_token(
+        r#"{"sub":"seatA","jti":"other","https://api.openai.com/auth":{"chatgpt_account_id":"acct-other"}}"#,
+    );
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(&exec_auth, format!(r#"{{"access_token":"{foreign}"}}"#)).unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "team@test").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains("other"),
+        "a foreign workspace was captured over a profile identified by metadata"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
