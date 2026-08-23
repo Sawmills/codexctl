@@ -471,30 +471,74 @@ pub fn exact_token_seat(paths: &Paths, auth_json: &Path) -> Result<ExistingSeat>
     let Ok(target) = api::read_auth_json(auth_json) else {
         return Ok(ExistingSeat::None);
     };
-    let holders: Vec<String> = stored_aliases(paths)?
+    let holders: Vec<AliasWorkspace> = stored_aliases(paths)?
         .into_iter()
         .filter(|alias| {
-            let holds = store::profile_dir(paths, alias)
+            store::profile_dir(paths, alias)
                 .ok()
                 .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
-                .is_some_and(|stored| stored.access_token == target.access_token);
-            // Holding the token is not the whole answer. One access token can
-            // name two workspaces through an explicit `account_id`, so a holder
-            // declaring a different one is a different account — and redirecting
-            // there would overwrite it with credentials for another workspace.
-            // The same rule `strongest_exact_match` applies to attribution.
-            holds
-                && !workspace_contradicts(
-                    target.account_id.as_deref(),
-                    workspace_of_profile(paths, alias).as_deref(),
-                )
+                .is_some_and(|stored| stored.access_token == target.access_token)
+        })
+        .map(|alias| {
+            let workspace = workspace_of_profile(paths, &alias);
+            (alias, workspace)
         })
         .collect();
-    Ok(match holders.len() {
-        0 => ExistingSeat::None,
-        1 => ExistingSeat::One(holders.into_iter().next().expect("one holder")),
-        _ => ExistingSeat::Ambiguous(holders),
-    })
+    Ok(exact_token_holder(target.account_id.as_deref(), &holders))
+}
+
+/// Weigh the whole holder set, the way `strongest_exact_match` does.
+///
+/// Judging holders one at a time gets this wrong in both directions. It can
+/// invent a sole owner — a claimless holder survives a filter that removes the
+/// holder proving the token spans workspaces, so an undecidable case looks
+/// settled — and it can discard the real one, when the arriving file declares no
+/// workspace and the only holder declares one.
+fn exact_token_holder(target_workspace: Option<&str>, holders: &[AliasWorkspace]) -> ExistingSeat {
+    if let [only] = holders {
+        // A lone holder of an identical token owns it. Only a workspace both
+        // sides declare *differently* rules it out.
+        let mismatch = matches!(
+            (target_workspace, only.1.as_deref()),
+            (Some(target), Some(stored)) if target != stored
+        );
+        return if mismatch {
+            ExistingSeat::None
+        } else {
+            ExistingSeat::One(only.0.clone())
+        };
+    }
+    let named = |set: Vec<&AliasWorkspace>| match set.len() {
+        0 => None,
+        1 => Some(ExistingSeat::One(set[0].0.clone())),
+        _ => Some(ExistingSeat::Ambiguous(
+            set.into_iter().map(|holder| holder.0.clone()).collect(),
+        )),
+    };
+    let declared: Vec<&AliasWorkspace> = holders
+        .iter()
+        .filter(|(_, workspace)| {
+            target_workspace.is_some() && workspace.as_deref() == target_workspace
+        })
+        .collect();
+    if let Some(seat) = named(declared) {
+        return seat;
+    }
+    // Nothing declares the target's workspace, and something declares another:
+    // the token demonstrably spans workspaces, so no holder is proven to own
+    // this one. Reported as ambiguous rather than absent — several profiles
+    // already hold this credential, which is a reason to refuse another copy.
+    if holders
+        .iter()
+        .any(|(_, workspace)| workspace_contradicts(target_workspace, workspace.as_deref()))
+    {
+        return ExistingSeat::Ambiguous(holders.iter().map(|holder| holder.0.clone()).collect());
+    }
+    let permitted: Vec<&AliasWorkspace> = holders
+        .iter()
+        .filter(|(_, workspace)| workspace_permits(target_workspace, workspace.as_deref()))
+        .collect();
+    named(permitted).unwrap_or(ExistingSeat::None)
 }
 
 pub fn existing_seat(

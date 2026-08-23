@@ -2395,3 +2395,77 @@ fn a_contested_live_workspace_is_not_inferred_onto_a_claimless_profile() {
         "an uncontested live workspace stopped identifying its own profile"
     );
 }
+
+/// Who owns an exact token, across the shapes two review rounds each got wrong
+/// in a different direction. Judging holders one at a time invents a sole owner
+/// in one case and discards the real one in another; only the whole set decides.
+#[test]
+fn exact_token_ownership_weighs_the_whole_holder_set() {
+    let shared = "opaque-not-a-jwt";
+    let case = |target: Option<&str>, holders: &[(&str, Option<&str>)]| {
+        let (_tmp, paths) = setup_test_env();
+        for (alias, workspace) in holders {
+            let dir = paths.profiles_dir().join(alias);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("auth.json"),
+                format!(r#"{{"access_token":"{shared}"}}"#),
+            )
+            .unwrap();
+            let account = match workspace {
+                Some(workspace) => format!(r#","account_id":"{workspace}""#),
+                None => String::new(),
+            };
+            std::fs::write(
+                dir.join("meta.json"),
+                format!(
+                    r#"{{"alias":"{alias}","email":null,"plan":null{account},"saved_at":"2026-01-01T00:00:00Z"}}"#
+                ),
+            )
+            .unwrap();
+        }
+        let incoming = paths.home.join("incoming.json");
+        let body = match target {
+            Some(workspace) => {
+                format!(r#"{{"access_token":"{shared}","account_id":"{workspace}"}}"#)
+            }
+            None => format!(r#"{{"access_token":"{shared}"}}"#),
+        };
+        std::fs::write(&incoming, body).unwrap();
+        match profile::exact_token_seat(&paths, &incoming).unwrap() {
+            profile::ExistingSeat::None => "none".to_string(),
+            profile::ExistingSeat::One(alias) => format!("one:{alias}"),
+            profile::ExistingSeat::Ambiguous(mut aliases) => {
+                aliases.sort();
+                format!("ambiguous:{}", aliases.join(","))
+            }
+        }
+    };
+
+    // Nobody holds it.
+    assert_eq!(case(Some("acct-a"), &[]), "none");
+    // A lone holder owns it, even when only one side names a workspace —
+    // otherwise a login for an identical credential forks a new profile.
+    assert_eq!(case(None, &[("a", Some("acct-a"))]), "one:a");
+    assert_eq!(case(Some("acct-a"), &[("a", None)]), "one:a");
+    assert_eq!(case(None, &[("a", None)]), "one:a");
+    // ...but not when both name a workspace and they differ.
+    assert_eq!(case(Some("acct-b"), &[("a", Some("acct-a"))]), "none");
+    // The holder declaring the arriving workspace owns it.
+    assert_eq!(
+        case(
+            Some("acct-a"),
+            &[("a", Some("acct-a")), ("b", Some("acct-b"))]
+        ),
+        "one:a"
+    );
+    // A claimless holder beside one proving the token spans workspaces is not a
+    // sole owner: ownership is undecidable, and several profiles already hold
+    // this credential.
+    assert_eq!(
+        case(Some("acct-c"), &[("a", None), ("b", Some("acct-b"))]),
+        "ambiguous:a,b"
+    );
+    // Two copies with nothing to tell them apart stay ambiguous.
+    assert_eq!(case(None, &[("a", None), ("b", None)]), "ambiguous:a,b");
+}
