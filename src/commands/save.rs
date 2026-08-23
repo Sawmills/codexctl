@@ -106,7 +106,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // what `list` and `whoami` show. Never kept across an adoption: there the
     // occupant is a different or unidentifiable account, and its address would
     // label the arriving credential as somebody else.
-    let mut established_email: Option<String> = None;
+    let mut keep_email: Option<String> = None;
     if existing.exists() {
         let adoption = classify_overwrite(
             &paths,
@@ -119,11 +119,15 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         // is being shown and agreeing to replace. Reading it afterwards would
         // silently adopt whatever landed there while they were deciding.
         let shown = adopt::stored_credentials(&existing);
+        let adoption_kind = match &adoption {
+            Adoption::Unneeded => Adoption::Unneeded,
+            Adoption::AskOperator { stored } => Adoption::AskOperator {
+                stored: stored.clone(),
+            },
+        };
         let approved = match adoption {
             Adoption::Unneeded => {
-                established_email = profile::get_profile_from(&paths, &resolved_alias)
-                    .ok()
-                    .and_then(|profile| profile.meta.email);
+                keep_email = established_email(&paths, &resolved_alias, &adoption_kind);
                 eprint!(
                     "profile '{}' already exists. Overwrite? [y/N] ",
                     resolved_alias
@@ -168,7 +172,7 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     // block every other codexctl process for as long as the operator takes to
     // answer. That makes the checks so far advisory, so they are re-run here
     // against the store as it actually stands at write time.
-    let email = email.or(established_email);
+    let email = email.or(keep_email);
 
     let lock = store::lock(&paths)?;
     // Everything above was decided from the auth file as it read at the start,
@@ -304,6 +308,20 @@ enum Adoption {
     /// has no way to decide. Only the operator can say whether replacing it is
     /// right, so this is a question rather than a refusal.
     AskOperator { stored: Option<String> },
+}
+
+/// The address to keep when the arriving token names none.
+///
+/// Only a profile settled as this same account has an address worth keeping.
+/// Across an adoption the occupant is a different or unidentifiable account, and
+/// its address would label the arriving credential as somebody else.
+fn established_email(paths: &config::Paths, alias: &str, adoption: &Adoption) -> Option<String> {
+    match adoption {
+        Adoption::Unneeded => profile::get_profile_from(paths, alias)
+            .ok()
+            .and_then(|profile| profile.meta.email),
+        Adoption::AskOperator { .. } => None,
+    }
 }
 
 /// Decide how the target profile stands against the account being saved.
@@ -497,6 +515,28 @@ mod tests {
         assert!(
             stored(&paths).contains(&token("legacy")),
             "the duplicate was written anyway"
+        );
+    }
+
+    /// The address a profile established survives a token that names none —
+    /// but only where the profile is settled as this same account.
+    #[test]
+    fn an_established_email_is_kept_only_without_an_adoption() {
+        let (_tmp, paths, _snapshot) = setup(&token("stored"));
+        std::fs::write(
+            paths.profiles_dir().join("work").join("meta.json"),
+            r#"{"alias":"work","email":"amir@sawmills.ai","plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            established_email(&paths, "work", &Adoption::Unneeded).as_deref(),
+            Some("amir@sawmills.ai")
+        );
+        assert_eq!(
+            established_email(&paths, "work", &Adoption::AskOperator { stored: None }),
+            None,
+            "an adopted account inherited the old occupant's address"
         );
     }
 

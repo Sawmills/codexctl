@@ -288,32 +288,36 @@ fn resolve_target_alias(
     let stored = conflict.stored().map(str::to_string);
 
     let Some(label) = label else {
+        // Wherever this account is already saved, that profile is where the
+        // login belongs — whatever the requested alias turned out to hold.
+        // Consent to replace an unidentifiable profile is not permission to make
+        // a second copy of an account the store can already point to, and a
+        // proven conflict on the requested alias is no reason to fail either:
+        // the browser login has already refreshed this grant, so stopping here
+        // discards the new token and leaves the saved profile holding the one
+        // this login just revoked.
+        match &seat {
+            profile::ExistingSeat::One(existing) if existing != alias => {
+                return Ok(Resolution::Ready(existing.clone()));
+            }
+            // Already saved more than once. Nothing here is permission to add a
+            // third copy.
+            profile::ExistingSeat::Ambiguous(aliases) => {
+                if aliases.iter().any(|existing| existing == alias) {
+                    return Ok(Resolution::Ready(alias.to_string()));
+                }
+                bail!(
+                    "this account is already saved under more than one alias ({}). \
+                     Remove the duplicates, or log in with one of them directly.",
+                    aliases.join(", ")
+                )
+            }
+            _ => {}
+        }
         // A claim that positively disagrees is never this account, so no answer
         // could make replacing it right. One that simply cannot be compared is a
         // question, and the operator is the only one who can answer it.
         let profile::AccountConflict::Different(different) = &conflict else {
-            // Adoption consent is permission to replace a profile nothing can
-            // identify. It is not permission to make a second copy of an
-            // account the store can already point to, so a saved seat wins
-            // over the question rather than being asked around.
-            match &seat {
-                profile::ExistingSeat::One(existing) if existing != alias => {
-                    return Ok(Resolution::Ready(existing.clone()));
-                }
-                // Already saved more than once. Consent to replace an
-                // unidentifiable profile is not consent to add a third copy.
-                profile::ExistingSeat::Ambiguous(aliases) => {
-                    if aliases.iter().any(|existing| existing == alias) {
-                        return Ok(Resolution::Ready(alias.to_string()));
-                    }
-                    bail!(
-                        "this account is already saved under more than one alias ({}). \
-                         Remove the duplicates, or log in with one of them directly.",
-                        aliases.join(", ")
-                    )
-                }
-                _ => {}
-            }
             return Ok(Resolution::NeedsConsent {
                 alias: alias.to_string(),
                 stored,
@@ -962,6 +966,59 @@ mod tests {
             std::fs::read_to_string(damaged.join("auth.json")).unwrap(),
             "{ not json",
             "the damaged profile was replaced"
+        );
+    }
+
+    /// The requested alias holds a proven different account, and this account
+    /// is saved elsewhere. Failing here would be worse than useless: the
+    /// browser login has already run and revoked the grant the saved profile
+    /// holds, and the fresh token then goes in the bin with the isolated home.
+    #[test]
+    fn run_from_saves_to_the_known_seat_when_the_named_alias_holds_another() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let mine = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{mine}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // A different account occupies the alias about to be typed.
+        let other = encode(
+            r#"{"sub":"seatB","https://api.openai.com/auth":{"chatgpt_account_id":"acct-personal","chatgpt_user_id":"user-b"}}"#,
+        );
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{other}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "personal", None, &paths.codex_auth_json().clone())
+            .unwrap();
+
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "personal", None, &mut runner).unwrap();
+
+        assert_eq!(saved, "team", "the refreshed credential was discarded");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json"))
+                .unwrap()
+                .contains(&refreshed),
+            "the known seat did not receive its refreshed token"
+        );
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("personal").join("auth.json"))
+                .unwrap()
+                .contains(&other),
+            "the unrelated profile was overwritten"
         );
     }
 

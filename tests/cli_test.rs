@@ -557,7 +557,10 @@ fn save_refuses_a_second_alias_for_an_account_it_already_holds() {
     let home = tmp.path();
     std::fs::create_dir_all(home.join(".codex")).unwrap();
     use base64::Engine;
-    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    // The email claim is present so `save` never falls back to the `/me`
+    // endpoint: a test that reaches the network is slow offline and depends on
+    // a service it is not trying to exercise.
+    let claims = r#"{"sub":"seatA","https://api.openai.com/profile":{"email":"amir@sawmills.ai"},"https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
     let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
     let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
     std::fs::write(
@@ -600,69 +603,5 @@ fn save_refuses_a_second_alias_for_an_account_it_already_holds() {
         aliases,
         vec!["amir@sawmills.ai"],
         "one account was saved twice under different aliases"
-    );
-}
-
-/// A token can carry no email claim, and the `/me` lookup is not always
-/// available. The write rebuilds metadata, so without keeping what the profile
-/// established, the address `list` and `whoami` show is erased.
-///
-/// Kept only when the profile is settled as this same account. Across an
-/// adoption the occupant is a different or unidentifiable account, and its
-/// address would label the arriving credential as somebody else.
-#[test]
-fn save_keeps_an_established_email_but_never_across_an_adoption() {
-    use base64::Engine;
-    let token = |account: &str, user: &str| {
-        let claims = format!(
-            r#"{{"sub":"seatA","https://api.openai.com/auth":{{"chatgpt_account_id":"{account}","chatgpt_user_id":"{user}"}}}}"#
-        );
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
-        format!("eyJhbGciOiJub25lIn0.{payload}.sig")
-    };
-
-    let run = |stored_auth: String, meta: &str, args: &[&str]| {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().to_path_buf();
-        std::fs::create_dir_all(home.join(".codex")).unwrap();
-        std::fs::write(
-            home.join(".codex").join("auth.json"),
-            format!(r#"{{"access_token":"{}"}}"#, token("acct-team", "user-a")),
-        )
-        .unwrap();
-        let dir = home.join(".codexctl").join("profiles").join("real");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("auth.json"), stored_auth).unwrap();
-        std::fs::write(dir.join("meta.json"), meta).unwrap();
-        Command::cargo_bin("codexctl")
-            .unwrap()
-            .env("HOME", &home)
-            .args(args)
-            .write_stdin("y\n")
-            .output()
-            .unwrap();
-        std::fs::read_to_string(dir.join("meta.json")).unwrap()
-    };
-
-    // Same account, settled: the established address survives.
-    let meta = run(
-        format!(r#"{{"access_token":"{}"}}"#, token("acct-team", "user-a")),
-        r#"{"alias":"real","email":"amir@sawmills.ai","plan":"team","account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
-        &["save", "real"],
-    );
-    assert!(
-        meta.contains("amir@sawmills.ai"),
-        "email was erased: {meta}"
-    );
-
-    // Unidentifiable occupant, adopted: its address must not follow.
-    let meta = run(
-        "{ not json".to_string(),
-        r#"{"alias":"real","email":"someone-else@example.com","plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
-        &["save", "real", "--allow-adopt"],
-    );
-    assert!(
-        !meta.contains("someone-else@example.com"),
-        "an adopted account inherited the old occupant's address: {meta}"
     );
 }
