@@ -251,33 +251,37 @@ fn resolve_target_alias(
 ) -> Result<Resolution> {
     let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
     let Some(conflict) = conflict else {
-        // The requested alias is usable. When a label was given, this seat may
-        // still be saved under a label-derived alias from an earlier run — and
-        // saving it here too would fork one account across two profiles, which
-        // is what makes ownership ambiguous later.
-        if label.is_some() {
-            match profile::existing_seat(paths, incoming_account, incoming_user)
-                .context("could not check whether this account is already saved")?
-            {
-                profile::ExistingSeat::One(existing) if existing != alias => {
-                    return Ok(Resolution::Ready(existing));
-                }
-                // Already ambiguous. A free alias is room for a third copy,
-                // not permission to make one — unless the operator named one of
-                // the duplicates, which is refreshing an existing profile and
-                // the very remedy this error recommends.
-                profile::ExistingSeat::Ambiguous(aliases) => {
-                    if aliases.iter().any(|existing| existing == alias) {
-                        return Ok(Resolution::Ready(alias.to_string()));
-                    }
-                    bail!(
-                        "this account is already saved under more than one alias ({}). \
-                         Remove the duplicates, or log in with one of them directly.",
-                        aliases.join(", ")
-                    )
-                }
-                _ => {}
+        // The requested alias is usable, but this seat may already be saved
+        // under another one — and saving it here too would fork one account
+        // across two profiles, which is what makes ownership ambiguous later.
+        //
+        // Checked whatever the operator typed, label or not. The account
+        // identifies the profile; the alias is only the name reached for. A
+        // mistyped alias is free by definition, so gating this on anything the
+        // operator got right is gating it on the case that never needed it —
+        // and the fresh login revokes the older grant server-side, leaving the
+        // duplicate dead as well as confusing.
+        match profile::existing_seat(paths, incoming_account, incoming_user)
+            .context("could not check whether this account is already saved")?
+        {
+            profile::ExistingSeat::One(existing) if existing != alias => {
+                return Ok(Resolution::Ready(existing));
             }
+            // Already ambiguous. A free alias is room for a third copy,
+            // not permission to make one — unless the operator named one of
+            // the duplicates, which is refreshing an existing profile and
+            // the very remedy this error recommends.
+            profile::ExistingSeat::Ambiguous(aliases) => {
+                if aliases.iter().any(|existing| existing == alias) {
+                    return Ok(Resolution::Ready(alias.to_string()));
+                }
+                bail!(
+                    "this account is already saved under more than one alias ({}). \
+                     Remove the duplicates, or log in with one of them directly.",
+                    aliases.join(", ")
+                )
+            }
+            _ => {}
         }
         return Ok(Resolution::Ready(alias.to_string()));
     };
@@ -792,6 +796,60 @@ mod tests {
                 .unwrap()
                 .contains(legacy),
             "the live credential was replaced with an unreadable one"
+        );
+    }
+
+    /// A login to a free alias for an account that is already saved.
+    ///
+    /// A mistyped alias is the everyday way to reach this, and the alias being
+    /// free is exactly why nothing stops it. Saving here anyway forks one
+    /// account across two profiles, which every later lookup reports as
+    /// ambiguous — and the fresh login revokes the older profile's grant
+    /// server-side, so the duplicate left behind is dead as well as confusing.
+    /// The account is what identifies the profile, not the string typed for it.
+    #[test]
+    fn run_from_reuses_a_saved_seat_when_the_alias_is_a_typo() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+        let stored = encode(claims);
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // The same account signing in again, under a mistyped alias.
+        let refreshed = encode(claims).replace(".sig", ".sig2");
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let saved = run_from(&paths, "amir@sawmils.ai", None, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "amir@sawmills.ai",
+            "a login for an already-saved account landed on a second alias"
+        );
+        let mut aliases: Vec<String> = std::fs::read_dir(paths.profiles_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        aliases.sort();
+        assert_eq!(
+            aliases,
+            vec!["amir@sawmills.ai"],
+            "one account was forked across two profiles"
         );
     }
 

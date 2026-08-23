@@ -62,6 +62,30 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         },
     };
 
+    // One account, one profile. If this account is already saved, refresh that
+    // profile rather than adding a second copy under whatever name was reached
+    // for — a mistyped alias is free by definition, and the fork it leaves is
+    // what every later lookup reports as ambiguous.
+    let resolved_alias = match profile::existing_seat(
+        &paths,
+        auth.account_id.as_deref(),
+        &api::token_logins(&auth.access_token),
+    )
+    .context("could not check whether this account is already saved")?
+    {
+        profile::ExistingSeat::One(saved) if saved != resolved_alias => saved,
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|saved| saved == &resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this account is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => resolved_alias,
+    };
+
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
     // applied to some other credential that lands there while they answer.

@@ -542,3 +542,51 @@ fn save_requires_an_explicit_alias_to_pre_approve_adoption() {
         "{stderr}"
     );
 }
+
+/// One account, one profile. A mistyped alias is free by definition, so nothing
+/// about the name stops a second copy being written — and the fork it leaves is
+/// what every later lookup reports as ambiguous.
+#[test]
+fn save_reuses_the_profile_that_already_holds_this_account() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    use base64::Engine;
+    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    std::fs::write(
+        home.join(".codex").join("auth.json"),
+        format!(r#"{{"access_token":"{token}"}}"#),
+    )
+    .unwrap();
+
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "amir@sawmills.ai"])
+        .write_stdin("")
+        .assert()
+        .success();
+
+    // The same account again, under a mistyped alias.
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "amir@sawmils.ai"])
+        .write_stdin("y\n")
+        .assert()
+        .success();
+
+    let mut aliases: Vec<String> = std::fs::read_dir(home.join(".codexctl").join("profiles"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    aliases.sort();
+    assert_eq!(
+        aliases,
+        vec!["amir@sawmills.ai"],
+        "one account was saved twice under different aliases"
+    );
+}
