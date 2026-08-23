@@ -98,13 +98,10 @@ fn run_from(
         // the address is whatever that profile already recorded — deriving one
         // from the requested alias would overwrite an established email with an
         // unrelated string, or with nothing at all.
-        let email = if target == alias {
-            email_from_alias(alias)
-        } else {
-            profile::get_profile_from(paths, &target)
-                .ok()
-                .and_then(|existing| existing.meta.email)
-        };
+        let email = profile::get_profile_from(paths, &target)
+            .ok()
+            .and_then(|existing| existing.meta.email)
+            .or_else(|| email_from_alias(alias));
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -230,13 +227,14 @@ fn resolve_target_alias(
             profile::short_workspace(&also_taken)
         );
     }
-    // No conflict can also mean no evidence: a profile with no workspace in its
-    // metadata or its stored token is unprovable, not proven safe. The operator
-    // never named this alias — it was derived from the label — so overwriting
-    // its occupant on that basis is not theirs to have approved.
-    if profile::unidentifiable_profile(paths, &qualified) {
+    // The agreement rule above has vouched for this pair, including two sides
+    // that both declare nothing — which is a claimless profile being refreshed
+    // by the command that created it. What it cannot vouch for is a profile
+    // whose credentials will not read at all: the operator never named this
+    // alias, so replacing its occupant on no evidence is not theirs to approve.
+    if profile::credentials_unreadable(paths, &qualified) {
         bail!(
-            "'{qualified}' already holds a profile whose account cannot be identified, \
+            "'{qualified}' already holds a profile whose credentials cannot be read, \
              so this login would overwrite it. Save or re-login that profile first, \
              or choose another label."
         );
@@ -847,6 +845,78 @@ mod tests {
         assert!(
             meta.contains("amir@sawmills.ai"),
             "the established email was discarded: {meta}"
+        );
+    }
+
+    /// Re-logging the same alias keeps its recorded address when the new token
+    /// carries no email claim — `list` and `whoami` should not lose established
+    /// identity to a token that simply says less than the last one.
+    #[test]
+    fn run_from_keeps_the_stored_email_on_a_same_alias_relogin() {
+        let (_tmp, paths) = setup_test_env();
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir-team", Some("amir@sawmills.ai"), &source).unwrap();
+
+        let refreshed = format!("{}refreshed", synthetic_token("acct-team"));
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        run_from(&paths, "amir-team", None, &mut runner).unwrap();
+
+        let meta =
+            std::fs::read_to_string(paths.profiles_dir().join("amir-team").join("meta.json"))
+                .unwrap();
+        assert!(
+            meta.contains("amir@sawmills.ai"),
+            "a re-login erased the stored email: {meta}"
+        );
+    }
+
+    /// A labelled profile for an account that declares no workspace must be
+    /// refreshable by the same command that created it. Both sides declaring
+    /// nothing is agreement, not missing evidence.
+    #[test]
+    fn run_from_refreshes_a_claimless_derived_profile() {
+        let (_tmp, paths) = setup_test_env();
+        // The base alias holds another account.
+        let personal = synthetic_token("acct-personal");
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{personal}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(
+            &paths,
+            "amir@sawmills.ai",
+            None,
+            &paths.codex_auth_json().clone(),
+        )
+        .unwrap();
+
+        // A claimless account already saved under the derived alias.
+        let claimless = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0WiJ9.first";
+        let source = paths.home.join("claimless.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{claimless}"}}"#)).unwrap();
+        profile::save_profile_to(&paths, "amir@sawmills.ai+team", None, &source).unwrap();
+
+        // The same claimless account logging in again.
+        let refreshed = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0WiJ9.second";
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        let target = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap();
+
+        assert_eq!(target, "amir@sawmills.ai+team");
+        assert!(
+            std::fs::read_to_string(
+                paths
+                    .profiles_dir()
+                    .join("amir@sawmills.ai+team")
+                    .join("auth.json")
+            )
+            .unwrap()
+            .contains(refreshed),
+            "the claimless profile was not refreshed"
         );
     }
 

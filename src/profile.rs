@@ -402,31 +402,18 @@ pub fn existing_seat(
     })
 }
 
-/// Whether `alias` holds a profile whose account cannot be identified at all —
-/// no workspace in its metadata and none in the token it stored.
+/// Whether `alias` holds a profile whose credentials cannot be read at all.
 ///
-/// Such a profile cannot be shown to be the same account as an incoming login,
-/// so an alias codexctl *derived* rather than the operator naming it must not
-/// be reused: the overwrite would rest on an unprovable match.
-pub fn unidentifiable_profile(paths: &Paths, alias: &str) -> bool {
+/// The guard for an alias codexctl *derived* rather than the operator naming
+/// it: an occupant whose auth file will not parse cannot be shown to be the
+/// same account, and replacing it on no evidence is not an approval anyone
+/// gave. Identity that is merely absent is judged by the agreement rule
+/// instead — two sides that both declare nothing still agree.
+pub fn credentials_unreadable(paths: &Paths, alias: &str) -> bool {
     let Ok(dir) = store::profile_dir(paths, alias) else {
         return false;
     };
-    if !dir.exists() {
-        // Nothing is there to overwrite.
-        return false;
-    }
-    // Something is there. Metadata that cannot be read is the strongest reason
-    // to treat it as unidentifiable, not a reason to treat it as absent — an
-    // interrupted save or a damaged file leaves exactly this shape.
-    if get_profile_from(paths, alias).is_err() {
-        return true;
-    }
-    // Both halves are required. A workspace holds many logins, so knowing only
-    // the workspace does not say whose credentials these are — and this guard
-    // protects an alias the operator never named, where "not proven different"
-    // is not good enough to overwrite.
-    workspace_of_profile(paths, alias).is_none() || user_of_profile(paths, alias).is_none()
+    dir.exists() && api::read_auth_json(&dir.join("auth.json")).is_err()
 }
 
 pub fn conflicting_workspace(
