@@ -892,11 +892,16 @@ fn auth_belongs_to_profile(paths: &Paths, auth_json: &Path, profile: &Profile) -
     // An identical access token is not identity on its own: `read_auth_json`
     // takes an explicit `account_id` from the file ahead of the JWT claim, so
     // two files can carry one token and name different workspaces.
-    if !workspace_permits(left.account_id.as_deref(), right.account_id.as_deref()) {
-        return false;
-    }
     if left.access_token == right.access_token {
-        return true;
+        return workspace_permits(left.account_id.as_deref(), right.account_id.as_deref());
+    }
+    // Beyond an identical token this is a *rotation*, and capture overwrites
+    // what the profile holds. A rotation that declares a workspace the profile
+    // never recorded cannot prove it is the same account — one login has seats
+    // in several workspaces — so it needs positive agreement, not the mere
+    // absence of contradiction.
+    if !claims_agree(left.account_id.as_deref(), right.account_id.as_deref()) {
+        return false;
     }
     let left_subject = api::token_subject(&left.access_token);
     if left_subject.is_none() || left_subject != api::token_subject(&right.access_token) {
@@ -969,18 +974,15 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
                 .filter(|(_, account)| declares(account))
                 .map(|(alias, _)| alias)
                 .collect();
-            let contradicted = same_seat
-                .iter()
-                .any(|(_, account)| account.is_some() && !declares(account));
-
             if !same_workspace.is_empty() {
                 same_workspace
-            } else if contradicted {
-                Vec::new()
             } else {
-                // Nothing declares a workspace at all: a profile saved before
-                // the claim was recorded still owns its own rotated tokens.
-                same_seat.iter().map(|(alias, _)| alias).collect()
+                // Nothing on this login declares the arriving workspace. A
+                // profile that never recorded one cannot confirm it is that
+                // account, and attributing a rotation here would copy another
+                // workspace's credential over it. The profile goes stale until
+                // its next save or login, which is recoverable; this is not.
+                Vec::new()
             }
         }
         // The target declares no workspace, so it cannot prove it belongs to a

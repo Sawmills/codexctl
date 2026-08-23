@@ -251,11 +251,15 @@ fn alias_for_auth_json_refuses_a_lone_profile_declaring_another_workspace() {
     );
 }
 
-/// A profile saved before workspace claims existed still captures its own
-/// rotated tokens: with nothing declaring a conflicting workspace, a lone
-/// claimless candidate remains the owner.
+/// A profile that never recorded a workspace cannot confirm that an arriving
+/// one is the same account — one login holds seats in several workspaces, and
+/// a native login elsewhere can put another seat's credential in the live file.
+/// So a claimed rotation is left unattributed rather than written over it.
+///
+/// The cost is that such a profile goes stale until its next `save` or `login`.
+/// That is recoverable; overwriting its credentials is not.
 #[test]
-fn alias_for_auth_json_still_matches_a_claimless_profile_with_no_rival() {
+fn alias_for_auth_json_leaves_a_claimed_rotation_unattributed_to_a_claimless_profile() {
     let (tmp, paths) = setup_test_env();
     write_profile(
         &paths,
@@ -271,7 +275,7 @@ fn alias_for_auth_json_still_matches_a_claimless_profile_with_no_rival() {
 
     assert_eq!(
         profile::alias_for_auth_json_from(&paths, &auth_json).unwrap(),
-        Some("legacy@test".to_string())
+        None
     );
 }
 
@@ -668,11 +672,11 @@ fn active_profile_ignores_a_claimless_live_token_against_a_claimed_profile() {
     );
 }
 
-/// The reverse is deliberately still allowed: a profile saved before workspaces
-/// were recorded owns the rotations of its own login, and a claimed live token
-/// contradicts nothing about it.
+/// The same rule governs which auth file the active row reads: a claimed live
+/// token is not shown as a claimless profile's own, because it may be another
+/// seat of that login. The stored copy is used instead.
 #[test]
-fn active_profile_still_uses_live_auth_for_a_claimless_stored_profile() {
+fn active_profile_ignores_a_claimed_live_token_for_a_claimless_profile() {
     let (_tmp, paths) = setup_test_env();
     write_profile(
         &paths,
@@ -691,7 +695,7 @@ fn active_profile_still_uses_live_auth_for_a_claimless_stored_profile() {
     let profile = profile::get_profile_from(&paths, "legacy@test").unwrap();
     let chosen = profile::auth_json_path_for_profile_from(&paths, &profile, Some("legacy@test"));
 
-    assert_eq!(chosen, paths.codex_auth_json());
+    assert_eq!(chosen, profile.auth_json_path());
 }
 
 /// The store-wide resolver is the other route credentials reach a profile, so
