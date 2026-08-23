@@ -716,14 +716,19 @@ fn exact_token_candidates(
     auth_json: &Path,
 ) -> Option<(Option<String>, Vec<(String, Option<String>)>)> {
     let target = api::read_auth_json(auth_json).ok()?;
-    let candidates: Vec<(String, Option<String>)> = list_profiles_from(paths)
+    // Enumerated from the store's directories rather than `list_profiles_from`,
+    // which skips a profile with no `meta.json`. A save writes `auth.json`
+    // first, so an interrupted one leaves a real holder of this token — and
+    // omitting it can leave a claimless sibling looking like the sole owner.
+    let candidates: Vec<(String, Option<String>)> = stored_aliases(paths)
         .ok()?
         .into_iter()
-        .filter_map(|profile| {
-            let stored = api::read_auth_json(&profile.auth_json_path()).ok()?;
+        .filter_map(|alias| {
+            let dir = store::profile_dir(paths, &alias).ok()?;
+            let stored = api::read_auth_json(&dir.join("auth.json")).ok()?;
             (stored.access_token == target.access_token).then_some({
-                let workspace = workspace_of_profile(paths, &profile.meta.alias);
-                (profile.meta.alias, workspace)
+                let workspace = workspace_of_profile(paths, &alias);
+                (alias, workspace)
             })
         })
         .collect();
@@ -786,29 +791,35 @@ pub fn alias_for_auth_json_with_hint(
     // Every profile holding this exact token is weighed first: one that declares
     // the target's workspace is a stronger owner than the hinted alias, and the
     // hint must not outrank evidence.
-    let exact = exact_token_candidates(paths, auth_json);
-    if let Some((target_workspace, candidates)) = &exact
-        && let Some(alias) = strongest_exact_match(target_workspace.as_deref(), candidates)
+    //
+    // Once any profile holds this exact token, that evidence decides the
+    // outcome by itself: a weaker rule must not answer a question the strongest
+    // one already considered and declined.
+    if let Some((target_workspace, candidates)) = &exact_token_candidates(paths, auth_json)
+        && !candidates.is_empty()
     {
-        return Some(alias);
-    }
-    // Exact matching was undecided. The hint settles it only when the hinted
-    // profile is itself one of those equally strong candidates — that is the
-    // duplicate-alias case it exists for.
-    if let Some(profile) = &hinted
-        && let Some((target_workspace, candidates)) = &exact
-        && candidates.iter().any(|(alias, workspace)| {
-            // Only among candidates the evidence left standing: a profile whose
-            // workspace positively differs is disqualified, and naming it is not
-            // a tie-break but an override.
-            alias == &profile.meta.alias
-                && !matches!(
-                    (target_workspace.as_deref(), workspace.as_deref()),
-                    (Some(target), Some(stored)) if target != stored
-                )
-        })
-    {
-        return Some(profile.meta.alias.clone());
+        if let Some(alias) = strongest_exact_match(target_workspace.as_deref(), candidates) {
+            return Some(alias);
+        }
+        // Undecided. The hint settles a genuine tie among equal candidates, but
+        // a contradiction anywhere in the set means this token demonstrably
+        // spans workspaces — naming one holder would be an override, not a
+        // tie-break.
+        let contradicted = candidates.iter().any(|(_, workspace)| {
+            matches!(
+                (target_workspace.as_deref(), workspace.as_deref()),
+                (Some(target), Some(stored)) if target != stored
+            )
+        });
+        if !contradicted
+            && let Some(profile) = &hinted
+            && candidates
+                .iter()
+                .any(|(alias, _)| alias == &profile.meta.alias)
+        {
+            return Some(profile.meta.alias.clone());
+        }
+        return None;
     }
     if let Some(profile) = hinted
         && auth_belongs_to_profile(paths, auth_json, &profile)

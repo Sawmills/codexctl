@@ -1291,6 +1291,85 @@ fn a_sole_exact_token_owner_receives_a_claimless_rotation() {
     );
 }
 
+/// A contradiction anywhere in the candidate set makes ownership undecidable
+/// for all of them: the token demonstrably spans workspaces. Naming one holder
+/// is then an override, not a tie-break.
+#[test]
+fn hint_does_not_revive_a_candidate_after_a_contradiction() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    for (alias, account) in [("legacy", None), ("other", Some("acct-b"))] {
+        let dir = paths.profiles_dir().join(alias);
+        std::fs::create_dir_all(&dir).unwrap();
+        let auth = match account {
+            Some(account) => format!(r#"{{"access_token":"{shared}","account_id":"{account}"}}"#),
+            None => format!(r#"{{"access_token":"{shared}"}}"#),
+        };
+        std::fs::write(dir.join("auth.json"), auth).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"alias":"{alias}","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    // A third workspace, same token, rotated refresh.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(r#"{{"access_token":"{shared}","refresh_token":"rotated","account_id":"acct-c"}}"#),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "legacy").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("legacy").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "the hint revived a candidate after ownership was undecidable"
+    );
+}
+
+/// A save writes `auth.json` before `meta.json`, so an interrupted one still
+/// holds the token. Omitting it can leave a claimless sibling looking like the
+/// sole owner of another workspace's credential.
+#[test]
+fn exact_token_candidates_include_a_profile_left_without_metadata() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    // Complete, claimless.
+    write_profile(&paths, "legacy", &shared);
+    // Half-written, and it declares the arriving workspace.
+    let dir = paths.profiles_dir().join("half-written");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+    )
+    .unwrap();
+
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(
+            r#"{{"access_token":"{shared}","refresh_token":"rotated","account_id":"acct-team"}}"#
+        ),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "legacy").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("legacy").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "an interrupted profile was ignored and its workspace landed on a sibling"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
