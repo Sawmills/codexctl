@@ -78,14 +78,24 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
             // The adoption question already asks to replace these credentials,
             // so it stands in for the overwrite prompt rather than following it.
             Adoption::AskOperator { stored } => {
-                adoption_approved = adopt::approve_adoption(
+                match adopt::approve_adoption(
                     &resolved_alias,
                     stored.as_deref(),
                     auth.account_id.as_deref(),
                     allow_adopt,
                     &mut std::io::stderr(),
-                );
-                adoption_approved
+                ) {
+                    adopt::Approval::Granted => {
+                        adoption_approved = true;
+                        true
+                    }
+                    adopt::Approval::Declined => false,
+                    // Not the operator declining — nobody was there to ask. A
+                    // quiet exit 0 here would report a save that did not happen.
+                    adopt::Approval::NoTerminal => {
+                        return Err(adopt::refusal(&resolved_alias, stored.as_deref()));
+                    }
+                }
             }
         };
         if !approved {

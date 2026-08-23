@@ -118,14 +118,22 @@ fn run_from_with_consent(
                 // without a timeout, so a question left unanswered would stall
                 // every other codexctl process, not just this one.
                 drop(lock);
-                if !adopt::approve_adoption(
+                // Either way nothing is saved, and the login has already
+                // happened — so neither outcome is a success.
+                match adopt::approve_adoption(
                     &pending,
                     stored.as_deref(),
                     incoming.as_deref(),
                     allow_adopt,
                     &mut std::io::stderr(),
                 ) {
-                    return Err(adopt::refusal(&pending, stored.as_deref()));
+                    adopt::Approval::Granted => {}
+                    adopt::Approval::Declined => {
+                        bail!("not replacing profile '{pending}', so this login was not saved")
+                    }
+                    adopt::Approval::NoTerminal => {
+                        return Err(adopt::refusal(&pending, stored.as_deref()));
+                    }
                 }
                 let lock = store::lock(paths)?;
                 // The answer approved one specific replacement. Resolving again

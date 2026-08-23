@@ -444,3 +444,77 @@ fn stateful_command_initializes_private_store() {
         }
     }
 }
+
+/// A profile the store cannot identify needs an answer, and an unattended run
+/// has nobody to give one. That must fail: exiting 0 having saved nothing would
+/// tell a script the account was captured when it was not.
+#[test]
+fn save_without_a_terminal_fails_rather_than_reporting_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    // A profile whose token declares a login but no workspace — what every
+    // profile written before workspaces were recorded looks like.
+    let legacy = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJzZWF0QSJ9.sig";
+    let dir = home.join(".codexctl").join("profiles").join("legacy");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{legacy}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"legacy","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // The live file: the same login, now carrying a workspace.
+    let claims =
+        r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#;
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let incoming = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+    let codex = home.join(".codex");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("auth.json"),
+        format!(r#"{{"access_token":"{incoming}"}}"#),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "legacy"])
+        .write_stdin("")
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an unanswerable save reported success: {output:?}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("--allow-adopt"), "{stderr}");
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains(legacy),
+        "the profile was replaced without approval"
+    );
+
+    // The same command with the answer supplied ahead of time does save.
+    Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .args(["save", "legacy", "--allow-adopt"])
+        .write_stdin("")
+        .assert()
+        .success();
+    assert!(
+        std::fs::read_to_string(dir.join("auth.json"))
+            .unwrap()
+            .contains(&incoming),
+        "the approved save did not land"
+    );
+}

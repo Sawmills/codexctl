@@ -15,6 +15,19 @@
 
 use crate::profile;
 
+/// How the adoption question came out.
+///
+/// Declining and being unable to ask are both "do not replace it", but they are
+/// not the same outcome: one is a decision, the other is a command that could
+/// not run. Collapsing them lets an unattended `save` report success having
+/// saved nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Approval {
+    Granted,
+    Declined,
+    NoTerminal,
+}
+
 /// Ask before replacing `alias` with an account that cannot be matched to it.
 ///
 /// `stored` is what the profile is understood to hold, when it declares
@@ -25,41 +38,51 @@ pub fn approve_adoption(
     arriving: Option<&str>,
     assume_yes: bool,
     out: &mut impl std::io::Write,
-) -> bool {
+) -> Approval {
     use std::io::IsTerminal;
 
     if assume_yes {
         let _ = writeln!(out, "codexctl: replacing the profile saved as {alias}");
-        return true;
+        return Approval::Granted;
     }
     if !std::io::stdin().is_terminal() {
-        let _ = writeln!(
-            out,
-            "codexctl: not replacing the profile saved as {alias} \
-             (no terminal to approve; pass --allow-adopt to allow)"
-        );
-        return false;
+        return Approval::NoTerminal;
     }
 
-    let held = match stored {
-        Some(stored) => format!("holds {}", profile::short_workspace(stored)),
-        None => "does not record which account it holds".to_string(),
-    };
+    let held = describes(stored);
     let arriving = arriving
         .map(|arriving| format!(" this login is {}.", profile::short_workspace(arriving)))
         .unwrap_or_default();
     let _ = write!(
         out,
-        "codexctl: profile '{alias}' {held}, so this login cannot be matched to it.{arriving} \
+        "codexctl: profile '{alias}' {held} cannot be matched to this login.{arriving} \
          Replace it? Its saved credentials are overwritten. [y/N] "
     );
     let _ = out.flush();
 
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
-        return false;
+        return Approval::Declined;
     }
-    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Approval::Granted,
+        _ => Approval::Declined,
+    }
+}
+
+/// What a profile is known to hold, phrased for an operator.
+///
+/// A login identifier is not a workspace, so it must not be rendered as one:
+/// `short_workspace` would print a namespaced login as `sub:seat…`, which reads
+/// like a truncated account id and names the wrong thing entirely.
+fn describes(stored: Option<&str>) -> String {
+    match stored {
+        Some(stored) if stored.starts_with("uid:") || stored.starts_with("sub:") => {
+            "records a login but no workspace, so it".to_string()
+        }
+        Some(stored) => format!("holds {}, which", profile::short_workspace(stored)),
+        None => "does not record which account it holds, so it".to_string(),
+    }
 }
 
 /// The error for an adoption nobody approved.
@@ -68,13 +91,7 @@ pub fn approve_adoption(
 /// than claiming a different account, which is exactly what the store could not
 /// establish.
 pub fn refusal(alias: &str, stored: Option<&str>) -> anyhow::Error {
-    let held = match stored {
-        Some(stored) => format!(
-            "holds {} but cannot be matched to this account",
-            profile::short_workspace(stored)
-        ),
-        None => "does not record which account it holds".to_string(),
-    };
+    let held = format!("{} cannot be matched to this account", describes(stored));
     anyhow::anyhow!(
         "profile '{alias}' {held}, so replacing it needs approval and none was given. \
          Re-run on a terminal to confirm, pass --allow-adopt, or choose another alias."
@@ -90,31 +107,23 @@ mod tests {
     #[test]
     fn the_flag_answers_without_a_terminal() {
         let mut out = Vec::new();
-        assert!(approve_adoption(
-            "work",
-            None,
-            Some("acct-team"),
-            true,
-            &mut out
-        ));
+        assert_eq!(
+            approve_adoption("work", None, Some("acct-team"), true, &mut out),
+            Approval::Granted
+        );
         assert!(String::from_utf8(out).unwrap().contains("work"));
     }
 
-    /// Tests have no terminal, which is exactly the condition being checked:
-    /// with no way to ask, the answer is no, and the message says what supplies
-    /// one instead.
+    /// Tests have no terminal, which is exactly the condition being checked.
+    /// It must report *why* it could not ask, so the caller can fail rather than
+    /// treat it as the operator saying no.
     #[test]
-    fn no_terminal_declines_and_names_the_flag() {
+    fn no_terminal_is_distinct_from_a_decline() {
         let mut out = Vec::new();
-        assert!(!approve_adoption(
-            "work",
-            Some("acct-team"),
-            None,
-            false,
-            &mut out
-        ));
-        let printed = String::from_utf8(out).unwrap();
-        assert!(printed.contains("--allow-adopt"), "{printed}");
+        assert_eq!(
+            approve_adoption("work", Some("acct-team"), None, false, &mut out),
+            Approval::NoTerminal
+        );
     }
 
     /// The refusal reports only what is known. Claiming a different account
@@ -132,5 +141,12 @@ mod tests {
                 .to_string()
                 .contains("cannot be matched"),
         );
+        // A login identifier must not be dressed up as a workspace.
+        let login_only = refusal("work", Some("sub:seatA")).to_string();
+        assert!(
+            login_only.contains("records a login but no workspace"),
+            "{login_only}"
+        );
+        assert!(!login_only.contains("sub:seat"), "{login_only}");
     }
 }
