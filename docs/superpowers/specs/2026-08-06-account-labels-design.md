@@ -199,7 +199,10 @@ the operator already decided. Approval settles only what could not be worked out
 on a conflict that was.
 
 One case is settled rather than asked about, deliberately: a workspace that matches with **neither
-side naming a login**. Both tokens predate `chatgpt_user_id`, and adopting would record no login
+side naming a login**, and only while the stored credentials actually read. A profile whose token
+will not parse is not saying nothing — nothing could be read from it, which is absence of evidence
+rather than a matching claim, and a shared workspace would otherwise let anyone holding a seat in it
+replace a damaged profile by naming its alias. Both tokens predate `chatgpt_user_id`, and adopting would record no login
 either — so the question would return on every refresh, and a prompt its own answer cannot satisfy is
 noise rather than consent. A matching workspace with nothing contradicting it is the strongest
 evidence such a token can offer. Two seats in one workspace behind tokens that old are the residual

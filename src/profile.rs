@@ -546,7 +546,14 @@ pub fn conflicting_workspace(
     // token can offer. Two seats in one workspace behind tokens that old are the
     // residual exposure; a token carrying the claim closes it permanently.
     let user_contradicts = if incoming_user.is_empty() && stored_logins.is_empty() {
-        false
+        // Mutual silence settles only when the stored side is actually saying
+        // nothing — a readable token that predates `chatgpt_user_id`. A profile
+        // whose credentials will not read is not saying nothing; nothing could
+        // be read from it, which is absence of evidence rather than a matching
+        // claim. A workspace is shared, so treating that as agreement lets
+        // anyone holding a seat in it replace a damaged profile by naming its
+        // alias — and lets a token carrying no login claim do the same.
+        !stored_auth_readable
     } else {
         // Anything short of positive proof of the same login is unsettled: one
         // side silent, or two claims that share no namespace to compare in.

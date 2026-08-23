@@ -707,6 +707,41 @@ mod tests {
         );
     }
 
+    /// A profile whose credentials will not read, but whose metadata still
+    /// records a workspace. An incoming token that names that workspace and no
+    /// login at all must not simply replace it: the stored side is silent
+    /// because nothing could be read, not because it is an old token, and a
+    /// workspace is shared — so anyone holding a seat in it could otherwise
+    /// overwrite a damaged profile by naming its alias.
+    #[test]
+    fn run_from_asks_before_replacing_a_damaged_profile_on_a_claimless_token() {
+        let (_tmp, paths) = setup_test_env();
+        let dir = paths.profiles_dir().join("team");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"team","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        // Readable, names the same workspace, and carries no login claim at all.
+        let mut runner =
+            FakeLoginRunner::new(r#"{"access_token":"opaque-not-a-jwt","account_id":"acct-team"}"#);
+
+        let error = run_from(&paths, "team", None, &mut runner).unwrap_err();
+
+        assert!(
+            error.to_string().contains("--allow-adopt"),
+            "a damaged profile was replaced without consent: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("auth.json")).unwrap(),
+            "{ not json",
+            "the damaged profile's credentials were overwritten"
+        );
+    }
+
     /// A login that produced an unreadable `auth.json` is a failed login, not a
     /// login by an account that declares nothing. Read as the latter, its empty
     /// identity agrees with any profile that also declares nothing — so the

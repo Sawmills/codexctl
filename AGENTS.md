@@ -40,6 +40,7 @@
 - Compare logins only inside one namespace. `uid:` and `sub:` are unrelated facts, so they must never match by coincidence and never prove a difference either.
 - Read a profile's identity from its stored token first and its metadata second, and keep what has been proven when a captured file omits it.
 - Require positive agreement before `login` or `save` replaces stored credentials. "Cannot confirm" is not "yes".
+- Treat silence from an unreadable profile as absence of evidence, never as a matching claim. Two sides declaring nothing agree only when both can actually be read.
 - Separate a conflict that is proven from one that is merely unprovable. Refuse claims that positively disagree; no flag may override that. Where neither side declares enough to compare, ask the operator: prompt on a terminal, refuse without one unless `--allow-adopt` is set.
 - Do not make `remove` the only remedy for a profile the store cannot identify. Deleting the evidence and replacing it unchecked is weaker than the replacement it guards.
 - Capture a token back to the alias the caller named. Fall back to token inspection only when the file does not belong to that alias.
