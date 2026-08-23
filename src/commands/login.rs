@@ -298,10 +298,10 @@ fn resolve_target_alias(
         };
         bail!(
             "profile '{alias}' holds a different account \
-             (stored workspace {}, this login {arriving}). \
+             (stored {}, this login {arriving}). \
              Re-run with --label <name> to save it alongside, choose another \
              alias, or remove it first: codexctl remove {alias}",
-            profile::short_workspace(different)
+            profile::describe_claim(different)
         );
     };
 
@@ -345,9 +345,9 @@ fn resolve_target_alias(
                  ({} and {}, this login {arriving}). Choose another alias.",
                 stored
                     .as_deref()
-                    .map(profile::short_workspace)
+                    .map(profile::describe_claim)
                     .unwrap_or_default(),
-                profile::short_workspace(also_taken)
+                profile::describe_claim(also_taken)
             );
         }
         return Ok(Resolution::NeedsConsent {
@@ -622,6 +622,51 @@ mod tests {
         let active = std::fs::read_to_string(paths.codex_auth_json()).unwrap();
         assert!(active.contains("new_active_tok"));
         assert!(!active.contains("old_active_tok"));
+    }
+
+    /// A legacy profile identified only by the JWT subject, meeting its own
+    /// refreshed token that now also carries `chatgpt_user_id`. The two
+    /// identifiers sit in different namespaces, so nothing proves they differ —
+    /// and treating them as proven different would make the refusal absolute,
+    /// leaving the exact population this design migrates with no way through:
+    /// `--allow-adopt` cannot override a proven conflict, by design.
+    #[test]
+    fn a_refreshed_login_claim_is_not_proof_of_a_different_person() {
+        let (_tmp, paths) = setup_test_env();
+        // Stored: subject only, and a workspace, so the workspace half agrees.
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        let stored = encode(
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team"}}"#,
+        );
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{stored}"}}"#),
+        )
+        .unwrap();
+        profile::save_profile_to(&paths, "team", None, &paths.codex_auth_json().clone()).unwrap();
+
+        // The same seat, refreshed: same subject, now also a user id.
+        let refreshed = encode(
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#,
+        );
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{refreshed}"}}"#));
+
+        // It must not be refused outright. Whether it lands silently or asks,
+        // the operator has a way through — which a proven conflict would deny.
+        let saved = run_from_with_consent(&paths, "team", None, true, &mut runner)
+            .expect("a refreshed login was refused as a different account");
+
+        assert_eq!(saved, "team");
+        assert!(
+            std::fs::read_to_string(paths.profiles_dir().join("team").join("auth.json"))
+                .unwrap()
+                .contains(&refreshed),
+            "the refreshed token did not land"
+        );
     }
 
     /// A login that produced an unreadable `auth.json` is a failed login, not a

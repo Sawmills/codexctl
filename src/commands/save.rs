@@ -266,8 +266,8 @@ fn classify_overwrite(
     };
     anyhow::bail!(
         "profile '{alias}' holds a different account \
-         (stored workspace {}, incoming {}). {remedy}",
-        profile::short_workspace(&stored),
+         (stored {}, incoming {}). {remedy}",
+        profile::describe_claim(&stored),
         incoming_account
             .map(profile::short_workspace)
             .unwrap_or_default()

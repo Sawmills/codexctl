@@ -507,10 +507,7 @@ pub fn conflicting_workspace(
         (incoming_account, stored_workspace.as_deref()),
         (Some(incoming), Some(stored)) if incoming != stored
     );
-    let user_differs = matches!(
-        (incoming_user, stored_user.as_deref()),
-        (Some(incoming), Some(stored)) if incoming != stored
-    );
+    let user_differs = logins_disagree(incoming_user, stored_user.as_deref());
     let described = stored_workspace.clone().or_else(|| stored_user.clone());
     if workspace_differs || user_differs {
         // Describe the claim that actually disagrees. Preferring the workspace
@@ -530,6 +527,19 @@ pub fn conflicting_workspace(
 }
 
 /// Short workspace id for an error message; the full uuid is noise.
+/// Name a stored claim as what it actually is.
+///
+/// A conflict may be proven by either half of the identity, so the value handed
+/// to an operator message is sometimes a workspace and sometimes a login.
+/// Announcing both as "workspace" mislabels the evidence in the one place the
+/// operator uses it to decide.
+pub fn describe_claim(claim: &str) -> String {
+    match claim.split_once(':') {
+        Some(("uid" | "sub", login)) => format!("login {login}"),
+        _ => format!("workspace {}", short_workspace(claim)),
+    }
+}
+
 pub fn short_workspace(account_id: &str) -> String {
     match account_id.char_indices().nth(8) {
         Some((index, _)) => format!("{}…", &account_id[..index]),
@@ -895,6 +905,29 @@ fn exact_token_candidates(paths: &Paths, auth_json: &Path) -> Option<ExactTokenC
         })
         .collect();
     Some((target.account_id, candidates))
+}
+
+/// Whether two login identifiers *prove* they are different people.
+///
+/// Difference is only provable inside one namespace. `uid:` comes from
+/// `chatgpt_user_id` and `sub:` from the JWT subject, and a token gaining the
+/// former does not stop it being the same login — a legacy profile identified as
+/// `sub:S` meeting its own refreshed token, now reporting `uid:U`, is the same
+/// person. Reading that as proof of difference makes the refusal absolute, so
+/// the one population this design exists to migrate would be left with no way
+/// through at all. Unequal across namespaces is unproven, not different: the
+/// caller still treats it as unsettled, so it becomes a question instead.
+fn logins_disagree(incoming: Option<&str>, stored: Option<&str>) -> bool {
+    let (Some(incoming), Some(stored)) = (incoming, stored) else {
+        return false;
+    };
+    let namespace = |login: &str| login.split_once(':').map(|(tag, _)| tag.to_string());
+    match (namespace(incoming), namespace(stored)) {
+        (Some(a), Some(b)) if a == b => incoming != stored,
+        // An untagged value on both sides is a single namespace by default.
+        (None, None) => incoming != stored,
+        _ => false,
+    }
 }
 
 /// Whether a subject-only match on a claimless pair is really undecided.

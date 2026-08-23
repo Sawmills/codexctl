@@ -2202,3 +2202,16 @@ fn case_fold_alias_collision_cannot_overwrite_credentials() {
     assert!(original.contains("original-token"));
     assert!(!original.contains("new-token"));
 }
+
+/// A conflict may be proven by either half of the identity, so the value in an
+/// operator message is sometimes a workspace and sometimes a login. Announcing
+/// both as "workspace" mislabels the evidence exactly where it is used to
+/// decide.
+#[test]
+fn a_claim_is_described_as_what_it_is() {
+    assert_eq!(profile::describe_claim("uid:user-a"), "login user-a");
+    assert_eq!(profile::describe_claim("sub:seatA"), "login seatA");
+    let workspace = profile::describe_claim("acct-team");
+    assert!(workspace.starts_with("workspace "), "{workspace}");
+    assert!(!workspace.contains("login"), "{workspace}");
+}

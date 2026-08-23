@@ -103,7 +103,7 @@ fn describes(stored: Option<&str>) -> String {
         Some(stored) if stored.starts_with("uid:") || stored.starts_with("sub:") => {
             "records a login but no workspace, so it".to_string()
         }
-        Some(stored) => format!("holds {}, which", profile::short_workspace(stored)),
+        Some(stored) => format!("holds {}, which", profile::describe_claim(stored)),
         None => "does not record which account it holds, so it".to_string(),
     }
 }
