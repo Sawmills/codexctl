@@ -160,7 +160,7 @@ fn save_verified_snapshot(
             Some(_) => {}
         }
     }
-    profile::save_profile_and_activate_locked(lock, paths, resolved_alias, email, snapshot)?;
+    profile::save_live_profile_locked(lock, paths, resolved_alias, email, snapshot)?;
     if let Some(label) = label {
         profile::set_label_locked(lock, paths, resolved_alias, Some(label))?;
     }

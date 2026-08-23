@@ -133,9 +133,20 @@ fn resolve_target_alias(
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
 ) -> Result<String> {
-    let Some(stored) =
-        profile::conflicting_workspace(paths, alias, incoming_account, incoming_user)
-    else {
+    let conflict = profile::conflicting_workspace(paths, alias, incoming_account, incoming_user);
+    let Some(stored) = conflict else {
+        // The requested alias is usable. When a label was given, this seat may
+        // still be saved under a label-derived alias from an earlier run — and
+        // saving it here too would fork one account across two profiles, which
+        // is what makes ownership ambiguous later.
+        if label.is_some()
+            && let profile::ExistingSeat::One(existing) =
+                profile::existing_seat(paths, incoming_account, incoming_user)
+                    .context("could not check whether this account is already saved")?
+            && existing != alias
+        {
+            return Ok(existing);
+        }
         return Ok(alias.to_string());
     };
     let arriving = incoming_account
@@ -475,9 +486,12 @@ mod tests {
 
         let error = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap_err();
 
+        // Either guard may speak first — the workspace guard now refuses an
+        // unproven owner outright — but the credentials must survive.
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("cannot be identified"),
-            "unhelpful refusal: {error}"
+            message.contains("cannot be identified") || message.contains("Choose another alias"),
+            "unhelpful refusal: {message}"
         );
         assert!(
             std::fs::read_to_string(dir.join("auth.json"))
@@ -571,6 +585,28 @@ mod tests {
         assert!(
             !paths.profiles_dir().join("amir@sawmills.ai+team").exists(),
             "a third copy of one account was created"
+        );
+    }
+
+    /// The base alias being free is not proof the seat is unsaved. Removing the
+    /// personal profile leaves the team seat under its label-derived alias, and
+    /// saving it again under the freed base alias would fork one account.
+    #[test]
+    fn run_from_reuses_an_existing_seat_when_the_base_alias_is_free() {
+        let (_tmp, paths) = setup_test_env();
+        let team = synthetic_token("acct-team");
+        let source = paths.home.join("team-auth.json");
+        std::fs::write(&source, format!(r#"{{"access_token":"{team}"}}"#)).unwrap();
+        // Only the label-derived alias exists; the base alias is free.
+        profile::save_profile_to(&paths, "amir@sawmills.ai+work", None, &source).unwrap();
+
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{team}"}}"#));
+        let target = run_from(&paths, "amir@sawmills.ai", Some("team"), &mut runner).unwrap();
+
+        assert_eq!(target, "amir@sawmills.ai+work", "the seat was forked");
+        assert!(
+            !paths.profiles_dir().join("amir@sawmills.ai").exists(),
+            "a second profile was created for one account"
         );
     }
 

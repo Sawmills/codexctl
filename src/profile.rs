@@ -127,6 +127,25 @@ pub fn save_profile_and_activate_to(
     save_profile_and_activate_locked(&lock, paths, alias, email, auth_json_src)
 }
 
+/// Record the credential that is *already* live under `alias` and make it
+/// active, without writing anything back to the live Codex home.
+///
+/// `save` reads the live file, so installing it again could only overwrite it —
+/// and a native `codex` refresh does not take this lock, so by then the live
+/// file may legitimately hold something newer. Copying a snapshot back over it
+/// would roll that away.
+pub fn save_live_profile_locked(
+    _lock: &store::StoreLock,
+    paths: &Paths,
+    alias: &str,
+    email: Option<&str>,
+    auth_json_src: &Path,
+) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    save_profile_unlocked(paths, alias, email, auth_json_src)?;
+    set_active_unlocked(paths, alias)
+}
+
 /// [`save_profile_and_activate_to`] for a caller that already holds the store
 /// lock, so it can decide *and* write without releasing it in between.
 ///
@@ -404,6 +423,7 @@ pub fn conflicting_workspace(
     incoming_account: Option<&str>,
     incoming_user: Option<&str>,
 ) -> Option<String> {
+    let dir = store::profile_dir(paths, alias).ok()?;
     let stored_workspace = workspace_of_profile(paths, alias);
     let stored_user = user_of_profile(paths, alias);
     if stored_workspace.is_none() && stored_user.is_none() {
@@ -421,10 +441,17 @@ pub fn conflicting_workspace(
     // different login in it is a different account; but a stored login that was
     // never recorded blocks nothing on its own, which is what keeps a profile
     // repairable when its token is unreadable and only metadata remains.
-    let user_contradicts = matches!(
-        (incoming_user, stored_user.as_deref()),
-        (Some(incoming), Some(stored)) if incoming != stored
-    );
+    // A stored login that is merely absent blocks nothing only when there is
+    // genuinely nothing to read — an unreadable token is what sends an operator
+    // back to `login` to repair the profile. A *readable* token that yields no
+    // login is different: the profile is intact, its owner is simply unproven,
+    // and a workspace does not identify its owner.
+    let stored_auth_readable = api::read_auth_json(&dir.join("auth.json")).is_ok();
+    let user_contradicts = match (incoming_user, stored_user.as_deref()) {
+        (Some(incoming), Some(stored)) => incoming != stored,
+        (Some(_), None) => stored_auth_readable,
+        _ => false,
+    };
     if workspace_settled && !user_contradicts {
         return None;
     }
