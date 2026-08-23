@@ -288,9 +288,19 @@ codexctl login amir@sawmills.ai --label team       # saves 'amir@sawmills.ai+tea
 ```
 
 Logging the same seat in again refreshes whichever alias it already occupies,
-so this is stable across re-logins. Without `--label` there is nothing to
-qualify with, and a login onto an alias held by another account is refused
-rather than allowed to replace its credentials.
+so this is stable across re-logins — including when the alias you type is not
+that one. An account lives in exactly one profile, and that profile is where a
+login for it lands, whatever the alias asked for turned out to hold. The name
+typed is not recorded as the address of a profile it did not name.
+
+Without `--label` there is nothing to qualify with, so a login onto an alias
+held by _another_ account, for an account not saved anywhere yet, is refused
+rather than allowed to replace those credentials.
+
+`codexctl save` refuses instead of redirecting. A login has already
+authenticated by the time the alias is resolved, so refusing it would throw away
+a working credential; a save has nothing to lose by asking you to name the alias
+it would have written to.
 
 `--label` also works on `codexctl save`, and `codexctl label <alias> [text]`
 sets or clears one later.

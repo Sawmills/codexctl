@@ -680,3 +680,46 @@ fn save_writes_the_right_email_when_the_token_names_none() {
         "an adopted account inherited the old occupant's address: {meta}"
     );
 }
+
+/// Claims are not the only proof of ownership. An opaque or pre-claims token
+/// gives the seat lookup nothing to match on, so without honouring the exact
+/// token the same credential lands under a second alias — the duplicate this
+/// whole change exists to prevent.
+#[test]
+fn save_refuses_a_second_alias_for_an_identical_opaque_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".codex")).unwrap();
+    std::fs::write(
+        home.join(".codex").join("auth.json"),
+        r#"{"access_token":"opaque-not-a-jwt"}"#,
+    )
+    .unwrap();
+
+    let save = |alias: &str| {
+        Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", home)
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("HTTP_PROXY", "http://127.0.0.1:1")
+            .env("ALL_PROXY", "http://127.0.0.1:1")
+            .args(["save", alias])
+            .write_stdin("y\n")
+            .output()
+            .unwrap()
+    };
+
+    assert!(save("alias-a").status.success());
+    let second = save("alias-b");
+    assert!(!second.status.success(), "{second:?}");
+    let stderr = String::from_utf8(second.stderr).unwrap();
+    assert!(stderr.contains("already saved as 'alias-a'"), "{stderr}");
+
+    let mut aliases: Vec<String> = std::fs::read_dir(home.join(".codexctl").join("profiles"))
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .collect();
+    aliases.sort();
+    assert_eq!(aliases, vec!["alias-a"], "one credential was saved twice");
+}

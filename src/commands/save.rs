@@ -95,6 +95,21 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
         _ => resolved_alias,
     };
 
+    // Claims are not the only proof of ownership. An opaque or pre-claims token
+    // gives `existing_seat` nothing to match on, so the same credential could be
+    // saved under a second alias — while being byte-identical to what the first
+    // profile holds, which the store already treats as conclusive everywhere
+    // else.
+    if let Some(owner) = profile::alias_for_auth_json_from(&paths, &auth_path)
+        .context("could not check which profile holds this credential")?
+        && owner != resolved_alias
+    {
+        anyhow::bail!(
+            "this credential is already saved as '{owner}'. Save to that alias instead: \
+             codexctl save {owner}"
+        );
+    }
+
     let existing = store::profile_dir(&paths, &resolved_alias)?;
     // What the operator is agreeing to replace, so the approval cannot be
     // applied to some other credential that lands there while they answer.
