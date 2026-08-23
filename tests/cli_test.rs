@@ -590,3 +590,58 @@ fn save_reuses_the_profile_that_already_holds_this_account() {
         "one account was saved twice under different aliases"
     );
 }
+
+/// Review read a redirect as able to carry `--allow-adopt` onto a profile the
+/// operator never named. The two are mutually exclusive and this pins why: a
+/// redirect needs `existing_seat` to positively match both the workspace and
+/// the login, and that is exactly the state in which nothing needs adopting.
+/// If the preconditions ever stop excluding each other, this fails.
+#[test]
+fn a_redirect_never_carries_pre_approved_adoption() {
+    use base64::Engine;
+    let claims = r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+    let token = format!("eyJhbGciOiJub25lIn0.{payload}.sig");
+
+    // `real` is damaged but fully identified, so a redirect is possible.
+    let case = |meta: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex").join("auth.json"),
+            format!(r#"{{"access_token":"{token}"}}"#),
+        )
+        .unwrap();
+        let real = home.join(".codexctl").join("profiles").join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("auth.json"), "{ not json").unwrap();
+        std::fs::write(real.join("meta.json"), meta).unwrap();
+
+        let output = Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", &home)
+            .args(["save", "typo", "--allow-adopt"])
+            .write_stdin("")
+            .output()
+            .unwrap();
+        let damaged = std::fs::read_to_string(real.join("auth.json")).unwrap();
+        (String::from_utf8_lossy(&output.stdout).to_string(), damaged)
+    };
+
+    // Identified on both halves: the save redirects to `real`, and because the
+    // account is settled it takes the ordinary overwrite prompt — the adoption
+    // flag never applies, so an unanswered prompt aborts.
+    let (out, damaged) = case(
+        r#"{"alias":"real","email":null,"plan":null,"account_id":"acct-team","user_id":"user-a","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    assert!(out.contains("aborted"), "{out}");
+    assert_eq!(damaged, "{ not json", "a redirect adopted without approval");
+
+    // Workspace only: adoption would be required, and precisely because the
+    // login cannot be matched there is no redirect to carry it.
+    let (_out, damaged) = case(
+        r#"{"alias":"real","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+    );
+    assert_eq!(damaged, "{ not json", "an unidentified profile was adopted");
+}

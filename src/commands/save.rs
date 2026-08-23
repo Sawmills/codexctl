@@ -208,6 +208,33 @@ fn save_verified_snapshot(
              Re-run the command to save the account that is active now."
         );
     }
+    // The seat was resolved before the lock, because the prompt must not be held
+    // under it. A concurrent save can create the profile this one should have
+    // reused in that window, which would rebuild the duplicate this check
+    // exists to prevent. Refuse rather than redirect: the operator already
+    // answered about a specific profile, and this is not it.
+    match profile::existing_seat(
+        paths,
+        live_now.account_id.as_deref(),
+        &api::token_logins(&live_now.access_token),
+    )
+    .context("could not check whether this account is already saved")?
+    {
+        profile::ExistingSeat::One(saved) if saved != resolved_alias => anyhow::bail!(
+            "this account was saved as '{saved}' while this command was preparing. \
+             Re-run it to refresh that profile."
+        ),
+        profile::ExistingSeat::Ambiguous(aliases)
+            if !aliases.iter().any(|saved| saved == resolved_alias) =>
+        {
+            anyhow::bail!(
+                "this account is already saved under more than one alias ({}). \
+                 Remove the duplicates, or save to one of them directly.",
+                aliases.join(", ")
+            )
+        }
+        _ => {}
+    }
     if store::profile_dir(paths, resolved_alias)?.exists() {
         // Re-run under the lock against the store as it actually stands. An
         // adoption the operator already approved carries over; one that only
@@ -415,6 +442,40 @@ mod tests {
         assert!(
             stored(&paths).contains(&incoming),
             "the approved save did not land"
+        );
+    }
+
+    /// The seat is resolved before the lock, so a concurrent save can create
+    /// the profile this one should have reused while the prompt is open.
+    /// Writing anyway rebuilds the duplicate the reuse check exists to prevent.
+    #[test]
+    fn refuses_when_another_alias_took_this_account_first() {
+        let (_tmp, paths, snapshot) = setup(&token("legacy"));
+        let arriving = workspace_token("acct-team");
+        std::fs::write(&snapshot, auth_bytes(&arriving)).unwrap();
+
+        // A concurrent save landed this very account under another alias.
+        let other = paths.profiles_dir().join("winner");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("auth.json"), auth_bytes(&arriving)).unwrap();
+        std::fs::write(
+            other.join("meta.json"),
+            r#"{"alias":"winner","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        let approved = Some(Some(auth_bytes(&token("legacy")).into_bytes()));
+        let lock = store::lock(&paths).unwrap();
+        let verified = api::read_auth_json(&snapshot).unwrap();
+        let error = save_verified_snapshot(
+            &lock, &paths, "work", None, None, &snapshot, &verified, true, approved, true,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("winner"), "{error}");
+        assert!(
+            stored(&paths).contains(&token("legacy")),
+            "the duplicate was written anyway"
         );
     }
 
