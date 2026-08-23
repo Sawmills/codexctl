@@ -1121,6 +1121,46 @@ fn attribution_honours_a_workspace_recorded_only_in_metadata() {
     );
 }
 
+/// The exact-token shortcut runs before the fuller ownership check, so it has
+/// to honour a workspace held only in metadata too. One access token can name
+/// two workspaces through an explicit `account_id`.
+#[test]
+fn exact_token_shortcut_honours_a_metadata_only_workspace() {
+    let (_tmp, paths) = setup_test_env();
+    let shared = synthetic_token(r#"{"sub":"seatA","jti":"shared"}"#);
+    let dir = paths.profiles_dir().join("team@test");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Claimless stored token; the workspace lives in metadata only.
+    std::fs::write(
+        dir.join("auth.json"),
+        format!(r#"{{"access_token":"{shared}"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("meta.json"),
+        r#"{"alias":"team@test","email":null,"plan":null,"account_id":"acct-team","saved_at":"2026-01-01T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    // Same access token, explicitly a different workspace, rotated refresh.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(
+            r#"{{"access_token":"{shared}","refresh_token":"foreign","account_id":"acct-other"}}"#
+        ),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "team@test").unwrap();
+
+    let kept = std::fs::read_to_string(dir.join("auth.json")).unwrap();
+    assert!(
+        !kept.contains("foreign"),
+        "a foreign workspace was captured through the exact-token shortcut"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();
