@@ -153,9 +153,12 @@ single-line forms, so nothing shifts for an unlabeled store.
 
 An account is identified by **both** its workspace (`chatgpt_account_id`) and its login
 (`chatgpt_user_id`, falling back to the token's `sub`). Neither half identifies an account alone: a
-workspace holds many people, and one login holds seats in many workspaces. A profile's workspace is
-read from its stored token first and its `meta.json` second, so a profile written before the field
+workspace holds many people, and one login holds seats in many workspaces. A profile's identity is
+read from its stored token first and its `meta.json` second, so a profile written before the fields
 existed is still identified.
+
+The login carries the claim it came from — `uid:` or `sub:` — so the two namespaces never compare
+equal on a coincidental value.
 
 `login` and `save` replace what is stored, so they require positive agreement rather than the mere
 absence of contradiction:
@@ -168,10 +171,15 @@ absence of contradiction:
 | known            | absent             | refuse — the token cannot prove it is this account |
 | absent           | absent             | allowed                                            |
 
-The login is checked alongside it: a login that differs is a refusal, and a token naming no login at
-all cannot overwrite a profile that names one. The single deliberate exception is a profile whose
-stored token cannot be read: nothing there can be identified or used, so an explicit re-login
-repairs it rather than destroying it.
+The login is checked alongside it, and unprovable in either direction is a refusal: a token naming
+no login cannot overwrite a profile that names one, and a profile whose stored login cannot be
+recovered is not open to a token that happens to name one — otherwise anyone in a shared workspace
+could replace a damaged profile by naming its alias.
+
+The single deliberate exception is a profile with **no readable token and no recorded account**:
+nothing there can be identified or used, so an explicit re-login repairs it rather than destroying
+it. A damaged profile that still records its workspace does not qualify — it is refused, and the
+error names `codexctl remove <alias>` as the way through.
 
 **This is fail-closed by design.** "Cannot confirm" is not "yes"; reading it as yes is what let a
 second workspace replace the first seat's credentials.
