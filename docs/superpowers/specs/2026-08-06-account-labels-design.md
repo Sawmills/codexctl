@@ -151,18 +151,30 @@ single-line forms, so nothing shifts for an unlabeled store.
 
 ### Refusing to overwrite a different account
 
-`save` resolves its alias, then compares the incoming token's `account_id` against the `account_id`
-stored in the target profile's `meta.json`:
+An account is identified by **both** its workspace (`chatgpt_account_id`) and its login
+(`chatgpt_user_id`, falling back to the token's `sub`). Neither half identifies an account alone: a
+workspace holds many people, and one login holds seats in many workspaces. A profile's workspace is
+read from its stored token first and its `meta.json` second, so a profile written before the field
+existed is still identified.
 
-| Stored               | Incoming | Result                                     |
-| -------------------- | -------- | ------------------------------------------ |
-| absent (old profile) | any      | today's `Overwrite? [y/N]` prompt          |
-| any                  | absent   | today's `Overwrite? [y/N]` prompt          |
-| equal                | equal    | today's `Overwrite? [y/N]` prompt          |
-| different            | known    | refuse, and name an explicit alias to pass |
+`login` and `save` replace what is stored, so they require positive agreement rather than the mere
+absence of contradiction:
 
-A refusal needs positive evidence of a _different_ account. Whenever either identifier is missing,
-the command falls back to the existing prompt rather than blocking a legitimate re-save.
+| Stored workspace | Incoming workspace | Result                                             |
+| ---------------- | ------------------ | -------------------------------------------------- |
+| equal            | equal              | allowed (`save` still prompts before overwriting)  |
+| different        | known              | refuse, and name an explicit alias to pass         |
+| absent           | known              | refuse — the profile cannot confirm this account   |
+| known            | absent             | refuse — the token cannot prove it is this account |
+| absent           | absent             | allowed                                            |
+
+The login is checked alongside it: a login that differs is a refusal, and a token naming no login at
+all cannot overwrite a profile that names one. The single deliberate exception is a profile whose
+stored token cannot be read: nothing there can be identified or used, so an explicit re-login
+repairs it rather than destroying it.
+
+**This is fail-closed by design.** "Cannot confirm" is not "yes"; reading it as yes is what let a
+second workspace replace the first seat's credentials.
 
 The refusal is an error, not a prompt, because the destructive answer is a single keystroke and the
 correct action is always to choose a different alias:
@@ -179,13 +191,27 @@ rather than to a later cleanup.
 
 ### Disambiguating the rotated-token fallback
 
-`alias_for_auth_json_from` keeps its exact-token-match pass unchanged. Its `sub` fallback gains
-`account_id` as a second key: a candidate matches when the subject matches **and** the account
-identifiers either both exist and are equal, or at least one is absent.
+Capture also overwrites a profile, so attribution follows the same rule, with one exception for
+evidence strong enough to stand alone.
 
-Two profiles for one login in two workspaces therefore stay distinguishable, and
-`capture_auth_file_profile_tokens` keeps folding rotated tokens back into the right profile. When
-either side lacks the claim, the behavior is exactly today's, so no existing store regresses.
+An **identical access token** is the same credential, so it resolves to its profile even when only
+one side declares a workspace — this is what lets a profile record its own workspace claim once
+Codex starts stamping one. Among several profiles holding one token, the one declaring the target's
+workspace wins; equally strong matches, or a sibling declaring a different workspace, resolve to no
+owner rather than letting directory order decide.
+
+Any **rotated** token needs the claims to agree. In particular a rotation declaring a workspace is
+not attributed to a same-login profile that never recorded one, because a native login elsewhere can
+put another seat's credential in the live file. A claimless rotation is likewise not attributed to a
+claimless profile when a declared sibling shares that login — either could own it.
+
+An alias the caller supplies (the active marker, or `CODEXCTL_PINNED_ALIAS`) breaks ties that token
+inspection cannot, but only after evidence: an exact-token owner outranks it, and it stands aside
+when the match is undecided.
+
+_Behaviour change:_ a profile whose stored token declares no workspace stops capturing rotations
+that declare one, so it goes stale until its next `save` or `login`. That is recoverable;
+overwriting its credentials is not.
 
 ## Testing
 
@@ -196,7 +222,7 @@ Focused unit tests:
 - Label validation accepts a normal label, trims, clears on empty, and rejects over-length,
   non-ASCII, and control-character input.
 - `alias_for_auth_json_from` returns the right alias for two profiles that share a `sub` and differ
-  by `account_id`, and preserves today's result when a claim is absent.
+  by `account_id`, and returns no owner when a claim is absent on either side of a rotation.
 - `Meta` deserializes a `meta.json` that predates the new fields.
 
 CLI tests:
@@ -204,7 +230,9 @@ CLI tests:
 - `label` sets, overwrites, and clears; it fails on an unknown alias.
 - `login --label` and `save --label` persist the label.
 - `list` and `status` omit the `Label` column with no labels present and include it once one is set.
-- `save` refuses when the target profile holds a different `account_id`.
+- `save` refuses when the target profile holds a different `account_id`, when either side's
+  workspace claim is missing, and when a concurrent write changes the profile or the live file
+  after the operator has confirmed the overwrite.
 
 Per `AGENTS.md`, no real token value enters a fixture. Test tokens are unsigned JWTs carrying only
 synthetic claims, following the existing `JWT_HDR` pattern in `commands/status.rs`.
