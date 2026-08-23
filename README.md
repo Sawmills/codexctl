@@ -330,7 +330,7 @@ reads them out of the stored token and remembers what it finds.
 
 Two credentials that positively disagree are never the same account, and
 `codexctl` refuses to overwrite one with the other. A profile that declares
-*nothing* is a different situation: the store cannot tell whether the account
+_nothing_ is a different situation: the store cannot tell whether the account
 arriving is the one it holds, but the operator who just logged in can. Those
 cases ask rather than refuse — on a terminal with a prompt, and elsewhere with
 `--allow-adopt`, the same shape `use` applies to billing and to banked resets.
@@ -353,7 +353,7 @@ error: profile 'amir@sawmills.ai' does not record which account it holds, so
 ```
 
 `--allow-adopt` settles only what the store could not work out. It has no
-effect on a conflict the store *did* work out: a stored workspace that
+effect on a conflict the store _did_ work out: a stored workspace that
 positively differs from the arriving one stays refused with or without it. It
 also has to name its target — `codexctl save --allow-adopt` without an alias is
 refused, because `save` would otherwise derive the alias from the token's email

@@ -169,13 +169,13 @@ replacement guards ask, while capture and seat lookup require positive agreement
 `login` and `save` replace what is stored, so they require positive agreement rather than the mere
 absence of contradiction:
 
-| Stored workspace | Incoming workspace | Result                                              |
-| ---------------- | ------------------ | --------------------------------------------------- |
-| equal            | equal              | allowed (`save` still prompts before overwriting)   |
-| different        | known              | refuse, and name an explicit alias to pass          |
+| Stored workspace | Incoming workspace | Result                                                |
+| ---------------- | ------------------ | ----------------------------------------------------- |
+| equal            | equal              | allowed (`save` still prompts before overwriting)     |
+| different        | known              | refuse, and name an explicit alias to pass            |
 | absent           | known              | ask — the profile cannot confirm or deny this account |
-| known            | absent             | ask — the token cannot prove it is this account      |
-| absent           | absent             | allowed                                             |
+| known            | absent             | ask — the token cannot prove it is this account       |
+| absent           | absent             | allowed                                               |
 
 The login is checked alongside it, and unprovable in either direction is never read as agreement: a
 token naming no login does not silently overwrite a profile that names one, and a profile whose
@@ -187,7 +187,7 @@ second workspace replace the first seat's credentials.
 
 But "cannot confirm" is not "no" either, and the two failures need different answers. A workspace
 that positively differs is never this account, so it is refused outright and no flag overrides it.
-A profile that declares *nothing* — which is precisely what every profile predating this design
+A profile that declares _nothing_ — which is precisely what every profile predating this design
 looks like — is a question the store cannot settle and the operator usually can. Refusing those
 outright leaves `codexctl remove` as the only way forward: it destroys the metadata that could have
 identified the profile and then performs the same replacement with nothing checked at all. The
