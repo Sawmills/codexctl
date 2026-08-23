@@ -1897,4 +1897,60 @@ mod tests {
         assert!(error.to_string().contains("simulated login failure"));
         assert!(!runner.seen_home.unwrap().exists());
     }
+    /// A legacy profile holding the very token that is live, where the live
+    /// copy declares a workspace the stored copy does not. Capture applies that
+    /// evidence — but only after a login has already chosen where to write, so
+    /// resolving without it made the profile invisible and the login landed
+    /// beside it. One account then existed twice, and every later lookup
+    /// reported it as ambiguous.
+    #[test]
+    fn run_from_does_not_duplicate_a_profile_the_live_file_identifies() {
+        let (_tmp, paths) = setup_test_env();
+        use base64::Engine;
+        let encode = |claims: &str| {
+            let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims);
+            format!("eyJhbGciOiJub25lIn0.{payload}.sig")
+        };
+        // The stored token declares a login but no workspace.
+        let shared =
+            encode(r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_user_id":"user-a"}}"#);
+        let dir = paths.profiles_dir().join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("auth.json"),
+            format!(r#"{{"access_token":"{shared}"}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            r#"{"alias":"legacy","email":null,"plan":null,"saved_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        // The live file holds that same token, with the workspace spelled out.
+        std::fs::write(
+            paths.codex_auth_json(),
+            format!(r#"{{"access_token":"{shared}","account_id":"acct-team"}}"#),
+        )
+        .unwrap();
+
+        let incoming = encode(
+            r#"{"sub":"seatA","https://api.openai.com/auth":{"chatgpt_account_id":"acct-team","chatgpt_user_id":"user-a"}}"#,
+        );
+        let mut runner = FakeLoginRunner::new(&format!(r#"{{"access_token":"{incoming}"}}"#));
+
+        let saved =
+            run_from_with_consent(&paths, "legacy", Some("team"), true, &mut runner).unwrap();
+
+        assert_eq!(
+            saved, "legacy",
+            "the login landed beside the profile it owns"
+        );
+        let mut aliases: Vec<String> = std::fs::read_dir(paths.profiles_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        aliases.sort();
+        assert_eq!(aliases, vec!["legacy"], "one account was saved twice");
+    }
 }

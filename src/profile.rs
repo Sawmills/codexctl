@@ -381,6 +381,42 @@ pub enum ExistingSeat {
 /// alias should be refreshed rather than duplicated when the operator gives it
 /// a different label. A store that cannot be scanned is an error rather than an
 /// answer, because "no match" and "could not look" are not the same thing.
+/// What a profile holds, using the live file when it proves to be this
+/// profile's own credential.
+///
+/// A profile's stored token can declare less than the live copy of that very
+/// token: `auth.json` carries an explicit `account_id` that a JWT claim may not,
+/// so a legacy profile can hold token T while the live T names a workspace. An
+/// exact access-token match already decides ownership everywhere else, and
+/// capture applies precisely this inference — but capture runs after a login has
+/// chosen its target. Resolving without it makes the profile invisible to
+/// `existing_seat`, and the login lands beside it as a second copy of one
+/// account, which every later lookup then reports as ambiguous.
+fn identity_of_profile(
+    paths: &Paths,
+    alias: &str,
+    live: Option<&api::AuthJson>,
+) -> (Option<String>, Option<String>) {
+    let stored_workspace = workspace_of_profile(paths, alias);
+    let stored_user = user_of_profile(paths, alias);
+    let Some(live) = live else {
+        return (stored_workspace, stored_user);
+    };
+    let holds_live_token = store::profile_dir(paths, alias)
+        .ok()
+        .and_then(|dir| api::read_auth_json(&dir.join("auth.json")).ok())
+        .is_some_and(|stored| stored.access_token == live.access_token);
+    if !holds_live_token {
+        return (stored_workspace, stored_user);
+    }
+    // Only ever adds what the profile could not say for itself. A stored claim
+    // that disagrees is left to the conflict rules rather than overwritten here.
+    (
+        stored_workspace.or_else(|| live.account_id.clone()),
+        stored_user.or_else(|| api::token_login(&live.access_token)),
+    )
+}
+
 pub fn existing_seat(
     paths: &Paths,
     workspace: Option<&str>,
@@ -393,11 +429,13 @@ pub fn existing_seat(
     if workspace.is_none() || user.is_none() {
         return Ok(ExistingSeat::None);
     }
+    // The live file is read once, not per alias.
+    let live = api::read_auth_json(&paths.codex_auth_json()).ok();
     let matching: Vec<String> = stored_aliases(paths)?
         .into_iter()
         .filter(|alias| {
-            workspace_of_profile(paths, alias).as_deref() == workspace
-                && user_of_profile(paths, alias).as_deref() == user
+            let (stored_workspace, stored_user) = identity_of_profile(paths, alias, live.as_ref());
+            stored_workspace.as_deref() == workspace && stored_user.as_deref() == user
         })
         .collect();
     Ok(match matching.len() {
