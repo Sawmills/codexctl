@@ -1772,6 +1772,40 @@ fn capture_proceeds_despite_an_unrelated_damaged_profile() {
     );
 }
 
+/// Two colleagues can share a `sub` while differing on `chatgpt_user_id`, and
+/// `login` already treats those as different accounts. Capture has to agree,
+/// or a file is one seat to attribution and two accounts to an overwrite.
+#[test]
+fn capture_uses_the_same_login_identity_as_login_does() {
+    let (_tmp, paths) = setup_test_env();
+    let seat = |user: &str, jti: &str| {
+        synthetic_token(&format!(
+            r#"{{"sub":"shared","jti":"{jti}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-team","chatgpt_user_id":"{user}"}}}}"#
+        ))
+    };
+    write_profile(&paths, "mine", &seat("user-a", "stored"));
+
+    // Same subject and workspace, a different login, rotated.
+    let exec_auth = paths.home.join("exec-auth.json");
+    std::fs::write(
+        &exec_auth,
+        format!(
+            r#"{{"access_token":"{}","refresh_token":"rotated"}}"#,
+            seat("user-b", "live")
+        ),
+    )
+    .unwrap();
+
+    profile::capture_exec_auth_from(&paths, &exec_auth, "mine").unwrap();
+
+    assert!(
+        !std::fs::read_to_string(paths.profiles_dir().join("mine").join("auth.json"))
+            .unwrap()
+            .contains("rotated"),
+        "a colleague's credential was captured over this profile"
+    );
+}
+
 #[test]
 fn active_starts_as_none() {
     let (_tmp, paths) = setup_test_env();

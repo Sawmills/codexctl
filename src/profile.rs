@@ -858,10 +858,10 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
     {
         return false;
     }
-    let Some(subject) = api::token_subject(&target.access_token) else {
+    let Some(login) = api::token_login(&target.access_token) else {
         return false;
     };
-    let target_login = api::token_login(&target.access_token);
+    let target_login = Some(login.clone());
     // A store that cannot be read is not evidence that no sibling declares a
     // workspace, and a half-written profile is still a profile — both count as
     // ambiguity rather than permission for the hint. Siblings are judged by
@@ -884,7 +884,7 @@ fn claimless_match_is_ambiguous(paths: &Paths, auth_json: &Path, hinted: &Profil
                 return !metadata_contradicts(paths, &alias, None, target_login.as_deref());
             };
             workspace_of_profile(paths, &alias).is_some()
-                && api::token_subject(&sibling.access_token).as_deref() == Some(subject.as_str())
+                && api::token_login(&sibling.access_token).as_deref() == Some(login.as_str())
         })
 }
 
@@ -1043,8 +1043,11 @@ fn auth_belongs_to_profile(paths: &Paths, auth_json: &Path, profile: &Profile) -
     if !claims_agree(left.account_id.as_deref(), right.account_id.as_deref()) {
         return false;
     }
-    let left_subject = api::token_subject(&left.access_token);
-    if left_subject.is_none() || left_subject != api::token_subject(&right.access_token) {
+    // The same login identity `login` and `save` compare, so a file is not one
+    // seat to capture and two accounts to an overwrite: `token_login` prefers
+    // `chatgpt_user_id` and only falls back to `sub`.
+    let left_login = api::token_login(&left.access_token);
+    if left_login.is_none() || left_login != api::token_login(&right.access_token) {
         return false;
     }
     // The same login is not the same account. Two workspace seats of one human
@@ -1065,7 +1068,7 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     let Ok(target_auth) = api::read_auth_json(auth_json) else {
         return Ok(None);
     };
-    let target_sub = api::token_subject(&target_auth.access_token);
+    let target_seat = api::token_login(&target_auth.access_token);
     let target_account = target_auth.account_id.clone();
     // Enumerated from the store's directories: `list_profiles_from` skips a
     // profile with no `meta.json`, and an interrupted save leaves a real one in
@@ -1116,8 +1119,8 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     let same_seat: Vec<(String, Option<String>)> = profile_auths
         .into_iter()
         .filter_map(|(alias, profile_auth)| {
-            let profile_sub = api::token_subject(&profile_auth.access_token);
-            (target_sub.is_some() && target_sub == profile_sub).then_some({
+            let profile_seat = api::token_login(&profile_auth.access_token);
+            (target_seat.is_some() && target_seat == profile_seat).then_some({
                 let workspace = workspace_of_profile(paths, &alias);
                 (alias, workspace)
             })
