@@ -45,6 +45,8 @@
 - Do not make `remove` the only remedy for a profile the store cannot identify. Deleting the evidence and replacing it unchecked is weaker than the replacement it guards.
 - Capture a token back to the alias the caller named. Fall back to token inspection only when the file does not belong to that alias.
 - Let an exact access token decide ownership on its own; anything rotated needs the claims to agree. Resolve undecidable ownership to no owner rather than a guess.
+- Weigh every holder of an exact token together, not one at a time. A holder naming another workspace is a different account; one naming none beside it leaves ownership undecided; all of them naming other workspaces leaves this seat free to be recorded.
+- Keep one account in one profile. The account identifies the profile; the alias is only the name reached for, and a mistyped one is free by definition. `login` lands on the profile that already holds the arriving account whatever alias was typed, because the browser login has already happened and refusing would discard it. `save` refuses and names that alias instead, having nothing to lose by asking.
 - Pass the pinned alias to children in `CODEXCTL_PINNED_ALIAS`. Recovery must exclude the account a pinned launch already selected.
 - Order captured tokens by issued-at and fall back to expiry. Never overwrite a saved token with an older copy of the same seat.
 - Pin a launch with `CODEX_HOME=~/.codexctl/exec-homes/<alias>`. Seed `auth.json` as a real file and share every other `~/.codex` entry by symbolic link. Never replace an entry that already exists, so an entry Codex turned into a real file stays as it left it until the home is deleted.
