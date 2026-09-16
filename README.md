@@ -253,6 +253,20 @@ So when every account is exhausted, `codexctl use` redeems a reset only after co
 hands back an account that works instead of a seat at 100%. Passing an explicit alias never
 redeems — use `codexctl reset <alias>` to spend a credit on a named account.
 
+### Weekly Quota Forecast
+
+```bash
+codexctl forecast            # seven-day chart, depletion risk and reset times
+codexctl schedule            # preview periodic status sampling
+codexctl schedule --install  # collect hourly samples while awake
+codexctl schedule --remove   # remove the sampling job
+```
+
+The dashboard uses each account's rolling seven-day window and actual reset
+time. It learns usage rates from saved status samples. First-run estimates are
+marked provisional. See [Weekly Quota Forecast](docs/forecast.md) for assumptions,
+history storage and schedule details.
+
 ### Other commands
 
 ```bash
