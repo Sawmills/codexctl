@@ -538,8 +538,12 @@ async fn fetch_and_split(
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active.as_deref());
-            let auth = api::read_auth_json(&auth_path)
-                .map(|auth| usage_auth_with_workspace(auth, p.meta.account_id.as_deref()));
+            let auth = api::read_auth_json(&auth_path).map(|auth| {
+                usage_auth_with_workspace(
+                    auth,
+                    profile::workspace_of_profile(paths, &p.meta.alias).as_deref(),
+                )
+            });
 
             async move {
                 let usage_result = match &auth {

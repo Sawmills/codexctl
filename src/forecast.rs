@@ -23,6 +23,9 @@ pub struct Window {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Sample {
     pub seat: (String, String),
+    /// Keep UID alongside the legacy subject so old history remains readable.
+    #[serde(default)]
+    pub login_uid: Option<String>,
     pub alias: String,
     pub plan: String,
     pub at: i64,
@@ -30,6 +33,14 @@ pub struct Sample {
 }
 
 impl Sample {
+    fn same_seat(&self, other: &Self) -> bool {
+        let claims = |s: &Self| api::Logins {
+            uid: s.login_uid.clone(),
+            sub: (!s.seat.1.is_empty()).then(|| s.seat.1.clone()),
+        };
+        self.seat.0 == other.seat.0 && claims(self).same(&claims(other))
+    }
+
     pub fn from_usage(
         alias: &str,
         auth: &api::AuthJson,
@@ -39,11 +50,15 @@ impl Sample {
         if usage.billing_class() != api::BillingClass::RateLimited {
             return None;
         }
+        let logins = api::token_logins(&auth.access_token);
+        if logins.is_empty() {
+            return None;
+        }
         let seat = (
             auth.account_id
                 .clone()
                 .or_else(|| api::extract_account_id(&auth.access_token))?,
-            api::token_subject(&auth.access_token)?,
+            logins.sub.unwrap_or_default(),
         );
         let mut windows = Vec::new();
         for (_, window) in usage.rate_limit.as_ref()?.windows() {
@@ -71,6 +86,7 @@ impl Sample {
         }
         Some(Self {
             seat,
+            login_uid: logins.uid,
             alias: alias.to_owned(),
             plan: usage.plan_type.clone()?,
             at,
@@ -109,7 +125,7 @@ pub fn record(paths: &Paths, samples: &[Sample], now: i64) -> Result<Vec<Sample>
         // Repeated status calls do not grow history faster than one sample per 5 minutes.
         if !history
             .iter()
-            .any(|s| s.seat == sample.seat && s.at >= sample.at - 300)
+            .any(|s| s.same_seat(sample) && s.at >= sample.at - 300)
         {
             history.push(sample.clone());
         }
@@ -148,7 +164,7 @@ impl Projection {
             let mut observations: Vec<_> = history
                 .iter()
                 .filter(|s| {
-                    s.seat == sample.seat
+                    s.same_seat(sample)
                         && s.plan == sample.plan
                         && s.at >= sample.at - WEEK
                         && s.at < sample.at
@@ -258,13 +274,12 @@ pub struct Report {
 
 impl Report {
     pub fn build(samples: Vec<Sample>, history: &[Sample], excluded: usize) -> Self {
-        let mut seen = HashSet::new();
         let mut report = Self {
             excluded,
             ..Self::default()
         };
         for sample in samples {
-            if !seen.insert(sample.seat.clone()) {
+            if report.samples.iter().any(|s| s.same_seat(&sample)) {
                 report.duplicates += 1;
                 continue;
             }
@@ -276,11 +291,19 @@ impl Report {
         let now = report.samples.iter().map(|s| s.at).max().unwrap_or(0);
         report.history_samples = history
             .iter()
-            .filter(|s| seen.contains(&s.seat) && s.at >= now - WEEK && s.at <= now)
+            .filter(|s| {
+                report.samples.iter().any(|current| current.same_seat(s))
+                    && s.at >= now - WEEK
+                    && s.at <= now
+            })
             .count();
         report.history_span = history
             .iter()
-            .filter(|s| seen.contains(&s.seat) && s.at >= now - WEEK && s.at <= now)
+            .filter(|s| {
+                report.samples.iter().any(|current| current.same_seat(s))
+                    && s.at >= now - WEEK
+                    && s.at <= now
+            })
             .map(|s| now - s.at)
             .max()
             .unwrap_or(0);
@@ -397,6 +420,7 @@ mod tests {
     fn sample(alias: &str, used: f64, reset_in: i64) -> Sample {
         Sample {
             seat: ("workspace".into(), alias.into()),
+            login_uid: None,
             alias: alias.into(),
             plan: "pro".into(),
             at: NOW,
@@ -413,6 +437,34 @@ mod tests {
         older.at -= ago;
         older.windows[0].used = used;
         older
+    }
+
+    #[test]
+    fn login_claims_preserve_history_across_subject_rotation_without_merging_conflicting_uids() {
+        let mut a = sample("a", 40.0, 86400);
+        a.login_uid = Some("user-a".into());
+        let mut rotated = past(&a, 86400, 20.0);
+        rotated.seat.1 = "rotated-subject".into();
+        assert!(
+            Projection::new(&a, &[rotated.clone()])
+                .unwrap()
+                .weekly_from_history
+        );
+        let mut conflicting = a.clone();
+        conflicting.login_uid = Some("user-b".into());
+        assert_eq!(
+            Report::build(vec![a.clone(), conflicting], &[], 0)
+                .samples
+                .len(),
+            2
+        );
+        let mut legacy = a.clone();
+        legacy.login_uid = None;
+        assert!(a.same_seat(&legacy));
+        rotated.seat.1.clear();
+        assert!(a.same_seat(&rotated));
+        legacy.seat.1 = "user-a".into();
+        assert!(!legacy.same_seat(&rotated));
     }
 
     #[test]

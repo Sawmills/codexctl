@@ -699,6 +699,7 @@ mod tests {
     fn fixture() -> Report {
         let sample = Sample {
             seat: ("workspace".into(), "seat".into()),
+            login_uid: None,
             alias: "very-long-account-name+personal@example.test".into(),
             plan: "pro".into(),
             at: NOW,

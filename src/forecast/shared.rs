@@ -167,6 +167,7 @@ mod tests {
         Projection {
             sample: Sample {
                 seat: ("w".into(), name.into()),
+                login_uid: None,
                 alias: name.into(),
                 plan: "pro".into(),
                 at: 0,
