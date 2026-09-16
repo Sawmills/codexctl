@@ -9,6 +9,7 @@ pub mod login;
 pub mod remove;
 pub mod resets;
 pub mod save;
+pub mod schedule;
 pub mod status;
 pub mod switch;
 pub mod use_profile;

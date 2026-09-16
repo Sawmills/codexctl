@@ -6,6 +6,7 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 use crate::api;
 use crate::commands::resets;
 use crate::config;
+use crate::forecast;
 use crate::profile;
 
 pub enum Filter {
@@ -157,7 +158,12 @@ impl UsageBasedAccount {
 }
 
 pub fn run(filter: Filter) -> Result<()> {
-    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
+    let LoadedStatuses {
+        rate_limited,
+        usage_based,
+        fetched_at,
+        ..
+    } = load_sorted_statuses()?;
 
     let show_rl = matches!(filter, Filter::All | Filter::RateLimited);
     let show_ub = matches!(filter, Filter::All | Filter::UsageBased);
@@ -192,7 +198,12 @@ pub fn run(filter: Filter) -> Result<()> {
 }
 
 pub fn run_focused(focused_alias: &str) -> Result<()> {
-    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
+    let LoadedStatuses {
+        rate_limited,
+        usage_based,
+        fetched_at,
+        ..
+    } = load_sorted_statuses()?;
     if !rate_limited.is_empty() || !usage_based.is_empty() {
         print_live_fetched_at(fetched_at);
     }
@@ -241,23 +252,50 @@ pub fn run_focused(focused_alias: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_sorted_statuses() -> Result<(
-    Vec<RateLimitedAccount>,
-    Vec<UsageBasedAccount>,
-    chrono::DateTime<chrono::Utc>,
-)> {
+pub fn run_forecast(details: bool) -> Result<()> {
+    let LoadedStatuses {
+        fetched_at,
+        mut report,
+        ..
+    } = load_sorted_statuses()?;
+    report.sampling_status = Some(super::schedule::status());
+    let width = crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width));
+    use std::io::IsTerminal;
+    let color = std::io::stdout().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").as_deref() != Ok("dumb");
+    print!(
+        "{}",
+        report.render_forecast(fetched_at.timestamp(), width, color, details)
+    );
+    Ok(())
+}
+
+struct LoadedStatuses {
+    rate_limited: Vec<RateLimitedAccount>,
+    usage_based: Vec<UsageBasedAccount>,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+    report: forecast::Report,
+}
+
+fn load_sorted_statuses() -> Result<LoadedStatuses> {
     let profiles = profile::list_profiles()?;
     let fetched_at = chrono::Utc::now();
     if profiles.is_empty() {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");
-        return Ok((Vec::new(), Vec::new(), fetched_at));
+        return Ok(LoadedStatuses {
+            rate_limited: Vec::new(),
+            usage_based: Vec::new(),
+            fetched_at,
+            report: forecast::Report::default(),
+        });
     }
 
     let paths = config::default_paths()?;
     let active = profile::get_active_from(&paths)?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (mut rate_limited, mut usage_based) =
+    let (mut rate_limited, mut usage_based, report) =
         rt.block_on(fetch_and_split(&profiles, &active, &paths))?;
 
     rate_limited.sort_by(|a, b| {
@@ -271,7 +309,12 @@ fn load_sorted_statuses() -> Result<(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    Ok((rate_limited, usage_based, fetched_at))
+    Ok(LoadedStatuses {
+        rate_limited,
+        usage_based,
+        fetched_at: chrono::Utc::now(),
+        report,
+    })
 }
 
 fn print_live_fetched_at(fetched_at: chrono::DateTime<chrono::Utc>) {
@@ -464,11 +507,25 @@ fn is_usage_based_plan(plan: &str) -> bool {
     plan.contains("usage_based")
 }
 
+// Retain the token-first, metadata-second workspace contract after a refresh
+// capture omits workspace claims. Use the same resolved value for GET and history.
+fn usage_auth_with_workspace(mut auth: api::AuthJson, recorded: Option<&str>) -> api::AuthJson {
+    auth.account_id = auth
+        .account_id
+        .or_else(|| api::extract_account_id(&auth.access_token))
+        .or_else(|| recorded.map(str::to_owned));
+    auth
+}
+
 async fn fetch_and_split(
     profiles: &[profile::Profile],
     active: &Option<String>,
     paths: &config::Paths,
-) -> Result<(Vec<RateLimitedAccount>, Vec<UsageBasedAccount>)> {
+) -> Result<(
+    Vec<RateLimitedAccount>,
+    Vec<UsageBasedAccount>,
+    forecast::Report,
+)> {
     let client = api::http_client()?;
 
     // Phase 1: fetch wham/usage for all accounts in parallel
@@ -481,7 +538,8 @@ async fn fetch_and_split(
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active.as_deref());
-            let auth = api::read_auth_json(&auth_path);
+            let auth = api::read_auth_json(&auth_path)
+                .map(|auth| usage_auth_with_workspace(auth, p.meta.account_id.as_deref()));
 
             async move {
                 let usage_result = match &auth {
@@ -497,6 +555,38 @@ async fn fetch_and_split(
         .collect();
 
     let results = futures::future::join_all(futures).await;
+
+    // Capture only numeric quota observations and stable seat identity, never credentials.
+    let now = chrono::Utc::now().timestamp();
+    let mut samples = Vec::new();
+    let mut excluded = 0;
+    let mut usage_based_count = 0;
+    for (alias, _, _, _, auth, usage) in &results {
+        match (auth, usage) {
+            (Ok(auth), Some(Ok(usage))) => {
+                if usage.billing_class() == api::BillingClass::UsageBased {
+                    usage_based_count += 1;
+                    continue;
+                }
+                if let Some(sample) = forecast::Sample::from_usage(alias, auth, usage, now) {
+                    samples.push(sample);
+                } else {
+                    excluded += 1;
+                }
+            }
+            _ => excluded += 1,
+        }
+    }
+    let (history, history_error) = match forecast::record(paths, &samples, now) {
+        Ok(history) => (history, None),
+        Err(error) => {
+            eprintln!("warning: usage history was not saved: {error:#}");
+            (Vec::new(), Some(format!("{error:#}")))
+        }
+    };
+    let mut report = forecast::Report::build(samples, &history, excluded);
+    report.usage_based = usage_based_count;
+    report.history_error = history_error;
 
     // Phase 2: classify and build account structs
     let mut rate_limited = Vec::new();
@@ -706,6 +796,12 @@ async fn fetch_and_split(
         .collect();
 
     for (idx, result) in futures::future::join_all(credit_futures).await {
+        report.set_reset_inventory(
+            &rate_limited[idx].alias,
+            rate_limited[idx].reset_credits,
+            result.as_ref().ok(),
+            now,
+        );
         if let Ok(details) = result {
             rate_limited[idx].reset_credit_expiry = details
                 .credits
@@ -716,7 +812,7 @@ async fn fetch_and_split(
         }
     }
 
-    Ok((rate_limited, usage_based))
+    Ok((rate_limited, usage_based, report))
 }
 
 fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
@@ -1013,6 +1109,32 @@ mod tests {
     use super::*;
 
     const JWT_HDR: &str = "eyJhbGciOiJub25lIn0";
+
+    #[test]
+    fn usage_workspace_preserves_metadata_after_claimless_refresh() {
+        let auth = api::AuthJson {
+            access_token: "claimless".into(),
+            refresh_token: None,
+            account_id: None,
+        };
+        assert_eq!(
+            usage_auth_with_workspace(auth, Some("saved-workspace"))
+                .account_id
+                .as_deref(),
+            Some("saved-workspace")
+        );
+        let auth = api::AuthJson {
+            access_token: "claimless".into(),
+            refresh_token: None,
+            account_id: Some("token-workspace".into()),
+        };
+        assert_eq!(
+            usage_auth_with_workspace(auth, Some("stale-workspace"))
+                .account_id
+                .as_deref(),
+            Some("token-workspace")
+        );
+    }
 
     #[test]
     fn auth_failure_label_reports_invalidated_when_token_is_not_time_expired() {

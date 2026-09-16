@@ -1,6 +1,6 @@
 [package]
 name = "codexctl"
-version = "0.1.23"
+version = "0.1.24"
 edition = "2024"
 rust-version = "1.89"
 description = "Manage multiple OpenAI Codex CLI accounts"
@@ -28,6 +28,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 vt100 = "0.16"
+flate2 = { version = "1", default-features = false, features = [
+  "rust_backend",
+] }
 
 [dev-dependencies]
 tempfile = "3"

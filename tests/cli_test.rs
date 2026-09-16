@@ -6,6 +6,8 @@ fn help_shows_all_subcommands() {
     let output = cmd.arg("--help").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("status"));
+    assert!(stdout.contains("forecast"));
+    assert!(stdout.contains("schedule"));
     assert!(stdout.contains("login"));
     assert!(stdout.contains("save"));
     assert!(stdout.contains("use"));
@@ -770,4 +772,85 @@ fn save_refuses_a_third_alias_for_an_already_duplicated_credential() {
             .exists(),
         "a third copy was created"
     );
+}
+
+#[test]
+fn forecast_without_profiles_explains_missing_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = run(tmp.path(), &["forecast"]);
+    assert!(output.status.success());
+    let text = stdout_of(&output);
+    assert!(text.contains("Account availability"));
+    assert!(text.contains("Total gaps unknown"));
+    let detailed = run(tmp.path(), &["forecast", "--details"]);
+    assert!(detailed.status.success());
+    assert!(stdout_of(&detailed).contains("QUOTA FORECAST"));
+    assert!(text.contains("Collecting history"));
+    assert!(!text.contains('\u{1b}'));
+}
+
+#[test]
+fn schedule_preview_is_read_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let output = run(tmp.path(), &["schedule"]);
+    assert!(output.status.success());
+    let text = stdout_of(&output);
+    assert!(text.contains("0 * * * *"));
+    assert!(text.contains(" status >/dev/null"));
+    assert!(!tmp.path().join(".codexctl").exists());
+    assert!(
+        !run(tmp.path(), &["schedule", "--install", "--remove"])
+            .status
+            .success()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn schedule_install_and_remove_preserve_existing_crontab() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let fake = tmp.path().join("crontab");
+    let crontab_file = tmp.path().join("cron.txt");
+    let other = "# My job\n0 1 * * * /usr/bin/true\n";
+    std::fs::write(&crontab_file, other).unwrap();
+    std::fs::write(&fake, "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then /bin/cat \"$TEST_CRON_FILE\"; else /bin/cat > \"$TEST_CRON_FILE\"; fi\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let execute = |args: &[&str]| {
+        Command::cargo_bin("codexctl")
+            .unwrap()
+            .env("HOME", tmp.path())
+            .env("PATH", tmp.path())
+            .env("TEST_CRON_FILE", &crontab_file)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(execute(&["schedule", "--install"]).status.success());
+    let installed = std::fs::read_to_string(&crontab_file).unwrap();
+    assert!(installed.starts_with(other));
+    assert_eq!(installed.matches("0 * * * *").count(), 1);
+    assert!(execute(&["schedule", "--install"]).status.success());
+    assert_eq!(std::fs::read_to_string(&crontab_file).unwrap(), installed);
+    assert!(execute(&["schedule", "--remove"]).status.success());
+    assert_eq!(std::fs::read_to_string(&crontab_file).unwrap(), other);
+}
+
+#[cfg(unix)]
+#[test]
+fn schedule_preserves_the_invoked_symlink_instead_of_its_versioned_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("codexctl");
+    let binary = assert_cmd::cargo::cargo_bin("codexctl");
+    std::os::unix::fs::symlink(binary, &link).unwrap();
+    for invoked in [&link, std::path::Path::new("codexctl")] {
+        let output = std::process::Command::new(invoked)
+            .env("HOME", tmp.path())
+            .env("PATH", tmp.path())
+            .arg("schedule")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(stdout_of(&output).contains(&format!("'{}' status", link.display())));
+    }
 }
