@@ -20,7 +20,7 @@ Ratatui would add widget layout and either terminal lifecycle management or conv
 
 **Charming: outside this command's needs.** Its supported renderers target HTML, images, and WebAssembly. Image rendering adds a JavaScript engine, and the project provides no minimum Rust version guarantee. It uses MIT or Apache-2.0. Consider it if a browser or exported image becomes a requirement. [Project Documentation](https://github.com/yuankunzhang/charming)
 
-These checks establish API fit, license terms, and release evidence. They are not a dependency security audit. Keeping the existing dependencies adds no new package to assess.
+These checks establish API fit, license terms, and release evidence. They are not a dependency security audit. The visualization uses existing dependencies. History compression separately adds `flate2`, which requires the normal dependency and advisory checks.
 
 ## Proposed Presentation
 

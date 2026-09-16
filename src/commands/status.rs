@@ -295,7 +295,7 @@ fn load_sorted_statuses() -> Result<LoadedStatuses> {
     let active = profile::get_active_from(&paths)?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (mut rate_limited, mut usage_based, report) =
+    let (mut rate_limited, mut usage_based, report, fetched_at) =
         rt.block_on(fetch_and_split(&profiles, &active, &paths))?;
 
     rate_limited.sort_by(|a, b| {
@@ -312,7 +312,7 @@ fn load_sorted_statuses() -> Result<LoadedStatuses> {
     Ok(LoadedStatuses {
         rate_limited,
         usage_based,
-        fetched_at: chrono::Utc::now(),
+        fetched_at,
         report,
     })
 }
@@ -525,6 +525,7 @@ async fn fetch_and_split(
     Vec<RateLimitedAccount>,
     Vec<UsageBasedAccount>,
     forecast::Report,
+    chrono::DateTime<chrono::Utc>,
 )> {
     let client = api::http_client()?;
 
@@ -799,12 +800,14 @@ async fn fetch_and_split(
         })
         .collect();
 
-    for (idx, result) in futures::future::join_all(credit_futures).await {
+    let credit_results = futures::future::join_all(credit_futures).await;
+    let inventory_at = chrono::Utc::now();
+    for (idx, result) in credit_results {
         report.set_reset_inventory(
             &rate_limited[idx].alias,
             rate_limited[idx].reset_credits,
             result.as_ref().ok(),
-            now,
+            inventory_at.timestamp(),
         );
         if let Ok(details) = result {
             rate_limited[idx].reset_credit_expiry = details
@@ -816,7 +819,7 @@ async fn fetch_and_split(
         }
     }
 
-    Ok((rate_limited, usage_based, report))
+    Ok((rate_limited, usage_based, report, inventory_at))
 }
 
 fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {

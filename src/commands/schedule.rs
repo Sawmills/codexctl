@@ -79,41 +79,64 @@ fn scheduled_executable() -> Result<PathBuf> {
     Ok(current)
 }
 
-pub fn run(install: bool, remove: bool) -> Result<()> {
-    let executable = scheduled_executable()?;
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    if !install && !remove {
-        print!("{}", entry(&executable, &home)?);
-        println!("Runs at minute 00 of every hour in cron's timezone.");
-        println!("Use --install to add it, or --remove to remove it.");
-        println!("The machine must be awake. Reinstall if a move or upgrade changes this path.");
-        return Ok(());
-    }
+fn read_crontab() -> Result<String> {
     let listed = Command::new("crontab")
         .arg("-l")
         .env("LC_ALL", "C")
         .output()
         .context("cannot run crontab; cron must be installed")?;
-    let existing = if listed.status.success() {
-        String::from_utf8(listed.stdout).context("crontab is not UTF-8; left unchanged")?
+    if listed.status.success() {
+        String::from_utf8(listed.stdout).context("crontab is not UTF-8; left unchanged")
     } else {
         let error = String::from_utf8_lossy(&listed.stderr);
         if listed.status.code() == Some(1) && error.contains("no crontab for") {
-            String::new()
+            Ok(String::new())
         } else {
             bail!("cannot read crontab; left unchanged: {error}");
         }
-    };
+    }
+}
+
+// Reconcile against a fresh read before replacing the user's table. Crontab has
+// no compare-and-swap API: an external writer after the final read can still race.
+fn reconcile_crontab(
+    replacement: &str,
+    mut read: impl FnMut() -> Result<String>,
+) -> Result<Option<String>> {
+    let mut existing = read()?;
+    for _ in 0..5 {
+        let updated = replace_managed(&existing, replacement)?;
+        let latest = read()?;
+        if latest != existing {
+            existing = latest;
+            continue;
+        }
+        return Ok((updated != existing).then_some(updated));
+    }
+    bail!("crontab keeps changing; retry when other editors have finished")
+}
+
+pub fn run(install: bool, remove: bool) -> Result<()> {
     let replacement = if remove {
         String::new()
     } else {
-        entry(&executable, &home)?
+        entry(
+            &scheduled_executable()?,
+            &dirs::home_dir().context("cannot determine home directory")?,
+        )?
     };
-    let updated = replace_managed(&existing, &replacement)?;
-    if updated == existing {
-        println!("Sampling schedule already matches.");
+    if !install && !remove {
+        print!("{replacement}");
+        println!("Runs at minute 00 of every hour in cron's timezone.");
+        println!("Use --install to add it, or --remove to remove it.");
+        println!("The machine must be awake. Reinstall if a move or upgrade changes this path.");
         return Ok(());
     }
+    let updated = reconcile_crontab(&replacement, read_crontab)?;
+    let Some(updated) = updated else {
+        println!("Sampling schedule already matches.");
+        return Ok(());
+    };
     let mut child = Command::new("crontab")
         .arg("-")
         .stdin(Stdio::piped())
@@ -174,6 +197,38 @@ pub fn status() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciles_intervening_jobs_on_install_and_remove() {
+        let block = entry(Path::new("/bin/codexctl"), Path::new("/home/test")).unwrap();
+        let other = "5 * * * * /usr/bin/true\n";
+        for replacement in [&block[..], ""] {
+            let initial = if replacement.is_empty() {
+                block.clone()
+            } else {
+                String::new()
+            };
+            let latest = format!("{initial}{other}");
+            let mut reads = [initial, latest.clone(), latest].into_iter();
+            let updated = reconcile_crontab(replacement, || Ok(reads.next().unwrap()))
+                .unwrap()
+                .unwrap();
+            assert!(updated.contains(other));
+            assert_eq!(updated.contains(START), !replacement.is_empty());
+        }
+    }
+
+    #[test]
+    fn refuses_continuously_changing_crontab() {
+        let mut revision = 0;
+        assert!(
+            reconcile_crontab("", || {
+                revision += 1;
+                Ok(format!("# revision {revision}\n"))
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn install_is_idempotent_and_preserves_other_jobs() {

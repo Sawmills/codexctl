@@ -1,11 +1,11 @@
 # Weekly Quota Forecast
 
 Run `codexctl forecast` to see whether at least one account remains available
-throughout the next seven days. The headline shows the first modeled gap, total gap time and longest gap, or
-the lowest account count. Confidence stays low when history is short or rates use
+throughout the next seven days. The headline shows the first modeled gap and
+total gap time, or states that no gaps are predicted. Confidence stays low when history is short or rates use
 assumptions. This is a scenario based on past demand, not a guarantee.
 
-`NOW` counts accounts with quota at the latest fetch. `WEEK LOW` gives the lowest
+The `--details` view includes the longest gap. `NOW` counts accounts with quota at the latest fetch. `WEEK LOW` gives the lowest
 modeled count. `HISTORY` shows the time since the oldest saved observation within
 the past week; observations count individual account records. That duration does
 not imply continuous sampling or equally long history for every account.
