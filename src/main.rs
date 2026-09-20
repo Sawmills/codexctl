@@ -1,6 +1,6 @@
 mod commands;
 
-use codexctl::{api, config, profile, store};
+use codexctl::{api, config, forecast, profile, store};
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -18,6 +18,21 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Graph the next seven days of quota, using usage history and rolling resets
+    Forecast {
+        /// Show account balances and model assumptions
+        #[arg(long)]
+        details: bool,
+    },
+    /// Preview or install periodic status sampling in your user crontab
+    Schedule {
+        /// Install or update the managed entry (default: preview only)
+        #[arg(long, conflicts_with = "remove")]
+        install: bool,
+        /// Remove only codexctl's managed sampling entry
+        #[arg(long)]
+        remove: bool,
+    },
     /// Show rate limit status for all accounts
     Status {
         /// Show only rate-limited accounts
@@ -148,13 +163,18 @@ fn main() {
     // Informational commands must work in a read-only or empty home. Clap
     // exits while parsing help, version, and invalid commands, and shell
     // completion generation does not need the profile store.
-    let needs_store = !matches!(&cli.command, Commands::Completions { .. });
+    let needs_store = !matches!(
+        &cli.command,
+        Commands::Completions { .. } | Commands::Schedule { .. }
+    );
     if needs_store && let Err(e) = config::ensure_dirs() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }
 
     let result = match cli.command {
+        Commands::Forecast { details } => commands::status::run_forecast(details),
+        Commands::Schedule { install, remove } => commands::schedule::run(install, remove),
         Commands::Status {
             rate_limited,
             usage_based,
