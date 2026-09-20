@@ -2,8 +2,9 @@
 
 Run `codexctl forecast` to see whether at least one account remains available
 throughout the next seven days. The headline shows the first modeled gap and
-total gap time, or states that no gaps are predicted. Confidence stays low when history is short or rates use
-assumptions. This is a scenario based on past demand, not a guarantee.
+total gap time, or states that no gaps are predicted. Usage evidence shows how many accounts have weekly rates measured from saved
+samples. Separate notices identify provisional weekly rates, unknown short-window rates, estimated window rates, and history shorter than two days. Banked resets remain an
+explicit scenario assumption; their presence does not downgrade measured history. This is a scenario based on past demand, not a guarantee.
 
 The `--details` view includes the longest gap. `NOW` counts accounts with quota at the latest fetch. `WEEK LOW` gives the lowest
 modeled count. `HISTORY` shows the time since the oldest saved observation within
@@ -22,7 +23,7 @@ among known accounts. Narrow terminals split the hours into bands without
 removing cells. The first three gap intervals appear below the heatmap.
 
 Use `codexctl forecast --details` for account balances, daily coverage totals,
-and full model assumptions. The compact view keeps confidence, history duration,
+and full model assumptions. The compact view keeps usage evidence, history duration,
 reset assumptions and sampling status visible.
 
 ```bash
@@ -47,8 +48,7 @@ percentage points from different plans do not establish comparable token counts.
 Even matching plan names do not prove equal capacity; this remains an assumption.
 
 A short window can block an account before its weekly allowance runs out.
-An unknown short-window rate assumes no future short-window use and lowers
-confidence. Known exhaustion still blocks the account until reset. An exhausted
+An unknown short-window rate assumes no future short-window use and shows a separate notice. Known exhaustion still blocks the account until reset. An exhausted
 weekly window with no rate also remains blocked until reset; its own demand
 is unknown and coverage is incomplete. After reset it can receive a share of
 known demand from its group.
@@ -71,7 +71,7 @@ accounts, and the model does not predict future credit grants.
 
 The simulation assumes one credit clears all exhausted main windows and starts
 new windows of the same duration. Unexhausted windows keep their usage and clocks.
-These reset effects are assumptions, so the display marks the scenario provisional.
+The display states these reset assumptions separately from measured usage history.
 The forecast never redeems a credit or changes reset approval settings.
 
 Only available `codex_rate_limits` credits with valid expiry timestamps enter the

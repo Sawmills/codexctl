@@ -102,6 +102,58 @@ fn minimum(intervals: &[(i64, i64, usize)], start: i64, end: i64) -> Option<usiz
         .min()
 }
 
+fn usage_evidence(view: &mut View, report: &Report) {
+    let measured = report
+        .projections
+        .iter()
+        .filter(|p| p.weekly_from_history)
+        .count();
+    let total = report.samples.len() + report.excluded;
+    view.text(
+        &format!("Weekly usage: {measured}/{total} accounts measured from saved samples"),
+        Color::Cyan,
+    );
+    let fallback = total - measured;
+    if fallback > 0 {
+        view.text(
+            &format!("Weekly pace: {fallback} account(s) lack a measured history rate."),
+            Color::Yellow,
+        );
+    }
+    let short = report
+        .projections
+        .iter()
+        .filter(|p| p.unknown_short_pace)
+        .count();
+    if short > 0 {
+        view.text(
+            &format!("Short-window pace: unknown for {short} account(s); no further short-window use assumed."),
+            Color::Yellow,
+        );
+    }
+    let other = report
+        .projections
+        .iter()
+        .filter(|p| p.provisional && !p.unknown_short_pace)
+        .count();
+    if other > 0 {
+        view.text(
+            &format!("Window rates: {other} account(s) use provisional current-window averages."),
+            Color::Yellow,
+        );
+    }
+    if report.history_span < 2 * 86400 {
+        view.text(
+            "History spans less than 2 days; the observed period is short.",
+            Color::Yellow,
+        );
+    }
+    view.text(
+        "Forecast assumes steady demand; future usage may change.",
+        Color::DarkGrey,
+    );
+}
+
 /// Compact default: hourly minima retain even one-second gaps.
 pub(super) fn compact(report: &Report, now: i64, width: usize, color: bool) -> String {
     let mut view = View {
@@ -126,11 +178,6 @@ pub(super) fn compact(report: &Report, now: i64, width: usize, color: bool) -> S
                 .zip(&p.rates)
                 .any(|(w, r)| w.seconds == WEEK && *r == 0.0)
         });
-    let low_confidence = incomplete
-        || report.history_span < 2 * 86400
-        || report.reset_inventory_unknown > 0
-        || banked > 0
-        || report.projections.iter().any(|p| p.provisional);
     view.blank();
     view.text("Account availability  /  next 7 days", Color::Cyan);
     view.text(
@@ -151,14 +198,7 @@ pub(super) fn compact(report: &Report, now: i64, width: usize, color: bool) -> S
         None => "No gaps predicted in the next 7 days".into(),
     };
     view.text(&summary, if total > 0 { Color::Red } else { Color::Reset });
-    view.text(
-        if low_confidence || intervals.is_empty() {
-            "Confidence: low / provisional scenario"
-        } else {
-            "Confidence: limited / past demand may change"
-        },
-        Color::Yellow,
-    );
+    usage_evidence(&mut view, report);
     view.blank();
     heatmap(&mut view, &intervals, now, incomplete);
     view.blank();
@@ -190,12 +230,6 @@ pub(super) fn compact(report: &Report, now: i64, width: usize, color: bool) -> S
     if report.reset_inventory_unknown > 0 {
         view.text(
             "Reset inventory incomplete; unverified credits excluded.",
-            Color::Yellow,
-        );
-    }
-    if report.projections.iter().any(|p| p.unknown_short_pace) {
-        view.text(
-            "Short-window pace unknown for some accounts.",
             Color::Yellow,
         );
     }
@@ -232,7 +266,7 @@ pub(super) fn compact(report: &Report, now: i64, width: usize, color: bool) -> S
     }
     view.blank();
     view.text(
-        "Assumes steady demand and balanced routing. Details: codexctl forecast --details",
+        "Assumes balanced routing. Details: codexctl forecast --details",
         Color::DarkGrey,
     );
     view.text(
@@ -358,9 +392,7 @@ pub(super) fn render(report: &Report, now: i64, width: usize, color: bool) -> St
         .iter()
         .map(|p| p.reset_expiries.len())
         .sum();
-    let provisional = report.projections.iter().any(|p| p.provisional)
-        || banked > 0
-        || report.reset_inventory_unknown > 0;
+    let provisional = report.projections.iter().any(|p| p.provisional);
     let current = report
         .samples
         .iter()
@@ -467,22 +499,7 @@ pub(super) fn render(report: &Report, now: i64, width: usize, color: bool) -> St
             Color::Yellow,
         );
     }
-    if provisional {
-        view.text(
-            "Confidence: low. PROVISIONAL rates or reset assumptions apply.",
-            Color::Yellow,
-        );
-    }
-    if !provisional {
-        view.text(
-            if unknown > 0 || report.history_span < 2 * 86400 {
-                "Confidence: low. Short or incomplete usage history."
-            } else {
-                "Confidence: limited. Past demand may change."
-            },
-            Color::Yellow,
-        );
-    }
+    usage_evidence(&mut view, report);
     view.text(
         "Shared workload: demand moves to usable accounts with matching plans and windows.",
         Color::DarkGrey,
@@ -521,12 +538,6 @@ pub(super) fn render(report: &Report, now: i64, width: usize, color: bool) -> St
     }
     view.blank();
     view.rule();
-    if report.projections.iter().any(|p| p.unknown_short_pace) {
-        view.text(
-            "Short-window pace unknown for some accounts; no further short-window use assumed.",
-            Color::Yellow,
-        );
-    }
     if unknown_weekly > 0 {
         view.text(
             "Pace after reset: unknown for some seats. Their own demand is excluded; they can receive shared work.",
@@ -716,6 +727,33 @@ mod tests {
     }
 
     #[test]
+    fn evidence_separates_measured_history_from_reset_assumptions() {
+        let mut report = fixture();
+        report.projections[0].reset_expiries.push(NOW + WEEK);
+        for details in [false, true] {
+            let output = report.render_forecast(NOW, 120, false, details);
+            assert!(output.contains("Weekly usage: 1/1 accounts measured from saved samples"));
+            if details {
+                assert!(output.contains("COVERED IN THE CURRENT MODEL"));
+            }
+            assert!(!output.contains("Confidence: low"));
+            assert!(!output.contains("PROVISIONAL rates or reset assumptions"));
+        }
+        report.excluded = 1;
+        let output = report.render(NOW, 120);
+        assert!(output.contains("Weekly usage: 1/2 accounts measured"));
+        assert!(output.contains("Weekly pace: 1 account(s) lack a measured history rate"));
+        report.excluded = 0;
+        report.projections[0].provisional = true;
+        report.projections[0].unknown_short_pace = true;
+        for details in [false, true] {
+            let output = report.render_forecast(NOW, 120, false, details);
+            assert!(output.contains("Short-window pace: unknown for 1 account(s)"));
+            assert!(output.contains("Weekly usage: 1/1 accounts measured"));
+        }
+    }
+
+    #[test]
     fn heatmap_legend_matches_cell_colors_and_plain_output() {
         for color in [false, true] {
             let mut view = View {
@@ -797,7 +835,11 @@ mod tests {
         assert!(!partial.contains("COVERED IN THE CURRENT MODEL"));
         report.excluded = 0;
         report.projections[0].provisional = true;
-        assert!(report.render(NOW, 80).contains("PROVISIONAL"));
+        assert!(
+            report
+                .render(NOW, 80)
+                .contains("provisional current-window averages")
+        );
         assert!(
             !report
                 .render(NOW, 80)

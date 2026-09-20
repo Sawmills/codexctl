@@ -663,7 +663,11 @@ mod tests {
         assert_eq!(p.remaining(NOW), 60.0);
         assert!(p.remaining(NOW + HOUR) > 59.0);
         assert!(report.outages(NOW).is_empty());
-        assert!(report.render(NOW, 80).contains("Short-window pace unknown"));
+        assert!(
+            report
+                .render(NOW, 80)
+                .contains("Short-window pace: unknown")
+        );
     }
 
     #[test]
