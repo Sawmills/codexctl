@@ -161,7 +161,31 @@ fn symlink_shared_entry(target: &Path, link: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn symlink_shared_entry(target: &Path, link: &Path) -> Result<()> {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        // A concurrent launch of the same alias won the race and linked the
+        // same target, so the entry is already shared.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => Err(error)
+            .context(format!(
+                "failed to link {}: Windows did not grant permission to create symbolic links; enable Developer Mode, grant SeCreateSymbolicLinkPrivilege, or run codexctl elevated",
+                link.display()
+            )),
+        Err(error) => Err(error).with_context(|| format!("failed to link {}", link.display())),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn symlink_shared_entry(_target: &Path, link: &Path) -> Result<()> {
     // Silently keeping the entry unshared would send session rollouts somewhere
     // `codex resume` never looks, so say so instead of pretending it worked.
@@ -291,7 +315,7 @@ mod tests {
         assert!(!paths.active_file().exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_shares_every_codex_entry_except_credentials() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
@@ -324,7 +348,7 @@ mod tests {
     /// A `codexctl use` mid-`atomic_replace` leaves a temporary file in the
     /// live home for an instant. Linking it would dangle the moment the rename
     /// lands, and nothing replaces an existing entry afterwards.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_skips_a_temporary_file_from_a_concurrent_switch() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
@@ -340,7 +364,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_keeps_an_entry_the_child_replaced() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);

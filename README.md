@@ -173,6 +173,10 @@ the saved profile when the child exits, and an older token never overwrites a ne
 ever replaces a symlink with a real file, that copy stops tracking the shared one; delete
 `~/.codexctl/exec-homes/<alias>` to start clean. The child's exit code becomes codexctl's.
 
+On Windows, creating these links requires Developer Mode, the
+`SeCreateSymbolicLinkPrivilege` user right, or an elevated `codexctl` process. If Windows refuses
+the operation, `exec` reports those options instead of failing with a generic link error.
+
 ### Reset-aware selection (default)
 
 Both `codexctl use` (no alias) and `codexctl codex` recovery prefer, among otherwise-eligible
