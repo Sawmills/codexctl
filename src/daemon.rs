@@ -10,10 +10,13 @@
 //! usage limit or the restart itself stopped.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use uds_windows::UnixStream;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -59,11 +62,34 @@ pub fn shares_daemon(codex_home: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
+#[cfg(unix)]
 fn process_alive(pid: i32) -> bool {
     // Signal 0 checks existence without delivering anything. EPERM still
     // means the process exists, just under another user.
     let delivered = unsafe { libc::kill(pid, 0) } == 0;
     delivered || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    // A process handle becomes signaled at exit, even while another handle
+    // keeps the exited process object alive. Access denied still means it exists.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid as u32);
+        if process.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let alive = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+        CloseHandle(process);
+        alive
+    }
 }
 
 /// Restart the daemon that serves `codex_home` through the Codex CLI.
@@ -636,14 +662,21 @@ pub fn codex_home_of(auth_json: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::net::UnixListener;
+    #[cfg(windows)]
+    use uds_windows::UnixListener;
 
     fn short_tempdir() -> tempfile::TempDir {
         // Unix socket paths must stay under ~104 bytes, which the default
         // macOS temp root can exceed.
+        #[cfg(unix)]
+        let root = PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let root = std::env::temp_dir();
         tempfile::Builder::new()
             .prefix("cxd")
-            .tempdir_in("/tmp")
+            .tempdir_in(root)
             .unwrap()
     }
 
@@ -662,7 +695,13 @@ mod tests {
         .unwrap();
         assert_eq!(running_pid(home.path()), Some(own));
 
+        #[cfg(unix)]
         let mut child = Command::new("true").spawn().unwrap();
+        #[cfg(windows)]
+        let mut child = Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
         let dead = child.id() as i32;
         child.wait().unwrap();
         std::fs::write(&pid_file, format!(r#"{{"pid":{dead}}}"#)).unwrap();
@@ -679,7 +718,11 @@ mod tests {
         assert!(!shares_daemon(live.path()));
 
         let pinned = short_tempdir();
-        std::os::unix::fs::symlink(
+        #[cfg(unix)]
+        let symlink = std::os::unix::fs::symlink;
+        #[cfg(windows)]
+        let symlink = std::os::windows::fs::symlink_dir;
+        symlink(
             live.path().join("app-server-daemon"),
             pinned.path().join("app-server-daemon"),
         )
@@ -737,6 +780,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restart_requires_a_restarted_report() {
         let dir = short_tempdir();
         let fake = dir.path().join("codex");
@@ -943,6 +987,7 @@ mod tests {
         daemon.join().unwrap();
     }
 
+    #[cfg(unix)]
     fn fake_codex(dir: &Path, body: &str) -> PathBuf {
         let fake = dir.join("codex");
         std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -952,6 +997,7 @@ mod tests {
         fake
     }
 
+    #[cfg(unix)]
     fn stopped(thread_id: &str, reason: StopReason) -> StoppedSession {
         StoppedSession {
             thread_id: thread_id.to_string(),
@@ -963,6 +1009,7 @@ mod tests {
     /// One session that cannot resume must not turn a successful restart into
     /// an error: `codexctl codex` still has its own session to relaunch.
     #[test]
+    #[cfg(unix)]
     fn a_failed_resume_is_reported_not_raised() {
         let home = short_tempdir();
         std::fs::create_dir_all(home.path().join("app-server-control")).unwrap();
@@ -985,6 +1032,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_failed_restart_is_an_error() {
         let home = short_tempdir();
         let codex = fake_codex(home.path(), "echo boom >&2; exit 1");
