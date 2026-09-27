@@ -24,6 +24,11 @@ const PID_FILE: &str = "app-server-daemon/daemon.pid";
 /// The daemon speaks WebSocket over its Unix socket; the URL only names the
 /// handshake target, exactly as Codex's own client sends it.
 const HANDSHAKE_URL: &str = "ws://localhost/rpc";
+/// What a resumed turn is allowed to do. `Client::resume` sets exactly this,
+/// and every path that resumes sessions states it first.
+pub const RESUME_PERMISSIONS: &str =
+    "no sandbox and no approval prompts (approvalPolicy=never, sandbox=danger-full-access)";
+
 /// How long the client waits for one response.
 #[derive(Debug, Clone, Copy)]
 struct Timeouts {
@@ -583,6 +588,16 @@ fn restart_and_resume_with(
         return Ok(Vec::new());
     }
 
+    let _ = writeln!(
+        out,
+        "codexctl: resuming {} {} with {RESUME_PERMISSIONS}",
+        sessions.len(),
+        if sessions.len() == 1 {
+            "session"
+        } else {
+            "sessions"
+        }
+    );
     let mut client = match Client::connect_when_ready(codex_home) {
         Ok(client) => client,
         Err(error) => {
@@ -980,6 +995,10 @@ mod tests {
 
         assert_eq!(unresumed, vec!["bad".to_string()]);
         let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains(&format!("resuming 2 sessions with {RESUME_PERMISSIONS}")),
+            "{out}"
+        );
         assert!(out.contains("failed to resume bad"), "{out}");
         assert!(out.contains("resumed t1 session t1"), "{out}");
     }

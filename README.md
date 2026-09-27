@@ -124,8 +124,10 @@ codexctl use amir+5@sawmills.ai --restart-daemon   # restarts without asking
 
 A restart stops the turns the daemon runs. Running turns get up to 60 s to finish first. After the
 restart, codexctl sends `Continue the previous request.` to each session that was running or had
-stopped on the usage limit. Those turns run with no sandbox and no approval prompts. A session
-whose turn finished during the restart gets nothing. Subagent sessions are left to their parent.
+stopped on the usage limit. Those turns run with no sandbox and no approval prompts
+(`approvalPolicy=never`, `sandbox=danger-full-access`). The restart question lists the sessions
+and states these permissions before you answer, and every restart prints them before it resumes
+anything, including `--restart-daemon` and `codexctl codex` recovery. A session whose turn finished during the restart gets nothing. Subagent sessions are left to their parent.
 Open TUIs reconnect to the new daemon by themselves. Only sessions the daemon has loaded are
 resumed: the daemon unloads an idle session about a second after its last client leaves, so a
 session whose TUI was closed stays stopped.

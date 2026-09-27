@@ -178,28 +178,36 @@ fn daemon_runs_installed(account: &daemon::DaemonAccount, auth_json: &Path) -> b
 }
 
 fn print_sessions(sessions: &[daemon::StoppedSession]) {
+    eprint!("{}", sessions_summary(sessions));
+}
+
+/// What a restart would do to the daemon's sessions, stated before the
+/// operator approves it, including the permissions resumed turns get.
+fn sessions_summary(sessions: &[daemon::StoppedSession]) -> String {
     if sessions.is_empty() {
-        eprintln!("codexctl: no session runs or waits on the usage limit.");
-        return;
+        return "codexctl: no session runs or waits on the usage limit.\n".to_string();
     }
-    eprintln!(
-        "codexctl: {} {} and {} resumed on the new account:",
+    let one = sessions.len() == 1;
+    let mut summary = format!(
+        "codexctl: {} {} and {} resumed on the new account with {}:\n",
         sessions.len(),
-        if sessions.len() == 1 {
+        if one {
             "session stops"
         } else {
             "sessions stop"
         },
-        if sessions.len() == 1 { "is" } else { "are" }
+        if one { "is" } else { "are" },
+        daemon::RESUME_PERMISSIONS
     );
     for session in sessions {
-        eprintln!(
-            "  {}  {}  ({})",
+        summary.push_str(&format!(
+            "  {}  {}  ({})\n",
             session.thread_id,
             session.title,
             session.reason.describe()
-        );
+        ));
     }
+    summary
 }
 
 /// Warn when the daemon for the live Codex home runs on another account than
@@ -305,5 +313,22 @@ mod tests {
         assert!(inspection.account.unreadable.is_some());
         let auth = auth_file(home.path(), "ws", Some("a@test"));
         assert!(!daemon_runs_installed(&inspection.account, &auth));
+    }
+
+    /// The question must say what a "yes" grants the resumed sessions.
+    #[test]
+    fn the_restart_question_discloses_the_resume_permissions() {
+        let sessions = [daemon::StoppedSession {
+            thread_id: "t1".into(),
+            title: "fix auth".into(),
+            reason: daemon::StopReason::UsageLimit,
+        }];
+        let summary = sessions_summary(&sessions);
+        assert!(
+            summary.contains("no sandbox and no approval prompts"),
+            "{summary}"
+        );
+        assert!(summary.contains("t1  fix auth"), "{summary}");
+        assert!(!sessions_summary(&[]).contains("sandbox"));
     }
 }

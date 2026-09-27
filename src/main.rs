@@ -72,6 +72,7 @@ enum Commands {
         allow_resets: bool,
         /// Restart the Codex app-server daemon without prompting when it
         /// still runs on another account, then resume the sessions it stops
+        /// with no sandbox and no approval prompts
         #[arg(long)]
         restart_daemon: bool,
     },
