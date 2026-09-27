@@ -66,7 +66,7 @@ pub fn after_switch(
         }
         return Ok(Vec::new());
     }
-    let Some(inspection) = daemon::inspect(&codex_home, exclude)? else {
+    let Some(inspection) = inspect_or_assume_stale(&codex_home, exclude) else {
         return Ok(Vec::new());
     };
     if daemon_runs_installed(&inspection.account, auth_json) {
@@ -93,12 +93,42 @@ pub fn after_switch(
             // A session may have started a turn while the question waited.
             // List again right before the restart; its drain rejects new
             // turns, so nothing can start after this.
-            daemon::inspect(&codex_home, exclude)?
+            inspect_or_assume_stale(&codex_home, exclude)
                 .map(|inspection| inspection.sessions)
                 .unwrap_or_default()
         }
     };
     daemon::restart_and_resume(&codex_home, &sessions, prompt, &mut std::io::stderr())
+}
+
+/// Inspect the daemon, or `None` when none runs.
+///
+/// The switch has already happened when this runs, so a daemon that cannot
+/// be read must not undo it or stop `codexctl codex` recovery. It is treated
+/// as running an unknown account with no known sessions: the policy still
+/// decides on a restart, and the warning says what could not be resumed.
+fn inspect_or_assume_stale(codex_home: &Path, exclude: Option<&str>) -> Option<daemon::Inspection> {
+    let error = match daemon::inspect(codex_home, exclude) {
+        Ok(inspection) => {
+            for thread in inspection.iter().flat_map(|i| &i.unreadable) {
+                eprintln!(
+                    "codexctl: warning: could not read session {thread}; it will not be resumed"
+                );
+            }
+            return inspection;
+        }
+        Err(error) => error,
+    };
+    let pid = daemon::running_pid(codex_home)?;
+    eprintln!(
+        "codexctl: warning: could not list the daemon's sessions ({error:#}); a restart resumes none of them"
+    );
+    Some(daemon::Inspection {
+        pid,
+        account: daemon::DaemonAccount::unreadable(&error),
+        sessions: Vec::new(),
+        unreadable: Vec::new(),
+    })
 }
 
 /// Fail when sessions the restart stopped did not resume.
@@ -244,5 +274,30 @@ mod tests {
             error.to_string(),
             "2 sessions did not resume; run `codex resume <id>` for: t1, t2"
         );
+    }
+
+    /// A daemon that runs but cannot be read still gets a restart decision,
+    /// so neither `use` nor `codex` recovery fails after the swap.
+    #[test]
+    fn an_unreadable_daemon_is_assumed_stale() {
+        let home = tempfile::Builder::new()
+            .prefix("cxs")
+            .tempdir_in("/tmp")
+            .unwrap();
+        assert!(inspect_or_assume_stale(home.path(), None).is_none());
+
+        std::fs::create_dir_all(home.path().join("app-server-daemon")).unwrap();
+        let own = std::process::id();
+        std::fs::write(
+            home.path().join("app-server-daemon/daemon.pid"),
+            format!(r#"{{"pid":{own}}}"#),
+        )
+        .unwrap();
+        let inspection = inspect_or_assume_stale(home.path(), None).unwrap();
+        assert_eq!(inspection.pid, own as i32);
+        assert!(inspection.sessions.is_empty());
+        assert!(inspection.account.unreadable.is_some());
+        let auth = auth_file(home.path(), "ws", Some("a@test"));
+        assert!(!daemon_runs_installed(&inspection.account, &auth));
     }
 }

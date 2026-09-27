@@ -116,7 +116,7 @@ impl DaemonAccount {
         }
     }
 
-    fn unreadable(error: &anyhow::Error) -> Self {
+    pub fn unreadable(error: &anyhow::Error) -> Self {
         Self {
             account_id: None,
             email: None,
@@ -183,9 +183,7 @@ pub enum Resumed {
 /// Subagent threads are left to the parent that drives them, and ephemeral
 /// threads have no rollout on disk to resume from.
 fn stop_reason(thread: &Value, last_turn: Option<&Value>) -> Option<StopReason> {
-    if thread.get("parentThreadId").is_some_and(|id| !id.is_null())
-        || thread.get("ephemeral").and_then(Value::as_bool) == Some(true)
-    {
+    if !resumable(thread) {
         return None;
     }
     let turn = last_turn?;
@@ -194,6 +192,11 @@ fn stop_reason(thread: &Value, last_turn: Option<&Value>) -> Option<StopReason> 
         "failed" if turn_failed_on_usage_limit(turn) => Some(StopReason::UsageLimit),
         _ => None,
     }
+}
+
+fn resumable(thread: &Value) -> bool {
+    thread.get("parentThreadId").is_none_or(Value::is_null)
+        && thread.get("ephemeral").and_then(Value::as_bool) != Some(true)
 }
 
 fn turn_failed_on_usage_limit(turn: &Value) -> bool {
@@ -289,28 +292,35 @@ impl Client {
     }
 
     /// Loaded sessions that need a turn once the daemon comes back.
-    pub fn stopped_sessions(&mut self) -> Result<Vec<StoppedSession>> {
-        let mut stopped = Vec::new();
+    ///
+    /// A thread that cannot be read is named in `unreadable` instead of
+    /// hiding every other session from recovery.
+    pub fn stopped_sessions(&mut self) -> Result<SessionScan> {
+        let mut scan = SessionScan::default();
         for thread_id in self.loaded_thread_ids()? {
-            let thread = self.request("thread/read", json!({"threadId": thread_id}))?;
-            let turns = self.request(
-                "thread/turns/list",
-                json!({"threadId": thread_id, "limit": 1, "itemsView": "notLoaded"}),
-            )?;
-            let thread = thread.get("thread").unwrap_or(&Value::Null);
-            let last_turn = turns
-                .get("data")
-                .and_then(Value::as_array)
-                .and_then(|t| t.first());
-            if let Some(reason) = stop_reason(thread, last_turn) {
-                stopped.push(StoppedSession {
+            match self.stop_reason_of(&thread_id) {
+                Ok(Some((title, reason))) => scan.sessions.push(StoppedSession {
                     thread_id,
-                    title: session_title(thread),
+                    title,
                     reason,
-                });
+                }),
+                Ok(None) => {}
+                Err(error) => scan.unreadable.push(format!("{thread_id}: {error:#}")),
             }
         }
-        Ok(stopped)
+        Ok(scan)
+    }
+
+    fn stop_reason_of(&mut self, thread_id: &str) -> Result<Option<(String, StopReason)>> {
+        let thread = self.request("thread/read", json!({"threadId": thread_id}))?;
+        let thread = thread.get("thread").unwrap_or(&Value::Null);
+        // Ephemeral threads refuse `thread/turns/list`, and neither they nor
+        // subagents are resumed, so their turns are never asked for.
+        if !resumable(thread) {
+            return Ok(None);
+        }
+        let last_turn = self.last_turn(thread_id)?;
+        Ok(stop_reason(thread, last_turn.as_ref()).map(|reason| (session_title(thread), reason)))
     }
 
     fn loaded_thread_ids(&mut self) -> Result<Vec<String>> {
@@ -495,6 +505,16 @@ pub struct Inspection {
     pub pid: i32,
     pub account: DaemonAccount,
     pub sessions: Vec<StoppedSession>,
+    /// Loaded threads that could not be read, as `id: error`.
+    pub unreadable: Vec<String>,
+}
+
+/// The loaded sessions that need a turn after a restart.
+#[derive(Debug, Default)]
+pub struct SessionScan {
+    pub sessions: Vec<StoppedSession>,
+    /// Threads that could not be read, as `id: error`.
+    pub unreadable: Vec<String>,
 }
 
 /// Inspect the daemon that serves `codex_home`, or `None` when none runs.
@@ -508,12 +528,16 @@ pub fn inspect(codex_home: &Path, exclude: Option<&str>) -> Result<Option<Inspec
     let account = client
         .account()
         .unwrap_or_else(|error| DaemonAccount::unreadable(&error));
-    let mut sessions = client.stopped_sessions()?;
+    let SessionScan {
+        mut sessions,
+        unreadable,
+    } = client.stopped_sessions()?;
     sessions.retain(|session| Some(session.thread_id.as_str()) != exclude);
     Ok(Some(Inspection {
         pid,
         account,
         sessions,
+        unreadable,
     }))
 }
 
@@ -767,12 +791,29 @@ mod tests {
                     ))
                     .unwrap();
                 let result = match method.as_str() {
+                    "thread/read" | "thread/resume" if request["params"]["threadId"] == "bad" => {
+                        seen.push(request.clone());
+                        let error =
+                            json!({"id": id, "error": {"code": -32600, "message": "no rollout"}});
+                        if socket.send(Message::text(error.to_string())).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
                     "initialize" => json!({}),
                     "account/read" => json!({
                         "account": {"type": "chatgpt", "email": "a@test"},
                         "workspaceRouting": {"chatgptAccountId": "acct-a"},
                     }),
-                    "thread/loaded/list" => json!({"data": ["t1", "t2", "t3"], "nextCursor": null}),
+                    "thread/loaded/list" => {
+                        json!({"data": ["t1", "t2", "t3", "bad", "eph"], "nextCursor": null})
+                    }
+                    "thread/read" if request["params"]["threadId"] == "eph" => {
+                        json!({"thread": {"id": "eph", "ephemeral": true}})
+                    }
+                    "thread/turns/list" if request["params"]["threadId"] == "eph" => {
+                        panic!("ephemeral threads refuse thread/turns/list")
+                    }
                     "thread/read" => {
                         let thread = request["params"]["threadId"].as_str().unwrap();
                         json!({"thread": {"id": thread, "name": format!("session {thread}")}})
@@ -784,15 +825,6 @@ mod tests {
                         Some("t2") => json!({"data": [{"id": "u", "status": "completed"}]}),
                         _ => json!({"data": [{"id": "u", "status": "inProgress"}]}),
                     },
-                    "thread/resume" if request["params"]["threadId"] == "bad" => {
-                        seen.push(request.clone());
-                        let error =
-                            json!({"id": id, "error": {"code": -32600, "message": "no rollout"}});
-                        if socket.send(Message::text(error.to_string())).is_err() {
-                            break;
-                        }
-                        continue;
-                    }
                     "thread/resume" => json!({"thread": {}}),
                     "turn/interrupt" => json!({}),
                     "turn/start" => json!({"turn": {"id": "new", "status": "inProgress"}}),
@@ -836,8 +868,15 @@ mod tests {
         assert_eq!(account.account_id.as_deref(), Some("acct-a"));
         assert_eq!(account.display(), "a@test");
 
-        let stopped = client.stopped_sessions().unwrap();
-        let summary: Vec<_> = stopped
+        let scan = client.stopped_sessions().unwrap();
+        assert_eq!(scan.unreadable.len(), 1, "{:?}", scan.unreadable);
+        assert!(
+            scan.unreadable[0].starts_with("bad: "),
+            "{:?}",
+            scan.unreadable
+        );
+        let summary: Vec<_> = scan
+            .sessions
             .iter()
             .map(|s| (s.thread_id.as_str(), s.title.as_str(), s.reason))
             .collect();
