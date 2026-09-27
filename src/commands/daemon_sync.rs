@@ -101,7 +101,25 @@ pub fn after_switch(
                 eprintln!("codexctl: the daemon runs this account already; not restarting it.");
                 return Ok(Vec::new());
             }
-            fresh.sessions
+            // The answer covers only the sessions it was shown. Resumed turns
+            // run with full access, so a session that appeared since needs its
+            // own yes; without one it is left to Codex and its own settings.
+            let (mut approved, added) = split_approved(fresh.sessions, &inspection.sessions);
+            if !added.is_empty() {
+                eprint!("{}", added_summary(&added));
+                if dialoguer::Confirm::new()
+                    .with_prompt("codexctl: resume these sessions too?")
+                    .default(false)
+                    .interact()?
+                {
+                    approved.extend(added);
+                } else {
+                    eprintln!(
+                        "codexctl: not resuming the sessions that started after the question."
+                    );
+                }
+            }
+            approved
         }
     };
     daemon::restart_and_resume(&codex_home, &sessions, prompt, &mut std::io::stderr())
@@ -177,6 +195,42 @@ fn daemon_runs_installed(account: &daemon::DaemonAccount, auth_json: &Path) -> b
     }
 }
 
+/// Split a fresh listing into the sessions the operator was shown and those
+/// that appeared since. Only the first may be resumed on the first answer.
+fn split_approved(
+    fresh: Vec<daemon::StoppedSession>,
+    shown: &[daemon::StoppedSession],
+) -> (Vec<daemon::StoppedSession>, Vec<daemon::StoppedSession>) {
+    fresh
+        .into_iter()
+        .partition(|session| shown.iter().any(|seen| seen.thread_id == session.thread_id))
+}
+
+fn added_summary(added: &[daemon::StoppedSession]) -> String {
+    let mut summary = format!(
+        "codexctl: {} started after the question and would also resume with {}:\n",
+        if added.len() == 1 {
+            "1 session".to_string()
+        } else {
+            format!("{} sessions", added.len())
+        },
+        daemon::RESUME_PERMISSIONS
+    );
+    for session in added {
+        summary.push_str(&session_row(session));
+    }
+    summary
+}
+
+fn session_row(session: &daemon::StoppedSession) -> String {
+    format!(
+        "  {}  {}  ({})\n",
+        session.thread_id,
+        session.title,
+        session.reason.describe()
+    )
+}
+
 fn print_sessions(sessions: &[daemon::StoppedSession]) {
     eprint!("{}", sessions_summary(sessions));
 }
@@ -200,12 +254,7 @@ fn sessions_summary(sessions: &[daemon::StoppedSession]) -> String {
         daemon::RESUME_PERMISSIONS
     );
     for session in sessions {
-        summary.push_str(&format!(
-            "  {}  {}  ({})\n",
-            session.thread_id,
-            session.title,
-            session.reason.describe()
-        ));
+        summary.push_str(&session_row(session));
     }
     summary
 }
@@ -330,5 +379,40 @@ mod tests {
         );
         assert!(summary.contains("t1  fix auth"), "{summary}");
         assert!(!sessions_summary(&[]).contains("sandbox"));
+    }
+
+    fn session(thread_id: &str, reason: daemon::StopReason) -> daemon::StoppedSession {
+        daemon::StoppedSession {
+            thread_id: thread_id.into(),
+            title: format!("session {thread_id}"),
+            reason,
+        }
+    }
+
+    /// A "yes" covers the sessions it was shown, never one that appeared
+    /// while the question waited.
+    #[test]
+    fn only_shown_sessions_are_approved() {
+        use daemon::StopReason::{Interrupted, UsageLimit};
+        let shown = [session("a", UsageLimit), session("gone", Interrupted)];
+        let fresh = vec![session("a", UsageLimit), session("new", Interrupted)];
+
+        let (approved, added) = split_approved(fresh, &shown);
+        let ids = |s: &[daemon::StoppedSession]| -> Vec<String> {
+            s.iter().map(|s| s.thread_id.clone()).collect()
+        };
+        assert_eq!(ids(&approved), ["a"]);
+        assert_eq!(ids(&added), ["new"]);
+
+        let summary = added_summary(&added);
+        assert!(
+            summary.contains("1 session started after the question"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("no sandbox and no approval prompts"),
+            "{summary}"
+        );
+        assert!(summary.contains("new  session new"), "{summary}");
     }
 }
