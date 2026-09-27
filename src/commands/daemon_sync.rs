@@ -90,12 +90,18 @@ pub fn after_switch(
             if !approved {
                 return Ok(declined(alias));
             }
-            // A session may have started a turn while the question waited.
-            // List again right before the restart; its drain rejects new
-            // turns, so nothing can start after this.
-            inspect_or_assume_stale(&codex_home, exclude)
-                .map(|inspection| inspection.sessions)
-                .unwrap_or_default()
+            // While the question waited, a session may have started a turn,
+            // or another switch may have restarted the daemon already. Look
+            // again right before the restart; its drain rejects new turns, so
+            // nothing can start after this.
+            let Some(fresh) = inspect_or_assume_stale(&codex_home, exclude) else {
+                return Ok(Vec::new());
+            };
+            if daemon_runs_installed(&fresh.account, auth_json) {
+                eprintln!("codexctl: the daemon runs this account already; not restarting it.");
+                return Ok(Vec::new());
+            }
+            fresh.sessions
         }
     };
     daemon::restart_and_resume(&codex_home, &sessions, prompt, &mut std::io::stderr())
