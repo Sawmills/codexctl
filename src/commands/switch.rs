@@ -2,6 +2,8 @@ use anyhow::Result;
 use dialoguer::FuzzySelect;
 
 use crate::api;
+use crate::commands::codex;
+use crate::commands::daemon_sync;
 use crate::config;
 use crate::profile;
 
@@ -43,6 +45,13 @@ pub fn run() -> Result<()> {
             let alias = &profiles[idx].meta.alias;
             let email = profile::switch_to(alias)?;
             println!("switched to {} ({})", alias, email);
+            daemon_sync::require_resumed(daemon_sync::after_switch(
+                alias,
+                &paths.codex_auth_json(),
+                daemon_sync::Restart::for_switch(false),
+                None,
+                codex::DEFAULT_RECOVERY_PROMPT,
+            )?)?;
         }
         None => {
             println!("cancelled");

@@ -110,6 +110,32 @@ Interactive fuzzy picker:
 codexctl switch
 ```
 
+### Codex app-server daemon
+
+With `features.daemon_auto_start`, every `codex` TUI attaches to one shared app-server daemon.
+The daemon reads `auth.json` once at startup and ignores a later swap, so a switch alone leaves
+every session on the old account. After a switch, `codexctl use` and `codexctl switch` ask the
+daemon which account it runs. If it runs another account, they offer to restart it:
+
+```bash
+codexctl use amir+5@sawmills.ai                    # asks before it restarts the daemon
+codexctl use amir+5@sawmills.ai --restart-daemon   # restarts without asking
+```
+
+A restart stops the turns the daemon runs. Running turns get up to 60 s to finish first. After the
+restart, codexctl sends `Continue the previous request.` to each session that was running or had
+stopped on the usage limit. Those turns run with no sandbox and no approval prompts. A session
+whose turn finished during the restart gets nothing. Subagent sessions are left to their parent.
+Open TUIs reconnect to the new daemon by themselves. Only sessions the daemon has loaded are
+resumed: the daemon unloads an idle session about a second after its last client leaves, so a
+session whose TUI was closed stays stopped.
+
+Without a terminal and without `--restart-daemon`, `use` only warns. `codexctl whoami` warns when
+the daemon account differs from the active profile. `codexctl codex` recovery restarts the daemon
+without asking, because every session on it shares the exhausted account. It resumes the other
+sessions; its own session relaunches with the flags it was started with. A pinned `exec` home
+shares the daemon of `~/.codex`, so a switch inside a pinned lane never restarts it.
+
 ### Run Codex with spend-cap recovery
 
 Use `codexctl codex` as the Codex launcher when you want account failover:

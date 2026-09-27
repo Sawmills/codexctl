@@ -72,8 +72,9 @@ trait ProfileSwitcher {
         tried: &[String],
     ) -> Result<Option<use_profile::RecoveryCandidate>>;
 
-    /// Switch the child Codex auth to `alias`.
-    fn switch_to(&mut self, alias: &str) -> Result<()>;
+    /// Switch the child Codex auth to `alias`. `own_session` is the session
+    /// the wrapper resumes itself, so a daemon restart must not resume it too.
+    fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()>;
 
     /// Redeem `alias`'s banked reset so its exhausted window clears.
     fn redeem_reset(&mut self, alias: &str, plan: &use_profile::ResetPlan) -> Result<()>;
@@ -254,10 +255,11 @@ fn run_with_reporter_inner(
                     switcher.redeem_reset(&candidate.alias, plan)?;
                 }
 
-                switcher.switch_to(&candidate.alias)?;
+                let next = recovery.clone().expect("recovery invocation set above");
+                let own_session = session_id_from_codex_args(&next.args);
+                switcher.switch_to(&candidate.alias, own_session.as_deref())?;
                 tried.push(candidate.alias);
 
-                let next = recovery.clone().expect("recovery invocation set above");
                 eprintln!("codexctl: running `codex {}`", next.args.join(" "));
                 invocation = next;
             }
@@ -818,7 +820,7 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
         use_profile::find_recovery_candidate(tried)
     }
 
-    fn switch_to(&mut self, alias: &str) -> Result<()> {
+    fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()> {
         // Inside a pinned lane the outgoing token is this lane's own account,
         // and the switch is about to overwrite it. Fold it back under the alias
         // the launch named first: subject alone cannot name it when one seat is
@@ -834,6 +836,21 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
         }
         let email = profile::switch_to_auth_json(alias, &self.auth_json)?;
         eprintln!("codexctl: switched to {alias} ({email})");
+        // Every session on a shared daemon runs on its one account, so the cap
+        // that stopped this session stopped them all. Restart it unasked; the
+        // relaunch below would otherwise attach to the old account again.
+        let unresumed = super::daemon_sync::after_switch(
+            alias,
+            &self.auth_json,
+            super::daemon_sync::Restart::Always,
+            own_session,
+            DEFAULT_RECOVERY_PROMPT,
+        )?;
+        // The daemon runs the new account now, so this session's own recovery
+        // can still go ahead; the others only need a manual resume.
+        if let Err(error) = super::daemon_sync::require_resumed(unresumed) {
+            eprintln!("codexctl: warning: {error:#}");
+        }
         Ok(())
     }
 
@@ -3633,7 +3650,7 @@ mod tests {
                 .cloned())
         }
 
-        fn switch_to(&mut self, alias: &str) -> anyhow::Result<()> {
+        fn switch_to(&mut self, alias: &str, _own_session: Option<&str>) -> anyhow::Result<()> {
             self.switched.push(alias.to_string());
             Ok(())
         }
