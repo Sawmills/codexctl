@@ -1,5 +1,7 @@
 use anyhow::Result;
 
+use crate::commands::daemon_sync;
+use crate::config;
 use crate::profile;
 
 pub fn run() -> Result<()> {
@@ -16,6 +18,7 @@ pub fn run() -> Result<()> {
                 .map(|label| format!(" — {label}"))
                 .unwrap_or_default();
             println!("{alias}{label} ({email}) [{plan}]");
+            daemon_sync::warn_if_stale(&alias, &config::codex_auth_json()?);
         }
         None => {
             println!("no active profile. Use 'codexctl save' or 'codexctl use <alias>'.");

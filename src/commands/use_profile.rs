@@ -6,6 +6,8 @@ use anyhow::{Result, bail};
 
 use crate::api;
 use crate::commands::alias;
+use crate::commands::codex;
+use crate::commands::daemon_sync;
 use crate::commands::resets;
 use crate::commands::status;
 use crate::config;
@@ -15,12 +17,27 @@ use crate::profile;
 /// 100% — i.e. the account has no usable headroom right now.
 const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
 
-pub fn run(alias: Option<&str>, _allow_billing: bool, allow_resets: bool) -> Result<()> {
-    run_to_auth_json(alias, &config::codex_auth_json()?, allow_resets)
+pub fn run(
+    alias: Option<&str>,
+    _allow_billing: bool,
+    allow_resets: bool,
+    restart_daemon: bool,
+) -> Result<()> {
+    run_to_auth_json(
+        alias,
+        &config::codex_auth_json()?,
+        allow_resets,
+        daemon_sync::Restart::for_switch(restart_daemon),
+    )
 }
 
-pub fn run_to_auth_json(alias: Option<&str>, auth_json: &Path, allow_resets: bool) -> Result<()> {
-    run_to_auth_json_excluding(alias, auth_json, None, allow_resets)
+pub fn run_to_auth_json(
+    alias: Option<&str>,
+    auth_json: &Path,
+    allow_resets: bool,
+    restart: daemon_sync::Restart,
+) -> Result<()> {
+    run_to_auth_json_excluding(alias, auth_json, None, allow_resets, restart)
 }
 
 pub fn run_to_auth_json_excluding(
@@ -28,26 +45,34 @@ pub fn run_to_auth_json_excluding(
     auth_json: &Path,
     excluded_alias: Option<&str>,
     allow_resets: bool,
+    restart: daemon_sync::Restart,
 ) -> Result<()> {
-    match alias::optional(alias)? {
+    let selected = match alias::optional(alias)? {
         // An explicit target is switched to as asked — never redeemed against,
         // since `codexctl reset <alias>` is the way to spend a credit on a
         // named account.
         Some(a) => {
             let email = profile::switch_to_auth_json(a, auth_json)?;
             println!("switched to {} ({})", a, email);
-            println!();
-            status::run_focused(a)?;
+            a.to_string()
         }
         None => {
             let best = find_most_available_excluding(excluded_alias, allow_resets)?;
             let email = profile::switch_to_auth_json(&best, auth_json)?;
             println!("auto-selected most available: {} ({})", best, email);
-            println!();
-            status::run_focused(&best)?;
+            best
         }
-    }
-    Ok(())
+    };
+    let unresumed = daemon_sync::after_switch(
+        &selected,
+        auth_json,
+        restart,
+        None,
+        codex::DEFAULT_RECOVERY_PROMPT,
+    )?;
+    println!();
+    status::run_focused(&selected)?;
+    daemon_sync::require_resumed(unresumed)
 }
 
 fn find_most_available_excluding(

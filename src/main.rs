@@ -1,6 +1,6 @@
 mod commands;
 
-use codexctl::{api, config, profile, store};
+use codexctl::{api, config, daemon, profile, store};
 
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
@@ -70,6 +70,11 @@ enum Commands {
         /// banked reset without prompting (resets are scarce and expire)
         #[arg(long)]
         allow_resets: bool,
+        /// Restart the Codex app-server daemon without prompting when it
+        /// still runs on another account, then resume the sessions it stops
+        /// with no sandbox and no approval prompts
+        #[arg(long)]
+        restart_daemon: bool,
     },
     /// Interactive fuzzy picker to switch accounts
     Switch,
@@ -186,7 +191,13 @@ fn main() {
             ref alias,
             allow_billing,
             allow_resets,
-        } => commands::use_profile::run(alias.as_deref(), allow_billing, allow_resets),
+            restart_daemon,
+        } => commands::use_profile::run(
+            alias.as_deref(),
+            allow_billing,
+            allow_resets,
+            restart_daemon,
+        ),
         Commands::Switch => commands::switch::run(),
         Commands::Resets {
             claim,

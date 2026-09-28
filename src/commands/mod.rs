@@ -2,6 +2,7 @@ pub mod adopt;
 mod alias;
 pub mod codex;
 pub mod completions;
+pub mod daemon_sync;
 pub mod exec;
 pub mod label;
 pub mod list;
