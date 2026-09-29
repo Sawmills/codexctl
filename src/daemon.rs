@@ -273,7 +273,10 @@ impl Client {
         };
         client.request(
             "initialize",
-            json!({"clientInfo": {"name": "codexctl", "version": env!("CARGO_PKG_VERSION")}}),
+            json!({
+                "clientInfo": {"name": "codexctl", "version": env!("CARGO_PKG_VERSION")},
+                "capabilities": {"experimentalApi": true},
+            }),
         )?;
         client.send(&json!({"method": "initialized"}))?;
         Ok(client)
@@ -370,6 +373,40 @@ impl Client {
                 "excludeTurns": true,
             }),
         )?;
+        if self
+            .last_turn(thread_id)?
+            .as_ref()
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str)
+            == Some("completed")
+        {
+            return Ok(Resumed::AlreadyFinished);
+        }
+        // A reconnecting TUI can load the thread before us. thread/resume
+        // ignores overrides on a loaded thread, and turn/start does not
+        // broadcast changed settings to attached clients. Update the sticky
+        // settings explicitly so those clients keep the same permissions.
+        self.request(
+            "thread/settings/update",
+            json!({
+                "threadId": thread_id,
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            }),
+        )?;
+        let effective = self.request_within(
+            self.timeouts.resume,
+            "thread/resume",
+            json!({"threadId": thread_id, "excludeTurns": true}),
+        )?;
+        if effective.get("approvalPolicy").and_then(Value::as_str) != Some("never")
+            || effective.pointer("/sandbox/type").and_then(Value::as_str)
+                != Some("dangerFullAccess")
+        {
+            bail!("daemon did not apply the requested resume permissions for {thread_id}");
+        }
+        // Recheck after the update: a turn may finish while permissions are
+        // applied. Never interrupt a running turn until the update succeeds.
         if let Some(turn) = self.last_turn(thread_id)? {
             match turn.get("status").and_then(Value::as_str) {
                 Some("completed") => return Ok(Resumed::AlreadyFinished),
@@ -623,14 +660,14 @@ fn restart_and_resume_with(
             Ok(Resumed::AlreadyFinished) => {
                 let _ = writeln!(
                     out,
-                    "codexctl: {} {} finished before the restart; not resumed",
+                    "codexctl: {} {} finished before continuation; no new turn started",
                     session.thread_id, session.title
                 );
             }
             Err(error) => {
                 let _ = writeln!(
                     out,
-                    "codexctl: failed to resume {} {}: {error:#}",
+                    "codexctl: failed to resume {} {}: {error:#}. Requested permissions may remain active",
                     session.thread_id, session.title
                 );
                 failed.push(session.thread_id.clone());
@@ -789,6 +826,8 @@ mod tests {
             let (stream, _) = listener.accept().unwrap();
             let mut socket = tungstenite::accept(stream).unwrap();
             let mut seen = Vec::new();
+            let mut full_access = std::collections::HashSet::new();
+            let mut experimental_api = false;
             loop {
                 let Ok(message) = socket.read() else { break };
                 let Message::Text(text) = message else {
@@ -815,7 +854,23 @@ mod tests {
                         }
                         continue;
                     }
-                    "initialize" => json!({}),
+                    "thread/settings/update" if request["params"]["threadId"] == "unsupported" => {
+                        seen.push(request.clone());
+                        socket
+                            .send(Message::text(
+                                json!({
+                                    "id": id, "error": {"code": -32601, "message": "unknown method"}
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                        continue;
+                    }
+                    "initialize" => {
+                        experimental_api =
+                            request["params"]["capabilities"]["experimentalApi"] == true;
+                        json!({})
+                    }
                     "account/read" => json!({
                         "account": {"type": "chatgpt", "email": "a@test"},
                         "workspaceRouting": {"chatgptAccountId": "acct-a"},
@@ -840,7 +895,21 @@ mod tests {
                         Some("t2") => json!({"data": [{"id": "u", "status": "completed"}]}),
                         _ => json!({"data": [{"id": "u", "status": "inProgress"}]}),
                     },
-                    "thread/resume" => json!({"thread": {}}),
+                    "thread/resume" => json!({
+                        "thread": {}, "approvalPolicy": if request["params"]["threadId"] == "approval-required" { "on-request" } else { "never" },
+                        "sandbox": {"type": if full_access.contains(request["params"]["threadId"].as_str().unwrap()) { "dangerFullAccess" } else { "workspaceWrite" }},
+                    }),
+                    "thread/settings/update" => {
+                        if experimental_api
+                            && request["params"]["sandboxPolicy"]["type"] == "dangerFullAccess"
+                            && request["params"]["approvalPolicy"] == "never"
+                            && request["params"]["threadId"] != "restricted"
+                        {
+                            full_access
+                                .insert(request["params"]["threadId"].as_str().unwrap().to_owned());
+                        }
+                        json!({})
+                    }
                     "turn/interrupt" => json!({}),
                     "turn/start" => json!({"turn": {"id": "new", "status": "inProgress"}}),
                     other => panic!("unexpected method {other}"),
@@ -922,6 +991,121 @@ mod tests {
         assert_eq!(
             turn["params"]["input"][0]["text"],
             "Continue the previous request."
+        );
+    }
+
+    #[test]
+    fn resume_updates_loaded_thread_settings_before_starting_work() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("t3", "go");
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert_eq!(result.unwrap(), Resumed::Started);
+        assert_eq!(
+            seen.iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "initialize",
+                "thread/resume",
+                "thread/turns/list",
+                "thread/settings/update",
+                "thread/resume",
+                "thread/turns/list",
+                "turn/interrupt",
+                "turn/start"
+            ]
+        );
+    }
+
+    #[test]
+    fn resume_does_not_start_work_if_full_access_was_not_applied() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("restricted", "go");
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("did not apply the requested resume permissions")
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r["method"] == "turn/start" || r["method"] == "turn/interrupt")
+        );
+    }
+
+    #[test]
+    fn resume_does_not_interrupt_when_approval_prompts_remain_enabled() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("approval-required", "go");
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("did not apply the requested resume permissions")
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r["method"] == "turn/start" || r["method"] == "turn/interrupt")
+        );
+    }
+
+    #[test]
+    fn unsupported_settings_update_does_not_start_work() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("unsupported", "go");
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert!(result.unwrap_err().to_string().contains("unknown method"));
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r["method"] == "turn/start" || r["method"] == "turn/interrupt")
+        );
+    }
+
+    #[test]
+    fn completed_session_keeps_its_permissions_and_receives_no_prompt() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("t2", "go");
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert_eq!(result.unwrap(), Resumed::AlreadyFinished);
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r["method"] == "thread/settings/update" || r["method"] == "turn/start")
         );
     }
 

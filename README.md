@@ -127,7 +127,15 @@ restart, codexctl sends `Continue the previous request.` to each session that wa
 stopped on the usage limit. Those turns run with no sandbox and no approval prompts
 (`approvalPolicy=never`, `sandbox=danger-full-access`). The restart question lists the sessions
 and states these permissions before you answer, and every restart prints them before it resumes
-anything, including `--restart-daemon` and `codexctl codex` recovery. A session whose turn finished during the restart gets nothing. Subagent sessions are left to their parent.
+anything, including `--restart-daemon` and `codexctl codex` recovery. A session whose turn finished during the restart receives no continuation prompt. Subagent sessions are left to their parent.
+
+Before it continues a stopped session, `codexctl` updates the thread permissions and checks
+that full access is active.
+The daemon sends the changed settings to attached TUIs so they retain those permissions.
+If the update fails, `codexctl` reports that session as not resumed and sends no continuation prompt.
+Once applied, these permissions remain active even if the turn finishes or a later recovery step fails.
+This path requires a Codex daemon that supports `thread/settings/update` (tested with Codex 0.158.0).
+
 Open TUIs reconnect to the new daemon by themselves. Only sessions the daemon has loaded are
 resumed: the daemon unloads an idle session about a second after its last client leaves, so a
 session whose TUI was closed stays stopped.
