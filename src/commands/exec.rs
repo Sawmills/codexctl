@@ -21,6 +21,8 @@ pub const PINNED_ALIAS_ENV: &str = "CODEXCTL_PINNED_ALIAS";
 
 pub fn run(account: &str, args: &[String]) -> Result<i32> {
     refuse_inherited_codex_home(std::env::var_os("CODEX_HOME").as_deref())?;
+    #[cfg(feature = "central-prototype")]
+    codexctl::central::native::require_local_mode()?;
     run_from(&config::default_paths()?, account, args)
 }
 

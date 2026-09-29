@@ -1,5 +1,6 @@
 //! Experimental single-account credential broker and local App Server client.
 mod client;
+pub mod native;
 mod rpc;
 mod server;
 mod vault;

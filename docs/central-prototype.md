@@ -2,9 +2,10 @@
 
 This prototype lets two registered clients run Codex locally with one server-owned account.
 The server holds the refresh token and gives clients only access tokens.
-Each client uses the experimental Codex App Server interface.
+The native TUI uses command-backed provider authentication.
+An earlier one-prompt client also uses the experimental Codex App Server interface.
 The prototype supports one account, multiple devices, and explicit tenant and user ownership.
-It does not replace the standard Codex terminal interface.
+Use the Native TUI Workflow section for the regular Codex terminal interface.
 
 ## Build and Test
 
@@ -148,7 +149,8 @@ Live refresh stays disabled to protect the original login.
 The temporary broker, key, device secrets, and runtime directories are removed afterward.
 The experiment uses included account quota and needs a usable account with enough quota.
 It exercises two independent client processes on one physical machine.
-A separate machine test and a dedicated-login live refresh test remain release requirements.
+This earlier experiment does not cover a second machine or live refresh.
+The native workflow tests below cover those cases with a dedicated login.
 
 ## Sources
 
@@ -159,3 +161,81 @@ A separate machine test and a dedicated-login live refresh test remain release r
 
 OpenAI marks external ChatGPT authentication as experimental.
 The implementation uses the documented integration point instead of a custom OAuth refresh endpoint.
+
+## Native TUI Workflow
+
+Build both prototype binaries with `cargo build --features central-prototype --bins`.
+After server setup and device registration, connect each device once:
+
+```sh
+./target/debug/codexctl-central connect --alias personal \
+  --server http://127.0.0.1:8787 --token-file /absolute/path/device.token
+./target/debug/codexctl use personal
+codex
+```
+
+With one registered remote account, `codexctl use` also selects it without an alias.
+Automatic selection refuses usage-based accounts and unknown billing.
+An explicit selection requires billing confirmation for those accounts.
+The broker reads effective rate limits and credits before it returns native credentials.
+A changed billing plan or billing class requires new approval.
+A failed billing read returns no token. A slow read can outlast the client deadline.
+The normal Codex TUI and local tools run unchanged.
+Codex calls a private `codexctl central-token` helper through its command-backed provider authentication.
+The helper gets access tokens from the broker and never stores an OpenAI refresh token on the device.
+Each helper invocation requests server-side refresh; this includes startup calls.
+Codex caches the result for the session and calls the helper again after an authorization error.
+The helper has a 95-second HTTP deadline, and Codex has a 110-second command deadline.
+These deadlines differ from the experimental App Server callback used by the earlier one-prompt client.
+
+Activation changes the model provider in the local Codex configuration.
+It refuses a default Codex profile that overrides the provider.
+It preserves the local login file and unrelated configuration.
+The provider uses the ChatGPT Codex endpoint with the assigned account header.
+Codex shows a custom provider instead of the standard ChatGPT account display.
+This prototype has no remote account availability ranking.
+Switching to a local profile restores the previous provider before swapping its login.
+After the daemon stops, run `codexctl-central disconnect` to restore the previous provider without switching the local login.
+Disconnect also refuses a running daemon.
+If the selected provider changes, disconnect preserves that user choice and removes the stale remote marker.
+If the TOML file cannot be parsed, fix its syntax before disconnecting.
+The marker is `~/.codexctl/central/.native-active.json`.
+A failed activation removes its newly prepared marker; an abrupt stop can leave one that disconnect clears.
+Linked configuration files keep their links and file permissions. Their parent directories keep their permissions.
+Remote activation refuses inherited Codex homes and pinned aliases.
+While the remote provider is selected, local login, save, switch, exec, and recovery commands refuse instead of reporting or using a different account.
+The token helper also refuses an existing pinned shell that sees the remote provider through its linked configuration.
+Use regular `codex`, or disconnect before those local account wrappers.
+Already-running TUI sessions keep the connection selected when they started.
+Remote activation refuses a running Codex daemon.
+Finish its sessions and run `codex app-server daemon stop` before selection.
+The prototype does not migrate existing sessions.
+
+## Native Workflow Test Evidence
+
+On September 29, 2026, the native workflow passed on two physical Macs through an SSH tunnel.
+The desktop used Codex 0.159.0. The MacBook used Codex 0.156.1.
+Each machine ran `codexctl use` and the regular Codex TUI with its default daemon.
+Each TUI read a different local file and returned its exact contents.
+Neither client created an OpenAI login file or received a refresh token.
+
+A separate test injected one HTTP 401 during the second turn of the same TUI session.
+The native helper requested a real server-side token refresh, and the access token changed.
+The same TUI then completed its next reply through OpenAI.
+This test exercises authorization-error recovery. It does not wait for literal token expiry.
+A graceful broker restart also preserved the latest access token in the encrypted vault.
+
+The repeatable client test uses an already running broker and a registered device:
+
+```sh
+python3 tests/central_native_e2e.py --bin-dir target/debug \
+  --server http://127.0.0.1:8787 --device /absolute/path/device.token \
+  --receipt /tmp/native-receipt.json
+```
+
+Live tests use a separate server login and consume included account quota.
+CI uses synthetic credentials and does not run these live tests.
+
+To unregister a remote alias after disconnecting, remove its `~/.codexctl/central/<alias>.json` file.
+Disconnect keeps this registration, so `codexctl use` continues to select the single registered remote account.
+Inline provider tables can become standard TOML tables during activation. Disconnect preserves their values but does not restore their inline layout.

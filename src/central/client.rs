@@ -60,6 +60,7 @@ impl RequestHandler for TokenHandler {
             TokenRequest {
                 previous_revision: Some(self.current.revision.clone()),
                 account_id: Some(self.current.chatgpt_account_id.clone()),
+                billing: false,
             },
         )
         .await?;

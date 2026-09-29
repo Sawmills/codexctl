@@ -26,9 +26,12 @@ impl BrokerTest {
         Self::start_with(&[])
     }
     fn start_with(options: &[&str]) -> Self {
+        Self::start_with_plan(options, Some("pro"))
+    }
+    fn start_with_plan(options: &[&str], plan: Option<&str>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"user-central","generation":0,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-central","chatgpt_plan_type":"pro"}})).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"user-central","generation":0,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-central","chatgpt_plan_type":plan}})).unwrap());
         let auth = json!({"auth_mode":"chatgpt","tokens":{"access_token":format!("eyJhbGciOiJub25lIn0.{payload}."),"refresh_token":"synthetic-initial-refresh","account_id":"acct-central"}});
         store::atomic_write(
             &root.path().join("auth.json"),
@@ -420,23 +423,26 @@ fn when_a_refresh_callback_precedes_the_turn_response_then_the_client_still_comp
 fn when_a_client_disconnects_during_refresh_then_the_owner_persists_the_result() {
     let broker = BrokerTest::start();
     let initial = broker.grant();
-    std::fs::write(broker.root.path().join("mode"), "slow").unwrap();
+    std::fs::write(broker.root.path().join("mode"), "disconnect").unwrap();
     let request =
         json!({"previousRevision":initial["revision"],"accountId":initial["chatgptAccountId"]});
-    let impatient = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(30))
-        .no_proxy()
-        .build()
-        .unwrap();
+    use std::io::Write;
+    let mut stream =
+        std::net::TcpStream::connect(broker.url.trim_start_matches("http://")).unwrap();
+    let body = serde_json::to_string(&request).unwrap();
+    write!(stream, "POST /v1/token HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", broker.token, body.len(), body).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !broker.root.path().join("refresh-started").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "refresh never started"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
-    let timed_out = impatient
-        .post(format!("{}/v1/token", broker.url))
-        .bearer_auth(&broker.token)
-        .json(&request)
-        .send();
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
     let latest = broker.grant();
 
-    assert!(timed_out.is_err());
     assert_ne!(latest["revision"], initial["revision"]);
     assert_eq!(
         std::fs::read_to_string(broker.root.path().join("refresh-count")).unwrap(),
@@ -637,4 +643,685 @@ fn when_the_terminal_signals_the_broker_group_then_shutdown_finishes_cleanly() {
 
     assert!(status.success());
     assert!(!has_runtime);
+}
+
+struct NativeClient {
+    broker: BrokerTest,
+    home: PathBuf,
+}
+impl NativeClient {
+    fn start() -> Self {
+        Self::with_plan(Some("pro"))
+    }
+    fn with_plan(plan: Option<&str>) -> Self {
+        let broker = BrokerTest::start_with_plan(&[], plan);
+        let home = broker.root.path().join("client");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::write(
+            home.join(".codex/config.toml"),
+            "# Personal preference\nmodel = 'gpt-6.1-sol'\nmodel_provider = 'openai'\n",
+        )
+        .unwrap();
+        std::fs::write(home.join(".codex/auth.json"), b"untouched local login").unwrap();
+        Self { broker, home }
+    }
+    fn run(&self, bin: &str, args: &[&str]) -> std::process::Output {
+        Command::new(bin)
+            .args(args)
+            .env("HOME", &self.home)
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    }
+    fn connect(&self) {
+        let output = self.run(
+            env!("CARGO_BIN_EXE_codexctl-central"),
+            &[
+                "connect",
+                "--alias",
+                "remote",
+                "--server",
+                &self.broker.url,
+                "--token-file",
+                self.broker
+                    .root
+                    .path()
+                    .join("laptop.token")
+                    .to_str()
+                    .unwrap(),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    fn select(&self) -> std::process::Output {
+        self.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "remote"])
+    }
+    fn helper(&self) -> std::process::Output {
+        self.run(
+            env!("CARGO_BIN_EXE_codexctl"),
+            &[
+                "central-token",
+                "--connection",
+                self.home
+                    .join(".codexctl/central/remote.json")
+                    .to_str()
+                    .unwrap(),
+            ],
+        )
+    }
+}
+
+#[test]
+fn when_a_remote_account_is_selected_then_native_configuration_preserves_the_local_login() {
+    let client = NativeClient::start();
+    client.connect();
+
+    let selected = client.select();
+    let configured: toml_edit::DocumentMut =
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert!(
+        configured["model_providers"]
+            .get("codexctl-central")
+            .is_some(),
+        "remote provider definition must reach Codex"
+    );
+
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
+        b"untouched local login"
+    );
+    assert!(
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .contains("# Personal preference")
+    );
+}
+
+#[test]
+fn when_native_codex_requests_a_token_then_only_access_credentials_are_returned() {
+    let client = NativeClient::start();
+    client.connect();
+
+    let token = client.helper();
+
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+    assert!(codexctl::api::token_identity(String::from_utf8_lossy(&token.stdout).trim()).is_some());
+    assert_eq!(
+        std::fs::read_to_string(client.broker.root.path().join("refresh-count")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn when_a_device_is_revoked_then_the_native_helper_returns_no_credentials() {
+    let client = NativeClient::start();
+    client.connect();
+    central::revoke(&client.broker.state(), "laptop").unwrap();
+
+    let token = client.helper();
+
+    assert!(!token.status.success());
+    assert!(token.stdout.is_empty());
+}
+
+#[test]
+fn when_remote_use_is_disconnected_then_the_previous_provider_is_restored() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl-central"), &["disconnect"]);
+
+    assert!(output.status.success());
+    let config = std::fs::read_to_string(client.home.join(".codex/config.toml")).unwrap();
+    assert!(
+        config.contains("# Personal preference")
+            && config.contains("model_provider = \"openai\"")
+            && !config.contains("Central Codex")
+            && !config.contains("model_providers")
+    );
+}
+
+#[test]
+fn when_two_native_helpers_share_a_device_then_both_get_credentials() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "slow").unwrap();
+
+    let outputs = std::thread::scope(|scope| {
+        let first = scope.spawn(|| client.helper());
+        let second = scope.spawn(|| client.helper());
+        (first.join().unwrap(), second.join().unwrap())
+    });
+
+    assert!(
+        outputs.0.status.success() && outputs.1.status.success(),
+        "both concurrent helper requests must succeed"
+    );
+}
+
+#[test]
+fn when_the_selected_provider_is_removed_then_disconnect_preserves_the_user_edit() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    std::fs::write(
+        client.home.join(".codex/config.toml"),
+        "# Edited preference\nmodel = 'gpt-6.1-sol'\n",
+    )
+    .unwrap();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl-central"), &["disconnect"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(client.home.join(".codex/config.toml")).unwrap(),
+        "# Edited preference\nmodel = 'gpt-6.1-sol'\n"
+    );
+}
+
+#[test]
+fn when_remote_mode_is_active_then_a_pinned_launch_cannot_use_the_wrong_account() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["exec", "--account", "local", "--", "echo", "unreachable"],
+    );
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remote provider is active"));
+}
+
+#[test]
+fn when_config_is_linked_then_remote_selection_preserves_the_link() {
+    let client = NativeClient::start();
+    client.connect();
+    let path = client.home.join(".codex/config.toml");
+    use std::os::unix::fs::PermissionsExt;
+    let original_parent_mode = std::fs::metadata(&client.home)
+        .unwrap()
+        .permissions()
+        .mode();
+    let target = client.home.join("preferences.toml");
+    std::fs::rename(&path, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let output = client.select();
+
+    assert!(output.status.success());
+    assert!(
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::metadata(&client.home)
+            .unwrap()
+            .permissions()
+            .mode(),
+        original_parent_mode
+    );
+}
+
+#[test]
+fn when_one_remote_account_is_registered_then_use_without_an_alias_selects_it() {
+    let client = NativeClient::start();
+    client.connect();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
+
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("switched to remote account remote"));
+}
+
+#[test]
+fn when_remote_billing_is_usage_based_then_automatic_selection_is_refused() {
+    let client = NativeClient::with_plan(Some("self_serve_business_usage_based"));
+    client.connect();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "--allow-billing"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("automatic remote selection refuses"));
+}
+
+#[test]
+fn when_remote_billing_is_unknown_then_noninteractive_explicit_selection_is_refused() {
+    let client = NativeClient::with_plan(None);
+    client.connect();
+
+    let output = client.select();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-billing"));
+}
+
+#[test]
+fn when_remote_billing_is_approved_then_the_helper_can_supply_access_credentials() {
+    let client = NativeClient::with_plan(Some("self_serve_business_usage_based"));
+    client.connect();
+
+    let output = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+    let token = client.helper();
+
+    assert!(output.status.success());
+    assert!(token.status.success());
+}
+
+#[test]
+fn when_no_remote_aliases_exist_then_local_use_keeps_the_local_error_and_configuration() {
+    let client = NativeClient::start();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "missing"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
+        b"untouched local login"
+    );
+}
+
+#[test]
+fn when_a_remote_switch_inherits_codex_home_then_it_refuses_before_writing_configuration() {
+    let client = NativeClient::start();
+    client.connect();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["use", "remote"])
+        .env("HOME", &client.home)
+        .env("CODEX_HOME", client.home.join("pinned"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(!client.home.join("pinned/config.toml").exists());
+}
+
+#[test]
+fn when_multiple_remote_connections_exist_then_automatic_selection_requires_an_alias() {
+    let client = NativeClient::start();
+    client.connect();
+    let connections = client.home.join(".codexctl/central");
+    store::atomic_write(
+        &connections.join("other.json"),
+        &std::fs::read(connections.join("remote.json")).unwrap(),
+    )
+    .unwrap();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("explicit alias"));
+}
+
+#[test]
+fn when_activation_cannot_resolve_config_then_no_stale_marker_blocks_recovery() {
+    let client = NativeClient::start();
+    client.connect();
+    let config = client.home.join(".codex/config.toml");
+    std::fs::remove_file(&config).unwrap();
+    std::os::unix::fs::symlink(client.home.join("missing.toml"), &config).unwrap();
+
+    let output = client.select();
+
+    assert!(!output.status.success());
+    assert!(
+        !client
+            .home
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+}
+
+#[test]
+fn when_remote_config_is_invalid_then_local_use_does_not_swap_credentials() {
+    let client = NativeClient::start();
+    client.connect();
+    codexctl::profile::save_profile_to(
+        &codexctl::config::Paths::from_home(client.home.clone()),
+        "local",
+        Some("local@example.invalid"),
+        &client.broker.root.path().join("auth.json"),
+    )
+    .unwrap();
+    assert!(client.select().status.success());
+    std::fs::write(client.home.join(".codex/config.toml"), "[invalid").unwrap();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "local"]);
+
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
+        b"untouched local login"
+    );
+}
+
+#[test]
+fn when_remote_mode_is_active_then_the_local_switch_picker_refuses_before_prompting() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["switch"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remote provider is active"));
+}
+
+#[test]
+fn when_an_alias_has_outer_spaces_then_connect_and_use_share_the_normalized_name() {
+    let client = NativeClient::start();
+    let connected = client.run(
+        env!("CARGO_BIN_EXE_codexctl-central"),
+        &[
+            "connect",
+            "--alias",
+            " remote ",
+            "--server",
+            &client.broker.url,
+            "--token-file",
+            client
+                .broker
+                .root
+                .path()
+                .join("laptop.token")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+
+    let selected = client.select();
+
+    assert!(connected.status.success());
+    assert!(selected.status.success());
+}
+
+#[test]
+fn when_allow_billing_is_unused_then_it_does_not_approve_future_billing_changes() {
+    let client = NativeClient::start();
+    client.connect();
+
+    let output = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(client.home.join(".codexctl/central/remote.json")).unwrap(),
+    )
+    .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(connection["allow_billing"], false);
+}
+
+#[test]
+fn when_no_remote_provider_is_active_then_invalid_codex_configuration_does_not_block_local_save() {
+    let client = NativeClient::start();
+    std::fs::write(client.home.join(".codex/config.toml"), "invalid = [").unwrap();
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["save", "local"]);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("TOML"));
+}
+
+#[test]
+fn when_a_local_alias_collides_with_a_remote_alias_then_activation_refuses_without_changes() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::create_dir_all(client.home.join(".codexctl/profiles/remote")).unwrap();
+    let before = std::fs::read(client.home.join(".codex/config.toml")).unwrap();
+    let output = client.select();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("alias"));
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/config.toml")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn when_a_daemon_is_running_then_remote_activation_refuses_without_changes() {
+    let client = NativeClient::start();
+    client.connect();
+    let directory = client.home.join(".codex/app-server-daemon");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("daemon.pid"),
+        serde_json::to_vec(&json!({"pid": std::process::id()})).unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(client.home.join(".codex/config.toml")).unwrap();
+    let output = client.select();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("daemon"));
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/config.toml")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn when_a_new_configuration_write_fails_then_its_marker_and_billing_approval_are_not_installed() {
+    use std::os::unix::fs::PermissionsExt;
+    let client = NativeClient::with_plan(Some("usage_based"));
+    client.connect();
+    let home = client.home.join(".codex");
+    std::fs::remove_file(home.join("config.toml")).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let output = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !client
+            .home
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(client.home.join(".codexctl/central/remote.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(connection["allow_billing"], false);
+}
+
+#[test]
+fn when_the_default_codex_profile_overrides_the_provider_then_remote_activation_refuses() {
+    let client = NativeClient::start();
+    client.connect();
+    let config = client.home.join(".codex/config.toml");
+    let text = "profile = 'work'\n[profiles.work]\nmodel_provider = 'openai'\n";
+    std::fs::write(&config, text).unwrap();
+    let output = client.select();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("profile"));
+    assert_eq!(std::fs::read_to_string(config).unwrap(), text);
+}
+
+#[test]
+fn when_the_remote_daemon_is_running_then_disconnect_keeps_the_marker_and_configuration() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let directory = client.home.join(".codex/app-server-daemon");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("daemon.pid"),
+        serde_json::to_vec(&json!({"pid":std::process::id()})).unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read(client.home.join(".codex/config.toml")).unwrap();
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl-central"), &["disconnect"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("daemon"));
+    assert!(
+        client
+            .home
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/config.toml")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn when_a_known_plan_has_paid_credits_then_automatic_remote_selection_is_refused() {
+    let client = NativeClient::start();
+    std::fs::write(client.broker.root.path().join("mode"), "credits").unwrap();
+    client.connect();
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("billing"));
+}
+
+#[test]
+fn when_credits_change_under_the_same_plan_then_the_helper_requires_new_approval() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    std::fs::write(client.broker.root.path().join("mode"), "credits").unwrap();
+    let output = client.helper();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn when_a_pinned_shell_sees_the_remote_provider_then_the_helper_refuses_credentials() {
+    let client = NativeClient::start();
+    client.connect();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["central-token", "--connection"])
+        .arg(client.home.join(".codexctl/central/remote.json"))
+        .env("HOME", &client.home)
+        .env("CODEXCTL_PINNED_ALIAS", "local")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pinned"));
+}
+
+#[test]
+fn when_an_inherited_home_is_local_then_global_save_still_refuses_remote_mode() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let isolated = client.home.join("isolated");
+    std::fs::create_dir_all(&isolated).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["save", "local"])
+        .env("HOME", &client.home)
+        .env("CODEX_HOME", isolated)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("remote provider is active"));
+}
+
+#[test]
+fn when_the_billing_read_rotates_credentials_then_restart_keeps_the_returned_token() {
+    let mut client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "billing-rotation").unwrap();
+    let output = client.helper();
+    assert!(output.status.success());
+    let token = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+    unsafe {
+        libc::kill(client.broker.child.id() as i32, libc::SIGINT);
+    }
+    assert!(client.broker.child.wait().unwrap().success());
+    client.broker.restart_read_only();
+    assert_eq!(client.broker.grant()["accessToken"], token);
+}
+
+#[test]
+fn when_the_billing_read_fails_then_the_helper_returns_no_token_and_one_failure_is_counted() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "billing-error").unwrap();
+    let output = client.helper();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let counters = client
+        .broker
+        .http
+        .get(format!("{}/metrics", client.broker.url))
+        .bearer_auth(&client.broker.token)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        counters,
+        "codexctl_central_failed_requests_total{reason=\"owner_unavailable\"} 1\n"
+    );
+}
+
+#[test]
+fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_no_token() {
+    let client = NativeClient::with_plan(Some("usage_based"));
+    client.connect();
+    assert!(
+        client
+            .run(
+                env!("CARGO_BIN_EXE_codexctl"),
+                &["use", "remote", "--allow-billing"]
+            )
+            .status
+            .success()
+    );
+    std::fs::write(client.broker.root.path().join("mode"), "disconnect").unwrap();
+    let path = client.home.join(".codexctl/central/remote.json");
+    let helper = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["central-token", "--connection"])
+        .arg(&path)
+        .env("HOME", &client.home)
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !client.broker.root.path().join("refresh-started").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut connection: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    connection["allow_billing"] = json!(false);
+    store::atomic_write(&path, &serde_json::to_vec(&connection).unwrap()).unwrap();
+    let output = helper.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
 }

@@ -18,6 +18,12 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(feature = "central-prototype")]
+    #[command(hide = true)]
+    CentralToken {
+        #[arg(long)]
+        connection: std::path::PathBuf,
+    },
     /// Show rate limit status for all accounts
     Status {
         /// Show only rate-limited accounts
@@ -159,6 +165,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    #[cfg(feature = "central-prototype")]
+    if matches!(
+        &cli.command,
+        Commands::Login { .. } | Commands::Save { .. } | Commands::Switch
+    ) && let Err(error) = codexctl::central::native::require_local_mode()
+    {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
     let result = match cli.command {
         Commands::Status {
             rate_limited,
@@ -187,6 +202,10 @@ fn main() {
             ref alias,
             ref text,
         } => commands::label::run(alias, text.as_deref()),
+        #[cfg(feature = "central-prototype")]
+        Commands::CentralToken { ref connection } => {
+            codexctl::central::native::print_token(connection)
+        }
         Commands::Use {
             ref alias,
             allow_billing,

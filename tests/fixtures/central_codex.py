@@ -28,7 +28,9 @@ def rotate():
     old = auth["tokens"]["access_token"]
     payload = json.loads(base64.urlsafe_b64decode(old.split(".")[1] + "=="))
     mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
-    if mode == "slow":
+    if mode == "disconnect":
+        pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("refresh-started").write_text("started")
+    if mode in ["slow", "disconnect"]:
         time.sleep(0.2)
     if mode == "identity":
         payload["sub"] = "different-login"
@@ -63,6 +65,17 @@ for line in sys.stdin:
                 continue
             rotate()
         result = {"account": {"type": "chatgpt"}}
+    elif method == "account/rateLimits/read":
+        mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode == "billing-error":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
+            continue
+        if mode == "billing-rotation":
+            rotate()
+        auth = json.loads(auth_path.read_text())
+        payload = json.loads(base64.urlsafe_b64decode(auth["tokens"]["access_token"].split(".")[1] + "=="))
+        mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        result = {"rateLimits": {"planType":payload["https://api.openai.com/auth"].get("chatgpt_plan_type"), "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":4102444800}, "credits":{"hasCredits": mode == "credits", "unlimited":False, "balance":"10" if mode == "credits" else "0"}}}
     elif method == "account/login/start":
         access = params["accessToken"]
         result = {"type": "chatgptAuthTokens"}

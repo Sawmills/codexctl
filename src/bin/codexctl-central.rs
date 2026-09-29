@@ -11,6 +11,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Restore the Codex provider that was selected before remote use.
+    Disconnect,
+    /// Register a remote account alias for ordinary codexctl use.
+    Connect {
+        #[arg(long)]
+        alias: String,
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        token_file: PathBuf,
+    },
     /// Import credentials into a new encrypted server vault. Transfer refresh ownership first.
     Init {
         #[arg(long)]
@@ -75,7 +86,26 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
-    let result = execute(Cli::parse()).await;
+    let cli = Cli::parse();
+    if let Commands::Connect {
+        alias,
+        server,
+        token_file,
+    } = &cli.command
+    {
+        let result = std::thread::scope(|scope| {
+            scope
+                .spawn(|| central::native::connect(alias, server, token_file))
+                .join()
+                .expect("connection worker panicked")
+        });
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let result = execute(cli).await;
     if let Err(error) = result {
         eprintln!("{error}");
         std::process::exit(1);
@@ -84,6 +114,8 @@ async fn main() {
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Commands::Disconnect => central::native::deactivate()?,
+        Commands::Connect { .. } => unreachable!("handled before async dispatch"),
         Commands::Init {
             state,
             key_file,

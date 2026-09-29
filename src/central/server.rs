@@ -26,6 +26,8 @@ use tokio::sync::Mutex;
 pub struct TokenRequest {
     pub previous_revision: Option<String>,
     pub account_id: Option<String>,
+    #[serde(default)]
+    pub billing: bool,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
@@ -35,6 +37,8 @@ pub struct TokenResponse {
     pub chatgpt_account_id: String,
     pub chatgpt_plan_type: Option<String>,
     pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_class: Option<api::BillingClass>,
 }
 
 impl TokenResponse {
@@ -95,6 +99,7 @@ impl Owner {
             chatgpt_plan_type: api::token_identity(&access_token).and_then(|i| i.plan),
             revision: vault::digest(access_token.as_bytes()),
             access_token,
+            billing_class: None,
         })
     }
 
@@ -114,7 +119,7 @@ impl Owner {
         }
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
-                return Ok(current);
+                return self.with_billing(current, request.billing).await;
             }
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
@@ -142,8 +147,53 @@ impl Owner {
             self.home.disable_cleanup(true);
         }
         result?;
-        snapshot.map_err(TokenFailure::from)
+        self.with_billing(snapshot?, request.billing).await
     }
+
+    async fn with_billing(
+        &mut self,
+        mut token: TokenResponse,
+        requested: bool,
+    ) -> Result<TokenResponse, TokenFailure> {
+        if !requested {
+            return Ok(token);
+        }
+        token.billing_class = Some(api::BillingClass::Unknown);
+        let Some(rpc) = self.rpc.as_mut() else {
+            return Ok(token);
+        };
+        // Rate-limit reads can refresh the owner's login too. Persist on every result.
+        self.home.disable_cleanup(true);
+        let result = rpc.call("account/rateLimits/read", json!({})).await;
+        let snapshot = self.snapshot();
+        if result.is_err() || snapshot.is_err() {
+            self.available = false;
+        }
+        let limits = result?;
+        token = snapshot?;
+        token.billing_class = Some(billing_class(&limits));
+        token.chatgpt_plan_type = limits
+            .pointer("/rateLimits/planType")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        Ok(token)
+    }
+}
+
+fn billing_class(response: &Value) -> api::BillingClass {
+    let limits = &response["rateLimits"];
+    let window = |name: &str| {
+        let window = &limits[name];
+        window.get("usedPercent").and_then(Value::as_f64).map(|used| {
+            json!({"used_percent": used, "window_minutes": window.get("windowDurationMins"), "resets_at": window.get("resetsAt")})
+        })
+    };
+    let credits = limits.get("credits").filter(|c| !c.is_null()).map(|c| {
+        json!({"has_credits": c.get("hasCredits"), "unlimited": c.get("unlimited"), "balance": c.get("balance")})
+    });
+    let usage = json!({"plan_type":limits.get("planType"), "rate_limit":{"primary":window("primary"), "secondary":window("secondary")}, "credits":credits});
+    serde_json::from_value::<api::RateLimitResponse>(usage)
+        .map_or(api::BillingClass::Unknown, |usage| usage.billing_class())
 }
 
 #[derive(Clone)]
