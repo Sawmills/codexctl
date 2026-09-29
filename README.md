@@ -470,3 +470,9 @@ Supports both Codex CLI auth formats:
 ## License
 
 Apache-2.0
+
+## Experimental Central Account Server
+
+The optional `central-prototype` feature builds `codexctl-central` for server-owned
+credentials and registered local clients. See the [prototype guide](docs/central-prototype.md)
+for setup, SSH tunnels, tests, and the remaining compatibility limits.

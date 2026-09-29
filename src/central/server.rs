@@ -1,0 +1,315 @@
+use super::{
+    rpc::Rpc,
+    vault::{self, Vault},
+};
+use crate::{api, store};
+use anyhow::{Context, Result, bail};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+};
+use tokio::sync::Mutex;
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TokenRequest {
+    pub previous_revision: Option<String>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub chatgpt_account_id: String,
+    pub chatgpt_plan_type: Option<String>,
+    pub revision: String,
+}
+
+impl TokenResponse {
+    pub fn login(&self) -> Value {
+        json!({"type":"chatgptAuthTokens","accessToken":self.access_token,"chatgptAccountId":self.chatgpt_account_id,"chatgptPlanType":self.chatgpt_plan_type})
+    }
+    pub fn refresh(&self) -> Value {
+        json!({"accessToken":self.access_token,"chatgptAccountId":self.chatgpt_account_id,"chatgptPlanType":self.chatgpt_plan_type})
+    }
+}
+
+enum TokenFailure {
+    AccountMismatch,
+    RefreshDisabled,
+    Unavailable(anyhow::Error),
+}
+
+impl From<anyhow::Error> for TokenFailure {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+struct Owner {
+    vault: Vault,
+    rpc: Option<Rpc>,
+    home: tempfile::TempDir,
+    state: PathBuf,
+    key: PathBuf,
+    available: bool,
+    refresh_enabled: bool,
+}
+
+impl Owner {
+    fn snapshot(&mut self) -> Result<TokenResponse> {
+        self.home.disable_cleanup(true);
+        let auth: Value =
+            serde_json::from_slice(&vault::private_read(&self.home.path().join("auth.json"))?)?;
+        vault::validate_auth(&auth)?;
+        if vault::account(&auth)? != vault::account(&self.vault.auth)?
+            || api::token_subject(vault::token(&auth)?)
+                != api::token_subject(vault::token(&self.vault.auth)?)
+        {
+            bail!("central credential owner changed identity");
+        }
+        let original = api::token_identity(vault::token(&self.vault.auth)?)
+            .context("missing original identity")?;
+        let updated =
+            api::token_identity(vault::token(&auth)?).context("missing updated identity")?;
+        if original.user_id.is_some() && original.user_id != updated.user_id {
+            bail!("central credential owner changed login identity");
+        }
+        self.vault.auth = auth;
+        vault::save(&self.state, &self.key, &self.vault)?;
+        let access_token = vault::token(&self.vault.auth)?.to_owned();
+        Ok(TokenResponse {
+            chatgpt_account_id: vault::account(&self.vault.auth)?,
+            chatgpt_plan_type: api::token_identity(&access_token).and_then(|i| i.plan),
+            revision: vault::digest(access_token.as_bytes()),
+            access_token,
+        })
+    }
+
+    async fn tokens(&mut self, request: TokenRequest) -> Result<TokenResponse, TokenFailure> {
+        if !self.available {
+            return Err(TokenFailure::Unavailable(anyhow::anyhow!(
+                "credential owner unavailable; restart after diagnosis"
+            )));
+        }
+        let current = self.snapshot()?;
+        if request
+            .account_id
+            .as_ref()
+            .is_some_and(|id| *id != current.chatgpt_account_id)
+        {
+            return Err(TokenFailure::AccountMismatch);
+        }
+        if let Some(previous) = request.previous_revision.as_ref() {
+            if previous != &current.revision {
+                return Ok(current);
+            }
+            if !self.refresh_enabled {
+                return Err(TokenFailure::RefreshDisabled);
+            }
+        }
+        // Serialize all calls, and persist any rotated credentials even when RPC fails.
+        let force = request.previous_revision.is_some();
+        self.home.disable_cleanup(true);
+        let result = if self.refresh_enabled {
+            self.rpc
+                .as_mut()
+                .context("missing credential owner")?
+                .call("account/read", json!({"refreshToken":force}))
+                .await
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.available = false;
+        }
+        let snapshot = self.snapshot();
+        if snapshot.is_err() {
+            self.available = false;
+            self.home.disable_cleanup(true);
+        }
+        result?;
+        snapshot.map_err(TokenFailure::from)
+    }
+}
+
+#[derive(Clone)]
+struct Broker {
+    owner: Arc<Mutex<Owner>>,
+    state: PathBuf,
+    tenant: String,
+    user: String,
+    failures: Arc<StdMutex<BTreeMap<&'static str, u64>>>,
+}
+
+type HttpError = (StatusCode, Json<Value>);
+
+impl Broker {
+    fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
+        *self
+            .failures
+            .lock()
+            .expect("failure counter lock")
+            .entry(reason)
+            .or_default() += 1;
+        eprintln!(
+            "{}",
+            json!({"operation":"token_request","stage":"broker","reason":reason,"status":status.as_u16()})
+        );
+        (status, Json(json!({"error":reason})))
+    }
+    fn authorize(&self, headers: &HeaderMap) -> Result<(), HttpError> {
+        let bearer = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+        let devices = vault::devices(&self.state)
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let hash = vault::digest(bearer.as_bytes());
+        let device = devices
+            .iter()
+            .find(|d| d.token_hash == hash && !d.revoked)
+            .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
+        if device.tenant != self.tenant || device.user != self.user {
+            return Err(self.error(StatusCode::FORBIDDEN, "forbidden"));
+        }
+        Ok(())
+    }
+}
+
+async fn tokens(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    body: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, HttpError> {
+    broker.authorize(&headers)?;
+    let Json(request) =
+        body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    // A disconnected HTTP client must not cancel a refresh after OpenAI rotates its token.
+    let owner = broker.owner.clone();
+    let task = tokio::spawn(async move { owner.lock().await.tokens(request).await });
+    let result = task
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?
+        .map_err(|error| match error {
+            TokenFailure::AccountMismatch => broker.error(StatusCode::BAD_REQUEST, "account_mismatch"),
+            TokenFailure::RefreshDisabled => broker.error(StatusCode::CONFLICT, "refresh_disabled"),
+            TokenFailure::Unavailable(error) => {
+                eprintln!("{}", json!({"operation":"token_request","stage":"owner","reason":"owner_unavailable","detail":error.to_string()}));
+                broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+            }
+        })?;
+    Ok(([("cache-control", "no-store")], Json(result)).into_response())
+}
+
+async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<String, HttpError> {
+    broker.authorize(&headers)?;
+    let counters = broker.failures.lock().expect("failure counter lock");
+    Ok(counters
+        .iter()
+        .map(|(reason, count)| {
+            format!("codexctl_central_failed_requests_total{{reason=\"{reason}\"}} {count}\n")
+        })
+        .collect())
+}
+
+pub async fn serve(
+    state: &Path,
+    key: &Path,
+    address: SocketAddr,
+    binary: &Path,
+    read_only: bool,
+) -> Result<()> {
+    if !address.ip().is_loopback() {
+        bail!("prototype binds only to loopback; use an SSH tunnel for other machines");
+    }
+    let _lock = vault::lock(state, "owner.lock")?;
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .context("could not bind broker")?;
+    let vault = vault::load(state, key)?;
+    vault::validate_auth(&vault.auth)?;
+    if std::fs::read_dir(state)?.any(|entry| {
+        entry.is_ok_and(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("owner-runtime-")
+        })
+    }) {
+        bail!("unfinished owner runtime exists; recover its refreshed auth before restarting");
+    }
+    let mut home = tempfile::Builder::new()
+        .prefix("owner-runtime-")
+        .tempdir_in(state)?;
+    store::ensure_private_dir(home.path())?;
+    store::atomic_write(
+        &home.path().join("auth.json"),
+        &serde_json::to_vec(&vault.auth)?,
+    )?;
+    let rpc = if read_only {
+        None
+    } else {
+        let mut rpc = Rpc::spawn(binary, home.path(), true)?;
+        home.disable_cleanup(true);
+        rpc.initialize().await?;
+        Some(rpc)
+    };
+    let broker = Broker {
+        state: state.into(),
+        tenant: vault.tenant.clone(),
+        user: vault.user.clone(),
+        owner: Arc::new(Mutex::new(Owner {
+            vault,
+            rpc,
+            home,
+            state: state.into(),
+            key: key.into(),
+            available: true,
+            refresh_enabled: !read_only,
+        })),
+        failures: Arc::new(StdMutex::new(BTreeMap::new())),
+    };
+    #[cfg(unix)]
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    #[cfg(unix)]
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    #[cfg(unix)]
+    let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    println!("{}", json!({"listening": listener.local_addr()?}));
+    let app = Router::new()
+        .route("/v1/token", post(tokens))
+        .route("/metrics", get(metrics))
+        .with_state(broker.clone());
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            #[cfg(unix)] {
+                tokio::select! { _ = interrupt.recv() => {}, _ = term.recv() => {}, _ = hup.recv() => {} }
+            }
+            #[cfg(not(unix))] { let _ = tokio::signal::ctrl_c().await; }
+        })
+        .await?;
+    let mut owner = broker.owner.lock().await;
+    if let Some(rpc) = owner.rpc.as_mut() {
+        rpc.shutdown().await?;
+    }
+    owner.snapshot()?;
+    if !owner.available {
+        bail!("owner unavailable; runtime retained for credential recovery");
+    }
+    std::fs::remove_dir_all(owner.home.path()).context("could not remove private owner runtime")?;
+    Ok(())
+}
