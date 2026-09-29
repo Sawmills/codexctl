@@ -9,7 +9,7 @@
 //! This module finds the daemon, restarts it, and resumes the sessions that a
 //! usage limit or the restart itself stopped.
 
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,20 +73,16 @@ fn process_alive(pid: i32) -> bool {
 
 /// Restart the daemon that serves `codex_home` through the Codex CLI.
 pub fn restart(codex_home: &Path) -> Result<()> {
-    restart_with(Path::new("codex"), codex_home)
+    restart_with(Command::new("codex"), codex_home)
 }
 
-fn restart_with(codex: &Path, codex_home: &Path) -> Result<()> {
-    let output = Command::new(codex)
+fn restart_with(mut command: Command, codex_home: &Path) -> Result<()> {
+    let codex = command.get_program().to_string_lossy().into_owned();
+    let output = command
         .args(["app-server", "daemon", "restart"])
         .env("CODEX_HOME", codex_home)
         .output()
-        .with_context(|| {
-            format!(
-                "failed to run `{} app-server daemon restart`",
-                codex.display()
-            )
-        })?;
+        .with_context(|| format!("failed to run `{codex} app-server daemon restart`"))?;
     let status = serde_json::from_slice::<Value>(&output.stdout)
         .ok()
         .and_then(|report| report.get("status")?.as_str().map(str::to_string));
@@ -236,9 +232,38 @@ fn session_title(thread: &Value) -> String {
     }
 }
 
+// Retry the syscall, not a WebSocket send: tungstenite may already have
+// queued the frame when an interrupted write returns to its caller.
+struct RetryInterrupted<S>(S);
+
+fn retry_interrupted<T>(mut operation: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
+        }
+    }
+}
+
+impl<S: Read> Read for RetryInterrupted<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        retry_interrupted(|| self.0.read(buf))
+    }
+}
+
+impl<S: Write> Write for RetryInterrupted<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        retry_interrupted(|| self.0.write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        retry_interrupted(|| self.0.flush())
+    }
+}
+
 /// A JSON-RPC client on the daemon's control socket.
 pub struct Client {
-    socket: WebSocket<UnixStream>,
+    socket: WebSocket<RetryInterrupted<UnixStream>>,
     next_id: u64,
     /// Notifications that arrived while a response was awaited.
     notifications: Vec<Value>,
@@ -263,7 +288,7 @@ impl Client {
         })?;
         stream.set_read_timeout(Some(timeouts.request))?;
         stream.set_write_timeout(Some(timeouts.request))?;
-        let (socket, _) = tungstenite::client(HANDSHAKE_URL, stream)
+        let (socket, _) = tungstenite::client(HANDSHAKE_URL, RetryInterrupted(stream))
             .map_err(|error| anyhow::anyhow!("daemon websocket handshake failed: {error}"))?;
         let mut client = Self {
             socket,
@@ -471,10 +496,11 @@ impl Client {
     }
 
     fn request_within(&mut self, timeout: Duration, method: &str, params: Value) -> Result<Value> {
-        self.socket.get_ref().set_read_timeout(Some(timeout))?;
+        self.socket.get_ref().0.set_read_timeout(Some(timeout))?;
         let result = self.request(method, params);
         self.socket
             .get_ref()
+            .0
             .set_read_timeout(Some(self.timeouts.request))?;
         result
     }
@@ -526,19 +552,22 @@ impl Client {
     }
 
     fn receive(&mut self) -> Result<Value> {
-        loop {
-            let message = self
-                .socket
-                .read()
-                .map_err(|error| anyhow::anyhow!("failed to read from the daemon: {error}"))?;
-            let text = match message {
-                Message::Text(text) => text.to_string(),
-                Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Message::Close(_) => bail!("the daemon closed the connection"),
-                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
-            };
-            return serde_json::from_str(&text).context("the daemon sent invalid JSON");
-        }
+        receive_json_message(&mut self.socket)
+    }
+}
+
+fn receive_json_message<S: Read + Write>(socket: &mut WebSocket<S>) -> Result<Value> {
+    loop {
+        let message = socket
+            .read()
+            .map_err(|error| anyhow::anyhow!("failed to read from the daemon: {error}"))?;
+        let text = match message {
+            Message::Text(text) => text.to_string(),
+            Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Message::Close(_) => bail!("the daemon closed the connection"),
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+        };
+        return serde_json::from_str(&text).context("the daemon sent invalid JSON");
     }
 }
 
@@ -594,11 +623,11 @@ pub fn restart_and_resume(
     prompt: &str,
     out: &mut impl Write,
 ) -> Result<Vec<String>> {
-    restart_and_resume_with(Path::new("codex"), codex_home, sessions, prompt, out)
+    restart_and_resume_with(Command::new("codex"), codex_home, sessions, prompt, out)
 }
 
 fn restart_and_resume_with(
-    codex: &Path,
+    codex: Command,
     codex_home: &Path,
     sessions: &[StoppedSession],
     prompt: &str,
@@ -689,6 +718,116 @@ pub fn codex_home_of(auth_json: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    struct InterruptedReader {
+        data: std::io::Cursor<Vec<u8>>,
+        error: Option<std::io::ErrorKind>,
+    }
+
+    impl Read for InterruptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.data.position() == 2
+                && let Some(error) = self.error.take()
+            {
+                return Err(error.into());
+            }
+            // Split the header from the payload so the error arrives after
+            // tungstenite has already consumed part of the frame.
+            let len = buf.len().min(2);
+            self.data.read(&mut buf[..len])
+        }
+    }
+
+    impl Write for InterruptedReader {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn interrupted_socket(
+        error: std::io::ErrorKind,
+    ) -> WebSocket<RetryInterrupted<InterruptedReader>> {
+        let payload = br#"{"result":"ok"}"#;
+        let mut frame = vec![0x81, payload.len() as u8];
+        frame.extend_from_slice(payload);
+        WebSocket::from_raw_socket(
+            RetryInterrupted(InterruptedReader {
+                data: std::io::Cursor::new(frame),
+                error: Some(error),
+            }),
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+    }
+
+    #[test]
+    fn interrupted_read_preserves_the_partial_websocket_frame() {
+        let mut socket = interrupted_socket(std::io::ErrorKind::Interrupted);
+        let expected = json!({"result": "ok"});
+
+        let response = receive_json_message(&mut socket);
+
+        assert_eq!(response.unwrap(), expected);
+    }
+
+    #[test]
+    fn read_timeout_is_not_retried() {
+        let mut socket = interrupted_socket(std::io::ErrorKind::WouldBlock);
+
+        let response = receive_json_message(&mut socket);
+
+        assert!(response.is_err());
+    }
+
+    struct InterruptedWriter {
+        bytes: Vec<u8>,
+        write_interrupted: bool,
+        flush_interrupted: bool,
+    }
+
+    impl Read for InterruptedWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for InterruptedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if std::mem::take(&mut self.write_interrupted) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if std::mem::take(&mut self.flush_interrupted) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interrupted_write_and_flush_send_one_websocket_frame() {
+        let stream = InterruptedWriter {
+            bytes: Vec::new(),
+            write_interrupted: true,
+            flush_interrupted: true,
+        };
+        let mut socket = WebSocket::from_raw_socket(
+            RetryInterrupted(stream),
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let expected = b"\x81\x02ok";
+
+        socket.send(Message::text("ok")).unwrap();
+
+        assert_eq!(&socket.get_ref().0.bytes, expected);
+    }
 
     fn short_tempdir() -> tempfile::TempDir {
         // Unix socket paths must stay under ~104 bytes, which the default
@@ -802,10 +941,10 @@ mod tests {
         write_fake(
             r#"[ "$*" = "app-server daemon restart" ] && [ -n "$CODEX_HOME" ] && echo '{"status":"restarted","pid":7}'"#,
         );
-        restart_with(&fake, dir.path()).unwrap();
+        restart_with(script_command(&fake), dir.path()).unwrap();
 
         write_fake(r#"echo 'boom' >&2; exit 1"#);
-        let error = restart_with(&fake, dir.path()).unwrap_err();
+        let error = restart_with(script_command(&fake), dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("boom"), "{error:#}");
     }
 
@@ -824,7 +963,7 @@ mod tests {
     ) -> std::thread::JoinHandle<Vec<Value>> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            let mut socket = tungstenite::accept(stream).unwrap();
+            let mut socket = tungstenite::accept(RetryInterrupted(stream)).unwrap();
             let mut seen = Vec::new();
             let mut full_access = std::collections::HashSet::new();
             let mut experimental_api = false;
@@ -1142,13 +1281,21 @@ mod tests {
         daemon.join().unwrap();
     }
 
-    fn fake_codex(dir: &Path, body: &str) -> PathBuf {
+    fn fake_codex(dir: &Path, body: &str) -> Command {
         let fake = dir.join("codex");
         std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
         let mut perms = std::fs::metadata(&fake).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&fake, perms).unwrap();
-        fake
+        script_command(&fake)
+    }
+
+    fn script_command(script: &Path) -> Command {
+        // Read fixtures through the interpreter. Direct exec can hit ETXTBSY
+        // on Linux when a parallel fork briefly inherits a writer's fd.
+        let mut command = Command::new("/bin/sh");
+        command.arg(script);
+        command
     }
 
     fn stopped(thread_id: &str, reason: StopReason) -> StoppedSession {
@@ -1174,7 +1321,7 @@ mod tests {
 
         let mut out = Vec::new();
         let unresumed =
-            restart_and_resume_with(&codex, home.path(), &sessions, "go", &mut out).unwrap();
+            restart_and_resume_with(codex, home.path(), &sessions, "go", &mut out).unwrap();
         daemon.join().unwrap();
 
         assert_eq!(unresumed, vec!["bad".to_string()]);
@@ -1192,7 +1339,7 @@ mod tests {
         let home = short_tempdir();
         let codex = fake_codex(home.path(), "echo boom >&2; exit 1");
         let sessions = [stopped("t1", StopReason::UsageLimit)];
-        let error = restart_and_resume_with(&codex, home.path(), &sessions, "go", &mut Vec::new())
+        let error = restart_and_resume_with(codex, home.path(), &sessions, "go", &mut Vec::new())
             .unwrap_err();
         assert!(format!("{error:#}").contains("boom"), "{error:#}");
     }
