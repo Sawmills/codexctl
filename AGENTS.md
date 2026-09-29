@@ -33,7 +33,7 @@
 - Preserve pinned exec homes at `~/.codexctl/exec-homes/<alias>`.
 - Run Codex login with `CODEX_HOME=~/.codexctl/login-homes/<alias>`.
 - Keep `codexctl use` as a local auth-file swap that does not contact OpenAI.
-- Keep `codexctl exec` non-mutating. It must never write `~/.codex/auth.json` or the active marker.
+- Keep `codexctl exec` from changing `~/.codex/auth.json` or the active marker. It can provision its exec home and capture rotated auth back to the saved profile.
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
 - Identify an account by its workspace and its login together. Neither identifies it alone: a workspace holds many logins, and a login holds seats in many workspaces.
 - Keep every login claim a token makes. A token gaining `chatgpt_user_id` is the ordinary legacy-to-current transition, and collapsing to one preferred claim makes the same seat look like two people.
