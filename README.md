@@ -445,7 +445,7 @@ take over completion for the shell's own `exec`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`. `codexctl exec` copies it into `~/.codexctl/exec-homes/<alias>/auth.json` instead and passes that directory to the child as `CODEX_HOME`, so a pinned launch changes no shared state at all.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`. `codexctl exec` copies it into `~/.codexctl/exec-homes/<alias>/auth.json` instead and passes that directory to the child as `CODEX_HOME`, so a pinned launch preserves the live auth file and active marker. It provisions its own exec home and can capture rotated credentials back to the saved profile.
 
 The live auth file and active marker are separate atomic files. A switch installs auth first and
 writes the marker last. If the process stops between those writes, the marker can remain on the
