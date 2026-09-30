@@ -152,15 +152,20 @@ pub fn token(auth: &Value) -> Result<&str> {
 
 pub fn account(auth: &Value) -> Result<String> {
     let token = token(auth)?;
-    let id = auth
-        .pointer("/tokens/account_id")
-        .or_else(|| auth.pointer("/tokens/chatgpt_account_id"))
-        .or_else(|| auth.get("account_id"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| api::extract_account_id(token))
-        .filter(|s| !s.is_empty())
-        .context("missing account identifier")?;
+    let id = [
+        auth.pointer("/tokens/account_id"),
+        auth.pointer("/tokens/chatgpt_account_id"),
+        auth.get("account_id"),
+        auth.get("chatgpt_account_id"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_str)
+    .find(|id| !id.is_empty())
+    .map(str::to_owned)
+    .or_else(|| api::extract_account_id(token))
+    .filter(|s| !s.is_empty())
+    .context("missing account identifier")?;
     if api::extract_account_id(token).is_some_and(|claimed| claimed != id) {
         bail!("account identifier conflicts with token");
     }

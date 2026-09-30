@@ -57,12 +57,16 @@ An account is "usage-based" when:
 - `rate_limit` is `null` AND `credits` is present with `has_credits: true`, OR
 - `plan_type` contains `usage_based`
 
-An account is "rate-limited" only when it has rate-limit windows, its `plan_type` is in the known
-subscription allowlist, and it has no conflicting positive credit evidence.
+An account is "rate-limited" only when it has rate-limit windows and its `plan_type` is in the known
+subscription allowlist. This includes `prolite`, `pro`, and `promax`. Purchased credits can coexist
+with subscription windows; spend control determines billing risk separately.
 
-New plan names, mixed rate-limit and positive-credit responses, and successful responses with
+The rate-limited table shows the returned plan. Pro tier labels follow Codex: `prolite` is Pro,
+`pro` is Pro (More), and `promax` is Pro (Max). These labels do not claim invoice amounts.
+
+New plan names and successful responses with
 neither rate-limit windows nor positive credit evidence are `Unknown`.
-Unknown accounts can appear as status errors, but automatic selection and recovery must not use
+Unknown accounts show returned usage with `Billing` set to `unknown`, but automatic selection and recovery must not use
 them. This keeps unfamiliar subscription metadata out of any path that can spend credits.
 
 Error accounts (bad auth, expired tokens) appear in whichever table matches their last known plan type from `meta.json`. If no plan is known, they appear in the rate-limited table (legacy default).

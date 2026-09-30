@@ -268,12 +268,19 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
 pub(super) fn billing_class(response: &Value) -> api::BillingClass {
     usage(response).map_or(api::BillingClass::Unknown, |u| {
         let class = u.billing_class();
+        let organization = matches!(
+            u.plan_type.as_deref(),
+            Some("team" | "business" | "enterprise" | "edu")
+        );
+        let credits = u
+            .credits
+            .as_ref()
+            .is_some_and(|c| c.has_credits || c.unlimited || c.overage_limit_reached);
+        // Included subscription credits do not prove that further spending is
+        // disabled. Keep entitlement classification separate from approval risk.
         if class == api::BillingClass::RateLimited
-            && matches!(
-                u.plan_type.as_deref(),
-                Some("team" | "business" | "enterprise" | "edu")
-            )
             && !u.spend_control.as_ref().is_some_and(|s| s.reached)
+            && (organization || credits || u.spend_control.is_some())
         {
             api::BillingClass::Unknown
         } else {
@@ -484,5 +491,19 @@ mod billing_tests {
     fn overage_evidence_prevents_automatic_selection() {
         let limits = json!({"rateLimits":{"planType":"pro","primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":false,"unlimited":false,"overageLimitReached":true}}});
         assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+    #[test]
+    fn subscription_credits_require_spend_control_before_automatic_selection() {
+        for plan in ["pro", "prolite", "promax"] {
+            let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":true,"unlimited":false},"spendControl":{"reached":true}}});
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
+            limits["rateLimits"]["spendControl"]["reached"] = json!(false);
+            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            limits["rateLimits"]
+                .as_object_mut()
+                .unwrap()
+                .remove("spendControl");
+            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+        }
     }
 }

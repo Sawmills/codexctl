@@ -68,10 +68,10 @@ impl RateLimitResponse {
             credits.has_credits || credits.unlimited || credits.overage_limit_reached
         });
         if self.rate_limit.as_ref().is_some_and(RateLimit::has_window) {
-            // A new plan name or mixed rate-limit and credit evidence is not
-            // proof that automatic use is free. Keep it out of selection until
-            // its contract is understood and added deliberately.
-            if has_credit_billing || !plan.is_some_and(is_known_rate_limited_plan) {
+            // Subscription windows and purchased credits can coexist. Plan
+            // identity establishes included usage; spend control separately
+            // determines whether selection needs billing approval.
+            if !plan.is_some_and(is_known_rate_limited_plan) {
                 return BillingClass::Unknown;
             }
             return BillingClass::RateLimited;
@@ -102,7 +102,16 @@ impl RateLimitResponse {
 fn is_known_rate_limited_plan(plan: &str) -> bool {
     matches!(
         plan,
-        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
+        "free"
+            | "go"
+            | "plus"
+            | "pro"
+            | "prolite"
+            | "promax"
+            | "team"
+            | "business"
+            | "enterprise"
+            | "edu"
     )
 }
 

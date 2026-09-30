@@ -26,12 +26,17 @@ fn root() -> Result<PathBuf> {
 fn path() -> Result<PathBuf> {
     Ok(root()?.join(".server.json"))
 }
-pub fn connection() -> Result<Option<Connection>> {
-    let path = path()?;
-    if !path.exists() {
+fn pending_path() -> Result<PathBuf> {
+    Ok(root()?.join(".pending-server.json"))
+}
+fn registration(path: &Path) -> Result<Option<Connection>> {
+    if !path.try_exists()? {
         return Ok(None);
     }
-    Ok(Some(serde_json::from_slice(&vault::private_read(&path)?)?))
+    Ok(Some(serde_json::from_slice(&vault::private_read(path)?)?))
+}
+pub fn connection() -> Result<Option<Connection>> {
+    registration(&path()?)
 }
 fn secret(connection: &Connection) -> Result<String> {
     Ok(
@@ -68,7 +73,7 @@ fn browser(url: &str) -> Result<()> {
 }
 pub fn connect(server: &str, name: Option<&str>, no_browser: bool) -> Result<()> {
     transport::origin(server)?;
-    if connection()?.is_some() {
+    if connection()?.is_some() || registration(&pending_path()?)?.is_some() {
         bail!("this machine is already connected; run codexctl disconnect --forget first");
     }
     native::require_local_mode()?;
@@ -139,7 +144,7 @@ pub(crate) fn install(server: &str, token: &str) -> Result<()> {
     transport::origin(server)?;
     let directory = root()?;
     let _lock = vault::lock(&directory, "native.lock")?;
-    if path()?.exists() {
+    if path()?.try_exists()? || pending_path()?.try_exists()? {
         bail!("machine already connected");
     }
     let me: Value = check(
@@ -158,15 +163,19 @@ pub(crate) fn install(server: &str, token: &str) -> Result<()> {
         ".device-{}.token",
         &vault::digest(token.as_bytes())[..16]
     ));
-    vault::create_secret(&token_file, token.as_bytes())?;
-    store::atomic_write(
-        &path()?,
-        &serde_json::to_vec(&Connection {
-            server: server.trim_end_matches('/').into(),
-            token_file,
-            user_id,
-        })?,
-    )?;
+    let connection = Connection {
+        server: server.trim_end_matches('/').into(),
+        token_file,
+        user_id,
+    };
+    let registration = serde_json::to_vec(&connection)?;
+    // Allocate cleanup evidence before any credential can appear on disk.
+    store::atomic_write(&pending_path()?, &registration)?;
+    vault::create_secret(&connection.token_file, token.as_bytes())?;
+    store::sync_directory(&directory)?;
+    store::atomic_write(&path()?, &registration)?;
+    std::fs::remove_file(pending_path()?)?;
+    store::sync_directory(&directory)?;
     Ok(())
 }
 pub(super) struct Catalog {
@@ -305,33 +314,47 @@ pub fn devices(revoke: Option<&str>) -> Result<()> {
 pub fn disconnect(forget: bool) -> Result<()> {
     let _lock = native::native_lock(&root()?)?;
     native::deactivate_locked()?;
-    if forget && let Some(connection) = connection()? {
-        // Remove only this connection's files after the provider is restored.
-        for entry in std::fs::read_dir(root()?)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "json")
-                && !path
-                    .file_name()
-                    .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-            {
-                native::remove_managed_connection(&path, &connection)?;
+    if forget {
+        let registrations: Vec<_> = [connection()?, registration(&pending_path()?)?]
+            .into_iter()
+            .flatten()
+            .collect();
+        for connection in &registrations {
+            // Remove only this connection's files after the provider is restored.
+            for entry in std::fs::read_dir(root()?)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "json")
+                    && !path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+                {
+                    native::remove_managed_connection(&path, connection)?;
+                }
             }
+            // Keep the connection as a durable cleanup reference until its credential
+            // is gone. A retry after either removal must tolerate a missing token.
+            match std::fs::remove_file(&connection.token_file) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            store::sync_directory(
+                connection
+                    .token_file
+                    .parent()
+                    .context("missing token directory")?,
+            )?;
         }
-        // Keep the connection as a durable cleanup reference until its credential
-        // is gone. A retry after either removal must tolerate a missing token.
-        match std::fs::remove_file(&connection.token_file) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if !registrations.is_empty() {
+            for reference in [path()?, pending_path()?] {
+                match std::fs::remove_file(reference) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            store::sync_directory(&root()?)?;
         }
-        store::sync_directory(
-            connection
-                .token_file
-                .parent()
-                .context("missing token directory")?,
-        )?;
-        std::fs::remove_file(path()?)?;
-        store::sync_directory(&root()?)?;
     }
     println!("Disconnected from the remote provider.");
     Ok(())

@@ -79,8 +79,9 @@ It prefers an account with headroom and the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
 Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
 The helper checks billing again before it supplies a token.
-Organizational plans need explicit spend-cap evidence to qualify for automatic selection.
-A missing or open cap requires billing consent.
+Organizational plans and accounts with credit evidence need a closed spend cap to qualify for automatic selection.
+A missing or open cap for those accounts requires billing consent.
+Subscription credits alone do not prove that further spending is disabled.
 No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
 Existing sessions keep the account they selected at startup.
@@ -100,6 +101,7 @@ An access token already supplied to Codex remains usable until OpenAI rejects it
 `disconnect` restores the previous provider and keeps registration.
 `--forget` also removes the local registration and device credential.
 If credential removal fails, the registration stays available for a cleanup retry.
+If sign-in finishes but local installation fails, run `codexctl disconnect --forget` before enrolling again.
 It does not revoke the server record.
 Provider restoration and registration removal hold one client lock through completion.
 

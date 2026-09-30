@@ -401,6 +401,8 @@ impl EnrollmentServer {
             .arg(&url)
             .arg("--sso-config")
             .arg(&sso)
+            .arg("--metrics-token-file")
+            .arg(server.root.path().join("metrics.token"))
             .arg("--codex-bin")
             .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"))
             .env("CENTRAL_TEST_MODE_FILE", server.root.path().join("mode"))
@@ -2070,4 +2072,197 @@ fn inaccessible_account_directories_fence_all_startup_replacements() {
     server.stop();
     server.restart();
     assert_eq!(server.token(&server.alex, "personal", None).status(), 200);
+}
+
+#[test]
+fn an_interrupted_enrollment_install_keeps_a_cleanup_reference() {
+    let server = Server::start();
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/central");
+    store::ensure_private_dir(&directory).unwrap();
+    let destination = directory.join(".server.json");
+    let mut protocol = Command::new("python3")
+        .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrollment_install.py"))
+        .arg(&destination)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(protocol.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    let result = server.cli(
+        home.path(),
+        &[
+            "connect",
+            "--server",
+            ready["url"].as_str().unwrap(),
+            "--no-browser",
+        ],
+    );
+    let _ = protocol.kill();
+    let _ = protocol.wait();
+    assert!(!result.status.success());
+    assert!(
+        destination.is_dir(),
+        "protocol must reach the installation write"
+    );
+    std::fs::remove_dir(&destination).unwrap();
+    assert!(
+        server
+            .cli(home.path(), &["disconnect", "--forget"])
+            .status
+            .success()
+    );
+    assert!(!std::fs::read_dir(&directory).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|value| value == "token")
+    }));
+}
+#[test]
+fn a_top_level_chatgpt_account_id_can_be_migrated_and_selected() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let mut credentials = auth("amir-login", "amir-seat");
+    let token = credentials["tokens"]["access_token"].as_str().unwrap();
+    let mut claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    claims["https://api.openai.com/auth"]
+        .as_object_mut()
+        .unwrap()
+        .remove("chatgpt_account_id");
+    credentials["tokens"]["access_token"] = json!(format!(
+        "header.{}.",
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+    ));
+    credentials["tokens"]["account_id"] = Value::Null;
+    credentials["chatgpt_account_id"] = json!("amir-seat");
+    store::atomic_write(
+        &paths.codex_auth_json(),
+        &serde_json::to_vec(&credentials).unwrap(),
+    )
+    .unwrap();
+    codexctl::profile::save_profile_to(&paths, "personal", None, &paths.codex_auth_json()).unwrap();
+    let result = server.cli(home.path(), &["migrate", "--all", "--exclusive-owner"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
+    );
+}
+#[cfg(unix)]
+#[test]
+fn enrollment_storage_failures_return_a_monitored_service_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let issuer = EnrollmentServer::start(company_identity());
+    let challenge = issuer.challenge();
+    let page = issuer
+        .browser(challenge["verificationUrl"].as_str().unwrap())
+        .text()
+        .unwrap();
+    let lock = issuer.server.root.path().join("state/users.lock");
+    store::atomic_write(&lock, b"").unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let response = issuer.approve(&page);
+    let status = response.status();
+    let body: Value = response.json().unwrap();
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(status, 503);
+    assert_eq!(body["error"], "registry_unavailable");
+    assert_eq!(
+        issuer
+            .server
+            .http
+            .get(format!("{}/ready", issuer.server.url))
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+    let metrics = issuer
+        .server
+        .http
+        .get(format!("{}/metrics", issuer.server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_failed_requests_total{reason=\"registry_unavailable\"} 1\n"
+        ),
+        "{metrics}"
+    );
+    assert!(metrics.contains(
+        "codexctl_central_last_failure_timestamp_seconds{reason=\"registry_unavailable\"}"
+    ));
+    let timestamp = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with(
+                "codexctl_central_last_failure_timestamp_seconds{reason=\"registry_unavailable\"}",
+            )
+        })
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .parse::<f64>()
+        .unwrap();
+    assert!(timestamp > 0.0);
+}
+
+#[test]
+fn enrollment_for_a_disabled_user_remains_a_policy_denial() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let challenge = issuer.challenge();
+    let page = issuer
+        .browser(challenge["verificationUrl"].as_str().unwrap())
+        .text()
+        .unwrap();
+    assert_eq!(issuer.approve(&page).status(), 200);
+    let grant: Value = issuer.poll(&challenge).json().unwrap();
+    let user: Value = issuer
+        .server
+        .http
+        .get(format!("{}/v1/me", issuer.server.url))
+        .bearer_auth(grant["deviceToken"].as_str().unwrap())
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let challenge = issuer.challenge();
+    let page = issuer
+        .browser(challenge["verificationUrl"].as_str().unwrap())
+        .text()
+        .unwrap();
+    central::managed::set_user(
+        &issuer.server.root.path().join("state"),
+        user["id"].as_str().unwrap(),
+        false,
+    )
+    .unwrap();
+    let response = issuer.approve(&page);
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "user_unavailable"
+    );
 }

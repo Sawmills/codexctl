@@ -442,8 +442,14 @@ async fn approve(
         .get_mut(&approval.device_hash)
         .filter(|d| d.grant.is_none())
         .ok_or_else(|| broker.error(StatusCode::GONE, "enrollment_expired"))?;
-    managed::record_user(&broker.state, &approval.user, &approval.email)
-        .map_err(|_| broker.error(StatusCode::FORBIDDEN, "user_unavailable"))?;
+    match managed::record_user(&broker.state, &approval.user, &approval.email)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    {
+        managed::UserEnrollment::Recorded => {}
+        managed::UserEnrollment::Disabled => {
+            return Err(broker.error(StatusCode::FORBIDDEN, "user_unavailable"));
+        }
+    }
     let token = secret();
     let _lock = vault::registry_lock(&broker.state, "devices.lock")
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;

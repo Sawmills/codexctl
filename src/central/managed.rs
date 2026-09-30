@@ -124,12 +124,16 @@ pub fn set_user(state: &Path, id: &str, enabled: bool) -> Result<()> {
     user.enabled = enabled;
     store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)
 }
-pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<()> {
+pub(super) enum UserEnrollment {
+    Recorded,
+    Disabled,
+}
+pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnrollment> {
     let _lock = vault::registry_lock(state, "users.lock")?;
     let mut users = users(state)?;
     if let Some(user) = users.iter_mut().find(|u| u.id == id) {
         if !user.enabled {
-            bail!("user disabled");
+            return Ok(UserEnrollment::Disabled);
         }
         user.email = email.into();
     } else {
@@ -139,7 +143,8 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<()> {
             enabled: true,
         });
     }
-    store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)
+    store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)?;
+    Ok(UserEnrollment::Recorded)
 }
 fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
