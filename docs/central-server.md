@@ -17,6 +17,7 @@ Sign in with company SSO in your browser.
 Compare the browser code with the terminal code.
 Approve the machine in your browser.
 For a machine without a browser, add `--no-browser` and open the printed link on another machine.
+Automatic browser launch supports macOS and Linux. On other platforms, use `--no-browser`.
 
 The client stores the server address, your immutable SSO identity, and a private device credential under `~/.codexctl/central`.
 You do not need a token file or an SSH tunnel.
@@ -187,7 +188,7 @@ Create these SSM SecureString values through the operator secret workflow:
 
 - `/app/codexctl/vault-key`: base64 of the 32-byte encryption key.
 - `/app/codexctl/oidc-client-secret`: the dedicated company OIDC client secret.
-- `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 bytes, without a final newline.
+- `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 visible ASCII characters. The server trims surrounding whitespace.
 
 External Secrets supplies the pod secret.
 An init container copies the projected files into private real files for the broker.

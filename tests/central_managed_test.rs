@@ -2266,3 +2266,54 @@ fn enrollment_for_a_disabled_user_remains_a_policy_denial() {
         "user_unavailable"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn an_inaccessible_activation_marker_refuses_local_profile_save() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    let home = server.connected_home();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let credentials = serde_json::to_vec(&auth("previous-login", "previous-seat")).unwrap();
+    store::atomic_write(&paths.codex_auth_json(), &credentials).unwrap();
+    store::atomic_write(
+        &paths.codex_home().join("config.toml"),
+        b"model_provider = 'codexctl-central'\n",
+    )
+    .unwrap();
+    let central = paths.codexctl_dir().join("central");
+    store::atomic_write(
+        &central.join(".native-active.json"),
+        &serde_json::to_vec(&json!({"home": paths.codex_home(), "original_provider": null}))
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&central, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let result = server.cli(home.path(), &["save", "previous-local"]);
+    std::fs::set_permissions(&central, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!result.status.success());
+    assert!(!paths.profiles_dir().join("previous-local").exists());
+    assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), credentials);
+}
+
+#[test]
+fn a_monitoring_token_with_a_trailing_newline_authenticates_scrapes() {
+    let mut server = Server::start();
+    server.stop();
+    store::atomic_write(
+        &server.root.path().join("metrics.token"),
+        b"synthetic-monitoring-credential-only\n",
+    )
+    .unwrap();
+    server.restart();
+    assert_eq!(
+        server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+}

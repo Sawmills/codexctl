@@ -93,7 +93,7 @@ fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub fn require_local_mode() -> Result<()> {
-    if !root()?.join(".native-active.json").exists() {
+    if !root()?.join(".native-active.json").try_exists()? {
         return Ok(());
     }
     let home = codex_home()?;
@@ -159,7 +159,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let path = connection_path(alias)?;
     let _lock = native_lock(&root()?)?;
-    if path.exists() || store::profile_dir(&config::default_paths()?, alias)?.exists() {
+    if path.try_exists()? || store::profile_dir(&config::default_paths()?, alias)?.try_exists()? {
         bail!("alias already exists");
     }
     let mut connection = Connection {
@@ -176,7 +176,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     drop(_lock);
     let token = fetch(&connection, false)?;
     let _lock = native_lock(&root()?)?;
-    if path.exists() {
+    if path.try_exists()? {
         bail!("alias registered while connecting");
     }
     connection.account_id = token.chatgpt_account_id;
@@ -258,7 +258,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         Some(alias) => alias.to_owned(),
         None => {
             let directory = root()?;
-            if !directory.exists() {
+            if !directory.try_exists()? {
                 return Ok(false);
             }
             let candidates = std::fs::read_dir(&directory)?
@@ -286,7 +286,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     };
     let alias = selected.as_str();
     let path = connection_path(alias)?;
-    if (catalog.is_some() || path.exists())
+    if (catalog.is_some() || path.try_exists()?)
         && (std::env::var_os("CODEX_HOME").is_some()
             || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some())
     {
@@ -302,11 +302,11 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
             .context("server account alias not found")?;
         sync_account(&catalog.connection, account)?;
     }
-    if !path.exists() {
+    if !path.try_exists()? {
         return Ok(false);
     }
     let local = store::profile_dir(&config::default_paths()?, alias)?;
-    if local.exists() && !local.join(".central-transfer.json").exists() {
+    if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
         bail!("remote alias conflicts with a local profile; rename one before selection");
     }
     let _lock = native_lock(&root()?)?;
@@ -353,7 +353,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
             "Codex daemon is running; finish its sessions and run codex app-server daemon stop before remote activation"
         );
     }
-    if !home.exists() {
+    if !home.try_exists()? {
         store::ensure_private_dir(&home)?;
     }
     let mut doc = document(&home)?;
@@ -369,7 +369,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         );
     }
     let marker = root()?.join(".native-active.json");
-    let activation = if marker.exists() {
+    let activation = if marker.try_exists()? {
         let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
         if active.home != home {
             bail!("remote provider is active in another Codex home");
@@ -428,7 +428,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     }
     connection.revision = latest.revision;
     let destination = config_path(&home)?;
-    let had_marker = marker.exists();
+    let had_marker = marker.try_exists()?;
     store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
     if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
         let not_installed = match std::fs::read(&destination) {
@@ -453,7 +453,7 @@ pub fn deactivate() -> Result<()> {
 
 pub(super) fn deactivate_locked() -> Result<()> {
     let marker = root()?.join(".native-active.json");
-    if !marker.exists() {
+    if !marker.try_exists()? {
         return Ok(());
     }
     let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
@@ -497,7 +497,7 @@ pub(super) fn sync_account(
             account.alias
         );
     }
-    if path.exists() {
+    if path.try_exists()? {
         let existing = read_connection(&path)?;
         if existing.server != device.server
             || existing.account_id != account.account_id

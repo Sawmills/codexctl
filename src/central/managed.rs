@@ -936,10 +936,13 @@ pub async fn serve(
         metrics_hash: metrics_token_file
             .map(|p| {
                 let bytes = vault::private_read(p)?;
-                if bytes.len() < 32 || std::str::from_utf8(&bytes).is_err() {
-                    bail!("metrics token must contain at least 32 UTF-8 bytes");
+                let token = std::str::from_utf8(&bytes)
+                    .context("metrics token must contain UTF-8 text")?
+                    .trim();
+                if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    bail!("metrics token must contain at least 32 visible ASCII characters");
                 }
-                Ok(vault::digest(&bytes))
+                Ok(vault::digest(token.as_bytes()))
             })
             .transpose()?,
     };

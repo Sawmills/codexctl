@@ -58,14 +58,14 @@ fn request(connection: &Connection, path: &str) -> Result<reqwest::blocking::Req
         .bearer_auth(secret(connection)?))
 }
 fn browser(url: &str) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let status = std::process::Command::new("open").arg(url).status()?;
-    #[cfg(target_os = "linux")]
-    let status = std::process::Command::new("xdg-open").arg(url).status()?;
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let status = std::process::Command::new("cmd")
-        .args(["/C", "start", url])
-        .status()?;
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "linux") {
+        "xdg-open"
+    } else {
+        bail!("automatic browser launch is unsupported; run connect with --no-browser");
+    };
+    let status = std::process::Command::new(program).arg(url).status()?;
     if !status.success() {
         bail!("browser did not open; use the printed sign-in link");
     }
@@ -416,7 +416,7 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
             account_id: vault::account(&auth)?,
             confirmed: false,
         };
-        if marker.exists() {
+        if marker.try_exists()? {
             let prior: Transfer = serde_json::from_slice(&vault::private_read(&marker)?)?;
             if prior.server != transfer.server
                 || prior.user_id != transfer.user_id
@@ -572,8 +572,8 @@ fn existing_holders(paths: &config::Paths) -> Result<Vec<PathBuf>> {
 }
 
 fn prepare_auth(paths: &config::Paths, p: &profile::Profile) -> Result<Value> {
-    let source = if p.dir.join(".central-transfer.json").exists()
-        && p.dir.join(".central-source.json").exists()
+    let source = if p.dir.join(".central-transfer.json").try_exists()?
+        && p.dir.join(".central-source.json").try_exists()?
     {
         p.dir.join(".central-source.json")
     } else {
@@ -612,7 +612,7 @@ fn retire_local_holders(paths: &config::Paths, p: &profile::Profile, auth: &Valu
             let backup = p
                 .dir
                 .join(format!(".retired-{}.json", vault::digest(&contents)));
-            if !backup.exists() {
+            if !backup.try_exists()? {
                 vault::create_secret(&backup, &contents)?;
                 store::sync_directory(&p.dir)?;
             }
@@ -641,11 +641,11 @@ pub(super) fn local_alias_matches(
     account: &Account,
     dir: &Path,
 ) -> Result<bool> {
-    if !dir.exists() {
+    if !dir.try_exists()? {
         return Ok(true);
     }
     let marker = dir.join(".central-transfer.json");
-    if !marker.exists() {
+    if !marker.try_exists()? {
         return Ok(false);
     }
     let transfer: Transfer = serde_json::from_slice(&vault::private_read(&marker)?)?;
