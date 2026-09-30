@@ -39,6 +39,7 @@ struct RateLimitedAccount {
     is_active: bool,
     is_error: bool,
     billing_unknown: bool,
+    plan: String,
     error_msg: String,
 }
 
@@ -150,6 +151,25 @@ impl RateLimitedAccount {
             is_active,
             is_error: false,
             billing_unknown: usage.billing_class() == api::BillingClass::Unknown,
+            plan: match usage.plan_type.as_deref() {
+                Some("pro") => "Pro (More)",
+                Some("prolite") => "Pro",
+                Some("promax") => "Pro (Max)",
+                Some("free") => "Free",
+                Some("go") => "Go",
+                Some("plus") => "Plus",
+                Some("team") => "Team",
+                Some("business") => "Business",
+                Some("enterprise") => "Enterprise",
+                Some("edu") => "Edu",
+                Some(plan) => plan,
+                None => "",
+            }
+            .trim()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(80)
+            .collect(),
             error_msg: String::new(),
         }
     }
@@ -330,6 +350,7 @@ struct RateLimitColumns {
     named_limits: bool,
     labeled: bool,
     billing: bool,
+    plan: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -422,6 +443,7 @@ impl RateLimitColumns {
         }
         Self {
             billing: accounts.iter().any(|account| account.billing_unknown),
+            plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
             // An error row still carries its label, so consider every account
             // here rather than only the healthy ones.
@@ -434,6 +456,9 @@ impl RateLimitColumns {
         let mut headers = vec!["Account".to_string()];
         if self.labeled {
             headers.push("Label".to_string());
+        }
+        if self.plan {
+            headers.push("Plan".to_string());
         }
         if self.named_limits {
             headers.push("Limit".to_string());
@@ -568,6 +593,7 @@ async fn fetch_and_split(
                         is_active: *is_active,
                         is_error: true,
                         billing_unknown: false,
+                        plan: String::new(),
                         error_msg: "bad auth.json".to_string(),
                     });
                 }
@@ -611,6 +637,7 @@ async fn fetch_and_split(
                         is_active: *is_active,
                         is_error: true,
                         billing_unknown: false,
+                        plan: String::new(),
                         error_msg: msg.to_string(),
                     });
                 }
@@ -784,6 +811,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         if columns.labeled {
             row.push(label_cell(account.label.as_deref()));
         }
+        if columns.plan {
+            row.push(Cell::new("-"));
+        }
         if columns.named_limits {
             row.push(Cell::new("-"));
         }
@@ -801,6 +831,13 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
     let mut row = vec![Cell::new(display_alias(&account.alias, account.is_active))];
     if columns.labeled {
         row.push(label_cell(account.label.as_deref()));
+    }
+    if columns.plan {
+        row.push(Cell::new(if account.plan.is_empty() {
+            "-"
+        } else {
+            &account.plan
+        }));
     }
     if columns.named_limits {
         row.push(Cell::new(
@@ -1088,6 +1125,7 @@ mod tests {
             is_active: false,
             is_error: false,
             billing_unknown: false,
+            plan: String::new(),
             error_msg: String::new(),
         }
     }
@@ -1103,15 +1141,59 @@ mod tests {
 
         let row = render_rate_limited_row(&account, &columns);
 
-        assert_eq!(row[1].content(), "96%");
-        assert_eq!(row[3].content(), "3");
-        assert_eq!(row.last().unwrap().content(), "unknown");
+        assert_eq!(row[1].content(), "Pro (More)");
+        assert_eq!(row[2].content(), "96%");
+        assert_eq!(row[4].content(), "3");
+        assert!(!columns.billing);
+    }
+
+    #[test]
+    fn pro_max_subscription_has_plan_and_live_windows() {
+        let usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{"plan_type":"promax","rate_limit":{"primary_window":{"used_percent":29,"limit_window_seconds":604800}},"credits":{"has_credits":true}}"#,
+        ).unwrap();
+        let account = RateLimitedAccount::from_usage("p4".to_string(), None, false, None, &usage);
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let row = render_rate_limited_row(&account, &columns);
+        assert_eq!(row[1].content(), "Pro (Max)");
+        assert_eq!(row[2].content(), "29%");
+        assert_eq!(row.len(), columns.headers().len());
+        assert!(!columns.billing);
+    }
+
+    #[test]
+    fn absent_plan_hides_column_and_external_plan_text_is_bounded() {
+        let mut usage: api::RateLimitResponse =
+            serde_json::from_str(r#"{"rate_limit":{"primary_window":{"used_percent":29}}}"#)
+                .unwrap();
+        let missing =
+            RateLimitedAccount::from_usage("missing".to_string(), None, false, None, &usage);
+        assert!(!RateLimitColumns::for_accounts(&[&missing]).plan);
+        usage.plan_type = Some(format!("\n{}\x1b\t", "x".repeat(100)));
+        let external =
+            RateLimitedAccount::from_usage("external".to_string(), None, false, None, &usage);
+        let columns = RateLimitColumns::for_accounts(&[&missing, &external]);
+        let row = render_rate_limited_row(&external, &columns);
+        assert_eq!(row[1].content(), "x".repeat(80));
+        assert_eq!(
+            render_rate_limited_row(&missing, &columns)[1].content(),
+            "-"
+        );
+        let error = RateLimitedAccount {
+            is_error: true,
+            error_msg: "bad auth".to_string(),
+            ..rate_limited_account()
+        };
+        assert_eq!(
+            render_rate_limited_row(&error, &columns).len(),
+            columns.headers().len()
+        );
     }
 
     #[test]
     fn unrecognized_plan_renders_returned_windows() {
         let usage: api::RateLimitResponse = serde_json::from_str(
-            r#"{"plan_type":"promax","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800}}}"#,
+            r#"{"plan_type":"new_plan","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":604800}}}"#,
         ).unwrap();
         let account =
             RateLimitedAccount::from_usage("new-plan".to_string(), None, false, None, &usage);
@@ -1119,7 +1201,8 @@ mod tests {
 
         let row = render_rate_limited_row(&account, &columns);
 
-        assert_eq!(row[1].content(), "1%");
+        assert_eq!(row[1].content(), "new_plan");
+        assert_eq!(row[2].content(), "1%");
         assert_eq!(row.last().unwrap().content(), "unknown");
     }
 
@@ -1153,8 +1236,8 @@ mod tests {
 
         let row = render_rate_limited_row(&account, &columns);
 
-        assert_eq!(row[1].content(), "Codex\nReserve");
-        assert_eq!(row[2].content(), "-\n1%");
+        assert_eq!(row[2].content(), "Codex\nReserve");
+        assert_eq!(row[3].content(), "-\n1%");
         assert!(account.availability_score() > healthy.availability_score());
     }
 

@@ -97,9 +97,14 @@ Usage-based accounts are shown in a separate table with balance, seat limit, cre
 control status.
 
 When billing classification is unknown, status still shows the returned usage windows, resets,
-and token expiry. A `Billing` column marks those accounts as `unknown`. Credits alongside included
-usage or an unrecognized plan can cause this classification. Automatic selection still excludes
+and token expiry. A `Billing` column marks those accounts as `unknown`. An unrecognized plan or
+missing main usage windows can cause this classification. Automatic selection still excludes
 these accounts.
+
+The `Plan` column shows the subscription returned by OpenAI, including Pro, Pro (More), and
+Pro (Max). Subscription windows and purchased credits can coexist. Credits do not make a known
+subscription unknown; spend control still determines billing risk during recovery. Plan names
+are not invoices or credit balances in dollars.
 
 ### Switch accounts
 
