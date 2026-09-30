@@ -157,6 +157,17 @@ impl UsageBasedAccount {
 }
 
 pub fn run(filter: Filter) -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    if codexctl::central::remote::show(
+        true,
+        match filter {
+            Filter::All => None,
+            Filter::RateLimited => Some(api::BillingClass::RateLimited),
+            Filter::UsageBased => Some(api::BillingClass::UsageBased),
+        },
+    )? {
+        return Ok(());
+    }
     let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
 
     let show_rl = matches!(filter, Filter::All | Filter::RateLimited);

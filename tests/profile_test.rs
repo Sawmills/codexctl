@@ -2479,3 +2479,34 @@ fn exact_token_ownership_weighs_the_whole_holder_set() {
         "none"
     );
 }
+
+#[test]
+fn transferred_profiles_cannot_be_installed_by_a_local_only_build() {
+    let (_tmp, paths) = setup_test_env();
+    profile::save_profile_to(&paths, "central-owned", None, &paths.codex_auth_json()).unwrap();
+    let saved = profile::get_profile_from(&paths, "central-owned").unwrap();
+    codexctl::store::atomic_write(&saved.dir.join(".central-transfer.json"), b"{}").unwrap();
+    assert!(
+        profile::switch_to_from(&paths, "central-owned")
+            .unwrap_err()
+            .to_string()
+            .contains("transferred")
+    );
+    assert!(
+        profile::seed_exec_auth_from(
+            &paths,
+            "central-owned",
+            &paths.codexctl_dir().join("exec-auth.json")
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("transferred")
+    );
+    assert!(
+        codexctl::api::read_auth_json(&saved.auth_json_path())
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("transferred")
+    );
+}

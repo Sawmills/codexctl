@@ -17,6 +17,10 @@ const PROVIDER: &str = "codexctl-central";
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Connection {
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
     server: String,
     device_token_file: PathBuf,
     account_id: String,
@@ -43,7 +47,7 @@ fn connection_path(alias: &str) -> Result<PathBuf> {
 fn codex_home() -> Result<PathBuf> {
     Ok(config::default_paths()?.codex_home())
 }
-fn native_lock(directory: &Path) -> Result<std::fs::File> {
+pub(super) fn native_lock(directory: &Path) -> Result<vault::Lock> {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         match vault::lock(directory, "native.lock") {
@@ -105,23 +109,9 @@ pub fn require_local_mode() -> Result<()> {
     Ok(())
 }
 fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
-    let url = reqwest::Url::parse(&connection.server)?;
-    if url.scheme() != "http"
-        || !matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
-        || url.path() != "/"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        bail!("remote account requires a loopback HTTP origin; use an SSH tunnel");
-    }
+    super::transport::origin(&connection.server)?;
     let secret = String::from_utf8(vault::private_read(&connection.device_token_file)?)?;
-    let http = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(95))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()?;
+    let http = super::transport::blocking()?;
     let response = http
         .post(format!(
             "{}/v1/token",
@@ -129,9 +119,11 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
         ))
         .bearer_auth(secret.trim())
         .json(&TokenRequest {
-            previous_revision: refresh.then(|| connection.revision.clone()),
+            previous_revision: (refresh && !connection.revision.is_empty())
+                .then(|| connection.revision.clone()),
             account_id: (!connection.account_id.is_empty()).then(|| connection.account_id.clone()),
             billing: true,
+            alias: connection.alias.clone(),
         })
         .send()
         .context("central token request failed")?;
@@ -142,6 +134,9 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
         );
     }
     let token: TokenResponse = response.json().context("invalid central token response")?;
+    if connection.user_id.is_some() && token.user_id != connection.user_id {
+        bail!("server user identity changed");
+    }
     if !connection.account_id.is_empty() && token.chatgpt_account_id != connection.account_id {
         bail!("central account identity changed");
     }
@@ -168,6 +163,8 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         bail!("alias already exists");
     }
     let mut connection = Connection {
+        user_id: None,
+        alias: None,
         server: server.into(),
         device_token_file: std::fs::canonicalize(token_file)?,
         account_id: String::new(),
@@ -240,6 +237,23 @@ fn document(home: &Path) -> Result<DocumentMut> {
 
 pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     let explicit = alias.is_some();
+    let catalog = super::remote::catalog()?;
+    let selected_remote = catalog
+        .as_ref()
+        .map(|catalog| {
+            let accounts = &catalog.accounts;
+            if let Some(alias) = alias {
+                accounts
+                    .iter()
+                    .find(|a| a.alias == alias)
+                    .map(|a| a.alias.clone())
+                    .context("server account alias not found")
+            } else {
+                super::remote::select(accounts)
+            }
+        })
+        .transpose()?;
+    let alias = selected_remote.as_deref().or(alias);
     let selected = match alias {
         Some(alias) => alias.to_owned(),
         None => {
@@ -253,7 +267,8 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
                 .map(|e| e.path())
                 .filter(|p| {
                     p.extension().is_some_and(|e| e == "json")
-                        && p.file_name().is_some_and(|n| n != ".native-active.json")
+                        && p.file_name()
+                            .is_some_and(|n| !n.to_string_lossy().starts_with('.'))
                 })
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
@@ -271,16 +286,28 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     };
     let alias = selected.as_str();
     let path = connection_path(alias)?;
+    if (catalog.is_some() || path.exists())
+        && (std::env::var_os("CODEX_HOME").is_some()
+            || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some())
+    {
+        bail!("remote activation refuses an inherited or pinned Codex home");
+    }
+    if let Some(catalog) = catalog.as_ref() {
+        let _lock = native_lock(&root()?)?;
+        super::remote::require_current_connection(&catalog.connection)?;
+        let account = catalog
+            .accounts
+            .iter()
+            .find(|a| a.alias == alias)
+            .context("server account alias not found")?;
+        sync_account(&catalog.connection, account)?;
+    }
     if !path.exists() {
         return Ok(false);
     }
-    if store::profile_dir(&config::default_paths()?, alias)?.exists() {
+    let local = store::profile_dir(&config::default_paths()?, alias)?;
+    if local.exists() && !local.join(".central-transfer.json").exists() {
         bail!("remote alias conflicts with a local profile; rename one before selection");
-    }
-    if std::env::var_os("CODEX_HOME").is_some()
-        || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
-    {
-        bail!("remote activation refuses an inherited or pinned Codex home");
     }
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
@@ -309,6 +336,17 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         .flatten();
     connection.approved_billing_class = usage_based.then_some(token.billing_class).flatten();
     let _lock = native_lock(&root()?)?;
+    if let Some(catalog) = catalog.as_ref() {
+        super::remote::require_current_connection(&catalog.connection)?;
+    }
+    let paths = config::default_paths()?;
+    // Migration takes store then native. Never wait for the store while holding native.
+    let _store =
+        store::try_lock(&paths)?.context("local account store is busy; retry selection")?;
+    super::remote::require_local_handoff(
+        &paths,
+        &serde_json::json!({"tokens":{"access_token":token.access_token,"account_id":token.chatgpt_account_id}}),
+    )?;
     let home = codex_home()?;
     if crate::daemon::running_pid(&home).is_some() {
         bail!(
@@ -371,7 +409,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     args.push(path.to_str().context("connection path must be UTF-8")?);
     provider["auth"]["args"] = value(args);
     provider["auth"]["refresh_interval_ms"] = value(0);
-    provider["auth"]["timeout_ms"] = value(110_000);
+    provider["auth"]["timeout_ms"] = value(210_000);
     if let Some(inline) = doc.get("model_providers").and_then(Item::as_inline_table) {
         doc["model_providers"] = Item::Table(inline.clone().into_table());
     } else if doc.get("model_providers").is_none() {
@@ -409,11 +447,15 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
 }
 
 pub fn deactivate() -> Result<()> {
+    let _lock = native_lock(&root()?)?;
+    deactivate_locked()
+}
+
+pub(super) fn deactivate_locked() -> Result<()> {
     let marker = root()?.join(".native-active.json");
     if !marker.exists() {
         return Ok(());
     }
-    let _lock = native_lock(&root()?)?;
     let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
     if crate::daemon::running_pid(&active.home).is_some() {
         bail!(
@@ -438,4 +480,77 @@ pub fn deactivate() -> Result<()> {
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
     std::fs::remove_file(marker)?;
     Ok(())
+}
+
+pub(super) fn sync_account(
+    device: &super::remote::Connection,
+    account: &super::managed::Account,
+) -> Result<()> {
+    if account.user_id != device.user_id {
+        bail!("server user identity changed");
+    }
+    let path = connection_path(&account.alias)?;
+    let local = store::profile_dir(&config::default_paths()?, &account.alias)?;
+    if !super::remote::local_alias_matches(device, account, &local)? {
+        bail!(
+            "server alias {} conflicts with a local profile; migrate or rename it",
+            account.alias
+        );
+    }
+    if path.exists() {
+        let existing = read_connection(&path)?;
+        if existing.server != device.server
+            || existing.account_id != account.account_id
+            || existing.alias.as_deref() != Some(&account.alias)
+            || existing.user_id.as_deref() != Some(&device.user_id)
+            || existing.device_token_file != device.token_file
+        {
+            bail!("remote account identity changed");
+        }
+        return Ok(());
+    }
+    save_connection(
+        &path,
+        &Connection {
+            user_id: Some(device.user_id.clone()),
+            alias: Some(account.alias.clone()),
+            server: device.server.clone(),
+            device_token_file: device.token_file.clone(),
+            account_id: account.account_id.clone(),
+            revision: String::new(),
+            allow_billing: false,
+            approved_billing_plan: None,
+            approved_billing_class: None,
+        },
+    )
+}
+pub(super) fn remove_managed_connection(
+    path: &Path,
+    device: &super::remote::Connection,
+) -> Result<()> {
+    let connection = read_connection(path)?;
+    if connection.server == device.server && connection.device_token_file == device.token_file {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+pub fn active_alias() -> Result<Option<String>> {
+    let home = codex_home()?;
+    let doc = document(&home)?;
+    if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
+        return Ok(None);
+    }
+    let path = doc
+        .get("model_providers")
+        .and_then(|p| p.get(PROVIDER))
+        .and_then(|p| p.get("auth"))
+        .and_then(|a| a.get("args"))
+        .and_then(Item::as_array)
+        .and_then(|args| args.get(2))
+        .and_then(toml_edit::Value::as_str)
+        .context("invalid central provider command")?;
+    Ok(std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_owned))
 }

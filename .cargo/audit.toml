@@ -1,0 +1,4 @@
+[advisories]
+# OIDC uses public-key verification only. No RSA private key operations are reachable.
+# Review this exception if signing or decryption is added. See docs/research/central-staging.md.
+ignore = ["RUSTSEC-2023-0071"]

@@ -650,6 +650,10 @@ struct NativeClient {
     home: PathBuf,
 }
 impl NativeClient {
+    fn local_auth_bytes() -> Vec<u8> {
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"unrelated-local-login","exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"unrelated-local-seat"}})).unwrap());
+        serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic-unrelated-refresh","account_id":"unrelated-local-seat"}})).unwrap()
+    }
     fn start() -> Self {
         Self::with_plan(Some("pro"))
     }
@@ -662,7 +666,7 @@ impl NativeClient {
             "# Personal preference\nmodel = 'gpt-6.1-sol'\nmodel_provider = 'openai'\n",
         )
         .unwrap();
-        std::fs::write(home.join(".codex/auth.json"), b"untouched local login").unwrap();
+        store::atomic_write(&home.join(".codex/auth.json"), &Self::local_auth_bytes()).unwrap();
         Self { broker, home }
     }
     fn run(&self, bin: &str, args: &[&str]) -> std::process::Output {
@@ -741,7 +745,7 @@ fn when_a_remote_account_is_selected_then_native_configuration_preserves_the_loc
     );
     assert_eq!(
         std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
-        b"untouched local login"
+        NativeClient::local_auth_bytes()
     );
     assert!(
         std::fs::read_to_string(client.home.join(".codex/config.toml"))
@@ -946,7 +950,7 @@ fn when_no_remote_aliases_exist_then_local_use_keeps_the_local_error_and_configu
     assert!(String::from_utf8_lossy(&output.stderr).contains("not found"));
     assert_eq!(
         std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
-        b"untouched local login"
+        NativeClient::local_auth_bytes()
     );
 }
 
@@ -1010,7 +1014,7 @@ fn when_remote_config_is_invalid_then_local_use_does_not_swap_credentials() {
         &codexctl::config::Paths::from_home(client.home.clone()),
         "local",
         Some("local@example.invalid"),
-        &client.broker.root.path().join("auth.json"),
+        &client.home.join(".codex/auth.json"),
     )
     .unwrap();
     assert!(client.select().status.success());
@@ -1021,7 +1025,7 @@ fn when_remote_config_is_invalid_then_local_use_does_not_swap_credentials() {
     assert!(!output.status.success());
     assert_eq!(
         std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
-        b"untouched local login"
+        NativeClient::local_auth_bytes()
     );
 }
 

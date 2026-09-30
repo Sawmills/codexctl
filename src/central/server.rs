@@ -28,11 +28,15 @@ pub struct TokenRequest {
     pub account_id: Option<String>,
     #[serde(default)]
     pub billing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
     pub access_token: String,
     pub chatgpt_account_id: String,
     pub chatgpt_plan_type: Option<String>,
@@ -50,7 +54,7 @@ impl TokenResponse {
     }
 }
 
-enum TokenFailure {
+pub(super) enum TokenFailure {
     AccountMismatch,
     RefreshDisabled,
     Unavailable(anyhow::Error),
@@ -62,24 +66,23 @@ impl From<anyhow::Error> for TokenFailure {
     }
 }
 
-struct Owner {
-    vault: Vault,
-    rpc: Option<Rpc>,
-    home: tempfile::TempDir,
-    state: PathBuf,
-    key: PathBuf,
-    available: bool,
-    refresh_enabled: bool,
+pub(super) struct Owner {
+    pub(super) vault: Vault,
+    pub(super) rpc: Option<Rpc>,
+    pub(super) home: PathBuf,
+    pub(super) state: PathBuf,
+    pub(super) key: PathBuf,
+    pub(super) available: bool,
+    pub(super) refresh_enabled: bool,
+    pub(super) limits: Option<Value>,
+    pub(super) verification_input: Option<Value>,
 }
 
 impl Owner {
-    fn snapshot(&mut self) -> Result<TokenResponse> {
-        self.home.disable_cleanup(true);
-        let auth: Value =
-            serde_json::from_slice(&vault::private_read(&self.home.path().join("auth.json"))?)?;
-        vault::validate_auth(&auth)?;
-        if vault::account(&auth)? != vault::account(&self.vault.auth)?
-            || api::token_subject(vault::token(&auth)?)
+    pub(super) fn validate_owned_auth(&self, auth: &Value) -> Result<()> {
+        vault::validate_auth(auth)?;
+        if vault::account(auth)? != vault::account(&self.vault.auth)?
+            || api::token_subject(vault::token(auth)?)
                 != api::token_subject(vault::token(&self.vault.auth)?)
         {
             bail!("central credential owner changed identity");
@@ -87,23 +90,79 @@ impl Owner {
         let original = api::token_identity(vault::token(&self.vault.auth)?)
             .context("missing original identity")?;
         let updated =
-            api::token_identity(vault::token(&auth)?).context("missing updated identity")?;
+            api::token_identity(vault::token(auth)?).context("missing updated identity")?;
         if original.user_id.is_some() && original.user_id != updated.user_id {
             bail!("central credential owner changed login identity");
+        }
+        Ok(())
+    }
+
+    pub(super) fn reconcile_journal(&mut self) -> Result<()> {
+        let journal: Value =
+            serde_json::from_slice(&vault::private_read(&self.home.join("auth.json"))?)?;
+        self.validate_owned_auth(&journal)?;
+        if journal == self.vault.auth {
+            return Ok(());
+        }
+        // A confirmed unchanged rejection permits a replacement grant. The journal
+        // is written before its vault, so a crash here must retain that replacement.
+        if !self.vault.verified && self.vault.import_rejected {
+            return Ok(());
+        }
+        let saved = vault::token(&self.vault.auth)?;
+        let retained = vault::token(&journal)?;
+        let order = api::token_issued_at(saved)
+            .zip(api::token_issued_at(retained))
+            .or_else(|| api::token_expiry(saved).zip(api::token_expiry(retained)));
+        match order {
+            Some((old, new)) if new > old => {}
+            Some((old, new)) if new < old => store::atomic_write(
+                &self.home.join("auth.json"),
+                &serde_json::to_vec(&self.vault.auth)?,
+            )?,
+            _ => {
+                bail!("cannot order retained and encrypted credentials; reconcile before recovery")
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn snapshot(&mut self) -> Result<TokenResponse> {
+        if self.rpc.is_none() {
+            self.reconcile_journal()?;
+        }
+        let auth: Value = serde_json::from_slice(&vault::private_read(
+            &self.home.as_path().join("auth.json"),
+        )?)?;
+        self.validate_owned_auth(&auth)?;
+        if self.rpc.as_ref().is_some_and(Rpc::verified_login) {
+            self.vault.verified = true;
+            self.vault.import_rejected = false;
+        } else if !self.vault.verified {
+            if let Some(rpc) = self.rpc.as_ref() {
+                self.vault.import_rejected =
+                    rpc.rejected_login() && self.verification_input.as_ref() == Some(&auth);
+            } else if self.vault.auth != auth {
+                self.vault.import_rejected = false;
+            }
         }
         self.vault.auth = auth;
         vault::save(&self.state, &self.key, &self.vault)?;
         let access_token = vault::token(&self.vault.auth)?.to_owned();
         Ok(TokenResponse {
+            user_id: None,
             chatgpt_account_id: vault::account(&self.vault.auth)?,
             chatgpt_plan_type: api::token_identity(&access_token).and_then(|i| i.plan),
-            revision: vault::digest(access_token.as_bytes()),
+            revision: vault::digest(&serde_json::to_vec(&self.vault.auth)?),
             access_token,
             billing_class: None,
         })
     }
 
-    async fn tokens(&mut self, request: TokenRequest) -> Result<TokenResponse, TokenFailure> {
+    pub(super) async fn tokens(
+        &mut self,
+        request: TokenRequest,
+    ) -> Result<TokenResponse, TokenFailure> {
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
                 "credential owner unavailable; restart after diagnosis"
@@ -127,7 +186,7 @@ impl Owner {
         }
         // Serialize all calls, and persist any rotated credentials even when RPC fails.
         let force = request.previous_revision.is_some();
-        self.home.disable_cleanup(true);
+
         let result = if self.refresh_enabled {
             self.rpc
                 .as_mut()
@@ -141,10 +200,16 @@ impl Owner {
         if result.is_err() {
             self.available = false;
         }
+        if force
+            && !self.vault.verified
+            && let Some(rpc) = self.rpc.as_mut()
+            && !rpc.verified_login()
+        {
+            rpc.inspect_rejection().await;
+        }
         let snapshot = self.snapshot();
         if snapshot.is_err() {
             self.available = false;
-            self.home.disable_cleanup(true);
         }
         result?;
         self.with_billing(snapshot?, request.billing).await
@@ -163,7 +228,7 @@ impl Owner {
             return Ok(token);
         };
         // Rate-limit reads can refresh the owner's login too. Persist on every result.
-        self.home.disable_cleanup(true);
+
         let result = rpc.call("account/rateLimits/read", json!({})).await;
         let snapshot = self.snapshot();
         if result.is_err() || snapshot.is_err() {
@@ -171,6 +236,7 @@ impl Owner {
         }
         let limits = result?;
         token = snapshot?;
+        self.limits = Some(limits.clone());
         token.billing_class = Some(billing_class(&limits));
         token.chatgpt_plan_type = limits
             .pointer("/rateLimits/planType")
@@ -180,7 +246,7 @@ impl Owner {
     }
 }
 
-fn billing_class(response: &Value) -> api::BillingClass {
+pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
     let limits = &response["rateLimits"];
     let window = |name: &str| {
         let window = &limits[name];
@@ -189,11 +255,31 @@ fn billing_class(response: &Value) -> api::BillingClass {
         })
     };
     let credits = limits.get("credits").filter(|c| !c.is_null()).map(|c| {
-        json!({"has_credits": c.get("hasCredits"), "unlimited": c.get("unlimited"), "balance": c.get("balance")})
+        json!({"has_credits": c.get("hasCredits"), "unlimited": c.get("unlimited"), "overage_limit_reached": c.get("overageLimitReached").and_then(Value::as_bool).unwrap_or(false), "balance": c.get("balance")})
     });
-    let usage = json!({"plan_type":limits.get("planType"), "rate_limit":{"primary":window("primary"), "secondary":window("secondary")}, "credits":credits});
-    serde_json::from_value::<api::RateLimitResponse>(usage)
-        .map_or(api::BillingClass::Unknown, |usage| usage.billing_class())
+    let spend = limits
+        .get("spendControl")
+        .or_else(|| limits.get("spend_control"))
+        .map(|s| json!({"reached":s.get("reached")}));
+    let usage = json!({"spend_control":spend,"plan_type":limits.get("planType"), "rate_limit":{"primary":window("primary"), "secondary":window("secondary")}, "credits":credits});
+    Ok(serde_json::from_value::<api::RateLimitResponse>(usage)?)
+}
+
+pub(super) fn billing_class(response: &Value) -> api::BillingClass {
+    usage(response).map_or(api::BillingClass::Unknown, |u| {
+        let class = u.billing_class();
+        if class == api::BillingClass::RateLimited
+            && matches!(
+                u.plan_type.as_deref(),
+                Some("team" | "business" | "enterprise" | "edu")
+            )
+            && !u.spend_control.as_ref().is_some_and(|s| s.reached)
+        {
+            api::BillingClass::Unknown
+        } else {
+            class
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -302,22 +388,24 @@ pub async fn serve(
     }) {
         bail!("unfinished owner runtime exists; recover its refreshed auth before restarting");
     }
-    let mut home = tempfile::Builder::new()
+    let mut runtime = tempfile::Builder::new()
         .prefix("owner-runtime-")
         .tempdir_in(state)?;
-    store::ensure_private_dir(home.path())?;
+    let home = runtime.path().to_path_buf();
+    store::ensure_private_dir(home.as_path())?;
     store::atomic_write(
-        &home.path().join("auth.json"),
+        &home.as_path().join("auth.json"),
         &serde_json::to_vec(&vault.auth)?,
     )?;
     let rpc = if read_only {
         None
     } else {
-        let mut rpc = Rpc::spawn(binary, home.path(), true)?;
-        home.disable_cleanup(true);
+        let mut rpc = Rpc::spawn(binary, home.as_path(), true)?;
+        runtime.disable_cleanup(true);
         rpc.initialize().await?;
         Some(rpc)
     };
+    runtime.disable_cleanup(true);
     let broker = Broker {
         state: state.into(),
         tenant: vault.tenant.clone(),
@@ -330,6 +418,8 @@ pub async fn serve(
             key: key.into(),
             available: true,
             refresh_enabled: !read_only,
+            limits: None,
+            verification_input: None,
         })),
         failures: Arc::new(StdMutex::new(BTreeMap::new())),
     };
@@ -360,6 +450,39 @@ pub async fn serve(
     if !owner.available {
         bail!("owner unavailable; runtime retained for credential recovery");
     }
-    std::fs::remove_dir_all(owner.home.path()).context("could not remove private owner runtime")?;
+    std::fs::remove_dir_all(owner.home.as_path())
+        .context("could not remove private owner runtime")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod token_compatibility_tests {
+    use super::*;
+    #[test]
+    fn when_the_client_has_no_managed_alias_then_it_preserves_the_legacy_request() {
+        let request = TokenRequest::default();
+        let encoded = serde_json::to_value(request).unwrap();
+        assert!(encoded.get("alias").is_none());
+    }
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::*;
+    #[test]
+    fn organizational_limits_need_a_closed_spend_cap_to_prove_included_usage() {
+        for plan in ["team", "business", "enterprise", "edu"] {
+            let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":false,"unlimited":false}}});
+            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            limits["rateLimits"]["spendControl"] = json!({"reached":false});
+            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            limits["rateLimits"]["spendControl"] = json!({"reached":true});
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
+        }
+    }
+    #[test]
+    fn overage_evidence_prevents_automatic_selection() {
+        let limits = json!({"rateLimits":{"planType":"pro","primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":false,"unlimited":false,"overageLimitReached":true}}});
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
 }

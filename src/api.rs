@@ -590,6 +590,7 @@ pub async fn fetch_usage_async(
 }
 
 pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
+    crate::store::require_local_auth(path)?;
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let raw: CodexAuthJson = serde_json::from_str(&contents)

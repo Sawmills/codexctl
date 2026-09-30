@@ -12,6 +12,7 @@ auth_path = home / "auth.json"
 access = None
 waiting = False
 pending_turn = None
+definitive_rejection = False
 
 
 def send(value):
@@ -28,16 +29,28 @@ def rotate():
     old = auth["tokens"]["access_token"]
     payload = json.loads(base64.urlsafe_b64decode(old.split(".")[1] + "=="))
     mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
-    if mode == "disconnect":
+    if mode == "disconnect" or (mode == "hold" and payload.get("sub") == "alex-login"):
         pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("refresh-started").write_text("started")
-    if mode in ["slow", "disconnect"]:
+    if mode == "hold" and payload.get("sub") == "alex-login":
+        release = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release")
+        deadline = time.monotonic() + 10
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+    if mode in ["slow", "disconnect", "late-error"]:
         time.sleep(0.2)
+    if mode == "gain-uid":
+        payload["https://api.openai.com/auth"]["chatgpt_user_id"] = "learned-uid"
     if mode == "identity":
         payload["sub"] = "different-login"
     payload["generation"] = payload.get("generation", 0) + 1
+    payload["iat"] = 2000000000 + payload["generation"]
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
-    auth["tokens"]["access_token"] = "eyJhbGciOiJub25lIn0." + body + "."
+    if mode != "refresh-only":
+        auth["tokens"]["access_token"] = "eyJhbGciOiJub25lIn0." + body + "."
     auth["tokens"]["refresh_token"] = "synthetic-rotated-refresh"
+    if mode == "refresh-only":
+        counter = pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"])
+        auth["tokens"]["refresh_token"] = "synthetic-only-refresh-" + str(int(counter.read_text()) + 1)
     auth_path.write_text(json.dumps(auth))
     auth_path.chmod(0o600)
     counter = pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"])
@@ -52,6 +65,8 @@ for line in sys.stdin:
     params = message.get("params", {})
     result = {}
     if method == "initialize":
+        if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
+            pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
         if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "startup":
             rotate()
         result = {"userAgent": "synthetic-codex"}
@@ -60,11 +75,24 @@ for line in sys.stdin:
             for _ in range(1500):
                 send({"method": "account/rateLimits/updated", "params": {}})
         if params.get("refreshToken"):
-            if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "error":
+            mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+            partial_failure = mode == "partial-migration" and json.loads(auth_path.read_text())["tokens"].get("account_id") == "bad-seat"
+            invalid_grant = json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh"
+            if mode == "rejected-success" and invalid_grant:
+                definitive_rejection = True
+                send({"id":message["id"],"result":{"account":None,"requiresOpenaiAuth":True}})
+                continue
+            if mode in ["error", "routing-error", "non-exportable"] or partial_failure or invalid_grant:
+                definitive_rejection = mode != "routing-error"
                 send({"id": message["id"], "error": {"code": -32000, "message": "synthetic upstream rejection"}})
                 continue
+            if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "late-error":
+                print("{invalid", flush=True)
             rotate()
         result = {"account": {"type": "chatgpt"}}
+    elif method == "getAuthStatus":
+        current = json.loads(auth_path.read_text())["tokens"]["access_token"]
+        result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection or pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() in ["non-exportable", "baseline-null"] else current, "requiresOpenaiAuth":True}
     elif method == "account/rateLimits/read":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         if mode == "billing-error":

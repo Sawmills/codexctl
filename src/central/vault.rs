@@ -19,6 +19,12 @@ pub struct Vault {
     pub tenant: String,
     pub user: String,
     pub auth: Value,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub import_rejected: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -65,7 +71,32 @@ pub fn create_secret(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn lock(state: &Path, name: &str) -> Result<File> {
+pub struct Lock(File);
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // A fork can inherit the open description. Release explicitly before closing.
+        let _ = self.0.unlock();
+    }
+}
+
+pub fn registry_lock(state: &Path, name: &str) -> Result<Lock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match lock(state, name) {
+            Ok(guard) => return Ok(guard),
+            Err(e)
+                if e.downcast_ref::<std::fs::TryLockError>()
+                    .is_some_and(|e| matches!(e, std::fs::TryLockError::WouldBlock))
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+pub fn lock(state: &Path, name: &str) -> Result<Lock> {
     store::ensure_private_dir(state)?;
     let path = state.join(name);
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -80,7 +111,7 @@ pub fn lock(state: &Path, name: &str) -> Result<File> {
     }
     let file = options.open(path)?;
     file.try_lock().context("another process owns this state")?;
-    Ok(file)
+    Ok(Lock(file))
 }
 
 fn cipher(key: &Path) -> Result<Aes256Gcm> {
@@ -178,6 +209,9 @@ mod tests {
                 alias: "personal".into(),
                 tenant: "personal".into(),
                 user: "amir".into(),
+                label: None,
+                verified: true,
+                import_rejected: false,
                 auth: json!({"refresh_token":"synthetic-rotated-refresh"}),
             },
         )
@@ -207,5 +241,23 @@ mod tests {
         let result = load(root.path(), &key);
 
         assert!(result.is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    #[test]
+    fn a_duplicate_descriptor_does_not_keep_a_released_lock_owned() {
+        let root = tempfile::tempdir().unwrap();
+        let guard = lock(root.path(), "owner.lock").unwrap();
+        let fd = unsafe { libc::dup(guard.0.as_raw_fd()) };
+        assert!(fd >= 0);
+        let inherited = unsafe { File::from_raw_fd(fd) };
+        assert!(lock(root.path(), "owner.lock").is_err());
+        drop(guard);
+        let _next = lock(root.path(), "owner.lock").unwrap();
+        drop(inherited);
     }
 }

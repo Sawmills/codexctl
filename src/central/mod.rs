@@ -1,8 +1,13 @@
 //! Experimental single-account credential broker and local App Server client.
 mod client;
+pub mod enrollment;
+pub mod managed;
 pub mod native;
+mod process;
+pub mod remote;
 mod rpc;
 mod server;
+mod transport;
 mod vault;
 
 pub use client::run_client;
@@ -41,6 +46,9 @@ pub fn init(
             tenant: tenant.into(),
             user: user.into(),
             auth,
+            label: None,
+            verified: true,
+            import_rejected: false,
         },
     )?;
     vault::save_devices(state, &[])?;
@@ -51,7 +59,7 @@ pub fn register(state: &Path, id: &str, tenant: &str, user: &str, token_file: &P
     store::validate_alias(id)?;
     store::validate_alias(tenant)?;
     store::validate_alias(user)?;
-    let _lock = vault::lock(state, "devices.lock")?;
+    let _lock = vault::registry_lock(state, "devices.lock")?;
     let mut devices = vault::devices(state)?;
     if devices.iter().any(|d| d.id == id) {
         bail!("device already registered");
@@ -71,7 +79,7 @@ pub fn register(state: &Path, id: &str, tenant: &str, user: &str, token_file: &P
 }
 
 pub fn revoke(state: &Path, id: &str) -> Result<()> {
-    let _lock = vault::lock(state, "devices.lock")?;
+    let _lock = vault::registry_lock(state, "devices.lock")?;
     let mut devices = vault::devices(state)?;
     let device = devices
         .iter_mut()

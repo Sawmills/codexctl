@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: codexctl
+  name: codexctl
+  annotations:
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /ready
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=240
+spec:
+  ingressClassName: alb
+  rules:
+    - host: codexctl.ue1.staging.plat.sm-svc.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: codexctl
+                port:
+                  number: 80

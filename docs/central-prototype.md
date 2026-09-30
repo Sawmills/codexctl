@@ -1,3 +1,5 @@
+For company SSO, multi-user accounts, migration, and Kubernetes setup, use [the central server guide](central-server.md). This document describes the earlier single-account prototype. Central support is now enabled by default.
+
 # Central Account Prototype
 
 This prototype lets two registered clients run Codex locally with one server-owned account.

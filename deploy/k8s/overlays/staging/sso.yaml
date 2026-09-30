@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  namespace: codexctl
+  name: codexctl-sso
+data:
+  sso.json: |
+    {
+      "issuer": "https://argocd.ue1.staging.plat.sm-svc.com/api/dex",
+      "client_id": "codexctl",
+      "client_secret_file": "/keys/oidc-client-secret",
+      "allowed_domains": ["sawmills.ai"]
+    }

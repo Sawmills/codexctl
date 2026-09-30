@@ -3,7 +3,7 @@ use codexctl::central;
 use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Parser)]
-#[command(about = "Experimental server-owned Codex credentials (one account, loopback only)")]
+#[command(about = "Server-owned Codex credentials with company SSO and user isolation")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -11,6 +11,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize an empty multi-user server. No account credentials are required.
+    Setup {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// List users, or enable or disable an SSO user. Requires server filesystem access.
+    Users {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        user: Option<String>,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
     /// Restore the Codex provider that was selected before remote use.
     Disconnect,
     /// Register a remote account alias for ordinary codexctl use.
@@ -57,7 +75,7 @@ enum Commands {
         #[arg(long)]
         device: String,
     },
-    /// Serve access tokens. Remote devices connect through an SSH tunnel.
+    /// Serve the account API behind a private HTTPS ingress.
     Serve {
         #[arg(long)]
         state: PathBuf,
@@ -69,6 +87,15 @@ enum Commands {
         codex_bin: PathBuf,
         #[arg(long)]
         read_only: bool,
+        /// HTTPS origin served by the private ingress. Required for managed mode.
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Company OIDC configuration. Required for a network listener.
+        #[arg(long)]
+        sso_config: Option<PathBuf>,
+        /// A separate private bearer credential for monitoring only.
+        #[arg(long)]
+        metrics_token_file: Option<PathBuf>,
     },
     /// Run one prompt through a local App Server with centrally supplied authentication.
     Run {
@@ -114,6 +141,31 @@ async fn main() {
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
+        Commands::Users {
+            state,
+            user,
+            enable,
+            disable,
+        } => {
+            if enable || disable {
+                central::managed::set_user(
+                    &state,
+                    user.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("--user required"))?,
+                    enable,
+                )?;
+            } else {
+                for user in central::managed::users(&state)? {
+                    println!(
+                        "{} {} {}",
+                        user.id,
+                        user.email,
+                        if user.enabled { "enabled" } else { "disabled" }
+                    );
+                }
+            }
+        }
         Commands::Disconnect => central::native::deactivate()?,
         Commands::Connect { .. } => unreachable!("handled before async dispatch"),
         Commands::Init {
@@ -138,7 +190,31 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             listen,
             codex_bin,
             read_only,
-        } => central::serve(&state, &key_file, listen, &codex_bin, read_only).await?,
+            public_url,
+            sso_config,
+            metrics_token_file,
+        } => {
+            if state.join("users.json").exists() {
+                central::managed::serve(
+                    &state,
+                    &key_file,
+                    listen,
+                    &codex_bin,
+                    read_only,
+                    public_url
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("managed server requires --public-url"))?,
+                    sso_config.as_deref(),
+                    metrics_token_file.as_deref(),
+                )
+                .await?;
+            } else {
+                if public_url.is_some() || sso_config.is_some() || metrics_token_file.is_some() {
+                    anyhow::bail!("run setup before managed server use");
+                }
+                central::serve(&state, &key_file, listen, &codex_bin, read_only).await?;
+            }
+        }
         Commands::Run {
             server,
             token_file,

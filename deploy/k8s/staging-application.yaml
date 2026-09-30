@@ -1,0 +1,18 @@
+# Review before registering this application. It does not sync automatically.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: codexctl
+  namespace: argocd
+spec:
+  project: sawmills
+  source:
+    repoURL: https://github.com/Sawmills/codexctl.git
+    targetRevision: main
+    path: deploy/k8s/overlays/staging
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: codexctl
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true

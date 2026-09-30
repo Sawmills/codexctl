@@ -32,6 +32,10 @@ pub struct Rpc {
     output: BufReader<ChildStdout>,
     next_id: u64,
     healthy: bool,
+    outstanding: Option<(u64, bool)>,
+    verified_login: bool,
+    rejected_login: bool,
+    exportable_login: bool,
     pending: VecDeque<Value>,
 }
 
@@ -43,6 +47,16 @@ impl Rpc {
     }
 
     pub fn spawn(binary: &Path, home: &Path, isolate_signals: bool) -> Result<Self> {
+        let home = if isolate_signals {
+            std::fs::canonicalize(home).context("could not resolve credential owner home")?
+        } else {
+            home.to_owned()
+        };
+        let binary = if isolate_signals {
+            super::process::owner_binary(binary)?
+        } else {
+            binary.to_path_buf()
+        };
         let mut command = Command::new(binary);
         command
             .args([
@@ -53,7 +67,7 @@ impl Rpc {
                 "-c",
                 "features.daemon_auto_start=false",
             ])
-            .env("CODEX_HOME", home)
+            .env("CODEX_HOME", &home)
             .env_remove("CODEX_ACCESS_TOKEN")
             .env_remove("OPENAI_API_KEY")
             .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -61,21 +75,57 @@ impl Rpc {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if isolate_signals {
+            command.current_dir(&home).args([
+                "-c",
+                "model_provider=\"openai\"",
+                "-c",
+                "forced_login_method=\"chatgpt\"",
+            ]);
+        }
         #[cfg(unix)]
         if isolate_signals {
             command.process_group(0);
         }
+        #[cfg(target_os = "linux")]
+        if isolate_signals {
+            let parent = unsafe { libc::getpid() };
+            // A killed broker cannot leave a process rotating credentials behind it.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        return Err(std::io::Error::other("credential owner parent exited"));
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = command
             .spawn()
             .context("could not start Codex app-server")?;
-        let input = child.stdin.take().context("missing app-server stdin")?;
-        let output = BufReader::new(child.stdout.take().context("missing app-server stdout")?);
+        let input = child
+            .stdin
+            .take()
+            .expect("configured piped app-server stdin");
+        let output = BufReader::new(
+            child
+                .stdout
+                .take()
+                .expect("configured piped app-server stdout"),
+        );
         Ok(Self {
             _child: child,
             input: Some(input),
             output,
             next_id: 0,
             healthy: true,
+            outstanding: None,
+            verified_login: false,
+            rejected_login: false,
+            exportable_login: false,
             pending: VecDeque::new(),
         })
     }
@@ -86,7 +136,91 @@ impl Rpc {
         Ok(())
     }
 
+    pub fn pid(&self) -> Result<u32> {
+        self._child.id().context("credential owner already exited")
+    }
+
+    pub fn verified_login(&self) -> bool {
+        self.verified_login
+    }
+
+    pub fn rejected_login(&self) -> bool {
+        self.rejected_login
+    }
+    fn observe_login(&mut self, verifies: bool, response: &Value) {
+        if !verifies {
+            return;
+        }
+        if response.get("error").is_none()
+            && response
+                .pointer("/result/account/type")
+                .and_then(Value::as_str)
+                == Some("chatgpt")
+        {
+            self.verified_login = true;
+        }
+    }
+
+    pub(super) async fn remember_exportable_login(&mut self, token: &str) -> Result<()> {
+        let status = self
+            .call_handled(
+                "getAuthStatus",
+                json!({"includeToken":true,"refreshToken":false}),
+                &mut RejectRequests,
+                Duration::from_secs(10),
+            )
+            .await?;
+        self.exportable_login = status.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
+            && status.get("authToken").and_then(Value::as_str) == Some(token)
+            && status.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true);
+        if !self.exportable_login {
+            bail!("native owner did not load the supplied cached ChatGPT login");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn inspect_rejection(&mut self) {
+        // A completed RPC error can mean configuration or routing failure. Never
+        // infer rejection from its code or message. An unfinished call stays fenced.
+        if !self.exportable_login || self.outstanding.is_some() {
+            return;
+        }
+        self.healthy = true;
+        let status = self
+            .call_handled(
+                "getAuthStatus",
+                json!({"includeToken":true,"refreshToken":false}),
+                &mut RejectRequests,
+                Duration::from_secs(10),
+            )
+            .await;
+        // Require an exportable cached ChatGPT token before the force attempt.
+        // Its later suppression is pinned Codex's permanent-failure evidence.
+        self.rejected_login = status.is_ok_and(|s| {
+            s.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
+                && s.get("authToken") == Some(&Value::Null)
+                && s.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true)
+        });
+        self.healthy = false;
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
+        // Do not close stdin while a timed-out request can still rotate credentials.
+        if let Some((id, verifies)) = self.outstanding {
+            timeout(Duration::from_secs(180), async {
+                loop {
+                    let response = self.read_wire().await?;
+                    if response.get("id") == Some(&json!(id)) && response.get("method").is_none() {
+                        self.outstanding = None;
+                        self.observe_login(verifies, &response);
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    if response.get("id").is_some() && response.get("method").is_some() {
+                        self.send(json!({"id":response["id"],"error":{"code":-32601,"message":"server stopping"}})).await?;
+                    }
+                }
+            }).await.context("owner request did not settle; runtime retained")??;
+        }
         drop(self.input.take());
         let status = timeout(Duration::from_secs(30), self._child.wait())
             .await
@@ -145,12 +279,19 @@ impl Rpc {
         }
         self.next_id += 1;
         let id = self.next_id;
+        let verifies = method == "account/read" && params.get("refreshToken") == Some(&json!(true));
+        if verifies {
+            self.rejected_login = false;
+        }
+        self.outstanding = Some((id, verifies));
         let operation = async {
             self.send(json!({"id":id,"method":method,"params":params}))
                 .await?;
             loop {
                 let response = self.read_wire().await?;
                 if response.get("id") == Some(&json!(id)) && response.get("method").is_none() {
+                    self.outstanding = None;
+                    self.observe_login(verifies, &response);
                     if response.get("error").is_some() {
                         bail!("app-server rejected {method}");
                     }
@@ -233,6 +374,11 @@ mod tests {
 
         assert!(result.is_err());
         assert!(rpc._child.try_wait().unwrap().is_none());
+        rpc.shutdown().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("count")).unwrap(),
+            "1"
+        );
     }
     #[tokio::test]
     async fn when_a_client_child_starts_then_it_stays_in_the_terminal_process_group() {
