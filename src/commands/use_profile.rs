@@ -866,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_never_picks_unknown_or_mixed_billing_accounts() {
+    fn selection_accepts_subscription_credits_but_not_unknown_plans() {
         let mut unknown = team_response(5.0, 10.0, true);
         unknown.plan_type = Some("new_plan".to_string());
         assert_eq!(selection_score(&unknown), f64::MAX);
@@ -879,8 +879,35 @@ mod tests {
             overage_limit_reached: false,
             balance: None,
         });
-        assert_eq!(selection_score(&mixed), f64::MAX);
-        assert_eq!(recovery_class(&mixed), None);
+        assert!(selection_score(&mixed) < RATE_LIMIT_EXHAUSTED);
+        assert!(recovery_class(&mixed).is_some());
+    }
+
+    #[test]
+    fn pro_max_credits_preserve_billing_risk_and_exhaustion() {
+        let mut usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{"plan_type":"promax","rate_limit":{"primary_window":{"used_percent":29,"limit_window_seconds":604800}},"credits":{"has_credits":true},"spend_control":{"reached":false}}"#,
+        ).unwrap();
+        let class = recovery_class(&usage).unwrap();
+        assert!(class.bills_credits);
+        assert!(!class.needs_reset);
+        assert!(selection_score(&usage) < RATE_LIMIT_EXHAUSTED);
+        usage
+            .rate_limit
+            .as_mut()
+            .unwrap()
+            .primary_window
+            .as_mut()
+            .unwrap()
+            .used_percent = 100.0;
+        assert!(recovery_class(&usage).is_none());
+        usage.rate_limit_reset_credits = Some(api::ResetCreditsSummary {
+            available_count: 1,
+            applicable_available_count: 1,
+        });
+        let class = recovery_class(&usage).unwrap();
+        assert!(class.bills_credits);
+        assert!(class.needs_reset);
     }
 
     #[test]
