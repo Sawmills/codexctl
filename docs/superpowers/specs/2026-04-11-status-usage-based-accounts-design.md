@@ -62,7 +62,7 @@ subscription allowlist, and it has no conflicting positive credit evidence.
 
 New plan names, mixed rate-limit and positive-credit responses, and successful responses with
 neither rate-limit windows nor positive credit evidence are `Unknown`.
-Unknown accounts can appear as status errors, but automatic selection and recovery must not use
+Unknown accounts show returned usage with `Billing` set to `unknown`, but automatic selection and recovery must not use
 them. This keeps unfamiliar subscription metadata out of any path that can spend credits.
 
 Error accounts (bad auth, expired tokens) appear in whichever table matches their last known plan type from `meta.json`. If no plan is known, they appear in the rate-limited table (legacy default).

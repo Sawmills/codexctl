@@ -96,6 +96,11 @@ only re-login a seat once its token genuinely shows `expired`.
 Usage-based accounts are shown in a separate table with balance, seat limit, credits, and spend
 control status.
 
+When billing classification is unknown, status still shows the returned usage windows, resets,
+and token expiry. A `Billing` column marks those accounts as `unknown`. Credits alongside included
+usage or an unrecognized plan can cause this classification. Automatic selection still excludes
+these accounts.
+
 ### Switch accounts
 
 Direct:
