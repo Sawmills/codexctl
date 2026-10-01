@@ -1,0 +1,3 @@
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "openidconnect uses RSA public-key verification only; the private-key timing path is unreachable. Reassess if signing/decryption is added. See docs/research/central-staging.md."

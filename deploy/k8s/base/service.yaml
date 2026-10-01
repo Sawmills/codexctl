@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: codexctl
+  name: codexctl
+  labels:
+    app.kubernetes.io/name: codexctl
+spec:
+  selector:
+    app.kubernetes.io/name: codexctl
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

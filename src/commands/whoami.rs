@@ -5,6 +5,10 @@ use crate::config;
 use crate::profile;
 
 pub fn run() -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    if codexctl::central::remote::whoami()? {
+        return Ok(());
+    }
     let active = profile::get_active()?;
     match active {
         Some(alias) => {

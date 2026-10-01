@@ -480,3 +480,15 @@ Supports both Codex CLI auth formats:
 ## License
 
 Apache-2.0
+
+## Experimental Central Account Server
+
+The optional `central-prototype` feature builds `codexctl-central` for server-owned
+credentials and registered local clients. See the [prototype guide](docs/central-prototype.md)
+for setup, SSH tunnels, tests, and the remaining compatibility limits.
+
+## Server-managed accounts
+
+Connect your machines with company SSO and keep OpenAI refresh credentials on a private server.
+Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and regular `codex`.
+See [server setup, migration, and staging deployment](docs/central-server.md).

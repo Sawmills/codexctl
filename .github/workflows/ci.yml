@@ -35,6 +35,13 @@ jobs:
       - name: Test
         run: cargo test --all-targets
 
+      - name: Central prototype
+        run: |
+          cargo clippy --all-targets --features central-prototype
+          cargo test --all-targets --features central-prototype
+          cargo test --all-targets --no-default-features
+          cargo build --bin codexctl-central --features central-prototype
+
       - name: Build
         run: cargo build --release
 

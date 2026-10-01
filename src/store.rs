@@ -271,14 +271,27 @@ fn set_private_file_permissions(_path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)
         .and_then(|dir| dir.sync_all())
         .with_context(|| format!("failed to sync {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Refuse credentials whose refresh ownership has moved to the account server.
+pub fn require_local_auth(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && parent
+            .join(".central-transfer.json")
+            .try_exists()
+            .context("cannot inspect credential transfer marker")?
+    {
+        bail!("credentials transferred to the server; use a server-enabled codexctl build");
+    }
     Ok(())
 }
 

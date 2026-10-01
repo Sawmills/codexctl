@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  namespace: codexctl
+  name: codexctl
+  labels:
+    release: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codexctl
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      bearerTokenSecret:
+        name: codexctl-secrets
+        key: metrics-token

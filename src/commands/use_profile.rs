@@ -23,6 +23,10 @@ pub fn run(
     allow_resets: bool,
     restart_daemon: bool,
 ) -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    if codexctl::central::native::activate(alias, _allow_billing)? {
+        return Ok(());
+    }
     run_to_auth_json(
         alias,
         &config::codex_auth_json()?,
@@ -47,22 +51,22 @@ pub fn run_to_auth_json_excluding(
     allow_resets: bool,
     restart: daemon_sync::Restart,
 ) -> Result<()> {
-    let selected = match alias::optional(alias)? {
-        // An explicit target is switched to as asked — never redeemed against,
-        // since `codexctl reset <alias>` is the way to spend a credit on a
-        // named account.
+    let explicit = alias::optional(alias)?;
+    let selected = match explicit {
         Some(a) => {
-            let email = profile::switch_to_auth_json(a, auth_json)?;
-            println!("switched to {} ({})", a, email);
-            a.to_string()
+            profile::get_profile(a)?;
+            a.to_owned()
         }
-        None => {
-            let best = find_most_available_excluding(excluded_alias, allow_resets)?;
-            let email = profile::switch_to_auth_json(&best, auth_json)?;
-            println!("auto-selected most available: {} ({})", best, email);
-            best
-        }
+        None => find_most_available_excluding(excluded_alias, allow_resets)?,
     };
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_selection()?;
+    let email = profile::switch_to_auth_json(&selected, auth_json)?;
+    if explicit.is_some() {
+        println!("switched to {} ({})", selected, email);
+    } else {
+        println!("auto-selected most available: {} ({})", selected, email);
+    }
     let unresumed = daemon_sync::after_switch(
         &selected,
         auth_json,

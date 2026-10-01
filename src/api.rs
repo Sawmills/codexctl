@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -115,7 +115,8 @@ fn is_known_rate_limited_plan(plan: &str) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BillingClass {
     RateLimited,
     UsageBased,
@@ -598,6 +599,7 @@ pub async fn fetch_usage_async(
 }
 
 pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
+    crate::store::require_local_auth(path)?;
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let raw: CodexAuthJson = serde_json::from_str(&contents)

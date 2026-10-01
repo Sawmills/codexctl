@@ -193,6 +193,7 @@ fn save_profile_unlocked(
     auth_json_src: &Path,
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
+    crate::store::require_local_auth(&store::profile_dir(paths, alias)?.join("auth.json"))?;
     store::ensure_private_dir(&paths.codexctl_dir())?;
     store::ensure_private_dir(&paths.profiles_dir())?;
     let dir = store::profile_dir(paths, alias)?;
@@ -823,6 +824,7 @@ pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
     let profile = get_profile_from(paths, alias)?;
+    crate::store::require_local_auth(&profile.auth_json_path())?;
 
     // Capture the outgoing live tokens before installing the next profile.
     // The exact-token or token-subject guard prevents a foreign live auth file
@@ -853,6 +855,7 @@ pub fn seed_exec_auth_from(paths: &Paths, alias: &str, exec_auth: &Path) -> Resu
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
     let profile = get_profile_from(paths, alias)?;
+    crate::store::require_local_auth(&profile.auth_json_path())?;
     capture_exec_auth_unlocked(paths, exec_auth, Some(alias));
     store::atomic_copy(&profile.auth_json_path(), exec_auth)
         .with_context(|| format!("failed to install auth.json at {}", exec_auth.display()))

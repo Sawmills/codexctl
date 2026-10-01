@@ -6,7 +6,38 @@ rust-version = "1.89"
 description = "Manage multiple OpenAI Codex CLI accounts"
 license = "Apache-2.0"
 
+[features]
+default = ["central-prototype"]
+central-prototype = [
+  "dep:openidconnect",
+  "dep:axum",
+  "dep:aes-gcm",
+  "dep:sha2",
+  "dep:tempfile",
+  "dep:toml_edit",
+  "tokio/process",
+  "tokio/io-util",
+  "tokio/net",
+  "tokio/sync",
+  "tokio/time",
+  "tokio/signal",
+]
+
+[[bin]]
+name = "codexctl-central"
+path = "src/bin/codexctl-central.rs"
+required-features = ["central-prototype"]
+
 [dependencies]
+openidconnect = { version = "4", optional = true, default-features = false, features = [
+  "reqwest",
+  "rustls-tls",
+] }
+axum = { version = "0.8", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+sha2 = { version = "0.10", optional = true }
+tempfile = { version = "3", optional = true }
+toml_edit = { version = "0.22", optional = true }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
