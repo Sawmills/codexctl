@@ -63,6 +63,13 @@ struct Failure {
     last: i64,
 }
 type Owners = BTreeMap<String, (String, Arc<Mutex<Owner>>)>;
+// Overlap retains a seat reservation even if UID evidence is missing or conflicts.
+// It is never permission to replace credentials.
+fn overlaps(left: &Value, right: &Value) -> bool {
+    vault::account(left).ok() == vault::account(right).ok()
+        && api::token_subject(vault::token(left).unwrap_or(""))
+            == api::token_subject(vault::token(right).unwrap_or(""))
+}
 #[derive(Clone)]
 pub(super) struct Broker {
     pub state: PathBuf,
@@ -253,6 +260,9 @@ impl Broker {
         match error {
             TokenFailure::AccountMismatch => self.error(StatusCode::CONFLICT, "account_mismatch"),
             TokenFailure::RefreshDisabled => self.error(StatusCode::CONFLICT, "refresh_disabled"),
+            TokenFailure::UnsupportedRouting => {
+                self.error(StatusCode::CONFLICT, "unsupported_workspace_routing")
+            }
             TokenFailure::Unavailable(_) => {
                 self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
@@ -317,23 +327,38 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
             if owner.vault.user != user {
                 return None;
             }
-            if owner.available
-                && owner
+            let mut summary_available = owner.available;
+            if owner.available {
+                match owner
                     .tokens(TokenRequest {
                         billing: true,
                         ..Default::default()
                     })
                     .await
-                    .is_err()
-            {
-                owner.available = false;
-                broker.record_failure(
-                    "catalog_owner_unavailable",
-                    "owner",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                {
+                    Ok(_) => {}
+                    Err(TokenFailure::UnsupportedRouting) => {
+                        summary_available = false;
+                        broker.record_failure(
+                            "unsupported_workspace_routing",
+                            "catalog",
+                            StatusCode::CONFLICT,
+                        );
+                    }
+                    Err(_) => {
+                        owner.available = false;
+                        summary_available = false;
+                        broker.record_failure(
+                            "catalog_owner_unavailable",
+                            "owner",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                    }
+                }
             }
-            Some(account_summary(&owner))
+            let mut summary = account_summary(&owner);
+            summary.available = summary_available;
+            Some(summary)
         })
     });
     let mut result = Vec::new();
@@ -391,21 +416,46 @@ impl Broker {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
         }
         let owners = self.owners.read().await.clone();
+        let mut quarantined = Vec::new();
         // Inventory journals before filtering by a vault identity. A failed refresh
         // can leave a different seat in the journal while its vault stays unchanged.
         for (_, owner) in owners.values() {
-            let owner = owner.lock().await;
-            let inventory = match owner.home.try_exists() {
-                Ok(false) => Ok(()),
-                Ok(true) => {
-                    retained_auth(&owner.home).and_then(|auth| owner.validate_owned_auth(&auth))
+            let mut owner = owner.lock().await;
+            let inventory = async {
+                if !owner.home.try_exists()? {
+                    return Ok(());
                 }
-                Err(error) => Err(error.into()),
-            };
+                let auth = retained_auth(&owner.home)?;
+                vault::validate_auth(&auth)?;
+                if owner.validate_owned_auth(&auth).is_ok() {
+                    return Ok(());
+                }
+                // Known conflicting identities are bounded reservations. Stop
+                // the candidate before trusting that inventory; a still-live or
+                // unreadable owner may hold any account and needs the broad fence.
+                owner.available = false;
+                if let Some(rpc) = owner.rpc.as_mut() {
+                    // A nonzero status is still a confirmed stopped owner.
+                    // Unknown request completion or process exit remains fenced.
+                    rpc.settle_and_stop().await?;
+                } else {
+                    previous_owner_exited(&owner.home)?;
+                }
+                owner.rpc = None;
+                let settled = retained_auth(&owner.home)?;
+                vault::validate_auth(&settled)?;
+                quarantined.push(owner.vault.auth.clone());
+                quarantined.push(settled);
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
             if inventory.is_err() {
                 self.ownership_unresolved.store(true, Ordering::Release);
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
             }
+        }
+        if quarantined.iter().any(|auth| overlaps(auth, &input.auth)) {
+            return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
         if let Some((_, owner)) = owners.get(&id) {
             let mut owner = owner.lock().await;
@@ -421,6 +471,15 @@ impl Broker {
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
             if owner.vault.verified && owner.available {
+                // A retained proof owns the grant, but cannot establish current
+                // routing or billing eligibility after a restart or policy change.
+                owner
+                    .tokens(TokenRequest {
+                        billing: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| self.owner_failure(e))?;
                 return Ok(account_summary(&owner));
             }
             if let Some(rpc) = owner.rpc.as_mut() {
@@ -766,14 +825,20 @@ async fn launch_owner(owner: &mut Owner, binary: &Path) -> Result<()> {
         .await?;
     owner.snapshot()?;
     if !owner.vault.verified {
-        let token = vault::token(&owner.vault.auth)?.to_owned();
-        owner
+        let status = owner
             .rpc
             .as_mut()
             .context("missing owner")?
-            .remember_exportable_login(&token)
-            .await?;
+            .remember_exportable_login()
+            .await;
+        // Even the cached-status call can refresh. Persist its journal and
+        // rejection evidence before returning any protocol or loading error.
         owner.snapshot()?;
+        let token = status?;
+        if token != vault::token(&owner.vault.auth)? {
+            bail!("native owner exported a login that differs from its journal");
+        }
+        owner.verification_input = Some(owner.vault.auth.clone());
     }
     Ok(())
 }
@@ -867,12 +932,14 @@ pub async fn serve(
             match retained_auth(&owner.home) {
                 Ok(auth) if owner.validate_owned_auth(&auth).is_ok() => {}
                 journal => {
-                    ownership_unresolved = true;
-                    replacements_blocked |= previous_owner_exited(&owner.home).is_err();
-                    if let Ok(auth) = journal
-                        && vault::validate_auth(&auth).is_ok()
-                    {
-                        conflicting_journals.push(auth);
+                    let stopped = previous_owner_exited(&owner.home).is_ok();
+                    replacements_blocked |= !stopped;
+                    match journal {
+                        Ok(auth) if vault::validate_auth(&auth).is_ok() && stopped => {
+                            conflicting_journals.push(owner.vault.auth.clone());
+                            conflicting_journals.push(auth);
+                        }
+                        _ => ownership_unresolved = true,
                     }
                 }
             }
@@ -890,9 +957,7 @@ pub async fn serve(
                 // This is an overlap fence, not permission to replace auth.
                 // Missing or contradictory UID evidence cannot free a seat
                 // whose workspace and subject already agree.
-                vault::account(&owner.vault.auth).ok() == vault::account(auth).ok()
-                    && api::token_subject(vault::token(&owner.vault.auth).unwrap_or(""))
-                        == api::token_subject(vault::token(auth).unwrap_or(""))
+                overlaps(&owner.vault.auth, auth)
             })
         {
             owner.available = false;

@@ -8,6 +8,16 @@ use tokio::{
     time::timeout,
 };
 
+#[derive(Debug)]
+pub(super) struct RoutingPolicyError;
+
+impl std::fmt::Display for RoutingPolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native workspace routing is unsupported")
+    }
+}
+impl std::error::Error for RoutingPolicyError {}
+
 pub(super) trait RequestHandler {
     fn keep_notifications(&self) -> bool {
         true
@@ -156,12 +166,16 @@ impl Rpc {
                 .pointer("/result/account/type")
                 .and_then(Value::as_str)
                 == Some("chatgpt")
+            && response
+                .get("result")
+                .and_then(super::server::supported_native_routing)
+                .is_some()
         {
             self.verified_login = true;
         }
     }
 
-    pub(super) async fn remember_exportable_login(&mut self, token: &str) -> Result<()> {
+    pub(super) async fn remember_exportable_login(&mut self) -> Result<String> {
         let status = self
             .call_handled(
                 "getAuthStatus",
@@ -170,13 +184,24 @@ impl Rpc {
                 Duration::from_secs(10),
             )
             .await?;
-        self.exportable_login = status.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
-            && status.get("authToken").and_then(Value::as_str) == Some(token)
+        let native_chatgpt = status.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
             && status.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true);
+        // Pinned file-backed ChatGPT auth suppresses export on permanent refresh
+        // failure, including a proactive refresh before our first status call.
+        // Empty/unreadable tokens and other auth kinds report a different method.
+        self.rejected_login = native_chatgpt && status.get("authToken") == Some(&Value::Null);
+        self.exportable_login = native_chatgpt
+            && status
+                .get("authToken")
+                .and_then(Value::as_str)
+                .is_some_and(|t| !t.is_empty());
         if !self.exportable_login {
             bail!("native owner did not load the supplied cached ChatGPT login");
         }
-        Ok(())
+        Ok(status["authToken"]
+            .as_str()
+            .context("missing exported login")?
+            .to_owned())
     }
 
     pub(super) async fn inspect_rejection(&mut self) {
@@ -185,6 +210,7 @@ impl Rpc {
         if !self.exportable_login || self.outstanding.is_some() {
             return;
         }
+        let healthy_before_inspection = self.healthy;
         self.healthy = true;
         let status = self
             .call_handled(
@@ -196,15 +222,22 @@ impl Rpc {
             .await;
         // Require an exportable cached ChatGPT token before the force attempt.
         // Its later suppression is pinned Codex's permanent-failure evidence.
-        self.rejected_login = status.is_ok_and(|s| {
+        self.rejected_login = status.as_ref().is_ok_and(|s| {
             s.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
                 && s.get("authToken") == Some(&Value::Null)
                 && s.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true)
         });
-        self.healthy = false;
+        self.healthy = healthy_before_inspection && status.is_ok() && !self.rejected_login;
     }
 
     pub async fn shutdown(&mut self) -> Result<()> {
+        if !self.settle_and_stop().await?.success() {
+            bail!("owner exited unsuccessfully; runtime retained");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn settle_and_stop(&mut self) -> Result<std::process::ExitStatus> {
         // Do not close stdin while a timed-out request can still rotate credentials.
         if let Some((id, verifies)) = self.outstanding {
             timeout(Duration::from_secs(180), async {
@@ -222,13 +255,10 @@ impl Rpc {
             }).await.context("owner request did not settle; runtime retained")??;
         }
         drop(self.input.take());
-        let status = timeout(Duration::from_secs(30), self._child.wait())
+        timeout(Duration::from_secs(30), self._child.wait())
             .await
-            .context("owner did not exit; runtime retained")??;
-        if !status.success() {
-            bail!("owner exited unsuccessfully; runtime retained");
-        }
-        Ok(())
+            .context("owner did not exit; runtime retained")?
+            .context("could not confirm owner exit; runtime retained")
     }
 
     pub async fn send(&mut self, value: Value) -> Result<()> {
@@ -293,6 +323,21 @@ impl Rpc {
                     self.outstanding = None;
                     self.observe_login(verifies, &response);
                     if response.get("error").is_some() {
+                        // Only these completed, pinned policy errors are safe
+                        // refusals. Never log or retain native protocol payloads.
+                        if method == "account/read"
+                            && response.pointer("/error/code").and_then(Value::as_i64)
+                                == Some(-32603)
+                            && matches!(
+                                response.pointer("/error/message").and_then(Value::as_str),
+                                Some(
+                                    "workspace routing discovery missing backend origin"
+                                        | "workspace routing discovery has invalid account routing override"
+                                )
+                            )
+                        {
+                            return Err(RoutingPolicyError.into());
+                        }
                         bail!("app-server rejected {method}");
                     }
                     return response
@@ -319,7 +364,10 @@ impl Rpc {
         };
         match timeout(deadline, operation).await {
             Ok(result) => {
-                if result.is_err() {
+                if result
+                    .as_ref()
+                    .is_err_and(|error| !error.is::<RoutingPolicyError>())
+                {
                     self.healthy = false;
                 }
                 result

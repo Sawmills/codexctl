@@ -206,13 +206,24 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
         })
         .send()
         .context("central token request failed")?;
-    if !response.status().is_success() {
-        bail!(
-            "central token request rejected (HTTP {})",
-            response.status()
-        );
+    let status = response.status();
+    if !status.is_success() {
+        if status == reqwest::StatusCode::CONFLICT
+            && response
+                .json::<serde_json::Value>()
+                .ok()
+                .is_some_and(|v| v["error"] == "unsupported_workspace_routing")
+        {
+            bail!(
+                "this account requires workspace routing that the central native provider does not yet support"
+            );
+        }
+        bail!("central token request rejected (HTTP {})", status);
     }
     let token: TokenResponse = response.json().context("invalid central token response")?;
+    if !token.native_routing_supported {
+        bail!("server has not verified supported workspace routing for the native provider");
+    }
     if connection.user_id.is_some() && token.user_id != connection.user_id {
         bail!("server user identity changed");
     }

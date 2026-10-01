@@ -619,6 +619,12 @@ fn retire_local_holders(paths: &config::Paths, p: &profile::Profile, auth: &Valu
                 vault::create_secret(&backup, &contents)?;
                 store::sync_directory(&p.dir)?;
             }
+            if path == paths.codex_auth_json() && paths.active_file().try_exists()? {
+                // Clear the marker first: interruption may leave credentials
+                // with no marker, but must not leave a marker without credentials.
+                std::fs::remove_file(paths.active_file())?;
+                store::sync_directory(&paths.codexctl_dir())?;
+            }
             std::fs::remove_file(&path)?;
             store::sync_directory(path.parent().context("credential file has no parent")?)?;
         }
@@ -741,6 +747,43 @@ mod tests {
         assert!(result.is_err());
         assert!(paths.codex_auth_json().exists());
         assert!(!profile.dir.join(".central-transfer.json").exists());
+    }
+
+    #[test]
+    fn retiring_live_credentials_clears_the_active_marker() {
+        let (_root, paths, profile) = profiles_with_refresh_only_rotation();
+        profile::set_active_from(&paths, "personal").unwrap();
+        let auth: Value =
+            serde_json::from_slice(&std::fs::read(paths.codex_auth_json()).unwrap()).unwrap();
+        assert_eq!(
+            profile::get_active_from(&paths).unwrap().as_deref(),
+            Some("personal")
+        );
+
+        retire_local_holders(&paths, &profile, &auth).unwrap();
+
+        assert!(!paths.codex_auth_json().exists());
+        assert_eq!(profile::get_active_from(&paths).unwrap(), None);
+    }
+
+    #[test]
+    fn retiring_another_seat_preserves_live_credentials_and_the_active_marker() {
+        let (_root, paths, profile) = profiles_with_refresh_only_rotation();
+        profile::set_active_from(&paths, "personal").unwrap();
+        let mut auth: Value =
+            serde_json::from_slice(&std::fs::read(profile.auth_json_path()).unwrap()).unwrap();
+        let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&serde_json::json!({"sub":"another-login","exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"another-seat"}})).unwrap());
+        auth["tokens"]["access_token"] = serde_json::json!(format!("header.{claims}."));
+        auth["tokens"]["account_id"] = serde_json::json!("another-seat");
+        let original = std::fs::read(paths.codex_auth_json()).unwrap();
+
+        retire_local_holders(&paths, &profile, &auth).unwrap();
+
+        assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), original);
+        assert_eq!(
+            profile::get_active_from(&paths).unwrap().as_deref(),
+            Some("personal")
+        );
     }
     #[test]
     fn interrupted_login_sessions_are_selected_and_retired_during_migration() {

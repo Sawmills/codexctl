@@ -1,5 +1,5 @@
 use super::{
-    rpc::Rpc,
+    rpc::{RoutingPolicyError, Rpc},
     vault::{self, Vault},
 };
 use crate::{api, store};
@@ -43,6 +43,8 @@ pub struct TokenResponse {
     pub revision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing_class: Option<api::BillingClass>,
+    #[serde(default)]
+    pub native_routing_supported: bool,
 }
 
 impl TokenResponse {
@@ -54,15 +56,39 @@ impl TokenResponse {
     }
 }
 
+pub(super) fn supported_native_routing(account: &Value) -> Option<&str> {
+    if account.pointer("/account/type").and_then(Value::as_str) != Some("chatgpt")
+        || account
+            .pointer("/workspaceRouting/backendOrigin")
+            .and_then(Value::as_str)
+            != Some("https://chatgpt.com")
+        || account
+            .pointer("/workspaceRouting/accountRoutingOverride")
+            .and_then(Value::as_str)
+            != Some("NO_CONSTRAINT")
+    {
+        return None;
+    }
+    account
+        .pointer("/workspaceRouting/chatgptAccountId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
 pub(super) enum TokenFailure {
     AccountMismatch,
     RefreshDisabled,
+    UnsupportedRouting,
     Unavailable(anyhow::Error),
 }
 
 impl From<anyhow::Error> for TokenFailure {
     fn from(error: anyhow::Error) -> Self {
-        Self::Unavailable(error)
+        if error.is::<RoutingPolicyError>() {
+            Self::UnsupportedRouting
+        } else {
+            Self::Unavailable(error)
+        }
     }
 }
 
@@ -156,6 +182,7 @@ impl Owner {
             revision: vault::digest(&serde_json::to_vec(&self.vault.auth)?),
             access_token,
             billing_class: None,
+            native_routing_supported: false,
         })
     }
 
@@ -197,7 +224,10 @@ impl Owner {
         } else {
             Ok(())
         };
-        if result.is_err() {
+        if result
+            .as_ref()
+            .is_err_and(|error| !error.is::<RoutingPolicyError>())
+        {
             self.available = false;
         }
         if force
@@ -211,8 +241,10 @@ impl Owner {
         if snapshot.is_err() {
             self.available = false;
         }
+        // Persistence/identity failure wins even for a completed routing refusal.
+        let current = snapshot?;
         result?;
-        self.with_billing(snapshot?, request.billing).await
+        self.with_billing(current, request.billing).await
     }
 
     async fn with_billing(
@@ -220,29 +252,80 @@ impl Owner {
         mut token: TokenResponse,
         requested: bool,
     ) -> Result<TokenResponse, TokenFailure> {
-        if !requested {
+        if self.rpc.is_none() {
+            if requested {
+                token.billing_class = Some(api::BillingClass::Unknown);
+            }
             return Ok(token);
         }
-        token.billing_class = Some(api::BillingClass::Unknown);
-        let Some(rpc) = self.rpc.as_mut() else {
-            return Ok(token);
-        };
-        // Rate-limit reads can refresh the owner's login too. Persist on every result.
-
-        let result = rpc.call("account/rateLimits/read", json!({})).await;
-        let snapshot = self.snapshot();
-        if result.is_err() || snapshot.is_err() {
-            self.available = false;
+        for attempt in 0..2 {
+            let revision = token.revision.clone();
+            let mut observed_limits = None;
+            if requested {
+                // Rate-limit reads can refresh too. Persist on every result.
+                let result = self
+                    .rpc
+                    .as_mut()
+                    .context("missing owner")?
+                    .call("account/rateLimits/read", json!({}))
+                    .await;
+                let snapshot = self.snapshot();
+                if result.is_err() || snapshot.is_err() {
+                    self.available = false;
+                }
+                let limits = result?;
+                token = snapshot?;
+                token.billing_class = Some(billing_class(&limits));
+                token.chatgpt_plan_type = limits
+                    .pointer("/rateLimits/planType")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                observed_limits = Some(limits);
+            }
+            // The command-auth provider bypasses first-party workspace routing.
+            // Re-discover after any billing refresh, before exporting credentials.
+            let result = self
+                .rpc
+                .as_mut()
+                .context("missing owner")?
+                .call("account/read", json!({"refreshToken":false}))
+                .await;
+            let snapshot = self.snapshot();
+            if result
+                .as_ref()
+                .is_err_and(|error| !error.is::<RoutingPolicyError>())
+                || snapshot.is_err()
+            {
+                self.available = false;
+            }
+            let mut current = snapshot?;
+            let account = result?;
+            if supported_native_routing(&account) != Some(current.chatgpt_account_id.as_str()) {
+                return Err(TokenFailure::UnsupportedRouting);
+            }
+            if requested && current.revision != revision {
+                // Native status, billing, and routing reads can rotate before OR
+                // after fetching their evidence. Cover one stable complete auth
+                // revision, or retain the latest journal and refuse delivery.
+                token = current;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(TokenFailure::Unavailable(anyhow::anyhow!(
+                    "credential state changed while checking billing; retry"
+                )));
+            }
+            current.billing_class = token.billing_class;
+            current.chatgpt_plan_type = token.chatgpt_plan_type;
+            current.native_routing_supported = true;
+            if let Some(limits) = observed_limits {
+                self.limits = Some(limits);
+            }
+            return Ok(current);
         }
-        let limits = result?;
-        token = snapshot?;
-        self.limits = Some(limits.clone());
-        token.billing_class = Some(billing_class(&limits));
-        token.chatgpt_plan_type = limits
-            .pointer("/rateLimits/planType")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        Ok(token)
+        Err(TokenFailure::Unavailable(anyhow::anyhow!(
+            "credential state changed while checking billing; retry"
+        )))
     }
 }
 
@@ -351,6 +434,7 @@ async fn tokens(
         .map_err(|error| match error {
             TokenFailure::AccountMismatch => broker.error(StatusCode::BAD_REQUEST, "account_mismatch"),
             TokenFailure::RefreshDisabled => broker.error(StatusCode::CONFLICT, "refresh_disabled"),
+            TokenFailure::UnsupportedRouting => broker.error(StatusCode::CONFLICT, "unsupported_workspace_routing"),
             TokenFailure::Unavailable(error) => {
                 eprintln!("{}", json!({"operation":"token_request","stage":"owner","reason":"owner_unavailable","detail":error.to_string()}));
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")

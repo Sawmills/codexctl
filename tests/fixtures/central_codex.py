@@ -13,6 +13,7 @@ access = None
 waiting = False
 pending_turn = None
 definitive_rejection = False
+billing_rotated = False
 
 
 def send(value):
@@ -24,7 +25,7 @@ def complete():
     send({"method": "turn/completed", "params": {"threadId": "central-thread", "turn": {"id": "central-turn", "status": "completed"}}})
 
 
-def rotate():
+def rotate(plan_change=False):
     auth = json.loads(auth_path.read_text())
     old = auth["tokens"]["access_token"]
     payload = json.loads(base64.urlsafe_b64decode(old.split(".")[1] + "=="))
@@ -40,8 +41,10 @@ def rotate():
         time.sleep(0.2)
     if mode == "gain-uid":
         payload["https://api.openai.com/auth"]["chatgpt_user_id"] = "learned-uid"
-    if mode == "identity":
+    if mode == "identity" or (mode == "identity-nonzero" and payload.get("sub") == "same-login"):
         payload["sub"] = "different-login"
+    if plan_change:
+        payload["https://api.openai.com/auth"]["chatgpt_plan_type"] = "business"
     payload["generation"] = payload.get("generation", 0) + 1
     payload["iat"] = 2000000000 + payload["generation"]
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
@@ -71,6 +74,8 @@ for line in sys.stdin:
             rotate()
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
+        if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
+            rotate(plan_change=True)
         if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "notifications":
             for _ in range(1500):
                 send({"method": "account/rateLimits/updated", "params": {}})
@@ -89,21 +94,52 @@ for line in sys.stdin:
             if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "late-error":
                 print("{invalid", flush=True)
             rotate()
-        result = {"account": {"type": "chatgpt"}}
+        mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode in ["routing-policy-missing", "routing-policy-override", "routing-policy-wrong-code"]:
+            text = "workspace routing discovery has invalid account routing override" if mode == "routing-policy-override" else "workspace routing discovery missing backend origin"
+            code = -32000 if mode == "routing-policy-wrong-code" else -32603
+            send({"id":message["id"], "error":{"code":code,"message":text}})
+            continue
+        saved = json.loads(auth_path.read_text())
+        claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
+        account_id = saved["tokens"].get("account_id") or saved.get("chatgpt_account_id") or claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+        result = {"account": {"type": "chatgpt"}, "workspaceRouting":{"chatgptAccountId":account_id, "backendOrigin":"https://chatgpt.com", "accountRoutingOverride":"NO_CONSTRAINT"}}
+        if mode in ["routing-us", "routing-us_cr"]:
+            result["workspaceRouting"]["accountRoutingOverride"] = mode.removeprefix("routing-")
+        if mode == "routing-regional":
+            result["workspaceRouting"]["backendOrigin"] = "https://regional.chatgpt.com"
+        if mode == "routing-missing":
+            result["workspaceRouting"] = None
     elif method == "getAuthStatus":
+        mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode == "cached-rotation":
+            rotate()
+        if mode == "cached-rejection" and json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh":
+            definitive_rejection = True
         current = json.loads(auth_path.read_text())["tokens"]["access_token"]
-        result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection or pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() in ["non-exportable", "baseline-null"] else current, "requiresOpenaiAuth":True}
+        result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection else current, "requiresOpenaiAuth":True}
+        if mode in ["non-exportable", "baseline-null"]:
+            result = {"authMethod":None, "authToken":None, "requiresOpenaiAuth":True}
     elif method == "account/rateLimits/read":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode == "billing-policy-wrong-method":
+            send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
+            continue
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode == "billing-rotation":
+        if mode == "billing-rotation" and not billing_rotated:
             rotate()
+            billing_rotated = True
         auth = json.loads(auth_path.read_text())
         payload = json.loads(base64.urlsafe_b64decode(auth["tokens"]["access_token"].split(".")[1] + "=="))
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         result = {"rateLimits": {"planType":payload["https://api.openai.com/auth"].get("chatgpt_plan_type"), "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":4102444800}, "credits":{"hasCredits": mode == "credits", "unlimited":False, "balance":"10" if mode == "credits" else "0"}}}
+        if mode == "billing-late-change":
+            rotate(plan_change=True)
+        if mode.startswith("billing-routing-policy-"):
+            rotate()
+            pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).write_text(mode.removeprefix("billing-"))
     elif method == "account/login/start":
         access = params["accessToken"]
         result = {"type": "chatgptAuthTokens"}
@@ -129,3 +165,9 @@ for line in sys.stdin:
 
 if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "exit-rotation":
     rotate()
+
+if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "identity-nonzero":
+    saved = json.loads(auth_path.read_text())
+    claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
+    if claims.get("sub") == "different-login":
+        sys.exit(1)

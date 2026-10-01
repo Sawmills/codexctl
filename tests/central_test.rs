@@ -250,6 +250,7 @@ fn when_tokens_are_issued_then_refresh_credentials_stay_on_the_server() {
         "accessToken",
         "chatgptAccountId",
         "chatgptPlanType",
+        "nativeRoutingSupported",
         "revision",
     ];
 
@@ -557,7 +558,10 @@ fn when_the_owner_restarts_then_it_uses_the_encrypted_rotated_credentials() {
     broker.restart_read_only();
     let restored = broker.grant();
 
-    assert_eq!(restored, rotated);
+    assert_eq!(restored["accessToken"], rotated["accessToken"]);
+    assert_eq!(restored["revision"], rotated["revision"]);
+    assert_eq!(rotated["nativeRoutingSupported"], true);
+    assert_eq!(restored["nativeRoutingSupported"], false);
 }
 
 #[test]
@@ -829,6 +833,34 @@ fn when_native_codex_requests_a_token_then_only_access_credentials_are_returned(
         std::fs::read_to_string(client.broker.root.path().join("refresh-count")).unwrap(),
         "1"
     );
+}
+
+#[test]
+fn a_read_only_broker_cannot_register_a_native_provider_without_routing_proof() {
+    let broker = BrokerTest::start_with(&["--read-only"]);
+    let home = broker.root.path().join("client");
+    let client = NativeClient { broker, home };
+    let output = client.run(
+        env!("CARGO_BIN_EXE_codexctl-central"),
+        &[
+            "connect",
+            "--alias",
+            "remote",
+            "--server",
+            &client.broker.url,
+            "--token-file",
+            client
+                .broker
+                .root
+                .path()
+                .join("laptop.token")
+                .to_str()
+                .unwrap(),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace routing"));
+    assert!(!client.home.join(".codexctl/central/remote.json").exists());
 }
 
 #[test]

@@ -81,6 +81,8 @@ It prefers an account with headroom and the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
 Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
 The helper checks billing again before it supplies a token.
+If credentials rotate during billing or routing checks, the broker repeats those checks once.
+Further rotation refuses delivery until the operator retries with stable evidence.
 Organizational plans and accounts with credit evidence need a closed spend cap to qualify for automatic selection.
 A missing or open cap for those accounts requires billing consent.
 Subscription credits alone do not prove that further spending is disabled.
@@ -90,7 +92,13 @@ Pending local logins and local recovery wrappers also block remote activation.
 Parallel local commands remain supported.
 An explicit saved local alias can restore local mode before migration, even when the server is unavailable.
 Transferred aliases require the server. A known remote connection with the same alias blocks local selection.
-`whoami` reports the active account. It reports the saved local profile after local selection or disconnect.
+Device login refuses a transferred alias even after disconnect.
+`whoami` reports the active account. Retiring live credentials also clears the local active marker.
+After disconnect, it reports a local profile only when local credentials remain active.
+The native provider currently supports the global ChatGPT backend with no regional routing constraint.
+Before each token delivery, the server checks workspace routing.
+Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
+Read-only brokers cannot verify native routing and cannot supply the native provider.
 Existing sessions keep the account they selected at startup.
 Local recovery wrappers remain separate from remote provider use.
 
@@ -225,8 +233,12 @@ Recovery keeps the newer journal or vault credentials and refuses unordered diff
 A failed reconciliation also blocks overlapping imports.
 An interrupted import keeps its credentials reserved until the original alias resolves verification.
 A generic `account/read` error does not prove credential rejection.
+The two pinned routing-policy errors for a missing backend origin or an invalid routing override produce a recoverable routing refusal.
+Other protocol errors still require owner diagnosis.
 The pinned owner can supply separate permanent-failure evidence through `getAuthStatus`.
-The broker requires an exportable cached ChatGPT token before the attempt and its suppression afterward.
+The cached-login check can proactively refresh credentials, so the broker reconciles its journal on every outcome.
+It compares an exported token with the validated post-call journal.
+For the pinned file-backed owner, a completed ChatGPT status with a suppressed token also identifies an initial permanent refresh failure.
 Missing, unsupported, or ambiguous evidence keeps the candidate reserved.
 A confirmed rejection with unchanged credentials allows another candidate.
 The original alias can supply fresh same-seat credentials after its rejected owner stops.
@@ -239,7 +251,9 @@ An unreadable account vault blocks new imports until an operator restores owners
 Unreadable ownership reports a recovery failure instead of a missing account or an empty catalog.
 Healthy existing accounts remain usable when unresolved previous processes are proven stopped.
 Startup inventories every account before it launches replacements.
-A journal with a conflicting identity also fences new imports.
+A stopped candidate with a readable conflicting journal remains quarantined.
+A completed request and confirmed process exit permit quarantine even when the process exits nonzero.
+Both the vault identity and journal identity block overlapping imports; unrelated users can continue onboarding.
 Startup blocks a replacement for any existing account named by that conflicting journal.
 This overlap check includes legacy journals that omit a known user ID.
 A journal under an unreadable vault also blocks matching replacements.

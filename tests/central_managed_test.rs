@@ -339,19 +339,31 @@ fn when_a_local_profile_is_migrated_then_local_refresh_is_fenced_and_remote_use_
         br#"{"alias":"personal","label":"Personal","saved_at":"2026-09-29"}"#,
     )
     .unwrap();
+    let paths = codexctl::config::Paths::from_home(home.path().to_owned());
+    store::atomic_write(
+        &paths.codex_auth_json(),
+        &std::fs::read(profile.join("auth.json")).unwrap(),
+    )
+    .unwrap();
+    codexctl::profile::set_active_from(&paths, "personal").unwrap();
     let migration = server.cli(home.path(), &["migrate", "--all", "--exclusive-owner"]);
-    let usage = server.cli(home.path(), &["use", "personal"]);
     assert!(
         migration.status.success(),
         "{}",
         String::from_utf8_lossy(&migration.stderr)
     );
+    let identity = server.cli(home.path(), &["whoami"]);
+    assert!(String::from_utf8_lossy(&identity.stdout).contains("no active profile"));
+    let usage = server.cli(home.path(), &["use", "personal"]);
     assert!(
         usage.status.success(),
         "{}",
         String::from_utf8_lossy(&usage.stderr)
     );
     assert!(api_read_fails(&profile.join("auth.json")));
+    assert!(server.cli(home.path(), &["disconnect"]).status.success());
+    let identity = server.cli(home.path(), &["whoami"]);
+    assert!(String::from_utf8_lossy(&identity.stdout).contains("no active profile"));
 }
 fn api_read_fails(path: &std::path::Path) -> bool {
     codexctl::api::read_auth_json(path).is_err()
@@ -1999,6 +2011,413 @@ fn a_non_exportable_baseline_never_attempts_import_refresh() {
             .status(),
         503
     );
+}
+
+#[test]
+fn a_conflicting_candidate_quarantines_both_identities_without_fencing_other_users() {
+    for restart in [false, true] {
+        let mut server = Server::start();
+        store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+        assert_eq!(
+            server
+                .import(&server.amir, "candidate", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        let directory = account_directory(&server, "amir", "candidate");
+        let retained = std::fs::read(directory.join("runtime/auth.json")).unwrap();
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        if restart {
+            server.child.kill().unwrap();
+            server.child.wait().unwrap();
+            restart_after_crash(&mut server);
+        }
+
+        assert_eq!(
+            server
+                .import(&server.alex, "personal", "alex-login", "alex-seat")
+                .status(),
+            200
+        );
+        assert_eq!(
+            server
+                .import(&server.alex, "old-seat", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        assert_eq!(
+            server
+                .import(&server.alex, "rotated-seat", "different-login", "same-seat")
+                .status(),
+            503
+        );
+        assert_eq!(
+            std::fs::read(directory.join("runtime/auth.json")).unwrap(),
+            retained
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "2"
+        );
+    }
+}
+
+#[test]
+fn a_settled_conflicting_candidate_with_nonzero_exit_does_not_fence_other_users() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"identity-nonzero").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "candidate", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    let directory = account_directory(&server, "amir", "candidate");
+    let retained = std::fs::read(directory.join("runtime/auth.json")).unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+    for login in ["same-login", "different-login"] {
+        assert_eq!(
+            server
+                .import(&server.alex, "reserved", login, "same-seat")
+                .status(),
+            503
+        );
+    }
+    assert_eq!(
+        std::fs::read(directory.join("runtime/auth.json")).unwrap(),
+        retained
+    );
+}
+
+#[test]
+fn proactive_cached_login_rotation_is_reconciled_before_import_verification() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"cached-rotation").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+    let directory = account_directory(&server, "amir", "personal");
+    assert!(directory.join("vault.enc").exists());
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn proactive_cached_login_rejection_allows_a_fresh_same_account_grant() {
+    for restart in [false, true] {
+        let mut server = Server::start();
+        store::atomic_write(&server.root.path().join("mode"), b"cached-rejection").unwrap();
+        let mut rejected = auth("amir-login", "amir-seat");
+        rejected["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+        let response = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"personal","auth":rejected}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        if restart {
+            server.stop();
+            server.restart();
+        }
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+    }
+}
+
+#[test]
+fn constrained_or_unknown_workspace_routes_are_refused_before_native_activation() {
+    for mode in [
+        "routing-us",
+        "routing-us_cr",
+        "routing-regional",
+        "routing-missing",
+    ] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+
+        let output = server.cli(home.path(), &["use", "personal"]);
+
+        assert!(
+            !output.status.success(),
+            "unsupported routing must refuse activation: {mode}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("workspace routing"));
+        assert!(!home.path().join(".codex/config.toml").exists());
+        assert!(
+            !home
+                .path()
+                .join(".codexctl/central/.native-active.json")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
+    for mode in [
+        "routing-policy-missing",
+        "routing-policy-override",
+        "billing-routing-policy-missing",
+        "billing-routing-policy-override",
+    ] {
+        for catalog in [false, true] {
+            let server = Server::start();
+            assert_eq!(
+                server
+                    .import(&server.amir, "personal", "amir-login", "amir-seat")
+                    .status(),
+                200
+            );
+            store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+            if catalog {
+                assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+            } else {
+                let refusal = server.token(&server.amir, "personal", None);
+                assert_eq!(refusal.status(), 409);
+                assert_eq!(
+                    refusal.json::<Value>().unwrap()["error"],
+                    "unsupported_workspace_routing"
+                );
+            }
+            let directory = account_directory(&server, "amir", "personal");
+            let journal: Value = serde_json::from_slice(
+                &std::fs::read(directory.join("runtime/auth.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved_vault(&server, &directory)["auth"], journal);
+            let secret = std::fs::read_to_string(server.root.path().join("metrics.token")).unwrap();
+            let metrics = server
+                .http
+                .get(format!("{}/metrics", server.url))
+                .bearer_auth(secret)
+                .send()
+                .unwrap()
+                .text()
+                .unwrap();
+            assert!(metrics.contains(
+                "codexctl_central_failed_requests_total{reason=\"unsupported_workspace_routing\"} 1"
+            ));
+            assert!(metrics.contains(
+                "codexctl_central_failed_requests_total{reason=\"catalog_owner_unavailable\"} 0"
+            ));
+            store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+            assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+            assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+        }
+    }
+}
+
+#[test]
+fn similar_errors_without_the_pinned_routing_contract_stay_unavailable() {
+    for mode in ["routing-policy-wrong-code", "billing-policy-wrong-method"] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    }
+}
+
+#[test]
+fn a_changed_workspace_route_refuses_native_token_delivery_and_counts_one_failure() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let home = server.connected_home();
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"routing-us").unwrap();
+    let connection = home.path().join(".codexctl/central/personal.json");
+
+    let output = server.cli(
+        home.path(),
+        &[
+            "central-token",
+            "--connection",
+            connection.to_str().unwrap(),
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace routing"));
+    let secret = std::fs::read_to_string(server.root.path().join("metrics.token")).unwrap();
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth(secret)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(metrics.contains(
+        "codexctl_central_failed_requests_total{reason=\"unsupported_workspace_routing\"} 1"
+    ));
+}
+
+fn saved_vault(server: &Server, directory: &std::path::Path) -> Value {
+    use aes_gcm::{
+        Aes256Gcm,
+        aead::{Aead, KeyInit},
+    };
+    let key = std::fs::read(server.root.path().join("key")).unwrap();
+    let bytes = std::fs::read(directory.join("vault.enc")).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let plain = cipher.decrypt(bytes[..12].into(), &bytes[12..]).unwrap();
+    serde_json::from_slice(&plain).unwrap()
+}
+
+#[test]
+fn unsupported_route_imports_stay_unverified_and_recoverable_across_restart() {
+    for mode in [
+        "routing-us",
+        "routing-us_cr",
+        "routing-regional",
+        "routing-missing",
+        "routing-policy-missing",
+        "routing-policy-override",
+    ] {
+        let mut server = Server::start();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let directory = account_directory(&server, "amir", "personal");
+        for restart in [false, true] {
+            if restart {
+                server.stop();
+                server.restart();
+            }
+            let response = server.import(&server.amir, "personal", "amir-login", "amir-seat");
+            assert_eq!(response.status(), 409, "{mode}");
+            assert_eq!(
+                response.json::<Value>().unwrap()["error"],
+                "unsupported_workspace_routing"
+            );
+            assert_eq!(saved_vault(&server, &directory)["verified"], false);
+            assert_eq!(saved_vault(&server, &directory)["import_rejected"], false);
+        }
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        assert_eq!(saved_vault(&server, &directory)["verified"], true);
+    }
+}
+
+#[test]
+fn a_previously_verified_alias_cannot_bypass_current_routing_on_import_retry() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-us").unwrap();
+    server.restart();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        409
+    );
+}
+
+#[test]
+fn routing_refresh_cannot_reuse_billing_evidence_for_an_older_revision() {
+    for mode in ["routing-billing-change", "billing-late-change"] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let connection = home.path().join(".codexctl/central/personal.json");
+        assert!(
+            server
+                .cli(
+                    home.path(),
+                    &[
+                        "central-token",
+                        "--connection",
+                        connection.to_str().unwrap()
+                    ]
+                )
+                .status
+                .success()
+        );
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let output = server.cli(
+            home.path(),
+            &[
+                "central-token",
+                "--connection",
+                connection.to_str().unwrap(),
+            ],
+        );
+        assert!(
+            !output.status.success(),
+            "new plan must not inherit the old plan's approval"
+        );
+        assert!(output.stdout.is_empty());
+        let saved = saved_vault(&server, &account_directory(&server, "amir", "personal"));
+        let token = saved["auth"]["tokens"]["access_token"].as_str().unwrap();
+        assert_eq!(
+            codexctl::api::token_identity(token)
+                .unwrap()
+                .plan
+                .as_deref(),
+            Some("business")
+        );
+    }
 }
 #[test]
 fn device_cleanup_remains_retryable_when_removing_the_credential_fails() {

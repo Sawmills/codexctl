@@ -17,7 +17,7 @@ cargo test --all-targets --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The feature is off by default.
+Central support is enabled by default. `--no-default-features` builds only the local account commands.
 The normal codexctl commands keep their current behavior.
 The automated tests use a synthetic Codex process for protocol and refresh failure scenarios.
 They do not prove live OpenAI refresh behavior.
@@ -84,13 +84,15 @@ Device revocation stops future broker access but cannot revoke an access token a
 ## Run the Broker and Clients
 
 ```sh
-./target/debug/codexctl-central serve \
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl-central serve \
   --state ./central-private/server --key-file ./central-private/vault-key
 ```
 
-The broker accepts only loopback connections.
-For another machine, use an SSH tunnel to encrypt network traffic.
-The client rejects redirects and non-loopback URLs.
+This earlier workflow runs the broker on loopback.
+Its HTTP examples require the explicit `CODEXCTL_ALLOW_INSECURE_LOOPBACK=1` test opt-in.
+The client rejects redirects and requires HTTPS for network origins.
+For the earlier cross-machine experiment, an SSH tunnel reached the loopback listener.
+Use the central server guide for the current HTTPS workflow.
 
 ```sh
 ssh -N -L 8787:127.0.0.1:8787 server-host
@@ -101,7 +103,8 @@ The client keeps the current directory and starts a private local Codex process.
 The prototype uses a read-only sandbox and does not approve interactive tool requests.
 
 ```sh
-codexctl-central run --token-file /absolute/path/laptop.token \
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 codexctl-central run \
+  --server http://127.0.0.1:8787 --token-file /absolute/path/laptop.token \
   'Explain the README. Do not change files.'
 ```
 
@@ -139,7 +142,7 @@ No monitoring collector, alert rule, or notification route exists in this local 
 ## Live End-to-End Experiment
 
 ```sh
-python3 tests/central_live_e2e.py \
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 python3 tests/central_live_e2e.py \
   --binary target/debug/codexctl-central \
   --auth /absolute/path/to/fresh/auth.json
 ```
@@ -170,10 +173,10 @@ Build both prototype binaries with `cargo build --features central-prototype --b
 After server setup and device registration, connect each device once:
 
 ```sh
-./target/debug/codexctl-central connect --alias personal \
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl-central connect --alias personal \
   --server http://127.0.0.1:8787 --token-file /absolute/path/device.token
-./target/debug/codexctl use personal
-codex
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl use personal
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 codex
 ```
 
 With one registered remote account, `codexctl use` also selects it without an alias.
@@ -187,13 +190,15 @@ Codex calls a private `codexctl central-token` helper through its command-backed
 The helper gets access tokens from the broker and never stores an OpenAI refresh token on the device.
 Each helper invocation requests server-side refresh; this includes startup calls.
 Codex caches the result for the session and calls the helper again after an authorization error.
-The helper has a 95-second HTTP deadline, and Codex has a 110-second command deadline.
+The helper has a 195-second HTTP deadline, and Codex has a 210-second command deadline.
 These deadlines differ from the experimental App Server callback used by the earlier one-prompt client.
 
 Activation changes the model provider in the local Codex configuration.
 It refuses a default Codex profile that overrides the provider.
 It preserves the local login file and unrelated configuration.
-The provider uses the ChatGPT Codex endpoint with the assigned account header.
+The provider supports the global ChatGPT Codex endpoint with the assigned account header.
+Regional routes and missing routing evidence refuse native activation or token delivery.
+Read-only mode supports only the earlier App Server client because it cannot verify native routing.
 Codex shows a custom provider instead of the standard ChatGPT account display.
 This prototype has no remote account availability ranking.
 Switching to a local profile restores the previous provider before swapping its login.
@@ -230,7 +235,7 @@ A graceful broker restart also preserved the latest access token in the encrypte
 The repeatable client test uses an already running broker and a registered device:
 
 ```sh
-python3 tests/central_native_e2e.py --bin-dir target/debug \
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 python3 tests/central_native_e2e.py --bin-dir target/debug \
   --server http://127.0.0.1:8787 --device /absolute/path/device.token \
   --receipt /tmp/native-receipt.json
 ```

@@ -104,6 +104,34 @@ fn run_from_with_consent(
     let label = label.map(store::validate_label).transpose()?.flatten();
     #[cfg(feature = "central-prototype")]
     let operation = codexctl::central::native::local_operation(paths)?;
+    // A retained transfer marker owns this alias even after disconnect. Refuse
+    // before authentication can revoke the grant owned by the server.
+    store::require_local_auth(&store::profile_dir(paths, alias)?.join("auth.json"))?;
+    if let Some(label) = label {
+        let slug = alias_safe(label);
+        if !slug.is_empty() {
+            let qualified = format!("{alias}+{slug}");
+            // This name may never be selected. Only fence a known transfer;
+            // leave length and case-collision checks to target resolution.
+            let profiles = paths.profiles_dir();
+            if store::validate_alias(&qualified).is_ok() && profiles.try_exists()? {
+                // Alias reservations ignore case on every platform, including
+                // filesystems where differently cased paths are distinct.
+                for entry in std::fs::read_dir(&profiles)
+                    .context("cannot inspect qualified alias transfer markers")?
+                {
+                    let entry = entry?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&qualified))
+                    {
+                        store::require_local_auth(&entry.path().join("auth.json"))?;
+                    }
+                }
+            }
+        }
+    }
     let codex_home = create_isolated_login_home(paths, alias)?;
     let result = (|| {
         runner.run_codex_login(&codex_home)?;
@@ -616,6 +644,54 @@ mod tests {
         assert!(run_from(&paths, "pending", None, &mut runner).is_err());
         assert!(!paths.profiles_dir().join("pending").exists());
         assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), original);
+    }
+
+    #[test]
+    fn a_transferred_alias_is_refused_before_device_login_even_when_disconnected() {
+        let (_root, paths) = setup_test_env();
+        let dir = store::profile_dir(&paths, "transferred").unwrap();
+        store::atomic_write(&dir.join(".central-transfer.json"), b"{}").unwrap();
+        let mut runner = FailingLoginRunner::default();
+
+        let error = run_from(&paths, "transferred", None, &mut runner).unwrap_err();
+
+        assert!(error.to_string().contains("transferred"));
+        assert!(runner.seen_home.is_none(), "device login must not start");
+        assert!(!store::login_home(&paths, "transferred").unwrap().exists());
+    }
+
+    #[test]
+    fn a_known_label_qualified_transfer_is_refused_before_device_login() {
+        for transferred in ["team+personal", "team+PERSONAL"] {
+            let (_root, paths) = setup_test_env();
+            let dir = store::profile_dir(&paths, transferred).unwrap();
+            store::atomic_write(&dir.join(".central-transfer.json"), b"{}").unwrap();
+            let mut runner = FailingLoginRunner::default();
+            let error = run_from(&paths, "team", Some("Personal"), &mut runner).unwrap_err();
+            assert!(error.to_string().contains("transferred"));
+            assert!(runner.seen_home.is_none());
+        }
+    }
+
+    #[test]
+    fn an_unused_label_qualified_alias_does_not_block_base_login() {
+        for alias in ["a".repeat(128), "team".to_string()] {
+            let (_root, paths) = setup_test_env();
+            // This ordinary profile differs only in case from the unused
+            // qualified target. It must not affect login to the base alias.
+            if alias == "team" {
+                let dir = paths.profiles_dir().join("team+PERSONAL");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("auth.json"), r#"{"access_token":"other_tok"}"#).unwrap();
+            }
+            let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_tok"}"#);
+            assert_eq!(
+                run_from(&paths, &alias, Some("Personal"), &mut runner).unwrap(),
+                alias
+            );
+            assert!(runner.seen_home.is_some());
+            assert_eq!(profile::get_active_from(&paths).unwrap(), Some(alias));
+        }
     }
 
     #[test]
