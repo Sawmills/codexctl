@@ -87,6 +87,8 @@ No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
 Pending local logins and local recovery wrappers also block remote activation.
 Parallel local commands remain supported.
+An explicit saved local alias can restore local mode before migration, even when the server is unavailable.
+Transferred aliases require the server. A known remote connection with the same alias blocks local selection.
 Existing sessions keep the account they selected at startup.
 Local recovery wrappers remain separate from remote provider use.
 
@@ -170,6 +172,7 @@ codexctl-central serve \
 The load balancer terminates TLS and forwards HTTP to the private service.
 Do not expose the backend listener outside that network.
 Clients reject cleartext remote origins and redirects.
+Saved registrations also pass origin validation before migration or device revocation.
 Isolated local tests can set `CODEXCTL_ALLOW_INSECURE_LOOPBACK=1` to permit loopback HTTP.
 Use only synthetic credentials or a dedicated test login with that option.
 

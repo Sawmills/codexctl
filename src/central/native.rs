@@ -316,6 +316,17 @@ fn document(home: &Path) -> Result<DocumentMut> {
 
 pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     let explicit = alias.is_some();
+    if let Some(alias) = alias {
+        let paths = config::default_paths()?;
+        let local = store::profile_dir(&paths, alias)?;
+        if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
+            if connection_path(alias)?.try_exists()? {
+                bail!("remote alias conflicts with a local profile; rename one before selection");
+            }
+            // An explicit unmigrated local selection remains offline after enrollment.
+            return Ok(false);
+        }
+    }
     let catalog = super::remote::catalog()?;
     let selected_remote = catalog
         .as_ref()

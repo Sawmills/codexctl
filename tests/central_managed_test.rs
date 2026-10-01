@@ -1543,6 +1543,109 @@ fn when_account_read_fails_for_routing_then_the_candidate_stays_reserved() {
 }
 
 #[test]
+fn persisted_plaintext_registration_refuses_migration_before_retiring_credentials() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let source = serde_json::to_vec(&auth("local-login", "local-seat")).unwrap();
+    store::atomic_write(&paths.codex_auth_json(), &source).unwrap();
+    codexctl::profile::save_profile_to(&paths, "local", None, &paths.codex_auth_json()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["migrate", "--all", "--exclusive-owner"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env_remove("CODEXCTL_ALLOW_INSECURE_LOOPBACK")
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("HTTPS origin"));
+    assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), source);
+    assert!(
+        !paths
+            .profiles_dir()
+            .join("local/.central-transfer.json")
+            .exists()
+    );
+    assert!(server.accounts(&server.amir).as_array().unwrap().is_empty());
+}
+
+#[test]
+fn persisted_plaintext_registration_cannot_send_device_revocation() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["devices", "--revoke", "amir-laptop"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env_remove("CODEXCTL_ALLOW_INSECURE_LOOPBACK")
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("HTTPS origin"));
+    assert!(
+        server
+            .http
+            .get(format!("{}/v1/devices", server.url))
+            .bearer_auth(&server.amir)
+            .send()
+            .unwrap()
+            .status()
+            .is_success()
+    );
+}
+
+#[test]
+fn managed_enrollment_preserves_offline_explicit_local_selection() {
+    let mut server = Server::start();
+    let home = server.connected_home();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let source = serde_json::to_vec(&auth("local-login", "local-seat")).unwrap();
+    store::atomic_write(&paths.codex_auth_json(), &source).unwrap();
+    codexctl::profile::save_profile_to(&paths, "local", None, &paths.codex_auth_json()).unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "remote", "remote-login", "remote-seat")
+            .status(),
+        200
+    );
+    assert!(server.cli(home.path(), &["use", "remote"]).status.success());
+    unsafe {
+        libc::kill(server.child.id() as i32, libc::SIGTERM);
+    }
+    server.child.wait().unwrap();
+
+    let result = server.cli(home.path(), &["use", "local"]);
+
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), source);
+    assert_eq!(
+        std::fs::read_to_string(paths.active_file()).unwrap().trim(),
+        "local"
+    );
+    assert!(paths.codexctl_dir().join("central/.server.json").exists());
+    assert!(
+        !paths
+            .codexctl_dir()
+            .join("central/.native-active.json")
+            .exists()
+    );
+    assert!(
+        !std::fs::read_to_string(paths.codex_home().join("config.toml"))
+            .unwrap()
+            .contains("codexctl-central")
+    );
+}
+
+#[test]
 fn when_registration_is_forgotten_during_migration_then_completion_does_not_recreate_it() {
     let server = Server::start();
     let home = server.connected_home();

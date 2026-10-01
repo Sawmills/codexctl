@@ -39,6 +39,7 @@ pub fn connection() -> Result<Option<Connection>> {
     registration(&path()?)
 }
 fn secret(connection: &Connection) -> Result<String> {
+    transport::origin(&connection.server)?;
     Ok(
         String::from_utf8(vault::private_read(&connection.token_file)?)?
             .trim()
@@ -388,6 +389,8 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
     }
     require_stopped_owners(&paths)?;
     let connection = connection()?.context("run codexctl connect first")?;
+    // Reject an unsafe persisted origin before any credential is retired.
+    transport::origin(&connection.server)?;
     let _store = store::lock(&paths)?;
     let profiles = profile::list_profiles_from(&paths)?;
     if profiles.is_empty() {
