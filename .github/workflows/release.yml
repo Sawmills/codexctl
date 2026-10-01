@@ -106,8 +106,8 @@ jobs:
         run: |
           set -euo pipefail
           archive="codexctl_${{ needs.setup.outputs.tag }}_${{ matrix.label }}.tar.gz"
-          strip "target/${{ matrix.target }}/release/codexctl" || true
-          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" codexctl
+          strip "target/${{ matrix.target }}/release/codexctl" "target/${{ matrix.target }}/release/codexctl-central"
+          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" codexctl codexctl-central
           shasum -a 256 "${archive}" > "${archive}.sha256"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -232,7 +232,7 @@ jobs:
             end
 
             def install
-              bin.install "codexctl"
+              bin.install "codexctl", "codexctl-central"
               generate_completions_from_executable(bin/"codexctl", "completions")
             end
 
@@ -240,6 +240,8 @@ jobs:
               help = shell_output("#{bin}/codexctl --help")
               assert_match "Usage:", help
               assert_match "codexctl", help
+              server_help = shell_output("#{bin}/codexctl-central --help")
+              assert_match "Serve the account API", server_help
               assert_path_exists bash_completion/"codexctl"
               assert_path_exists zsh_completion/"_codexctl"
               assert_path_exists fish_completion/"codexctl.fish"
