@@ -549,12 +549,10 @@ impl Broker {
             prepare_owner(&state, &self.key, self.read_only)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?,
         ));
+        let guard = owner.clone().lock_owned().await;
         // Retain ownership before initialization or any potentially uncertain refresh.
-        self.owners
-            .write()
-            .await
-            .insert(id, (user.into(), owner.clone()));
-        let mut owner = owner.lock().await;
+        self.owners.write().await.insert(id, (user.into(), owner));
+        let mut owner = guard;
         let verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -1029,6 +1027,85 @@ mod tests {
     }
 
     use super::*;
+    #[tokio::test]
+    async fn catalog_discovery_cannot_take_an_import_before_owner_initialization() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let key = root.path().join("key");
+        setup(&state, &key).unwrap();
+        record_user(&state, "test-user", "synthetic@sawmills.ai").unwrap();
+        let credential = root.path().join("device");
+        crate::central::register(&state, "device", "sawmills", "test-user", &credential).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!(
+                "Bearer {}",
+                std::fs::read_to_string(credential).unwrap().trim()
+            )
+            .parse()
+            .unwrap(),
+        );
+        let mode = root.path().join("mode");
+        let counter = root.path().join("counter");
+        store::atomic_write(&mode, b"").unwrap();
+        store::atomic_write(&counter, b"0").unwrap();
+        let binary = root.path().join("synthetic-codex");
+        let quoted = |p: &Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\"'\"'"));
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        store::atomic_write(&binary,format!("#!/bin/sh\nexport CENTRAL_TEST_MODE_FILE={}\nexport CENTRAL_TEST_REFRESH_COUNTER={}\nexec {} \"$@\"\n",quoted(&mode),quoted(&counter),quoted(&fixture)).as_bytes()).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let broker = Broker {
+            state,
+            key,
+            binary,
+            read_only: false,
+            ownership_unresolved: Arc::new(AtomicBool::new(false)),
+            owners: Arc::new(RwLock::new(BTreeMap::new())),
+            imports: Arc::new(Mutex::new(())),
+            sso: None,
+            failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            metrics_hash: None,
+            work: Arc::new(Semaphore::new(128)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+        let auth = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh","account_id":"synthetic-seat"}});
+        let mut imported = Box::pin(broker.import_account(
+            "test-user",
+            Import {
+                alias: "personal".into(),
+                label: None,
+                auth,
+            },
+        ));
+        // Force scheduler preemption at publication's last lock boundary. A catalog
+        // task has a fresh cooperative budget and can run before import resumes.
+        tokio::task::yield_now().await;
+        for _ in 0..125 {
+            tokio::task::consume_budget().await;
+        }
+        assert!(futures::poll!(&mut imported).is_pending());
+        let catalog_broker = broker.clone();
+        let catalog = tokio::spawn(async move { accounts(State(catalog_broker), headers).await })
+            .await
+            .unwrap();
+        assert!(catalog.is_ok());
+        let result = imported.await;
+        assert!(
+            result.is_ok(),
+            "catalog discovery invalidated an initializing import"
+        );
+        assert!(result.unwrap_or_else(|_| unreachable!()).available);
+        for (_, owner) in broker.owners.read().await.values() {
+            if let Some(rpc) = owner.lock().await.rpc.as_mut() {
+                rpc.shutdown().await.unwrap();
+            }
+        }
+    }
+
     fn recovery_auth(generation: Option<i64>, refresh: &str) -> Value {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = serde_json::json!({"sub":"synthetic-login", "iat":generation, "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat"}});

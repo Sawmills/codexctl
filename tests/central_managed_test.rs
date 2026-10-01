@@ -1643,6 +1643,9 @@ fn managed_enrollment_preserves_offline_explicit_local_selection() {
             .unwrap()
             .contains("codexctl-central")
     );
+    let identity = server.cli(home.path(), &["whoami"]);
+    assert!(identity.status.success());
+    assert!(String::from_utf8_lossy(&identity.stdout).starts_with("local ("));
 }
 
 #[test]

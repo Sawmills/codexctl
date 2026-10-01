@@ -276,13 +276,10 @@ pub fn show(status: bool, filter: Option<api::BillingClass>) -> Result<bool> {
     Ok(true)
 }
 pub fn whoami() -> Result<bool> {
-    if connection()?.is_none() {
+    let Some(alias) = native::active_alias()? else {
         return Ok(false);
-    }
-    match native::active_alias()? {
-        Some(alias) => println!("{alias} [server]"),
-        None => println!("Connected to account server; run codexctl use."),
     };
+    println!("{alias} [server]");
     Ok(true)
 }
 pub fn devices(revoke: Option<&str>) -> Result<()> {

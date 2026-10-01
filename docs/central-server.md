@@ -71,6 +71,7 @@ A copy under another alias or an uncertain identity requires an explicit handoff
 ```sh
 codexctl status
 codexctl list
+codexctl whoami
 codexctl use
 codex
 ```
@@ -89,6 +90,7 @@ Pending local logins and local recovery wrappers also block remote activation.
 Parallel local commands remain supported.
 An explicit saved local alias can restore local mode before migration, even when the server is unavailable.
 Transferred aliases require the server. A known remote connection with the same alias blocks local selection.
+`whoami` reports the active account. It reports the saved local profile after local selection or disconnect.
 Existing sessions keep the account they selected at startup.
 Local recovery wrappers remain separate from remote provider use.
 
