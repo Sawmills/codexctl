@@ -12,6 +12,55 @@ use std::{
     time::Duration,
 };
 
+#[test]
+fn loopback_does_not_receive_a_device_credential_without_explicit_test_opt_in() {
+    use std::io::{Read, Write};
+    let root = tempfile::tempdir().unwrap();
+    let token_file = root.path().join("device.token");
+    store::atomic_write(&token_file, b"synthetic-loopback-device-credential").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let observer = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    let mut bytes = [0u8; 4096];
+                    let length = stream.read(&mut bytes).unwrap();
+                    let received = String::from_utf8_lossy(&bytes[..length])
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer");
+                    stream.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    return received;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("listener failed: {error}"),
+            }
+        }
+        false
+    });
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["run", "--server", &url, "--token-file"])
+        .arg(token_file)
+        .arg("synthetic prompt")
+        .env_remove("CODEXCTL_ALLOW_INSECURE_LOOPBACK")
+        .output()
+        .unwrap();
+    let received = observer.join().unwrap();
+    assert!(!result.status.success());
+    assert!(
+        !received,
+        "a loopback listener must not receive the device bearer credential"
+    );
+}
+
 struct BrokerTest {
     root: tempfile::TempDir,
     child: Child,
@@ -58,6 +107,7 @@ impl BrokerTest {
         store::atomic_write(&root.path().join("refresh-count"), b"0").unwrap();
         store::atomic_write(&root.path().join("mode"), b"").unwrap();
         let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(root.path().join("state"))
             .arg("--key-file")
@@ -102,6 +152,7 @@ impl BrokerTest {
     }
     fn restart_read_only(&mut self) {
         self.child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(self.state())
             .arg("--key-file")
@@ -139,6 +190,7 @@ impl BrokerTest {
     }
     fn run_client(&self, token: &Path) -> Child {
         Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["run", "--server", &self.url, "--token-file"])
             .arg(token)
             .arg("--codex-bin")
@@ -280,6 +332,7 @@ fn when_an_owner_is_running_then_a_second_owner_is_refused() {
     let broker = BrokerTest::start();
 
     let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["serve", "--state"])
         .arg(broker.state())
         .arg("--key-file")
@@ -401,6 +454,7 @@ fn when_a_refresh_callback_precedes_the_turn_response_then_the_client_still_comp
     let broker = BrokerTest::start();
 
     let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["run", "--server", &broker.url, "--token-file"])
         .arg(broker.root.path().join("laptop.token"))
         .arg("--codex-bin")
@@ -470,6 +524,7 @@ fn when_an_owner_exits_abruptly_then_restart_refuses_an_unfinished_runtime() {
     broker.child.wait().unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["serve", "--state"])
         .arg(broker.state())
         .arg("--key-file")
@@ -533,6 +588,7 @@ fn when_the_port_is_occupied_then_no_credential_owner_starts() {
     let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["serve", "--state"])
         .arg(broker.state())
         .arg("--key-file")
@@ -565,6 +621,7 @@ fn when_the_codex_executable_is_missing_then_no_runtime_blocks_a_later_start() {
     broker.child.wait().unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["serve", "--state"])
         .arg(broker.state())
         .arg("--key-file")
@@ -671,6 +728,7 @@ impl NativeClient {
     }
     fn run(&self, bin: &str, args: &[&str]) -> std::process::Output {
         Command::new(bin)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(args)
             .env("HOME", &self.home)
             .env_remove("CODEX_HOME")
@@ -783,6 +841,34 @@ fn when_a_device_is_revoked_then_the_native_helper_returns_no_credentials() {
 
     assert!(!token.status.success());
     assert!(token.stdout.is_empty());
+}
+
+#[test]
+fn selecting_a_local_profile_restores_the_provider_after_remote_use() {
+    let client = NativeClient::start();
+    let paths = codexctl::config::Paths::from_home(client.home.clone());
+    codexctl::profile::save_profile_to(&paths, "local", None, &paths.codex_auth_json()).unwrap();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "local"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = std::fs::read_to_string(client.home.join(".codex/config.toml")).unwrap();
+    assert!(config.contains("model_provider = \"openai\""));
+    assert!(!config.contains("model_providers"));
+    assert_eq!(
+        std::fs::read(paths.codex_auth_json()).unwrap(),
+        NativeClient::local_auth_bytes()
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.active_file()).unwrap().trim(),
+        "local"
+    );
 }
 
 #[test]
@@ -960,6 +1046,7 @@ fn when_a_remote_switch_inherits_codex_home_then_it_refuses_before_writing_confi
     client.connect();
 
     let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["use", "remote"])
         .env("HOME", &client.home)
         .env("CODEX_HOME", client.home.join("pinned"))
@@ -1225,6 +1312,7 @@ fn when_a_pinned_shell_sees_the_remote_provider_then_the_helper_refuses_credenti
     let client = NativeClient::start();
     client.connect();
     let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["central-token", "--connection"])
         .arg(client.home.join(".codexctl/central/remote.json"))
         .env("HOME", &client.home)
@@ -1244,6 +1332,7 @@ fn when_an_inherited_home_is_local_then_global_save_still_refuses_remote_mode() 
     let isolated = client.home.join("isolated");
     std::fs::create_dir_all(&isolated).unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["save", "local"])
         .env("HOME", &client.home)
         .env("CODEX_HOME", isolated)
@@ -1308,6 +1397,7 @@ fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_n
     std::fs::write(client.broker.root.path().join("mode"), "disconnect").unwrap();
     let path = client.home.join(".codexctl/central/remote.json");
     let helper = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["central-token", "--connection"])
         .arg(&path)
         .env("HOME", &client.home)

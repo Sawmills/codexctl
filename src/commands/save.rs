@@ -27,6 +27,8 @@ pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Resul
     let label = label.map(store::validate_label).transpose()?.flatten();
 
     let paths = config::default_paths()?;
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_operation(&paths)?;
     let auth_path = paths.codex_auth_json();
     if !auth_path.exists() {
         anyhow::bail!(

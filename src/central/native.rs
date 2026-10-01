@@ -93,10 +93,17 @@ fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 pub fn require_local_mode() -> Result<()> {
-    if !root()?.join(".native-active.json").try_exists()? {
+    require_local_mode_from(&config::default_paths()?)
+}
+fn require_local_mode_from(paths: &config::Paths) -> Result<()> {
+    if !paths
+        .codexctl_dir()
+        .join("central/.native-active.json")
+        .try_exists()?
+    {
         return Ok(());
     }
-    let home = codex_home()?;
+    let home = paths.codex_home();
     if document(&home)?
         .get("model_provider")
         .and_then(Item::as_str)
@@ -107,6 +114,78 @@ pub fn require_local_mode() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[must_use = "keep this guard alive for the complete local credential operation"]
+pub struct LocalOperation {
+    _guard: std::fs::File,
+    paths: config::Paths,
+}
+
+pub fn local_operation(paths: &config::Paths) -> Result<LocalOperation> {
+    require_local_mode_from(paths)?;
+    let operation = local_lease(paths)?;
+    operation.revalidate()?;
+    Ok(operation)
+}
+
+/// Restore the local provider and retain a lease through its credential swap.
+pub fn local_selection() -> Result<LocalOperation> {
+    let operation = local_lease(&config::default_paths()?)?;
+    deactivate()?;
+    operation.revalidate()?;
+    Ok(operation)
+}
+
+fn local_lease(paths: &config::Paths) -> Result<LocalOperation> {
+    let guard = vault::mode_lock(
+        &paths.codexctl_dir().join("central"),
+        vault::LockMode::Shared,
+    )?;
+    Ok(LocalOperation {
+        _guard: guard,
+        paths: paths.clone(),
+    })
+}
+
+impl LocalOperation {
+    pub fn revalidate(&self) -> Result<()> {
+        require_local_mode_from(&self.paths)
+    }
+
+    pub fn run_child(
+        &self,
+        command: &mut std::process::Command,
+    ) -> Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        {
+            use std::os::{fd::AsRawFd, unix::process::CommandExt};
+            let fd = self._guard.as_raw_fd();
+            // Only the child inherits this lease. A killed login parent cannot
+            // let activation overtake its still-pending device flow.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        command
+            .status()
+            .context("local credential process failed to run")
+    }
+}
+
+pub(super) fn exclusive_mode(paths: &config::Paths) -> Result<std::fs::File> {
+    vault::mode_lock(
+        &paths.codexctl_dir().join("central"),
+        vault::LockMode::Exclusive,
+    )
 }
 fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     super::transport::origin(&connection.server)?;
@@ -292,6 +371,10 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     {
         bail!("remote activation refuses an inherited or pinned Codex home");
     }
+    if catalog.is_none() && !path.try_exists()? {
+        return Ok(false);
+    }
+    let _mode = exclusive_mode(&config::default_paths()?)?;
     if let Some(catalog) = catalog.as_ref() {
         let _lock = native_lock(&root()?)?;
         super::remote::require_current_connection(&catalog.connection)?;

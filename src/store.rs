@@ -284,9 +284,11 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
 
 /// Refuse credentials whose refresh ownership has moved to the account server.
 pub fn require_local_auth(path: &Path) -> Result<()> {
-    if path
-        .parent()
-        .is_some_and(|p| p.join(".central-transfer.json").exists())
+    if let Some(parent) = path.parent()
+        && parent
+            .join(".central-transfer.json")
+            .try_exists()
+            .context("cannot inspect credential transfer marker")?
     {
         bail!("credentials transferred to the server; use a server-enabled codexctl build");
     }

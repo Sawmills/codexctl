@@ -312,6 +312,8 @@ pub fn devices(revoke: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub fn disconnect(forget: bool) -> Result<()> {
+    // Cleanup must remain available while migration waits on the server.
+    // The native lock serializes provider restoration with activation.
     let _lock = native::native_lock(&root()?)?;
     native::deactivate_locked()?;
     if forget {
@@ -380,6 +382,7 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
         bail!("migration requires the normal unpinned home");
     }
     let paths = config::default_paths()?;
+    let _mode = native::exclusive_mode(&paths)?;
     if crate::daemon::running_pid(&paths.codex_home()).is_some() {
         bail!("finish Codex sessions and stop the Codex daemon before migration");
     }

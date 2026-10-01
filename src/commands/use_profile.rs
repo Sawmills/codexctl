@@ -60,7 +60,7 @@ pub fn run_to_auth_json_excluding(
         None => find_most_available_excluding(excluded_alias, allow_resets)?,
     };
     #[cfg(feature = "central-prototype")]
-    codexctl::central::native::deactivate()?;
+    let _operation = codexctl::central::native::local_selection()?;
     let email = profile::switch_to_auth_json(&selected, auth_json)?;
     if explicit.is_some() {
         println!("switched to {} ({})", selected, email);

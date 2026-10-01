@@ -81,17 +81,7 @@ pub async fn run_client(
     model: &str,
     prompt: &str,
 ) -> Result<String> {
-    let parsed = reqwest::Url::parse(url)?;
-    if parsed.scheme() != "http"
-        || !matches!(parsed.host_str(), Some("127.0.0.1" | "[::1]" | "::1"))
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-        || parsed.path() != "/"
-    {
-        bail!("prototype URL must be an HTTP loopback origin; use an SSH tunnel");
-    }
+    super::transport::origin(url)?;
     let device_token = String::from_utf8(vault::private_read(token_file)?)?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))

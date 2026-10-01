@@ -85,6 +85,8 @@ A missing or open cap for those accounts requires billing consent.
 Subscription credits alone do not prove that further spending is disabled.
 No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
+Pending local logins and local recovery wrappers also block remote activation.
+Parallel local commands remain supported.
 Existing sessions keep the account they selected at startup.
 Local recovery wrappers remain separate from remote provider use.
 
@@ -168,7 +170,8 @@ codexctl-central serve \
 The load balancer terminates TLS and forwards HTTP to the private service.
 Do not expose the backend listener outside that network.
 Clients reject cleartext remote origins and redirects.
-Loopback HTTP remains available for local tests.
+Isolated local tests can set `CODEXCTL_ALLOW_INSECURE_LOOPBACK=1` to permit loopback HTTP.
+Use only synthetic credentials or a dedicated test login with that option.
 
 ## Staging Deployment
 

@@ -31,7 +31,7 @@ pub fn run(
     allow_resets: bool,
 ) -> Result<i32> {
     #[cfg(feature = "central-prototype")]
-    codexctl::central::native::require_local_mode()?;
+    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());

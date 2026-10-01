@@ -33,10 +33,18 @@ impl CodexLoginRunner for CodexCliLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()> {
         store::ensure_private_dir(codex_home)?;
 
-        let status = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .arg("login")
             .arg("--device-auth")
-            .env("CODEX_HOME", codex_home)
+            .env("CODEX_HOME", codex_home);
+        #[cfg(feature = "central-prototype")]
+        let status = {
+            let operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
+            operation.run_child(&mut command)?
+        };
+        #[cfg(not(feature = "central-prototype"))]
+        let status = command
             .status()
             .context("failed to run `codex login --device-auth`")?;
 
@@ -94,6 +102,8 @@ fn run_from_with_consent(
     // an empty slug and fails — after the browser login, which is precisely
     // what checking here is meant to prevent.
     let label = label.map(store::validate_label).transpose()?.flatten();
+    #[cfg(feature = "central-prototype")]
+    let operation = codexctl::central::native::local_operation(paths)?;
     let codex_home = create_isolated_login_home(paths, alias)?;
     let result = (|| {
         runner.run_codex_login(&codex_home)?;
@@ -212,6 +222,8 @@ fn run_from_with_consent(
                 // stamp the name typed for one account onto another's profile.
                 (target == alias).then(|| email_from_alias(alias)).flatten()
             });
+        #[cfg(feature = "central-prototype")]
+        operation.revalidate()?;
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -568,6 +580,42 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         std::fs::write(paths.codex_auth_json(), r#"{"access_token":"active_tok"}"#).unwrap();
         (tmp, paths)
+    }
+
+    #[cfg(feature = "central-prototype")]
+    #[test]
+    fn a_provider_change_during_login_refuses_the_final_credential_write() {
+        struct ProviderChangingLogin {
+            paths: Paths,
+        }
+        impl CodexLoginRunner for ProviderChangingLogin {
+            fn run_codex_login(&mut self, home: &Path) -> Result<()> {
+                store::atomic_write(
+                    &home.join("auth.json"),
+                    br#"{"access_token":"synthetic-login-grant","account_id":"synthetic-seat"}"#,
+                )?;
+                store::atomic_write(
+                    &self
+                        .paths
+                        .codexctl_dir()
+                        .join("central/.native-active.json"),
+                    b"{}",
+                )?;
+                store::atomic_write(
+                    &self.paths.codex_home().join("config.toml"),
+                    b"model_provider='codexctl-central'\n",
+                )?;
+                Ok(())
+            }
+        }
+        let (_root, paths) = setup_test_env();
+        let original = std::fs::read(paths.codex_auth_json()).unwrap();
+        let mut runner = ProviderChangingLogin {
+            paths: paths.clone(),
+        };
+        assert!(run_from(&paths, "pending", None, &mut runner).is_err());
+        assert!(!paths.profiles_dir().join("pending").exists());
+        assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), original);
     }
 
     #[test]

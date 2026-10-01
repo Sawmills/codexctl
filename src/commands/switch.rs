@@ -15,6 +15,8 @@ pub fn run() -> Result<()> {
     }
 
     let paths = config::default_paths()?;
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_operation(&paths)?;
     let active = profile::get_active_from(&paths)?;
 
     let items: Vec<String> = profiles

@@ -97,6 +97,40 @@ pub fn registry_lock(state: &Path, name: &str) -> Result<Lock> {
 }
 
 pub fn lock(state: &Path, name: &str) -> Result<Lock> {
+    let file = open_lock(state, name)?;
+    file.try_lock().context("another process owns this state")?;
+    Ok(Lock(file))
+}
+
+pub(super) enum LockMode {
+    Shared,
+    Exclusive,
+}
+
+/// A shared lease can stay with a login child after its parent dies.
+pub(super) fn mode_lock(state: &Path, mode: LockMode) -> Result<File> {
+    let file = open_lock(state, "mode.lock")?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let result = match mode {
+            LockMode::Shared => file.try_lock_shared(),
+            LockMode::Exclusive => file.try_lock(),
+        };
+        match result {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error @ std::fs::TryLockError::WouldBlock) => {
+                return Err(error)
+                    .context("credential mode is busy; finish existing local operations");
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn open_lock(state: &Path, name: &str) -> Result<File> {
     store::ensure_private_dir(state)?;
     let path = state.join(name);
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -109,9 +143,7 @@ pub fn lock(state: &Path, name: &str) -> Result<Lock> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path)?;
-    file.try_lock().context("another process owns this state")?;
-    Ok(Lock(file))
+    Ok(options.open(path)?)
 }
 
 fn cipher(key: &Path) -> Result<Aes256Gcm> {

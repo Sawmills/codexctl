@@ -90,6 +90,7 @@ impl Server {
     }
     fn spawn_binary(root: &tempfile::TempDir, binary: &std::path::Path) -> (Child, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(root.path().join("state"))
             .arg("--key-file")
@@ -169,6 +170,7 @@ impl Server {
     }
     fn cli(&self, home: &std::path::Path, args: &[&str]) -> std::process::Output {
         Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(args)
             .env("HOME", home)
             .env_remove("CODEX_HOME")
@@ -391,6 +393,7 @@ impl EnrollmentServer {
             .unwrap();
         let url = format!("http://{address}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(server.root.path().join("state"))
             .arg("--key-file")
@@ -561,6 +564,7 @@ fn when_connect_is_run_then_the_machine_stores_only_its_own_device_credential() 
     let issuer = EnrollmentServer::start(company_identity());
     let home = tempfile::tempdir().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args([
             "connect",
             "--server",
@@ -654,6 +658,7 @@ fn restart_after_crash(server: &mut Server) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(server.root.path().join("state"))
             .arg("--key-file")
@@ -1550,6 +1555,7 @@ fn when_registration_is_forgotten_during_migration_then_completion_does_not_recr
     codexctl::profile::save_profile_to(&paths, "personal", None, &paths.codex_auth_json()).unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["migrate", "--all", "--exclusive-owner"])
         .env("HOME", home.path())
         .env_remove("CODEX_HOME")
@@ -1678,6 +1684,7 @@ fn relative_server_state_paths_still_load_the_private_owner_home() {
     let mut server = Server::start();
     server.stop();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .current_dir(server.root.path())
         .args([
             "serve",
@@ -2315,5 +2322,94 @@ fn a_monitoring_token_with_a_trailing_newline_authenticates_scrapes() {
             .unwrap()
             .status(),
         200
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pending_local_login_blocks_remote_activation_until_it_finishes() {
+    pending_local_login_scenario(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pending_login_child_keeps_ownership_after_its_parent_is_killed() {
+    pending_local_login_scenario(true);
+}
+
+#[cfg(unix)]
+fn pending_local_login_scenario(kill_parent: bool) {
+    use std::os::unix::fs::symlink;
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let home = server.connected_home();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    symlink(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pending_codex_login.py"),
+        bin.join("codex"),
+    )
+    .unwrap();
+    let gate = home.path().join("login-gate");
+    let start = |alias: &str, gate: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .args(["login", alias])
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("CENTRAL_TEST_LOGIN_GATE", gate)
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let wait_ready = |gate: &std::path::Path| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !gate.with_extension("ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        gate.with_extension("ready").exists()
+    };
+    let mut login = start("pending", &gate);
+    let ready = wait_ready(&gate);
+    let killed_status = if kill_parent {
+        login.kill().unwrap();
+        Some(login.wait().unwrap())
+    } else {
+        None
+    };
+    let other_gate = home.path().join("other-login-gate");
+    let mut other_login = (!kill_parent).then(|| start("other-pending", &other_gate));
+    let other_ready = other_login.is_none() || wait_ready(&other_gate);
+    let selected = server.cli(home.path(), &["use", "personal"]);
+    std::fs::write(&gate, b"finish").unwrap();
+    std::fs::write(&other_gate, b"finish").unwrap();
+    let failed_login = killed_status.unwrap_or_else(|| login.wait().unwrap());
+    if let Some(other) = other_login.as_mut() {
+        assert!(!other.wait().unwrap().success());
+    }
+    assert!(ready, "the device login must be pending before selection");
+    assert!(other_ready, "parallel local logins must remain possible");
+    assert!(
+        !selected.status.success(),
+        "activation must not overtake a pending login"
+    );
+    assert!(!failed_login.success());
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
     );
 }

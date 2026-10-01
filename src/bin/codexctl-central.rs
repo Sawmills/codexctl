@@ -99,7 +99,7 @@ enum Commands {
     },
     /// Run one prompt through a local App Server with centrally supplied authentication.
     Run {
-        #[arg(long, default_value = "http://127.0.0.1:8787")]
+        #[arg(long)]
         server: String,
         #[arg(long)]
         token_file: PathBuf,

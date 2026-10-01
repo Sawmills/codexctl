@@ -1,11 +1,12 @@
 use anyhow::{Result, bail};
 use std::time::Duration;
 
-/// Credentials never travel over cleartext except a local loopback connection.
+/// TLS is required unless the operator explicitly enables isolated loopback tests.
 pub fn origin(server: &str) -> Result<reqwest::Url> {
     let url = reqwest::Url::parse(server)?;
     let local = matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "::1"));
-    if !(url.scheme() == "https" || (url.scheme() == "http" && local))
+    let test_loopback = std::env::var("CODEXCTL_ALLOW_INSECURE_LOOPBACK").as_deref() == Ok("1");
+    if !(url.scheme() == "https" || (url.scheme() == "http" && local && test_loopback))
         || url.host_str().is_none()
         || url.path() != "/"
         || !url.username().is_empty()
@@ -13,7 +14,9 @@ pub fn origin(server: &str) -> Result<reqwest::Url> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        bail!("server must be an HTTPS origin (loopback HTTP is allowed for local tests)");
+        bail!(
+            "server must be an HTTPS origin; isolated local tests can explicitly set CODEXCTL_ALLOW_INSECURE_LOOPBACK=1"
+        );
     }
     Ok(url)
 }
