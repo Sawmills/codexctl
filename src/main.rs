@@ -56,6 +56,9 @@ enum Commands {
     },
     /// Show rate limit status for all accounts
     Status {
+        /// Print a versioned JSON document
+        #[arg(long)]
+        json: bool,
         /// Show only rate-limited accounts
         #[arg(long, conflicts_with = "usage_based")]
         rate_limited: bool,
@@ -145,7 +148,11 @@ enum Commands {
         credit: Option<String>,
     },
     /// List saved profiles
-    List,
+    List {
+        /// Print a versioned JSON document
+        #[arg(long)]
+        json: bool,
+    },
     /// Remove a saved profile
     Remove {
         /// Profile alias to remove
@@ -227,6 +234,7 @@ fn main() {
         #[cfg(feature = "central-prototype")]
         Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
         Commands::Status {
+            json,
             rate_limited,
             usage_based,
         } => {
@@ -237,7 +245,7 @@ fn main() {
             } else {
                 commands::status::Filter::All
             };
-            commands::status::run(filter)
+            commands::status::run(filter, json)
         }
         Commands::Login {
             ref alias,
@@ -302,7 +310,7 @@ fn main() {
             yes,
             ref credit,
         } => commands::resets::run_redeem(alias.as_deref(), yes, credit.as_deref()),
-        Commands::List => commands::list::run(),
+        Commands::List { json } => commands::list::run(json),
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
         Commands::Codex {

@@ -204,7 +204,7 @@ impl UsageBasedAccount {
     }
 }
 
-pub fn run(filter: Filter) -> Result<()> {
+pub fn run(filter: Filter, json: bool) -> Result<()> {
     #[cfg(feature = "central-prototype")]
     if codexctl::central::remote::show(
         true,
@@ -213,11 +213,31 @@ pub fn run(filter: Filter) -> Result<()> {
             Filter::RateLimited => Some(api::BillingClass::RateLimited),
             Filter::UsageBased => Some(api::BillingClass::UsageBased),
         },
+        json,
     )? {
         return Ok(());
     }
-    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
+    let StatusSnapshot {
+        rate_limited,
+        usage_based,
+        fetched_at,
+        accounts,
+    } = load_sorted_statuses()?;
+    if json {
+        let accounts: Vec<_> = accounts
+            .into_iter()
+            .filter(|account| match filter {
+                Filter::All => true,
+                Filter::RateLimited => rate_limited.iter().any(|row| row.alias == account.alias),
+                Filter::UsageBased => usage_based.iter().any(|row| row.alias == account.alias),
+            })
+            .collect();
+        return codexctl::status_json::print(&accounts);
+    }
 
+    if accounts.is_empty() {
+        println!("no profiles saved. Use 'codexctl save' to save the current account.");
+    }
     let show_rl = matches!(filter, Filter::All | Filter::RateLimited);
     let show_ub = matches!(filter, Filter::All | Filter::UsageBased);
     let has_rows = (show_rl && !rate_limited.is_empty()) || (show_ub && !usage_based.is_empty());
@@ -251,7 +271,15 @@ pub fn run(filter: Filter) -> Result<()> {
 }
 
 pub fn run_focused(focused_alias: &str) -> Result<()> {
-    let (rate_limited, usage_based, fetched_at) = load_sorted_statuses()?;
+    let StatusSnapshot {
+        rate_limited,
+        usage_based,
+        fetched_at,
+        accounts,
+    } = load_sorted_statuses()?;
+    if accounts.is_empty() {
+        println!("no profiles saved. Use 'codexctl save' to save the current account.");
+    }
     if !rate_limited.is_empty() || !usage_based.is_empty() {
         print_live_fetched_at(fetched_at);
     }
@@ -300,24 +328,33 @@ pub fn run_focused(focused_alias: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_sorted_statuses() -> Result<(
-    Vec<RateLimitedAccount>,
-    Vec<UsageBasedAccount>,
-    chrono::DateTime<chrono::Utc>,
-)> {
+struct StatusSnapshot {
+    rate_limited: Vec<RateLimitedAccount>,
+    usage_based: Vec<UsageBasedAccount>,
+    accounts: Vec<codexctl::status_json::AccountStatus>,
+    fetched_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn load_sorted_statuses() -> Result<StatusSnapshot> {
     let profiles = profile::list_profiles()?;
     let fetched_at = chrono::Utc::now();
     if profiles.is_empty() {
-        println!("no profiles saved. Use 'codexctl save' to save the current account.");
-        return Ok((Vec::new(), Vec::new(), fetched_at));
+        return Ok(StatusSnapshot {
+            rate_limited: Vec::new(),
+            usage_based: Vec::new(),
+            accounts: Vec::new(),
+            fetched_at,
+        });
     }
 
     let paths = config::default_paths()?;
     let active = profile::get_active_from(&paths)?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    let (mut rate_limited, mut usage_based) =
-        rt.block_on(fetch_and_split(&profiles, &active, &paths))?;
+    let mut snapshot = rt.block_on(fetch_and_split(&profiles, &active, &paths))?;
+    snapshot.fetched_at = fetched_at;
+    let rate_limited = &mut snapshot.rate_limited;
+    let usage_based = &mut snapshot.usage_based;
 
     rate_limited.sort_by(|a, b| {
         a.availability_score()
@@ -330,7 +367,7 @@ fn load_sorted_statuses() -> Result<(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    Ok((rate_limited, usage_based, fetched_at))
+    Ok(snapshot)
 }
 
 fn print_live_fetched_at(fetched_at: chrono::DateTime<chrono::Utc>) {
@@ -537,7 +574,7 @@ async fn fetch_and_split(
     profiles: &[profile::Profile],
     active: &Option<String>,
     paths: &config::Paths,
-) -> Result<(Vec<RateLimitedAccount>, Vec<UsageBasedAccount>)> {
+) -> Result<StatusSnapshot> {
     let client = api::http_client()?;
 
     // Phase 1: fetch wham/usage for all accounts in parallel
@@ -566,6 +603,33 @@ async fn fetch_and_split(
         .collect();
 
     let results = futures::future::join_all(futures).await;
+
+    let accounts = results
+        .iter()
+        .zip(profiles)
+        .map(|(result, profile)| {
+            let (_, _, _, is_active, auth, usage) = result;
+            let mut row = codexctl::status_json::AccountStatus::local(&profile.meta, *is_active);
+            match (auth, usage) {
+                (Ok(_), Some(Ok(usage))) => row.set_usage(usage),
+                (Ok(auth), Some(Err(error))) => {
+                    row.error = Some(
+                        if error.to_string().contains("expired") {
+                            auth_failure_label(&auth.access_token)
+                        } else {
+                            "error"
+                        }
+                        .into(),
+                    );
+                }
+                _ => row.error = Some("bad auth.json".into()),
+            }
+            if row.error.is_some() {
+                row.state = codexctl::status_json::State::Unavailable;
+            }
+            row
+        })
+        .collect();
 
     // Phase 2: classify and build account structs
     let mut rate_limited = Vec::new();
@@ -778,7 +842,12 @@ async fn fetch_and_split(
         }
     }
 
-    Ok((rate_limited, usage_based))
+    Ok(StatusSnapshot {
+        rate_limited,
+        usage_based,
+        accounts,
+        fetched_at: chrono::Utc::now(),
+    })
 }
 
 fn rate_limit_statuses(usage: &api::RateLimitResponse) -> Vec<LimitStatus> {
