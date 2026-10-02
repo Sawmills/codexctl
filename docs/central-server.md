@@ -66,6 +66,22 @@ A new machine with no local copies needs only enrollment.
 Before activation, the client checks every known local credential home by account identity.
 A copy under another alias or an uncertain identity requires an explicit handoff.
 
+### Migration window on a busy machine
+
+These steps come from a migration on 2026-10-02 with 28 Codex panes on one Mac.
+
+1. Record each pane's session ID from its statusline or the rollout file that its Codex process keeps open.
+2. Run `codexctl devices` on each machine and confirm that all machines show the same company user. Sign in to the browser with the correct company account.
+3. Pause supervisors that automatically restart lanes so they cannot restart Codex during the migration window.
+4. Stop Codex with a normal exit (Ctrl+C twice) or `codex app-server daemon stop`.
+   Avoid SIGTERM: it leaves threads locked and can leave the terminal in an extended keyboard mode. Run `printf '\033[<u'` to restore the terminal.
+5. Quit the Codex desktop app and any plugin app-servers. `codexctl migrate` refuses while any Codex process runs.
+6. After migration, run `codexctl use <alias>`. Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
+7. Resume each session with `codexctl codex resume <sid>`.
+   Plain `codex resume` restores the saved `openai` provider and gets HTTP 401 at compaction. If a shell alias adds flags, do not repeat them.
+8. When resume shows "This conversation is open in another app", press `r` once; the daemon releases the thread.
+   Do not use the TUI `f fork` for this: a TUI fork keeps the `openai` provider.
+
 ## Daily Use
 
 ```sh
