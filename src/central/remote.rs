@@ -4,6 +4,7 @@ use super::{
     managed::{Account, Import, RevokeDevice},
     native, transport, vault,
 };
+use crate::status_format::format_window_reset as reset_time;
 use crate::{api, config, profile, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -216,62 +217,203 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
         accounts,
     }))
 }
+// Display rows never enter the server catalog used by selection or recovery.
+struct DisplayRow {
+    cells: Vec<String>,
+    billing: api::BillingClass,
+}
+
+fn usage_cells(usage: &api::RateLimitResponse) -> Vec<String> {
+    let limits = usage.rate_limit.as_ref();
+    vec![
+        percentage(
+            limits
+                .and_then(api::RateLimit::short_window)
+                .map(|w| w.used_percent),
+        ),
+        percentage(
+            limits
+                .and_then(api::RateLimit::long_window)
+                .map(|w| w.used_percent),
+        ),
+        reset_time(
+            limits
+                .and_then(api::RateLimit::long_window)
+                .and_then(api::RateLimitWindow::reset_timestamp),
+        ),
+        usage
+            .credits
+            .as_ref()
+            .and_then(|c| c.balance.as_deref())
+            .map(|balance| match balance.parse::<f64>() {
+                Ok(value) if value.is_finite() => format!("{value:.2}"),
+                _ => balance.to_owned(),
+            })
+            .unwrap_or_else(|| "-".into()),
+    ]
+}
+
+fn percentage(value: Option<f64>) -> String {
+    value.map_or("-".into(), |n| format!("{n:.0}%"))
+}
+
+async fn local_display_rows(
+    profiles: &[profile::Profile],
+    paths: &config::Paths,
+    active: Option<&str>,
+) -> Result<Vec<DisplayRow>> {
+    let client = api::http_client()?;
+    futures::future::try_join_all(profiles.iter().map(|p| {
+        let client = &client;
+        async move {
+            // A pending migration also fences local credentials. Never query a
+            // retired copy or infer migration from an alias shared with the server.
+            if p.dir.join(".central-transfer.json").try_exists()? {
+                return Ok(None);
+            }
+            let mut row = DisplayRow {
+                cells: vec![
+                    p.meta.alias.clone(),
+                    p.meta.label.clone().unwrap_or_else(|| "-".into()),
+                    p.meta.plan.clone().unwrap_or_else(|| "-".into()),
+                ],
+                billing: api::BillingClass::Unknown,
+            };
+            let auth_path = profile::auth_json_path_for_profile_from(paths, p, active);
+            let usage = match api::read_auth_json(&auth_path) {
+                Ok(auth) => {
+                    api::fetch_usage_async(client, &auth.access_token, auth.account_id.as_deref())
+                        .await
+                        .map_err(|_| "usage unavailable")
+                }
+                Err(_) => Err("credentials unavailable"),
+            };
+            match usage {
+                Ok(usage) => {
+                    // Local status groups unknown billing with rate-limited
+                    // results for display; selection still uses the catalog.
+                    row.billing = match usage.billing_class() {
+                        api::BillingClass::UsageBased => api::BillingClass::UsageBased,
+                        _ => api::BillingClass::RateLimited,
+                    };
+                    if let Some(plan) = &usage.plan_type {
+                        row.cells[2] = plan.clone();
+                    }
+                    row.cells.extend(usage_cells(&usage));
+                    row.cells.extend(["local".into(), "-".into()]);
+                }
+                Err(reason) => {
+                    // Match the local status command's error grouping. This is
+                    // display metadata, never permission to select or bill.
+                    row.billing = if p
+                        .meta
+                        .plan
+                        .as_deref()
+                        .is_some_and(|plan| plan.contains("usage_based"))
+                    {
+                        api::BillingClass::UsageBased
+                    } else {
+                        api::BillingClass::RateLimited
+                    };
+                    row.cells.extend([
+                        "-".into(),
+                        "-".into(),
+                        "-".into(),
+                        "-".into(),
+                        "local".into(),
+                        reason.into(),
+                    ]);
+                }
+            }
+            Ok(Some(row))
+        }
+    }))
+    .await
+    .map(|rows| rows.into_iter().flatten().collect())
+}
+
 pub fn show(status: bool, filter: Option<api::BillingClass>) -> Result<bool> {
     let Some(accounts) = accounts()? else {
         return Ok(false);
     };
-    let mut table = comfy_table::Table::new();
-    table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
-    table.set_header(if status {
-        vec![
+    let paths = config::default_paths()?;
+    let profiles = profile::list_profiles_from(&paths)?;
+    let local_active = profile::get_active_from(&paths)?;
+    let mut rows = tokio::runtime::Runtime::new()?.block_on(local_display_rows(
+        &profiles,
+        &paths,
+        local_active.as_deref(),
+    ))?;
+    let show_usage = status || !rows.is_empty();
+    let active = native::active_alias()?;
+    let mut server_rows: Vec<_> = accounts
+        .iter()
+        .map(|account| {
+            let state = if !account.available {
+                "unavailable"
+            } else if active.as_deref() == Some(&account.alias) {
+                "active"
+            } else {
+                "server"
+            };
+            DisplayRow {
+                cells: vec![
+                    account.alias.clone(),
+                    account.label.clone().unwrap_or_else(|| "-".into()),
+                    account.plan.clone().unwrap_or_else(|| "-".into()),
+                    percentage(account.primary_used),
+                    percentage(account.secondary_used),
+                    reset_time(account.resets_at),
+                    "-".into(),
+                    state.into(),
+                    "-".into(),
+                ],
+                billing: account.billing_class,
+            }
+        })
+        .collect();
+    server_rows.append(&mut rows);
+    server_rows.retain(|row| filter.is_none_or(|f| row.billing == f));
+    if !server_rows.is_empty() {
+        let headers = [
             "Account",
             "Label",
             "Plan",
             "Short used",
             "Long used",
             "Resets",
+            "Balance",
             "State",
-        ]
-    } else {
-        vec!["Account", "Label", "Plan", "State"]
-    });
-    for account in accounts
-        .iter()
-        .filter(|a| filter.is_none_or(|f| a.billing_class == f))
-    {
-        let state = if !account.available {
-            "unavailable"
-        } else if native::active_alias()?.as_deref() == Some(&account.alias) {
-            "active"
-        } else {
-            "server"
-        };
-        let mut row = vec![
-            account.alias.clone(),
-            account.label.clone().unwrap_or_else(|| "-".into()),
-            account.plan.clone().unwrap_or_else(|| "unknown".into()),
+            "Error",
         ];
-        if status {
-            row.extend([
-                account
-                    .primary_used
-                    .map_or("-".into(), |n| format!("{n:.0}%")),
-                account
-                    .secondary_used
-                    .map_or("-".into(), |n| format!("{n:.0}%")),
-                account
-                    .resets_at
-                    .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-                    .map_or("-".into(), |t| t.to_rfc3339()),
-            ]);
+        let columns: Vec<_> = (0..headers.len())
+            .filter(|&i| {
+                (show_usage || !(3..=6).contains(&i))
+                    && (i == 0
+                        || i == 7
+                        || server_rows
+                            .iter()
+                            .any(|row| !row.cells[i].trim().is_empty() && row.cells[i] != "-"))
+            })
+            .collect();
+        let mut table = comfy_table::Table::new();
+        table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
+        table.set_header(columns.iter().map(|&i| headers[i]));
+        for row in server_rows {
+            table.add_row(columns.iter().map(|&i| {
+                row.cells[i]
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(160)
+                    .collect::<String>()
+            }));
         }
-        row.push(state.into());
-        table.add_row(row);
+        println!("{table}");
+    } else if !accounts.is_empty() {
+        println!("no matching accounts found.");
     }
     if accounts.is_empty() {
         println!("No server accounts yet. Run codexctl migrate --all on your source machine.");
-    } else {
-        println!("{table}");
     }
     Ok(true)
 }
@@ -717,6 +859,46 @@ fn require_stopped_owners(paths: &config::Paths) -> Result<()> {
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn local_usage_keeps_a_weekly_only_window_in_the_long_column() {
+        let usage = serde_json::from_value(serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {"primary_window": {"used_percent": 37, "limit_window_seconds": 604800}},
+            "credits": {"has_credits": true, "balance": "12.50"}
+        }))
+        .unwrap();
+
+        assert_eq!(usage_cells(&usage), ["-", "37%", "-", "12.50"]);
+    }
+    #[test]
+    fn connected_local_balance_is_short() {
+        let usage = serde_json::from_value(serde_json::json!({
+            "credits": {"has_credits": true, "balance": "55835.5394250000"}
+        }))
+        .unwrap();
+
+        assert_eq!(usage_cells(&usage)[3], "55835.54");
+    }
+
+    #[test]
+    fn connected_local_reset_uses_relative_time_and_local_date() {
+        let reset = chrono::Utc::now().timestamp() + 6 * 86400 + 3 * 3600 + 1800;
+        let date = chrono::DateTime::from_timestamp(reset, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%a %b %d %H:%M")
+            .to_string();
+        let usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 37, "limit_window_seconds": 604800, "reset_at": reset
+            }}
+        }))
+        .unwrap();
+
+        assert_eq!(usage_cells(&usage)[2], format!("in 6d 3h ({date})"));
+    }
+
     fn profiles_with_refresh_only_rotation() -> (tempfile::TempDir, config::Paths, profile::Profile)
     {
         let root = tempfile::tempdir().unwrap();

@@ -200,6 +200,184 @@ impl Drop for Server {
     }
 }
 
+fn local_profile(home: &std::path::Path, alias: &str) -> PathBuf {
+    let directory = home.join(".codexctl/profiles").join(alias);
+    store::atomic_write(
+        &directory.join("meta.json"),
+        &serde_json::to_vec(&json!({"alias":alias,"saved_at":"2026-10-02T00:00:00Z"})).unwrap(),
+    )
+    .unwrap();
+    // An unreadable credential must still leave the profile visible.
+    store::atomic_write(&directory.join("auth.json"), b"{}").unwrap();
+    directory
+}
+
+#[test]
+fn connected_status_before_migration_shows_local_profiles() {
+    let server = Server::start();
+    let home = server.connected_home();
+    local_profile(home.path(), "laptop-profile");
+
+    let output = server.cli(home.path(), &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("laptop-profile") && stdout.contains("local"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("No server accounts yet") && !stdout.contains("Label"));
+}
+
+#[test]
+fn connected_status_formats_server_reset() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    let date = chrono::DateTime::from_timestamp(4102444800, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%a %b %d %H:%M")
+        .to_string();
+
+    let output = server.cli(home.path(), &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("Resets") && stdout.contains("in ") && stdout.contains(&date),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn connected_list_before_migration_shows_local_profiles() {
+    let server = Server::start();
+    let home = server.connected_home();
+    local_profile(home.path(), "laptop-profile");
+
+    let output = server.cli(home.path(), &["list"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("laptop-profile") && stdout.contains("local"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("No server accounts yet") && !stdout.contains("Plan"));
+}
+
+#[test]
+fn connected_filtered_status_keeps_local_profile_errors() {
+    let server = Server::start();
+    let home = server.connected_home();
+    local_profile(home.path(), "laptop-profile");
+
+    let output = server.cli(home.path(), &["status", "--rate-limited"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("laptop-profile") && stdout.contains("credentials unavailable"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn connected_status_shows_server_and_unmigrated_profiles_with_the_same_alias() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "personal");
+    let transferred = local_profile(home.path(), "retired-profile");
+    store::atomic_write(&transferred.join(".central-transfer.json"), b"{}").unwrap();
+
+    let output = server.cli(home.path(), &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(stdout.matches("personal").count(), 2, "{stdout}");
+    assert!(
+        stdout.contains("local")
+            && stdout.contains("server")
+            && !stdout.contains("retired-profile")
+            && !stdout.contains("No server accounts yet"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn connected_list_fetches_local_usage_and_preserves_credentials_on_failure() {
+    use std::io::Write;
+    let server = Server::start();
+    let home = server.connected_home();
+    let directory = local_profile(home.path(), "laptop-profile");
+    let credentials = serde_json::to_vec(&auth("local-login", "local-seat")).unwrap();
+    store::atomic_write(&directory.join("auth.json"), &credentials).unwrap();
+    let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_address = proxy.local_addr().unwrap();
+    proxy.set_nonblocking(true).unwrap();
+    let request = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut stream = loop {
+            match proxy.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Err(error) => panic!("usage request did not reach proxy: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        stream
+            .write_all(
+                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        line
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .arg("list")
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("HTTPS_PROXY", format!("http://{proxy_address}"))
+        .env("https_proxy", format!("http://{proxy_address}"))
+        .env("NO_PROXY", "127.0.0.1")
+        .env("no_proxy", "127.0.0.1")
+        .output()
+        .unwrap();
+
+    assert!(
+        request
+            .join()
+            .unwrap()
+            .starts_with("CONNECT chatgpt.com:443")
+    );
+    assert!(
+        output.status.success()
+            && String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("usage unavailable")
+    );
+    assert_eq!(
+        std::fs::read(directory.join("auth.json")).unwrap(),
+        credentials
+    );
+}
+
 #[test]
 fn when_users_share_an_alias_then_each_catalog_contains_only_their_own_seat() {
     let server = Server::start();
