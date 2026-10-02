@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
     pub server: String,
@@ -83,20 +83,23 @@ pub fn login(
     cancel: bool,
 ) -> Result<bool> {
     let alias = store::validate_alias(alias)?;
-    if native::known_local_alias(alias)? {
-        // The existing local login path still checks active-provider and transfer
-        // ownership before it launches device authentication.
-        return Ok(false);
-    }
-    let Some(catalog) = catalog()? else {
+    let Some(connection) = connection()? else {
         return Ok(false);
     };
+    if !known_server_alias(&connection, alias)? {
+        return Ok(false);
+    }
+    let catalog = catalog()
+        .with_context(|| format!("cannot renew server account {alias}; local login is disabled"))?
+        .context("machine registration removed; local login is disabled for this server account")?;
     let Some(account) = catalog
         .accounts
         .iter()
         .find(|a| a.alias.eq_ignore_ascii_case(alias))
     else {
-        return Ok(false);
+        bail!(
+            "known server account {alias} is absent from the catalog; local login is disabled; reconcile its migration or connection records"
+        );
     };
     if label.is_some() || allow_adopt {
         bail!(
@@ -391,6 +394,57 @@ pub(crate) fn install(server: &str, token: &str) -> Result<()> {
     store::sync_directory(&directory)?;
     Ok(())
 }
+// This cache only routes login. Selection and credential delivery still require
+// a current catalog from the account server.
+#[derive(Serialize, Deserialize)]
+struct KnownAliases {
+    connection: Connection,
+    aliases: Vec<String>,
+}
+
+fn known_server_alias(connection: &Connection, alias: &str) -> Result<bool> {
+    let directory = root()?;
+    let cache = directory.join(".catalog.json");
+    if cache.try_exists()? {
+        let known: KnownAliases = serde_json::from_slice(&vault::private_read(&cache)?)
+            .context("cannot read known server aliases; local login is disabled")?;
+        if known.connection == *connection
+            && known
+                .aliases
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(alias))
+        {
+            return Ok(true);
+        }
+    }
+    // Retained migration and native connection records fence names even if the
+    // cached catalog is absent or no longer lists them. Match aliases on Linux too.
+    let profiles = config::default_paths()?.profiles_dir();
+    for (parent, name, marker) in [
+        (directory, format!("{alias}.json"), None),
+        (profiles, alias.to_owned(), Some(".central-transfer.json")),
+    ] {
+        if !parent.try_exists()? {
+            continue;
+        }
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+                && match marker {
+                    Some(marker) => entry.path().join(marker).try_exists()?,
+                    None => true,
+                }
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(super) struct Catalog {
     pub connection: Connection,
     pub accounts: Vec<Account>,
@@ -413,16 +467,32 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
     let Some(connection) = connection()? else {
         return Ok(None);
     };
+    let directory = root()?;
+    // Serialize discovery with its cache write so an older response cannot
+    // erase a server alias that another discovery already recorded.
+    let _discovery = vault::registry_lock(&directory, "catalog.lock")?;
+    require_current_connection(&connection)?;
     let response = request(&connection, "/v1/accounts")?
         .send()
         .context("cannot reach the account server")?;
     let accounts: Vec<Account> = check(response)?.json()?;
+    let _lock = native::native_lock(&directory)?;
     require_current_connection(&connection)?;
     for account in &accounts {
         if account.user_id != connection.user_id {
             bail!("server user identity changed");
         }
     }
+    store::atomic_write(
+        &directory.join(".catalog.json"),
+        &serde_json::to_vec(&KnownAliases {
+            connection: connection.clone(),
+            aliases: accounts
+                .iter()
+                .map(|account| account.alias.clone())
+                .collect(),
+        })?,
+    )?;
     Ok(Some(Catalog {
         connection,
         accounts,
