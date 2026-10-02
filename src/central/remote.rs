@@ -5,6 +5,7 @@ use super::{
     native, transport, vault,
 };
 use crate::status_format::format_window_reset as reset_time;
+use crate::status_json::{self, AccountStatus, Source, State};
 use crate::{api, config, profile, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -502,6 +503,7 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
 struct DisplayRow {
     cells: Vec<String>,
     billing: api::BillingClass,
+    account: AccountStatus,
 }
 
 fn usage_cells(usage: &api::RateLimitResponse) -> Vec<String> {
@@ -559,6 +561,7 @@ async fn local_display_rows(
                     p.meta.plan.clone().unwrap_or_else(|| "-".into()),
                 ],
                 billing: api::BillingClass::Unknown,
+                account: AccountStatus::local(&p.meta, false),
             };
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active);
             let usage = match api::read_auth_json(&auth_path) {
@@ -571,6 +574,7 @@ async fn local_display_rows(
             };
             match usage {
                 Ok(usage) => {
+                    row.account.set_usage(&usage);
                     // Local status groups unknown billing with rate-limited
                     // results for display; selection still uses the catalog.
                     row.billing = match usage.billing_class() {
@@ -584,6 +588,7 @@ async fn local_display_rows(
                     row.cells.extend(["local".into(), "-".into()]);
                 }
                 Err(reason) => {
+                    row.account.error = Some(reason.into());
                     // Match the local status command's error grouping. This is
                     // display metadata, never permission to select or bill.
                     row.billing = if p
@@ -613,7 +618,7 @@ async fn local_display_rows(
     .map(|rows| rows.into_iter().flatten().collect())
 }
 
-pub fn show(status: bool, filter: Option<api::BillingClass>) -> Result<bool> {
+pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Result<bool> {
     let Some(accounts) = accounts()? else {
         return Ok(false);
     };
@@ -650,11 +655,34 @@ pub fn show(status: bool, filter: Option<api::BillingClass>) -> Result<bool> {
                     "-".into(),
                 ],
                 billing: account.billing_class,
+                account: AccountStatus {
+                    alias: account.alias.clone(),
+                    label: account.label.clone(),
+                    plan: account.plan.clone(),
+                    source: Source::Server,
+                    state: if !account.available {
+                        State::Unavailable
+                    } else if active.as_deref() == Some(&account.alias) {
+                        State::Active
+                    } else {
+                        State::Server
+                    },
+                    primary_used_percent: account.primary_used,
+                    secondary_used_percent: account.secondary_used,
+                    resets_at: status_json::timestamp(account.resets_at),
+                    billing_class: account.billing_class,
+                    error: (!account.available).then(|| "account unavailable".into()),
+                },
             }
         })
         .collect();
     server_rows.append(&mut rows);
     server_rows.retain(|row| filter.is_none_or(|f| row.billing == f));
+    if json {
+        let accounts: Vec<_> = server_rows.into_iter().map(|row| row.account).collect();
+        status_json::print(&accounts)?;
+        return Ok(true);
+    }
     if !server_rows.is_empty() {
         let headers = [
             "Account",

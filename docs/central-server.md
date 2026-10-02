@@ -84,6 +84,9 @@ These steps come from a migration on 2026-10-02 with 28 Codex panes on one Mac.
 
 ## Daily Use
 
+Use `codexctl status --json` or `codexctl list --json` for automation.
+See the [versioned JSON schema](status-json.md) for fields and failure behavior.
+
 ```sh
 codexctl status
 codexctl list
