@@ -188,11 +188,20 @@ Use only synthetic credentials or a dedicated test login with that option.
 
 ## Staging Deployment
 
-The image definition is `deploy/Dockerfile`.
-Use the staging overlay at `deploy/k8s/overlays/staging`.
-Review the Argo application definition at `deploy/k8s/staging-application.yaml`.
-That definition has no automatic sync.
-Before registration, pin both workload images to the built image digest.
+The image definition is `deploy/Dockerfile`. Its allowlisted build context contains
+only the Rust source, locked dependencies, and Dockerfile.
+The `Central server image` workflow publishes reviewed `main` commits to private ECR.
+Its dedicated AWS role can publish only the codexctl image. It cannot read runtime
+secrets or access the cluster. Forks and non-main branches cannot assume that role.
+The workflow publishes both Linux architectures and records the combined digest.
+Set the repository variable `CENTRAL_IMAGE_PUBLISH_ROLE` to the dedicated role ARN.
+Before registration, pin both workload images to that digest in the staging overlay.
+
+The staging application lives in `Sawmills/argocd-deploy` at
+`plat/ue1-staging/argocd/codexctl-application.yaml`.
+Its parent application registers it from Git. Automatic sync, prune, and self-heal
+then reconcile `deploy/k8s/overlays/staging` from this repository.
+The internal ALB terminates HTTPS. The broker uses a ClusterIP service.
 
 One StatefulSet replica owns an encrypted `ReadWriteOncePod` volume.
 Do not add replicas, an autoscaler, or a second server with a copy of the credentials.
@@ -210,10 +219,11 @@ External Secrets supplies the pod secret.
 An init container copies the projected files into private real files for the broker.
 Key rotation needs a separate re-encryption procedure. Do not rotate the key independently of the stored vaults.
 
-The supplied SSO overlay points to the existing staging Dex issuer.
-Dex documents a security concern with its existing SAML connector.
-Resolve that concern or select a maintained company OIDC provider before live deployment.
-See [the staging research](research/central-staging.md).
+The SSO overlay uses the company production identity issuer `https://clerk.sawmills.ai`.
+Its test mode is disabled. The service deployment and dedicated client remain in staging. A dedicated confidential application requires PKCE and has one exact
+HTTPS callback. Google sign-in is enabled. Enrollment requires a verified
+`sawmills.ai` primary email. The broker requests only `openid email`.
+See [the OIDC configuration research](research/central-staging-oidc.md).
 
 The staging VPC CNI currently has NetworkPolicy enforcement disabled.
 The supplied policy does not yet restrict pod traffic in that cluster.
@@ -278,13 +288,14 @@ This first deployment has one server and does not promise uninterrupted availabi
 Authenticated `/metrics` records each rejected API attempt once, including JSON and body-limit rejections.
 Owner failures during account listing have a separate bounded reason.
 The staging overlay includes a PrometheusRule for the existing `kube-prometheus` selector.
-`deploy/monitoring/servicemonitor.yaml` supplies the separate authenticated scrape.
-The current staging ServiceMonitor schema has no authentication fields.
-Update that schema before registering this scrape definition.
-The unavailable rule also detects a missing scrape.
-The metrics endpoint uses a separate credential from `/app/codexctl/metrics-token`.
-This credential has no account API access.
-Rules cover unavailable scrapes and recent credential or persistence failures.
+The staging `ScrapeConfig` supplies an authenticated scrape through the existing
+Prometheus operator. Its Secret reference selects only the metrics credential.
+The ServiceMonitor schema lacks authentication fields, so this deployment uses
+that supported ScrapeConfig path without changing the shared monitoring hold.
+The endpoint declares Prometheus text format version 0.0.4.
+Availability alerts use failed or absent scrapes. Credential alerts use recent
+failure timestamps and the unresolved-ownership gauge.
+The metrics credential at `/app/codexctl/metrics-token` has no account API access.
 Failure timestamps allow the first failure to alert even before a zero counter was scraped.
 Alert routing and notification delivery are separate deployment checks.
 

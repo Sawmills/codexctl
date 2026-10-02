@@ -771,14 +771,17 @@ fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_reject
             .status(),
         400
     );
-    let output = server
+    let response = server
         .http
         .get(format!("{}/metrics", server.url))
         .bearer_auth(metrics)
         .send()
-        .unwrap()
-        .text()
         .unwrap();
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let output = response.text().unwrap();
     assert!(output.contains("reason=\"unauthorized\"} 1\n"), "{output}");
     assert!(
         output.contains("reason=\"invalid_request\"} 1\n"),

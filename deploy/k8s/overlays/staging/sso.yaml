@@ -6,8 +6,8 @@ metadata:
 data:
   sso.json: |
     {
-      "issuer": "https://argocd.ue1.staging.plat.sm-svc.com/api/dex",
-      "client_id": "codexctl",
+      "issuer": "https://clerk.sawmills.ai",
+      "client_id": "StnV91x99CEYVmSy",
       "client_secret_file": "/keys/oidc-client-secret",
       "allowed_domains": ["sawmills.ai"]
     }
