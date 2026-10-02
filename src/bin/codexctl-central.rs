@@ -111,7 +111,9 @@ enum Commands {
     },
 }
 
-#[tokio::main]
+// Native children use Linux PR_SET_PDEATHSIG, which follows the spawning thread.
+// Spawn directly on this long-lived main thread, never in spawn_blocking.
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
     if let Commands::Connect {

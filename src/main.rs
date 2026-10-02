@@ -63,7 +63,7 @@ enum Commands {
         #[arg(long, conflicts_with = "rate_limited")]
         usage_based: bool,
     },
-    /// Log into a Codex account in an isolated auth home and save it
+    /// Log into a local Codex account or renew an existing server account
     Login {
         /// Profile alias to save the login as
         alias: String,
@@ -74,6 +74,12 @@ enum Commands {
         /// prompting (needed on a terminal that cannot answer)
         #[arg(long)]
         allow_adopt: bool,
+        /// Print the server-managed OpenAI sign-in link without opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Stop a pending server-managed login and wait for its terminal status.
+        #[arg(long)]
+        cancel: bool,
     },
     /// Save current ~/.codex/auth.json as a profile
     Save {
@@ -237,7 +243,24 @@ fn main() {
             ref alias,
             ref label,
             allow_adopt,
-        } => commands::login::run(alias, label.as_deref(), allow_adopt),
+            no_browser,
+            cancel,
+        } => (|| {
+            #[cfg(feature = "central-prototype")]
+            if codexctl::central::remote::login(
+                alias,
+                label.as_deref(),
+                allow_adopt,
+                no_browser,
+                cancel,
+            )? {
+                return Ok(());
+            }
+            if no_browser || cancel {
+                anyhow::bail!("--no-browser and --cancel require an existing server account");
+            }
+            commands::login::run(alias, label.as_deref(), allow_adopt)
+        })(),
         Commands::Save {
             ref alias,
             ref label,

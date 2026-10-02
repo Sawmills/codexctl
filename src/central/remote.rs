@@ -8,7 +8,7 @@ use crate::status_format::format_window_reset as reset_time;
 use crate::{api, config, profile, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -72,6 +72,217 @@ fn browser(url: &str) -> Result<()> {
         bail!("browser did not open; use the printed sign-in link");
     }
     Ok(())
+}
+
+/// Existing remote aliases renew on the server. Local login retains its old contract.
+pub fn login(
+    alias: &str,
+    label: Option<&str>,
+    allow_adopt: bool,
+    no_browser: bool,
+    cancel: bool,
+) -> Result<bool> {
+    let alias = store::validate_alias(alias)?;
+    if native::known_local_alias(alias)? {
+        // The existing local login path still checks active-provider and transfer
+        // ownership before it launches device authentication.
+        return Ok(false);
+    }
+    let Some(catalog) = catalog()? else {
+        return Ok(false);
+    };
+    let Some(account) = catalog
+        .accounts
+        .iter()
+        .find(|a| a.alias.eq_ignore_ascii_case(alias))
+    else {
+        return Ok(false);
+    };
+    if label.is_some() || allow_adopt {
+        bail!(
+            "server login preserves the account identity and label; omit --label and --allow-adopt"
+        );
+    }
+    let connection = catalog.connection;
+    let alias = &account.alias;
+    let directory = root()?;
+    store::ensure_private_dir(&directory)?;
+    let lock_name = format!(
+        "login-{}.lock",
+        vault::digest(alias.to_ascii_lowercase().as_bytes())
+    );
+    let receipt_lock = vault::registry_lock(&directory, &lock_name)?;
+    let path = directory.join(format!(
+        ".login-{}.json",
+        vault::digest(alias.to_ascii_lowercase().as_bytes())
+    ));
+    let mut id = if path.try_exists()? {
+        let saved: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
+        if saved["server"] != connection.server
+            || saved["userId"] != connection.user_id
+            || saved["alias"] != *alias
+        {
+            bail!(
+                "saved server login belongs to another registration; retain it until ownership is reconciled"
+            );
+        }
+        saved["id"]
+            .as_str()
+            .context("invalid saved login operation")?
+            .to_owned()
+    } else {
+        vault::digest(&super::enrollment::random_bytes())
+    };
+    let persist = |id: &str| {
+        store::atomic_write(
+            &path,
+            &serde_json::to_vec(
+                &json!({"server":connection.server,"userId":connection.user_id,"alias":alias,"id":id}),
+            )?,
+        )
+    };
+    let call = |endpoint: &str, id: &str| -> Result<Value> {
+        require_current_connection(&connection)?;
+        let http = transport::blocking()?;
+        let response = http
+            .post(format!(
+                "{}{endpoint}",
+                connection.server.trim_end_matches('/')
+            ))
+            .bearer_auth(secret(&connection)?)
+            .json(&json!({"alias":alias,"id":id}))
+            .send()?;
+        if !response.status().is_success() {
+            bail!(
+                "server login request rejected (HTTP {}); the operation is retained, rerun codexctl login {alias}",
+                response.status()
+            );
+        }
+        let value: Value = response.json()?;
+        require_current_connection(&connection)?;
+        if value["userId"] != connection.user_id || value["alias"] != *alias {
+            bail!("server login identity changed");
+        }
+        let response_id = value["id"]
+            .as_str()
+            .context("missing server login operation")?;
+        if response_id.len() != 64
+            || !response_id
+                .bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            bail!("invalid server login operation");
+        }
+        Ok(value)
+    };
+    let had_receipt = path.try_exists()?;
+    if !cancel {
+        persist(&id)?;
+    }
+    drop(receipt_lock);
+    let requested_id = id.clone();
+    let mut status = if cancel {
+        call("/v1/relogin/status", if had_receipt { &id } else { "" })?
+    } else {
+        println!(
+            "Renewing OpenAI login for server account {alias}. Sign in to that same OpenAI account and workspace."
+        );
+        println!("Approving a different account can invalidate its previous OpenAI login.");
+        call("/v1/relogin/start", &id)?
+    };
+    id = status["id"]
+        .as_str()
+        .context("missing login operation")?
+        .into();
+    {
+        let _lock = vault::registry_lock(&directory, &lock_name)?;
+        let saved = if path.try_exists()? {
+            Some(serde_json::from_slice::<Value>(&vault::private_read(
+                &path,
+            )?)?)
+        } else {
+            None
+        };
+        if saved
+            .as_ref()
+            .is_none_or(|value| value["id"] == requested_id)
+        {
+            persist(&id)?;
+        }
+    }
+    if cancel {
+        status = call("/v1/relogin/cancel", &id)?;
+    }
+    let clear_receipt = || -> Result<()> {
+        let _lock = vault::registry_lock(&directory, &lock_name)?;
+        if path.try_exists()? {
+            let saved: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
+            if saved["id"] == id {
+                std::fs::remove_file(&path)?;
+                store::sync_directory(&directory)?;
+            }
+        }
+        Ok(())
+    };
+    let started = std::time::Instant::now();
+    let mut displayed = false;
+    loop {
+        match status["status"].as_str() {
+            Some("verifying") if status["error"].is_string() => {
+                bail!(
+                    "server could not finish credential verification; the operation is retained. Retry codexctl login {alias}"
+                );
+            }
+            Some("completed") => {
+                clear_receipt()?;
+                println!(
+                    "Server login renewed for {alias}. Connected machines can keep using this account."
+                );
+                return Ok(true);
+            }
+            Some("failed" | "canceled") => {
+                clear_receipt()?;
+                let reason = match status["error"].as_str() {
+                    Some("wrong_account") => {
+                        "OpenAI returned a different account; its grant is retained on the server"
+                    }
+                    Some("login_stopped_account_requires_relogin") => {
+                        "login stopped; the account requires a new login"
+                    }
+                    _ => "server login failed; the account remains unavailable",
+                };
+                bail!("{reason}. Retry with codexctl login {alias}");
+            }
+            Some("starting" | "verifying" | "pending") => {}
+            _ => bail!("unsupported server login state; operation retained"),
+        }
+        if !cancel && !displayed && status["status"] == "pending" {
+            if status["verificationUrl"] != "https://auth.openai.com/codex/device" {
+                bail!("unsupported OpenAI login URL");
+            }
+            let code = status["userCode"]
+                .as_str()
+                .context("missing OpenAI login code")?;
+            if code.is_empty() || code.len() > 128 || !code.bytes().all(|c| c.is_ascii_graphic()) {
+                bail!("invalid OpenAI login code");
+            }
+            println!("Open https://auth.openai.com/codex/device and enter: {code}");
+            if !no_browser {
+                browser("https://auth.openai.com/codex/device")?;
+            }
+            displayed = true;
+        }
+        if started.elapsed() > Duration::from_secs(960) {
+            bail!(
+                "login status timed out; rerun codexctl login {alias} to resume, or add --cancel"
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        status = call("/v1/relogin/status", &id)?;
+        if status["id"] != id {
+            bail!("server login operation changed");
+        }
+    }
 }
 pub fn connect(server: &str, name: Option<&str>, no_browser: bool) -> Result<()> {
     transport::origin(server)?;

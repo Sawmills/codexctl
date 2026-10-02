@@ -99,6 +99,28 @@ Parallel local commands remain supported.
 An explicit saved local alias can restore local mode before migration, even when the server is unavailable.
 Transferred aliases require the server. A known remote connection with the same alias blocks local selection.
 Device login refuses a transferred alias even after disconnect.
+An enrolled machine uses `codexctl login <alias>` to renew an existing server account.
+The command prints an OpenAI device code and opens the OpenAI sign-in page.
+Use `--no-browser` to open that page on another machine.
+Approve the same OpenAI login and workspace as the selected alias.
+The server stops that account's previous refresh owner before sign-in.
+It retains the replacement credentials in a private server home and checks the account identity before replacement.
+It then verifies the replacement owner before reporting success.
+Your machine's OpenAI credentials and active account do not change.
+Your other enrolled machines keep their registration and aliases.
+
+If your terminal disconnects, run the same login command to resume.
+Resume from the machine that started the login. Other machines cannot resume or cancel its pending login.
+To stop a pending login, run `codexctl login <alias> --cancel`.
+A canceled or failed login leaves that account unavailable until you retry.
+Cancellation does not undo an authorization that OpenAI already issued.
+Approving a different OpenAI account can invalidate that other account's previous grant.
+The server retains a wrong-account grant without replacing the selected alias.
+It stops a known owner of that wrong grant until the rightful user renews that account.
+Other accounts remain available.
+
+Without server registration, `codexctl login` keeps its local behavior.
+Other aliases keep the existing local login and transfer checks.
 `whoami` reports the active account. Retiring live credentials also clears the local active marker.
 After disconnect, it reports a local profile only when local credentials remain active.
 The native provider currently supports the global ChatGPT backend with no regional routing constraint.

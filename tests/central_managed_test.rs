@@ -21,6 +21,39 @@ fn auth(subject: &str, account: &str) -> Value {
     json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic-refresh","account_id":account}})
 }
 impl Server {
+    fn login_request(
+        &self,
+        token: &str,
+        operation: &str,
+        alias: &str,
+        id: &str,
+    ) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/relogin/{operation}", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias,"id":id}))
+            .send()
+            .unwrap()
+    }
+    fn await_login(&self, token: &str, alias: &str, id: &str, terminal: &str) -> Value {
+        for _ in 0..200 {
+            let status: Value = self
+                .login_request(token, "status", alias, id)
+                .json()
+                .unwrap();
+            if status["status"] == terminal {
+                return status;
+            }
+            if matches!(
+                status["status"].as_str(),
+                Some("completed" | "failed" | "canceled")
+            ) {
+                panic!("unexpected login result: {}", status["status"]);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("login did not finish");
+    }
     fn start() -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
@@ -89,6 +122,13 @@ impl Server {
         )
     }
     fn spawn_binary(root: &tempfile::TempDir, binary: &std::path::Path) -> (Child, String) {
+        Self::spawn_binary_with_flags(root, binary, &[])
+    }
+    fn spawn_binary_with_flags(
+        root: &tempfile::TempDir,
+        binary: &std::path::Path,
+        flags: &[&str],
+    ) -> (Child, String) {
         let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
@@ -105,6 +145,7 @@ impl Server {
                 "--codex-bin",
             ])
             .arg(binary)
+            .args(flags)
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
             .env("CENTRAL_TEST_KEY_FILE", root.path().join("key"))
@@ -192,6 +233,664 @@ impl Server {
         .unwrap();
         home
     }
+}
+
+#[test]
+fn server_relogin_rejects_and_retains_another_login_in_the_same_workspace() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "shared-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "work", "alex-login", "shared-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "other", "other-login", "other-seat")
+            .status()
+            .is_success()
+    );
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let id = "b".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("alex-login", "shared-seat")).unwrap(),
+    )
+    .unwrap();
+    let failed = server.await_login(&server.amir, "personal", &id, "failed");
+    assert_eq!(failed["error"], "wrong_account");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "other", None).status(), 200);
+    assert_eq!(
+        server
+            .import(&server.amir, "stolen", "alex-login", "shared-seat")
+            .status(),
+        409
+    );
+    let original = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join(format!("relogin/{id}/record.json")).exists())
+        .unwrap();
+    let retained: Value = serde_json::from_slice(
+        &std::fs::read(original.join(format!("relogin/{id}/record.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained["candidate"]["tokens"]["account_id"], "shared-seat");
+    let original_auth: Value =
+        serde_json::from_slice(&std::fs::read(original.join("runtime/auth.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        original_auth["tokens"]["access_token"],
+        before["accessToken"]
+    );
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "other", None).status(), 200);
+}
+
+#[test]
+fn hq_same_device_resumes_but_other_devices_cannot_read_or_cancel() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    central::register(
+        &server.root.path().join("state"),
+        "amir-desktop",
+        "sawmills",
+        "amir",
+        &server.root.path().join("desktop.token"),
+    )
+    .unwrap();
+    let desktop = std::fs::read_to_string(server.root.path().join("desktop.token")).unwrap();
+    let id = "c".repeat(64);
+    let first: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    let resumed: Value = server
+        .login_request(&server.amir, "start", "personal", &"d".repeat(64))
+        .json()
+        .unwrap();
+    assert_eq!(first["id"], resumed["id"]);
+    for operation in ["start", "status", "cancel"] {
+        assert_eq!(
+            server
+                .login_request(&desktop, operation, "personal", &id)
+                .status(),
+            409
+        );
+    }
+    assert_eq!(
+        server
+            .login_request(&server.alex, "cancel", "personal", &id)
+            .status(),
+        404
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "cancel", "personal", &id)
+            .status(),
+        200
+    );
+    server.await_login(&server.amir, "personal", &id, "canceled");
+    assert_eq!(server.token(&desktop, "personal", None).status(), 503);
+    assert_eq!(
+        server
+            .login_request(&desktop, "start", "personal", &"e".repeat(64))
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&desktop, "cancel", "personal", &"e".repeat(64))
+            .status(),
+        200
+    );
+    server.await_login(&desktop, "personal", &"e".repeat(64), "canceled");
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn server_login_uses_the_existing_cli_without_changing_local_credentials() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/central");
+    store::ensure_private_dir(&directory).unwrap();
+    let token = directory.join("device.token");
+    store::atomic_write(&token, server.amir.as_bytes()).unwrap();
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(&json!({"server":server.url,"token_file":token,"user_id":"amir"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let auth_file = home.path().join(".codex/auth.json");
+    store::ensure_private_dir(auth_file.parent().unwrap()).unwrap();
+    store::atomic_write(&auth_file, b"local-auth-sentinel").unwrap();
+    let cli = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["login", "personal", "--no-browser"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let current = server.await_login(&server.amir, "personal", "", "pending");
+    assert_eq!(current["userCode"], "TEST-LOGIN");
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    let output = cli.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Server login renewed"));
+    assert_eq!(std::fs::read(auth_file).unwrap(), b"local-auth-sentinel");
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+}
+
+#[test]
+fn server_login_revocation_stops_the_native_child_and_rejects_future_status_delivery() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let id = "1".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    let response = server
+        .http
+        .post(format!("{}/v1/devices/revoke", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"id":"amir-laptop"}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "status", "personal", &id)
+            .status(),
+        401
+    );
+    central::register(
+        &server.root.path().join("state"),
+        "amir-replacement",
+        "sawmills",
+        "amir",
+        &server.root.path().join("replacement.token"),
+    )
+    .unwrap();
+    let replacement =
+        std::fs::read_to_string(server.root.path().join("replacement.token")).unwrap();
+    assert_eq!(
+        server
+            .login_request(&replacement, "status", "personal", &id)
+            .status(),
+        409
+    );
+    let record_path = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .map(|e| e.unwrap().path().join(format!("relogin/{id}/record.json")))
+        .find(|p| p.exists())
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let record: Value = serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        if record["phase"] == "canceled" {
+            assert_eq!(record["child"]["status"], "exited");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.token(&server.alex, "personal", None).status(), 200);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_failed_requests_total{reason=\"relogin_stopped\"} 1")
+    );
+}
+
+#[test]
+fn identical_operation_ids_do_not_cross_company_user_boundaries() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let id = "2".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.alex, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.alex, "cancel", "personal", &id)
+            .status(),
+        200
+    );
+    server.await_login(&server.alex, "personal", &id, "canceled");
+    let amir: Value = server
+        .login_request(&server.amir, "status", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(amir["status"], "pending");
+    server.login_request(&server.amir, "cancel", "personal", &id);
+    server.await_login(&server.amir, "personal", &id, "canceled");
+}
+
+#[test]
+fn unsupported_native_login_output_is_stopped_and_can_be_retried() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-invalid-prompt").unwrap();
+    let id = "3".repeat(64);
+    let result: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(result["status"], "failed");
+    assert!(result["userCode"].is_null());
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let retry = "4".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &retry)
+            .status(),
+        200
+    );
+    server.login_request(&server.amir, "cancel", "personal", &retry);
+    server.await_login(&server.amir, "personal", &retry, "canceled");
+}
+
+#[test]
+fn restarting_after_native_grant_save_recovers_it_without_another_browser_login() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    let id = "5".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let native = account.join(format!("relogin/{id}/home/auth.json"));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.root.path().join("login-saved").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(native.exists());
+    let process: Value = serde_json::from_slice(
+        &std::fs::read(account.join(format!("relogin/{id}/record.json"))).unwrap(),
+    )
+    .unwrap();
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    // macOS has no parent-death signal. Stop this test's recorded native child explicitly.
+    unsafe {
+        libc::kill(
+            process["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    server.restart();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn an_interrupted_pending_login_becomes_retryable_after_server_restart() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let id = "6".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let process: Value = serde_json::from_slice(
+        &std::fs::read(account.join(format!("relogin/{id}/record.json"))).unwrap(),
+    )
+    .unwrap();
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    unsafe {
+        libc::kill(
+            process["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    server.restart();
+    let previous: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(previous["status"], "failed");
+    let retry = "7".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &retry)
+            .status(),
+        200
+    );
+    server.login_request(&server.amir, "cancel", "personal", &retry);
+    server.await_login(&server.amir, "personal", &retry, "canceled");
+}
+
+#[test]
+fn read_only_restart_never_verifies_a_pending_replacement_and_writable_restart_recovers() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let id = "8".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result: Value = server
+            .login_request(&server.amir, "status", "personal", &id)
+            .json()
+            .unwrap();
+        if result["error"] == "relogin_failed" {
+            assert_eq!(result["status"], "verifying");
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.stop();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let count = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    let (child, url) = Server::spawn_binary_with_flags(&server.root, &fixture, &["--read-only"]);
+    server.child = child;
+    server.url = url;
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        count
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    server.stop();
+    server.restart();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn verified_replacement_finishes_quarantine_retirement_before_recovery_reports_success() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "shared-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "work", "alex-login", "shared-seat")
+            .status()
+            .is_success()
+    );
+    let wrong = "9".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &wrong);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("alex-login", "shared-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &wrong, "failed");
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let repair = "a".repeat(64);
+    server.login_request(&server.alex, "start", "work", &repair);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("alex-login", "shared-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.alex, "work", &repair, "completed");
+    server.stop();
+    for entry in std::fs::read_dir(server.root.path().join("state/accounts")).unwrap() {
+        let account = entry.unwrap().path();
+        for (id, stage) in [(&wrong, "failed"), (&repair, "retiring")] {
+            let path = account.join(format!("relogin/{id}/record.json"));
+            if !path.exists() {
+                continue;
+            }
+            let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            record["phase"] = json!(stage);
+            record["retired"] = json!(false);
+            store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+    }
+    server.restart();
+    server.await_login(&server.alex, "work", &repair, "completed");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn server_relogin_replaces_only_the_original_account_and_survives_restart() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let start = server
+        .http
+        .post(format!("{}/v1/relogin/start", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"alias":"personal","id":"a".repeat(64)}))
+        .send()
+        .unwrap();
+    assert_eq!(
+        start.status(),
+        200,
+        "server-managed re-login must be available"
+    );
+    let flow: Value = start.json().unwrap();
+    assert_eq!(flow["status"], "pending");
+    assert_eq!(
+        flow["verificationUrl"],
+        "https://auth.openai.com/codex/device"
+    );
+    assert_eq!(flow["userCode"], "TEST-LOGIN");
+    let retry = server
+        .import(&server.amir, "personal", "amir-login", "amir-seat")
+        .status();
+    if retry != 409 {
+        server.login_request(
+            &server.amir,
+            "cancel",
+            "personal",
+            flow["id"].as_str().unwrap(),
+        );
+        server.await_login(
+            &server.amir,
+            "personal",
+            flow["id"].as_str().unwrap(),
+            "canceled",
+        );
+    }
+    assert_eq!(
+        retry, 409,
+        "the selected account stays reserved before a candidate grant exists"
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "personal", None).status(), 200);
+    let forbidden = server
+        .http
+        .post(format!("{}/v1/relogin/status", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"personal","id":flow["id"]}))
+        .send()
+        .unwrap();
+    assert_eq!(forbidden.status(), 404);
+    let mut replacement = auth("amir-login", "amir-seat");
+    let body = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"amir-login","iat":2000000020_u64,"exp":4102444800_u64,"generation":20,"https://api.openai.com/auth":{"chatgpt_account_id":"amir-seat","chatgpt_plan_type":"pro"}})).unwrap());
+    replacement["tokens"]["access_token"] = json!(format!("header.{body}."));
+    replacement["tokens"]["refresh_token"] = json!("synthetic-fresh-relogin-grant");
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&replacement).unwrap(),
+    )
+    .unwrap();
+    let mut done = false;
+    for _ in 0..200 {
+        let status: Value = server
+            .http
+            .post(format!("{}/v1/relogin/status", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"personal","id":flow["id"]}))
+            .send()
+            .unwrap()
+            .json()
+            .unwrap();
+        if status["status"] == "completed" {
+            done = true;
+            break;
+        }
+        assert!(
+            status["error"].is_null(),
+            "re-login failed: {}",
+            status["error"]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(done);
+    let after: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    assert_ne!(before["revision"], after["revision"]);
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -3166,4 +3865,1153 @@ fn pending_local_login_scenario(kill_parent: bool) {
             .status
             .success()
     );
+}
+
+#[test]
+fn hq_rejected_alias_cannot_renew_an_account_owned_by_another_user() {
+    let server = Server::start();
+    let mut rejected = auth("same-login", "same-seat");
+    rejected["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    let response = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"alias":"rejected", "auth":rejected}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        server
+            .import(&server.alex, "owner", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "rejected", &"a".repeat(64))
+            .status(),
+        409
+    );
+    assert_eq!(server.token(&server.alex, "owner", None).status(), 200);
+}
+
+#[test]
+fn hq_partial_native_write_does_not_poison_later_renewal_or_unrelated_import() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let interrupted = "b".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &interrupted);
+    server.login_request(&server.amir, "cancel", "personal", &interrupted);
+    server.await_login(&server.amir, "personal", &interrupted, "canceled");
+    server.stop();
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    store::atomic_write(
+        &account.join(format!("relogin/{interrupted}/home/auth.json")),
+        b"{partial",
+    )
+    .unwrap();
+    server.restart();
+    assert_eq!(
+        server
+            .import(&server.alex, "other", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+    let retry = "c".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &retry)
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &retry, "completed");
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert_eq!(server.token(&server.alex, "other", None).status(), 200);
+}
+
+#[test]
+fn hq_permanent_rejection_allows_a_fresh_login_after_restart() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let first = "d".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &first);
+    let mut rejected = auth("amir-login", "amir-seat");
+    rejected["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&rejected).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &first, "failed");
+    server.stop();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    server.restart();
+    let retry = "e".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &retry)
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &retry, "completed");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn hq_cli_cancellation_can_run_while_the_original_cli_polls() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let home = server.connected_home();
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["login", "personal", "--no-browser"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    server.await_login(&server.amir, "personal", "", "pending");
+    let canceled = server.cli(home.path(), &["login", "personal", "--cancel"]);
+    let stderr = String::from_utf8_lossy(&canceled.stderr);
+    if !stderr.contains("login stopped") {
+        cli.kill().unwrap();
+    }
+    cli.wait().unwrap();
+    assert!(stderr.contains("login stopped"), "{stderr}");
+    assert_eq!(
+        server
+            .login_request(&server.amir, "status", "personal", "")
+            .json::<Value>()
+            .unwrap()["status"],
+        "canceled"
+    );
+}
+
+#[test]
+fn hq_remote_login_normalizes_alias_before_routing() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    let home = server.connected_home();
+    let result = server.cli(home.path(), &["login", " personal ", "--no-browser"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+}
+
+#[test]
+fn hq_login_resolves_the_owner_after_a_concurrent_import_replaces_it() {
+    let server = Server::start();
+    let mut rejected = auth("amir-login", "same-seat");
+    rejected["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"personal","auth":rejected}))
+            .send()
+            .unwrap()
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    std::thread::scope(|scope| {
+        let unrelated =
+            scope.spawn(|| server.import(&server.alex, "other", "alex-login", "other-seat"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.root.path().join("refresh-started").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let imported =
+            scope.spawn(|| server.import(&server.amir, "personal", "amir-login", "same-seat"));
+        std::thread::sleep(Duration::from_millis(100));
+        let login = scope
+            .spawn(|| server.login_request(&server.amir, "start", "personal", &"f".repeat(64)));
+        std::thread::sleep(Duration::from_millis(100));
+        store::atomic_write(&server.root.path().join("release"), b"go").unwrap();
+        assert_eq!(unrelated.join().unwrap().status(), 200);
+        assert_eq!(imported.join().unwrap().status(), 200);
+        assert_eq!(login.join().unwrap().status(), 200);
+    });
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &"f".repeat(64), "completed");
+}
+
+#[test]
+fn hq_late_worker_cannot_undo_another_accounts_retirement() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "same-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.alex, "work", "alex-login", "same-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    let wrong = "1".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &wrong);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("alex-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.root.path().join("login-saved").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    let repair = "2".repeat(64);
+    std::thread::scope(|scope| {
+        let request = scope.spawn(|| server.login_request(&server.alex, "start", "work", &repair));
+        while !server.root.path().join("refresh-started").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        store::atomic_write(&server.root.path().join("login-exit"), b"go").unwrap();
+        // The native child has exited, but its worker waits behind verification.
+        std::thread::sleep(Duration::from_millis(150));
+        store::atomic_write(&server.root.path().join("release"), b"go").unwrap();
+        assert_eq!(request.join().unwrap().status(), 200);
+    });
+    server.await_login(&server.alex, "work", &repair, "completed");
+    server.await_login(&server.amir, "personal", &wrong, "failed");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+}
+
+#[test]
+fn hq_relative_state_path_uses_an_absolute_native_home() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .current_dir(server.root.path())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args([
+            "serve",
+            "--state",
+            "state",
+            "--key-file",
+            "key",
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:8787",
+            "--codex-bin",
+        ])
+        .arg(fixture)
+        .env("CENTRAL_TEST_MODE_FILE", server.root.path().join("mode"))
+        .env(
+            "CENTRAL_TEST_REFRESH_COUNTER",
+            server.root.path().join("count"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    server.url = format!("http://{}", ready["listening"].as_str().unwrap());
+    server.child = child;
+    let id = "3".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "completed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hq_linux_parent_death_covers_the_missing_child_pid_window() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "4".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = account.join(format!("relogin/{id}/record.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let pid = record["child"]["process"]["pid"].as_u64().unwrap();
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        if stat
+            .as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            || stat
+                .as_ref()
+                .is_ok_and(|s| s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'))
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PDEATHSIG must stop the login child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Retain only the broker identity, as if the crash preceded the child PID write.
+    record["child"] = json!({"status":"spawning"});
+    store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+    server.restart();
+    server.await_login(&server.amir, "personal", &id, "failed");
+    assert_eq!(
+        server
+            .import(&server.alex, "other", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn hq_corrupt_unspawned_record_fences_only_its_account() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.alex, "other", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+    let id = "5".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    server.login_request(&server.amir, "cancel", "personal", &id);
+    server.await_login(&server.amir, "personal", &id, "canceled");
+    server.stop();
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.join(format!("relogin/{id}")).exists())
+        .unwrap();
+    let dir = account.join(format!("relogin/{id}"));
+    // Model a damaged published preparation with durable proof of no spawn.
+    store::atomic_write(&dir.join("home/spawn-failed"), b"not-started").unwrap();
+    store::atomic_write(&dir.join("record.json"), b"{partial").unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "other", None).status(), 200);
+    assert_eq!(
+        server
+            .import(&server.alex, "new", "other-login", "new-seat")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn hq_rejection_after_a_partial_verification_still_allows_fresh_login() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "6".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status: Value = server
+            .login_request(&server.amir, "status", "personal", &id)
+            .json()
+            .unwrap();
+        if status["error"].is_string() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"error").unwrap();
+    let retried: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(retried["status"], "failed");
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let fresh = "7".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &fresh)
+            .status(),
+        200
+    );
+    server.await_login(&server.amir, "personal", &fresh, "completed");
+}
+
+#[test]
+fn hq_verifier_missing_pid_crash_keeps_unrelated_accounts_available() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "a".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = account.join(format!("relogin/{id}/record.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        record["verifier_broker"], record["broker"],
+        "the real verifier must persist its own spawn intent"
+    );
+    #[cfg(not(target_os = "linux"))]
+    server.stop();
+    #[cfg(target_os = "linux")]
+    {
+        let process: Value =
+            serde_json::from_slice(&std::fs::read(account.join("runtime/pid")).unwrap()).unwrap();
+        let pid = process["pid"].as_u64().unwrap();
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            if stat
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                || stat
+                    .as_ref()
+                    .is_ok_and(|s| s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PDEATHSIG must stop the verifier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Crash after durable verifier spawn intent, before its PID is persisted.
+    record["phase"] = json!("promoted");
+    store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::remove_file(account.join("runtime/pid")).unwrap();
+    assert!(!account.join("runtime/spawn-failed").exists());
+    server.restart();
+    assert_eq!(
+        server
+            .import(&server.alex, "other", "alex-login", "alex-seat")
+            .status(),
+        200,
+        "unknown verifier must not fence other accounts"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        server.await_login(&server.amir, "personal", &id, "completed");
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn hq_known_local_login_does_not_require_the_server_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut server = Server::start();
+    let home = server.connected_home();
+    let profile = home.path().join(".codexctl/profiles/local");
+    store::ensure_private_dir(&profile).unwrap();
+    store::atomic_write(
+        &profile.join("auth.json"),
+        &serde_json::to_vec(&auth("local-login", "local-seat")).unwrap(),
+    )
+    .unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = bin.join("codex");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\necho LOCAL_LOGIN_REACHED >&2\nexit 42\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    server.stop();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["login", "local"])
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    };
+    let result = run();
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("LOCAL_LOGIN_REACHED"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // Known remote names must never fall through to native local login.
+    store::atomic_write(&profile.join(".central-transfer.json"), b"{}").unwrap();
+    assert!(!String::from_utf8_lossy(&run().stderr).contains("LOCAL_LOGIN_REACHED"));
+    std::fs::remove_file(profile.join(".central-transfer.json")).unwrap();
+    store::atomic_write(&home.path().join(".codexctl/central/local.json"), b"{}").unwrap();
+    assert!(!String::from_utf8_lossy(&run().stderr).contains("LOCAL_LOGIN_REACHED"));
+}
+
+#[test]
+fn hq_renewal_refuses_a_live_conflicting_import_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "different-login", "same-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    let id = "d".repeat(64);
+    let result = server.login_request(&server.amir, "start", "personal", &id);
+    if result.status().is_success() {
+        server.login_request(&server.amir, "cancel", "personal", &id);
+        server.await_login(&server.amir, "personal", &id, "canceled");
+    }
+    assert_eq!(
+        result.status(),
+        409,
+        "renewal must reserve the conflicting journal before device login"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn hq_startup_refuses_verification_against_a_conflicting_import_journal() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "different-login", "same-seat")
+            .status(),
+        200
+    );
+    let id = "c".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("different-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let response: Value = server
+            .login_request(&server.amir, "status", "personal", &id)
+            .json()
+            .unwrap();
+        if response["error"] == "relogin_failed" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    unsafe {
+        libc::kill(server.child.id() as i32, libc::SIGTERM);
+    }
+    assert!(!server.child.wait().unwrap().success());
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before,
+        "startup must not launch a competing verifier"
+    );
+}
+
+fn wait_for_renewal_error(server: &Server, alias: &str, id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result: Value = server
+            .login_request(&server.amir, "status", alias, id)
+            .json()
+            .unwrap();
+        if result["error"] == "relogin_failed" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "login renewal did not fail"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn hq5_verifier_retry_does_not_launch_a_conflicting_selected_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    let id = "1".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("same-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    wait_for_renewal_error(&server, "personal", &id);
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"startup").unwrap();
+    server.login_request(&server.amir, "start", "personal", &id);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before,
+        "no refresh process may start against the conflicting journal"
+    );
+}
+
+#[test]
+fn hq5_wrong_grant_fences_a_refresh_process_identified_only_by_its_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "2".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    let state = account_directory(&server, "alex", "pending");
+    let pid: Value =
+        serde_json::from_slice(&std::fs::read(state.join("runtime/pid")).unwrap()).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("different-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "failed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if unsafe { libc::kill(pid["pid"].as_i64().unwrap() as i32, 0) } != 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "quarantined runtime refresh process is still alive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn hq5_completed_retirement_retry_does_not_repeat_verification() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "3".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    let path =
+        account_directory(&server, "amir", "personal").join(format!("relogin/{id}/record.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["phase"] = json!("retiring");
+    store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let result: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert!(
+        result["error"].is_null(),
+        "completed recovery must not run a second failing verifier"
+    );
+}
+
+#[test]
+fn hq5_unauthenticated_renewal_refuses_before_waiting_for_migration_lock() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    std::thread::scope(|scope| {
+        let migration =
+            scope.spawn(|| server.import(&server.alex, "work", "alex-login", "alex-seat"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.root.path().join("refresh-started").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/relogin/start", server.url))
+            .json(&json!({"alias":"work","id":"4".repeat(64)}))
+            .timeout(Duration::from_millis(400))
+            .send();
+        store::atomic_write(&server.root.path().join("release"), b"go").unwrap();
+        assert_eq!(migration.join().unwrap().status(), 200);
+        assert_eq!(
+            result
+                .expect("authentication must not wait on migration")
+                .status(),
+            401
+        );
+    });
+}
+
+#[test]
+fn hq5_migration_normalizes_the_alias_used_for_lookup() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, " personal ", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "personal");
+    assert_eq!(server.token(&server.amir, " personal ", None).status(), 200);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn hq6_legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
+    use aes_gcm::{
+        Aes256Gcm,
+        aead::{Aead, KeyInit},
+    };
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    let canonical = account_directory(&server, "amir", "personal");
+    let legacy = account_directory(&server, "amir", " personal ");
+    let mut saved = saved_vault(&server, &canonical);
+    saved["alias"] = json!(" personal ");
+    let key = std::fs::read(server.root.path().join("key")).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    // Synthetic fixture only; this nonce is used once with this test's random key.
+    let nonce = [123_u8; 12];
+    let encrypted = cipher
+        .encrypt(
+            (&nonce).into(),
+            serde_json::to_vec(&saved).unwrap().as_slice(),
+        )
+        .unwrap();
+    let mut bytes = nonce.to_vec();
+    bytes.extend(encrypted);
+    store::atomic_write(&canonical.join("vault.enc"), &bytes).unwrap();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    server.restart();
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "personal");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert_eq!(
+        server
+            .import(&server.amir, " personal ", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    assert!(!canonical.exists());
+    let id = "b".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "status", " personal ", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "cancel", "personal", &id)
+            .status(),
+        200
+    );
+    server.await_login(&server.amir, "personal", &id, "canceled");
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("same-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    let machine = server.connected_home();
+    let renewed = server.cli(machine.path(), &["login", "personal", "--no-browser"]);
+    assert!(
+        renewed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renewed.stderr)
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn hq6_slow_refresh_does_not_block_another_alias_of_the_same_company_user() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "slow", "alex-login", "slow-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.amir, "fast", "amir-login", "fast-seat")
+            .status(),
+        200
+    );
+    let initial: Value = server.token(&server.amir, "slow", None).json().unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    let fast = std::thread::scope(|scope| {
+        let slow = scope.spawn(|| server.token(&server.amir, "slow", initial["revision"].as_str()));
+        wait_for_refresh(&server);
+        let fast = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/token", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"fast", "billing":true}))
+            .send();
+        store::atomic_write(&server.root.path().join("release"), b"released").unwrap();
+        assert_eq!(slow.join().unwrap().status(), 200);
+        fast
+    });
+    assert_eq!(
+        fast.expect("unrelated alias waited for slow refresh")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn hq6_partial_journal_does_not_prevent_an_unrelated_verified_restart() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    let journal = account_directory(&server, "amir", "personal").join("runtime/auth.json");
+    store::atomic_write(&journal, b"{partial").unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "personal", None).status(), 200);
+    assert_eq!(std::fs::read(&journal).unwrap(), b"{partial");
+    assert_eq!(
+        server
+            .import(&server.alex, "new", "other-login", "other-seat")
+            .status(),
+        503
+    );
+}
+
+#[test]
+fn hq7_unstarted_migrations_do_not_permanently_block_each_other() {
+    for cross_user in [false, true] {
+        let mut server = Server::start();
+        server.stop();
+        let executable = server.root.path().join("missing-codex");
+        let (child, url) = Server::spawn_binary(&server.root, &executable);
+        server.child = child;
+        server.url = url;
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        let claimant = if cross_user {
+            &server.alex
+        } else {
+            &server.amir
+        };
+        assert_eq!(
+            server
+                .import(claimant, "work", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        std::os::unix::fs::symlink(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"),
+            &executable,
+        )
+        .unwrap();
+        assert_eq!(
+            server
+                .import(claimant, "work", "same-login", "same-seat")
+                .status(),
+            200,
+            "two proven unstarted migrations must not reserve each other's grant"
+        );
+        assert_eq!(server.token(claimant, "work", None).status(), 200);
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "same-login", "same-seat")
+                .status(),
+            409
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "1"
+        );
+    }
+}
+
+#[test]
+fn hq7_migration_can_repair_quarantine_without_an_existing_server_account() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "shared-seat")
+            .status(),
+        200
+    );
+    let id = "c".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth_with_uid("alex-login", "shared-seat", "alex-uid")).unwrap(),
+    )
+    .unwrap();
+    let failed = server.await_login(&server.amir, "personal", &id, "failed");
+    assert_eq!(failed["error"], "wrong_account");
+    let quarantine =
+        account_directory(&server, "amir", "personal").join(format!("relogin/{id}/record.json"));
+    let original: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(original["retired"], false);
+    // Neither missing nor conflicting UID claims can retire this reservation.
+    for grant in [
+        auth("alex-login", "shared-seat"),
+        auth_with_uid("alex-login", "shared-seat", "wrong-uid"),
+    ] {
+        let refused = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.alex)
+            .json(&json!({"alias":"work", "auth":grant}))
+            .send()
+            .unwrap();
+        assert_eq!(refused.status(), 503);
+        assert!(!account_directory(&server, "alex", "work").exists());
+    }
+    let mut grant = auth_with_uid("alex-login", "shared-seat", "alex-uid");
+    grant["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    let rejected = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(rejected.status(), 503);
+    let retained: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(
+        retained, original,
+        "rejected verification must retain the reservation"
+    );
+    grant["tokens"]["refresh_token"] = json!("synthetic-fresh-bootstrap-grant");
+    let migrated = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(
+        migrated.status(),
+        200,
+        "a verified fresh migration must provide a quarantine repair path"
+    );
+    let retired: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(retired["retired"], true);
+    assert_eq!(
+        retired["candidate"], original["candidate"],
+        "retirement preserves quarantine evidence"
+    );
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    server.stop();
+    // Recreate a crash after the verified vault write but before retirement.
+    store::atomic_write(&quarantine, &serde_json::to_vec(&original).unwrap()).unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    let before = std::fs::read_to_string(server.root.path().join("count"))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let retried = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(retried.status(), 200);
+    let after = std::fs::read_to_string(server.root.path().join("count"))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "retry must verify again before retirement"
+    );
+    let retired: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(retired["retired"], true);
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
 }

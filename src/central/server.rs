@@ -104,23 +104,26 @@ pub(super) struct Owner {
     pub(super) verification_input: Option<Value>,
 }
 
+pub(super) fn validate_owned_identity(original_auth: &Value, auth: &Value) -> Result<()> {
+    vault::validate_auth(auth)?;
+    if vault::account(auth)? != vault::account(original_auth)?
+        || api::token_subject(vault::token(auth)?)
+            != api::token_subject(vault::token(original_auth)?)
+    {
+        bail!("central credential owner changed identity");
+    }
+    let original =
+        api::token_identity(vault::token(original_auth)?).context("missing original identity")?;
+    let updated = api::token_identity(vault::token(auth)?).context("missing updated identity")?;
+    if original.user_id.is_some() && original.user_id != updated.user_id {
+        bail!("central credential owner changed login identity");
+    }
+    Ok(())
+}
+
 impl Owner {
     pub(super) fn validate_owned_auth(&self, auth: &Value) -> Result<()> {
-        vault::validate_auth(auth)?;
-        if vault::account(auth)? != vault::account(&self.vault.auth)?
-            || api::token_subject(vault::token(auth)?)
-                != api::token_subject(vault::token(&self.vault.auth)?)
-        {
-            bail!("central credential owner changed identity");
-        }
-        let original = api::token_identity(vault::token(&self.vault.auth)?)
-            .context("missing original identity")?;
-        let updated =
-            api::token_identity(vault::token(auth)?).context("missing updated identity")?;
-        if original.user_id.is_some() && original.user_id != updated.user_id {
-            bail!("central credential owner changed login identity");
-        }
-        Ok(())
+        validate_owned_identity(&self.vault.auth, auth)
     }
 
     pub(super) fn reconcile_journal(&mut self) -> Result<()> {
@@ -493,30 +496,41 @@ pub async fn serve(
         &home.as_path().join("auth.json"),
         &serde_json::to_vec(&vault.auth)?,
     )?;
-    let rpc = if read_only {
-        None
-    } else {
-        let mut rpc = Rpc::spawn(binary, home.as_path(), true)?;
-        runtime.disable_cleanup(true);
-        rpc.initialize().await?;
-        Some(rpc)
+    store::atomic_write(&home.join("spawn-failed"), b"not-started")?;
+    let tenant = vault.tenant.clone();
+    let user = vault.user.clone();
+    let mut refresh = Owner {
+        vault,
+        rpc: None,
+        home,
+        state: state.into(),
+        key: key.into(),
+        available: true,
+        refresh_enabled: !read_only,
+        limits: None,
+        verification_input: None,
     };
+    if !read_only {
+        let migration_lock = Mutex::new(());
+        let guard = migration_lock.lock().await;
+        let proof = super::relogin::identity_inventory(state, key, &refresh.home)
+            .clear_for_launch(&refresh, super::relogin::AdmissionKind::Restore, &guard)?;
+        runtime.disable_cleanup(true);
+        if let Err(error) = super::managed::launch_owner(&mut refresh, binary, proof).await {
+            // Retain every runtime that might have refreshed credentials. A
+            // proven pre-spawn failure can safely remove this temporary copy.
+            if refresh.rpc.is_none() && super::managed::definitely_not_started(&refresh.home) {
+                runtime.disable_cleanup(false);
+            }
+            return Err(error);
+        }
+    }
     runtime.disable_cleanup(true);
     let broker = Broker {
         state: state.into(),
-        tenant: vault.tenant.clone(),
-        user: vault.user.clone(),
-        owner: Arc::new(Mutex::new(Owner {
-            vault,
-            rpc,
-            home,
-            state: state.into(),
-            key: key.into(),
-            available: true,
-            refresh_enabled: !read_only,
-            limits: None,
-            verification_input: None,
-        })),
+        tenant,
+        user,
+        owner: Arc::new(Mutex::new(refresh)),
         failures: Arc::new(StdMutex::new(BTreeMap::new())),
     };
     #[cfg(unix)]
