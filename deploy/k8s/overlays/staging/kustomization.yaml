@@ -7,3 +7,7 @@ resources:
   - externalsecret.yaml
   - sso.yaml
   - monitoring.yaml
+images:
+  - name: codexctl-central
+    newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
+    digest: sha256:ef7d07c474eb2551c773e7a3d200ed0c2c1c15ad4c439a8920d4072eddf87403
