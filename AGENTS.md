@@ -9,6 +9,8 @@
 
 ## Map
 
+- `CONTEXT.md` is the domain glossary. Use its terms in code, docs, PRs, and reports.
+- `docs/adr/` records architecture decisions.
 - `src/main.rs` is the binary entry point.
 - `src/lib.rs` is the library entry point.
 - `src/commands/` contains CLI command implementations.
