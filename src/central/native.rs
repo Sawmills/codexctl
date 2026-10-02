@@ -12,7 +12,7 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
-const PROVIDER: &str = "codexctl-central";
+pub(super) const PROVIDER: &str = "codexctl-central";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -604,6 +604,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         return Err(error);
     }
     save_connection(&path, &connection)?;
+    repair_sessions_if_active(SessionProviderAction::Rewrite).with_context(|| {
+        format!("server account {alias} is active; session repair failed; resolve the reported cause and retry codexctl session-provider rewrite")
+    })?;
     println!(
         "switched to remote account {alias}; start codexctl codex (resume: codexctl codex resume <session-id>)"
     );
@@ -626,6 +629,7 @@ pub(super) fn deactivate_locked() -> Result<()> {
             "Codex daemon is running; finish its sessions and run codex app-server daemon stop before disconnecting"
         );
     }
+    super::sessions::require_restored(&active.home)?;
     let mut doc = document(&active.home)?;
     if doc.get("model_provider").and_then(Item::as_str) == Some(PROVIDER) {
         match active.original_provider {
@@ -717,4 +721,50 @@ pub fn active_alias() -> Result<Option<String>> {
         .file_stem()
         .and_then(|s| s.to_str())
         .map(str::to_owned))
+}
+
+/// Session repair has explicit actions, so a dry run can never imply a write.
+#[derive(Clone, Copy, clap::Subcommand)]
+pub enum SessionProviderAction {
+    /// List old sessions and open-file skips without changing rollouts or backups.
+    DryRun,
+    /// Rewrite old providers after saving private original metadata lines.
+    Rewrite,
+    /// Restore original metadata lines from private backups.
+    Restore,
+}
+
+pub fn session_provider(action: SessionProviderAction) -> Result<()> {
+    let paths = config::default_paths()?;
+    let _mode = vault::mode_lock(
+        &paths.codexctl_dir().join("central"),
+        vault::LockMode::Shared,
+    )?;
+    let _lock = native_lock(&root()?)?;
+    if !repair_sessions_if_active(action)? {
+        bail!("session provider repair requires an active server account in this CODEX_HOME");
+    }
+    Ok(())
+}
+
+// Caller holds native.lock and a mode lease. Migration already owns both locks.
+pub(super) fn repair_sessions_if_active(action: SessionProviderAction) -> Result<bool> {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or(codex_home()?);
+    let marker = root()?.join(".native-active.json");
+    if !marker.try_exists()?
+        || document(&home)?
+            .get("model_provider")
+            .and_then(Item::as_str)
+            != Some(PROVIDER)
+    {
+        return Ok(false);
+    }
+    let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
+    if std::fs::canonicalize(&active.home)? != std::fs::canonicalize(&home)? {
+        bail!("remote provider is active in another Codex home");
+    }
+    super::sessions::run(&home, action)?;
+    Ok(true)
 }

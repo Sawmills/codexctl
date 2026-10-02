@@ -43,6 +43,12 @@ enum Commands {
         exclusive_owner: bool,
     },
     #[cfg(feature = "central-prototype")]
+    /// Repair or restore saved session providers in the active Codex home.
+    SessionProvider {
+        #[command(subcommand)]
+        action: codexctl::central::native::SessionProviderAction,
+    },
+    #[cfg(feature = "central-prototype")]
     /// List your registered devices, or revoke one.
     Devices {
         #[arg(long)]
@@ -231,6 +237,8 @@ fn main() {
             all,
             exclusive_owner,
         } => codexctl::central::remote::migrate(all, exclusive_owner),
+        #[cfg(feature = "central-prototype")]
+        Commands::SessionProvider { action } => codexctl::central::native::session_provider(action),
         #[cfg(feature = "central-prototype")]
         Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
         Commands::Status {

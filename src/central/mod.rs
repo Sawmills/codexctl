@@ -10,6 +10,7 @@ pub mod remote;
 pub(crate) mod resets;
 mod rpc;
 mod server;
+mod sessions;
 mod transport;
 mod vault;
 
