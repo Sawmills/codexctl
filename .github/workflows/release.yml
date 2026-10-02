@@ -85,6 +85,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             label: Linux_x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            label: Linux_arm64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -101,6 +104,14 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify Linux arm64 compatibility
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          test "$(getconf GNU_LIBC_VERSION)" = "glibc 2.35"
+          target/aarch64-unknown-linux-gnu/release/codexctl --version
+          target/aarch64-unknown-linux-gnu/release/codexctl-central --help
 
       - name: Package
         run: |
@@ -127,6 +138,7 @@ jobs:
       sha_darwin_arm64: ${{ steps.shas.outputs.darwin_arm64 }}
       sha_darwin_x86_64: ${{ steps.shas.outputs.darwin_x86_64 }}
       sha_linux_x86_64: ${{ steps.shas.outputs.linux_x86_64 }}
+      sha_linux_arm64: ${{ steps.shas.outputs.linux_arm64 }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -144,6 +156,7 @@ jobs:
             echo "darwin_arm64=$(sha Darwin_arm64)"
             echo "darwin_x86_64=$(sha Darwin_x86_64)"
             echo "linux_x86_64=$(sha Linux_x86_64)"
+            echo "linux_arm64=$(sha Linux_arm64)"
           } >> "$GITHUB_OUTPUT"
 
       - name: Create immutable GitHub release
@@ -199,6 +212,7 @@ jobs:
           SHA_DARWIN_ARM64: ${{ needs.release.outputs.sha_darwin_arm64 }}
           SHA_DARWIN_X86_64: ${{ needs.release.outputs.sha_darwin_x86_64 }}
           SHA_LINUX_X86_64: ${{ needs.release.outputs.sha_linux_x86_64 }}
+          SHA_LINUX_ARM64: ${{ needs.release.outputs.sha_linux_arm64 }}
         run: |
           set -euo pipefail
           base="https://github.com/${{ github.repository }}/releases/download/${TAG}"
@@ -225,6 +239,10 @@ jobs:
             end
 
             on_linux do
+              on_arm do
+                url "${base}/codexctl_${TAG}_Linux_arm64.tar.gz"
+                sha256 "${SHA_LINUX_ARM64}"
+              end
               on_intel do
                 url "${base}/codexctl_${TAG}_Linux_x86_64.tar.gz"
                 sha256 "${SHA_LINUX_X86_64}"
