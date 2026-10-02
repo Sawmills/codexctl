@@ -16,12 +16,14 @@ pub(in crate::central) enum AdmissionDenied {
     Reserved,
     Owned,
     Unsettled,
+    IdentityConflict,
 }
 impl std::fmt::Display for AdmissionDenied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Reserved => "login renewal reserves this server account",
             Self::Owned => "server account already belongs to a company user",
+            Self::IdentityConflict => "migration conflicts with retained login identity",
             Self::Unsettled => "previous refresh or login process is not cleared",
         })
     }
@@ -271,7 +273,8 @@ pub(in crate::central) fn clear_registry(
                 if kind == AdmissionKind::Migration {
                     // A new grant must preserve every known login claim before it
                     // can retire a quarantine, even when no server account exists.
-                    super::super::server::validate_owned_identity(&candidate.auth, auth)?;
+                    super::super::server::validate_owned_identity(&candidate.auth, auth)
+                        .map_err(|_| AdmissionDenied::IdentityConflict)?;
                 }
                 admission.quarantine_repair = true;
             }

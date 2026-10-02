@@ -391,6 +391,7 @@ fn server_login_uses_the_existing_cli_without_changing_local_credentials() {
             .unwrap(),
     )
     .unwrap();
+    assert!(server.cli(home.path(), &["list"]).status.success());
     let auth_file = home.path().join(".codex/auth.json");
     store::ensure_private_dir(auth_file.parent().unwrap()).unwrap();
     store::atomic_write(&auth_file, b"local-auth-sentinel").unwrap();
@@ -3994,6 +3995,7 @@ fn hq_cli_cancellation_can_run_while_the_original_cli_polls() {
         200
     );
     let home = server.connected_home();
+    assert!(server.cli(home.path(), &["list"]).status.success());
     let mut cli = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .env("HOME", home.path())
         .env_remove("CODEX_HOME")
@@ -4036,6 +4038,7 @@ fn hq_remote_login_normalizes_alias_before_routing() {
     )
     .unwrap();
     let home = server.connected_home();
+    assert!(server.cli(home.path(), &["list"]).status.success());
     let result = server.cli(home.path(), &["login", " personal ", "--no-browser"]);
     assert!(
         result.status.success(),
@@ -4779,6 +4782,7 @@ fn hq6_legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
     )
     .unwrap();
     let machine = server.connected_home();
+    assert!(server.cli(machine.path(), &["list"]).status.success());
     let renewed = server.cli(machine.path(), &["login", "personal", "--no-browser"]);
     assert!(
         renewed.status.success(),
@@ -4944,7 +4948,32 @@ fn hq7_migration_can_repair_quarantine_without_an_existing_server_account() {
             .json(&json!({"alias":"work", "auth":grant}))
             .send()
             .unwrap();
-        assert_eq!(refused.status(), 503);
+        assert_eq!(refused.status(), 409);
+        assert_eq!(
+            refused.json::<Value>().unwrap()["error"],
+            "alias_identity_conflict"
+        );
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(
+            metrics
+                .contains("codexctl_central_failed_requests_total{reason=\"recovery_failed\"} 0\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains(
+                "codexctl_central_last_failure_timestamp_seconds{reason=\"recovery_failed\"} 0\n"
+            ),
+            "{metrics}"
+        );
+        let retained: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+        assert_eq!(retained["retired"], false);
         assert!(!account_directory(&server, "alex", "work").exists());
     }
     let mut grant = auth_with_uid("alex-login", "shared-seat", "alex-uid");
@@ -5014,4 +5043,115 @@ fn hq7_migration_can_repair_quarantine_without_an_existing_server_account() {
     server.stop();
     server.restart();
     assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+}
+
+#[test]
+fn p3_new_local_login_skips_discovery_but_known_server_aliases_stay_fenced() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let home = server.connected_home();
+    // Populate the last catalog through the production discovery path.
+    assert!(server.cli(home.path(), &["list"]).status.success());
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = bin.join("codex");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\necho LOCAL_LOGIN_REACHED >&2\nexit 42\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    server.stop();
+    // A listening endpoint detects even an attempted discovery request.
+    let listener =
+        std::net::TcpListener::bind(server.url.strip_prefix("http://").unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop = done.clone();
+    let probe = std::thread::spawn(move || {
+        use std::io::Write;
+        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    return true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        false
+    });
+    let run = |alias: &str| {
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["login", alias])
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    };
+    let result = run("new-profile");
+    done.store(true, std::sync::atomic::Ordering::Release);
+    let contacted_server = probe.join().unwrap();
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("LOCAL_LOGIN_REACHED"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !contacted_server,
+        "a new local alias must not query the catalog"
+    );
+    for alias in ["personal", "PERSONAL"] {
+        let result = run(alias);
+        let error = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success());
+        assert!(!error.contains("LOCAL_LOGIN_REACHED"));
+        assert!(
+            error.contains("server account") && error.contains("local login"),
+            "{error}"
+        );
+    }
+    let profile = home.path().join(".codexctl/profiles/migrated");
+    store::ensure_private_dir(&profile).unwrap();
+    store::atomic_write(&profile.join(".central-transfer.json"), b"{}").unwrap();
+    for alias in ["migrated", "MIGRATED"] {
+        assert!(!String::from_utf8_lossy(&run(alias).stderr).contains("LOCAL_LOGIN_REACHED"));
+    }
+    store::atomic_write(&home.path().join(".codexctl/central/connected.json"), b"{}").unwrap();
+    for alias in ["connected", "CONNECTED"] {
+        assert!(!String::from_utf8_lossy(&run(alias).stderr).contains("LOCAL_LOGIN_REACHED"));
+    }
+    let cache = home.path().join(".codexctl/central/.catalog.json");
+    let mut known: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    known["connection"]["user_id"] = json!("another-company-user");
+    store::atomic_write(&cache, &serde_json::to_vec(&known).unwrap()).unwrap();
+    assert!(
+        String::from_utf8_lossy(&run("personal").stderr).contains("LOCAL_LOGIN_REACHED"),
+        "aliases cached for another registration cannot route this login"
+    );
+    std::fs::remove_file(&cache).unwrap();
+    assert!(
+        String::from_utf8_lossy(&run("new-profile").stderr).contains("LOCAL_LOGIN_REACHED"),
+        "a new machine does not need a cached catalog to start local login"
+    );
+    store::atomic_write(&cache, b"{").unwrap();
+    let refused = run("new-profile");
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(!error.contains("LOCAL_LOGIN_REACHED"));
+    assert!(
+        error.contains("cannot read known server aliases"),
+        "{error}"
+    );
 }

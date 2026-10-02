@@ -562,6 +562,9 @@ impl Broker {
                 Some(relogin::AdmissionDenied::Owned) => {
                     self.error(StatusCode::CONFLICT, "account_already_owned")
                 }
+                Some(relogin::AdmissionDenied::IdentityConflict) => {
+                    self.error(StatusCode::CONFLICT, "alias_identity_conflict")
+                }
                 Some(relogin::AdmissionDenied::Unsettled) => {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
                 }

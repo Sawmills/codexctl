@@ -118,9 +118,15 @@ Approving a different OpenAI account can invalidate that other account's previou
 The server retains a wrong-account grant without replacing the selected alias.
 It stops a known owner of that wrong grant until the rightful user renews that account.
 Other accounts remain available.
+A migration whose login identity conflicts with retained credentials returns HTTP 409 with `alias_identity_conflict`.
+The account stays fenced. This refusal does not record a recovery failure or trigger the credential-operation alert.
 
 Without server registration, `codexctl login` keeps its local behavior.
-Other aliases keep the existing local login and transfer checks.
+The machine remembers server aliases from its last successful account discovery.
+Run `codexctl list` to discover server accounts created on another machine.
+Aliases absent from that catalog and the machine's migration or connection records use local login without contacting the account server.
+Known server aliases require the account server; an outage never starts local login for them.
+Local login keeps the existing migration and active-provider checks.
 `whoami` reports the active account. Retiring live credentials also clears the local active marker.
 After disconnect, it reports a local profile only when local credentials remain active.
 The native provider currently supports the global ChatGPT backend with no regional routing constraint.
