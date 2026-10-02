@@ -230,6 +230,28 @@ fn connected_status_before_migration_shows_local_profiles() {
 }
 
 #[test]
+fn connected_status_formats_server_reset() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    let date = chrono::DateTime::from_timestamp(4102444800, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%a %b %d %H:%M")
+        .to_string();
+
+    let output = server.cli(home.path(), &["status"]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        stdout.contains("Resets") && stdout.contains("in ") && stdout.contains(&date),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn connected_list_before_migration_shows_local_profiles() {
     let server = Server::start();
     let home = server.connected_home();

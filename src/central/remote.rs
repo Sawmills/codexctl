@@ -4,6 +4,7 @@ use super::{
     managed::{Account, Import, RevokeDevice},
     native, transport, vault,
 };
+use crate::status_format::format_window_reset as reset_time;
 use crate::{api, config, profile, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -243,19 +244,17 @@ fn usage_cells(usage: &api::RateLimitResponse) -> Vec<String> {
         usage
             .credits
             .as_ref()
-            .and_then(|c| c.balance.clone())
+            .and_then(|c| c.balance.as_deref())
+            .map(|balance| match balance.parse::<f64>() {
+                Ok(value) if value.is_finite() => format!("{value:.2}"),
+                _ => balance.to_owned(),
+            })
             .unwrap_or_else(|| "-".into()),
     ]
 }
 
 fn percentage(value: Option<f64>) -> String {
     value.map_or("-".into(), |n| format!("{n:.0}%"))
-}
-
-fn reset_time(value: Option<i64>) -> String {
-    value
-        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
-        .map_or("-".into(), |t| t.to_rfc3339())
 }
 
 async fn local_display_rows(
@@ -872,6 +871,34 @@ mod tests {
 
         assert_eq!(usage_cells(&usage), ["-", "37%", "-", "12.50"]);
     }
+    #[test]
+    fn connected_local_balance_is_short() {
+        let usage = serde_json::from_value(serde_json::json!({
+            "credits": {"has_credits": true, "balance": "55835.5394250000"}
+        }))
+        .unwrap();
+
+        assert_eq!(usage_cells(&usage)[3], "55835.54");
+    }
+
+    #[test]
+    fn connected_local_reset_uses_relative_time_and_local_date() {
+        let reset = chrono::Utc::now().timestamp() + 6 * 86400 + 3 * 3600 + 1800;
+        let date = chrono::DateTime::from_timestamp(reset, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%a %b %d %H:%M")
+            .to_string();
+        let usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 37, "limit_window_seconds": 604800, "reset_at": reset
+            }}
+        }))
+        .unwrap();
+
+        assert_eq!(usage_cells(&usage)[2], format!("in 6d 3h ({date})"));
+    }
+
     fn profiles_with_refresh_only_rotation() -> (tempfile::TempDir, config::Paths, profile::Profile)
     {
         let root = tempfile::tempdir().unwrap();

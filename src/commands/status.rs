@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::Result;
 use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
+use codexctl::status_format::format_duration;
+
 use crate::api;
 use crate::commands::resets;
 use crate::config;
@@ -1017,50 +1019,9 @@ fn display_alias(alias: &str, is_active: bool) -> String {
 }
 
 fn format_window_reset(window: Option<&api::RateLimitWindow>) -> String {
-    match window {
-        Some(w) => match w.reset_timestamp() {
-            Some(reset_ts) => {
-                let now = chrono::Utc::now().timestamp();
-                let diff_secs = reset_ts - now;
-                if diff_secs <= 0 {
-                    "now".to_string()
-                } else if diff_secs >= 86400 {
-                    format!(
-                        "in {} ({})",
-                        format_duration(diff_secs),
-                        format_reset_timestamp(reset_ts)
-                    )
-                } else {
-                    format!("in {}", format_duration(diff_secs))
-                }
-            }
-            None => "-".to_string(),
-        },
-        None => "-".to_string(),
-    }
-}
-
-fn format_reset_timestamp(reset_ts: i64) -> String {
-    chrono::DateTime::from_timestamp(reset_ts, 0)
-        .map(|dt| {
-            let local = dt.with_timezone(&chrono::Local);
-            local.format("%a %b %d %H:%M").to_string()
-        })
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn format_duration(secs: i64) -> String {
-    let days = secs / 86400;
-    let hours = (secs % 86400) / 3600;
-    let minutes = (secs % 3600) / 60;
-
-    if days > 0 {
-        format!("{days}d {hours}h")
-    } else if hours > 0 {
-        format!("{hours}h {minutes:02}m")
-    } else {
-        format!("{minutes}m")
-    }
+    codexctl::status_format::format_window_reset(
+        window.and_then(api::RateLimitWindow::reset_timestamp),
+    )
 }
 
 fn colorize_usage_lines(used_percent: &[Option<f64>]) -> Cell {
