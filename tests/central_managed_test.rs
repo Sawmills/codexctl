@@ -5257,3 +5257,31 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
         "{error}"
     );
 }
+
+#[test]
+fn when_subscription_cap_is_closed_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"closed-spend-cap").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
+fn when_subscription_has_included_headroom_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"included-weekly").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}

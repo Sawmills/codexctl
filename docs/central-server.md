@@ -99,15 +99,34 @@ no accounts, a migration hint appears below the table. Profiles with a migration
 marker remain excluded, including migrations whose completion is unknown.
 
 Automatic selection uses only accounts with verified included usage.
-It prefers an account with headroom and the soonest long-window reset.
+Pro and Plus subscriptions (including `prolite` and `promax`) qualify while every
+reported usage window has headroom, even when credits are available and the cap is open.
+Both bare `codexctl use` and `codexctl use <alias>` allow this selection without `--allow-billing`.
+Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
-Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
-The helper checks billing again before it supplies a token.
+An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
+Usage-based accounts never qualify for automatic selection.
+Explicit credit-billing selection requires consent or `--allow-billing` on a non-interactive terminal.
+Organizational plans still need a closed spend cap, reported as `spendControlReached = true`.
+No flag for billing consent approves a banked reset.
+
+The provider uses `auth.refresh_interval_ms = 60000`.
+The helper asks the account server for current billing evidence on every refresh.
+After included usage ends, the helper returns no token unless the account has billing approval.
+A failed billing read also refuses unapproved token delivery.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.
 Further rotation refuses delivery until the operator retries with stable evidence.
-Organizational plans and accounts with credit evidence need a closed spend cap to qualify for automatic selection.
-A missing or open cap for those accounts requires billing consent.
-Subscription credits alone do not prove that further spending is disabled.
+
+This policy accepts about one refresh interval of credit exposure between checks.
+It is not a hard spending cap or token expiry.
+[Codex 0.159.0 caches helper tokens](https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/login/src/auth/external_bearer.rs#L33-L46)
+until their age reaches the configured interval, then runs the helper before the next request.
+Zero disables that age check; 60000 milliseconds limits normal cache reuse to one minute
+without a billing read before every model request.
+A helper failure supplies no replacement token.
+The interval does not stop an in-flight response, revoke an issued token, or remove delays in OpenAI usage reporting.
+Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
+Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
 No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
 Pending local logins and local recovery wrappers also block remote activation.
