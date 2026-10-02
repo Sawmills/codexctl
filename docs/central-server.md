@@ -89,9 +89,14 @@ Explicit credit-billing selection still requires consent or `--allow-billing` on
 The helper checks billing again before it supplies a token.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.
 Further rotation refuses delivery until the operator retries with stable evidence.
-Organizational plans and accounts with credit evidence need a closed spend cap to qualify for automatic selection.
+Pro and Plus accounts qualify while every reported included-usage window has headroom, even when credits are present or the spend cap is open.
+Accounts without a usage window do not qualify for this exception.
+Invalid usage, exhausted windows, or overage evidence also prevent this exception.
+An exhausted account requires billing consent before selection.
+The helper refuses further token delivery without consent when included headroom runs out.
+Organizational plans and other accounts with credit evidence still need a closed spend cap to qualify for automatic selection.
 A missing or open cap for those accounts requires billing consent.
-Subscription credits alone do not prove that further spending is disabled.
+Usage-based accounts never qualify for automatic selection, even with `--allow-billing`.
 No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
 Pending local logins and local recovery wrappers also block remote activation.

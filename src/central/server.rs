@@ -354,6 +354,28 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
 pub(super) fn billing_class(response: &Value) -> api::BillingClass {
     usage(response).map_or(api::BillingClass::Unknown, |u| {
         let class = u.billing_class();
+        // Every reported window must have valid included headroom. Inspect the
+        // protocol fields too: usage() omits windows with malformed percentages.
+        let headroom = ["primary", "secondary"].into_iter().all(|name| {
+            let window = &response["rateLimits"][name];
+            window.is_null()
+                || window["usedPercent"]
+                    .as_f64()
+                    .is_some_and(|used| (0.0..100.0).contains(&used))
+        });
+        if class == api::BillingClass::RateLimited && !headroom {
+            return api::BillingClass::Unknown;
+        }
+        let personal_subscription = matches!(
+            u.plan_type.as_deref(),
+            Some("plus" | "pro" | "prolite" | "promax")
+        );
+        if class == api::BillingClass::RateLimited
+            && personal_subscription
+            && !u.credits.as_ref().is_some_and(|c| c.overage_limit_reached)
+        {
+            return class;
+        }
         let organization = matches!(
             u.plan_type.as_deref(),
             Some("team" | "business" | "enterprise" | "edu")
@@ -596,17 +618,54 @@ mod billing_tests {
         assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
     }
     #[test]
-    fn subscription_credits_require_spend_control_before_automatic_selection() {
-        for plan in ["pro", "prolite", "promax"] {
+    fn subscription_credits_with_headroom_do_not_require_spend_control() {
+        for plan in ["plus", "pro", "prolite", "promax"] {
             let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":true,"unlimited":false},"spendControl":{"reached":true}}});
             assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
             limits["rateLimits"]["spendControl"]["reached"] = json!(false);
-            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
             limits["rateLimits"]
                 .as_object_mut()
                 .unwrap()
                 .remove("spendControl");
-            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
         }
     }
+
+    macro_rules! headroom_case {
+        ($name:ident, $primary:expr, $secondary:expr) => {
+            #[test]
+            fn $name() {
+                let limits = json!({"rateLimits":{"planType":"pro",
+                    "primary":$primary,"secondary":$secondary,
+                    "spendControl":{"reached":true}}});
+                assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            }
+        };
+    }
+    headroom_case!(
+        when_primary_exhausted_then_consent_required,
+        json!({"usedPercent":100}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_secondary_exhausted_then_consent_required,
+        json!({"usedPercent":15}),
+        json!({"usedPercent":100})
+    );
+    headroom_case!(
+        when_usage_negative_then_consent_required,
+        json!({"usedPercent":-1}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_usage_missing_then_consent_required,
+        json!({}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_usage_malformed_then_consent_required,
+        json!({"usedPercent":"15"}),
+        json!({"usedPercent":15})
+    );
 }
