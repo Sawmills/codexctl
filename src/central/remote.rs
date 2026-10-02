@@ -470,12 +470,13 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
     let directory = root()?;
     // Serialize discovery with its cache write so an older response cannot
     // erase a server alias that another discovery already recorded.
-    let _lock = native::native_lock(&directory)?;
+    let _discovery = vault::registry_lock(&directory, "catalog.lock")?;
     require_current_connection(&connection)?;
     let response = request(&connection, "/v1/accounts")?
         .send()
         .context("cannot reach the account server")?;
     let accounts: Vec<Account> = check(response)?.json()?;
+    let _lock = native::native_lock(&directory)?;
     require_current_connection(&connection)?;
     for account in &accounts {
         if account.user_id != connection.user_id {

@@ -5230,6 +5230,7 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
     };
     let first = spawn();
     let old_request = accept(&listener, Duration::from_secs(5)).unwrap();
+    let cleanup = server.cli(home.path(), &["disconnect"]);
     let second = spawn();
     // Force the newer response to complete first if discovery is not serialized.
     if let Some(new_request) = accept(&listener, Duration::from_secs(1)) {
@@ -5244,6 +5245,11 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
         assert!(second.wait_with_output().unwrap().status.success());
     }
     drop(listener);
+    assert!(
+        cleanup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleanup.stderr)
+    );
     let login = server.cli(home.path(), &["login", "personal", "--no-browser"]);
     let error = String::from_utf8_lossy(&login.stderr);
     assert!(
