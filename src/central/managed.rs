@@ -1,6 +1,6 @@
 //! Multi-user broker. One process and one persistent disk own every refresh token.
 use super::{
-    enrollment, relogin,
+    catalog, enrollment, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest},
     transport,
@@ -49,6 +49,12 @@ pub struct Account {
     pub resets_at: Option<i64>,
     pub available: bool,
     pub usage_score: Option<f64>,
+    #[serde(default)]
+    pub usage_age_seconds: Option<u64>,
+    #[serde(default)]
+    pub usage_stale: bool,
+    #[serde(default)]
+    pub usage_error: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -86,6 +92,7 @@ pub(super) struct Broker {
     pub(super) imports: Arc<Mutex<()>>,
     pub sso: Option<Arc<enrollment::Sso>>,
     pub(super) reset_reader: super::resets::Reader,
+    catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
@@ -199,7 +206,16 @@ fn account_summary(owner: &Owner) -> Account {
         resets_at: windows
             .and_then(|r| r.long_window())
             .and_then(|w| w.reset_timestamp()),
-        available: owner.available,
+        available: owner.available && !owner.routing_refused,
+        usage_age_seconds: owner
+            .limits_observed
+            .as_ref()
+            .map(|(at, _)| at.elapsed().as_secs()),
+        usage_stale: owner
+            .limits_observed
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= catalog::TTL),
+        usage_error: None,
         usage_score: owner
             .limits
             .as_ref()
@@ -347,67 +363,68 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
         .owners
         .read()
         .await
-        .values()
-        .filter(|(identity, _)| identity.user == device.user)
-        .map(|(_, owner)| owner.clone())
+        .iter()
+        .filter(|(_, (identity, _))| identity.user == device.user)
+        .map(|(key, (_, owner))| (key.clone(), owner.clone()))
         .collect();
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
-    let tasks = owners.into_iter().map(|owner| {
-        let user = device.user.clone();
+    let tasks = owners.into_iter().map(|(key, owner)| {
         let broker = broker.clone();
         tokio::spawn(async move {
-            let mut owner = owner.lock().await;
-            if owner.vault.user != user {
-                return None;
+            // Copy only the access credential. Listing never snapshots, refreshes,
+            // persists, or changes the credential owner's availability.
+            let (mut summary, revision, access, seed) = {
+                let owner = owner.lock().await;
+                let revision = vault::digest(owner.vault.auth.to_string().as_bytes());
+                let seed = owner
+                    .limits_observed
+                    .as_ref()
+                    .filter(|(_, observed)| observed == &revision)
+                    .and_then(|(at, _)| {
+                        Some((super::server::usage(owner.limits.as_ref()?).ok()?, *at))
+                    });
+                (
+                    account_summary(&owner),
+                    revision,
+                    vault::token(&owner.vault.auth).ok().map(str::to_owned),
+                    seed,
+                )
+            };
+            let failure = broker
+                .catalog
+                .read(&key, &revision, access.as_deref(), seed, &mut summary)
+                .await;
+            if let Some(reason) = failure {
+                broker.record_failure(reason, "catalog_usage", StatusCode::SERVICE_UNAVAILABLE);
             }
-            let mut summary_available = owner.available;
-            if owner.available {
-                match owner
-                    .tokens(TokenRequest {
-                        billing: true,
-                        ..Default::default()
-                    })
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(TokenFailure::UnsupportedRouting) => {
-                        summary_available = false;
-                        broker.record_failure(
-                            "unsupported_workspace_routing",
-                            "catalog",
-                            StatusCode::CONFLICT,
-                        );
-                    }
-                    Err(_) => {
-                        owner.available = false;
-                        summary_available = false;
-                        broker.record_failure(
-                            "catalog_owner_unavailable",
-                            "owner",
-                            StatusCode::SERVICE_UNAVAILABLE,
-                        );
-                    }
-                }
+            // Renewal or a token request may have changed the credential while
+            // the independent usage request was in flight. Do not publish its evidence.
+            let current = owner.lock().await;
+            summary.available = current.available && !current.routing_refused;
+            if vault::digest(current.vault.auth.to_string().as_bytes()) != revision {
+                summary.usage_stale = true;
+                summary.usage_error = Some("credentials_changed".into());
             }
-            let mut summary = account_summary(&owner);
-            summary.available = summary_available;
-            Some(summary)
+            if summary.usage_stale {
+                summary.billing_class = api::BillingClass::Unknown;
+                summary.usage_score = None;
+            }
+            summary
         })
     });
     let mut result = Vec::new();
     for task in futures::future::join_all(tasks).await {
-        if let Some(account) =
-            task.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?
-        {
-            result.push(account);
-        }
+        result.push(
+            task.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "catalog_task_failed"))?,
+        );
     }
     result.sort_by(|a, b| a.alias.cmp(&b.alias));
     broker.authorize(&headers)?;
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
+
 async fn import(
     State(broker): State<Broker>,
     headers: HeaderMap,
@@ -880,8 +897,10 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         state: state.into(),
         key: key.into(),
         available: true,
+        routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
+        limits_observed: None,
         verification_input: None,
     };
     // Reconcile the latest disk credentials before any new refresh or reseeding.
@@ -1048,8 +1067,10 @@ pub async fn serve(
                     state: entry.path(),
                     key: key.into(),
                     available: false,
+                    routing_refused: false,
                     refresh_enabled: false,
                     limits: None,
+                    limits_observed: None,
                     verification_input: None,
                 }
             }
@@ -1127,12 +1148,16 @@ pub async fn serve(
         imports,
         sso,
         reset_reader: super::resets::Reader::new()?,
+        catalog: Arc::new(catalog::Reader::new()?),
         failures: Arc::new(StdMutex::new(
             [
                 "owner_unavailable",
                 "catalog_owner_unavailable",
                 "reset_read_failed",
                 "reset_auth_rejected",
+                "catalog_usage_failed",
+                "catalog_usage_timeout",
+                "catalog_task_failed",
                 "persistence_failed",
                 "registry_unavailable",
                 "registry_busy",
@@ -1285,6 +1310,7 @@ mod tests {
             imports: Arc::new(Mutex::new(())),
             sso: None,
             reset_reader: crate::central::resets::Reader::new().unwrap(),
+            catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
@@ -1327,7 +1353,7 @@ mod tests {
         }
     }
 
-    fn recovery_auth(generation: Option<i64>, refresh: &str) -> Value {
+    pub(super) fn recovery_auth(generation: Option<i64>, refresh: &str) -> Value {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = serde_json::json!({"sub":"synthetic-login", "iat":generation, "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat"}});
         serde_json::json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":refresh,"account_id":"synthetic-seat"}})
@@ -1481,3 +1507,6 @@ mod tests {
 #[cfg(test)]
 #[path = "reset_tests.rs"]
 mod reset_tests;
+
+#[cfg(test)]
+mod catalog_tests;

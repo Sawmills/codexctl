@@ -32,6 +32,8 @@ pub struct AccountStatus {
     pub resets_at: Option<String>,
     pub billing_class: api::BillingClass,
     pub error: Option<String>,
+    pub usage_age_seconds: Option<u64>,
+    pub usage_stale: Option<bool>,
 }
 
 impl AccountStatus {
@@ -47,6 +49,8 @@ impl AccountStatus {
             resets_at: None,
             billing_class: api::BillingClass::Unknown,
             error: None,
+            usage_age_seconds: None,
+            usage_stale: None,
         }
     }
 

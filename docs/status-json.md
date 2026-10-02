@@ -27,7 +27,9 @@ codexctl list --json
       "secondary_used_percent": 37.0,
       "resets_at": "2100-01-01T00:00:00Z",
       "billing_class": "rate_limited",
-      "error": null
+      "error": null,
+      "usage_age_seconds": 12,
+      "usage_stale": false
     }
   ]
 }
@@ -54,6 +56,10 @@ An empty result is `{"version":1,"accounts":[]}`.
   Failed requests keep unknown billing, regardless of the table's display group.
 - `error`: A brief account error, or `null`.
   Server accounts marked unavailable use `account unavailable` because the catalog supplies no detailed cause.
+
+- `usage_age_seconds`: Age of the last successful server usage observation, or `null` when unknown or local.
+- `usage_stale`: Whether server usage is stale or missing, or `null` for local rows.
+  Stale server rows retain the last usage values and include an `error`; consumers must treat their quota as unknown.
 
 An alias can occur twice when a profile and a server account share it.
 Use `source` with `alias` to distinguish those rows.

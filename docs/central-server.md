@@ -121,6 +121,24 @@ A structured log identifies the `resets` stage. The existing `CodexctlCredential
 The server rechecks machine authorization before delivery.
 Alert routing and notification delivery still require deployment checks.
 
+Account listing never calls the refresh owner or changes its availability.
+The server caches usage for 60 seconds and shares one fetch across concurrent polls
+for the same account. On a cache miss or expiry, it uses the saved access token
+for a read-only usage request outside the credential-owner lock, with a 15-second
+timeout. It never refreshes credentials for listing. A failed fetch retains the
+last observation and delays the next attempt for 60 seconds.
+
+The account API returns `usageAgeSeconds`, `usageStale`, and `usageError`.
+Age is null until an observation succeeds. Status and list show stale or missing
+usage in the Error column. Stale usage cannot authorize automatic account selection.
+An expired access token can leave usage stale until a normal token request or login
+renewal updates the credentials. An expired token reports `access_expired` without
+an upstream request or a failure alert. Token delivery still checks billing and
+routing. Listing retains routing refusals observed by token delivery until a
+successful routing check clears them.
+A quota monitor can poll every 60 seconds without overlapping requests and must
+treat stale usage as unknown, not as available quota.
+
 Automatic selection uses only accounts with verified included usage.
 Pro and Plus subscriptions (including `prolite` and `promax`) qualify while every
 reported usage window has headroom, even when credits are available and the cap is open.
@@ -393,7 +411,10 @@ This first deployment has one server and does not promise uninterrupted availabi
 
 `/health` checks process availability. `/ready` checks readable user and device registries.
 Authenticated `/metrics` records each rejected API attempt once, including JSON and body-limit rejections.
-Owner failures during account listing have a separate bounded reason.
+Usage fetch failures during listing have separate bounded reasons:
+`catalog_usage_failed` and `catalog_usage_timeout`. The server counts each failed
+fetch once, even when several polls share it. These reasons use the existing
+account-operation alert. A usage alert does not mean token delivery has failed.
 The staging overlay includes a PrometheusRule for the existing `kube-prometheus` selector.
 The staging `ScrapeConfig` supplies an authenticated scrape through the existing
 Prometheus operator. Its Secret reference selects only the metrics credential.

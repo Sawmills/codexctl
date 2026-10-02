@@ -99,8 +99,10 @@ pub(super) struct Owner {
     pub(super) state: PathBuf,
     pub(super) key: PathBuf,
     pub(super) available: bool,
+    pub(super) routing_refused: bool,
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
+    pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
 }
 
@@ -229,6 +231,12 @@ impl Owner {
         };
         if result
             .as_ref()
+            .is_err_and(|error| error.is::<RoutingPolicyError>())
+        {
+            self.routing_refused = true;
+        }
+        if result
+            .as_ref()
             .is_err_and(|error| !error.is::<RoutingPolicyError>())
         {
             self.available = false;
@@ -272,6 +280,7 @@ impl Owner {
                     .context("missing owner")?
                     .call("account/rateLimits/read", json!({}))
                     .await;
+                let observed_at = std::time::Instant::now();
                 let snapshot = self.snapshot();
                 if result.is_err() || snapshot.is_err() {
                     self.available = false;
@@ -283,7 +292,7 @@ impl Owner {
                     .pointer("/rateLimits/planType")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                observed_limits = Some(limits);
+                observed_limits = Some((limits, observed_at));
             }
             // The command-auth provider bypasses first-party workspace routing.
             // Re-discover after any billing refresh, before exporting credentials.
@@ -302,10 +311,18 @@ impl Owner {
                 self.available = false;
             }
             let mut current = snapshot?;
+            if result
+                .as_ref()
+                .is_err_and(|error| error.is::<RoutingPolicyError>())
+            {
+                self.routing_refused = true;
+            }
             let account = result?;
             if supported_native_routing(&account) != Some(current.chatgpt_account_id.as_str()) {
+                self.routing_refused = true;
                 return Err(TokenFailure::UnsupportedRouting);
             }
+            self.routing_refused = false;
             if requested && current.revision != revision {
                 // Native status, billing, and routing reads can rotate before OR
                 // after fetching their evidence. Cover one stable complete auth
@@ -321,8 +338,9 @@ impl Owner {
             current.billing_class = token.billing_class;
             current.chatgpt_plan_type = token.chatgpt_plan_type;
             current.native_routing_supported = true;
-            if let Some(limits) = observed_limits {
+            if let Some((limits, observed_at)) = observed_limits {
                 self.limits = Some(limits);
+                self.limits_observed = Some((observed_at, current.revision.clone()));
             }
             return Ok(current);
         }
@@ -358,9 +376,7 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
 
 pub(super) fn billing_class(response: &Value) -> api::BillingClass {
     usage(response).map_or(api::BillingClass::Unknown, |u| {
-        let class = u.billing_class();
-        // Every reported window must have valid included headroom. Inspect the
-        // protocol fields too: usage() omits windows with malformed percentages.
+        // Keep malformed protocol windows from disappearing during conversion.
         let headroom = ["primary", "secondary"].into_iter().all(|name| {
             let window = &response["rateLimits"][name];
             window.is_null()
@@ -368,38 +384,50 @@ pub(super) fn billing_class(response: &Value) -> api::BillingClass {
                     .as_f64()
                     .is_some_and(|used| (0.0..100.0).contains(&used))
         });
-        if class == api::BillingClass::RateLimited && !headroom {
-            return api::BillingClass::Unknown;
-        }
-        let personal_subscription = matches!(
-            u.plan_type.as_deref(),
-            Some("plus" | "pro" | "prolite" | "promax")
-        );
-        if class == api::BillingClass::RateLimited
-            && personal_subscription
-            && !u.credits.as_ref().is_some_and(|c| c.overage_limit_reached)
-        {
-            return class;
-        }
-        let organization = matches!(
-            u.plan_type.as_deref(),
-            Some("team" | "business" | "enterprise" | "edu")
-        );
-        let credits = u
-            .credits
-            .as_ref()
-            .is_some_and(|c| c.has_credits || c.unlimited || c.overage_limit_reached);
-        // Included subscription credits do not prove that further spending is
-        // disabled. Keep entitlement classification separate from approval risk.
-        if class == api::BillingClass::RateLimited
-            && !u.spend_control.as_ref().is_some_and(|s| s.reached)
-            && (organization || credits || u.spend_control.is_some())
-        {
+        if u.billing_class() == api::BillingClass::RateLimited && !headroom {
             api::BillingClass::Unknown
         } else {
-            class
+            usage_billing_class(&u)
         }
     })
+}
+
+pub(super) fn usage_billing_class(u: &api::RateLimitResponse) -> api::BillingClass {
+    let class = u.billing_class();
+    let headroom = u.rate_limit.as_ref().is_none_or(|limits| {
+        limits
+            .windows()
+            .all(|(_, w)| (0.0..100.0).contains(&w.used_percent))
+    });
+    if class == api::BillingClass::RateLimited && !headroom {
+        return api::BillingClass::Unknown;
+    }
+    let personal_subscription = matches!(
+        u.plan_type.as_deref(),
+        Some("plus" | "pro" | "prolite" | "promax")
+    );
+    if class == api::BillingClass::RateLimited
+        && personal_subscription
+        && !u.credits.as_ref().is_some_and(|c| c.overage_limit_reached)
+    {
+        return class;
+    }
+    let organization = matches!(
+        u.plan_type.as_deref(),
+        Some("team" | "business" | "enterprise" | "edu")
+    );
+    let credits = u
+        .credits
+        .as_ref()
+        .is_some_and(|c| c.has_credits || c.unlimited || c.overage_limit_reached);
+    if class == api::BillingClass::RateLimited
+        && !u.spend_control.as_ref().is_some_and(|s| s.reached)
+        && (organization || credits || u.spend_control.is_some())
+    {
+        api::BillingClass::Unknown
+    } else {
+        class
+    }
 }
 
 #[derive(Clone)]
@@ -533,8 +561,10 @@ pub async fn serve(
         state: state.into(),
         key: key.into(),
         available: true,
+        routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
+        limits_observed: None,
         verification_input: None,
     };
     if !read_only {

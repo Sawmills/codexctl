@@ -146,6 +146,11 @@ impl Server {
             ])
             .arg(binary)
             .args(flags)
+            // Synthetic access credentials must never reach an external usage API.
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
             .env("CENTRAL_TEST_KEY_FILE", root.path().join("key"))
@@ -3123,8 +3128,9 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
             );
             store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
             if catalog {
-                assert_eq!(server.accounts(&server.amir)[0]["available"], false);
-            } else {
+                assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+            }
+            {
                 let refusal = server.token(&server.amir, "personal", None);
                 assert_eq!(refusal.status(), 409);
                 assert_eq!(
@@ -3132,6 +3138,7 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
                     "unsupported_workspace_routing"
                 );
             }
+            assert_eq!(server.accounts(&server.amir)[0]["available"], false);
             let directory = account_directory(&server, "amir", "personal");
             let journal: Value = serde_json::from_slice(
                 &std::fs::read(directory.join("runtime/auth.json")).unwrap(),
@@ -5395,6 +5402,25 @@ fn reset_listing_rejects_another_company_users_response() {
 }
 
 #[test]
+fn b8_listing_cannot_disable_tokens_after_a_temporary_owner_error() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+
+    let catalog = server.accounts(&server.amir);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let token = server.token(&server.amir, "personal", None);
+
+    assert_eq!(catalog[0]["available"], true);
+    assert_eq!(token.status(), 200);
+}
+
+#[test]
 fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
     let server = Server::start();
     store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
@@ -5406,17 +5432,21 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
 
     let output = server.cli(home.path(), &["status", "--json"]);
 
-    assert!(output.status.success(), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let age = document["accounts"][0]["usage_age_seconds"]
+        .as_u64()
+        .unwrap();
+    assert!(output.status.success() && age < 60, "{output:?}");
     assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        document,
         json!({
         "version":1,"accounts":[
             {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
              "primary_used_percent":0.0,"secondary_used_percent":37.0,
-             "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null},
+             "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null,"usage_age_seconds":age,"usage_stale":false},
             {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
              "primary_used_percent":null,"secondary_used_percent":null,
-             "resets_at":null,"billing_class":"unknown","error":"credentials unavailable"}
+             "resets_at":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
         ]})
     );
 }
@@ -5442,6 +5472,7 @@ fn connected_status_json_keeps_unavailable_accounts() {
     let home = server.connected_home();
     store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
 
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let output = server.cli(home.path(), &["status", "--json"]);
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
 
@@ -5470,4 +5501,27 @@ fn connected_status_json_filter_matches_the_table() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
         json!({"version":1,"accounts":[]})
     );
+}
+
+#[test]
+fn b8_status_json_reports_stale_usage_without_disabling_the_account() {
+    let mut server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    server.stop();
+    server.restart();
+    let home = server.connected_home();
+
+    let output = server.cli(home.path(), &["status", "--json"]);
+    let row = serde_json::from_slice::<Value>(&output.stdout).unwrap()["accounts"][0].clone();
+
+    assert!(output.status.success());
+    assert_eq!(
+        (
+            row["state"].clone(),
+            row["usage_stale"].clone(),
+            row["usage_age_seconds"].clone()
+        ),
+        (json!("server"), json!(true), Value::Null)
+    );
+    assert_eq!(row["error"], "catalog_usage_failed");
 }

@@ -879,7 +879,7 @@ fn status_json_keeps_failed_profiles_and_unknown_billing() {
         serde_json::json!({"version":1,"accounts":[{
             "alias":"broken","label":"Personal","plan":"pro","source":"local",
             "state":"unavailable","primary_used_percent":null,"secondary_used_percent":null,
-            "resets_at":null,"billing_class":"unknown","error":"bad auth.json"
+            "resets_at":null,"billing_class":"unknown","error":"bad auth.json","usage_age_seconds":null,"usage_stale":null
         }]})
     );
 }
@@ -909,7 +909,7 @@ fn list_json_keeps_local_metadata_without_reading_credentials() {
         serde_json::json!({"version":1,"accounts":[{
             "alias":"offline","label":null,"plan":null,"source":"local",
             "state":"local","primary_used_percent":null,"secondary_used_percent":null,
-            "resets_at":null,"billing_class":"unknown","error":null
+            "resets_at":null,"billing_class":"unknown","error":null,"usage_age_seconds":null,"usage_stale":null
         }]})
     );
 }
