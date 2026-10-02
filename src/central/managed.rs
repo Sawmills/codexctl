@@ -55,6 +55,8 @@ pub struct Account {
     pub usage_stale: bool,
     #[serde(default)]
     pub usage_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline_usage: Option<crate::statusline::Usage>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -197,6 +199,7 @@ fn account_summary(owner: &Owner) -> Account {
                 api::token_identity(vault::token(&owner.vault.auth).ok()?).and_then(|i| i.plan)
             }),
         billing_class: billing,
+        statusline_usage: usage.as_ref().map(crate::statusline::Usage::from_usage),
         primary_used: windows
             .and_then(|r| r.short_window())
             .map(|w| w.used_percent),

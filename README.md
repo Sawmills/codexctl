@@ -106,6 +106,11 @@ Pro (Max). Subscription windows and purchased credits can coexist. Credits do no
 subscription unknown; spend control still determines billing risk during recovery. Plan names
 are not invoices or credit balances in dollars.
 
+### Terminal status bars
+
+Run `codexctl statusline` for cached active-account usage such as `p2 62% wk · 6d22h`.
+See [the statusline guide](docs/statusline.md) for cache refresh and tmux, Starship, zsh, and HerdR examples.
+
 ### Switch accounts
 
 Direct:

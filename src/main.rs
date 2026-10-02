@@ -72,6 +72,8 @@ enum Commands {
         #[arg(long, conflicts_with = "rate_limited")]
         usage_based: bool,
     },
+    /// Print cached active-account usage for prompts. Silent on unavailable data.
+    Statusline,
     /// Log into a local Codex account or renew an existing server account
     Login {
         /// Profile alias to save the login as
@@ -205,6 +207,10 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
 
+    if matches!(cli.command, Commands::Statusline) {
+        codexctl::statusline::run();
+        return;
+    }
     // Informational commands must work in a read-only or empty home. Clap
     // exits while parsing help, version, and invalid commands, and shell
     // completion generation does not need the profile store.
@@ -224,6 +230,7 @@ fn main() {
         std::process::exit(1);
     }
     let result = match cli.command {
+        Commands::Statusline => Ok(()),
         #[cfg(feature = "central-prototype")]
         Commands::Connect {
             server,
