@@ -12,6 +12,7 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
@@ -19,6 +20,7 @@ use openidconnect::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::Path,
@@ -144,7 +146,24 @@ fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
 }
 fn page(html: String) -> Response {
-    ([( "cache-control","no-store"),("referrer-policy","no-referrer"),("content-security-policy","default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")],Html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>Codexctl sign-in</title><main>{html}</main></html>"))).into_response()
+    let styles = include_str!("enrollment/style.css");
+    let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
+    let policy = format!(
+        "default-src 'none'; style-src 'sha256-{style_hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+    );
+    let document = include_str!("enrollment/page.html")
+        .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))
+        .replace("<!-- CONTENT -->", &html);
+    (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+            ("content-security-policy", policy.as_str()),
+            ("x-content-type-options", "nosniff"),
+        ],
+        Html(document),
+    )
+        .into_response()
 }
 fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -405,8 +424,11 @@ async fn callback(
     let code = escape(&device.user_code);
     let approval = secret();
     let html = format!(
-        "<h1>Connect this machine?</h1><p>Signed in as {}.</p><p>Machine: {name}</p><p>Make sure that your terminal shows code <strong>{code}</strong>.</p><form method=\"post\" action=\"/auth/approve\"><input type=\"hidden\" name=\"approval\" value=\"{approval}\"><button type=\"submit\">Connect machine</button></form>",
-        escape(email)
+        include_str!("enrollment/approval.html"),
+        email = escape(email),
+        name = name,
+        code = code,
+        approval = approval,
     );
     if flows.approvals.len() >= 1024 {
         return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
@@ -465,9 +487,7 @@ async fn approve(
     vault::save_devices(&broker.state, &devices)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     device.grant = Some(token);
-    Ok(page(
-        "<h1>Machine connected</h1><p>You can return to your terminal.</p>".into(),
-    ))
+    Ok(page(include_str!("enrollment/connected.html").into()))
 }
 pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
     router
