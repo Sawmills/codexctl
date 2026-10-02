@@ -28,6 +28,8 @@ use std::{
     },
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
+#[path = "relogin.rs"]
+mod relogin;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
@@ -84,6 +86,7 @@ pub(super) struct Broker {
     metrics_hash: Option<String>,
     work: Arc<Semaphore>,
     stopping: Arc<AtomicBool>,
+    relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 pub(super) struct HttpError {
     status: StatusCode,
@@ -406,6 +409,8 @@ impl Broker {
     async fn import_account(&self, user: &str, input: Import) -> Result<Account, HttpError> {
         let id = account_key(user, &input.alias);
         let _import = self.imports.lock().await;
+        relogin::check_import(&self.state, user, &input)
+            .map_err(|_| self.error(StatusCode::CONFLICT, "relogin_reserved"))?;
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
         }
@@ -876,6 +881,13 @@ pub async fn serve(
     let mut ownership_unresolved = false;
     let mut replacements_blocked = false;
     let mut conflicting_journals = Vec::new();
+    // Resolve all durable commits before inventorying quarantines from other accounts.
+    for entry in std::fs::read_dir(state.join("accounts"))? {
+        if relogin::recover(&entry?.path(), key).is_err() {
+            replacements_blocked = true;
+            ownership_unresolved = true;
+        }
+    }
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let entry = entry?;
         let stored = vault::load(&entry.path(), key);
@@ -903,7 +915,14 @@ pub async fn serve(
                 continue;
             }
         };
-        let pending = !account_vault.verified;
+        let repair = relogin::recover(&entry.path(), key);
+        if repair.is_err() {
+            replacements_blocked = true;
+            ownership_unresolved = true;
+        }
+        let repair = repair.unwrap_or_default();
+        conflicting_journals.extend(repair.quarantined);
+        let pending = !account_vault.verified && !repair.verify;
         let id = account_key(&account_vault.user, &account_vault.alias);
         let prepared = if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false))
         {
@@ -928,7 +947,7 @@ pub async fn serve(
                 }
             }
         };
-        if pending {
+        if pending || repair.blocked || (read_only && repair.verify) {
             owner.available = false;
         }
         // Metadata errors retain the inventory fence; only proven absence is empty.
@@ -974,6 +993,16 @@ pub async fn serve(
             owner.available = false;
             recovery_failures += 1;
         }
+        if owner.available
+            && owner.refresh_enabled
+            && relogin::needs_verification(&owner.state)?
+            && relogin::verify_replacement(&mut owner, binary)
+                .await
+                .is_err()
+        {
+            owner.available = false;
+            recovery_failures += 1;
+        }
     }
     let broker = Broker {
         state: state.into(),
@@ -1000,6 +1029,7 @@ pub async fn serve(
         )),
         work: Arc::new(Semaphore::new(128)),
         stopping: Arc::new(AtomicBool::new(false)),
+        relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         metrics_hash: metrics_token_file
             .map(|p| {
                 let bytes = vault::private_read(p)?;
@@ -1026,6 +1056,9 @@ pub async fn serve(
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))
         .route("/v1/devices/revoke", post(revoke_device))
+        .route("/v1/relogin/start", post(relogin::start))
+        .route("/v1/relogin/status", post(relogin::status))
+        .route("/v1/relogin/cancel", post(relogin::cancel))
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }));
@@ -1138,6 +1171,7 @@ mod tests {
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
+            relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});

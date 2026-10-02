@@ -15,6 +15,28 @@ pending_turn = None
 definitive_rejection = False
 billing_rotated = False
 
+if "login" in sys.argv:
+    # Login writes a grant, but never reads accounts or refreshes credentials.
+    mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+    if mode == "login-invalid-prompt":
+        print("\033]52;unsupported\n", flush=True)
+        while True:
+            time.sleep(1)
+    print("1. Open this link in your browser and sign in to your account", flush=True)
+    print("   https://auth.openai.com/codex/device", flush=True)
+    print("\n2. Enter this one-time code (expires in 15 minutes)", flush=True)
+    print("   TEST-LOGIN", flush=True)
+    gate = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-release")
+    while not gate.exists():
+        time.sleep(0.02)
+    auth_path.write_text(gate.read_text())
+    auth_path.chmod(0o600)
+    if mode == "login-hold-after-save":
+        gate.with_name("login-saved").write_text("saved")
+        while not gate.with_name("login-exit").exists():
+            time.sleep(0.02)
+    sys.exit(0)
+
 
 def send(value):
     print(json.dumps(value), flush=True)

@@ -93,25 +93,8 @@ impl Rpc {
                 "forced_login_method=\"chatgpt\"",
             ]);
         }
-        #[cfg(unix)]
         if isolate_signals {
-            command.process_group(0);
-        }
-        #[cfg(target_os = "linux")]
-        if isolate_signals {
-            let parent = unsafe { libc::getpid() };
-            // A killed broker cannot leave a process rotating credentials behind it.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent {
-                        return Err(std::io::Error::other("credential owner parent exited"));
-                    }
-                    Ok(())
-                });
-            }
+            super::process::isolate(&mut command);
         }
         let mut child = command
             .spawn()

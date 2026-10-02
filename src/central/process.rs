@@ -7,6 +7,26 @@ pub struct Process {
     pid: u32,
     incarnation: String,
 }
+/// All server credential children share process and parent-death isolation.
+pub(super) fn isolate(command: &mut tokio::process::Command) {
+    #[cfg(unix)]
+    command.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        let parent = unsafe { libc::getpid() };
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    return Err(std::io::Error::other("credential owner parent exited"));
+                }
+                Ok(())
+            });
+        }
+    }
+}
 fn incarnation(pid: u32) -> Result<Option<String>> {
     #[cfg(target_os = "linux")]
     {
