@@ -1,4 +1,5 @@
 //! Experimental single-account credential broker and local App Server client.
+mod catalog;
 mod client;
 pub mod enrollment;
 pub mod managed;

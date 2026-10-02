@@ -666,7 +666,20 @@ pub fn show(status: bool, filter: Option<api::BillingClass>) -> Result<bool> {
                     reset_time(account.resets_at),
                     "-".into(),
                     state.into(),
-                    "-".into(),
+                    if account.usage_stale {
+                        match account.usage_age_seconds {
+                            Some(age) => format!(
+                                "usage stale ({age}s): {}",
+                                account.usage_error.as_deref().unwrap_or("refresh pending")
+                            ),
+                            None => format!(
+                                "usage unknown: {}",
+                                account.usage_error.as_deref().unwrap_or("not fetched")
+                            ),
+                        }
+                    } else {
+                        "-".into()
+                    },
                 ],
                 billing: account.billing_class,
             }
@@ -920,7 +933,7 @@ pub fn select(accounts: &[Account]) -> Result<String> {
         )
     });
     let score = |a: &Account| a.usage_score.unwrap_or(f64::MAX);
-    accounts.iter().filter(|a|a.available&&a.billing_class==api::BillingClass::RateLimited&&(a.primary_used.is_some()||a.secondary_used.is_some())).min_by(|a,b|{
+    accounts.iter().filter(|a|a.available&&!a.usage_stale&&a.billing_class==api::BillingClass::RateLimited&&(a.primary_used.is_some()||a.secondary_used.is_some())).min_by(|a,b|{
         let by_score=score(a).total_cmp(&score(b));
         let exhausted_a=score(a)>=500.0;let exhausted_b=score(b)>=500.0;
         exhausted_a.cmp(&exhausted_b).then_with(||if most||exhausted_a{by_score}else{a.resets_at.unwrap_or(i64::MAX).cmp(&b.resets_at.unwrap_or(i64::MAX)).then(by_score)})

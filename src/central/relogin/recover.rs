@@ -16,8 +16,10 @@ pub(in crate::central) fn promote(
         state: state.into(),
         key: key.into(),
         available: false,
+        routing_refused: false,
         refresh_enabled: true,
         limits: None,
+        limits_observed: None,
         verification_input: None,
     };
     identity.validate_owned_auth(auth)?;
@@ -292,8 +294,10 @@ fn finish_verified(state: &Path, key: &Path, record: &mut Record) -> Result<bool
         state: state.into(),
         key: key.into(),
         available: false,
+        routing_refused: false,
         refresh_enabled: false,
         limits: None,
+        limits_observed: None,
         verification_input: None,
     };
     baseline.validate_owned_auth(&verified)?;

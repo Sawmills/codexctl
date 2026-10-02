@@ -146,6 +146,11 @@ impl Server {
             ])
             .arg(binary)
             .args(flags)
+            // Synthetic access credentials must never reach an external usage API.
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
             .env("CENTRAL_TEST_KEY_FILE", root.path().join("key"))
@@ -3123,8 +3128,9 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
             );
             store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
             if catalog {
-                assert_eq!(server.accounts(&server.amir)[0]["available"], false);
-            } else {
+                assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+            }
+            {
                 let refusal = server.token(&server.amir, "personal", None);
                 assert_eq!(refusal.status(), 409);
                 assert_eq!(
@@ -3132,6 +3138,7 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
                     "unsupported_workspace_routing"
                 );
             }
+            assert_eq!(server.accounts(&server.amir)[0]["available"], false);
             let directory = account_directory(&server, "amir", "personal");
             let journal: Value = serde_json::from_slice(
                 &std::fs::read(directory.join("runtime/auth.json")).unwrap(),
@@ -5365,3 +5372,21 @@ fn reset_listing_rejects_another_company_users_response() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("server user identity changed"));
 }
+
+#[test]
+fn b8_listing_cannot_disable_tokens_after_a_temporary_owner_error() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+
+    let catalog = server.accounts(&server.amir);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let token = server.token(&server.amir, "personal", None);
+
+    assert_eq!(catalog[0]["available"], true);
+    assert_eq!(token.status(), 200);
