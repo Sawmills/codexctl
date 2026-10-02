@@ -508,5 +508,6 @@ for setup, SSH tunnels, tests, and the remaining compatibility limits.
 ## Server-managed accounts
 
 Connect your machines with company SSO and keep OpenAI refresh credentials on a private server.
-Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and regular `codex`.
+Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and `codexctl codex`.
+Resume a session from before migration with `codexctl codex resume <session-id>`.
 See [server setup, migration, and staging deployment](docs/central-server.md).

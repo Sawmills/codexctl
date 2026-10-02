@@ -110,7 +110,7 @@ fn require_local_mode_from(paths: &config::Paths) -> Result<()> {
         == Some(PROVIDER)
     {
         bail!(
-            "remote provider is active; run regular codex or disconnect before local account wrappers"
+            "remote provider is active; run codexctl codex or disconnect before local account wrappers"
         );
     }
     Ok(())
@@ -157,28 +157,75 @@ impl LocalOperation {
         &self,
         command: &mut std::process::Command,
     ) -> Result<std::process::ExitStatus> {
-        #[cfg(unix)]
-        {
-            use std::os::{fd::AsRawFd, unix::process::CommandExt};
-            let fd = self._guard.as_raw_fd();
-            // Only the child inherits this lease. A killed login parent cannot
-            // let activation overtake its still-pending device flow.
-            unsafe {
-                command.pre_exec(move || {
-                    let flags = libc::fcntl(fd, libc::F_GETFD);
-                    if flags == -1
-                        || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        command
-            .status()
-            .context("local credential process failed to run")
+        run_child_with_lease(&self._guard, command)
     }
+}
+
+fn run_child_with_lease(
+    guard: &std::fs::File,
+    command: &mut std::process::Command,
+) -> Result<std::process::ExitStatus> {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let fd = guard.as_raw_fd();
+    // The child retains the mode lease if its launcher dies.
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.status().context("Codex process failed to run")
+}
+
+/// Launch the active server account without restoring a resumed thread's old provider.
+/// Local account launches remain the caller's responsibility.
+pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
+    use std::os::unix::process::ExitStatusExt;
+    let paths = config::default_paths()?;
+    let directory = paths.codexctl_dir().join("central");
+    let marker = directory.join(".native-active.json");
+    if !marker.try_exists()? {
+        return Ok(None);
+    }
+    let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
+    {
+        let _lock = native_lock(&directory)?;
+        if !marker.try_exists()? {
+            return Ok(None);
+        }
+        let home = paths.codex_home();
+        if document(&home)?
+            .get("model_provider")
+            .and_then(Item::as_str)
+            != Some(PROVIDER)
+        {
+            return Ok(None);
+        }
+        if std::env::var_os("CODEX_HOME").is_some()
+            || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
+        {
+            bail!("server account launch refuses an inherited or pinned Codex home");
+        }
+        let activation: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
+        if activation.home != home {
+            bail!("remote provider is active in another Codex home");
+        }
+    }
+    // Codex 0.160 restores the saved provider unless the launch explicitly overrides it.
+    // Keep this before user arguments so a prompt after `--` remains a prompt.
+    let mut command = std::process::Command::new("codex");
+    command
+        .args(["-c", "model_provider=\"codexctl-central\""])
+        .args(args);
+    let status = run_child_with_lease(&lease, &mut command)?;
+    Ok(Some(
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+    ))
 }
 
 pub(super) fn exclusive_mode(paths: &config::Paths) -> Result<std::fs::File> {
@@ -555,7 +602,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         return Err(error);
     }
     save_connection(&path, &connection)?;
-    println!("switched to remote account {alias}; start regular codex");
+    println!(
+        "switched to remote account {alias}; start codexctl codex (resume: codexctl codex resume <session-id>)"
+    );
     Ok(true)
 }
 

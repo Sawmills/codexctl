@@ -73,7 +73,7 @@ codexctl status
 codexctl list
 codexctl whoami
 codexctl use
-codex
+codexctl codex
 ```
 
 On a connected machine, `status` and `list` also show profiles that have not
@@ -134,7 +134,20 @@ Before each token delivery, the server checks workspace routing.
 Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
 Read-only brokers cannot verify native routing and cannot supply the native provider.
 Existing sessions keep the account they selected at startup.
-Local recovery wrappers remain separate from remote provider use.
+Use `codexctl codex resume <session-id>` to resume a session from before migration.
+The launcher passes `-c 'model_provider="codexctl-central"'` to Codex.
+Codex 0.160.0 otherwise restores the session's saved provider, even when the base configuration selects a server account.
+An old `openai` session can then fail compaction with HTTP 401 because migration retired its local credentials.
+For a direct launch, use `codex resume <session-id> -c 'model_provider="codexctl-central"'`.
+The account-server provider uses local compaction through its authenticated Responses connection.
+The launcher preserves the current directory, arguments, and child exit status.
+Codex and its child processes inherit a mode lease.
+Account selection and disconnect refuse while any process holds that lease, including background tools that outlive Codex.
+Stop those processes before you retry account selection or disconnect.
+It refuses inherited or pinned Codex homes.
+Server-account launches use the provider token helper without local account failover or banked resets.
+Local-account launches retain the existing recovery behavior.
+Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 
 ## Manage Devices and Users
 

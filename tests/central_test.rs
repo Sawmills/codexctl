@@ -780,6 +780,199 @@ impl NativeClient {
             ],
         )
     }
+
+    fn launch_command(&self, args: &[&str]) -> Command {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        std::fs::write(
+            &codex,
+            "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\"\nexit 23\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        command
+            .arg("codex")
+            .args(args)
+            .current_dir(&self.home)
+            .env("PATH", &bin)
+            .env("HOME", &self.home)
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS");
+        command
+    }
+}
+
+#[test]
+fn when_resuming_with_a_server_account_then_the_launch_overrides_the_saved_provider() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let args = [
+        "resume",
+        "old-openai-session",
+        "--",
+        "keep this prompt intact",
+    ];
+    let cwd = std::fs::canonicalize(&client.home).unwrap();
+    let expected = format!(
+        "{}\n-c\nmodel_provider=\"codexctl-central\"\n--cd\n{}\n{}\n",
+        cwd.display(),
+        cwd.display(),
+        args.join("\n")
+    );
+
+    let output = client.launch_command(&args).output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/auth.json")).unwrap(),
+        NativeClient::local_auth_bytes()
+    );
+}
+
+#[test]
+fn when_a_server_launch_has_an_explicit_directory_then_it_keeps_that_override() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let args = ["resume", "old-session", "-C", "/chosen/project"];
+    let expected = format!(
+        "{}\n-c\nmodel_provider=\"codexctl-central\"\n{}\n",
+        std::fs::canonicalize(&client.home).unwrap().display(),
+        args.join("\n")
+    );
+
+    let output = client.launch_command(&args).output().unwrap();
+
+    assert_eq!(output.status.code(), Some(23));
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+}
+
+#[test]
+fn when_a_server_launch_inherits_a_codex_home_then_it_refuses_before_starting_codex() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client
+        .launch_command(&["resume", "old-session"])
+        .env("CODEX_HOME", client.home.join(".codex"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inherited or pinned Codex home"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn when_a_server_launch_child_receives_a_signal_then_the_launcher_preserves_its_status() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let mut command = client.launch_command(&[]);
+    std::fs::write(client.home.join("bin/codex"), "#!/bin/sh\nkill -TERM $$\n").unwrap();
+
+    let output = command.output().unwrap();
+
+    assert_eq!(output.status.code(), Some(128 + libc::SIGTERM));
+}
+
+#[test]
+fn when_a_server_launch_inherits_a_pinned_alias_then_it_refuses_before_starting_codex() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let output = client
+        .launch_command(&[])
+        .env("CODEXCTL_PINNED_ALIAS", "local")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("inherited or pinned Codex home"));
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn when_the_provider_is_local_despite_a_marker_then_the_local_launcher_keeps_its_arguments() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    std::fs::write(
+        client.home.join(".codex/config.toml"),
+        "model_provider='openai'\n",
+    )
+    .unwrap();
+    let args = ["resume", "local-session"];
+    let cwd = std::fs::canonicalize(&client.home).unwrap();
+    let expected = format!(
+        "{}\n--cd\n{}\n{}\n",
+        cwd.display(),
+        cwd.display(),
+        args.join("\n")
+    );
+
+    let output = client.launch_command(&args).output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().replace('\r', ""),
+        expected
+    );
+}
+
+#[test]
+fn when_a_server_launch_is_running_then_selection_refuses_but_the_token_helper_works() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let mut command = client.launch_command(&[]);
+    std::fs::write(
+        client.home.join("bin/codex"),
+        "#!/bin/sh\nprintf 'ready\\n'\nread -r finish\n",
+    )
+    .unwrap();
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+
+    let selected = client.select();
+    let token = client.helper();
+    drop(child.stdin.take());
+    child.wait().unwrap();
+
+    assert_eq!(ready, "ready\n");
+    assert!(
+        !selected.status.success()
+            && String::from_utf8_lossy(&selected.stderr).contains("credential mode is busy")
+    );
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
 }
 
 #[test]

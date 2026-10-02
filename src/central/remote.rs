@@ -888,7 +888,7 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
         println!("Transferred {}", p.meta.alias);
     }
     println!(
-        "Migration complete. Run codexctl use, then regular codex. Keep other machines from refreshing their old credential copies."
+        "Migration complete. Run codexctl use, then codexctl codex. Resume old sessions with codexctl codex resume <session-id>. Keep other machines from refreshing their old credential copies."
     );
     Ok(())
 }
