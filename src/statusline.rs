@@ -14,6 +14,8 @@ const MAX_BYTES: u64 = 65_536;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Usage {
+    #[serde(default)]
+    pub age_seconds: u64,
     pub weekly_used_percent: Option<f64>,
     pub weekly_resets_at: Option<i64>,
     pub five_hour_used_percent: Option<f64>,
@@ -33,6 +35,7 @@ impl Usage {
         let weekly = window(604_800);
         let short = window(18_000);
         Self {
+            age_seconds: 0,
             weekly_used_percent: weekly.map(|w| w.used_percent),
             weekly_resets_at: weekly.and_then(api::RateLimitWindow::reset_timestamp),
             five_hour_used_percent: short.map(|w| w.used_percent),
@@ -127,6 +130,11 @@ pub(crate) fn record(
             return Ok(());
         }
         let destination = paths.codexctl_dir().join("statusline.json");
+        let age_seconds = usage.as_ref().map_or(0, |u| u.age_seconds);
+        let sampled_at = chrono::Utc::now()
+            .timestamp()
+            .checked_sub(i64::try_from(age_seconds)?)
+            .context("invalid usage age")?;
         let five_hour_resets_at = usage.as_ref().and_then(|u| u.five_hour_resets_at);
         let account = usage.map(|usage| crate::status_json::AccountStatus {
             alias: selection.alias.clone(),
@@ -142,10 +150,12 @@ pub(crate) fn record(
             resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
             billing_class: api::BillingClass::Unknown,
             error: None,
+            usage_age_seconds: Some(age_seconds),
+            usage_stale: Some(false),
         });
         let cache = Cache {
             version: 1,
-            sampled_at: chrono::Utc::now().timestamp(),
+            sampled_at,
             selection,
             account,
             five_hour_resets_at,
@@ -211,7 +221,10 @@ fn render(paths: &config::Paths) -> Result<String> {
         bail!("cache is not current");
     }
     let account = cache.account.context("no usage")?;
-    if account.error.is_some() || account.alias != cache.selection.alias {
+    if account.error.is_some()
+        || account.usage_stale == Some(true)
+        || account.alias != cache.selection.alias
+    {
         bail!("invalid status");
     }
     let weekly = remaining(account.secondary_used_percent.context("no weekly window")?)
@@ -314,6 +327,16 @@ mod tests {
         std::fs::create_dir(paths.codexctl_dir().join("statusline.json")).unwrap();
 
         record_local(&paths, &meta, Some(&usage(604800)));
+
+        assert!(render(&paths).is_err());
+    }
+    #[test]
+    fn statusline_rewriting_an_old_server_sample_does_not_extend_its_lifetime() {
+        let (_home, paths, meta) = setup();
+        let mut sample = Usage::from_usage(&usage(604800));
+        sample.age_seconds = 121;
+
+        record(&paths, Selection::local(&meta), None, Some(sample));
 
         assert!(render(&paths).is_err());
     }

@@ -148,6 +148,7 @@ impl Reader {
                 .as_ref()
                 .is_none_or(|(_, at)| at.elapsed() >= self.ttl);
         summary.usage_error = entry.error.map(str::to_owned);
+        summary.statusline_usage = None;
         summary.primary_used = None;
         summary.secondary_used = None;
         summary.resets_at = None;
@@ -164,6 +165,9 @@ impl Reader {
                 .and_then(|r| r.long_window())
                 .and_then(|w| w.reset_timestamp());
             if !summary.usage_stale {
+                let mut snapshot = crate::statusline::Usage::from_usage(usage);
+                snapshot.age_seconds = summary.usage_age_seconds.unwrap_or_default();
+                summary.statusline_usage = Some(snapshot);
                 summary.billing_class = server::usage_billing_class(usage);
                 summary.usage_score = limits.map(|r| r.availability_score());
             }

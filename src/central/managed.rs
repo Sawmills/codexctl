@@ -199,7 +199,7 @@ fn account_summary(owner: &Owner) -> Account {
                 api::token_identity(vault::token(&owner.vault.auth).ok()?).and_then(|i| i.plan)
             }),
         billing_class: billing,
-        statusline_usage: usage.as_ref().map(crate::statusline::Usage::from_usage),
+        statusline_usage: None,
         primary_used: windows
             .and_then(|r| r.short_window())
             .map(|w| w.used_percent),
@@ -411,6 +411,7 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
                 summary.usage_error = Some("credentials_changed".into());
             }
             if summary.usage_stale {
+                summary.statusline_usage = None;
                 summary.billing_class = api::BillingClass::Unknown;
                 summary.usage_score = None;
             }

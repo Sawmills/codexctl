@@ -13,7 +13,8 @@ The time shows the weekly reset countdown.
 A known five-hour window adds, for example, `· 88% 5h`.
 An account without a weekly window produces no output.
 
-The command reads a private local cache with a 120-second lifetime.
+The command reads a private local cache with a 120-second lifetime from the original usage sample.
+Server sample age is preserved, and stale or failed server usage is hidden.
 It makes no network requests, takes no store lock, and creates no files.
 Local reads have a 150-millisecond wait budget.
 Process startup and operating-system scheduling can add time.

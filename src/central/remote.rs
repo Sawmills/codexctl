@@ -655,8 +655,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     let active = native::active_alias()?;
     for account in &accounts {
         // Summary columns do not prove window durations on an older server.
-        let usage = account
-            .available
+        let usage = (account.available && !account.usage_stale && account.usage_error.is_none())
             .then(|| account.statusline_usage.clone())
             .flatten();
         crate::statusline::record(
