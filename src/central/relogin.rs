@@ -1,6 +1,6 @@
 //! Server-owned native login with durable operation records.
 use super::{
-    managed::{self, Broker, HttpError, Import},
+    managed::{self, Broker, HttpError},
     process,
     server::{Owner, TokenRequest},
     vault::{self, Vault},
@@ -26,14 +26,17 @@ use std::{
 use tokio::sync::Mutex;
 mod http;
 mod inventory;
-pub(super) use inventory::{ClearedIdentity, ProcessState, identity_inventory};
+pub(super) use inventory::{
+    AdmissionDenied, AdmissionKind, ClearedIdentity, ProcessState, clear_registry,
+    identity_inventory,
+};
 mod recover;
 mod state;
 mod worker;
 pub(super) use http::{cancel, start, status};
 use recover::*;
 pub(super) use recover::{
-    check_import, needs_verification, recover, verifier_parent_exited, verify_replacement,
+    needs_verification, recover, retire_reservations, verifier_parent_exited, verify_replacement,
 };
 use state::*;
 use worker::*;

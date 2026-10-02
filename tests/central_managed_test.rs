@@ -4857,3 +4857,161 @@ fn hq6_partial_journal_does_not_prevent_an_unrelated_verified_restart() {
         503
     );
 }
+
+#[test]
+fn hq7_unstarted_migrations_do_not_permanently_block_each_other() {
+    for cross_user in [false, true] {
+        let mut server = Server::start();
+        server.stop();
+        let executable = server.root.path().join("missing-codex");
+        let (child, url) = Server::spawn_binary(&server.root, &executable);
+        server.child = child;
+        server.url = url;
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        let claimant = if cross_user {
+            &server.alex
+        } else {
+            &server.amir
+        };
+        assert_eq!(
+            server
+                .import(claimant, "work", "same-login", "same-seat")
+                .status(),
+            503
+        );
+        std::os::unix::fs::symlink(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"),
+            &executable,
+        )
+        .unwrap();
+        assert_eq!(
+            server
+                .import(claimant, "work", "same-login", "same-seat")
+                .status(),
+            200,
+            "two proven unstarted migrations must not reserve each other's grant"
+        );
+        assert_eq!(server.token(claimant, "work", None).status(), 200);
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "same-login", "same-seat")
+                .status(),
+            409
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "1"
+        );
+    }
+}
+
+#[test]
+fn hq7_migration_can_repair_quarantine_without_an_existing_server_account() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "shared-seat")
+            .status(),
+        200
+    );
+    let id = "c".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth_with_uid("alex-login", "shared-seat", "alex-uid")).unwrap(),
+    )
+    .unwrap();
+    let failed = server.await_login(&server.amir, "personal", &id, "failed");
+    assert_eq!(failed["error"], "wrong_account");
+    let quarantine =
+        account_directory(&server, "amir", "personal").join(format!("relogin/{id}/record.json"));
+    let original: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(original["retired"], false);
+    // Neither missing nor conflicting UID claims can retire this reservation.
+    for grant in [
+        auth("alex-login", "shared-seat"),
+        auth_with_uid("alex-login", "shared-seat", "wrong-uid"),
+    ] {
+        let refused = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.alex)
+            .json(&json!({"alias":"work", "auth":grant}))
+            .send()
+            .unwrap();
+        assert_eq!(refused.status(), 503);
+        assert!(!account_directory(&server, "alex", "work").exists());
+    }
+    let mut grant = auth_with_uid("alex-login", "shared-seat", "alex-uid");
+    grant["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    let rejected = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(rejected.status(), 503);
+    let retained: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(
+        retained, original,
+        "rejected verification must retain the reservation"
+    );
+    grant["tokens"]["refresh_token"] = json!("synthetic-fresh-bootstrap-grant");
+    let migrated = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(
+        migrated.status(),
+        200,
+        "a verified fresh migration must provide a quarantine repair path"
+    );
+    let retired: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(retired["retired"], true);
+    assert_eq!(
+        retired["candidate"], original["candidate"],
+        "retirement preserves quarantine evidence"
+    );
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    server.stop();
+    // Recreate a crash after the verified vault write but before retirement.
+    store::atomic_write(&quarantine, &serde_json::to_vec(&original).unwrap()).unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    let before = std::fs::read_to_string(server.root.path().join("count"))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    let retried = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"work", "auth":grant}))
+        .send()
+        .unwrap();
+    assert_eq!(retried.status(), 200);
+    let after = std::fs::read_to_string(server.root.path().join("count"))
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "retry must verify again before retirement"
+    );
+    let retired: Value = serde_json::from_slice(&std::fs::read(&quarantine).unwrap()).unwrap();
+    assert_eq!(retired["retired"], true);
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+}

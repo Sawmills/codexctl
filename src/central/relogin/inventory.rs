@@ -1,6 +1,33 @@
 //! One disk inventory for migration, login renewal, and refresh ownership checks.
 use super::*;
 
+/// A fresh verification may repair a stopped quarantine; ordinary restart may not.
+#[derive(Clone, Copy, PartialEq)]
+pub(in crate::central) enum AdmissionKind {
+    Migration,
+    Renewal,
+    Restore,
+}
+pub(in crate::central) struct Admission {
+    pub quarantine_repair: bool,
+}
+#[derive(Debug)]
+pub(in crate::central) enum AdmissionDenied {
+    Reserved,
+    Owned,
+    Unsettled,
+}
+impl std::fmt::Display for AdmissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Reserved => "login renewal reserves this server account",
+            Self::Owned => "server account already belongs to a company user",
+            Self::Unsettled => "previous refresh or login process is not cleared",
+        })
+    }
+}
+impl std::error::Error for AdmissionDenied {}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(in crate::central) enum ProcessState {
     Stopped,
@@ -144,6 +171,7 @@ impl IdentityInventory {
     pub(in crate::central) fn clear_for_launch<'a>(
         self,
         refresh: &Owner,
+        kind: AdmissionKind,
         _lock: &'a tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<ClearedIdentity<'a>> {
         if self.state != refresh.state || self.home != refresh.home || refresh.rpc.is_some() {
@@ -177,7 +205,7 @@ impl IdentityInventory {
                 &refresh.key,
                 &self.state,
                 &saved.auth,
-                saved.verified,
+                kind,
             )?;
         }
         Ok(ClearedIdentity {
@@ -210,21 +238,24 @@ impl IdentityInventory {
     }
 }
 
-pub(super) fn check_registry_claim(
+/// The sole registry admission policy, shared by migration, renewal and launch.
+/// Call under the migration lock, after settling any conflicting refresh processes.
+pub(in crate::central) fn clear_registry(
     accounts: &Path,
     key: &Path,
     selected: &Path,
     auth: &Value,
-) -> Result<()> {
-    clear_registry(accounts, key, selected, auth, false)
-}
-fn clear_registry(
-    accounts: &Path,
-    key: &Path,
-    selected: &Path,
-    auth: &Value,
-    restoring_verified: bool,
-) -> Result<()> {
+    kind: AdmissionKind,
+) -> Result<Admission> {
+    if kind == AdmissionKind::Migration
+        && current(selected)?.is_some_and(|r| r.phase != Phase::Completed)
+    {
+        return Err(AdmissionDenied::Reserved.into());
+    }
+    let restoring_verified = kind == AdmissionKind::Restore;
+    let mut admission = Admission {
+        quarantine_repair: false,
+    };
     for entry in std::fs::read_dir(accounts)? {
         let state = entry?.path();
         if state == selected {
@@ -233,10 +264,16 @@ fn clear_registry(
         let inventory = identity_inventory(&state, key, &state.join("runtime"));
         let conflict = inventory.journal_conflicts();
         for candidate in inventory.candidates? {
-            if overlaps(&candidate.auth, auth)
-                && (restoring_verified || candidate.process != ProcessState::Stopped)
-            {
-                bail!("matching quarantine reserves this server account");
+            if overlaps(&candidate.auth, auth) {
+                if restoring_verified || candidate.process != ProcessState::Stopped {
+                    return Err(AdmissionDenied::Reserved.into());
+                }
+                if kind == AdmissionKind::Migration {
+                    // A new grant must preserve every known login claim before it
+                    // can retire a quarantine, even when no server account exists.
+                    super::super::server::validate_owned_identity(&candidate.auth, auth)?;
+                }
+                admission.quarantine_repair = true;
             }
         }
         let journal = match inventory.journal {
@@ -273,21 +310,26 @@ fn clear_registry(
         };
         if conflict {
             if inventory.runtime != ProcessState::Stopped {
-                bail!("conflicting journal owner has not stopped");
+                return Err(AdmissionDenied::Unsettled.into());
             }
             if overlaps(&saved.auth, auth) || journal.as_ref().is_some_and(|a| overlaps(a, auth)) {
-                bail!("conflicting journal reserves this account");
+                return Err(AdmissionDenied::Unsettled.into());
             }
         }
         if !overlaps(&saved.auth, auth) {
             continue;
         }
-        if saved.verified || !saved.import_rejected || inventory.login_reserved {
-            bail!("account already owned or reserved");
+        if inventory.login_reserved {
+            return Err(AdmissionDenied::Reserved.into());
         }
-        if inventory.runtime != ProcessState::Stopped {
-            bail!("previous credential owner has not stopped");
+        if saved.verified {
+            return Err(AdmissionDenied::Owned.into());
+        }
+        if inventory.runtime != ProcessState::Stopped
+            || (!saved.import_rejected && !managed::definitely_not_started(&inventory.home))
+        {
+            return Err(AdmissionDenied::Unsettled.into());
         }
     }
-    Ok(())
+    Ok(admission)
 }

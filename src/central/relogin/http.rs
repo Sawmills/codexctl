@@ -170,7 +170,7 @@ async fn start_owned(
                 .snapshot()
                 .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
             let proof = identity_inventory(&state, &broker.key, &original.home)
-                .clear_for_launch(&original, &_import)
+                .clear_for_launch(&original, AdmissionKind::Restore, &_import)
                 .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut original, &broker.binary, proof)
                 .await

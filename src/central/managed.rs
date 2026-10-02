@@ -448,8 +448,6 @@ impl Broker {
             .map(|(key, _)| key)
             .unwrap_or_else(|| account_key(user, &input.alias));
         let selected = self.state.join("accounts").join(&id);
-        relogin::check_import(&self.state, &self.key, &selected, &input)
-            .map_err(|_| self.error(StatusCode::CONFLICT, "relogin_reserved"))?;
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
         }
@@ -460,7 +458,6 @@ impl Broker {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
         }
         let owners = self.owners.read().await.clone();
-        let mut quarantined = Vec::new();
         // Inventory journals before filtering by a vault identity. A failed refresh
         // can leave a different seat in the journal while its vault stays unchanged.
         for (_, owner) in owners.values() {
@@ -505,8 +502,8 @@ impl Broker {
                 if settled.runtime != relogin::ProcessState::Stopped {
                     bail!("conflicting owner did not stop");
                 }
-                quarantined.push(settled.saved?.auth);
-                quarantined.push(settled.journal?.context("missing conflicting journal")?);
+                settled.saved?;
+                settled.journal?.context("missing conflicting journal")?;
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -515,9 +512,62 @@ impl Broker {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
             }
         }
-        if quarantined.iter().any(|auth| overlaps(auth, &input.auth)) {
-            return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        for (key, (_, owner)) in &owners {
+            if key == &id {
+                continue;
+            }
+            let mut owner = owner.lock().await;
+            let same = vault::account(&owner.vault.auth).ok() == vault::account(&input.auth).ok()
+                && api::token_subject(vault::token(&owner.vault.auth).unwrap_or(""))
+                    == api::token_subject(vault::token(&input.auth).unwrap_or(""));
+            if !same {
+                continue;
+            }
+            if !owner.vault.verified {
+                // Settle an unverified refresh process before the shared admission
+                // rule decides whether another migration can claim its identity.
+                if let Some(rpc) = owner.rpc.as_mut() {
+                    rpc.shutdown().await.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
+                } else {
+                    previous_owner_exited(&owner.home).map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
+                }
+                owner.available = false;
+                if owner
+                    .home
+                    .try_exists()
+                    .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
+                {
+                    owner.snapshot().map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed")
+                    })?;
+                }
+            }
         }
+        let admission = relogin::clear_registry(
+            &self.state.join("accounts"),
+            &self.key,
+            &selected,
+            &input.auth,
+            relogin::AdmissionKind::Migration,
+        )
+        .map_err(
+            |error| match error.downcast_ref::<relogin::AdmissionDenied>() {
+                Some(relogin::AdmissionDenied::Reserved) => {
+                    self.error(StatusCode::CONFLICT, "relogin_reserved")
+                }
+                Some(relogin::AdmissionDenied::Owned) => {
+                    self.error(StatusCode::CONFLICT, "account_already_owned")
+                }
+                Some(relogin::AdmissionDenied::Unsettled) => {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                }
+                None => self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"),
+            },
+        )?;
         if let Some((_, owner)) = owners.get(&id) {
             let mut owner = owner.lock().await;
             let original_uid = api::token_identity(vault::token(&owner.vault.auth).unwrap_or(""))
@@ -531,7 +581,7 @@ impl Broker {
             {
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
-            if owner.vault.verified && owner.available {
+            if owner.vault.verified && owner.available && !admission.quarantine_repair {
                 // A retained proof owns the grant, but cannot establish current
                 // routing or billing eligibility after a restart or policy change.
                 owner
@@ -563,49 +613,6 @@ impl Broker {
             }
             // Keep the reservation until the prepared replacement is inserted below.
             // Validation or preparation can still fail after this owner has stopped.
-        }
-        for (key, (_, owner)) in &owners {
-            if key == &id {
-                continue;
-            }
-            let mut owner = owner.lock().await;
-            let same = vault::account(&owner.vault.auth).ok() == vault::account(&input.auth).ok()
-                && api::token_subject(vault::token(&owner.vault.auth).unwrap_or(""))
-                    == api::token_subject(vault::token(&input.auth).unwrap_or(""));
-            if !same {
-                continue;
-            }
-            if !owner.vault.verified {
-                // A rejected candidate cannot reserve a seat, but an uncertain live owner
-                // must settle before another candidate may attempt the same credentials.
-                if let Some(rpc) = owner.rpc.as_mut() {
-                    rpc.shutdown().await.map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                    })?;
-                } else {
-                    previous_owner_exited(&owner.home).map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                    })?;
-                }
-                owner.available = false;
-                if owner
-                    .home
-                    .try_exists()
-                    .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
-                {
-                    owner.snapshot().map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed")
-                    })?;
-                }
-            }
-            if owner.vault.verified {
-                return Err(self.error(StatusCode::CONFLICT, "account_already_owned"));
-            }
-            if !owner.vault.import_rejected && !definitely_not_started(&owner.home) {
-                // An interrupted proof may have rotated credentials. Only its original
-                // alias may retry with the retained journal; never replay a new input.
-                return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            }
         }
         let state = self.state.join("accounts").join(&id);
         if state
@@ -682,7 +689,7 @@ impl Broker {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
             let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                .clear_for_launch(&owner, &_import)
+                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, &_import)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut owner, &self.binary, proof)
                 .await
@@ -704,6 +711,10 @@ impl Broker {
             }
             owner.vault.verified = true;
             vault::save(&state, &self.key, &owner.vault)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            // Verification and the durable vault precede retirement. A crash or
+            // retirement failure leaves reservations for an explicit migration retry.
+            relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             Ok(account_summary(&owner))
         }
@@ -1081,7 +1092,7 @@ pub async fn serve(
             && !repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
             && async {
                 let proof = relogin::identity_inventory(&owner.state, key, &owner.home)
-                    .clear_for_launch(&owner, &startup_import)?;
+                    .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &startup_import)?;
                 launch_owner(&mut owner, binary, proof).await
             }
             .await
@@ -1376,7 +1387,7 @@ mod tests {
         let lock = Mutex::new(());
         let guard = lock.lock().await;
         let proof = relogin::identity_inventory(&owner.state, &key, &owner.home)
-            .clear_for_launch(&owner, &guard)
+            .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &guard)
             .unwrap();
         assert!(
             launch_owner(&mut owner, &root.path().join("missing-codex"), proof)
@@ -1404,7 +1415,7 @@ mod tests {
         let lock = Mutex::new(());
         let guard = lock.lock().await;
         let proof = relogin::identity_inventory(&owner.state, &key, &owner.home)
-            .clear_for_launch(&owner, &guard)
+            .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &guard)
             .unwrap();
         assert!(
             launch_owner(&mut owner, &root.path().join("missing-codex"), proof)
@@ -1423,7 +1434,7 @@ mod tests {
         let lock = Mutex::new(());
         let guard = lock.lock().await;
         let proof = relogin::identity_inventory(&refresh.state, &key, &refresh.home)
-            .clear_for_launch(&refresh, &guard)
+            .clear_for_launch(&refresh, relogin::AdmissionKind::Restore, &guard)
             .unwrap();
         let changed = recovery_auth(Some(2), "unexpected-refresh");
         store::atomic_write(

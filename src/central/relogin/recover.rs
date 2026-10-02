@@ -90,8 +90,11 @@ async fn verify_inner(
     if owner.rpc.is_none() {
         // Clearance must read the previous verifier's exit evidence before the
         // new intent replaces its recorded account-server incarnation.
-        let proof = identity_inventory(&owner.state, &owner.key, &owner.home)
-            .clear_for_launch(owner, lock)?;
+        let proof = identity_inventory(&owner.state, &owner.key, &owner.home).clear_for_launch(
+            owner,
+            AdmissionKind::Renewal,
+            lock,
+        )?;
         let mut record = current(&owner.state)?.context("missing re-login commit")?;
         // Persist BEFORE launch_owner invalidates runtime/pid and spawn-failed.
         // Production spawns on the broker's long-lived main thread; isolate()
@@ -126,7 +129,11 @@ async fn verify_inner(
     save(&owner.state, &record)?;
     Ok(())
 }
-fn retire_reservations(accounts: &Path, auth: &Value, skip: &Path) -> Result<()> {
+pub(in crate::central) fn retire_reservations(
+    accounts: &Path,
+    auth: &Value,
+    skip: &Path,
+) -> Result<()> {
     for entry in std::fs::read_dir(accounts)? {
         let state = entry?.path();
         for mut record in records(&state)? {
@@ -145,30 +152,6 @@ fn retire_reservations(accounts: &Path, auth: &Value, skip: &Path) -> Result<()>
                     record.error = Some("superseded_by_owner_repair".into());
                 }
                 save(&state, &record)?;
-            }
-        }
-    }
-    Ok(())
-}
-pub(in crate::central) fn check_import(
-    state: &Path,
-    key: &Path,
-    selected: &Path,
-    input: &Import,
-) -> Result<()> {
-    if current(selected)?.is_some_and(|r| r.phase != Phase::Completed) {
-        bail!("selected account is reserved by re-login");
-    }
-    let auth = &input.auth;
-    for entry in std::fs::read_dir(state.join("accounts"))? {
-        let state = entry?.path();
-        let inventory = identity_inventory(&state, key, &state.join("runtime"));
-        if inventory.login_reserved && overlaps(&inventory.saved?.auth, auth) {
-            bail!("selected identity is reserved by login");
-        }
-        for candidate in inventory.candidates? {
-            if overlaps(&candidate.auth, auth) {
-                bail!("re-login candidate reserves this account");
             }
         }
     }
@@ -333,7 +316,7 @@ pub(super) fn check_claim(
     selected: &Path,
     auth: &Value,
 ) -> Result<()> {
-    inventory::check_registry_claim(accounts, key, selected, auth)
+    inventory::clear_registry(accounts, key, selected, auth, AdmissionKind::Renewal).map(|_| ())
 }
 
 fn rejected(saved: &Vault) -> bool {

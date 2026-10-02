@@ -64,7 +64,8 @@ Copy it into an atomic, synchronized private record before promotion.
 The native login file itself is not an atomic persistence guarantee.
 Preserve wrong-account grants in quarantine and leave the selected account unchanged.
 Stop any known owner whose grant matches that quarantine.
-Reject overlapping imports until the rightful account owner supplies a matching fresh login.
+Allow a matching migration or login renewal to repair a stopped quarantine only after native verification.
+Migration can create the first server account for that identity; it must preserve all known login claims.
 Never assign a wrong-account grant to a different company user.
 
 For a matching candidate, persist a commit intent with the original identity and exact old/new credential digests.
@@ -191,14 +192,38 @@ The same restart rule applies to a stopped partial journal when its readable vau
 names a different identity. If both copies are unreadable, clearance fails.
 New migration and login renewal claims retain the stricter refusal.
 
+`clear_registry` is the single admission rule for migration and refresh launch.
+It accepts the registry, encryption key path, selected state, auth, and an explicit
+`AdmissionKind`: migration, renewal, or restore. The alternative was a boolean
+restart flag plus a separate migration check. That interface left callers to
+coordinate two policies and allowed them to disagree. The enum keeps the policy
+in the inventory module and makes each call site's purpose explicit.
+
+The check reads evidence and returns admission or a typed refusal. It does not
+stop processes, write credentials, or create tasks. Callers hold the migration
+lock and settle conflicting refresh processes first. Admission reports matching
+quarantines so migration cannot return cached success without fresh verification.
+A verified server account or an active login reservation retains its identity.
+An unverified server account frees it only after proven process exit and either
+permanent rejection or proof that its refresh process never started.
+
+Migration and renewal can repair matching quarantines after proven login-process
+exit. Ordinary restore refuses them. Migration requires positive identity agreement,
+including every known UID, before launch. It forces native verification and saves
+the verified vault before retiring matching reservations. Retirement preserves
+candidate bytes. Failure retains the reservations and makes the selected server
+account unavailable. An explicit migration retry verifies again using its retained
+journal, including after a crash between the vault write and retirement. No
+quarantine credential is assigned to another company user.
+
 Launch call sites:
 
 - `managed::import_account`: holds the migration lock, inventories the prepared
-  server account, and passes clearance to `launch_owner`.
-- `managed::serve`: holds the same lock during startup inventory and launch.
+  server account, and passes migration clearance to `launch_owner`.
+- `managed::serve`: holds the same lock during startup inventory and restore clearance.
   Recovery that needs verification goes through `verify_replacement`.
 - `relogin::recover::verify_inner`: validates and reconciles the selected journal,
-  obtains clearance using the previous process evidence, records the new verifier
+  obtains renewal clearance using the previous process evidence, records the new verifier
   spawn intent, then starts the verifier.
   Both worker completion and HTTP retry pass the held migration lock here.
 - `relogin::http::start_owned`: when recovery has completed retirement, obtains

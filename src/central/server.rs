@@ -514,7 +514,7 @@ pub async fn serve(
         let migration_lock = Mutex::new(());
         let guard = migration_lock.lock().await;
         let proof = super::relogin::identity_inventory(state, key, &refresh.home)
-            .clear_for_launch(&refresh, &guard)?;
+            .clear_for_launch(&refresh, super::relogin::AdmissionKind::Restore, &guard)?;
         runtime.disable_cleanup(true);
         if let Err(error) = super::managed::launch_owner(&mut refresh, binary, proof).await {
             // Retain every runtime that might have refreshed credentials. A
