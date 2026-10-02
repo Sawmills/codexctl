@@ -10,4 +10,4 @@ resources:
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
-    digest: sha256:ad770b5609b8511ba37e78d925aa43f014ef1d2c4940c5353083e27994a76bf8
+    digest: sha256:7c442a3ced9bf906ffc2ffa38d97d199761810c70a2299ba18bd514eacce419f
