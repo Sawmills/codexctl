@@ -187,6 +187,8 @@ accounts. It checks vaults, runtime journals, quarantined candidates, and proces
 exit evidence. A live login child for the selected server account prevents clearance.
 Verified server accounts can restart beside an unreadable vault only when that
 vault's refresh process has exited and its readable journal does not overlap.
+The same restart rule applies to a stopped partial journal when its readable vault
+names a different identity. If both copies are unreadable, clearance fails.
 New migration and login renewal claims retain the stricter refusal.
 
 Launch call sites:
@@ -196,7 +198,8 @@ Launch call sites:
 - `managed::serve`: holds the same lock during startup inventory and launch.
   Recovery that needs verification goes through `verify_replacement`.
 - `relogin::recover::verify_inner`: validates and reconciles the selected journal,
-  records verifier spawn intent, obtains clearance, then starts the verifier.
+  obtains clearance using the previous process evidence, records the new verifier
+  spawn intent, then starts the verifier.
   Both worker completion and HTTP retry pass the held migration lock here.
 - `relogin::http::start_owned`: when recovery has completed retirement, obtains
   clearance and restores the normal refresh process without repeating verification.
@@ -227,6 +230,17 @@ The **Promoted, verifier spawning** row retains its prior crash evidence. Cleara
 match the server account identity before native code can read it.
 All five round-four findings have regression tests that fail on `bfcfb10`.
 The final independent review uses the Claude engine across the full branch.
+
+The login child publishes spawn intent, spawns, and saves its process identity
+inside one migration critical section. A concurrent migration cannot observe that
+transient interval. A crash can still leave spawn intent without a PID; the state
+table governs that case. A queued-lock regression checks this ordering.
+
+The registry keeps company user and normalized alias metadata beside each refresh
+process handle. Alias lookup reads that metadata without waiting for any refresh
+process mutex. Historical whitespace aliases retain their physical state directory;
+catalog and login-renewal replies expose the same normalized alias. Tests cover the
+complete CLI renewal path and token delivery while a different alias is refreshing.
 
 ## Primary Sources
 

@@ -88,14 +88,16 @@ async fn verify_inner(
     owner.verification_input = Some(owner.vault.auth.clone());
     vault::save(&owner.state, &owner.key, &owner.vault)?;
     if owner.rpc.is_none() {
+        // Clearance must read the previous verifier's exit evidence before the
+        // new intent replaces its recorded account-server incarnation.
+        let proof = identity_inventory(&owner.state, &owner.key, &owner.home)
+            .clear_for_launch(owner, lock)?;
         let mut record = current(&owner.state)?.context("missing re-login commit")?;
         // Persist BEFORE launch_owner invalidates runtime/pid and spawn-failed.
         // Production spawns on the broker's long-lived main thread; isolate()
         // gives this verifier the same Linux parent-death contract as login.
         record.verifier_broker = Some(process::Process::capture(std::process::id())?);
         save(&owner.state, &record)?;
-        let proof = identity_inventory(&owner.state, &owner.key, &owner.home)
-            .clear_for_launch(owner, lock)?;
         launch_owner(owner, binary, proof).await?;
     }
     let revision = owner.snapshot()?.revision;

@@ -209,7 +209,7 @@ pub(super) fn response(record: &Record) -> Response {
     (
         [("cache-control", "no-store")],
         Json(json!({
-            "id":record.id, "alias":record.alias, "userId":record.user, "status":status,
+            "id":record.id, "alias":record.alias.trim(), "userId":record.user, "status":status,
             "verificationUrl":if record.phase == Phase::Pending { Some(URL) } else { None },
             "userCode":if record.phase == Phase::Pending { record.code.as_deref() } else { None },
             "error":record.error,

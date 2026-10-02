@@ -62,7 +62,12 @@ struct Failure {
     count: u64,
     last: i64,
 }
-type Owners = BTreeMap<String, (String, Arc<Mutex<Owner>>)>;
+#[derive(Clone)]
+pub(super) struct AccountIndex {
+    user: String,
+    alias: String,
+}
+type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
 pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
@@ -268,21 +273,19 @@ impl Broker {
     ) -> Result<Option<(String, Arc<Mutex<Owner>>)>, HttpError> {
         let alias = normalize_alias(alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-        let entries = self.owners.read().await.clone();
+        let entries = self.owners.read().await;
         let mut selected = None;
         // Retain the physical key for server accounts saved before normalization.
         // Ambiguous historical aliases require repair; never choose one silently.
-        for (key, (company_user, refresh)) in entries {
-            if company_user != user {
+        for (key, (identity, refresh)) in entries.iter() {
+            if identity.user != user {
                 continue;
             }
-            let matches = normalize_alias(&refresh.lock().await.vault.alias)
-                .is_ok_and(|saved| saved.eq_ignore_ascii_case(alias));
-            if matches {
+            if identity.alias.eq_ignore_ascii_case(alias) {
                 if selected.is_some() {
                     return Err(self.error(StatusCode::CONFLICT, "ambiguous_alias"));
                 }
-                selected = Some((key, refresh));
+                selected = Some((key.clone(), refresh.clone()));
             }
         }
         Ok(selected)
@@ -344,7 +347,7 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
         .read()
         .await
         .values()
-        .filter(|(user, _)| user == &device.user)
+        .filter(|(identity, _)| identity.user == device.user)
         .map(|(_, owner)| owner.clone())
         .collect();
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
@@ -668,7 +671,11 @@ impl Broker {
         ));
         let guard = owner.clone().lock_owned().await;
         // Retain ownership before initialization or any potentially uncertain refresh.
-        self.owners.write().await.insert(id, (user.into(), owner));
+        let identity = AccountIndex {
+            user: user.into(),
+            alias: guard.vault.alias.trim().into(),
+        };
+        self.owners.write().await.insert(id, (identity, owner));
         let mut owner = guard;
         let verification = async {
             if self.read_only {
@@ -1046,9 +1053,12 @@ pub async fn serve(
                 _ => ownership_unresolved = true,
             }
         }
-        let user = owner.vault.user.clone();
+        let identity = AccountIndex {
+            user: owner.vault.user.clone(),
+            alias: owner.vault.alias.trim().into(),
+        };
         let owner = Arc::new(Mutex::new(owner));
-        owners.insert(id, (user, owner));
+        owners.insert(id, (identity, owner));
     }
     // Inventory every retained runtime before starting replacements. An unresolved
     // process could hold any seat, so do not launch against incomplete evidence.

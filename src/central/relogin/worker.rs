@@ -97,39 +97,7 @@ pub(super) async fn run(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     process::isolate(&mut command);
-    {
-        let _import = broker.imports.lock().await;
-        record.child = Child::Spawning;
-        save(&state, record)?;
-        std::fs::remove_file(home.join("spawn-failed"))?;
-        store::sync_directory(&home)?;
-    }
-    // Direct spawn in a Tokio task on codexctl-central's current-thread runtime.
-    // A blocking-pool thread must never own a PDEATHSIG-protected login child.
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            let _import = broker.imports.lock().await;
-            record.child = Child::NotStarted;
-            save(&state, record)?;
-            return Err(e.into());
-        }
-    };
-    let recorded = async {
-        let process = process::Process::capture(child.id().context("login exited")?)?;
-        let _import = broker.imports.lock().await;
-        record.child = Child::Running(process);
-        save(&state, record)
-    }
-    .await;
-    if let Err(error) = recorded {
-        child.start_kill()?;
-        child.wait().await?;
-        let _import = broker.imports.lock().await;
-        record.child = Child::Exited;
-        save(&state, record)?;
-        return Err(error);
-    }
+    let mut child = spawn_login(&broker.imports, &state, &home, record, &mut command).await?;
     let mut output = child.stdout.take().context("missing login output")?;
     let started = tokio::time::Instant::now();
     let mut bytes = Vec::new();
@@ -273,4 +241,43 @@ async fn fence(broker: &Broker, auth: &Value) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+pub(super) async fn spawn_login(
+    imports: &Mutex<()>,
+    state: &Path,
+    home: &Path,
+    record: &mut Record,
+    command: &mut Command,
+) -> Result<tokio::process::Child> {
+    // Keep intent, spawn, and process evidence in one migration critical section.
+    // A queued inventory must not turn a transient spawn window into a global fence.
+    let _import = imports.lock().await;
+    record.child = Child::Spawning;
+    save(state, record)?;
+    std::fs::remove_file(home.join("spawn-failed"))?;
+    store::sync_directory(home)?;
+    // Direct spawn on the account server's long-lived main thread. A blocking-pool
+    // thread must never be the parent of a PDEATHSIG-protected login child.
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            record.child = Child::NotStarted;
+            save(state, record)?;
+            return Err(error.into());
+        }
+    };
+    let recorded = (|| {
+        let process = process::Process::capture(child.id().context("login exited")?)?;
+        record.child = Child::Running(process);
+        save(state, record)
+    })();
+    if let Err(error) = recorded {
+        child.start_kill()?;
+        child.wait().await?;
+        record.child = Child::Exited;
+        save(state, record)?;
+        return Err(error);
+    }
+    Ok(child)
 }

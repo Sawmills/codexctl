@@ -4712,7 +4712,7 @@ fn hq5_migration_normalizes_the_alias_used_for_lookup() {
 }
 
 #[test]
-fn legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
+fn hq6_legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
     use aes_gcm::{
         Aes256Gcm,
         aead::{Aead, KeyInit},
@@ -4773,4 +4773,87 @@ fn legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
         200
     );
     server.await_login(&server.amir, "personal", &id, "canceled");
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("same-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    let machine = server.connected_home();
+    let renewed = server.cli(machine.path(), &["login", "personal", "--no-browser"]);
+    assert!(
+        renewed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renewed.stderr)
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn hq6_slow_refresh_does_not_block_another_alias_of_the_same_company_user() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "slow", "alex-login", "slow-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.amir, "fast", "amir-login", "fast-seat")
+            .status(),
+        200
+    );
+    let initial: Value = server.token(&server.amir, "slow", None).json().unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    let fast = std::thread::scope(|scope| {
+        let slow = scope.spawn(|| server.token(&server.amir, "slow", initial["revision"].as_str()));
+        wait_for_refresh(&server);
+        let fast = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/token", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"fast", "billing":true}))
+            .send();
+        store::atomic_write(&server.root.path().join("release"), b"released").unwrap();
+        assert_eq!(slow.join().unwrap().status(), 200);
+        fast
+    });
+    assert_eq!(
+        fast.expect("unrelated alias waited for slow refresh")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn hq6_partial_journal_does_not_prevent_an_unrelated_verified_restart() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .import(&server.alex, "personal", "alex-login", "alex-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    let journal = account_directory(&server, "amir", "personal").join("runtime/auth.json");
+    store::atomic_write(&journal, b"{partial").unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.alex, "personal", None).status(), 200);
+    assert_eq!(std::fs::read(&journal).unwrap(), b"{partial");
+    assert_eq!(
+        server
+            .import(&server.alex, "new", "other-login", "other-seat")
+            .status(),
+        503
+    );
 }

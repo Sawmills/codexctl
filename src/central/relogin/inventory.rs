@@ -232,7 +232,6 @@ fn clear_registry(
         }
         let inventory = identity_inventory(&state, key, &state.join("runtime"));
         let conflict = inventory.journal_conflicts();
-        let journal = inventory.journal?;
         for candidate in inventory.candidates? {
             if overlaps(&candidate.auth, auth)
                 && (restoring_verified || candidate.process != ProcessState::Stopped)
@@ -240,6 +239,23 @@ fn clear_registry(
                 bail!("matching quarantine reserves this server account");
             }
         }
+        let journal = match inventory.journal {
+            Ok(journal) => journal,
+            Err(error) => {
+                // Resume only established, unrelated grants beside a stopped
+                // partial journal. Migration and login renewal still refuse.
+                if restoring_verified
+                    && inventory.runtime == ProcessState::Stopped
+                    && inventory
+                        .saved
+                        .as_ref()
+                        .is_ok_and(|saved| !overlaps(&saved.auth, auth))
+                {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         let saved = match inventory.saved {
             Ok(saved) => saved,
             Err(error) => {

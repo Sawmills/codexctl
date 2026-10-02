@@ -352,3 +352,36 @@ fn promoted_verifier_without_exit_proof_fences_only_its_account() {
         assert!(previous_owner_exited(&state.join("runtime")).is_err());
     }
 }
+
+#[tokio::test]
+async fn hq6_queued_inventory_never_observes_a_transient_spawning_child() {
+    let (_root, state, _key, mut record) = fixture();
+    let home = directory(&state, &record.id).unwrap().join("home");
+    let imports = Mutex::new(());
+    let held = imports.lock().await;
+    let mut command = tokio::process::Command::new("/bin/sleep");
+    command.arg("30").kill_on_drop(true);
+    process::isolate(&mut command);
+    let mut spawn = Box::pin(spawn_login(
+        &imports,
+        &state,
+        &home,
+        &mut record,
+        &mut command,
+    ));
+    assert!(futures::poll!(&mut spawn).is_pending());
+    let mut observe = Box::pin(async {
+        let _lock = imports.lock().await;
+        current(&state).unwrap().unwrap().child
+    });
+    assert!(futures::poll!(&mut observe).is_pending());
+    drop(held);
+    let (child, observed) = tokio::join!(spawn, observe);
+    let mut child = child.unwrap();
+    child.start_kill().unwrap();
+    child.wait().await.unwrap();
+    assert!(
+        matches!(observed, Child::Running(_)),
+        "migration saw transient spawn intent without PID evidence"
+    );
+}
