@@ -461,6 +461,25 @@ pub(super) fn require_current_connection(expected: &Connection) -> Result<()> {
     }
     Ok(())
 }
+pub use super::resets::{Inventory as ResetInventory, Outcome as ResetOutcome};
+
+pub fn resets() -> Result<Option<ResetInventory>> {
+    let Some(connection) = connection()? else {
+        return Ok(None);
+    };
+    let result: super::resets::Inventory = check(
+        request(&connection, "/v1/resets")?
+            .send()
+            .context("cannot reach the account server for reset credits")?,
+    )?
+    .json()?;
+    require_current_connection(&connection)?;
+    if result.user_id != connection.user_id {
+        bail!("server user identity changed");
+    }
+    Ok(Some(result))
+}
+
 pub fn accounts() -> Result<Option<Vec<Account>>> {
     Ok(catalog()?.map(|c| c.accounts))
 }

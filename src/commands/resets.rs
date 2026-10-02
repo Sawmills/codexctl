@@ -16,14 +16,65 @@ use crate::profile;
 
 /// `codexctl resets` — list banked resets across every saved profile.
 pub fn run_list() -> Result<()> {
-    let profiles = profile::list_profiles()?;
-    if profiles.is_empty() {
-        println!("no profiles saved. Use 'codexctl save' to save the current account.");
+    #[cfg(feature = "central-prototype")]
+    let server = codexctl::central::remote::resets()?;
+    #[allow(unused_mut)]
+    let mut profiles = profile::list_profiles()?;
+    #[cfg(feature = "central-prototype")]
+    if server.is_some() {
+        profiles = profiles
+            .into_iter()
+            .map(|p| Ok((!p.dir.join(".central-transfer.json").try_exists()?, p)))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|(local, p)| local.then_some(p))
+            .collect();
+    }
+    let active = profile::get_active()?;
+    #[allow(unused_mut)]
+    let mut rows = fetch_all(&profiles, &active)?;
+    #[cfg(feature = "central-prototype")]
+    let server_mode = server.is_some();
+    #[cfg(not(feature = "central-prototype"))]
+    let server_mode = false;
+    #[cfg(feature = "central-prototype")]
+    if let Some(server) = server {
+        let active = codexctl::central::native::active_alias()?;
+        for account in server.accounts {
+            use codexctl::central::remote::ResetOutcome as Outcome;
+            let is_active = active.as_deref() == Some(&account.alias);
+            rows.push(match account.outcome {
+                Outcome::Read {
+                    available,
+                    applicable,
+                    credits,
+                } => ResetsRow {
+                    alias: account.alias,
+                    is_active,
+                    available,
+                    applicable,
+                    credits,
+                    error: None,
+                },
+                Outcome::Failed { error } => ResetsRow {
+                    alias: account.alias,
+                    is_active,
+                    available: 0,
+                    applicable: 0,
+                    credits: Vec::new(),
+                    error: Some(error),
+                },
+            });
+        }
+    }
+    if rows.is_empty() {
+        if server_mode {
+            println!("no accounts saved.");
+        } else {
+            println!("no profiles saved. Use 'codexctl save' to save the current account.");
+        }
         return Ok(());
     }
-
-    let active = profile::get_active()?;
-    let rows = fetch_all(&profiles, &active)?;
 
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
@@ -38,8 +89,17 @@ pub fn run_list() -> Result<()> {
     println!("{table}");
 
     println!();
+    let failed = rows.iter().filter(|row| row.error.is_some()).count();
+    if failed > 0 {
+        println!(
+            "Partial total: {total} banked, {redeemable} redeemable on accounts read successfully."
+        );
+        bail!("reset credits unavailable for {failed} account(s); total is incomplete");
+    }
     println!("{total} banked, {redeemable} redeemable now.");
-    if redeemable > 0 {
+    if server_mode {
+        println!("Server-account reset redemption is not supported.");
+    } else if redeemable > 0 {
         println!("Redeem with `codexctl reset <alias>`.");
     } else if total > 0 {
         println!(

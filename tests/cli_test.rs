@@ -812,6 +812,30 @@ fn save_refuses_a_third_alias_for_an_already_duplicated_credential() {
 }
 
 #[test]
+fn resets_reports_an_incomplete_total_when_a_local_profile_has_no_auth() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".codexctl/profiles/broken");
+    codexctl::store::ensure_private_dir(&profile).unwrap();
+    codexctl::store::atomic_write(
+        &profile.join("meta.json"),
+        br#"{"alias":"broken","saved_at":"2036-01-01"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .arg("resets")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("bad auth.json"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("total is incomplete"));
+}
+
+#[test]
 fn status_json_returns_one_empty_document_without_messages() {
     let home = tempfile::tempdir().unwrap();
     let output = Command::cargo_bin("codexctl")

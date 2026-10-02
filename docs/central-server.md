@@ -91,6 +91,7 @@ See the [versioned JSON schema](status-json.md) for fields and failure behavior.
 codexctl status
 codexctl list
 codexctl whoami
+codexctl resets
 codexctl use
 codexctl codex
 ```
@@ -100,6 +101,25 @@ started migration, marked `local`, with live usage. A failed usage request keeps
 the profile visible with an error. Empty columns are hidden. When the server has
 no accounts, a migration hint appears below the table. Profiles with a migration
 marker remain excluded, including migrations whose completion is unknown.
+
+`codexctl resets` lists banked counts, redeemable counts, and expiry dates for server accounts.
+It reads those values through the account server. Migration does not require local `auth.json` files for this command.
+Unmigrated profiles retain their local reset lookup.
+A failed account read shows an error and an incomplete total. The command exits with failure in both server and local modes.
+An account server without the reset endpoint rejects this command until the operator deploys the new server.
+Server-account reset redemption remains unsupported. The list command never spends a reset or approves credit billing.
+Local redemption still requires an exhausted window and selects the qualifying reset closest to expiry.
+Explicit account selection never redeems a reset. `--allow-resets` and `--allow-billing` remain separate approvals.
+
+The read-only `GET /v1/resets` endpoint requires a registered machine credential.
+It returns only that company user's aliases, counts, and reset details, with `Cache-Control: no-store`.
+The refresh owner supplies credentials for the server's OpenAI reads. The response contains no OpenAI credentials.
+After OpenAI rejects an access token, the server records `reset_auth_rejected` and retries once through the refresh owner.
+A successful retry does not trigger the operational failure alert.
+Each failed account read increments `codexctl_central_failed_requests_total{reason="reset_read_failed"}` once.
+A structured log identifies the `resets` stage. The existing `CodexctlCredentialOperationFailed` alert includes this reason.
+The server rechecks machine authorization before delivery.
+Alert routing and notification delivery still require deployment checks.
 
 Automatic selection uses only accounts with verified included usage.
 It prefers an account with headroom and the soonest long-window reset.
