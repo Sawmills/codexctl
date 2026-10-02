@@ -90,7 +90,15 @@ fn recovery_retains_uid_loss_and_uid_conflict_without_promoting_either() {
         .unwrap();
         let recovery = recover(&state, &key).unwrap();
         assert!(recovery.blocked && !recovery.verify);
-        assert_eq!(recovery.quarantined, vec![unexpected]);
+        assert_eq!(
+            identity_inventory(&state, &key)
+                .candidates
+                .unwrap()
+                .into_iter()
+                .map(|c| c.auth)
+                .collect::<Vec<_>>(),
+            vec![unexpected]
+        );
         assert_eq!(std::fs::read(state.join("vault.enc")).unwrap(), before);
     }
 }
@@ -112,7 +120,14 @@ fn incomplete_native_credentials_keep_only_the_target_unavailable_after_proven_e
     )
     .unwrap();
     let recovery = recover(&state, &key).unwrap();
-    assert!(recovery.blocked && !recovery.verify && recovery.quarantined.is_empty());
+    assert!(
+        recovery.blocked
+            && !recovery.verify
+            && identity_inventory(&state, &key)
+                .candidates
+                .unwrap()
+                .is_empty()
+    );
 }
 #[test]
 fn unpublished_preparation_is_ignored_and_a_stopped_interruption_becomes_terminal() {

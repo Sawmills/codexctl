@@ -135,6 +135,18 @@ The file approach remains suitable because each phase transition has one authori
 atomic record write; journal, vault, and reservation writes are idempotent effects of a
 durable intent, so SQLite would not make those external effects transactional.
 
+Import, renewal, and startup use one read-only identity inventory. It reads the vault,
+runtime journal, retained login candidates, and process-exit evidence before filtering
+by identity. An unreadable source remains unknown evidence. A conflicting journal
+reserves both the vault identity and the journal identity.
+
+Two interfaces were considered: an async broker inventory that also stops children,
+and a read-only disk inventory with explicit process states. The latter supports both
+live requests and startup before RPC owners exist. Its callers hold the import lock
+or startup owner lock. Import can stop a conflicting RPC and reread the inventory;
+renewal refuses while that process remains live or unidentified. Stopped login
+quarantines remain eligible for rightful-owner repair only after fresh-grant verification.
+
 All mutation paths take the import lock before resolving the normalized alias and
 current owner. Worker completion, cancellation, import, and renewal follow this order.
 The lock covers ownership checks and commit verification. An unfinished operation

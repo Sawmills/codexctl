@@ -430,17 +430,24 @@ impl Broker {
         for (_, owner) in owners.values() {
             let mut owner = owner.lock().await;
             let inventory = async {
-                if !owner.home.try_exists()? {
+                let inventory = relogin::identity_inventory(&owner.state, &self.key);
+                inventory
+                    .saved
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                inventory
+                    .journal
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                inventory
+                    .candidates
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if !inventory.journal_conflicts() {
                     return Ok(());
                 }
-                let auth = retained_auth(&owner.home)?;
-                vault::validate_auth(&auth)?;
-                if owner.validate_owned_auth(&auth).is_ok() {
-                    return Ok(());
-                }
-                // Known conflicting identities are bounded reservations. Stop
-                // the candidate before trusting that inventory; a still-live or
-                // unreadable owner may hold any account and needs the broad fence.
+                // Settle before trusting a conflicting journal, then inventory it
+                // again through the same reader used by renewal and startup.
                 owner.available = false;
                 if let Some(rpc) = owner.rpc.as_mut() {
                     // A nonzero status is still a confirmed stopped owner.
@@ -450,10 +457,12 @@ impl Broker {
                     previous_owner_exited(&owner.home)?;
                 }
                 owner.rpc = None;
-                let settled = retained_auth(&owner.home)?;
-                vault::validate_auth(&settled)?;
-                quarantined.push(owner.vault.auth.clone());
-                quarantined.push(settled);
+                let settled = relogin::identity_inventory(&owner.state, &self.key);
+                if settled.runtime != relogin::ProcessState::Stopped {
+                    bail!("conflicting owner did not stop");
+                }
+                quarantined.push(settled.saved?.auth);
+                quarantined.push(settled.journal?.context("missing conflicting journal")?);
                 Ok::<(), anyhow::Error>(())
             }
             .await;
@@ -745,7 +754,7 @@ async fn ready(State(broker): State<Broker>) -> StatusCode {
     }
 }
 
-fn retained_auth(home: &Path) -> Result<Value> {
+pub(super) fn retained_auth(home: &Path) -> Result<Value> {
     Ok(serde_json::from_slice(&vault::private_read(
         &home.join("auth.json"),
     )?)?)
@@ -906,7 +915,17 @@ pub async fn serve(
     }
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let entry = entry?;
-        let stored = vault::load(&entry.path(), key);
+        let inventory = relogin::identity_inventory(&entry.path(), key);
+        let journal_conflicts = inventory.journal_conflicts();
+        let stopped = inventory.runtime == relogin::ProcessState::Stopped;
+        match inventory.candidates {
+            Ok(candidates) => conflicting_journals.extend(candidates.into_iter().map(|c| c.auth)),
+            Err(_) => {
+                replacements_blocked = true;
+                ownership_unresolved = true;
+            }
+        }
+        let stored = inventory.saved;
         let account_vault = match stored {
             Ok(v)
                 if entry.file_type()?.is_dir()
@@ -917,16 +936,11 @@ pub async fn serve(
             _ => {
                 recovery_failures += 1;
                 ownership_unresolved = true;
-                let home = entry.path().join("runtime");
-                replacements_blocked |= previous_owner_exited(&home).is_err();
-                match retained_auth(&home) {
-                    Ok(auth) if vault::validate_auth(&auth).is_ok() => {
-                        conflicting_journals.push(auth);
-                    }
-                    // An empty pre-runtime reservation never started an owner.
-                    // Once a runtime exists, missing identity must retain the fence.
-                    _ if matches!(home.try_exists(), Ok(false)) => {}
-                    _ => replacements_blocked = true,
+                replacements_blocked |= !stopped;
+                match inventory.journal {
+                    Ok(Some(auth)) => conflicting_journals.push(auth),
+                    Ok(None) => {}
+                    Err(_) => replacements_blocked = true,
                 }
                 continue;
             }
@@ -937,7 +951,6 @@ pub async fn serve(
             ownership_unresolved = true;
         }
         let repair = repair.unwrap_or_default();
-        conflicting_journals.extend(repair.quarantined);
         let pending = !account_vault.verified && !repair.verify;
         let id = account_key(&account_vault.user, &account_vault.alias);
         if repair.verify {
@@ -969,21 +982,15 @@ pub async fn serve(
         if pending || repair.blocked || (read_only && repair.verify) {
             owner.available = false;
         }
-        // Metadata errors retain the inventory fence; only proven absence is empty.
-        if !matches!(owner.home.try_exists(), Ok(false)) {
-            match retained_auth(&owner.home) {
-                Ok(auth) if owner.validate_owned_auth(&auth).is_ok() => {}
-                journal => {
-                    let stopped = previous_owner_exited(&owner.home).is_ok();
-                    replacements_blocked |= !stopped;
-                    match journal {
-                        Ok(auth) if vault::validate_auth(&auth).is_ok() && stopped => {
-                            conflicting_journals.push(owner.vault.auth.clone());
-                            conflicting_journals.push(auth);
-                        }
-                        _ => ownership_unresolved = true,
-                    }
+        // Use the same complete identity inventory as live import and renewal.
+        if journal_conflicts {
+            replacements_blocked |= !stopped;
+            match inventory.journal {
+                Ok(Some(auth)) if stopped => {
+                    conflicting_journals.push(owner.vault.auth.clone());
+                    conflicting_journals.push(auth);
                 }
+                _ => ownership_unresolved = true,
             }
         }
         let user = owner.vault.user.clone();

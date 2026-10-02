@@ -104,23 +104,26 @@ pub(super) struct Owner {
     pub(super) verification_input: Option<Value>,
 }
 
+pub(super) fn validate_owned_identity(original_auth: &Value, auth: &Value) -> Result<()> {
+    vault::validate_auth(auth)?;
+    if vault::account(auth)? != vault::account(original_auth)?
+        || api::token_subject(vault::token(auth)?)
+            != api::token_subject(vault::token(original_auth)?)
+    {
+        bail!("central credential owner changed identity");
+    }
+    let original =
+        api::token_identity(vault::token(original_auth)?).context("missing original identity")?;
+    let updated = api::token_identity(vault::token(auth)?).context("missing updated identity")?;
+    if original.user_id.is_some() && original.user_id != updated.user_id {
+        bail!("central credential owner changed login identity");
+    }
+    Ok(())
+}
+
 impl Owner {
     pub(super) fn validate_owned_auth(&self, auth: &Value) -> Result<()> {
-        vault::validate_auth(auth)?;
-        if vault::account(auth)? != vault::account(&self.vault.auth)?
-            || api::token_subject(vault::token(auth)?)
-                != api::token_subject(vault::token(&self.vault.auth)?)
-        {
-            bail!("central credential owner changed identity");
-        }
-        let original = api::token_identity(vault::token(&self.vault.auth)?)
-            .context("missing original identity")?;
-        let updated =
-            api::token_identity(vault::token(auth)?).context("missing updated identity")?;
-        if original.user_id.is_some() && original.user_id != updated.user_id {
-            bail!("central credential owner changed login identity");
-        }
-        Ok(())
+        validate_owned_identity(&self.vault.auth, auth)
     }
 
     pub(super) fn reconcile_journal(&mut self) -> Result<()> {

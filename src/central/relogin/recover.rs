@@ -148,19 +148,12 @@ pub(in crate::central) fn check_import(
     let auth = &input.auth;
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let state = entry?.path();
-        if current(&state)
-            .ok()
-            .flatten()
-            .is_some_and(|r| r.phase != Phase::Completed)
-            && overlaps(&vault::load(&state, key)?.auth, auth)
-        {
+        let inventory = identity_inventory(&state, key);
+        if inventory.login_reserved && overlaps(&inventory.saved?.auth, auth) {
             bail!("selected identity is reserved by login");
         }
-        for record in records(&state)? {
-            if record.phase == Phase::Completed || record.retired {
-                continue;
-            }
-            if reservation(&state, &record)?.is_some_and(|a| overlaps(&a, auth)) {
+        for candidate in inventory.candidates? {
+            if overlaps(&candidate.auth, auth) {
                 bail!("re-login candidate reserves this account");
             }
         }
@@ -171,7 +164,6 @@ pub(in crate::central) fn check_import(
 pub(in crate::central) struct Recovery {
     pub blocked: bool,
     pub verify: bool,
-    pub quarantined: Vec<Value>,
 }
 pub(in crate::central) fn recover(state: &Path, key: &Path) -> Result<Recovery> {
     // An unknown login child can hold any account and needs a global fence.
@@ -188,10 +180,6 @@ pub(in crate::central) fn recover(state: &Path, key: &Path) -> Result<Recovery> 
         Err(_) => Ok(Recovery {
             blocked: true,
             verify: false,
-            quarantined: records
-                .iter()
-                .filter_map(|r| reservation(state, r).ok().flatten())
-                .collect(),
         }),
     }
 }
@@ -282,7 +270,6 @@ fn recover_inner(state: &Path, key: &Path) -> Result<Recovery> {
         if let Ok(Some(auth)) = auth {
             record.candidate = Some(auth.clone());
             save(state, &record)?;
-            result.quarantined.push(auth);
         }
     }
     Ok(result)
@@ -337,17 +324,34 @@ pub(super) fn check_claim(
         if state == selected {
             continue;
         }
-        let saved = vault::load(&state, key)?;
+        let inventory = identity_inventory(&state, key);
+        let conflict = inventory.journal_conflicts();
+        let journal = inventory.journal?;
+        let saved = inventory.saved?;
+        if conflict {
+            if inventory.runtime != ProcessState::Stopped {
+                bail!("conflicting journal owner has not stopped");
+            }
+            if overlaps(&saved.auth, auth) || journal.as_ref().is_some_and(|a| overlaps(a, auth)) {
+                bail!("conflicting journal reserves this account");
+            }
+        }
+        for candidate in inventory.candidates? {
+            if overlaps(&candidate.auth, auth) && candidate.process != ProcessState::Stopped {
+                bail!("matching quarantined login has not stopped");
+            }
+            // A stopped quarantine may be retired only after this rightful
+            // owner's fresh grant passes verification. Import cannot do that.
+        }
         if !overlaps(&saved.auth, auth) {
             continue;
         }
-        if saved.verified
-            || !saved.import_rejected
-            || current(&state)?.is_some_and(|r| r.phase != Phase::Completed)
-        {
+        if saved.verified || !saved.import_rejected || inventory.login_reserved {
             bail!("account already owned or reserved");
         }
-        previous_owner_exited(&state.join("runtime"))?;
+        if inventory.runtime != ProcessState::Stopped {
+            bail!("previous credential owner has not stopped");
+        }
     }
     Ok(())
 }

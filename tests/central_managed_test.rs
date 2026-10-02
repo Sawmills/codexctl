@@ -4461,3 +4461,89 @@ fn hq_known_local_login_does_not_require_the_server_catalog() {
     store::atomic_write(&home.path().join(".codexctl/central/local.json"), b"{}").unwrap();
     assert!(!String::from_utf8_lossy(&run().stderr).contains("LOCAL_LOGIN_REACHED"));
 }
+
+#[test]
+fn hq_renewal_refuses_a_live_conflicting_import_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "different-login", "same-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    let id = "d".repeat(64);
+    let result = server.login_request(&server.amir, "start", "personal", &id);
+    if result.status().is_success() {
+        server.login_request(&server.amir, "cancel", "personal", &id);
+        server.await_login(&server.amir, "personal", &id, "canceled");
+    }
+    assert_eq!(
+        result.status(),
+        409,
+        "renewal must reserve the conflicting journal before device login"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn hq_startup_refuses_verification_against_a_conflicting_import_journal() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "different-login", "same-seat")
+            .status(),
+        200
+    );
+    let id = "c".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("different-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let response: Value = server
+            .login_request(&server.amir, "status", "personal", &id)
+            .json()
+            .unwrap();
+        if response["error"] == "relogin_failed" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    unsafe {
+        libc::kill(server.child.id() as i32, libc::SIGTERM);
+    }
+    assert!(!server.child.wait().unwrap().success());
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before,
+        "startup must not launch a competing verifier"
+    );
+}

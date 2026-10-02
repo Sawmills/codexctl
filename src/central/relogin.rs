@@ -25,6 +25,8 @@ use std::{
 };
 use tokio::sync::Mutex;
 mod http;
+mod inventory;
+pub(super) use inventory::{ProcessState, identity_inventory};
 mod recover;
 mod state;
 mod worker;
