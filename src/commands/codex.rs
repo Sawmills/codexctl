@@ -32,6 +32,12 @@ pub fn run(
     allow_billing: bool,
     allow_resets: bool,
 ) -> Result<i32> {
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    #[cfg(feature = "central-prototype")]
+    if let Some(code) = codexctl::central::native::run_codex(&invocation_args_for_cwd(args, &cwd))?
+    {
+        return Ok(code);
+    }
     #[cfg(feature = "central-prototype")]
     let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
     let paths = config::default_paths()?;
@@ -44,7 +50,6 @@ pub fn run(
         allow_billing,
         allow_resets,
     };
-    let cwd = std::env::current_dir().context("failed to get current directory")?;
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
     // The account that hit the cap is already active; never switch back to it.
     let initial_tried: Vec<String> = failed_alias.into_iter().collect();

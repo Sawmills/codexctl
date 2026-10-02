@@ -176,7 +176,7 @@ After server setup and device registration, connect each device once:
 CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl-central connect --alias personal \
   --server http://127.0.0.1:8787 --token-file /absolute/path/device.token
 CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl use personal
-CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 codex
+CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 ./target/debug/codexctl codex
 ```
 
 With one registered remote account, `codexctl use` also selects it without an alias.
@@ -210,9 +210,11 @@ The marker is `~/.codexctl/central/.native-active.json`.
 A failed activation removes its newly prepared marker; an abrupt stop can leave one that disconnect clears.
 Linked configuration files keep their links and file permissions. Their parent directories keep their permissions.
 Remote activation refuses inherited Codex homes and pinned aliases.
-While the remote provider is selected, local login, save, switch, exec, and recovery commands refuse instead of reporting or using a different account.
+While the remote provider is selected, local login, save, switch, and exec commands refuse instead of reporting or using a different account.
 The token helper also refuses an existing pinned shell that sees the remote provider through its linked configuration.
-Use regular `codex`, or disconnect before those local account wrappers.
+Use `codexctl codex` for a server-account launch, or disconnect before local account wrappers.
+Use `codexctl codex resume <session-id>` to override an old session's saved provider.
+Server-account launches do not use local account recovery or banked resets.
 Already-running TUI sessions keep the connection selected when they started.
 Remote activation refuses a running Codex daemon.
 Finish its sessions and run `codex app-server daemon stop` before selection.
