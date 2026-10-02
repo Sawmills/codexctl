@@ -211,13 +211,19 @@ The second form composes pinning with spend-cap recovery: the wrapper reads its 
 other lane. `exec` also names the pinned account to its children in `CODEXCTL_PINNED_ALIAS`, so
 recovery knows which account just failed and never switches straight back to it. `codexctl whoami` still reports whatever `codexctl use` last selected.
 
-Each alias gets a persistent pinned home at `~/.codexctl/exec-homes/<alias>/`. Only `auth.json` is
-a real per-account file there. Every other entry of `~/.codex` — `config.toml`, `AGENTS.md`,
-`sessions/` — is symlinked, so settings stay shared and session rollouts land in the real
-`~/.codex/sessions/` where `codex resume` looks for them. A refreshed token is folded back into
-the saved profile when the child exits, and an older token never overwrites a newer one. If Codex
-ever replaces a symlink with a real file, that copy stops tracking the shared one; delete
-`~/.codexctl/exec-homes/<alias>` to start clean. The child's exit code becomes codexctl's.
+Each alias gets a persistent pinned home at `~/.codexctl/exec-homes/<alias>/`.
+Credentials, daemon state, SQLite databases, locks, and unknown entries stay local to that home.
+Only these entries from `~/.codex` are shared through symbolic links: `config.toml`, `AGENTS.md`,
+`AGENTS.override.md`, `instructions.md`, `sessions/`, `archived_sessions/`, `session_index.jsonl`,
+`history.jsonl`, `skills/`, `prompts/`, `rules/`, and `memories/`.
+Session rollouts still land in `~/.codex/sessions/`, where `codex resume` finds them.
+On launch, `exec` removes old links at excluded names only when they point into the live Codex
+home. It preserves real files, directories, and links outside that home.
+
+A refreshed token is folded back into the saved profile when the child exits.
+An older token never overwrites a newer one. If Codex replaces a shared link with a real file,
+that copy stops tracking the shared one. Delete `~/.codexctl/exec-homes/<alias>` to start clean.
+The child's exit code becomes codexctl's.
 
 On Windows, creating these links requires Developer Mode, the
 `SeCreateSymbolicLinkPrivilege` user right, or an elevated `codexctl` process. If Windows denies
