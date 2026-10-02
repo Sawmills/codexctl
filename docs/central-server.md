@@ -76,6 +76,12 @@ codexctl use
 codex
 ```
 
+On a connected machine, `status` and `list` also show profiles that have not
+started migration, marked `local`, with live usage. A failed usage request keeps
+the profile visible with an error. Empty columns are hidden. When the server has
+no accounts, a migration hint appears below the table. Profiles with a migration
+marker remain excluded, including migrations whose completion is unknown.
+
 Automatic selection uses only accounts with verified included usage.
 It prefers an account with headroom and the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
