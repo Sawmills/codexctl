@@ -4,7 +4,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --release --locked --features central-prototype --bin codexctl-central
 
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4
 ARG CODEX_VERSION=0.159.0
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates \
