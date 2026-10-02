@@ -5113,6 +5113,13 @@ fn p3_new_local_login_skips_discovery_but_known_server_aliases_stay_fenced() {
         !contacted_server,
         "a new local alias must not query the catalog"
     );
+    let collision = home.path().join(".codexctl/profiles/personal");
+    store::ensure_private_dir(&collision).unwrap();
+    store::atomic_write(
+        &collision.join("auth.json"),
+        &serde_json::to_vec(&auth("local-login", "local-seat")).unwrap(),
+    )
+    .unwrap();
     for alias in ["personal", "PERSONAL"] {
         let result = run(alias);
         let error = String::from_utf8_lossy(&result.stderr);
@@ -5152,6 +5159,95 @@ fn p3_new_local_login_skips_discovery_but_known_server_aliases_stay_fenced() {
     assert!(!error.contains("LOCAL_LOGIN_REACHED"));
     assert!(
         error.contains("cannot read known server aliases"),
+        "{error}"
+    );
+}
+
+#[test]
+fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
+    use std::io::Write;
+    use std::net::{TcpListener, TcpStream};
+    fn accept(listener: &TcpListener, timeout: Duration) -> Option<TcpStream> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return Some(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+    fn reply(mut stream: TcpStream, body: &str) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            request.read_line(&mut line).unwrap();
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let newer = server
+        .http
+        .get(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.amir)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let home = server.connected_home();
+    server.stop();
+    let listener = TcpListener::bind(server.url.strip_prefix("http://").unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let spawn = || {
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .arg("list")
+            .env("HOME", home.path())
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let first = spawn();
+    let old_request = accept(&listener, Duration::from_secs(5)).unwrap();
+    let second = spawn();
+    // Force the newer response to complete first if discovery is not serialized.
+    if let Some(new_request) = accept(&listener, Duration::from_secs(1)) {
+        reply(new_request, &newer);
+        assert!(second.wait_with_output().unwrap().status.success());
+        reply(old_request, "[]");
+        assert!(first.wait_with_output().unwrap().status.success());
+    } else {
+        reply(old_request, "[]");
+        assert!(first.wait_with_output().unwrap().status.success());
+        reply(accept(&listener, Duration::from_secs(5)).unwrap(), &newer);
+        assert!(second.wait_with_output().unwrap().status.success());
+    }
+    drop(listener);
+    let login = server.cli(home.path(), &["login", "personal", "--no-browser"]);
+    let error = String::from_utf8_lossy(&login.stderr);
+    assert!(
+        error.contains("cannot renew server account personal; local login is disabled"),
         "{error}"
     );
 }

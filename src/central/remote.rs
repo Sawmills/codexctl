@@ -83,11 +83,6 @@ pub fn login(
     cancel: bool,
 ) -> Result<bool> {
     let alias = store::validate_alias(alias)?;
-    if native::known_local_alias(alias)? {
-        // The existing local login path still checks active-provider and transfer
-        // ownership before it launches device authentication.
-        return Ok(false);
-    }
     let Some(connection) = connection()? else {
         return Ok(false);
     };
@@ -472,6 +467,11 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
     let Some(connection) = connection()? else {
         return Ok(None);
     };
+    let directory = root()?;
+    // Serialize discovery with its cache write so an older response cannot
+    // erase a server alias that another discovery already recorded.
+    let _lock = native::native_lock(&directory)?;
+    require_current_connection(&connection)?;
     let response = request(&connection, "/v1/accounts")?
         .send()
         .context("cannot reach the account server")?;
@@ -482,9 +482,6 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
             bail!("server user identity changed");
         }
     }
-    let directory = root()?;
-    let _lock = native::native_lock(&directory)?;
-    require_current_connection(&connection)?;
     store::atomic_write(
         &directory.join(".catalog.json"),
         &serde_json::to_vec(&KnownAliases {
