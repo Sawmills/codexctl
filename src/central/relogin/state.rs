@@ -37,6 +37,9 @@ pub(super) struct Record {
     pub alias: String,
     pub broker: process::Process,
     pub child: Child,
+    // Durable verifier spawn intent, separate from the device-login child.
+    #[serde(default)]
+    pub verifier_broker: Option<process::Process>,
     pub original_revision: String,
     pub candidate_revision: Option<String>,
     pub candidate: Option<Value>,

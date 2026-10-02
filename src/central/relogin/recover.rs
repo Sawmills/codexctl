@@ -77,6 +77,12 @@ async fn verify_inner(owner: &mut Owner, binary: &Path) -> Result<()> {
     owner.verification_input = Some(owner.vault.auth.clone());
     vault::save(&owner.state, &owner.key, &owner.vault)?;
     if owner.rpc.is_none() {
+        let mut record = current(&owner.state)?.context("missing re-login commit")?;
+        // Persist BEFORE launch_owner invalidates runtime/pid and spawn-failed.
+        // Production spawns on the broker's long-lived main thread; isolate()
+        // gives this verifier the same Linux parent-death contract as login.
+        record.verifier_broker = Some(process::Process::capture(std::process::id())?);
+        save(&owner.state, &record)?;
         launch_owner(owner, binary).await?;
     }
     let revision = owner.snapshot()?.revision;
@@ -168,15 +174,13 @@ pub(in crate::central) struct Recovery {
     pub quarantined: Vec<Value>,
 }
 pub(in crate::central) fn recover(state: &Path, key: &Path) -> Result<Recovery> {
-    // Only unresolved process ownership needs a server-wide fence. Persistence or
-    // identity failures in stopped operations remain scoped to their account.
+    // An unknown login child can hold any account and needs a global fence.
+    // The verifier only receives an identity-checked grant: failure to prove its
+    // exit fences that account inside recover_inner, not unrelated accounts.
     let records = records(state)?;
     for record in &records {
         if !record.retired && record.phase != Phase::Completed {
             stopped(state, record)?;
-        }
-        if record.phase.commit_started() {
-            previous_owner_exited(&state.join("runtime"))?;
         }
     }
     match recover_inner(state, key) {
@@ -372,4 +376,19 @@ pub(super) async fn finish_rejection(owner: &mut Owner) -> Result<bool> {
     record.error = Some("login_rejected_retry".into());
     save(&owner.state, &record)?;
     Ok(true)
+}
+
+/// Only a current verifier intent can extend the ordinary runtime PID evidence.
+/// Never infer this from the older device-login broker incarnation.
+pub(in crate::central) fn verifier_parent_exited(state: &Path) -> Result<bool> {
+    #[cfg(target_os = "linux")]
+    if let Some(record) = current(state)?
+        && record.phase.commit_started()
+        && let Some(broker) = record.verifier_broker
+    {
+        return Ok(!broker.alive()?);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = state;
+    Ok(false)
 }

@@ -4335,3 +4335,129 @@ fn hq_rejection_after_a_partial_verification_still_allows_fresh_login() {
     );
     server.await_login(&server.amir, "personal", &fresh, "completed");
 }
+
+#[test]
+fn hq_verifier_missing_pid_crash_keeps_unrelated_accounts_available() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "a".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = account.join(format!("relogin/{id}/record.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        record["verifier_broker"], record["broker"],
+        "the real verifier must persist its own spawn intent"
+    );
+    #[cfg(not(target_os = "linux"))]
+    server.stop();
+    #[cfg(target_os = "linux")]
+    {
+        let process: Value =
+            serde_json::from_slice(&std::fs::read(account.join("runtime/pid")).unwrap()).unwrap();
+        let pid = process["pid"].as_u64().unwrap();
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            if stat
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                || stat
+                    .as_ref()
+                    .is_ok_and(|s| s.rsplit_once(')').unwrap().1.trim_start().starts_with('Z'))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "PDEATHSIG must stop the verifier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    // Crash after durable verifier spawn intent, before its PID is persisted.
+    record["phase"] = json!("promoted");
+    store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+    std::fs::remove_file(account.join("runtime/pid")).unwrap();
+    assert!(!account.join("runtime/spawn-failed").exists());
+    server.restart();
+    assert_eq!(
+        server
+            .import(&server.alex, "other", "alex-login", "alex-seat")
+            .status(),
+        200,
+        "unknown verifier must not fence other accounts"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        server.await_login(&server.amir, "personal", &id, "completed");
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn hq_known_local_login_does_not_require_the_server_catalog() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut server = Server::start();
+    let home = server.connected_home();
+    let profile = home.path().join(".codexctl/profiles/local");
+    store::ensure_private_dir(&profile).unwrap();
+    store::atomic_write(
+        &profile.join("auth.json"),
+        &serde_json::to_vec(&auth("local-login", "local-seat")).unwrap(),
+    )
+    .unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let executable = bin.join("codex");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\necho LOCAL_LOGIN_REACHED >&2\nexit 42\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    server.stop();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["login", "local"])
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    };
+    let result = run();
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("LOCAL_LOGIN_REACHED"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    // Known remote names must never fall through to native local login.
+    store::atomic_write(&profile.join(".central-transfer.json"), b"{}").unwrap();
+    assert!(!String::from_utf8_lossy(&run().stderr).contains("LOCAL_LOGIN_REACHED"));
+    std::fs::remove_file(profile.join(".central-transfer.json")).unwrap();
+    store::atomic_write(&home.path().join(".codexctl/central/local.json"), b"{}").unwrap();
+    assert!(!String::from_utf8_lossy(&run().stderr).contains("LOCAL_LOGIN_REACHED"));
+}

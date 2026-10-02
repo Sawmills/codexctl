@@ -36,6 +36,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
         device: "laptop".into(),
         broker: process::Process::capture(std::process::id()).unwrap(),
         child: Child::NotStarted,
+        verifier_broker: None,
         candidate: None,
         id: "f".repeat(64),
         user: "amir".into(),
@@ -318,4 +319,21 @@ recovery_table! {
     hq_table_failed => Failed,
     hq_table_corrupt => Corrupt,
     hq_table_read_only => ReadOnly,
+}
+
+#[test]
+fn promoted_verifier_without_exit_proof_fences_only_its_account() {
+    for verifier_intent in [false, true] {
+        let (_root, state, key, mut record) = fixture();
+        promote(&state, &key, &mut record, &auth(Some("known-login"), 1)).unwrap();
+        if verifier_intent {
+            // A still-live verifier broker never supplies Linux exit proof.
+            record.verifier_broker = Some(process::Process::capture(std::process::id()).unwrap());
+            save(&state, &record).unwrap();
+        }
+        std::fs::remove_file(state.join("runtime/spawn-failed")).unwrap();
+        let recovery = recover(&state, &key).expect("verifier uncertainty must be account scoped");
+        assert!(recovery.blocked && !recovery.verify);
+        assert!(previous_owner_exited(&state.join("runtime")).is_err());
+    }
 }

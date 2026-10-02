@@ -30,7 +30,9 @@ mod state;
 mod worker;
 pub(super) use http::{cancel, start, status};
 use recover::*;
-pub(super) use recover::{check_import, needs_verification, recover, verify_replacement};
+pub(super) use recover::{
+    check_import, needs_verification, recover, verifier_parent_exited, verify_replacement,
+};
 use state::*;
 use worker::*;
 #[cfg(test)]

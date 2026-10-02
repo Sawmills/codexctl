@@ -223,6 +223,7 @@ async fn start_owned(
         broker: process::Process::capture(std::process::id())
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?,
         child: Child::NotStarted,
+        verifier_broker: None,
         candidate: None,
         alias: original.vault.alias.clone(),
         original_revision: vault::digest(

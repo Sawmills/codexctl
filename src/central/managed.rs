@@ -762,13 +762,25 @@ pub(super) fn previous_owner_exited(home: &Path) -> Result<()> {
     if definitely_not_started(home) {
         return Ok(());
     }
-    let process: super::process::Process =
-        serde_json::from_slice(&vault::private_read(&home.join("pid"))?)?;
-    if process.alive()? {
-        bail!("previous credential owner still exists");
+    let pid_evidence = (|| -> Result<()> {
+        let process: super::process::Process =
+            serde_json::from_slice(&vault::private_read(&home.join("pid"))?)?;
+        if process.alive()? {
+            bail!("previous credential owner still exists");
+        }
+        Ok(())
+    })();
+    if pid_evidence.is_ok() {
+        return pid_evidence;
     }
-    Ok(())
+    if let Some(state) = home.parent()
+        && relogin::verifier_parent_exited(state)?
+    {
+        return Ok(());
+    }
+    pid_evidence
 }
+
 fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
     let vault = vault::load(state, key)?;
     vault::validate_auth(&vault.auth)?;
