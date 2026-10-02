@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  namespace: codexctl
+  name: codexctl
+  annotations:
+    checkov.io/skip2: CKV2_K8S_6=Checkov graph excludes StatefulSet. networkpolicy.yaml selects the same namespace and pod label.
+    checkov.io/skip1: CKV_K8S_43=Release must replace template workload images with the published digest before Argo registration.
+spec:
+  serviceName: codexctl
+  replicas: 1
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codexctl
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codexctl
+    spec:
+      terminationGracePeriodSeconds: 600
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: prepare-secrets
+          imagePullPolicy: Always
+          image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          command:
+            - sh
+            - -ec
+            - >-
+              cp /projected/vault-key /keys/vault-key;
+              cp /projected/oidc-client-secret /keys/oidc-client-secret;
+              cp /projected/metrics-token /keys/metrics-token;
+              chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 32Mi }
+          volumeMounts:
+            - { name: projected, mountPath: /projected, readOnly: true }
+            - { name: keys, mountPath: /keys }
+        - name: initialize
+          imagePullPolicy: Always
+          image: codexctl-central:staging
+          command: [sh, -ec]
+          args:
+            - >-
+              if [ ! -f /data/state/users.json ]; then
+              codexctl-central setup --state /data/state --key-file /keys/vault-key;
+              fi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: keys, mountPath: /keys, readOnly: true }
+      containers:
+        - name: broker
+          imagePullPolicy: Always
+          image: codexctl-central:staging
+          args:
+            - serve
+            - --state
+            - /data/state
+            - --key-file
+            - /keys/vault-key
+            - --listen
+            - 0.0.0.0:8787
+            - --public-url
+            - https://codexctl.ue1.staging.plat.sm-svc.com
+            - --metrics-token-file
+            - /keys/metrics-token
+            - --sso-config
+            - /configuration/sso.json
+          ports:
+            - { name: http, containerPort: 8787 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "2", memory: 2Gi }
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+          volumeMounts:
+            - { name: state, mountPath: /data }
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: configuration, mountPath: /configuration, readOnly: true }
+            - { name: temporary, mountPath: /tmp }
+            - { name: home, mountPath: /home/codexctl }
+      volumes:
+        - name: projected
+          secret:
+            secretName: codexctl-secrets
+            defaultMode: 288
+        - name: keys
+          emptyDir: { medium: Memory }
+        - name: configuration
+          configMap:
+            name: codexctl-sso
+        - name: temporary
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOncePod]
+        storageClassName: encrypted-gp3-1b
+        resources:
+          requests:
+            storage: 5Gi

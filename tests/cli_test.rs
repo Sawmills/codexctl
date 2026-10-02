@@ -1,4 +1,43 @@
+// These process fixtures isolate credentials through HOME. Windows resolves the
+// profile through Known Folders instead, so HOME cannot isolate these tests.
+#![cfg(unix)]
+
 use assert_cmd::Command;
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_transfer_marker_cannot_be_bypassed_by_adoption() {
+    use base64::Engine;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = codexctl::config::Paths::from_home(tmp.path().into());
+    let claims = r#"{"sub":"synthetic-login","https://api.openai.com/profile":{"email":"synthetic@example.test"},"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat"}}"#;
+    let token = format!(
+        "header.{}.sig",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims)
+    );
+    let credentials = serde_json::to_vec(&serde_json::json!({"access_token": token})).unwrap();
+    codexctl::store::atomic_write(&paths.codex_auth_json(), &credentials).unwrap();
+    codexctl::profile::save_profile_to(&paths, "transferred", None, &paths.codex_auth_json())
+        .unwrap();
+    let dir = paths.profiles_dir().join("transferred");
+    codexctl::store::atomic_write(&dir.join(".central-transfer.json"), b"{}").unwrap();
+    std::fs::remove_file(dir.join("auth.json")).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", tmp.path())
+        .env_remove("CODEX_HOME")
+        .args(["save", "transferred", "--allow-adopt"])
+        .write_stdin("")
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!output.status.success());
+    assert!(!dir.join("auth.json").exists());
+    assert!(dir.join(".central-transfer.json").exists());
+    assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), credentials);
+}
 
 #[test]
 fn help_shows_all_subcommands() {

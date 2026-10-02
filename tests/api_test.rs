@@ -198,7 +198,7 @@ fn billing_class_is_conservative_for_missing_or_changed_metadata() {
             r#"{{"plan_type":"pro","rate_limit":{{"primary_window":{{"used_percent":1,"limit_window_seconds":604800}}}},"credits":{credits}}}"#
         ))
         .unwrap();
-        assert_eq!(mixed.billing_class(), BillingClass::Unknown);
+        assert_eq!(mixed.billing_class(), BillingClass::RateLimited);
     }
 
     let empty_rate_limit: RateLimitResponse =
@@ -722,4 +722,21 @@ fn parse_null_additional_rate_limits_as_empty() {
 
     let response: RateLimitResponse = serde_json::from_str(json).unwrap();
     assert!(response.additional_rate_limits.is_empty());
+}
+
+#[test]
+fn current_pro_tiers_with_credits_have_included_usage() {
+    for plan in ["pro", "prolite", "promax"] {
+        let usage: RateLimitResponse = serde_json::from_value(serde_json::json!({
+            "plan_type": plan,
+            "rate_limit": {"primary_window": {"used_percent": 29, "limit_window_seconds": 604800}},
+            "credits": {"has_credits": true}
+        }))
+        .unwrap();
+        assert_eq!(
+            usage.billing_class(),
+            api::BillingClass::RateLimited,
+            "{plan}"
+        );
+    }
 }

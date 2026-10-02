@@ -18,6 +18,42 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(feature = "central-prototype")]
+    /// Connect this machine to an account server with company SSO.
+    Connect {
+        #[arg(long)]
+        server: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        no_browser: bool,
+    },
+    #[cfg(feature = "central-prototype")]
+    /// Restore the previous provider. Optionally forget this machine's registration.
+    Disconnect {
+        #[arg(long)]
+        forget: bool,
+    },
+    #[cfg(feature = "central-prototype")]
+    /// Transfer local profiles to the server after stopping all credential owners.
+    Migrate {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        exclusive_owner: bool,
+    },
+    #[cfg(feature = "central-prototype")]
+    /// List your registered devices, or revoke one.
+    Devices {
+        #[arg(long)]
+        revoke: Option<String>,
+    },
+    #[cfg(feature = "central-prototype")]
+    #[command(hide = true)]
+    CentralToken {
+        #[arg(long)]
+        connection: std::path::PathBuf,
+    },
     /// Show rate limit status for all accounts
     Status {
         /// Show only rate-limited accounts
@@ -159,7 +195,31 @@ fn main() {
         std::process::exit(1);
     }
 
+    #[cfg(feature = "central-prototype")]
+    if matches!(
+        &cli.command,
+        Commands::Login { .. } | Commands::Save { .. } | Commands::Switch
+    ) && let Err(error) = codexctl::central::native::require_local_mode()
+    {
+        eprintln!("error: {error:#}");
+        std::process::exit(1);
+    }
     let result = match cli.command {
+        #[cfg(feature = "central-prototype")]
+        Commands::Connect {
+            server,
+            name,
+            no_browser,
+        } => codexctl::central::remote::connect(&server, name.as_deref(), no_browser),
+        #[cfg(feature = "central-prototype")]
+        Commands::Disconnect { forget } => codexctl::central::remote::disconnect(forget),
+        #[cfg(feature = "central-prototype")]
+        Commands::Migrate {
+            all,
+            exclusive_owner,
+        } => codexctl::central::remote::migrate(all, exclusive_owner),
+        #[cfg(feature = "central-prototype")]
+        Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
         Commands::Status {
             rate_limited,
             usage_based,
@@ -187,6 +247,10 @@ fn main() {
             ref alias,
             ref text,
         } => commands::label::run(alias, text.as_deref()),
+        #[cfg(feature = "central-prototype")]
+        Commands::CentralToken { ref connection } => {
+            codexctl::central::native::print_token(connection)
+        }
         Commands::Use {
             ref alias,
             allow_billing,

@@ -23,6 +23,10 @@ pub fn run(
     allow_resets: bool,
     restart_daemon: bool,
 ) -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    if codexctl::central::native::activate(alias, _allow_billing)? {
+        return Ok(());
+    }
     run_to_auth_json(
         alias,
         &config::codex_auth_json()?,
@@ -47,22 +51,22 @@ pub fn run_to_auth_json_excluding(
     allow_resets: bool,
     restart: daemon_sync::Restart,
 ) -> Result<()> {
-    let selected = match alias::optional(alias)? {
-        // An explicit target is switched to as asked — never redeemed against,
-        // since `codexctl reset <alias>` is the way to spend a credit on a
-        // named account.
+    let explicit = alias::optional(alias)?;
+    let selected = match explicit {
         Some(a) => {
-            let email = profile::switch_to_auth_json(a, auth_json)?;
-            println!("switched to {} ({})", a, email);
-            a.to_string()
+            profile::get_profile(a)?;
+            a.to_owned()
         }
-        None => {
-            let best = find_most_available_excluding(excluded_alias, allow_resets)?;
-            let email = profile::switch_to_auth_json(&best, auth_json)?;
-            println!("auto-selected most available: {} ({})", best, email);
-            best
-        }
+        None => find_most_available_excluding(excluded_alias, allow_resets)?,
     };
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_selection()?;
+    let email = profile::switch_to_auth_json(&selected, auth_json)?;
+    if explicit.is_some() {
+        println!("switched to {} ({})", selected, email);
+    } else {
+        println!("auto-selected most available: {} ({})", selected, email);
+    }
     let unresumed = daemon_sync::after_switch(
         &selected,
         auth_json,
@@ -866,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_never_picks_unknown_or_mixed_billing_accounts() {
+    fn selection_accepts_subscription_credits_but_not_unknown_plans() {
         let mut unknown = team_response(5.0, 10.0, true);
         unknown.plan_type = Some("new_plan".to_string());
         assert_eq!(selection_score(&unknown), f64::MAX);
@@ -879,8 +883,35 @@ mod tests {
             overage_limit_reached: false,
             balance: None,
         });
-        assert_eq!(selection_score(&mixed), f64::MAX);
-        assert_eq!(recovery_class(&mixed), None);
+        assert!(selection_score(&mixed) < RATE_LIMIT_EXHAUSTED);
+        assert!(recovery_class(&mixed).is_some());
+    }
+
+    #[test]
+    fn pro_max_credits_preserve_billing_risk_and_exhaustion() {
+        let mut usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{"plan_type":"promax","rate_limit":{"primary_window":{"used_percent":29,"limit_window_seconds":604800}},"credits":{"has_credits":true},"spend_control":{"reached":false}}"#,
+        ).unwrap();
+        let class = recovery_class(&usage).unwrap();
+        assert!(class.bills_credits);
+        assert!(!class.needs_reset);
+        assert!(selection_score(&usage) < RATE_LIMIT_EXHAUSTED);
+        usage
+            .rate_limit
+            .as_mut()
+            .unwrap()
+            .primary_window
+            .as_mut()
+            .unwrap()
+            .used_percent = 100.0;
+        assert!(recovery_class(&usage).is_none());
+        usage.rate_limit_reset_credits = Some(api::ResetCreditsSummary {
+            available_count: 1,
+            applicable_available_count: 1,
+        });
+        let class = recovery_class(&usage).unwrap();
+        assert!(class.bills_credits);
+        assert!(class.needs_reset);
     }
 
     #[test]

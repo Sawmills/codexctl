@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: codexctl
+resources:
+  - ../../base
+  - ingress.yaml
+  - externalsecret.yaml
+  - sso.yaml
+  - monitoring.yaml
+images:
+  - name: codexctl-central
+    newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
+    digest: sha256:ad770b5609b8511ba37e78d925aa43f014ef1d2c4940c5353083e27994a76bf8

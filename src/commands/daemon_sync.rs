@@ -343,9 +343,13 @@ mod tests {
     /// so neither `use` nor `codex` recovery fails after the swap.
     #[test]
     fn an_unreadable_daemon_is_assumed_stale() {
+        #[cfg(unix)]
+        let root = std::path::PathBuf::from("/tmp");
+        #[cfg(windows)]
+        let root = std::env::temp_dir();
         let home = tempfile::Builder::new()
             .prefix("cxs")
-            .tempdir_in("/tmp")
+            .tempdir_in(root)
             .unwrap();
         assert!(inspect_or_assume_stale(home.path(), None).is_none());
 

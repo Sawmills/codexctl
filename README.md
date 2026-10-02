@@ -96,6 +96,16 @@ only re-login a seat once its token genuinely shows `expired`.
 Usage-based accounts are shown in a separate table with balance, seat limit, credits, and spend
 control status.
 
+When billing classification is unknown, status still shows the returned usage windows, resets,
+and token expiry. A `Billing` column marks those accounts as `unknown`. An unrecognized plan or
+missing main usage windows can cause this classification. Automatic selection still excludes
+these accounts.
+
+The `Plan` column shows the subscription returned by OpenAI, including Pro, Pro (More), and
+Pro (Max). Subscription windows and purchased credits can coexist. Credits do not make a known
+subscription unknown; spend control still determines billing risk during recovery. Plan names
+are not invoices or credit balances in dollars.
+
 ### Switch accounts
 
 Direct:
@@ -210,8 +220,16 @@ ever replaces a symlink with a real file, that copy stops tracking the shared on
 `~/.codexctl/exec-homes/<alias>` to start clean. The child's exit code becomes codexctl's.
 
 On Windows, creating these links requires Developer Mode, the
-`SeCreateSymbolicLinkPrivilege` user right, or an elevated `codexctl` process. If Windows refuses
-the operation, `exec` reports those options instead of failing with a generic link error.
+`SeCreateSymbolicLinkPrivilege` user right, or an elevated `codexctl` process. If Windows denies
+the operation because of missing link privileges, `exec` reports these remedies.
+
+Install the standalone CLI on Windows with
+`cargo install --git https://github.com/Sawmills/codexctl --no-default-features`.
+The central prototype requires Unix process and shell support.
+Windows tests require the same symbolic-link permissions as `exec`.
+CI enables Developer Mode and tests both file and directory links before the suite.
+Windows daemon synchronization has only mock-daemon test coverage.
+Compatibility with a real Windows Codex daemon remains unverified.
 
 ### Reset-aware selection (default)
 
@@ -449,7 +467,7 @@ take over completion for the shell's own `exec`.
 
 ## How it works
 
-Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`. `codexctl exec` copies it into `~/.codexctl/exec-homes/<alias>/auth.json` instead and passes that directory to the child as `CODEX_HOME`, so a pinned launch changes no shared state at all.
+Profiles are stored in `~/.codexctl/profiles/<alias>/` — each containing a copy of `auth.json` and `meta.json`. `codexctl login <alias>` runs `codex login --device-auth` with a unique isolated `CODEX_HOME` under `~/.codexctl/login-homes/<alias>/`, imports that auth file, removes the temporary login home, then switches to the saved profile. Switching copies the profile's `auth.json` into `~/.codex/auth.json`. `codexctl exec` copies it into `~/.codexctl/exec-homes/<alias>/auth.json` instead and passes that directory to the child as `CODEX_HOME`, so a pinned launch preserves the live auth file and active marker. It provisions its own exec home and can capture rotated credentials back to the saved profile.
 
 The live auth file and active marker are separate atomic files. A switch installs auth first and
 writes the marker last. If the process stops between those writes, the marker can remain on the
@@ -474,3 +492,15 @@ Supports both Codex CLI auth formats:
 ## License
 
 Apache-2.0
+
+## Experimental Central Account Server
+
+The optional `central-prototype` feature builds `codexctl-central` for server-owned
+credentials and registered local clients. See the [prototype guide](docs/central-prototype.md)
+for setup, SSH tunnels, tests, and the remaining compatibility limits.
+
+## Server-managed accounts
+
+Connect your machines with company SSO and keep OpenAI refresh credentials on a private server.
+Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and regular `codex`.
+See [server setup, migration, and staging deployment](docs/central-server.md).

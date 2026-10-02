@@ -5,7 +5,9 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 #[cfg(not(unix))]
@@ -30,6 +32,8 @@ pub fn run(
     allow_billing: bool,
     allow_resets: bool,
 ) -> Result<i32> {
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());
@@ -314,6 +318,7 @@ impl AgentReporter for Option<HerdrAgentReporter> {
 
 #[derive(Clone)]
 struct HerdrAgentReporter {
+    #[cfg(unix)]
     socket_path: PathBuf,
     pane_id: String,
 }
@@ -327,12 +332,14 @@ impl HerdrAgentReporter {
         if std::env::var_os("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
             return None;
         }
+        #[cfg(unix)]
         let socket_path = std::env::var_os("HERDR_SOCKET_PATH").map(PathBuf::from)?;
         let pane_id = std::env::var("HERDR_PANE_ID").ok()?;
         if pane_id.trim().is_empty() {
             return None;
         }
         Some(Self {
+            #[cfg(unix)]
             socket_path,
             pane_id,
         })
@@ -1674,10 +1681,10 @@ fn spawn_input_thread(
             match event::poll(std::time::Duration::from_millis(50)) {
                 Ok(true) => match event::read() {
                     Ok(Event::Key(key)) => {
-                        if let Some(bytes) = key_event_bytes(key) {
-                            if !write_to_pty(&writer, &bytes) {
-                                break;
-                            }
+                        if let Some(bytes) = key_event_bytes(key)
+                            && !write_to_pty(&writer, &bytes)
+                        {
+                            break;
                         }
                     }
                     Ok(Event::Paste(text)) => {
@@ -1814,6 +1821,7 @@ fn function_key_bytes(n: u8) -> Option<&'static [u8]> {
     }
 }
 
+#[cfg(unix)]
 fn resize_child_if_needed(
     master: &(dyn portable_pty::MasterPty + Send),
     last_size: &mut Option<(u16, u16)>,

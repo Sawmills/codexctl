@@ -1,3 +1,7 @@
+// These process fixtures isolate credentials through HOME. Native Windows child
+// coverage uses explicit temporary Paths in commands::exec::tests instead.
+#![cfg(unix)]
+
 use std::path::Path;
 
 use assert_cmd::Command;

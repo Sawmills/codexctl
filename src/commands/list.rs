@@ -4,6 +4,10 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 use crate::profile;
 
 pub fn run() -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    if codexctl::central::remote::show(false, None)? {
+        return Ok(());
+    }
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");

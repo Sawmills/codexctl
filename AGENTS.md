@@ -4,7 +4,7 @@
 
 - `codexctl` is a Rust 2024 CLI for managing multiple OpenAI Codex CLI accounts.
 - It saves profiles, labels and tells apart accounts, switches accounts, reports rate limits, manages banked resets, launches Codex with account recovery, and runs account-pinned commands.
-- The package version is `0.1.24`.
+- `Cargo.toml` is the source of truth for the package version.
 - The license is Apache-2.0.
 
 ## Map
@@ -33,7 +33,7 @@
 - Preserve pinned exec homes at `~/.codexctl/exec-homes/<alias>`.
 - Run Codex login with `CODEX_HOME=~/.codexctl/login-homes/<alias>`.
 - Keep `codexctl use` as a local auth-file swap that does not contact OpenAI.
-- Keep `codexctl exec` non-mutating. It must never write `~/.codex/auth.json` or the active marker.
+- Keep `codexctl exec` from changing `~/.codex/auth.json` or the active marker. It can provision its exec home and capture rotated auth back to the saved profile.
 - Refuse `codexctl exec` when `CODEX_HOME` is already set. A pinned launch must not replace an inherited Codex home without saying so.
 - Identify an account by its workspace and its login together. Neither identifies it alone: a workspace holds many logins, and a login holds seats in many workspaces.
 - Keep every login claim a token makes. A token gaining `chatgpt_user_id` is the ordinary legacy-to-current transition, and collapsing to one preferred claim makes the same seat look like two people.
@@ -57,3 +57,7 @@
 - Spend the qualifying banked reset closest to expiry.
 - Keep explicit alias selection from redeeming a reset.
 - Preserve the current working directory when `codexctl codex` or `codexctl exec` launches a child.
+
+## Independent review
+
+During independent code review, read [CODING_STANDARDS.md](CODING_STANDARDS.md).

@@ -33,10 +33,18 @@ impl CodexLoginRunner for CodexCliLoginRunner {
     fn run_codex_login(&mut self, codex_home: &Path) -> Result<()> {
         store::ensure_private_dir(codex_home)?;
 
-        let status = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .arg("login")
             .arg("--device-auth")
-            .env("CODEX_HOME", codex_home)
+            .env("CODEX_HOME", codex_home);
+        #[cfg(feature = "central-prototype")]
+        let status = {
+            let operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
+            operation.run_child(&mut command)?
+        };
+        #[cfg(not(feature = "central-prototype"))]
+        let status = command
             .status()
             .context("failed to run `codex login --device-auth`")?;
 
@@ -94,6 +102,36 @@ fn run_from_with_consent(
     // an empty slug and fails — after the browser login, which is precisely
     // what checking here is meant to prevent.
     let label = label.map(store::validate_label).transpose()?.flatten();
+    #[cfg(feature = "central-prototype")]
+    let operation = codexctl::central::native::local_operation(paths)?;
+    // A retained transfer marker owns this alias even after disconnect. Refuse
+    // before authentication can revoke the grant owned by the server.
+    store::require_local_auth(&store::profile_dir(paths, alias)?.join("auth.json"))?;
+    if let Some(label) = label {
+        let slug = alias_safe(label);
+        if !slug.is_empty() {
+            let qualified = format!("{alias}+{slug}");
+            // This name may never be selected. Only fence a known transfer;
+            // leave length and case-collision checks to target resolution.
+            let profiles = paths.profiles_dir();
+            if store::validate_alias(&qualified).is_ok() && profiles.try_exists()? {
+                // Alias reservations ignore case on every platform, including
+                // filesystems where differently cased paths are distinct.
+                for entry in std::fs::read_dir(&profiles)
+                    .context("cannot inspect qualified alias transfer markers")?
+                {
+                    let entry = entry?;
+                    if entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case(&qualified))
+                    {
+                        store::require_local_auth(&entry.path().join("auth.json"))?;
+                    }
+                }
+            }
+        }
+    }
     let codex_home = create_isolated_login_home(paths, alias)?;
     let result = (|| {
         runner.run_codex_login(&codex_home)?;
@@ -212,6 +250,8 @@ fn run_from_with_consent(
                 // stamp the name typed for one account onto another's profile.
                 (target == alias).then(|| email_from_alias(alias)).flatten()
             });
+        #[cfg(feature = "central-prototype")]
+        operation.revalidate()?;
         profile::save_profile_and_activate_locked(
             &lock,
             paths,
@@ -568,6 +608,90 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".codex")).unwrap();
         std::fs::write(paths.codex_auth_json(), r#"{"access_token":"active_tok"}"#).unwrap();
         (tmp, paths)
+    }
+
+    #[cfg(feature = "central-prototype")]
+    #[test]
+    fn a_provider_change_during_login_refuses_the_final_credential_write() {
+        struct ProviderChangingLogin {
+            paths: Paths,
+        }
+        impl CodexLoginRunner for ProviderChangingLogin {
+            fn run_codex_login(&mut self, home: &Path) -> Result<()> {
+                store::atomic_write(
+                    &home.join("auth.json"),
+                    br#"{"access_token":"synthetic-login-grant","account_id":"synthetic-seat"}"#,
+                )?;
+                store::atomic_write(
+                    &self
+                        .paths
+                        .codexctl_dir()
+                        .join("central/.native-active.json"),
+                    b"{}",
+                )?;
+                store::atomic_write(
+                    &self.paths.codex_home().join("config.toml"),
+                    b"model_provider='codexctl-central'\n",
+                )?;
+                Ok(())
+            }
+        }
+        let (_root, paths) = setup_test_env();
+        let original = std::fs::read(paths.codex_auth_json()).unwrap();
+        let mut runner = ProviderChangingLogin {
+            paths: paths.clone(),
+        };
+        assert!(run_from(&paths, "pending", None, &mut runner).is_err());
+        assert!(!paths.profiles_dir().join("pending").exists());
+        assert_eq!(std::fs::read(paths.codex_auth_json()).unwrap(), original);
+    }
+
+    #[test]
+    fn a_transferred_alias_is_refused_before_device_login_even_when_disconnected() {
+        let (_root, paths) = setup_test_env();
+        let dir = store::profile_dir(&paths, "transferred").unwrap();
+        store::atomic_write(&dir.join(".central-transfer.json"), b"{}").unwrap();
+        let mut runner = FailingLoginRunner::default();
+
+        let error = run_from(&paths, "transferred", None, &mut runner).unwrap_err();
+
+        assert!(error.to_string().contains("transferred"));
+        assert!(runner.seen_home.is_none(), "device login must not start");
+        assert!(!store::login_home(&paths, "transferred").unwrap().exists());
+    }
+
+    #[test]
+    fn a_known_label_qualified_transfer_is_refused_before_device_login() {
+        for transferred in ["team+personal", "team+PERSONAL"] {
+            let (_root, paths) = setup_test_env();
+            let dir = store::profile_dir(&paths, transferred).unwrap();
+            store::atomic_write(&dir.join(".central-transfer.json"), b"{}").unwrap();
+            let mut runner = FailingLoginRunner::default();
+            let error = run_from(&paths, "team", Some("Personal"), &mut runner).unwrap_err();
+            assert!(error.to_string().contains("transferred"));
+            assert!(runner.seen_home.is_none());
+        }
+    }
+
+    #[test]
+    fn an_unused_label_qualified_alias_does_not_block_base_login() {
+        for alias in ["a".repeat(128), "team".to_string()] {
+            let (_root, paths) = setup_test_env();
+            // This ordinary profile differs only in case from the unused
+            // qualified target. It must not affect login to the base alias.
+            if alias == "team" {
+                let dir = paths.profiles_dir().join("team+PERSONAL");
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("auth.json"), r#"{"access_token":"other_tok"}"#).unwrap();
+            }
+            let mut runner = FakeLoginRunner::new(r#"{"access_token":"new_tok"}"#);
+            assert_eq!(
+                run_from(&paths, &alias, Some("Personal"), &mut runner).unwrap(),
+                alias
+            );
+            assert!(runner.seen_home.is_some());
+            assert_eq!(profile::get_active_from(&paths).unwrap(), Some(alias));
+        }
     }
 
     #[test]

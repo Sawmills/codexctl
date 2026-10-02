@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -68,10 +68,10 @@ impl RateLimitResponse {
             credits.has_credits || credits.unlimited || credits.overage_limit_reached
         });
         if self.rate_limit.as_ref().is_some_and(RateLimit::has_window) {
-            // A new plan name or mixed rate-limit and credit evidence is not
-            // proof that automatic use is free. Keep it out of selection until
-            // its contract is understood and added deliberately.
-            if has_credit_billing || !plan.is_some_and(is_known_rate_limited_plan) {
+            // Subscription windows and purchased credits can coexist. Plan
+            // identity establishes included usage; spend control separately
+            // determines whether selection needs billing approval.
+            if !plan.is_some_and(is_known_rate_limited_plan) {
                 return BillingClass::Unknown;
             }
             return BillingClass::RateLimited;
@@ -102,11 +102,21 @@ impl RateLimitResponse {
 fn is_known_rate_limited_plan(plan: &str) -> bool {
     matches!(
         plan,
-        "free" | "go" | "plus" | "pro" | "team" | "business" | "enterprise" | "edu"
+        "free"
+            | "go"
+            | "plus"
+            | "pro"
+            | "prolite"
+            | "promax"
+            | "team"
+            | "business"
+            | "enterprise"
+            | "edu"
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BillingClass {
     RateLimited,
     UsageBased,
@@ -589,6 +599,7 @@ pub async fn fetch_usage_async(
 }
 
 pub fn read_auth_json(path: &std::path::Path) -> Result<AuthJson> {
+    crate::store::require_local_auth(path)?;
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     let raw: CodexAuthJson = serde_json::from_str(&contents)

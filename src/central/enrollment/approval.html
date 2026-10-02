@@ -1,0 +1,29 @@
+<p class="eyebrow step">
+  MACHINE SETUP <span aria-hidden="true">/</span> CONFIRM ACCESS
+</p>
+<h1 id="page-title">Connect this<br />machine.</h1>
+<p class="intro">
+  Use your company sign-in to connect this machine to your accounts.
+</p>
+<dl class="details">
+  <div>
+    <dt>Signed in as</dt>
+    <dd>{email}</dd>
+  </div>
+  <div>
+    <dt>Machine</dt>
+    <dd>{name}</dd>
+  </div>
+</dl>
+<div class="verification">
+  <p class="eyebrow">CHECK YOUR TERMINAL</p>
+  <code class="verification-code">{code}</code>
+  <p>Only connect if this code matches the one in your terminal.</p>
+</div>
+<form method="post" action="/auth/approve">
+  <input type="hidden" name="approval" value="{approval}" />
+  <button type="submit">
+    Connect machine <span aria-hidden="true">&rarr;</span>
+  </button>
+</form>
+<p class="footnote">Not your account or machine? Close this page to cancel.</p>

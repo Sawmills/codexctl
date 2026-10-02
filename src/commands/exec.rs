@@ -21,6 +21,8 @@ pub const PINNED_ALIAS_ENV: &str = "CODEXCTL_PINNED_ALIAS";
 
 pub fn run(account: &str, args: &[String]) -> Result<i32> {
     refuse_inherited_codex_home(std::env::var_os("CODEX_HOME").as_deref())?;
+    #[cfg(feature = "central-prototype")]
+    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
     run_from(&config::default_paths()?, account, args)
 }
 
@@ -394,6 +396,61 @@ mod tests {
         let home = provision_exec_home(&paths, "a").unwrap();
 
         assert_eq!(token_of(&home.join(AUTH_FILE)), token);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_uses_pinned_auth_and_shared_sessions() {
+        let token = format!("{JWT_HDR}.{SEAT_A}.sig");
+        let rotated = format!("{token}-rotated");
+        let (_tmp, paths) = setup(&[("a", &token)]);
+        let live = paths.codex_home();
+        std::fs::create_dir_all(live.join("sessions")).unwrap();
+        std::fs::write(live.join("config.toml"), "shared").unwrap();
+        std::fs::write(paths.codex_auth_json(), r#"{"access_token":"live"}"#).unwrap();
+        std::fs::write(paths.active_file(), "unchanged").unwrap();
+        let script = r#"
+            $ErrorActionPreference = 'Stop'
+            $homePath = $env:CODEX_HOME
+            if ((Get-Content -Raw "$homePath/config.toml") -ne 'shared') { exit 8 }
+            Copy-Item "$homePath/auth.json" "$homePath/sessions/child-auth.json"
+            [IO.File]::WriteAllText("$homePath/sessions/alias", $env:CODEXCTL_PINNED_ALIAS)
+            [IO.File]::WriteAllText("$homePath/sessions/cwd", (Get-Location).Path)
+            $auth = Get-Content -Raw "$homePath/auth.json" | ConvertFrom-Json
+            $auth.access_token += '-rotated'
+            [IO.File]::WriteAllText("$homePath/auth.json", ($auth | ConvertTo-Json))
+            exit 7
+        "#;
+
+        let code = run_from(
+            &paths,
+            "a",
+            &[
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(token_of(&live.join("sessions/child-auth.json")), token);
+        assert_eq!(token_of(&paths.profiles_dir().join("a/auth.json")), rotated);
+        assert_eq!(
+            std::fs::read_to_string(live.join("sessions/alias")).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            PathBuf::from(std::fs::read_to_string(live.join("sessions/cwd")).unwrap()),
+            std::env::current_dir().unwrap()
+        );
+        assert_eq!(token_of(&paths.codex_auth_json()), "live");
+        assert_eq!(
+            std::fs::read_to_string(paths.active_file()).unwrap(),
+            "unchanged"
+        );
     }
 
     #[cfg(unix)]
