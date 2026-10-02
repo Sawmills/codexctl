@@ -492,6 +492,54 @@ fn company_identity() -> Value {
     json!({"sub":"company-amir","email":"amir@sawmills.ai"})
 }
 #[test]
+fn enrollment_pages_allow_only_their_bundled_styles_and_escape_device_names() {
+    use base64::engine::general_purpose::STANDARD;
+    use sha2::{Digest, Sha256};
+
+    fn check_page(response: reqwest::blocking::Response) -> String {
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+        let policy = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let html = response.text().unwrap();
+        let style = html
+            .split("<style>")
+            .nth(1)
+            .unwrap()
+            .split("</style>")
+            .next()
+            .unwrap();
+        let hash = STANDARD.encode(Sha256::digest(style.as_bytes()));
+        assert_eq!(
+            policy,
+            format!(
+                "default-src 'none'; style-src 'sha256-{hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+            )
+        );
+        html
+    }
+
+    let issuer = EnrollmentServer::start(company_identity());
+    let challenge: Value = issuer
+        .server
+        .http
+        .post(format!("{}/v1/enrollment/start", issuer.server.url))
+        .json(&json!({"name":"Mac <img src=x onerror=alert(1)> & laptop"}))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let html = check_page(issuer.browser(challenge["verificationUrl"].as_str().unwrap()));
+    assert!(html.contains("Mac &lt;img src=x onerror=alert(1)&gt; &amp; laptop"));
+    assert!(!html.contains("<img"));
+    check_page(issuer.approve(&html));
+    assert_eq!(issuer.poll(&challenge).status(), 200);
+}
+#[test]
 fn when_company_sign_in_is_confirmed_then_only_the_requesting_device_receives_a_credential() {
     let issuer = EnrollmentServer::start(company_identity());
     let challenge = issuer.challenge();
