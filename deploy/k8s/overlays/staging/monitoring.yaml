@@ -32,3 +32,29 @@ spec:
             summary: Codexctl credential operation failed
             description: Inspect the broker reason and stage in structured logs. Check the saved owner journal before any account import retry.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+---
+# The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports
+# credentials and is already selected by the existing Prometheus operator.
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  namespace: codexctl
+  name: codexctl
+  labels:
+    release: kube-prometheus
+spec:
+  jobName: codexctl
+  metricsPath: /metrics
+  scrapeInterval: 30s
+  scrapeTimeout: 5s
+  scrapeProtocols: [PrometheusText0.0.4]
+  authorization:
+    type: Bearer
+    credentials:
+      name: codexctl-secrets
+      key: metrics-token
+  staticConfigs:
+    - targets: [codexctl.codexctl.svc.cluster.local:80]
+      labels:
+        namespace: codexctl
+        service: codexctl

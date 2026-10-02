@@ -688,7 +688,7 @@ async fn revoke_device(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
-async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<String, HttpError> {
+async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     if let Some(expected) = &broker.metrics_hash {
         let actual = headers
             .get("authorization")
@@ -714,7 +714,11 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Str
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
     ));
-    Ok(output)
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        output,
+    )
+        .into_response())
 }
 async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;

@@ -443,15 +443,20 @@ async fn tokens(
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 
-async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<String, HttpError> {
+async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     broker.authorize(&headers)?;
     let counters = broker.failures.lock().expect("failure counter lock");
-    Ok(counters
+    let output: String = counters
         .iter()
         .map(|(reason, count)| {
             format!("codexctl_central_failed_requests_total{{reason=\"{reason}\"}} {count}\n")
         })
-        .collect())
+        .collect();
+    Ok((
+        [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
+        output,
+    )
+        .into_response())
 }
 
 pub async fn serve(
