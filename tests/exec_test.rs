@@ -321,6 +321,159 @@ fn child_arguments_that_look_like_flags_are_forwarded() {
 
 #[cfg(unix)]
 #[test]
+fn pinned_launch_repairs_a_shared_daemon_before_starting_the_child() {
+    let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
+    let daemon = paths.codex_home().join("app-server-daemon");
+    std::fs::create_dir_all(&daemon).unwrap();
+    std::fs::create_dir_all(exec_home(&paths, "a")).unwrap();
+    std::os::unix::fs::symlink(&daemon, exec_home(&paths, "a").join("app-server-daemon")).unwrap();
+
+    codexctl(&paths)
+        .args(["exec", "--account", "a", "--", "/bin/sh", "-c",
+            r#"test ! -L "$CODEX_HOME/app-server-daemon" && mkdir "$CODEX_HOME/app-server-daemon" && printf pinned > "$CODEX_HOME/app-server-daemon/owner""#])
+        .assert()
+        .success();
+
+    assert!(!daemon.join("owner").exists());
+    assert_eq!(
+        std::fs::read_to_string(exec_home(&paths, "a").join("app-server-daemon/owner")).unwrap(),
+        "pinned"
+    );
+}
+
+fn runtime_fixture(names: &[&str], link_existing: bool) -> (tempfile::TempDir, Paths) {
+    let (tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
+    std::fs::create_dir_all(exec_home(&paths, "a")).unwrap();
+    for name in names {
+        let source = paths.codex_home().join(name);
+        std::fs::write(&source, "live state").unwrap();
+        if link_existing {
+            std::os::unix::fs::symlink(&source, exec_home(&paths, "a").join(name)).unwrap();
+        }
+    }
+    (tmp, paths)
+}
+
+#[test]
+fn new_pinned_homes_do_not_share_credentials_databases_locks_or_unknown_state() {
+    let (_tmp, paths) = runtime_fixture(
+        &[
+            ".credentials.json",
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "state_5.sqlite-shm",
+            "runtime.lock",
+            "future-runtime",
+            "app-server-daemon",
+        ],
+        false,
+    );
+
+    codexctl(&paths)
+        .args(["exec", "--account", "a", "--", "/bin/sh", "-c",
+            r#"test ! -e "$CODEX_HOME/.credentials.json" && test ! -e "$CODEX_HOME/state_5.sqlite" && test ! -e "$CODEX_HOME/state_5.sqlite-wal" && test ! -e "$CODEX_HOME/state_5.sqlite-shm" && test ! -e "$CODEX_HOME/runtime.lock" && test ! -e "$CODEX_HOME/future-runtime" && test ! -e "$CODEX_HOME/app-server-daemon""#])
+        .assert()
+        .success();
+}
+
+#[test]
+fn existing_runtime_links_are_removed_without_changing_the_live_targets() {
+    let (_tmp, paths) = runtime_fixture(
+        &[".credentials.json", "state_5.sqlite", "runtime.lock"],
+        true,
+    );
+
+    codexctl(&paths)
+        .args(["exec", "--account", "a", "--", "/bin/sh", "-c",
+            r#"test ! -L "$CODEX_HOME/.credentials.json" && test ! -L "$CODEX_HOME/state_5.sqlite" && test ! -L "$CODEX_HOME/runtime.lock""#])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(paths.codex_home().join(".credentials.json")).unwrap(),
+        "live state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.codex_home().join("state_5.sqlite")).unwrap(),
+        "live state"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.codex_home().join("runtime.lock")).unwrap(),
+        "live state"
+    );
+}
+
+#[test]
+fn dangling_runtime_links_are_repaired_even_without_a_live_home() {
+    let (_tmp, paths) = runtime_fixture(&["state_5.sqlite"], true);
+    std::fs::remove_file(paths.codex_home().join("state_5.sqlite")).unwrap();
+    std::fs::remove_dir(paths.codex_home()).unwrap();
+
+    codexctl(&paths)
+        .args([
+            "exec",
+            "--account",
+            "a",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"test ! -L "$CODEX_HOME/state_5.sqlite""#,
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn real_runtime_entries_and_foreign_links_are_preserved() {
+    let (_tmp, paths) = runtime_fixture(&[], false);
+    let home = exec_home(&paths, "a");
+    let foreign = paths.home.join("foreign-credentials");
+    std::fs::write(&foreign, "private credentials").unwrap();
+    std::fs::write(home.join("state_5.sqlite"), "private database").unwrap();
+    std::fs::create_dir(home.join("app-server-daemon")).unwrap();
+    std::os::unix::fs::symlink(&foreign, home.join(".credentials.json")).unwrap();
+
+    codexctl(&paths)
+        .args(["exec", "--account", "a", "--", "/bin/sh", "-c",
+            r#"test -d "$CODEX_HOME/app-server-daemon" && test ! -L "$CODEX_HOME/app-server-daemon""#])
+        .assert()
+        .success();
+
+    assert_eq!(
+        std::fs::read_to_string(home.join("state_5.sqlite")).unwrap(),
+        "private database"
+    );
+    assert_eq!(
+        std::fs::read_link(home.join(".credentials.json")).unwrap(),
+        foreign
+    );
+}
+
+#[test]
+fn relative_links_into_the_live_home_are_repaired() {
+    let (_tmp, paths) = runtime_fixture(&["state_5.sqlite"], false);
+    std::os::unix::fs::symlink(
+        "../../../.codex/state_5.sqlite",
+        exec_home(&paths, "a").join("state_5.sqlite"),
+    )
+    .unwrap();
+
+    codexctl(&paths)
+        .args([
+            "exec",
+            "--account",
+            "a",
+            "--",
+            "/bin/sh",
+            "-c",
+            r#"test ! -L "$CODEX_HOME/state_5.sqlite""#,
+        ])
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[test]
 fn shared_codex_entries_are_linked_and_sessions_land_in_the_real_home() {
     let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
     std::fs::create_dir_all(paths.codex_home().join("sessions")).unwrap();

@@ -107,18 +107,70 @@ fn warn_when_token_expired(alias: &str, auth_json: &Path) {
     }
 }
 
-/// Share everything except credentials with the live Codex home.
-///
-/// Config, global instructions, and the sessions directory are symlinked, so a
-/// pinned run reads the same settings and writes its rollouts where `codex
-/// resume` and the `codexctl codex` wrapper already look for them. Only
-/// `auth.json` is a real per-alias file. An entry that already exists is never
-/// replaced, so a link the child turned into a real file stays as it left it.
+/// Share settings and rollouts, while keeping credentials and runtime state local.
+/// Existing real entries and links outside the live home remain untouched.
 fn link_shared_codex_entries(paths: &Paths, home: &Path) -> Result<()> {
     let codex_home = paths.codex_home();
+    // Scan the pinned home first: stale links can outlive their live targets.
+    for entry in
+        std::fs::read_dir(home).with_context(|| format!("failed to read {}", home.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", home.display()))?;
+        if is_shared_entry(&entry.file_name()) {
+            continue;
+        }
+        let link = entry.path();
+        let metadata = match std::fs::symlink_metadata(&link) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", link.display()));
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = match std::fs::read_link(&link) {
+            Ok(target) => home.join(target),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read link {}", link.display()));
+            }
+        };
+        // The direct comparison also handles dangling links created by older
+        // codexctl versions. Canonical paths cover relative and indirect links.
+        let points_into_live_home = target == codex_home.join(entry.file_name())
+            || target
+                .canonicalize()
+                .ok()
+                .zip(codex_home.canonicalize().ok())
+                .is_some_and(|(target, live)| target.starts_with(live));
+        if points_into_live_home {
+            #[cfg(windows)]
+            let result = {
+                use std::os::windows::fs::FileTypeExt;
+                if metadata.file_type().is_symlink_dir() {
+                    std::fs::remove_dir(&link)
+                } else {
+                    std::fs::remove_file(&link)
+                }
+            };
+            #[cfg(not(windows))]
+            let result = std::fs::remove_file(&link);
+            match result {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to remove shared runtime link {}", link.display())
+                    });
+                }
+            }
+        }
+    }
     let entries = match std::fs::read_dir(&codex_home) {
         Ok(entries) => entries,
-        // No live Codex home to share: the pinned home holds credentials only.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(error).with_context(|| format!("failed to read {}", codex_home.display()));
@@ -128,12 +180,16 @@ fn link_shared_codex_entries(paths: &Paths, home: &Path) -> Result<()> {
     for entry in entries {
         let entry = entry.with_context(|| format!("failed to read {}", codex_home.display()))?;
         let name = entry.file_name();
-        if name == OsStr::new(AUTH_FILE) || is_atomic_replace_temp(&name) {
+        if !is_shared_entry(&name) {
             continue;
         }
         let link = home.join(&name);
-        if std::fs::symlink_metadata(&link).is_ok() {
-            continue;
+        match std::fs::symlink_metadata(&link) {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to inspect {}", link.display()));
+            }
         }
         symlink_shared_entry(&entry.path(), &link)?;
     }
@@ -141,15 +197,25 @@ fn link_shared_codex_entries(paths: &Paths, home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a name is one of the temporary files `store::atomic_replace` holds
-/// for the moment before its rename.
-///
-/// Linking one leaves a symlink that dangles as soon as the rename lands, and
-/// nothing replaces an existing entry afterwards — so a `codexctl use` running
-/// during the scan would leave permanent litter in the pinned home.
-fn is_atomic_replace_temp(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(|name| name.starts_with('.') && name.ends_with(".tmp"))
+/// Unknown entries stay local, including future daemon, credential, DB and lock files.
+fn is_shared_entry(name: &OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some(
+            "config.toml"
+                | "AGENTS.md"
+                | "AGENTS.override.md"
+                | "instructions.md"
+                | "sessions"
+                | "archived_sessions"
+                | "session_index.jsonl"
+                | "history.jsonl"
+                | "skills"
+                | "prompts"
+                | "rules"
+                | "memories"
+        )
+    )
 }
 
 #[cfg(unix)]
@@ -271,13 +337,19 @@ mod tests {
         assert!(error.to_string().contains("/tmp/work-codex"), "{error:#}");
     }
 
+    #[cfg(any(unix, windows))]
     #[test]
-    fn atomic_replace_temporaries_are_not_shared() {
-        assert!(is_atomic_replace_temp(OsStr::new(
-            ".auth.json.codexctl-1-2-3.tmp"
-        )));
-        assert!(!is_atomic_replace_temp(OsStr::new("config.toml")));
-        assert!(!is_atomic_replace_temp(OsStr::new("sessions")));
+    fn provisioning_repairs_a_shared_daemon_directory() {
+        let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
+        let daemon = paths.codex_home().join("app-server-daemon");
+        std::fs::create_dir_all(&daemon).unwrap();
+        let home = provision_exec_home(&paths, "a").unwrap();
+        symlink_shared_entry(&daemon, &home.join("app-server-daemon")).unwrap();
+
+        provision_exec_home(&paths, "a").unwrap();
+
+        assert!(home.join("app-server-daemon").symlink_metadata().is_err());
+        assert!(daemon.is_dir());
     }
 
     #[test]
