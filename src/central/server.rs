@@ -510,14 +510,22 @@ pub async fn serve(
         limits: None,
         verification_input: None,
     };
-    runtime.disable_cleanup(true);
     if !read_only {
         let migration_lock = Mutex::new(());
         let guard = migration_lock.lock().await;
         let proof = super::relogin::identity_inventory(state, key, &refresh.home)
             .clear_for_launch(&refresh, &guard)?;
-        super::managed::launch_owner(&mut refresh, binary, proof).await?;
+        runtime.disable_cleanup(true);
+        if let Err(error) = super::managed::launch_owner(&mut refresh, binary, proof).await {
+            // Retain every runtime that might have refreshed credentials. A
+            // proven pre-spawn failure can safely remove this temporary copy.
+            if refresh.rpc.is_none() && super::managed::definitely_not_started(&refresh.home) {
+                runtime.disable_cleanup(false);
+            }
+            return Err(error);
+        }
     }
+    runtime.disable_cleanup(true);
     let broker = Broker {
         state: state.into(),
         tenant,

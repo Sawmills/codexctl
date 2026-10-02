@@ -811,7 +811,7 @@ pub(super) fn retained_auth(home: &Path) -> Result<Value> {
     )?)?)
 }
 
-fn definitely_not_started(home: &Path) -> bool {
+pub(super) fn definitely_not_started(home: &Path) -> bool {
     matches!(home.join("pid").try_exists(), Ok(false))
         && vault::private_read(&home.join("spawn-failed")).is_ok_and(|v| v == b"not-started")
 }
