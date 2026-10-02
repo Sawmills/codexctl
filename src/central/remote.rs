@@ -887,6 +887,13 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
         native::sync_account(&connection, &result)?;
         println!("Transferred {}", p.meta.alias);
     }
+    {
+        let _lock = native::native_lock(&root()?)?;
+        if !native::repair_sessions_if_active(native::SessionProviderAction::Rewrite)
+            .context("accounts transferred; session repair failed; resolve the reported cause and retry codexctl session-provider rewrite")? {
+            println!("Session providers: deferred until codexctl use activates a server account.");
+        }
+    }
     println!(
         "Migration complete. Run codexctl use, then codexctl codex. Resume old sessions with codexctl codex resume <session-id>. Keep other machines from refreshing their old credential copies."
     );

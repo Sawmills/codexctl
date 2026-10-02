@@ -1644,3 +1644,42 @@ fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_n
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+
+#[test]
+fn selecting_a_server_account_repairs_saved_session_providers() {
+    let client = NativeClient::start();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-old.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let old = "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n";
+    std::fs::write(&rollout, old).unwrap();
+    let result = client.select();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(rollout).unwrap(),
+        old.replace("openai", "codexctl-central")
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("changed=1"));
+}
+
+#[test]
+fn repair_failure_reports_that_the_server_account_is_already_active() {
+    let client = NativeClient::start();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-malformed.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(&rollout, b"not JSON\n").unwrap();
+    let result = client.select();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("account remote is active; session repair failed"),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(std::fs::read(rollout).unwrap(), b"not JSON\n");
+}

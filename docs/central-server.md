@@ -355,3 +355,67 @@ The earlier prototype proved the native TUI helper with a dedicated live account
 Repeat that acceptance against the final staging image after SSO registration and deployment.
 
 The OIDC RSA dependency has a narrow public-verification exception for RUSTSEC-2023-0071. See [the dependency analysis](research/central-staging.md#rsa-dependency-exception).
+
+## Repair Saved Session Providers
+
+For an active server account, `codexctl use` repairs old saved session providers.
+Plain `codex resume <session-id>` then uses the account server for those sessions.
+Migration also runs the repair if a server account is already active.
+Otherwise, migration defers the repair until `codexctl use` activates one.
+The repair requires `lsof` on the machine. macOS includes it; install the `lsof` package on Linux.
+A failed OS inspection stops the repair and reports any completed changes.
+If repair fails after account activation or migration, the error names that completed step.
+Resolve the reported cause before you retry the repair.
+
+Preview the files without changing rollouts or backups:
+
+```sh
+codexctl session-provider dry-run
+```
+
+Close sessions that the preview reports as `skipped-open`.
+Run the repair after you inspect the list:
+
+```sh
+codexctl session-provider rewrite
+```
+
+The repair searches only `sessions` and `archived_sessions` under the active `CODEX_HOME`.
+When `CODEX_HOME` is unset, it uses `~/.codex`.
+The active server account must belong to that home.
+It does not follow symbolic links or replace files with hard links.
+Only the `payload.model_provider` value in the first `session_meta` line changes from `openai` to `codexctl-central`.
+Every other byte stays identical, including whitespace and line endings.
+Other providers, missing provider fields, and valid legacy headers without a record type stay unchanged.
+Malformed metadata stops the repair; metadata lines above 8 MiB also stop it.
+The rest of each rollout streams through a temporary file in the same directory.
+The replacement preserves permissions and modification time.
+The repair syncs the replacement and its directory.
+
+Private backups retain the original metadata line under
+`CODEX_HOME/.codexctl-session-provider-backups/`, with the same relative rollout path.
+A backup reaches disk before its rollout changes.
+Repeated repair runs preserve the first backup.
+The summary reports changed, unchanged, open, and linked files.
+A failure preserves prior completed changes and backups for a retry.
+If a process interrupts a copy, the original rollout stays intact and a temporary file can remain beside it.
+
+To restore the original metadata while the server account is still active, run:
+
+```sh
+codexctl session-provider restore
+```
+
+Restore also skips open files and preserves the rollout body, permissions, and modification time.
+It refuses a file whose metadata no longer matches its backup or the repaired version of that backup.
+After Codex archives or unarchives a rollout, restore matches its filename and exact metadata to the original backup.
+Multiple matches or conflicting metadata stop restore.
+Files with no backup appear as `skipped-no-backup`.
+Keep the backups until you no longer need restore.
+After restore, old sessions need the explicit provider override from `codexctl codex resume` again.
+
+The OS inventory and the final per-file inspection include open files from other processes.
+Each replacement repeats the OS inspection.
+Large stores take longer on the first run; later runs need only the initial inventory and metadata reads.
+Close Codex sessions before repair or restore and do not start sessions during the operation.
+These OS inspections cannot prevent a process from opening a file after the final inspection.

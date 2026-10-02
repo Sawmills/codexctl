@@ -8,6 +8,7 @@ mod relogin;
 pub mod remote;
 mod rpc;
 mod server;
+mod sessions;
 mod transport;
 mod vault;
 
