@@ -5390,3 +5390,4 @@ fn b8_listing_cannot_disable_tokens_after_a_temporary_owner_error() {
 
     assert_eq!(catalog[0]["available"], true);
     assert_eq!(token.status(), 200);
+}
