@@ -336,7 +336,7 @@ pub struct ResetCreditsDetails {
     pub available_count: i64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct ResetCredit {
     pub id: String,
     pub status: String,
@@ -391,14 +391,24 @@ pub struct ConsumeResetResponse {
     pub windows_reset: i64,
 }
 
-const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+pub(crate) const RESET_CREDITS_URL: &str =
+    "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 
 pub async fn fetch_reset_credits_async(
     client: &reqwest::Client,
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<ResetCreditsDetails> {
-    let mut request = client.get(RESET_CREDITS_URL).bearer_auth(access_token);
+    fetch_reset_credits_at(client, RESET_CREDITS_URL, access_token, account_id).await
+}
+
+pub(crate) async fn fetch_reset_credits_at(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<ResetCreditsDetails> {
+    let mut request = client.get(url).bearer_auth(access_token);
     if let Some(account_id) = account_id {
         request = request.header("chatgpt-account-id", account_id);
     }
@@ -531,7 +541,7 @@ pub async fn fetch_account_settings_async(
         .context("failed to parse account settings response")
 }
 
-const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+pub(crate) const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
 pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -575,7 +585,16 @@ pub async fn fetch_usage_async(
     access_token: &str,
     account_id: Option<&str>,
 ) -> Result<RateLimitResponse> {
-    let mut request = client.get(USAGE_URL).bearer_auth(access_token);
+    fetch_usage_at(client, USAGE_URL, access_token, account_id).await
+}
+
+pub(crate) async fn fetch_usage_at(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+) -> Result<RateLimitResponse> {
+    let mut request = client.get(url).bearer_auth(access_token);
     if let Some(account_id) = account_id {
         request = request.header("chatgpt-account-id", account_id);
     }

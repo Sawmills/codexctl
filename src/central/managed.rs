@@ -64,8 +64,8 @@ struct Failure {
 }
 #[derive(Clone)]
 pub(super) struct AccountIndex {
-    user: String,
-    alias: String,
+    pub(super) user: String,
+    pub(super) alias: String,
 }
 type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
@@ -85,6 +85,7 @@ pub(super) struct Broker {
     pub(super) owners: Arc<RwLock<Owners>>,
     pub(super) imports: Arc<Mutex<()>>,
     pub sso: Option<Arc<enrollment::Sso>>,
+    pub(super) reset_reader: super::resets::Reader,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
@@ -1125,10 +1126,12 @@ pub async fn serve(
         owners: Arc::new(RwLock::new(owners)),
         imports,
         sso,
+        reset_reader: super::resets::Reader::new()?,
         failures: Arc::new(StdMutex::new(
             [
                 "owner_unavailable",
                 "catalog_owner_unavailable",
+                "reset_read_failed",
                 "persistence_failed",
                 "registry_unavailable",
                 "registry_busy",
@@ -1165,6 +1168,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
+        .route("/v1/resets", get(super::resets::list))
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))
         .route("/v1/devices/revoke", post(revoke_device))
@@ -1279,6 +1283,7 @@ mod tests {
             owners: Arc::new(RwLock::new(BTreeMap::new())),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            reset_reader: crate::central::resets::Reader::new().unwrap(),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
@@ -1471,3 +1476,7 @@ mod tests {
         assert!(previous_owner_exited(root.path()).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "reset_tests.rs"]
+mod reset_tests;

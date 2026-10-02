@@ -5257,3 +5257,104 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
         "{error}"
     );
 }
+
+#[test]
+fn reset_listing_requires_a_registered_machine() {
+    let server = Server::start();
+
+    let response = server
+        .http
+        .get(format!("{}/v1/resets", server.url))
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+}
+
+fn reset_cli(response: Value) -> std::process::Output {
+    use std::io::{Read, Write};
+    let server = Server::start();
+    let home = server.connected_home();
+    let migrated = home.path().join(".codexctl/profiles/personal");
+    store::ensure_private_dir(&migrated).unwrap();
+    store::atomic_write(
+        &migrated.join("meta.json"),
+        br#"{"alias":"personal","saved_at":"2036-01-01"}"#,
+    )
+    .unwrap();
+    store::atomic_write(&migrated.join(".central-transfer.json"), b"{}").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let registration = home.path().join(".codexctl/central/.server.json");
+    let mut connection: Value =
+        serde_json::from_slice(&std::fs::read(&registration).unwrap()).unwrap();
+    connection["server"] = json!(format!("http://{}", listener.local_addr().unwrap()));
+    store::atomic_write(&registration, &serde_json::to_vec(&connection).unwrap()).unwrap();
+    let request = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut buffer = [0; 4096];
+                let n = stream.read(&mut buffer).unwrap();
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                return String::from_utf8_lossy(&buffer[..n]).into_owned();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        String::new()
+    });
+    let output = server.cli(home.path(), &["resets"]);
+    let request = request.join().unwrap();
+    assert!(request.starts_with("GET /v1/resets "), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer ")
+    );
+    output
+}
+
+#[test]
+fn reset_listing_on_a_connected_machine_needs_no_local_auth() {
+    let reply = json!({"userId":"amir", "accounts":[{"alias":"personal", "available":2, "applicable":1,
+        "credits":[{"id":"later","status":"available","expires_at":"2036-08-12T12:00:00Z"},
+                   {"id":"sooner","status":"available","expires_at":"2036-07-26T12:00:00Z"}]}]});
+
+    let output = reset_cli(reply);
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("2 banked, 1 redeemable now."), "{text}");
+    assert!(text.contains("Jul 26, Aug 12"), "{text}");
+}
+
+#[test]
+fn reset_listing_failure_does_not_report_a_complete_zero_total() {
+    let reply =
+        json!({"userId":"amir", "accounts":[{"alias":"personal", "error":"reset_read_failed"}]});
+
+    let output = reset_cli(reply);
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success());
+    assert!(!text.contains("0 banked, 0 redeemable now."), "{text}");
+    assert!(text.contains("reset_read_failed"), "{text}");
+}
+
+#[test]
+fn reset_listing_rejects_another_company_users_response() {
+    let reply = json!({"userId":"alex", "accounts":[]});
+
+    let output = reset_cli(reply);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server user identity changed"));
+}
