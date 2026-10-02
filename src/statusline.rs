@@ -78,8 +78,8 @@ struct Cache {
     version: u32,
     sampled_at: i64,
     selection: Selection,
-    label: Option<String>,
-    usage: Option<Usage>,
+    account: Option<crate::status_json::AccountStatus>,
+    five_hour_resets_at: Option<i64>,
 }
 
 fn read(path: &Path) -> Result<Vec<u8>> {
@@ -127,13 +127,28 @@ pub(crate) fn record(
             return Ok(());
         }
         let destination = paths.codexctl_dir().join("statusline.json");
-        let label = label.map(str::to_owned);
+        let five_hour_resets_at = usage.as_ref().and_then(|u| u.five_hour_resets_at);
+        let account = usage.map(|usage| crate::status_json::AccountStatus {
+            alias: selection.alias.clone(),
+            label: label.map(str::to_owned),
+            plan: None,
+            source: match selection.source {
+                Source::Local { .. } => crate::status_json::Source::Local,
+                Source::Server { .. } => crate::status_json::Source::Server,
+            },
+            state: crate::status_json::State::Active,
+            primary_used_percent: usage.five_hour_used_percent,
+            secondary_used_percent: usage.weekly_used_percent,
+            resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
+            billing_class: api::BillingClass::Unknown,
+            error: None,
+        });
         let cache = Cache {
             version: 1,
             sampled_at: chrono::Utc::now().timestamp(),
             selection,
-            label,
-            usage,
+            account,
+            five_hour_resets_at,
         };
         store::atomic_write(&destination, &serde_json::to_vec(&cache)?)
     })();
@@ -195,14 +210,20 @@ fn render(paths: &config::Paths) -> Result<String> {
     {
         bail!("cache is not current");
     }
-    let usage = cache.usage.context("no usage")?;
-    let weekly = remaining(usage.weekly_used_percent.context("no weekly window")?)
+    let account = cache.account.context("no usage")?;
+    if account.error.is_some() || account.alias != cache.selection.alias {
+        bail!("invalid status");
+    }
+    let weekly = remaining(account.secondary_used_percent.context("no weekly window")?)
         .context("invalid usage")?;
-    let reset = usage.weekly_resets_at.context("no reset time")?;
+    let reset = chrono::DateTime::parse_from_rfc3339(
+        account.resets_at.as_deref().context("no reset time")?,
+    )?
+    .timestamp();
     if reset <= now {
         bail!("window ended");
     }
-    let name = short_name(&cache.selection.alias, cache.label.as_deref());
+    let name = short_name(&cache.selection.alias, account.label.as_deref());
     if name.is_empty() {
         bail!("no display name");
     }
@@ -210,8 +231,8 @@ fn render(paths: &config::Paths) -> Result<String> {
         "{name} {weekly}% wk · {}",
         duration(reset.saturating_sub(now))
     );
-    if let Some(short) = usage.five_hour_used_percent.and_then(remaining)
-        && usage.five_hour_resets_at.is_none_or(|reset| reset > now)
+    if let Some(short) = account.primary_used_percent.and_then(remaining)
+        && cache.five_hour_resets_at.is_none_or(|reset| reset > now)
     {
         line.push_str(&format!(" · {short}% 5h"));
     }

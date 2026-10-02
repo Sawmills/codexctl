@@ -36,7 +36,7 @@ fn cached(home: &Path, age: i64, label: Option<&str>) {
     )
     .unwrap();
     let now = chrono::Utc::now().timestamp();
-    let cache = json!({"version":1,"sampled_at":now-age,"selection":{"alias":"amir+p2@example.test","source":{"local":{"account_id":"seat","user_id":"login","saved_at":"today"}}},"label":label,"usage":{"weekly_used_percent":38.0,"weekly_resets_at":now+600000,"five_hour_used_percent":null}});
+    let cache = json!({"version":1,"sampled_at":now-age,"selection":{"alias":"amir+p2@example.test","source":{"local":{"account_id":"seat","user_id":"login","saved_at":"today"}}},"account":{"alias":"amir+p2@example.test","label":label,"plan":null,"source":"local","state":"active","primary_used_percent":null,"secondary_used_percent":38.0,"resets_at":codexctl::status_json::timestamp(Some(now+600000)),"billing_class":"rate_limited","error":null},"five_hour_resets_at":null});
     std::fs::write(root.join("statusline.json"), cache.to_string()).unwrap();
 }
 
@@ -104,7 +104,7 @@ fn change_cache(home: &Path, key: &str, value: serde_json::Value) {
 fn statusline_includes_five_hour_only_when_present() {
     let home = tempfile::tempdir().unwrap();
     cached(home.path(), 0, Some("team"));
-    change_cache(home.path(), "/usage/five_hour_used_percent", json!(12));
+    change_cache(home.path(), "/account/primary_used_percent", json!(12));
 
     let output = run(home.path());
 
@@ -132,7 +132,11 @@ fn statusline_prompt_control_characters_cannot_escape_the_label() {
 fn statusline_past_reset_hides_outdated_budget() {
     let home = tempfile::tempdir().unwrap();
     cached(home.path(), 0, None);
-    change_cache(home.path(), "/usage/weekly_resets_at", json!(1));
+    change_cache(
+        home.path(),
+        "/account/resets_at",
+        json!("2000-01-01T00:00:00Z"),
+    );
 
     let output = run(home.path());
 
@@ -143,7 +147,7 @@ fn statusline_past_reset_hides_outdated_budget() {
 fn statusline_invalid_usage_is_silent() {
     let home = tempfile::tempdir().unwrap();
     cached(home.path(), 0, None);
-    change_cache(home.path(), "/usage/weekly_used_percent", json!(101));
+    change_cache(home.path(), "/account/secondary_used_percent", json!(101));
 
     let output = run(home.path());
 
@@ -170,6 +174,27 @@ fn statusline_corrupt_cache_is_silent() {
     let home = tempfile::tempdir().unwrap();
     cached(home.path(), 0, None);
     std::fs::write(home.path().join(".codexctl/statusline.json"), "broken").unwrap();
+
+    let output = run(home.path());
+
+    assert!(output.status.success());
+    assert_eq!((output.stdout, output.stderr), (vec![], vec![]));
+}
+
+#[cfg(feature = "central-prototype")]
+#[test]
+fn statusline_stalled_provider_configuration_exits_without_waiting() {
+    let home = tempfile::tempdir().unwrap();
+    cached(home.path(), 0, None);
+    std::fs::create_dir(home.path().join(".codex")).unwrap();
+    let path = std::ffi::CString::new(
+        home.path()
+            .join(".codex/config.toml")
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
+    .unwrap();
+    unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
 
     let output = run(home.path());
 

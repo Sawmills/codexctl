@@ -1,17 +1,17 @@
 //! Versioned machine-readable account status. No credential data belongs here.
 use crate::{api, profile};
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::Write;
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     Local,
     Server,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Local,
@@ -20,7 +20,7 @@ pub enum State {
     Unavailable,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AccountStatus {
     pub alias: String,
     pub label: Option<String>,

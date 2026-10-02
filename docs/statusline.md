@@ -1,4 +1,4 @@
-# Cached usage in terminal status bars
+# Cached Usage in Terminal Status Bars
 
 `codexctl statusline` prints one short line for this machine's active account:
 
@@ -8,21 +8,21 @@ p2 62% wk · 6d22h
 
 The name is the account label, or the alias suffix after `+` and before `@`.
 Names contain at most 20 letters, digits, spaces, dots, underscores, or hyphens.
-The percentage is the weekly allowance left, rounded down.
+Percentages show the weekly allowance left, rounded down.
 The time shows the weekly reset countdown.
 A known five-hour window adds, for example, `· 88% 5h`.
 An account without a weekly window produces no output.
 
 The command reads a private local cache with a 120-second lifetime.
 It makes no network requests, takes no store lock, and creates no files.
-It stops waiting for local reads after 150 milliseconds.
+Local reads have a 150-millisecond wait budget.
 Process startup and operating-system scheduling can add time.
 Missing, stale, invalid, or unreadable data produces no output and exit code 0.
 An account change hides a cache entry for the previous account.
 A passed weekly reset also hides the entry until fresh usage arrives.
 The command shows the machine's selected account. Running Codex sessions can retain an earlier account.
 
-## Refresh the cache
+## Refresh the Cache
 
 Run this command once before using a status bar:
 

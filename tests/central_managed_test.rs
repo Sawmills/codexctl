@@ -5525,3 +5525,24 @@ fn b8_status_json_reports_stale_usage_without_disabling_the_account() {
     );
     assert_eq!(row["error"], "catalog_usage_failed");
 }
+
+#[test]
+fn statusline_status_json_populates_only_the_active_server_account() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
+    );
+
+    let status = server.cli(home.path(), &["status", "--json"]);
+    let line = server.cli(home.path(), &["statusline"]);
+
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&line.stdout).starts_with("Personal 63% wk · "));
+    assert!(line.stderr.is_empty());
+}
