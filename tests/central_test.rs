@@ -1512,8 +1512,8 @@ fn when_the_remote_daemon_is_running_then_disconnect_keeps_the_marker_and_config
 }
 
 #[test]
-fn when_a_known_plan_has_paid_credits_then_automatic_remote_selection_is_refused() {
-    let client = NativeClient::start();
+fn when_an_organizational_plan_has_paid_credits_then_automatic_remote_selection_is_refused() {
+    let client = NativeClient::with_plan(Some("team"));
     std::fs::write(client.broker.root.path().join("mode"), "credits").unwrap();
     client.connect();
     let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
@@ -1522,14 +1522,14 @@ fn when_a_known_plan_has_paid_credits_then_automatic_remote_selection_is_refused
 }
 
 #[test]
-fn when_credits_change_under_the_same_plan_then_the_helper_requires_new_approval() {
+fn when_subscription_credits_change_with_headroom_then_the_helper_needs_no_approval() {
     let client = NativeClient::start();
     client.connect();
     assert!(client.select().status.success());
     std::fs::write(client.broker.root.path().join("mode"), "credits").unwrap();
     let output = client.helper();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert!(output.status.success());
+    assert!(!output.stdout.is_empty());
 }
 
 #[test]
@@ -1643,4 +1643,152 @@ fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_n
     let output = helper.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn when_subscription_cap_is_closed_then_automatic_use_and_helper_succeed() {
+    let client = NativeClient::with_plan(Some("team"));
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "closed-spend-cap").unwrap();
+
+    let selected = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
+    let token = client.helper();
+
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+}
+
+#[test]
+fn when_subscription_cap_is_closed_then_explicit_use_needs_no_consent() {
+    let client = NativeClient::with_plan(Some("team"));
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "closed-spend-cap").unwrap();
+
+    let selected = client.select();
+
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+}
+
+#[test]
+fn when_subscription_cap_reopens_then_the_helper_refuses_token_delivery() {
+    let client = NativeClient::with_plan(Some("team"));
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "closed-spend-cap").unwrap();
+    let selected = client.select();
+    std::fs::write(client.broker.root.path().join("mode"), "open-spend-cap").unwrap();
+
+    let token = client.helper();
+
+    assert!(selected.status.success());
+    assert!(!token.status.success());
+    assert!(token.stdout.is_empty());
+}
+
+#[test]
+fn when_subscription_has_included_headroom_then_automatic_use_and_helper_succeed() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "included-weekly").unwrap();
+
+    let selected = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]);
+    let helper = client.helper();
+
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(
+        helper.status.success(),
+        "{}",
+        String::from_utf8_lossy(&helper.stderr)
+    );
+}
+
+#[test]
+fn when_subscription_has_included_headroom_then_explicit_use_needs_no_billing_consent() {
+    let client = NativeClient::with_plan(Some("plus"));
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "included-weekly").unwrap();
+
+    let selected = client.select();
+
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+}
+
+#[test]
+fn when_included_headroom_exhausts_then_helper_returns_no_token() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "included-weekly").unwrap();
+    let selected = client.select();
+    let initial = client.helper();
+    std::fs::write(client.broker.root.path().join("mode"), "exhausted-weekly").unwrap();
+
+    let helper = client.helper();
+
+    assert!(selected.status.success() && initial.status.success());
+    assert!(!helper.status.success());
+    assert!(helper.stdout.is_empty());
+}
+
+#[test]
+fn when_included_headroom_is_exhausted_then_explicit_use_requires_consent() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "exhausted-weekly").unwrap();
+
+    let selected = client.select();
+
+    assert!(!selected.status.success());
+    assert!(String::from_utf8_lossy(&selected.stderr).contains("--allow-billing"));
+}
+
+#[test]
+fn when_remote_use_succeeds_then_provider_refreshes_every_minute() {
+    let client = NativeClient::start();
+    client.connect();
+    let selected = client.select();
+    let config: toml_edit::DocumentMut =
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+
+    assert!(selected.status.success());
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["auth"]["refresh_interval_ms"].as_integer(),
+        Some(60_000)
+    );
+}
+
+#[test]
+fn when_included_headroom_is_exhausted_then_consent_allows_use_and_refresh() {
+    let client = NativeClient::start();
+    client.connect();
+    std::fs::write(client.broker.root.path().join("mode"), "exhausted-weekly").unwrap();
+    let selected = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+    let helper = client.helper();
+
+    assert!(selected.status.success());
+    assert!(helper.status.success());
 }

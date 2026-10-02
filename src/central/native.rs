@@ -568,7 +568,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     args.push("--connection");
     args.push(path.to_str().context("connection path must be UTF-8")?);
     provider["auth"]["args"] = value(args);
-    provider["auth"]["refresh_interval_ms"] = value(0);
+    // Codex checks cached helper-token age before requests. This bounds normal
+    // reuse to one minute; it does not cancel in-flight work or revoke tokens.
+    provider["auth"]["refresh_interval_ms"] = value(60_000);
     provider["auth"]["timeout_ms"] = value(210_000);
     if let Some(inline) = doc.get("model_providers").and_then(Item::as_inline_table) {
         doc["model_providers"] = Item::Table(inline.clone().into_table());

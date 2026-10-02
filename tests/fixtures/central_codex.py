@@ -157,6 +157,13 @@ for line in sys.stdin:
         payload = json.loads(base64.urlsafe_b64decode(auth["tokens"]["access_token"].split(".")[1] + "=="))
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         result = {"rateLimits": {"planType":payload["https://api.openai.com/auth"].get("chatgpt_plan_type"), "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":4102444800}, "credits":{"hasCredits": mode == "credits", "unlimited":False, "balance":"10" if mode == "credits" else "0"}}}
+        if mode in ["closed-spend-cap", "open-spend-cap"]:
+            result["rateLimits"]["spendControlReached"] = mode == "closed-spend-cap"
+            result["rateLimits"]["credits"] = {"hasCredits":True,"unlimited":False,"balance":"10"}
+        if mode in ["included-weekly", "exhausted-weekly", "credits"]:
+            result["rateLimits"]["primary"] = {"usedPercent": 100 if mode == "exhausted-weekly" else 15, "windowDurationMins":10080,"resetsAt":4102444800}
+            result["rateLimits"]["credits"] = {"hasCredits":True,"unlimited":False,"balance":"10"}
+            result["rateLimits"]["spendControlReached"] = False
         if mode == "status-reset":
             result["rateLimits"]["secondary"] = {"usedPercent":37,"windowDurationMins":10080,"resetsAt":4102444800}
         if mode == "billing-late-change":
