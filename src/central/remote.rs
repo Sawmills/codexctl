@@ -82,7 +82,7 @@ pub fn login(
     no_browser: bool,
     cancel: bool,
 ) -> Result<bool> {
-    store::validate_alias(alias)?;
+    let alias = store::validate_alias(alias)?;
     let Some(catalog) = catalog()? else {
         return Ok(false);
     };
@@ -102,7 +102,11 @@ pub fn login(
     let alias = &account.alias;
     let directory = root()?;
     store::ensure_private_dir(&directory)?;
-    let _lock = vault::lock(&directory, "login.lock")?;
+    let lock_name = format!(
+        "login-{}.lock",
+        vault::digest(alias.to_ascii_lowercase().as_bytes())
+    );
+    let receipt_lock = vault::registry_lock(&directory, &lock_name)?;
     let path = directory.join(format!(
         ".login-{}.json",
         vault::digest(alias.to_ascii_lowercase().as_bytes())
@@ -166,13 +170,15 @@ pub fn login(
         }
         Ok(value)
     };
-    let mut status = if cancel {
-        call(
-            "/v1/relogin/status",
-            if path.try_exists()? { &id } else { "" },
-        )?
-    } else {
+    let had_receipt = path.try_exists()?;
+    if !cancel {
         persist(&id)?;
+    }
+    drop(receipt_lock);
+    let requested_id = id.clone();
+    let mut status = if cancel {
+        call("/v1/relogin/status", if had_receipt { &id } else { "" })?
+    } else {
         println!(
             "Renewing OpenAI login for server account {alias}. Sign in to that same OpenAI account and workspace."
         );
@@ -183,10 +189,36 @@ pub fn login(
         .as_str()
         .context("missing login operation")?
         .into();
-    persist(&id)?;
+    {
+        let _lock = vault::registry_lock(&directory, &lock_name)?;
+        let saved = if path.try_exists()? {
+            Some(serde_json::from_slice::<Value>(&vault::private_read(
+                &path,
+            )?)?)
+        } else {
+            None
+        };
+        if saved
+            .as_ref()
+            .is_none_or(|value| value["id"] == requested_id)
+        {
+            persist(&id)?;
+        }
+    }
     if cancel {
         status = call("/v1/relogin/cancel", &id)?;
     }
+    let clear_receipt = || -> Result<()> {
+        let _lock = vault::registry_lock(&directory, &lock_name)?;
+        if path.try_exists()? {
+            let saved: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
+            if saved["id"] == id {
+                std::fs::remove_file(&path)?;
+                store::sync_directory(&directory)?;
+            }
+        }
+        Ok(())
+    };
     let started = std::time::Instant::now();
     let mut displayed = false;
     loop {
@@ -197,16 +229,14 @@ pub fn login(
                 );
             }
             Some("completed") => {
-                std::fs::remove_file(&path)?;
-                store::sync_directory(&directory)?;
+                clear_receipt()?;
                 println!(
                     "Server login renewed for {alias}. Connected machines can keep using this account."
                 );
                 return Ok(true);
             }
             Some("failed" | "canceled") => {
-                std::fs::remove_file(&path)?;
-                store::sync_directory(&directory)?;
+                clear_receipt()?;
                 let reason = match status["error"].as_str() {
                     Some("wrong_account") => {
                         "OpenAI returned a different account; its grant is retained on the server"

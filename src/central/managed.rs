@@ -1,6 +1,6 @@
 //! Multi-user broker. One process and one persistent disk own every refresh token.
 use super::{
-    enrollment,
+    enrollment, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest},
     transport,
@@ -28,8 +28,6 @@ use std::{
     },
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
-#[path = "relogin.rs"]
-mod relogin;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
@@ -67,7 +65,7 @@ struct Failure {
 type Owners = BTreeMap<String, (String, Arc<Mutex<Owner>>)>;
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
-fn overlaps(left: &Value, right: &Value) -> bool {
+pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
     vault::account(left).ok() == vault::account(right).ok()
         && api::token_subject(vault::token(left).unwrap_or(""))
             == api::token_subject(vault::token(right).unwrap_or(""))
@@ -76,17 +74,17 @@ fn overlaps(left: &Value, right: &Value) -> bool {
 pub(super) struct Broker {
     pub state: PathBuf,
     pub key: PathBuf,
-    binary: PathBuf,
-    read_only: bool,
-    ownership_unresolved: Arc<AtomicBool>,
-    owners: Arc<RwLock<Owners>>,
-    imports: Arc<Mutex<()>>,
+    pub(super) binary: PathBuf,
+    pub(super) read_only: bool,
+    pub(super) ownership_unresolved: Arc<AtomicBool>,
+    pub(super) owners: Arc<RwLock<Owners>>,
+    pub(super) imports: Arc<Mutex<()>>,
     pub sso: Option<Arc<enrollment::Sso>>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     metrics_hash: Option<String>,
-    work: Arc<Semaphore>,
-    stopping: Arc<AtomicBool>,
-    relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    pub(super) work: Arc<Semaphore>,
+    pub(super) stopping: Arc<AtomicBool>,
+    pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
 }
 pub(super) struct HttpError {
     status: StatusCode,
@@ -156,7 +154,7 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnr
     store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)?;
     Ok(UserEnrollment::Recorded)
 }
-fn account_key(user: &str, alias: &str) -> String {
+pub(super) fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
 fn account_summary(owner: &Owner) -> Account {
@@ -202,7 +200,12 @@ fn account_summary(owner: &Owner) -> Account {
 }
 
 impl Broker {
-    fn record_failure(&self, reason: &'static str, stage: &'static str, status: StatusCode) {
+    pub(super) fn record_failure(
+        &self,
+        reason: &'static str,
+        stage: &'static str,
+        status: StatusCode,
+    ) {
         let mut failures = self.failures.lock().expect("metrics lock");
         let failure = failures.entry(reason).or_default();
         failure.count += 1;
@@ -239,12 +242,12 @@ impl Broker {
         }
         Ok(device)
     }
-    async fn owner(
+    pub(super) async fn owner(
         &self,
         device: &vault::Device,
         alias: &str,
     ) -> Result<Arc<Mutex<Owner>>, HttpError> {
-        store::validate_alias(alias)
+        let alias = store::validate_alias(alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
         self.owners
             .read()
@@ -409,7 +412,7 @@ impl Broker {
     async fn import_account(&self, user: &str, input: Import) -> Result<Account, HttpError> {
         let id = account_key(user, &input.alias);
         let _import = self.imports.lock().await;
-        relogin::check_import(&self.state, user, &input)
+        relogin::check_import(&self.state, &self.key, user, &input)
             .map_err(|_| self.error(StatusCode::CONFLICT, "relogin_reserved"))?;
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -752,7 +755,7 @@ fn definitely_not_started(home: &Path) -> bool {
     matches!(home.join("pid").try_exists(), Ok(false))
         && vault::private_read(&home.join("spawn-failed")).is_ok_and(|v| v == b"not-started")
 }
-fn previous_owner_exited(home: &Path) -> Result<()> {
+pub(super) fn previous_owner_exited(home: &Path) -> Result<()> {
     if !home.try_exists()? {
         return Ok(());
     }
@@ -797,7 +800,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
     owner.snapshot()?;
     Ok(owner)
 }
-async fn launch_owner(owner: &mut Owner, binary: &Path) -> Result<()> {
+pub(super) async fn launch_owner(owner: &mut Owner, binary: &Path) -> Result<()> {
     if !owner.vault.verified {
         owner.vault.import_rejected = false;
         owner.verification_input = Some(owner.vault.auth.clone());
@@ -881,6 +884,7 @@ pub async fn serve(
     let mut ownership_unresolved = false;
     let mut replacements_blocked = false;
     let mut conflicting_journals = Vec::new();
+    let mut repairing = std::collections::BTreeSet::new();
     // Resolve all durable commits before inventorying quarantines from other accounts.
     for entry in std::fs::read_dir(state.join("accounts"))? {
         if relogin::recover(&entry?.path(), key).is_err() {
@@ -924,6 +928,9 @@ pub async fn serve(
         conflicting_journals.extend(repair.quarantined);
         let pending = !account_vault.verified && !repair.verify;
         let id = account_key(&account_vault.user, &account_vault.alias);
+        if repair.verify {
+            repairing.insert(id.clone());
+        }
         let prepared = if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false))
         {
             Err(anyhow::anyhow!("candidate has not started"))
@@ -976,18 +983,20 @@ pub async fn serve(
     for (_, owner) in owners.values() {
         let mut owner = owner.lock().await;
         if replacements_blocked
-            || conflicting_journals.iter().any(|auth| {
-                // This is an overlap fence, not permission to replace auth.
-                // Missing or contradictory UID evidence cannot free a seat
-                // whose workspace and subject already agree.
-                overlaps(&owner.vault.auth, auth)
-            })
+            || (!repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
+                && conflicting_journals.iter().any(|auth| {
+                    // This is an overlap fence, not permission to replace auth.
+                    // Missing or contradictory UID evidence cannot free a seat
+                    // whose workspace and subject already agree.
+                    overlaps(&owner.vault.auth, auth)
+                }))
         {
             owner.available = false;
             continue;
         }
         if owner.available
             && owner.refresh_enabled
+            && !repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
             && launch_owner(&mut owner, binary).await.is_err()
         {
             owner.available = false;

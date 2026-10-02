@@ -22,7 +22,8 @@ It polls until the server reports completion or an actionable failure.
 `--no-browser` supports a terminal without a browser.
 Repeated start requests resume the same operation while it is pending.
 Status and cancellation require the account owner's company device credential.
-Another enrolled device under that same company identity can resume the operation.
+Only the initiating device can resume or cancel a pending operation.
+Cross-device resume is deferred to a follow-up.
 
 ## Native Login
 
@@ -77,7 +78,7 @@ Report success only after routing, native login verification, and durable creden
 A stopped child does not prove that OpenAI undid an issued grant.
 A canceled, interrupted, or incomplete sign-in keeps the selected account unavailable.
 Preserve its old credentials and operation evidence for a safe retry.
-A live or unidentifiable process blocks replacement.
+A live or unidentifiable process blocks replacement unless Linux parent-death protection proves that the recorded broker exit also stopped the child.
 A completed wrong-account login can revoke that wrong account's previous grant at OpenAI.
 The server cannot prevent this issuer side effect after browser approval.
 Show the selected alias before opening the browser and explain this risk.
@@ -87,14 +88,81 @@ Do not claim that cancel restores prior OpenAI authorization.
 
 Test the public HTTP and CLI paths with a real server process and synthetic native login children.
 Cover same-identity replacement, shared-workspace wrong login, UID loss/conflict, cross-user access,
-duplicate start, two-device resume, cancellation, timeout, revocation, and unrelated account use.
+duplicate start, same-device resume, other-device refusal, cancellation, timeout, revocation, and unrelated account use.
 Cover crash windows before candidate spawn, after grant save, and between journal/vault promotion.
 Use real filesystem and process evidence for ownership and persistence tests.
 Prove the gap with a failing regression before implementation.
 Run formatting, Clippy, default and no-default-feature tests, release build, Trunk, and independent Astra review.
 Report protocol fixtures separately from a live OpenAI acceptance test.
 
+## State Machine and Crash Recovery
+
+This table is the implementation contract. Each operation has one private `record.json`.
+The record contains its sequence, initiating device, phase, process evidence, candidate,
+old/new credential digests, error, and retirement marker. Each transition replaces that
+record with one atomic, synchronized write. A new operation becomes visible by renaming
+a fully initialized temporary directory. The highest published sequence selects the
+current operation; no separate current-operation pointer is needed.
+
+| Phase and crash point                                       | Durable evidence on disk                                                                                                         | Recovery action                                                                                                                               | Terminal or resumable state                                                       |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| Preparation before directory publication                    | Only an unpublished temporary directory; no child can have started                                                               | Ignore the temporary directory                                                                                                                | No operation                                                                      |
+| Prepared before stopping the old owner                      | Published record says no login child started                                                                                     | Confirm the old owner stopped; retain credentials and mark interruption                                                                       | Failed, retry allowed                                                             |
+| Spawning before process evidence is saved                   | Record says spawn attempted but has no process identity                                                                          | On Linux, prove the recorded broker incarnation exited and use parent-death protection as child exit proof; otherwise retain the global fence | Failed on Linux after proven broker exit; process reconciliation on other systems |
+| Pending with a live or unidentifiable child                 | Record contains process incarnation, or process inspection is inconclusive                                                       | On Linux after broker exit, use parent-death protection; with a live broker or on other systems, retain the global fence                      | Recover the native file after proven exit; otherwise Pending                      |
+| Pending after confirmed child exit, no complete native auth | Process exit is proven; native file is absent or partial                                                                         | Retain native bytes; mark interruption; fence only the selected account                                                                       | Failed, retry allowed                                                             |
+| Pending after complete native auth save                     | Process exit is proven; native file contains a complete grant                                                                    | Atomically capture candidate and commit intent after identity and ownership checks                                                            | Committing, resumable                                                             |
+| Pending after wrong-account auth save                       | Process exit is proven; grant disagrees with selected identity                                                                   | Atomically retain candidate and failure; reserve the observed identity                                                                        | Failed, rightful owner can repair                                                 |
+| Committing before journal write                             | Record contains candidate and exact old/new digests; vault still contains old grant                                              | Validate intent and identity; replay journal and vault writes                                                                                 | Promoted, resumable                                                               |
+| Committing after journal write, before vault write          | Same intent; journal contains candidate; vault contains old grant                                                                | Replay the same candidate into vault; preserve intent on error                                                                                | Promoted, resumable                                                               |
+| Committing after vault write, before phase write            | Same intent; journal and vault contain candidate                                                                                 | Verify exact digests; finish phase write                                                                                                      | Promoted, resumable                                                               |
+| Promoted before or during native verification               | Candidate and intent remain; journal can contain a rotated grant                                                                 | Prove old process exit, reconcile journal, then verify with a writable server                                                                 | Promoted, retryable; Failed only after definitive rejection is reconciled         |
+| Promoted after permanent rejection                          | Native rejection is durable and refers to the unchanged verification input, which can be a rotated grant; process exit is proven | Retain grant and rejection evidence; allow a new explicit login                                                                               | Failed, retry allowed                                                             |
+| Retiring during reservation updates                         | Record proves full verification; some matching stopped reservations may already be retired                                       | Repeat retirement under the import lock; reload each reservation before writing                                                               | Completed after all retirement writes succeed                                     |
+| Completed after success response is lost                    | Durable completion and verified vault                                                                                            | Return the saved result to the initiating device                                                                                              | Completed                                                                         |
+| Failed or Canceled after a worker stops                     | Record retains outcome, candidate if readable, and process evidence                                                              | Preserve evidence; ignore unusable candidate bytes after proven exit                                                                          | Failed or Canceled, retry allowed                                                 |
+| Corrupt published record with proof no child started        | Private no-start publication evidence; no runtime process uncertainty                                                            | Fence this account only; retain corrupt bytes                                                                                                 | Account requires repair; unrelated accounts remain usable                         |
+| Any recoverable phase on a read-only server                 | Existing intent and process evidence                                                                                             | Perform disk reconciliation only; never launch or verify an owner                                                                             | Failed or resumable phase; writable retry completes verification                  |
+
+The Linux broker uses a current-thread Tokio runtime. Native children spawn directly
+on that long-lived main thread, never in the retiring blocking pool. The child sets
+`PR_SET_PDEATHSIG=SIGKILL` before exec and checks the parent PID to close the setup
+race. Each operation records the broker incarnation before spawn. Linux recovery
+uses its proven exit as child exit evidence, including the spawn-to-PID-record gap.
+
+The file approach remains suitable because each phase transition has one authoritative
+atomic record write; journal, vault, and reservation writes are idempotent effects of a
+durable intent, so SQLite would not make those external effects transactional.
+
+All mutation paths take the import lock before resolving the normalized alias and
+current owner. Worker completion, cancellation, import, and renewal follow this order.
+The lock covers ownership checks and commit verification. An unfinished operation
+reserves both its selected identity and any complete candidate identity. A rejected
+alias cannot renew an account that another alias or company user already owns.
+A waiting worker reloads its record under the lock and honors a retirement written by
+another operation. A stopped process does not prove that its worker has finished.
+
+A same-device retry resumes the saved operation. Other devices cannot read its code,
+cancel it, or resume it. Cross-device resume is a follow-up after this PR.
+The client holds an alias-specific lock only while changing its operation receipt.
+Cancellation can run while the first client is polling. Completion removes a receipt
+only when it still names that operation.
+
+### Review Regression Coverage
+
+Retain all fifteen reviewer findings as regression cases. The table covers partial
+publication, incomplete native writes, commit errors, interrupted login, read-only
+startup, permanent rejection, and retirement ordering. Additional cases cover early
+import reservation, restoration of writable refresh ownership, rejected-alias
+ownership, owner-map replacement while waiting for the lock, late worker retirement,
+concurrent CLI cancellation, relative state paths, and normalized remote aliases. Existing tests
+cover unchanged import and local-login contracts; new tests exercise the changed
+server renewal paths. Record each red/green result against the WIP commit.
+
 ## Primary Sources
+
+- [Linux parent-death signal and spawning-thread lifetime](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).
+- Tokio 1.52.3, pinned in `Cargo.lock`: `process::Command::spawn` directly calls `self.std.spawn()` on the calling thread (`src/process/mod.rs:863`).
 
 - [Official App Server authentication documentation](https://learn.chatgpt.com/docs/app-server#authentication-endpoints).
 - [Pinned App Server account processor](https://github.com/openai/codex/blob/687a119f0fcaace47e1f1abcc77cec6c813fd6da/codex-rs/app-server/src/request_processors/account_processor.rs).

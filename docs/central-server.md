@@ -110,7 +110,7 @@ Your machine's OpenAI credentials and active account do not change.
 Your other enrolled machines keep their registration and aliases.
 
 If your terminal disconnects, run the same login command to resume.
-Another machine under the same company identity can also resume the pending login.
+Resume from the machine that started the login. Other machines cannot resume or cancel its pending login.
 To stop a pending login, run `codexctl login <alias> --cancel`.
 A canceled or failed login leaves that account unavailable until you retry.
 Cancellation does not undo an authorization that OpenAI already issued.

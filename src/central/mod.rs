@@ -4,6 +4,7 @@ pub mod enrollment;
 pub mod managed;
 pub mod native;
 mod process;
+mod relogin;
 pub mod remote;
 mod rpc;
 mod server;
