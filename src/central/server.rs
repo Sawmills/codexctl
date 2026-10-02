@@ -623,6 +623,11 @@ mod billing_tests {
         assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
     }
     #[test]
+    fn subscription_overage_limit_with_paid_credits_still_requires_consent() {
+        let limits = json!({"rateLimits":{"planType":"pro","primary":{"usedPercent":15,"windowDurationMins":10080},"credits":{"hasCredits":true,"unlimited":false,"overageLimitReached":true}}});
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+    #[test]
     fn subscription_credits_with_headroom_do_not_require_spend_control() {
         for plan in ["plus", "pro", "prolite", "promax"] {
             let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":true,"unlimited":false},"spendControl":{"reached":true}}});

@@ -125,6 +125,7 @@ Both bare `codexctl use` and `codexctl use <alias>` allow this selection without
 Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
 An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
+Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
 Usage-based accounts never qualify for automatic selection.
 Explicit credit-billing selection requires consent or `--allow-billing` on a non-interactive terminal.
 Organizational plans still need a closed spend cap, reported as `spendControlReached = true`.
@@ -137,8 +138,9 @@ A failed billing read also refuses unapproved token delivery.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.
 Further rotation refuses delivery until the operator retries with stable evidence.
 
-This policy accepts about one refresh interval of credit exposure between checks.
-It is not a hard spending cap or token expiry.
+After OpenAI reports the weekly limit, unapproved new requests stop at the next refresh, within one 60-second cache interval.
+An in-flight response may finish, and usage reporting can lag, so a small credit spend remains possible.
+This policy is not a hard spending cap or token expiry.
 [Codex 0.159.0 caches helper tokens](https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/login/src/auth/external_bearer.rs#L33-L46)
 until their age reaches the configured interval, then runs the helper before the next request.
 Zero disables that age check; 60000 milliseconds limits normal cache reuse to one minute
