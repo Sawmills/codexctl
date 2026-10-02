@@ -5272,7 +5272,7 @@ fn reset_listing_requires_a_registered_machine() {
 }
 
 fn reset_cli(response: Value) -> std::process::Output {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let server = Server::start();
     let home = server.connected_home();
     let migrated = home.path().join(".codexctl/profiles/personal");
@@ -5294,14 +5294,21 @@ fn reset_cli(response: Value) -> std::process::Output {
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
             if let Ok((mut stream, _)) = listener.accept() {
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();
-                let mut buffer = [0; 4096];
-                let n = stream.read(&mut buffer).unwrap();
+                let mut received = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                while !received.ends_with("\r\n\r\n") {
+                    if reader.read_line(&mut received).unwrap() == 0 {
+                        break;
+                    }
+                }
+                drop(reader);
                 let body = response.to_string();
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                return String::from_utf8_lossy(&buffer[..n]).into_owned();
+                return received;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
