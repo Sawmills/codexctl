@@ -201,3 +201,77 @@ fn statusline_stalled_provider_configuration_exits_without_waiting() {
     assert!(output.status.success());
     assert_eq!((output.stdout, output.stderr), (vec![], vec![]));
 }
+
+#[test]
+fn statusline_ended_five_hour_window_is_hidden_until_refreshed() {
+    let home = tempfile::tempdir().unwrap();
+    cached(home.path(), 0, None);
+    change_cache(home.path(), "/account/primary_used_percent", json!(12));
+    change_cache(home.path(), "/five_hour_resets_at", json!(1));
+
+    let output = run(home.path());
+
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "p2 62% wk · 6d22h\n"
+    );
+}
+
+#[cfg(feature = "central-prototype")]
+fn legacy_status(home: &Path) -> std::process::Output {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let root = home.join(".codexctl/central");
+    let token = root.join("device.token");
+    let connection = root.join("personal.json");
+    codexctl::store::atomic_write(&token, b"synthetic").unwrap();
+    codexctl::store::atomic_write(
+        &root.join(".server.json"),
+        json!({"server":url,"token_file":token,"user_id":"user"})
+            .to_string()
+            .as_bytes(),
+    )
+    .unwrap();
+    codexctl::store::atomic_write(&connection, json!({"server":url,"device_token_file":token,"user_id":"user","account_id":"seat","revision":"r"}).to_string().as_bytes()).unwrap();
+    codexctl::store::atomic_write(&home.join(".codex/config.toml"), format!("model_provider = 'codexctl-central'\n[model_providers.codexctl-central.auth]\nargs = ['central-token', '--connection', '{}']\n", connection.display()).as_bytes()).unwrap();
+    let response = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 && !line.ends_with("\r\n\r\n") {}
+        let body = json!([{"userId":"user","alias":"personal","label":null,"accountId":"seat","plan":"pro","billingClass":"rate_limited","primaryUsed":5,"secondaryUsed":38,"resetsAt":4102444800_i64,"available":true,"usageScore":0}]).to_string();
+        write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+    });
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .args(["status", "--json"])
+        .timeout(Duration::from_secs(3))
+        .output()
+        .unwrap();
+    response.join().unwrap();
+    output
+}
+
+#[cfg(feature = "central-prototype")]
+#[test]
+fn statusline_legacy_server_does_not_claim_unknown_window_is_weekly() {
+    let home = tempfile::tempdir().unwrap();
+
+    let status = legacy_status(home.path());
+    let output = run(home.path());
+
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(output.status.success());
+    assert_eq!((output.stdout, output.stderr), (vec![], vec![]));
+}

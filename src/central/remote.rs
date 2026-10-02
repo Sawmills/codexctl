@@ -654,18 +654,11 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     let show_usage = status || !rows.is_empty();
     let active = native::active_alias()?;
     for account in &accounts {
-        // Older servers publish only the long-window summary. Do not infer a 5h duration.
-        let usage = account.available.then(|| {
-            account
-                .statusline_usage
-                .clone()
-                .unwrap_or(crate::statusline::Usage {
-                    weekly_used_percent: account.secondary_used,
-                    weekly_resets_at: account.resets_at,
-                    five_hour_used_percent: None,
-                    five_hour_resets_at: None,
-                })
-        });
+        // Summary columns do not prove window durations on an older server.
+        let usage = account
+            .available
+            .then(|| account.statusline_usage.clone())
+            .flatten();
         crate::statusline::record(
             &paths,
             crate::statusline::Selection {

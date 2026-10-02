@@ -32,8 +32,9 @@ codexctl status >/dev/null
 
 `status` updates `~/.codexctl/statusline.json` from the usage it already fetches.
 The token helper also updates this file when the account server supplies usage in its token response.
-That update needs an account server with statusline support. Older servers still work through `status`.
-Their summaries do not identify the short-window duration, so the statusline omits the five-hour value.
+Server accounts need an account server with statusline support for both update paths.
+Older servers do not prove window durations, so their accounts produce no statusline.
+Their normal `status` and `status --json` output stays available.
 The cache contains account identity metadata and usage, with no credentials.
 Cache write errors do not fail the original status or token operation.
 

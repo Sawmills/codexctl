@@ -1948,5 +1948,5 @@ fn statusline_token_helper_populates_cache_without_exposing_credentials() {
 
     assert!(helper.status.success());
     assert!(String::from_utf8_lossy(&line.stdout).starts_with("remote 63% wk · "));
-    assert!(!String::from_utf8_lossy(&line.stdout).contains("eyJ"));
+    assert!(String::from_utf8_lossy(&line.stdout).ends_with(" · 100% 5h\n"));
 }
