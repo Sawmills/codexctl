@@ -5,4 +5,5 @@ pub mod config;
 pub mod daemon;
 pub mod profile;
 pub mod status_format;
+pub mod status_json;
 pub mod store;

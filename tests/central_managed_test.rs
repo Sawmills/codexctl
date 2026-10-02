@@ -5257,3 +5257,217 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
         "{error}"
     );
 }
+
+#[test]
+fn when_subscription_cap_is_closed_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"closed-spend-cap").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
+fn when_subscription_has_included_headroom_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"included-weekly").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
+fn reset_listing_requires_a_registered_machine() {
+    let server = Server::start();
+
+    let response = server
+        .http
+        .get(format!("{}/v1/resets", server.url))
+        .send()
+        .unwrap();
+
+    assert_eq!(response.status(), 401);
+}
+
+fn reset_cli(response: Value) -> std::process::Output {
+    use std::io::Write;
+    let server = Server::start();
+    let home = server.connected_home();
+    let migrated = home.path().join(".codexctl/profiles/personal");
+    store::ensure_private_dir(&migrated).unwrap();
+    store::atomic_write(
+        &migrated.join("meta.json"),
+        br#"{"alias":"personal","saved_at":"2036-01-01"}"#,
+    )
+    .unwrap();
+    store::atomic_write(&migrated.join(".central-transfer.json"), b"{}").unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let registration = home.path().join(".codexctl/central/.server.json");
+    let mut connection: Value =
+        serde_json::from_slice(&std::fs::read(&registration).unwrap()).unwrap();
+    connection["server"] = json!(format!("http://{}", listener.local_addr().unwrap()));
+    store::atomic_write(&registration, &serde_json::to_vec(&connection).unwrap()).unwrap();
+    let request = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            if let Ok((mut stream, _)) = listener.accept() {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut received = String::new();
+                let mut reader = BufReader::new(&mut stream);
+                while !received.ends_with("\r\n\r\n") {
+                    if reader.read_line(&mut received).unwrap() == 0 {
+                        break;
+                    }
+                }
+                drop(reader);
+                let body = response.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                return received;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        String::new()
+    });
+    let output = server.cli(home.path(), &["resets"]);
+    let request = request.join().unwrap();
+    assert!(request.starts_with("GET /v1/resets "), "{request}");
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer ")
+    );
+    output
+}
+
+#[test]
+fn reset_listing_on_a_connected_machine_needs_no_local_auth() {
+    let reply = json!({"userId":"amir", "accounts":[{"alias":"personal", "available":2, "applicable":1,
+        "credits":[{"id":"later","status":"available","expires_at":"2036-08-12T12:00:00Z"},
+                   {"id":"sooner","status":"available","expires_at":"2036-07-26T12:00:00Z"}]}]});
+
+    let output = reset_cli(reply);
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("2 banked, 1 redeemable now."), "{text}");
+    assert!(text.contains("Jul 26, Aug 12"), "{text}");
+}
+
+#[test]
+fn reset_listing_failure_does_not_report_a_complete_zero_total() {
+    let reply =
+        json!({"userId":"amir", "accounts":[{"alias":"personal", "error":"reset_read_failed"}]});
+
+    let output = reset_cli(reply);
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(!output.status.success());
+    assert!(!text.contains("0 banked, 0 redeemable now."), "{text}");
+    assert!(text.contains("reset_read_failed"), "{text}");
+}
+
+#[test]
+fn reset_listing_rejects_another_company_users_response() {
+    let reply = json!({"userId":"alex", "accounts":[]});
+
+    let output = reset_cli(reply);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server user identity changed"));
+}
+
+#[test]
+fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "personal");
+    let retired = local_profile(home.path(), "retired");
+    store::atomic_write(&retired.join(".central-transfer.json"), b"{}").unwrap();
+
+    let output = server.cli(home.path(), &["status", "--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({
+        "version":1,"accounts":[
+            {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
+             "primary_used_percent":0.0,"secondary_used_percent":37.0,
+             "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null},
+            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
+             "primary_used_percent":null,"secondary_used_percent":null,
+             "resets_at":null,"billing_class":"unknown","error":"credentials unavailable"}
+        ]})
+    );
+}
+
+#[test]
+fn connected_list_json_returns_empty_catalog_without_prose() {
+    let server = Server::start();
+    let home = server.connected_home();
+
+    let output = server.cli(home.path(), &["list", "--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"version":1,"accounts":[]})
+    );
+}
+
+#[test]
+fn connected_status_json_keeps_unavailable_accounts() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+
+    let output = server.cli(home.path(), &["status", "--json"]);
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(document["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (
+            &document["accounts"][0]["state"],
+            &document["accounts"][0]["error"]
+        ),
+        (&json!("unavailable"), &json!("account unavailable"))
+    );
+}
+
+#[test]
+fn connected_status_json_filter_matches_the_table() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "broken");
+
+    let output = server.cli(home.path(), &["status", "--json", "--usage-based"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"version":1,"accounts":[]})
+    );
+}

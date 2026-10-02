@@ -66,12 +66,32 @@ A new machine with no local copies needs only enrollment.
 Before activation, the client checks every known local credential home by account identity.
 A copy under another alias or an uncertain identity requires an explicit handoff.
 
+### Migration window on a busy machine
+
+These steps come from a migration on 2026-10-02 with 28 Codex panes on one Mac.
+
+1. Record each pane's session ID from its statusline or the rollout file that its Codex process keeps open.
+2. Run `codexctl devices` on each machine and confirm that all machines show the same company user. Sign in to the browser with the correct company account.
+3. Pause supervisors that automatically restart lanes so they cannot restart Codex during the migration window.
+4. Stop Codex with a normal exit (Ctrl+C twice) or `codex app-server daemon stop`.
+   Avoid SIGTERM: it leaves threads locked and can leave the terminal in an extended keyboard mode. Run `printf '\033[<u'` to restore the terminal.
+5. Quit the Codex desktop app and any plugin app-servers. `codexctl migrate` refuses while any Codex process runs.
+6. After migration, run `codexctl use <alias>`. Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
+7. Resume each session with `codexctl codex resume <sid>`.
+   Plain `codex resume` restores the saved `openai` provider and gets HTTP 401 at compaction. If a shell alias adds flags, do not repeat them.
+8. When resume shows "This conversation is open in another app", press `r` once; the daemon releases the thread.
+   Do not use the TUI `f fork` for this: a TUI fork keeps the `openai` provider.
+
 ## Daily Use
+
+Use `codexctl status --json` or `codexctl list --json` for automation.
+See the [versioned JSON schema](status-json.md) for fields and failure behavior.
 
 ```sh
 codexctl status
 codexctl list
 codexctl whoami
+codexctl resets
 codexctl use
 codexctl codex
 ```
@@ -82,16 +102,56 @@ the profile visible with an error. Empty columns are hidden. When the server has
 no accounts, a migration hint appears below the table. Profiles with a migration
 marker remain excluded, including migrations whose completion is unknown.
 
+`codexctl resets` lists banked counts, redeemable counts, and expiry dates for server accounts.
+It reads those values through the account server. Migration does not require local `auth.json` files for this command.
+Unmigrated profiles retain their local reset lookup.
+A failed account read shows an error and an incomplete total. The command exits with failure in both server and local modes.
+An account server without the reset endpoint rejects this command until the operator deploys the new server.
+Server-account reset redemption remains unsupported. The list command never spends a reset or approves credit billing.
+Local redemption still requires an exhausted window and selects the qualifying reset closest to expiry.
+Explicit account selection never redeems a reset. `--allow-resets` and `--allow-billing` remain separate approvals.
+
+The read-only `GET /v1/resets` endpoint requires a registered machine credential.
+It returns only that company user's aliases, counts, and reset details, with `Cache-Control: no-store`.
+The refresh owner supplies credentials for the server's OpenAI reads. The response contains no OpenAI credentials.
+After OpenAI rejects an access token, the server records `reset_auth_rejected` and retries once through the refresh owner.
+A successful retry does not trigger the operational failure alert.
+Each failed account read increments `codexctl_central_failed_requests_total{reason="reset_read_failed"}` once.
+A structured log identifies the `resets` stage. The existing `CodexctlCredentialOperationFailed` alert includes this reason.
+The server rechecks machine authorization before delivery.
+Alert routing and notification delivery still require deployment checks.
+
 Automatic selection uses only accounts with verified included usage.
-It prefers an account with headroom and the soonest long-window reset.
+Pro and Plus subscriptions (including `prolite` and `promax`) qualify while every
+reported usage window has headroom, even when credits are available and the cap is open.
+Both bare `codexctl use` and `codexctl use <alias>` allow this selection without `--allow-billing`.
+Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
-Explicit credit-billing selection still requires consent or `--allow-billing` on a non-interactive terminal.
-The helper checks billing again before it supplies a token.
+An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
+Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
+Usage-based accounts never qualify for automatic selection.
+Explicit credit-billing selection requires consent or `--allow-billing` on a non-interactive terminal.
+Organizational plans still need a closed spend cap, reported as `spendControlReached = true`.
+No flag for billing consent approves a banked reset.
+
+The provider uses `auth.refresh_interval_ms = 60000`.
+The helper asks the account server for current billing evidence on every refresh.
+After included usage ends, the helper returns no token unless the account has billing approval.
+A failed billing read also refuses unapproved token delivery.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.
 Further rotation refuses delivery until the operator retries with stable evidence.
-Organizational plans and accounts with credit evidence need a closed spend cap to qualify for automatic selection.
-A missing or open cap for those accounts requires billing consent.
-Subscription credits alone do not prove that further spending is disabled.
+
+After OpenAI reports the weekly limit, unapproved new requests stop at the next refresh, within one 60-second cache interval.
+An in-flight response may finish, and usage reporting can lag, so a small credit spend remains possible.
+This policy is not a hard spending cap or token expiry.
+[Codex 0.159.0 caches helper tokens](https://github.com/openai/codex/blob/rust-v0.159.0/codex-rs/login/src/auth/external_bearer.rs#L33-L46)
+until their age reaches the configured interval, then runs the helper before the next request.
+Zero disables that age check; 60000 milliseconds limits normal cache reuse to one minute
+without a billing read before every model request.
+A helper failure supplies no replacement token.
+The interval does not stop an in-flight response, revoke an issued token, or remove delays in OpenAI usage reporting.
+Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
+Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
 No remote command redeems a banked reset implicitly.
 Finish existing TUI sessions and stop the daemon before switching accounts.
 Pending local logins and local recovery wrappers also block remote activation.

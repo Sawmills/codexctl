@@ -6,6 +6,7 @@ pub mod native;
 mod process;
 mod relogin;
 pub mod remote;
+pub(crate) mod resets;
 mod rpc;
 mod server;
 mod sessions;

@@ -3,12 +3,25 @@ use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 use crate::profile;
 
-pub fn run() -> Result<()> {
+pub fn run(json: bool) -> Result<()> {
     #[cfg(feature = "central-prototype")]
-    if codexctl::central::remote::show(false, None)? {
+    if codexctl::central::remote::show(false, None, json)? {
         return Ok(());
     }
     let profiles = profile::list_profiles()?;
+    if json {
+        let active = profile::get_active()?;
+        let rows: Vec<_> = profiles
+            .iter()
+            .map(|p| {
+                codexctl::status_json::AccountStatus::local(
+                    &p.meta,
+                    active.as_deref() == Some(&p.meta.alias),
+                )
+            })
+            .collect();
+        return codexctl::status_json::print(&rows);
+    }
     if profiles.is_empty() {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");
         return Ok(());

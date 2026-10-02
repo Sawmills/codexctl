@@ -810,3 +810,106 @@ fn save_refuses_a_third_alias_for_an_already_duplicated_credential() {
         "a third copy was created"
     );
 }
+
+#[test]
+fn resets_reports_an_incomplete_total_when_a_local_profile_has_no_auth() {
+    let home = tempfile::tempdir().unwrap();
+    let profile = home.path().join(".codexctl/profiles/broken");
+    codexctl::store::ensure_private_dir(&profile).unwrap();
+    codexctl::store::atomic_write(
+        &profile.join("meta.json"),
+        br#"{"alias":"broken","saved_at":"2036-01-01"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .arg("resets")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("bad auth.json"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("total is incomplete"));
+}
+
+#[test]
+fn status_json_returns_one_empty_document_without_messages() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .args(["status", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"version": 1, "accounts": []})
+    );
+}
+
+#[test]
+fn status_json_keeps_failed_profiles_and_unknown_billing() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let dir = paths.profiles_dir().join("broken");
+    codexctl::store::atomic_write(
+        &dir.join("meta.json"),
+        br#"{"alias":"broken","label":"Personal","plan":"pro","saved_at":"2026-10-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+    codexctl::store::atomic_write(&dir.join("auth.json"), b"{}").unwrap();
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .args(["status", "--json", "--rate-limited"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"version":1,"accounts":[{
+            "alias":"broken","label":"Personal","plan":"pro","source":"local",
+            "state":"unavailable","primary_used_percent":null,"secondary_used_percent":null,
+            "resets_at":null,"billing_class":"unknown","error":"bad auth.json"
+        }]})
+    );
+}
+
+#[test]
+fn list_json_keeps_local_metadata_without_reading_credentials() {
+    let home = tempfile::tempdir().unwrap();
+    let paths = codexctl::config::Paths::from_home(home.path().into());
+    let dir = paths.profiles_dir().join("offline");
+    codexctl::store::atomic_write(
+        &dir.join("meta.json"),
+        br#"{"alias":"offline","saved_at":"2026-10-02T00:00:00Z"}"#,
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .args(["list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({"version":1,"accounts":[{
+            "alias":"offline","label":null,"plan":null,"source":"local",
+            "state":"local","primary_used_percent":null,"secondary_used_percent":null,
+            "resets_at":null,"billing_class":"unknown","error":null
+        }]})
+    );
+}
