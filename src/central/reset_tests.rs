@@ -99,7 +99,7 @@ impl Fixture {
 async fn upstream(
     usage: Value,
     credits: Value,
-    fail: bool,
+    status: StatusCode,
 ) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
@@ -120,8 +120,8 @@ async fn upstream(
                 if !validate(headers) {
                     return StatusCode::UNAUTHORIZED.into_response();
                 }
-                if fail {
-                    return StatusCode::BAD_GATEWAY.into_response();
+                if status != StatusCode::OK {
+                    return status.into_response();
                 }
                 Json(usage).into_response()
             }),
@@ -148,7 +148,7 @@ async fn reset_inventory_preserves_provider_counts_and_expiries_without_exportin
     let usage =
         json!({"rate_limit_reset_credits":{"available_count":3,"applicable_available_count":0}});
     let credits = json!({"available_count":2,"credits":[{"id":"later","status":"available","expires_at":"2036-08-12T12:00:00Z"},{"id":"sooner","status":"available","expires_at":"2036-07-26T12:00:00Z"}]});
-    let (base, upstream) = upstream(usage, credits.clone(), false).await;
+    let (base, upstream) = upstream(usage, credits.clone(), StatusCode::OK).await;
     let fixture = Fixture::start(&base).await;
 
     let (headers, result) = fixture.list().await;
@@ -164,7 +164,7 @@ async fn reset_inventory_preserves_provider_counts_and_expiries_without_exportin
 
 #[tokio::test]
 async fn reset_inventory_failure_counts_once_and_keeps_totals_unknown() {
-    let (base, upstream) = upstream(json!({}), json!({}), true).await;
+    let (base, upstream) = upstream(json!({}), json!({}), StatusCode::BAD_GATEWAY).await;
     let fixture = Fixture::start(&base).await;
 
     let (_, result) = fixture.list().await;
@@ -235,4 +235,84 @@ async fn slow_reset_reads_do_not_hold_the_refresh_owner_lock() {
         owner_is_free,
         "a slow reset endpoint blocks the refresh owner"
     );
+}
+
+#[tokio::test]
+async fn reset_inventory_refreshes_a_rejected_token_once() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::start(&format!("http://{}", listener.local_addr().unwrap())).await;
+    let app = Router::new().route("/usage", get(|headers: HeaderMap| async move {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let token = headers["authorization"].to_str().unwrap();
+        let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        if claims["generation"] == 1 { return StatusCode::UNAUTHORIZED.into_response(); }
+        Json(json!({"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":1}})).into_response()
+    })).route("/credits", get(|| async { Json(json!({"available_count":2,"credits":[]})) }));
+    let upstream = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (_, result) = fixture.list().await;
+
+    assert_eq!(
+        result["accounts"],
+        json!([{"alias":"personal","available":2,"applicable":1,"credits":[]}])
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("counter")).unwrap(),
+        "2"
+    );
+    fixture.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn reset_inventory_never_reads_credentials_from_another_vault_user() {
+    let (base, upstream) = upstream(json!({}), json!({}), StatusCode::OK).await;
+    let fixture = Fixture::start(&base).await;
+    fixture
+        .broker
+        .owners
+        .read()
+        .await
+        .values()
+        .next()
+        .unwrap()
+        .1
+        .lock()
+        .await
+        .vault
+        .user = "another-user".into();
+
+    let (_, result) = fixture.list().await;
+
+    assert_eq!(
+        result["accounts"],
+        json!([{"alias":"personal","error":"reset_read_failed"}])
+    );
+    fixture.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn reset_inventory_stops_after_one_rejected_token_retry() {
+    let (base, upstream) = upstream(json!({}), json!({}), StatusCode::UNAUTHORIZED).await;
+    let fixture = Fixture::start(&base).await;
+
+    let (_, result) = fixture.list().await;
+
+    assert_eq!(
+        result["accounts"],
+        json!([{"alias":"personal","error":"reset_read_failed"}])
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("counter")).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        fixture.broker.failures.lock().unwrap()["reset_read_failed"].count,
+        1
+    );
+    fixture.stop().await;
+    upstream.abort();
 }

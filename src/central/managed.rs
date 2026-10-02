@@ -1132,6 +1132,7 @@ pub async fn serve(
                 "owner_unavailable",
                 "catalog_owner_unavailable",
                 "reset_read_failed",
+                "reset_auth_rejected",
                 "persistence_failed",
                 "registry_unavailable",
                 "registry_busy",

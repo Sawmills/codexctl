@@ -101,24 +101,50 @@ pub(super) async fn list(
     }
     let tasks = owners.into_iter().map(|(alias, owner)| {
         let broker = broker.clone();
+        let user = device.user.clone();
         tokio::spawn(async move {
             // A canceled HTTP request must not interrupt credential persistence.
             let result = async {
                 let _permit = broker.work.acquire().await?;
-                let mut owner = owner.lock().await;
-                let token = owner
-                    .tokens(TokenRequest::default())
-                    .await
-                    .map_err(|_| anyhow::anyhow!("owner unavailable"))?;
-                drop(owner);
-                anyhow::ensure!(
-                    token.native_routing_supported,
-                    "unsupported workspace routing"
-                );
-                broker
-                    .reset_reader
-                    .read(&token.access_token, &token.chatgpt_account_id)
-                    .await
+                let mut request = TokenRequest::default();
+                let mut retried = false;
+                loop {
+                    let token = {
+                        let mut owner = owner.lock().await;
+                        anyhow::ensure!(owner.vault.user == user, "account user mismatch");
+                        owner
+                            .tokens(request)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("owner unavailable"))?
+                    };
+                    anyhow::ensure!(
+                        token.native_routing_supported,
+                        "unsupported workspace routing"
+                    );
+                    let result = broker
+                        .reset_reader
+                        .read(&token.access_token, &token.chatgpt_account_id)
+                        .await;
+                    if !retried
+                        && result
+                            .as_ref()
+                            .is_err_and(|error| error.is::<api::AuthExpired>())
+                    {
+                        broker.record_failure(
+                            "reset_auth_rejected",
+                            "resets",
+                            StatusCode::UNAUTHORIZED,
+                        );
+                        retried = true;
+                        request = TokenRequest {
+                            previous_revision: Some(token.revision),
+                            account_id: Some(token.chatgpt_account_id),
+                            ..Default::default()
+                        };
+                        continue;
+                    }
+                    return result;
+                }
             }
             .await;
             let outcome = match result {

@@ -68,7 +68,11 @@ pub fn run_list() -> Result<()> {
         }
     }
     if rows.is_empty() {
-        println!("no accounts saved.");
+        if server_mode {
+            println!("no accounts saved.");
+        } else {
+            println!("no profiles saved. Use 'codexctl save' to save the current account.");
+        }
         return Ok(());
     }
 

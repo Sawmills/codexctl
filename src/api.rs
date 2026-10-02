@@ -391,6 +391,16 @@ pub struct ConsumeResetResponse {
     pub windows_reset: i64,
 }
 
+#[derive(Debug)]
+pub(crate) struct AuthExpired;
+
+impl std::fmt::Display for AuthExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("expired")
+    }
+}
+impl std::error::Error for AuthExpired {}
+
 pub(crate) const RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 
@@ -420,7 +430,7 @@ pub(crate) async fn fetch_reset_credits_at(
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("expired");
+        return Err(AuthExpired.into());
     }
     if !status.is_success() {
         anyhow::bail!("reset credits API returned {status}");
@@ -606,7 +616,7 @@ pub(crate) async fn fetch_usage_at(
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("expired");
+        return Err(AuthExpired.into());
     }
     if !status.is_success() {
         anyhow::bail!("API returned {status}");

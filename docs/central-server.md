@@ -111,6 +111,8 @@ Explicit account selection never redeems a reset. `--allow-resets` and `--allow-
 The read-only `GET /v1/resets` endpoint requires a registered machine credential.
 It returns only that company user's aliases, counts, and reset details, with `Cache-Control: no-store`.
 The refresh owner supplies credentials for the server's OpenAI reads. The response contains no OpenAI credentials.
+After OpenAI rejects an access token, the server records `reset_auth_rejected` and retries once through the refresh owner.
+A successful retry does not trigger the operational failure alert.
 Each failed account read increments `codexctl_central_failed_requests_total{reason="reset_read_failed"}` once.
 A structured log identifies the `resets` stage. The existing `CodexctlCredentialOperationFailed` alert includes this reason.
 The server rechecks machine authorization before delivery.
