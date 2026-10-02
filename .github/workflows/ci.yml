@@ -98,3 +98,34 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --all-targets
+
+  build-windows:
+    name: Build (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Enable and verify symbolic links
+        shell: pwsh
+        run: |
+          $key = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock'
+          New-Item -Path $key -Force | Out-Null
+          New-ItemProperty -Path $key -Name AllowDevelopmentWithoutDevLicense -Value 1 -PropertyType DWord -Force | Out-Null
+          $probe = Join-Path $env:RUNNER_TEMP 'codexctl-symlink-probe'
+          New-Item -ItemType Directory -Path $probe | Out-Null
+          New-Item -ItemType Directory -Path "$probe\directory" | Out-Null
+          Set-Content -Path "$probe\file" -Value 'probe'
+          New-Item -ItemType SymbolicLink -Path "$probe\directory-link" -Target "$probe\directory" | Out-Null
+          New-Item -ItemType SymbolicLink -Path "$probe\file-link" -Target "$probe\file" | Out-Null
+      # The central prototype requires Unix process and shell support.
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --no-default-features
+      - name: Test
+        run: cargo test --locked --all-targets --no-default-features
+      - name: Build
+        run: cargo build --locked --release --no-default-features

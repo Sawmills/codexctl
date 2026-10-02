@@ -219,6 +219,18 @@ the saved profile when the child exits, and an older token never overwrites a ne
 ever replaces a symlink with a real file, that copy stops tracking the shared one; delete
 `~/.codexctl/exec-homes/<alias>` to start clean. The child's exit code becomes codexctl's.
 
+On Windows, creating these links requires Developer Mode, the
+`SeCreateSymbolicLinkPrivilege` user right, or an elevated `codexctl` process. If Windows denies
+the operation because of missing link privileges, `exec` reports these remedies.
+
+Install the standalone CLI on Windows with
+`cargo install --git https://github.com/Sawmills/codexctl --no-default-features`.
+The central prototype requires Unix process and shell support.
+Windows tests require the same symbolic-link permissions as `exec`.
+CI enables Developer Mode and tests both file and directory links before the suite.
+Windows daemon synchronization has only mock-daemon test coverage.
+Compatibility with a real Windows Codex daemon remains unverified.
+
 ### Reset-aware selection (default)
 
 Both `codexctl use` (no alias) and `codexctl codex` recovery prefer, among otherwise-eligible

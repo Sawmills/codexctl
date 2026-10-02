@@ -1,3 +1,7 @@
+// These process fixtures isolate credentials through HOME. Windows resolves the
+// profile through Known Folders instead, so HOME cannot isolate these tests.
+#![cfg(unix)]
+
 use assert_cmd::Command;
 
 #[cfg(unix)]

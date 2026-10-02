@@ -66,3 +66,10 @@ tungstenite = { version = "0.30", default-features = false, features = [
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.2.1"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+] }

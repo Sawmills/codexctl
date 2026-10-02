@@ -163,7 +163,31 @@ fn symlink_shared_entry(target: &Path, link: &Path) -> Result<()> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn symlink_shared_entry(target: &Path, link: &Path) -> Result<()> {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+    let result = if target.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        // A concurrent launch of the same alias won the race and linked the
+        // same target, so the entry is already shared.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => Err(error)
+            .context(format!(
+                "failed to link {}: Windows did not grant permission to create symbolic links; enable Developer Mode, grant SeCreateSymbolicLinkPrivilege, or run codexctl elevated",
+                link.display()
+            )),
+        Err(error) => Err(error).with_context(|| format!("failed to link {}", link.display())),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn symlink_shared_entry(_target: &Path, link: &Path) -> Result<()> {
     // Silently keeping the entry unshared would send session rollouts somewhere
     // `codex resume` never looks, so say so instead of pretending it worked.
@@ -293,7 +317,7 @@ mod tests {
         assert!(!paths.active_file().exists());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_shares_every_codex_entry_except_credentials() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
@@ -326,7 +350,7 @@ mod tests {
     /// A `codexctl use` mid-`atomic_replace` leaves a temporary file in the
     /// live home for an instant. Linking it would dangle the moment the rename
     /// lands, and nothing replaces an existing entry afterwards.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_skips_a_temporary_file_from_a_concurrent_switch() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
@@ -342,7 +366,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn provisioning_keeps_an_entry_the_child_replaced() {
         let (_tmp, paths) = setup(&[("a", &format!("{JWT_HDR}.{SEAT_A}.sig"))]);
@@ -372,6 +396,61 @@ mod tests {
         let home = provision_exec_home(&paths, "a").unwrap();
 
         assert_eq!(token_of(&home.join(AUTH_FILE)), token);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_child_uses_pinned_auth_and_shared_sessions() {
+        let token = format!("{JWT_HDR}.{SEAT_A}.sig");
+        let rotated = format!("{token}-rotated");
+        let (_tmp, paths) = setup(&[("a", &token)]);
+        let live = paths.codex_home();
+        std::fs::create_dir_all(live.join("sessions")).unwrap();
+        std::fs::write(live.join("config.toml"), "shared").unwrap();
+        std::fs::write(paths.codex_auth_json(), r#"{"access_token":"live"}"#).unwrap();
+        std::fs::write(paths.active_file(), "unchanged").unwrap();
+        let script = r#"
+            $ErrorActionPreference = 'Stop'
+            $homePath = $env:CODEX_HOME
+            if ((Get-Content -Raw "$homePath/config.toml") -ne 'shared') { exit 8 }
+            Copy-Item "$homePath/auth.json" "$homePath/sessions/child-auth.json"
+            [IO.File]::WriteAllText("$homePath/sessions/alias", $env:CODEXCTL_PINNED_ALIAS)
+            [IO.File]::WriteAllText("$homePath/sessions/cwd", (Get-Location).Path)
+            $auth = Get-Content -Raw "$homePath/auth.json" | ConvertFrom-Json
+            $auth.access_token += '-rotated'
+            [IO.File]::WriteAllText("$homePath/auth.json", ($auth | ConvertTo-Json))
+            exit 7
+        "#;
+
+        let code = run_from(
+            &paths,
+            "a",
+            &[
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                script.into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(code, 7);
+        assert_eq!(token_of(&live.join("sessions/child-auth.json")), token);
+        assert_eq!(token_of(&paths.profiles_dir().join("a/auth.json")), rotated);
+        assert_eq!(
+            std::fs::read_to_string(live.join("sessions/alias")).unwrap(),
+            "a"
+        );
+        assert_eq!(
+            PathBuf::from(std::fs::read_to_string(live.join("sessions/cwd")).unwrap()),
+            std::env::current_dir().unwrap()
+        );
+        assert_eq!(token_of(&paths.codex_auth_json()), "live");
+        assert_eq!(
+            std::fs::read_to_string(paths.active_file()).unwrap(),
+            "unchanged"
+        );
     }
 
     #[cfg(unix)]
