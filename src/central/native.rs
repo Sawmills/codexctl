@@ -361,6 +361,13 @@ pub fn print_token(path: &Path) -> Result<()> {
             save_connection(path, &latest)?;
         }
     }
+    if let (Ok(paths), Ok(selection), Some(usage)) = (
+        config::default_paths(),
+        statusline_identity(path, &connection),
+        token.statusline_usage,
+    ) {
+        crate::statusline::record(&paths, selection, token.label.as_deref(), Some(usage));
+    }
     println!("{}", token.access_token);
     Ok(())
 }
@@ -767,4 +774,42 @@ pub(super) fn repair_sessions_if_active(action: SessionProviderAction) -> Result
     }
     super::sessions::run(&home, action)?;
     Ok(true)
+}
+
+fn statusline_identity(
+    path: &Path,
+    connection: &Connection,
+) -> Result<crate::statusline::Selection> {
+    Ok(crate::statusline::Selection {
+        alias: path
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .context("invalid connection path")?
+            .to_owned(),
+        source: crate::statusline::Source::Server {
+            server: connection.server.clone(),
+            user_id: connection.user_id.clone(),
+            account_id: connection.account_id.clone(),
+        },
+    })
+}
+
+pub(crate) fn statusline_selection(
+    paths: &config::Paths,
+) -> Result<Option<crate::statusline::Selection>> {
+    let doc = document(&paths.codex_home())?;
+    if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
+        return Ok(None);
+    }
+    let path = doc
+        .get("model_providers")
+        .and_then(|p| p.get(PROVIDER))
+        .and_then(|p| p.get("auth"))
+        .and_then(|p| p.get("args"))
+        .and_then(Item::as_array)
+        .and_then(|args| args.get(2))
+        .and_then(toml_edit::Value::as_str)
+        .context("invalid central provider command")?;
+    let path = Path::new(path);
+    statusline_identity(path, &read_connection(path)?).map(Some)
 }

@@ -591,6 +591,7 @@ async fn local_display_rows(
                 }
                 Err(_) => Err("credentials unavailable"),
             };
+            crate::statusline::record_local(paths, &p.meta, usage.as_ref().ok());
             match usage {
                 Ok(usage) => {
                     row.account.set_usage(&usage);
@@ -638,9 +639,10 @@ async fn local_display_rows(
 }
 
 pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Result<bool> {
-    let Some(accounts) = accounts()? else {
+    let Some(catalog) = catalog()? else {
         return Ok(false);
     };
+    let accounts = catalog.accounts;
     let paths = config::default_paths()?;
     let profiles = profile::list_profiles_from(&paths)?;
     let local_active = profile::get_active_from(&paths)?;
@@ -651,6 +653,25 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     ))?;
     let show_usage = status || !rows.is_empty();
     let active = native::active_alias()?;
+    for account in &accounts {
+        // Summary columns do not prove window durations on an older server.
+        let usage = (account.available && !account.usage_stale && account.usage_error.is_none())
+            .then(|| account.statusline_usage.clone())
+            .flatten();
+        crate::statusline::record(
+            &paths,
+            crate::statusline::Selection {
+                alias: account.alias.clone(),
+                source: crate::statusline::Source::Server {
+                    server: catalog.connection.server.clone(),
+                    user_id: Some(account.user_id.clone()),
+                    account_id: account.account_id.clone(),
+                },
+            },
+            account.label.as_deref(),
+            usage,
+        );
+    }
     let mut server_rows: Vec<_> = accounts
         .iter()
         .map(|account| {

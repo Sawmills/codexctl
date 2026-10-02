@@ -45,6 +45,10 @@ pub struct TokenResponse {
     pub billing_class: Option<api::BillingClass>,
     #[serde(default)]
     pub native_routing_supported: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statusline_usage: Option<crate::statusline::Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl TokenResponse {
@@ -188,6 +192,8 @@ impl Owner {
             access_token,
             billing_class: None,
             native_routing_supported: false,
+            statusline_usage: None,
+            label: self.vault.label.clone(),
         })
     }
 
@@ -339,6 +345,13 @@ impl Owner {
             current.chatgpt_plan_type = token.chatgpt_plan_type;
             current.native_routing_supported = true;
             if let Some((limits, observed_at)) = observed_limits {
+                current.statusline_usage = usage(&limits)
+                    .ok()
+                    .as_ref()
+                    .map(crate::statusline::Usage::from_usage);
+                if let Some(usage) = current.statusline_usage.as_mut() {
+                    usage.age_seconds = observed_at.elapsed().as_secs();
+                }
                 self.limits = Some(limits);
                 self.limits_observed = Some((observed_at, current.revision.clone()));
             }

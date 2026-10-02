@@ -1935,3 +1935,18 @@ fn when_a_recent_repaired_session_is_archived_then_local_selection_requires_rest
             .contains("model_provider = \"codexctl-central\"")
     );
 }
+
+#[test]
+fn statusline_token_helper_populates_cache_without_exposing_credentials() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    store::atomic_write(&client.broker.root.path().join("mode"), b"status-reset").unwrap();
+
+    let helper = client.helper();
+    let line = client.run(env!("CARGO_BIN_EXE_codexctl"), &["statusline"]);
+
+    assert!(helper.status.success());
+    assert!(String::from_utf8_lossy(&line.stdout).starts_with("remote 63% wk · "));
+    assert!(String::from_utf8_lossy(&line.stdout).ends_with(" · 100% 5h\n"));
+}

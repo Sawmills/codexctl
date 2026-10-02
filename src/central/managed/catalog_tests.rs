@@ -256,6 +256,10 @@ async fn b8_expired_cache_refreshes_once_and_reports_age() {
         (json!(false), json!(0))
     );
     assert_eq!(fixture.requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        first["statuslineUsage"]["five_hour_used_percent"],
+        json!(25.0)
+    );
 }
 
 #[tokio::test]
@@ -277,8 +281,12 @@ async fn b8_failed_refresh_retains_stale_usage_without_selection_permission() {
     );
     assert!(stale["usageAgeSeconds"].as_u64().unwrap() >= 60);
     assert_eq!(
-        (stale["billingClass"].clone(), stale["usageScore"].clone()),
-        (json!("unknown"), Value::Null)
+        (
+            stale["billingClass"].clone(),
+            stale["usageScore"].clone(),
+            stale["statuslineUsage"].clone()
+        ),
+        (json!("unknown"), Value::Null, Value::Null)
     );
 }
 
@@ -327,9 +335,15 @@ async fn b8_credential_rotation_discards_inflight_usage_evidence() {
         (
             summary["usageStale"].clone(),
             summary["usageError"].clone(),
-            summary["billingClass"].clone()
+            summary["billingClass"].clone(),
+            summary["statuslineUsage"].clone()
         ),
-        (json!(true), json!("credentials_changed"), json!("unknown"))
+        (
+            json!(true),
+            json!("credentials_changed"),
+            json!("unknown"),
+            Value::Null
+        )
     );
 }
 

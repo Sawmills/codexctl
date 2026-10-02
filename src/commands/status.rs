@@ -584,6 +584,7 @@ async fn fetch_and_split(
             let client = client.clone();
             let alias = p.meta.alias.clone();
             let label = p.meta.label.clone();
+            let meta = p.meta.clone();
             let plan_from_meta = p.meta.plan.clone();
             let is_active = active.as_deref() == Some(&p.meta.alias);
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active.as_deref());
@@ -597,6 +598,11 @@ async fn fetch_and_split(
                     ),
                     Err(_) => None,
                 };
+                codexctl::statusline::record_local(
+                    paths,
+                    &meta,
+                    usage_result.as_ref().and_then(|r| r.as_ref().ok()),
+                );
                 (alias, label, plan_from_meta, is_active, auth, usage_result)
             }
         })
