@@ -1845,3 +1845,93 @@ fn when_included_headroom_is_exhausted_then_consent_allows_use_and_refresh() {
     assert!(selected.status.success());
     assert!(helper.status.success());
 }
+
+#[test]
+fn when_repaired_sessions_remain_then_disconnect_requires_restore() {
+    let client = NativeClient::start();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-old.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(
+        &rollout,
+        b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n",
+    )
+    .unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
+    assert!(client.select().status.success());
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl-central"), &["disconnect"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("session-provider restore"));
+    assert!(
+        client
+            .home
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+
+    let restored = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["session-provider", "restore"],
+    );
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(
+        client
+            .run(env!("CARGO_BIN_EXE_codexctl-central"), &["disconnect"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn when_a_recent_repaired_session_is_archived_then_local_selection_requires_restore() {
+    let client = NativeClient::start();
+    let paths = codexctl::config::Paths::from_home(client.home.clone());
+    codexctl::profile::save_profile_to(&paths, "local", None, &paths.codex_auth_json()).unwrap();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-old.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(
+        &rollout,
+        b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n",
+    )
+    .unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
+    assert!(client.select().status.success());
+    let archived = client
+        .home
+        .join(".codex/archived_sessions/rollout-old.jsonl");
+    std::fs::create_dir_all(archived.parent().unwrap()).unwrap();
+    std::fs::rename(&rollout, &archived).unwrap();
+    std::fs::File::open(&archived)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+        .unwrap();
+
+    let output = client.run(env!("CARGO_BIN_EXE_codexctl"), &["use", "local"]);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("session-provider restore"));
+    assert!(
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .contains("model_provider = \"codexctl-central\"")
+    );
+}

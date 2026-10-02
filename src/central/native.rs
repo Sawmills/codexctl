@@ -629,6 +629,7 @@ pub(super) fn deactivate_locked() -> Result<()> {
             "Codex daemon is running; finish its sessions and run codex app-server daemon stop before disconnecting"
         );
     }
+    super::sessions::require_restored(&active.home)?;
     let mut doc = document(&active.home)?;
     if doc.get("model_provider").and_then(Item::as_str) == Some(PROVIDER) {
         match active.original_provider {

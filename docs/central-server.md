@@ -471,6 +471,11 @@ To restore the original metadata while the server account is still active, run:
 codexctl session-provider restore
 ```
 
+Before local selection or `disconnect`, restore all repaired rollouts.
+Both commands refuse to remove the server provider while a repaired rollout still needs it.
+If restore skips open or recent files, close those sessions and wait for the 60-minute window before you retry.
+This guard also finds repaired rollouts that moved to the archive.
+
 Restore also skips open and recent files and preserves the rollout body, permissions, and modification time.
 It refuses a file whose metadata no longer matches its backup or the repaired version of that backup.
 After Codex archives or unarchives a rollout, restore matches its filename and exact metadata to the original backup.

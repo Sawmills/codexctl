@@ -99,6 +99,38 @@ pub(super) fn run(home: &Path, action: SessionProviderAction) -> Result<()> {
     result
 }
 
+// Local deactivation removes the central provider. Require explicit restoration
+// first, including rollouts that restore skipped because they are open or recent.
+pub(super) fn require_restored(home: &Path) -> Result<()> {
+    let mut backups = BackupIndex::new();
+    index_backups(&home.join(BACKUPS), &mut backups)?;
+    if backups.is_empty() {
+        return Ok(());
+    }
+    let mut rollouts = BackupIndex::new();
+    for directory in ["sessions", "archived_sessions"] {
+        index_backups(&home.join(directory), &mut rollouts)?;
+    }
+    for (name, paths) in rollouts {
+        if !backups.contains_key(&name) {
+            continue;
+        }
+        for path in paths {
+            let (current, _) = header(regular(&path)?)?;
+            let exact = home.join(BACKUPS).join(path.strip_prefix(home)?);
+            if let Some(saved) = restore_backup(&exact, &path, &current, &backups)?
+                && current != saved
+            {
+                bail!(
+                    "repaired session {} still needs the server provider; close sessions, wait until rollouts have no modifications for 60 minutes, then run codexctl session-provider restore before switching to local mode",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn visit(
     home: &Path,
     path: &Path,
