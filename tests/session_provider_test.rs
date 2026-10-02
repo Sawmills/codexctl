@@ -18,6 +18,16 @@ fn migrated() -> String {
         "\"model_provider\" : \"codexctl-central\"",
     )
 }
+fn age(path: &std::path::Path) {
+    File::open(path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200)),
+        )
+        .unwrap();
+}
+
 struct Fixture {
     root: TempDir,
     home: PathBuf,
@@ -42,11 +52,16 @@ impl Fixture {
         )
         .unwrap();
         fs::write(&rollout, [HEADER.as_bytes(), TAIL].concat()).unwrap();
+        age(&rollout);
         Self {
             root,
             home,
             rollout,
         }
+    }
+    fn write(&self, bytes: impl AsRef<[u8]>) {
+        fs::write(&self.rollout, bytes).unwrap();
+        age(&self.rollout);
     }
     fn run(&self, action: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_codexctl"))
@@ -162,6 +177,7 @@ fn only_active_home_session_directories_change() {
     fs::create_dir_all(archived.parent().unwrap()).unwrap();
     fs::write(&outside, HEADER).unwrap();
     fs::write(&archived, HEADER).unwrap();
+    age(&archived);
     let result = f.run("rewrite");
     assert!(result.status.success());
     assert_eq!(fs::read_to_string(archived).unwrap(), migrated());
@@ -193,6 +209,7 @@ fn large_rollout_streams_and_restores_unchanged_tail() {
         file.write_all(&block).unwrap();
     }
     drop(file);
+    age(&f.rollout);
     fn digest(path: &std::path::Path) -> Vec<u8> {
         let mut file = File::open(path).unwrap();
         let mut hash = Sha256::new();
@@ -217,7 +234,7 @@ fn large_rollout_streams_and_restores_unchanged_tail() {
 fn escaped_provider_changes_only_the_raw_value() {
     let f = Fixture::new();
     let source = HEADER.replace(" : \"openai\"", " : \"op\\u0065nai\"");
-    fs::write(&f.rollout, source).unwrap();
+    f.write(source);
     let result = f.run("rewrite");
     assert!(
         result.status.success(),
@@ -247,7 +264,7 @@ fn changed_metadata_refuses_restore_without_losing_backup() {
     let f = Fixture::new();
     f.run("rewrite");
     let changed = migrated().replace("fixture", "other-session");
-    fs::write(&f.rollout, &changed).unwrap();
+    f.write(&changed);
     let result = f.run("restore");
     assert!(!result.status.success());
     assert_eq!(fs::read_to_string(&f.rollout).unwrap(), changed);
@@ -258,7 +275,7 @@ fn changed_metadata_refuses_restore_without_losing_backup() {
 fn duplicate_provider_is_rejected_without_rewriting() {
     let f = Fixture::new();
     let original = b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\",\"model_provider\":\"openai\"}}\n";
-    fs::write(&f.rollout, original).unwrap();
+    f.write(original);
     let result = f.run("rewrite");
     assert!(!result.status.success());
     assert_eq!(fs::read(&f.rollout).unwrap(), original);
@@ -284,6 +301,7 @@ impl Fixture {
             .unwrap()
             .set_len(2 * 1024 * 1024 * 1024)
             .unwrap();
+        age(&self.rollout);
         let mut child = self.spawn_rewrite();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -373,7 +391,7 @@ fn valid_legacy_metadata_without_a_provider_stays_unchanged() {
     let f = Fixture::new();
     let original =
         b"{\"id\":\"legacy-session\",\"timestamp\":\"2025-01-01\",\"instructions\":\"keep me\"}\n";
-    fs::write(&f.rollout, original).unwrap();
+    f.write(original);
     let result = f.run("rewrite");
     assert!(
         result.status.success(),
@@ -436,4 +454,84 @@ fn archived_rollouts_refuse_ambiguous_backups() {
         fs::read(archived).unwrap(),
         [migrated().as_bytes(), TAIL].concat()
     );
+}
+
+#[test]
+fn recent_rollouts_are_skipped_even_when_no_process_has_them_open() {
+    let f = Fixture::new();
+    File::open(&f.rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(59 * 60),
+            ),
+        )
+        .unwrap();
+    let result = f.run("rewrite");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("skipped-recent=1"));
+    assert_eq!(
+        fs::read(&f.rollout).unwrap(),
+        [HEADER.as_bytes(), TAIL].concat()
+    );
+}
+
+#[test]
+fn an_append_during_copy_is_preserved_and_counted_as_recent() {
+    let f = Fixture::new();
+    let child = f.make_large_and_wait_for_copy();
+    File::options()
+        .append(true)
+        .open(&f.rollout)
+        .unwrap()
+        .write_all(b"x")
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("skipped-recent=1 errors=0"));
+    assert_eq!(
+        fs::metadata(&f.rollout).unwrap().len(),
+        2 * 1024 * 1024 * 1024 + 1
+    );
+}
+
+#[test]
+fn restore_also_skips_recent_rollouts() {
+    let f = Fixture::new();
+    f.run("rewrite");
+    File::open(&f.rollout)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+        .unwrap();
+    let result = f.run("restore");
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("skipped-recent=1"));
+    assert_eq!(
+        fs::read(&f.rollout).unwrap(),
+        [migrated().as_bytes(), TAIL].concat()
+    );
+}
+
+#[test]
+fn dry_run_skips_future_timestamps() {
+    let f = Fixture::new();
+    File::open(&f.rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+        )
+        .unwrap();
+    let result = f.run("dry-run");
+    assert!(result.status.success());
+    assert!(String::from_utf8_lossy(&result.stdout).contains("skipped-recent=1"));
+    assert!(!f.backup().exists());
 }

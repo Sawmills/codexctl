@@ -374,6 +374,7 @@ codexctl session-provider dry-run
 ```
 
 Close sessions that the preview reports as `skipped-open`.
+Wait until files reported as `skipped-recent` have no modifications for at least 60 minutes.
 Run the repair after you inspect the list:
 
 ```sh
@@ -384,6 +385,9 @@ The repair searches only `sessions` and `archived_sessions` under the active `CO
 When `CODEX_HOME` is unset, it uses `~/.codex`.
 The active server account must belong to that home.
 It does not follow symbolic links or replace files with hard links.
+Preview, rewrite, and restore skip any rollout modified within the last 60 minutes, including future timestamps.
+The repair checks modification time again after the copy and before replacement.
+This protects idle sessions that close their files between appends.
 Only the `payload.model_provider` value in the first `session_meta` line changes from `openai` to `codexctl-central`.
 Every other byte stays identical, including whitespace and line endings.
 Other providers, missing provider fields, and valid legacy headers without a record type stay unchanged.
@@ -396,7 +400,8 @@ Private backups retain the original metadata line under
 `CODEX_HOME/.codexctl-session-provider-backups/`, with the same relative rollout path.
 A backup reaches disk before its rollout changes.
 Repeated repair runs preserve the first backup.
-The summary reports changed, unchanged, open, and linked files.
+The command prints the backup directory and the exact restore command.
+The summary reports rewritten, unchanged, open, recent, linked, and missing-backup files, plus errors.
 A failure preserves prior completed changes and backups for a retry.
 If a process interrupts a copy, the original rollout stays intact and a temporary file can remain beside it.
 
@@ -406,7 +411,7 @@ To restore the original metadata while the server account is still active, run:
 codexctl session-provider restore
 ```
 
-Restore also skips open files and preserves the rollout body, permissions, and modification time.
+Restore also skips open and recent files and preserves the rollout body, permissions, and modification time.
 It refuses a file whose metadata no longer matches its backup or the repaired version of that backup.
 After Codex archives or unarchives a rollout, restore matches its filename and exact metadata to the original backup.
 Multiple matches or conflicting metadata stop restore.

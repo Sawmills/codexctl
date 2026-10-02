@@ -12,8 +12,10 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, SystemTime},
 };
 
+const RECENT_WINDOW: Duration = Duration::from_secs(60 * 60);
 const MAX_HEADER: u64 = 8 * 1024 * 1024;
 const BACKUPS: &str = ".codexctl-session-provider-backups";
 type BackupIndex = HashMap<OsString, Vec<PathBuf>>;
@@ -26,35 +28,59 @@ struct Summary {
     open: usize,
     unsafe_path: usize,
     no_backup: usize,
+    recent: usize,
+    errors: usize,
 }
 impl Summary {
     fn print(&self, action: SessionProviderAction) {
         let label = match action {
             SessionProviderAction::DryRun => "would-change",
-            SessionProviderAction::Rewrite => "changed",
+            SessionProviderAction::Rewrite => "rewritten",
             SessionProviderAction::Restore => "restored",
         };
         println!(
-            "Session providers: scanned={} {label}={} unchanged={} skipped-open={} skipped-path={} skipped-no-backup={}",
-            self.scanned, self.changed, self.unchanged, self.open, self.unsafe_path, self.no_backup
+            "Session providers: scanned={} {label}={} unchanged={} skipped-open={} skipped-path={} skipped-no-backup={} skipped-recent={} errors={}",
+            self.scanned,
+            self.changed,
+            self.unchanged,
+            self.open,
+            self.unsafe_path,
+            self.no_backup,
+            self.recent,
+            self.errors
         );
     }
 }
 
 pub(super) fn run(home: &Path, action: SessionProviderAction) -> Result<()> {
     let home = fs::canonicalize(home)?;
-    let open =
-        if home.join("sessions").try_exists()? || home.join("archived_sessions").try_exists()? {
+    let mut summary = Summary::default();
+    let result = (|| {
+        let quote = |path: &Path| -> Result<String> {
+            Ok(format!(
+                "'{}'",
+                path.to_str()
+                    .context("restore path must be UTF-8")?
+                    .replace('\'', "'\\''")
+            ))
+        };
+        println!("Session provider backups: {}", home.join(BACKUPS).display());
+        println!(
+            "Restore command: CODEX_HOME={} {} session-provider restore",
+            quote(&home)?,
+            quote(&std::env::current_exe()?)?
+        );
+        let open = if home.join("sessions").try_exists()?
+            || home.join("archived_sessions").try_exists()?
+        {
             open_files()?
         } else {
             HashSet::new()
         };
-    let mut backups = BackupIndex::new();
-    if matches!(action, SessionProviderAction::Restore) {
-        index_backups(&home.join(BACKUPS), &mut backups)?;
-    }
-    let mut summary = Summary::default();
-    let result = (|| {
+        let mut backups = BackupIndex::new();
+        if matches!(action, SessionProviderAction::Restore) {
+            index_backups(&home.join(BACKUPS), &mut backups)?;
+        }
         for directory in ["sessions", "archived_sessions"] {
             visit(
                 &home,
@@ -68,6 +94,7 @@ pub(super) fn run(home: &Path, action: SessionProviderAction) -> Result<()> {
         Ok(())
     })();
     // Partial progress remains visible even when a later file fails.
+    summary.errors = usize::from(result.is_err());
     summary.print(action);
     result
 }
@@ -102,6 +129,8 @@ fn visit(
         } else if open.contains(&(metadata.dev(), metadata.ino())) {
             summary.open += 1;
             println!("skipped-open {}", path.display());
+        } else if skip_recent(path, &metadata, summary)? {
+            return Ok(());
         } else {
             repair(home, path, action, &metadata, backups, summary).with_context(|| {
                 format!("session provider repair failed for {}", path.display())
@@ -109,6 +138,21 @@ fn visit(
         }
     }
     Ok(())
+}
+
+fn skip_recent(path: &Path, metadata: &Metadata, summary: &mut Summary) -> Result<bool> {
+    // Future timestamps also stay protected. An idle session can close its file
+    // between appends, so an open-file snapshot alone is insufficient.
+    if SystemTime::now()
+        .duration_since(metadata.modified()?)
+        .unwrap_or_default()
+        < RECENT_WINDOW
+    {
+        summary.recent += 1;
+        println!("skipped-recent {}", path.display());
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[derive(Deserialize)]
@@ -217,7 +261,11 @@ fn repair(
     summary: &mut Summary,
 ) -> Result<()> {
     let file = regular(path)?;
-    if !same(before, &file.metadata()?) {
+    let inspected = file.metadata()?;
+    if skip_recent(path, &inspected, summary)? {
+        return Ok(());
+    }
+    if !same(before, &inspected) {
         bail!("rollout changed during inspection; retry");
     }
     let (original, mut reader) = header(file)?;
@@ -255,10 +303,14 @@ fn repair(
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(&updated)?;
     std::io::copy(&mut reader, temp.as_file_mut())?;
-    if !same(before, &reader.get_ref().metadata()?) {
+    let copied = reader.get_ref().metadata()?;
+    drop(reader);
+    if skip_recent(path, &copied, summary)? {
+        return Ok(());
+    }
+    if !same(before, &copied) {
         bail!("rollout changed during copy; file unchanged");
     }
-    drop(reader);
     if matches!(action, SessionProviderAction::Rewrite) {
         save_backup(&backup, &original)?;
     }
@@ -276,7 +328,11 @@ fn repair(
         println!("skipped-open {}", path.display());
         return Ok(());
     }
-    if !same(before, &fs::symlink_metadata(path)?) {
+    let latest = fs::symlink_metadata(path)?;
+    if skip_recent(path, &latest, summary)? {
+        return Ok(());
+    }
+    if !same(before, &latest) {
         bail!("rollout changed during copy; file unchanged");
     }
     temp.persist(path).map_err(|e| e.error)?;

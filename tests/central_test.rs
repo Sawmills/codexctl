@@ -1653,6 +1653,13 @@ fn selecting_a_server_account_repairs_saved_session_providers() {
     std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
     let old = "{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n";
     std::fs::write(&rollout, old).unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
     let result = client.select();
     assert!(
         result.status.success(),
@@ -1663,7 +1670,7 @@ fn selecting_a_server_account_repairs_saved_session_providers() {
         std::fs::read_to_string(rollout).unwrap(),
         old.replace("openai", "codexctl-central")
     );
-    assert!(String::from_utf8_lossy(&result.stdout).contains("changed=1"));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("rewritten=1"));
 }
 
 #[test]
@@ -1673,6 +1680,13 @@ fn repair_failure_reports_that_the_server_account_is_already_active() {
     let rollout = client.home.join(".codex/sessions/rollout-malformed.jsonl");
     std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
     std::fs::write(&rollout, b"not JSON\n").unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
     let result = client.select();
     assert!(!result.status.success());
     assert!(
