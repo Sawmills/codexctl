@@ -5266,6 +5266,34 @@ fn p3_overlapping_discoveries_preserve_the_newer_server_alias() {
 }
 
 #[test]
+fn when_subscription_cap_is_closed_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"closed-spend-cap").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
+fn when_subscription_has_included_headroom_then_catalog_allows_automatic_selection() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"included-weekly").unwrap();
+
+    let accounts = server.accounts(&server.amir);
+    let selected = central::remote::select(
+        &serde_json::from_value::<Vec<central::managed::Account>>(accounts).unwrap(),
+    );
+
+    assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
 fn reset_listing_requires_a_registered_machine() {
     let server = Server::start();
 
@@ -5390,4 +5418,82 @@ fn b8_listing_cannot_disable_tokens_after_a_temporary_owner_error() {
 
     assert_eq!(catalog[0]["available"], true);
     assert_eq!(token.status(), 200);
+}
+
+#[test]
+fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "personal");
+    let retired = local_profile(home.path(), "retired");
+    store::atomic_write(&retired.join(".central-transfer.json"), b"{}").unwrap();
+
+    let output = server.cli(home.path(), &["status", "--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({
+        "version":1,"accounts":[
+            {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
+             "primary_used_percent":0.0,"secondary_used_percent":37.0,
+             "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null},
+            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
+             "primary_used_percent":null,"secondary_used_percent":null,
+             "resets_at":null,"billing_class":"unknown","error":"credentials unavailable"}
+        ]})
+    );
+}
+
+#[test]
+fn connected_list_json_returns_empty_catalog_without_prose() {
+    let server = Server::start();
+    let home = server.connected_home();
+
+    let output = server.cli(home.path(), &["list", "--json"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"version":1,"accounts":[]})
+    );
+}
+
+#[test]
+fn connected_status_json_keeps_unavailable_accounts() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+
+    let output = server.cli(home.path(), &["status", "--json"]);
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(document["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        (
+            &document["accounts"][0]["state"],
+            &document["accounts"][0]["error"]
+        ),
+        (&json!("unavailable"), &json!("account unavailable"))
+    );
+}
+
+#[test]
+fn connected_status_json_filter_matches_the_table() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "broken");
+
+    let output = server.cli(home.path(), &["status", "--json", "--usage-based"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"version":1,"accounts":[]})
+    );
 }

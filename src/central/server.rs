@@ -361,20 +361,57 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
     let credits = limits.get("credits").filter(|c| !c.is_null()).map(|c| {
         json!({"has_credits": c.get("hasCredits"), "unlimited": c.get("unlimited"), "overage_limit_reached": c.get("overageLimitReached").and_then(Value::as_bool).unwrap_or(false), "balance": c.get("balance")})
     });
-    let spend = limits
-        .get("spendControl")
-        .or_else(|| limits.get("spend_control"))
-        .map(|s| json!({"reached":s.get("reached")}));
+    // Current Codex exposes this as a flat optional boolean. A present but
+    // unavailable or invalid value must not reuse legacy closed-cap evidence.
+    let spend = match limits.get("spendControlReached") {
+        Some(reached) => reached.as_bool().map(|reached| json!({"reached": reached})),
+        None => limits
+            .get("spendControl")
+            .or_else(|| limits.get("spend_control"))
+            .map(|s| json!({"reached":s.get("reached")})),
+    };
     let usage = json!({"spend_control":spend,"plan_type":limits.get("planType"), "rate_limit":{"primary":window("primary"), "secondary":window("secondary")}, "credits":credits});
     Ok(serde_json::from_value::<api::RateLimitResponse>(usage)?)
 }
 
 pub(super) fn billing_class(response: &Value) -> api::BillingClass {
-    usage(response).map_or(api::BillingClass::Unknown, |u| usage_billing_class(&u))
+    usage(response).map_or(api::BillingClass::Unknown, |u| {
+        // Keep malformed protocol windows from disappearing during conversion.
+        let headroom = ["primary", "secondary"].into_iter().all(|name| {
+            let window = &response["rateLimits"][name];
+            window.is_null()
+                || window["usedPercent"]
+                    .as_f64()
+                    .is_some_and(|used| (0.0..100.0).contains(&used))
+        });
+        if u.billing_class() == api::BillingClass::RateLimited && !headroom {
+            api::BillingClass::Unknown
+        } else {
+            usage_billing_class(&u)
+        }
+    })
 }
 
 pub(super) fn usage_billing_class(u: &api::RateLimitResponse) -> api::BillingClass {
     let class = u.billing_class();
+    let headroom = u.rate_limit.as_ref().is_none_or(|limits| {
+        limits
+            .windows()
+            .all(|(_, w)| (0.0..100.0).contains(&w.used_percent))
+    });
+    if class == api::BillingClass::RateLimited && !headroom {
+        return api::BillingClass::Unknown;
+    }
+    let personal_subscription = matches!(
+        u.plan_type.as_deref(),
+        Some("plus" | "pro" | "prolite" | "promax")
+    );
+    if class == api::BillingClass::RateLimited
+        && personal_subscription
+        && !u.credits.as_ref().is_some_and(|c| c.overage_limit_reached)
+    {
+        return class;
+    }
     let organization = matches!(
         u.plan_type.as_deref(),
         Some("team" | "business" | "enterprise" | "edu")
@@ -616,17 +653,100 @@ mod billing_tests {
         assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
     }
     #[test]
-    fn subscription_credits_require_spend_control_before_automatic_selection() {
-        for plan in ["pro", "prolite", "promax"] {
+    fn subscription_overage_limit_with_paid_credits_still_requires_consent() {
+        let limits = json!({"rateLimits":{"planType":"pro","primary":{"usedPercent":15,"windowDurationMins":10080},"credits":{"hasCredits":true,"unlimited":false,"overageLimitReached":true}}});
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+    #[test]
+    fn subscription_credits_with_headroom_do_not_require_spend_control() {
+        for plan in ["plus", "pro", "prolite", "promax"] {
             let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":true,"unlimited":false},"spendControl":{"reached":true}}});
             assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
             limits["rateLimits"]["spendControl"]["reached"] = json!(false);
-            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
             limits["rateLimits"]
                 .as_object_mut()
                 .unwrap()
                 .remove("spendControl");
-            assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
         }
     }
+
+    #[test]
+    fn flat_spend_control_reached_proves_a_closed_organizational_cap() {
+        let limits = json!({"rateLimits":{"planType":"team","primary":{"usedPercent":15,"windowDurationMins":10080},"credits":{"hasCredits":true,"unlimited":false},"spendControlReached":true}});
+        assert_eq!(billing_class(&limits), api::BillingClass::RateLimited);
+    }
+
+    #[test]
+    fn flat_open_cap_overrides_legacy_closed_cap() {
+        let limits = json!({"rateLimits":{"planType":"team","primary":{"usedPercent":15},"credits":{"hasCredits":true,"unlimited":false},"spendControlReached":false,"spendControl":{"reached":true}}});
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
+    #[test]
+    fn unavailable_flat_cap_does_not_reuse_legacy_closed_cap() {
+        let limits = json!({"rateLimits":{"planType":"team","primary":{"usedPercent":15},"credits":{"hasCredits":true,"unlimited":false},"spendControlReached":null,"spendControl":{"reached":true}}});
+        let parsed = usage(&limits).unwrap();
+        assert_eq!(
+            parsed.rate_limit.unwrap().primary.unwrap().used_percent,
+            15.0
+        );
+        assert!(parsed.spend_control.is_none());
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
+    #[test]
+    fn invalid_flat_cap_does_not_reuse_legacy_closed_cap() {
+        let limits = json!({"rateLimits":{"planType":"team","primary":{"usedPercent":15},"credits":{"hasCredits":true,"unlimited":false},"spendControlReached":"true","spendControl":{"reached":true}}});
+        let parsed = usage(&limits).unwrap();
+        assert_eq!(
+            parsed.rate_limit.unwrap().primary.unwrap().used_percent,
+            15.0
+        );
+        assert!(parsed.spend_control.is_none());
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
+    #[test]
+    fn individual_limit_alone_does_not_prove_a_closed_cap() {
+        let limits = json!({"rateLimits":{"planType":"team","primary":{"usedPercent":15},"credits":{"hasCredits":true,"unlimited":false},"individualLimit":{"limit":0}}});
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+    macro_rules! headroom_case {
+        ($name:ident, $primary:expr, $secondary:expr) => {
+            #[test]
+            fn $name() {
+                let limits = json!({"rateLimits":{"planType":"pro",
+                    "primary":$primary,"secondary":$secondary,
+                    "spendControl":{"reached":true}}});
+                assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+            }
+        };
+    }
+    headroom_case!(
+        when_primary_exhausted_then_consent_required,
+        json!({"usedPercent":100}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_secondary_exhausted_then_consent_required,
+        json!({"usedPercent":15}),
+        json!({"usedPercent":100})
+    );
+    headroom_case!(
+        when_usage_negative_then_consent_required,
+        json!({"usedPercent":-1}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_usage_missing_then_consent_required,
+        json!({}),
+        json!({"usedPercent":15})
+    );
+    headroom_case!(
+        when_usage_malformed_then_consent_required,
+        json!({"usedPercent":"15"}),
+        json!({"usedPercent":15})
+    );
 }
