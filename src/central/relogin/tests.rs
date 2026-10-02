@@ -91,7 +91,7 @@ fn recovery_retains_uid_loss_and_uid_conflict_without_promoting_either() {
         let recovery = recover(&state, &key).unwrap();
         assert!(recovery.blocked && !recovery.verify);
         assert_eq!(
-            identity_inventory(&state, &key)
+            identity_inventory(&state, &key, &state.join("runtime"))
                 .candidates
                 .unwrap()
                 .into_iter()
@@ -123,7 +123,7 @@ fn incomplete_native_credentials_keep_only_the_target_unavailable_after_proven_e
     assert!(
         recovery.blocked
             && !recovery.verify
-            && identity_inventory(&state, &key)
+            && identity_inventory(&state, &key, &state.join("runtime"))
                 .candidates
                 .unwrap()
                 .is_empty()

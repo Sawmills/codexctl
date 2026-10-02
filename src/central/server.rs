@@ -496,30 +496,33 @@ pub async fn serve(
         &home.as_path().join("auth.json"),
         &serde_json::to_vec(&vault.auth)?,
     )?;
-    let rpc = if read_only {
-        None
-    } else {
-        let mut rpc = Rpc::spawn(binary, home.as_path(), true)?;
-        runtime.disable_cleanup(true);
-        rpc.initialize().await?;
-        Some(rpc)
+    store::atomic_write(&home.join("spawn-failed"), b"not-started")?;
+    let tenant = vault.tenant.clone();
+    let user = vault.user.clone();
+    let mut refresh = Owner {
+        vault,
+        rpc: None,
+        home,
+        state: state.into(),
+        key: key.into(),
+        available: true,
+        refresh_enabled: !read_only,
+        limits: None,
+        verification_input: None,
     };
     runtime.disable_cleanup(true);
+    if !read_only {
+        let migration_lock = Mutex::new(());
+        let guard = migration_lock.lock().await;
+        let proof = super::relogin::identity_inventory(state, key, &refresh.home)
+            .clear_for_launch(&refresh, &guard)?;
+        super::managed::launch_owner(&mut refresh, binary, proof).await?;
+    }
     let broker = Broker {
         state: state.into(),
-        tenant: vault.tenant.clone(),
-        user: vault.user.clone(),
-        owner: Arc::new(Mutex::new(Owner {
-            vault,
-            rpc,
-            home,
-            state: state.into(),
-            key: key.into(),
-            available: true,
-            refresh_enabled: !read_only,
-            limits: None,
-            verification_input: None,
-        })),
+        tenant,
+        user,
+        owner: Arc::new(Mutex::new(refresh)),
         failures: Arc::new(StdMutex::new(BTreeMap::new())),
     };
     #[cfg(unix)]

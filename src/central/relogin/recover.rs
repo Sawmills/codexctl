@@ -46,11 +46,15 @@ pub(in crate::central) fn promote(
 pub(in crate::central) fn needs_verification(state: &Path) -> Result<bool> {
     Ok(current(state)?.is_some_and(|r| matches!(r.phase, Phase::Promoted | Phase::Retiring)))
 }
-pub(in crate::central) async fn verify_replacement(owner: &mut Owner, binary: &Path) -> Result<()> {
+pub(in crate::central) async fn verify_replacement(
+    owner: &mut Owner,
+    binary: &Path,
+    lock: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<()> {
     if !owner.refresh_enabled {
         bail!("read-only owner cannot verify a replacement");
     }
-    let result = verify_inner(owner, binary).await;
+    let result = verify_inner(owner, binary, lock).await;
     if let Err(error) = result {
         owner.available = false;
         let reconciled = finish_rejection(owner).await;
@@ -62,13 +66,20 @@ pub(in crate::central) async fn verify_replacement(owner: &mut Owner, binary: &P
     }
     Ok(())
 }
-async fn verify_inner(owner: &mut Owner, binary: &Path) -> Result<()> {
+async fn verify_inner(
+    owner: &mut Owner,
+    binary: &Path,
+    lock: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<()> {
     check_claim(
         owner.state.parent().context("missing registry")?,
         &owner.key,
         &owner.state,
         &owner.vault.auth,
     )?;
+    // Validate and reconcile the selected journal BEFORE a refresh process can
+    // read it. A vault-only identity check does not clear the selected journal.
+    owner.snapshot()?;
     // A previous attempt may have proved authentication but failed routing or
     // billing. Establish a fresh verification baseline, including permanent
     // rejection evidence, for the retained (possibly rotated) grant.
@@ -83,7 +94,9 @@ async fn verify_inner(owner: &mut Owner, binary: &Path) -> Result<()> {
         // gives this verifier the same Linux parent-death contract as login.
         record.verifier_broker = Some(process::Process::capture(std::process::id())?);
         save(&owner.state, &record)?;
-        launch_owner(owner, binary).await?;
+        let proof = identity_inventory(&owner.state, &owner.key, &owner.home)
+            .clear_for_launch(owner, lock)?;
+        launch_owner(owner, binary, proof).await?;
     }
     let revision = owner.snapshot()?.revision;
     owner
@@ -138,17 +151,16 @@ fn retire_reservations(accounts: &Path, auth: &Value, skip: &Path) -> Result<()>
 pub(in crate::central) fn check_import(
     state: &Path,
     key: &Path,
-    user: &str,
+    selected: &Path,
     input: &Import,
 ) -> Result<()> {
-    let selected = state.join("accounts").join(account_key(user, &input.alias));
-    if current(&selected)?.is_some_and(|r| r.phase != Phase::Completed) {
+    if current(selected)?.is_some_and(|r| r.phase != Phase::Completed) {
         bail!("selected account is reserved by re-login");
     }
     let auth = &input.auth;
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let state = entry?.path();
-        let inventory = identity_inventory(&state, key);
+        let inventory = identity_inventory(&state, key, &state.join("runtime"));
         if inventory.login_reserved && overlaps(&inventory.saved?.auth, auth) {
             bail!("selected identity is reserved by login");
         }
@@ -319,42 +331,9 @@ pub(super) fn check_claim(
     selected: &Path,
     auth: &Value,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(accounts)? {
-        let state = entry?.path();
-        if state == selected {
-            continue;
-        }
-        let inventory = identity_inventory(&state, key);
-        let conflict = inventory.journal_conflicts();
-        let journal = inventory.journal?;
-        let saved = inventory.saved?;
-        if conflict {
-            if inventory.runtime != ProcessState::Stopped {
-                bail!("conflicting journal owner has not stopped");
-            }
-            if overlaps(&saved.auth, auth) || journal.as_ref().is_some_and(|a| overlaps(a, auth)) {
-                bail!("conflicting journal reserves this account");
-            }
-        }
-        for candidate in inventory.candidates? {
-            if overlaps(&candidate.auth, auth) && candidate.process != ProcessState::Stopped {
-                bail!("matching quarantined login has not stopped");
-            }
-            // A stopped quarantine may be retired only after this rightful
-            // owner's fresh grant passes verification. Import cannot do that.
-        }
-        if !overlaps(&saved.auth, auth) {
-            continue;
-        }
-        if saved.verified || !saved.import_rejected || inventory.login_reserved {
-            bail!("account already owned or reserved");
-        }
-        if inventory.runtime != ProcessState::Stopped {
-            bail!("previous credential owner has not stopped");
-        }
-    }
-    Ok(())
+    inventory::check_registry_claim(accounts, key, selected, auth)
 }
+
 fn rejected(saved: &Vault) -> bool {
     // Owner::snapshot only records this proof for the unchanged, validated
     // verification input. That input can be a rotation of the original candidate.

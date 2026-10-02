@@ -236,7 +236,7 @@ pub(super) async fn run(
     old.verification_input = Some(old.vault.auth.clone());
     old.refresh_enabled = true;
     old.available = true;
-    if let Err(error) = verify_replacement(&mut old, &broker.binary).await {
+    if let Err(error) = verify_replacement(&mut old, &broker.binary, &_import).await {
         finish_rejection(&mut old).await?;
         return Err(error);
     }
@@ -245,19 +245,32 @@ pub(super) async fn run(
 
 async fn fence(broker: &Broker, auth: &Value) -> Result<()> {
     let owners = broker.owners.read().await.clone();
+    let mut failure = None;
     for (_, owner) in owners.values() {
         let mut owner = owner.lock().await;
-        if !overlaps(&owner.vault.auth, auth) {
+        let inventory = identity_inventory(&owner.state, &broker.key, &owner.home);
+        if !inventory.needs_fence(auth) {
             continue;
         }
         owner.available = false;
-        if let Some(rpc) = owner.rpc.as_mut() {
-            rpc.settle_and_stop().await?;
+        let stopped = if let Some(rpc) = owner.rpc.as_mut() {
+            rpc.settle_and_stop().await.map(|_| ())
         } else {
-            previous_owner_exited(&owner.home)?;
+            previous_owner_exited(&owner.home)
+        };
+        if let Err(error) = stopped {
+            failure.get_or_insert(error);
+            continue;
         }
         owner.rpc = None;
-        owner.snapshot()?;
+        // A conflicting journal remains reserved. Report its validation failure
+        // after stopping every matching refresh process, rather than returning early.
+        if let Err(error) = owner.snapshot() {
+            failure.get_or_insert(error);
+        }
     }
-    Ok(())
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

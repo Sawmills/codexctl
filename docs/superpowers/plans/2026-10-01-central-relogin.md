@@ -172,6 +172,62 @@ concurrent CLI cancellation, relative state paths, and normalized remote aliases
 cover unchanged import and local-login contracts; new tests exercise the changed
 server renewal paths. Record each red/green result against the WIP commit.
 
+## Refresh Launch Clearance
+
+Every server refresh process starts through `managed::launch_owner`.
+The function requires a `ClearedIdentity` value from `relogin::inventory`.
+Only that module can construct the value. Its lifetime borrows the migration lock.
+It binds the company user, server account alias, state directory, runtime home,
+vault auth digest, and exact journal digest. Launch checks those bindings before
+clearing process evidence. `Rpc::spawn_refresh` consumes the value and checks the
+journal again before spawning. The generic RPC spawn function is private.
+
+Clearance inventories the selected server account and all other retained server
+accounts. It checks vaults, runtime journals, quarantined candidates, and process
+exit evidence. A live login child for the selected server account prevents clearance.
+Verified server accounts can restart beside an unreadable vault only when that
+vault's refresh process has exited and its readable journal does not overlap.
+New migration and login renewal claims retain the stricter refusal.
+
+Launch call sites:
+
+- `managed::import_account`: holds the migration lock, inventories the prepared
+  server account, and passes clearance to `launch_owner`.
+- `managed::serve`: holds the same lock during startup inventory and launch.
+  Recovery that needs verification goes through `verify_replacement`.
+- `relogin::recover::verify_inner`: validates and reconciles the selected journal,
+  records verifier spawn intent, obtains clearance, then starts the verifier.
+  Both worker completion and HTTP retry pass the held migration lock here.
+- `relogin::http::start_owned`: when recovery has completed retirement, obtains
+  clearance and restores the normal refresh process without repeating verification.
+- `server::serve`: the single-server-account compatibility path obtains clearance
+  under its migration lock and uses the same launch function.
+- The managed-server unit tests obtain real clearance before exercising launch
+  failures. They also check that a changed journal invalidates clearance.
+
+Identity-based fencing call sites:
+
+- `relogin::worker::fence` uses `IdentityInventory::needs_fence`. It includes vault,
+  journal, and quarantine matches, plus unreadable or unidentified evidence.
+  The fence attempts to stop every matching refresh process before reporting failures.
+- `managed::import_account` inventories each retained server account before
+  selecting identities, stops conflicting refresh processes, and inventories again.
+  It retains both conflicting identities as reservations. A later launch still
+  requires `ClearedIdentity`.
+- `managed::serve` inventories the complete registry before restarting processes.
+  Conflicting identities and unknown process state prevent clearance. Each remaining
+  launch must obtain its own `ClearedIdentity`; the startup scan cannot bypass it.
+
+Cancellation and shutdown stop already identified process handles; neither grants
+launch clearance. Machine-side `Rpc::start` uses an access-only temporary home and
+is outside the server refresh-process path. Native login starts with an empty home
+and remains governed by the login-child state table.
+
+The **Promoted, verifier spawning** row retains its prior crash evidence. Clearance adds a pre-launch requirement: the selected runtime journal must
+match the server account identity before native code can read it.
+All five round-four findings have regression tests that fail on `bfcfb10`.
+The final independent review uses the Claude engine across the full branch.
+
 ## Primary Sources
 
 - [Linux parent-death signal and spawning-thread lifetime](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html).

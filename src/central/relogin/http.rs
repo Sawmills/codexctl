@@ -8,18 +8,20 @@ pub(in crate::central) async fn status(
     let device = broker.authorize(&headers)?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    broker.owner(&device, &request.alias).await?;
-    let state = broker
-        .state
-        .join("accounts")
-        .join(account_key(&device.user, request.alias.trim()));
+    let refresh = broker.owner(&device, &request.alias).await?;
+    let state = refresh.lock().await.state.clone();
     let record = if request.id.is_empty() {
         current(&state).and_then(|r| r.context("no login operation"))
     } else {
         load(&state, &request.id)
     }
     .map_err(|_| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
-    if record.user != device.user || !record.alias.eq_ignore_ascii_case(request.alias.trim()) {
+    if record.user != device.user
+        || !record
+            .alias
+            .trim()
+            .eq_ignore_ascii_case(request.alias.trim())
+    {
         return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
     }
     if record.device != device.id {
@@ -37,14 +39,16 @@ pub(in crate::central) async fn cancel(
     let device = broker.authorize(&headers)?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    broker.owner(&device, &request.alias).await?;
-    let state = broker
-        .state
-        .join("accounts")
-        .join(account_key(&device.user, request.alias.trim()));
+    let refresh = broker.owner(&device, &request.alias).await?;
+    let state = refresh.lock().await.state.clone();
     let record = load(&state, &request.id)
         .map_err(|_| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
-    if record.user != device.user || !record.alias.eq_ignore_ascii_case(request.alias.trim()) {
+    if record.user != device.user
+        || !record
+            .alias
+            .trim()
+            .eq_ignore_ascii_case(request.alias.trim())
+    {
         return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
     }
     if record.device != device.id {
@@ -68,6 +72,7 @@ pub(in crate::central) async fn start(
 ) -> Result<Response, HttpError> {
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    broker.authorize(&headers)?;
     let permit = broker
         .work
         .clone()
@@ -93,7 +98,7 @@ async fn start_owned(
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let _import = broker.imports.lock().await;
     let device = broker.authorize(&headers)?;
-    let alias = store::validate_alias(&request.alias)
+    let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
     let owner = broker.owner(&device, alias).await?;
     if broker.read_only
@@ -152,9 +157,30 @@ async fn start_owned(
         }
         original.vault = vault::load(&state, &broker.key)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        if !repair.verify {
+            let completed = current(&state)
+                .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
+                .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
+            if completed.phase != Phase::Completed {
+                return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "relogin_commit_pending"));
+            }
+            // Retirement already proved verification. Restore only the normal
+            // refresh process; never reset that proof or repeat forced refresh.
+            original
+                .snapshot()
+                .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
+            let proof = identity_inventory(&state, &broker.key, &original.home)
+                .clear_for_launch(&original, &_import)
+                .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            launch_owner(&mut original, &broker.binary, proof)
+                .await
+                .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            original.available = true;
+            return Ok(response(&completed));
+        }
         original.refresh_enabled = true;
         original.available = true;
-        if verify_replacement(&mut original, &broker.binary)
+        if verify_replacement(&mut original, &broker.binary, &_import)
             .await
             .is_err()
         {

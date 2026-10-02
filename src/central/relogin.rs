@@ -13,7 +13,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use managed::{account_key, launch_owner, overlaps, previous_owner_exited};
+use managed::{launch_owner, overlaps, previous_owner_exited};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -26,7 +26,7 @@ use std::{
 use tokio::sync::Mutex;
 mod http;
 mod inventory;
-pub(super) use inventory::{ProcessState, identity_inventory};
+pub(super) use inventory::{ClearedIdentity, ProcessState, identity_inventory};
 mod recover;
 mod state;
 mod worker;

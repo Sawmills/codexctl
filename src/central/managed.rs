@@ -154,6 +154,9 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnr
     store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)?;
     Ok(UserEnrollment::Recorded)
 }
+pub(super) fn normalize_alias(alias: &str) -> Result<&str> {
+    store::validate_alias(alias)
+}
 pub(super) fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
@@ -171,7 +174,7 @@ fn account_summary(owner: &Owner) -> Account {
         .unwrap_or(api::BillingClass::Unknown);
     Account {
         user_id: owner.vault.user.clone(),
-        alias: owner.vault.alias.clone(),
+        alias: owner.vault.alias.trim().to_owned(),
         label: owner.vault.label.clone(),
         account_id: vault::account(&owner.vault.auth).unwrap_or_default(),
         plan: limits
@@ -247,13 +250,9 @@ impl Broker {
         device: &vault::Device,
         alias: &str,
     ) -> Result<Arc<Mutex<Owner>>, HttpError> {
-        let alias = store::validate_alias(alias)
-            .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-        self.owners
-            .read()
-            .await
-            .get(&account_key(&device.user, alias))
-            .map(|(_, owner)| owner.clone())
+        self.resolve_alias(&device.user, alias)
+            .await?
+            .map(|(_, refresh)| refresh)
             .ok_or_else(|| {
                 if self.ownership_unresolved.load(Ordering::Acquire) {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed")
@@ -261,6 +260,32 @@ impl Broker {
                     self.error(StatusCode::NOT_FOUND, "account_not_found")
                 }
             })
+    }
+    async fn resolve_alias(
+        &self,
+        user: &str,
+        alias: &str,
+    ) -> Result<Option<(String, Arc<Mutex<Owner>>)>, HttpError> {
+        let alias = normalize_alias(alias)
+            .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
+        let entries = self.owners.read().await.clone();
+        let mut selected = None;
+        // Retain the physical key for server accounts saved before normalization.
+        // Ambiguous historical aliases require repair; never choose one silently.
+        for (key, (company_user, refresh)) in entries {
+            if company_user != user {
+                continue;
+            }
+            let matches = normalize_alias(&refresh.lock().await.vault.alias)
+                .is_ok_and(|saved| saved.eq_ignore_ascii_case(alias));
+            if matches {
+                if selected.is_some() {
+                    return Err(self.error(StatusCode::CONFLICT, "ambiguous_alias"));
+                }
+                selected = Some((key, refresh));
+            }
+        }
+        Ok(selected)
     }
     fn owner_failure(&self, error: TokenFailure) -> HttpError {
         match error {
@@ -386,7 +411,7 @@ async fn import(
 ) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers)?;
     let Json(input) = body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    store::validate_alias(&input.alias)
+    normalize_alias(&input.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
     store::validate_label(input.label.as_deref().unwrap_or(""))
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_label"))?;
@@ -409,10 +434,18 @@ async fn import(
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
-    async fn import_account(&self, user: &str, input: Import) -> Result<Account, HttpError> {
-        let id = account_key(user, &input.alias);
+    async fn import_account(&self, user: &str, mut input: Import) -> Result<Account, HttpError> {
+        input.alias = normalize_alias(&input.alias)
+            .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
+            .to_owned();
         let _import = self.imports.lock().await;
-        relogin::check_import(&self.state, &self.key, user, &input)
+        let id = self
+            .resolve_alias(user, &input.alias)
+            .await?
+            .map(|(key, _)| key)
+            .unwrap_or_else(|| account_key(user, &input.alias));
+        let selected = self.state.join("accounts").join(&id);
+        relogin::check_import(&self.state, &self.key, &selected, &input)
             .map_err(|_| self.error(StatusCode::CONFLICT, "relogin_reserved"))?;
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -430,7 +463,11 @@ impl Broker {
         for (_, owner) in owners.values() {
             let mut owner = owner.lock().await;
             let inventory = async {
-                let inventory = relogin::identity_inventory(&owner.state, &self.key);
+                let inventory = relogin::identity_inventory(
+                    &owner.state,
+                    &self.key,
+                    &owner.state.join("runtime"),
+                );
                 inventory
                     .saved
                     .as_ref()
@@ -457,7 +494,11 @@ impl Broker {
                     previous_owner_exited(&owner.home)?;
                 }
                 owner.rpc = None;
-                let settled = relogin::identity_inventory(&owner.state, &self.key);
+                let settled = relogin::identity_inventory(
+                    &owner.state,
+                    &self.key,
+                    &owner.state.join("runtime"),
+                );
                 if settled.runtime != relogin::ProcessState::Stopped {
                     bail!("conflicting owner did not stop");
                 }
@@ -571,7 +612,7 @@ impl Broker {
             let mut saved = vault::load(&state, &self.key)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             if saved.user != user
-                || saved.alias != input.alias
+                || !normalize_alias(&saved.alias).is_ok_and(|alias| alias == input.alias)
                 || vault::account(&saved.auth).ok() != vault::account(&input.auth).ok()
                 || api::token_subject(vault::token(&saved.auth).unwrap_or(""))
                     != api::token_subject(vault::token(&input.auth).unwrap_or(""))
@@ -633,7 +674,10 @@ impl Broker {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
-            launch_owner(&mut owner, &self.binary)
+            let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
+                .clear_for_launch(&owner, &_import)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            launch_owner(&mut owner, &self.binary, proof)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             let revision = owner
@@ -805,6 +849,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         }
     } else {
         store::atomic_write(&home.join("auth.json"), &serde_json::to_vec(&vault.auth)?)?;
+        store::atomic_write(&home.join("spawn-failed"), b"not-started")?;
     }
     let mut owner = Owner {
         vault,
@@ -821,7 +866,12 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
     owner.snapshot()?;
     Ok(owner)
 }
-pub(super) async fn launch_owner(owner: &mut Owner, binary: &Path) -> Result<()> {
+pub(super) async fn launch_owner(
+    owner: &mut Owner,
+    binary: &Path,
+    proof: relogin::ClearedIdentity<'_>,
+) -> Result<()> {
+    proof.validate(owner)?;
     if !owner.vault.verified {
         owner.vault.import_rejected = false;
         owner.verification_input = Some(owner.vault.auth.clone());
@@ -836,7 +886,7 @@ pub(super) async fn launch_owner(owner: &mut Owner, binary: &Path) -> Result<()>
         }
     }
     store::sync_directory(&owner.home)?;
-    let rpc = match Rpc::spawn(binary, &owner.home, true) {
+    let rpc = match Rpc::spawn_refresh(binary, &owner.home, proof) {
         Ok(rpc) => rpc,
         Err(error) => {
             // Rpc::spawn only returns errors before a Codex process has successfully started.
@@ -900,6 +950,8 @@ pub async fn serve(
         None if address.ip().is_loopback() => None,
         None => bail!("network server requires company SSO configuration"),
     };
+    let imports = Arc::new(Mutex::new(()));
+    let startup_import = imports.lock().await;
     let mut owners = BTreeMap::new();
     let mut recovery_failures = 0;
     let mut ownership_unresolved = false;
@@ -915,7 +967,8 @@ pub async fn serve(
     }
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let entry = entry?;
-        let inventory = relogin::identity_inventory(&entry.path(), key);
+        let inventory =
+            relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
         let journal_conflicts = inventory.journal_conflicts();
         let stopped = inventory.runtime == relogin::ProcessState::Stopped;
         match inventory.candidates {
@@ -1016,7 +1069,13 @@ pub async fn serve(
         if owner.available
             && owner.refresh_enabled
             && !repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
-            && launch_owner(&mut owner, binary).await.is_err()
+            && async {
+                let proof = relogin::identity_inventory(&owner.state, key, &owner.home)
+                    .clear_for_launch(&owner, &startup_import)?;
+                launch_owner(&mut owner, binary, proof).await
+            }
+            .await
+            .is_err()
         {
             owner.available = false;
             recovery_failures += 1;
@@ -1024,7 +1083,7 @@ pub async fn serve(
         if owner.available
             && owner.refresh_enabled
             && relogin::needs_verification(&owner.state)?
-            && relogin::verify_replacement(&mut owner, binary)
+            && relogin::verify_replacement(&mut owner, binary, &startup_import)
                 .await
                 .is_err()
         {
@@ -1032,6 +1091,7 @@ pub async fn serve(
             recovery_failures += 1;
         }
     }
+    drop(startup_import);
     let broker = Broker {
         state: state.into(),
         key: key.into(),
@@ -1039,7 +1099,7 @@ pub async fn serve(
         read_only,
         ownership_unresolved: Arc::new(AtomicBool::new(ownership_unresolved)),
         owners: Arc::new(RwLock::new(owners)),
-        imports: Arc::new(Mutex::new(())),
+        imports,
         sso,
         failures: Arc::new(StdMutex::new(
             [
@@ -1301,9 +1361,15 @@ mod tests {
     async fn a_definite_spawn_failure_allows_retry_without_relaxing_unknown_process_fences() {
         let auth = recovery_auth(Some(1), "refresh");
         let (root, key) = recovery_fixture(auth.clone(), auth);
+        store::atomic_write(&root.path().join("runtime/spawn-failed"), b"not-started").unwrap();
         let mut owner = prepare_owner(root.path(), &key, true).unwrap();
+        let lock = Mutex::new(());
+        let guard = lock.lock().await;
+        let proof = relogin::identity_inventory(&owner.state, &key, &owner.home)
+            .clear_for_launch(&owner, &guard)
+            .unwrap();
         assert!(
-            launch_owner(&mut owner, &root.path().join("missing-codex"))
+            launch_owner(&mut owner, &root.path().join("missing-codex"), proof)
                 .await
                 .is_err()
         );
@@ -1325,14 +1391,44 @@ mod tests {
         )
         .unwrap();
         let mut owner = prepare_owner(root.path(), &key, false).unwrap();
+        let lock = Mutex::new(());
+        let guard = lock.lock().await;
+        let proof = relogin::identity_inventory(&owner.state, &key, &owner.home)
+            .clear_for_launch(&owner, &guard)
+            .unwrap();
         assert!(
-            launch_owner(&mut owner, &root.path().join("missing-codex"))
+            launch_owner(&mut owner, &root.path().join("missing-codex"), proof)
                 .await
                 .is_err()
         );
         assert!(!home.join("pid").exists());
         assert!(previous_owner_exited(&home).is_ok());
     }
+    #[tokio::test]
+    async fn launch_clearance_rejects_changed_journal_before_invalidating_exit_evidence() {
+        let auth = recovery_auth(Some(1), "refresh");
+        let (root, key) = recovery_fixture(auth.clone(), auth);
+        store::atomic_write(&root.path().join("runtime/spawn-failed"), b"not-started").unwrap();
+        let mut refresh = prepare_owner(root.path(), &key, true).unwrap();
+        let lock = Mutex::new(());
+        let guard = lock.lock().await;
+        let proof = relogin::identity_inventory(&refresh.state, &key, &refresh.home)
+            .clear_for_launch(&refresh, &guard)
+            .unwrap();
+        let changed = recovery_auth(Some(2), "unexpected-refresh");
+        store::atomic_write(
+            &refresh.home.join("auth.json"),
+            &serde_json::to_vec(&changed).unwrap(),
+        )
+        .unwrap();
+        let error = launch_owner(&mut refresh, &root.path().join("missing-codex"), proof)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("journal changed"));
+        assert!(refresh.rpc.is_none());
+        assert!(previous_owner_exited(&refresh.home).is_ok());
+    }
+
     #[test]
     fn surviving_process_identity_blocks_recovery_even_without_an_rpc_handle() {
         let root = tempfile::tempdir().unwrap();

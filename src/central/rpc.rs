@@ -56,7 +56,16 @@ impl Rpc {
         Ok(rpc)
     }
 
-    pub fn spawn(binary: &Path, home: &Path, isolate_signals: bool) -> Result<Self> {
+    pub(super) fn spawn_refresh(
+        binary: &Path,
+        home: &Path,
+        proof: super::relogin::ClearedIdentity<'_>,
+    ) -> Result<Self> {
+        proof.validate_home(home)?;
+        Self::spawn(binary, home, true)
+    }
+
+    fn spawn(binary: &Path, home: &Path, isolate_signals: bool) -> Result<Self> {
         let home = if isolate_signals {
             std::fs::canonicalize(home).context("could not resolve credential owner home")?
         } else {

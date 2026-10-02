@@ -4547,3 +4547,230 @@ fn hq_startup_refuses_verification_against_a_conflicting_import_journal() {
         "startup must not launch a competing verifier"
     );
 }
+
+fn wait_for_renewal_error(server: &Server, alias: &str, id: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result: Value = server
+            .login_request(&server.amir, "status", alias, id)
+            .json()
+            .unwrap();
+        if result["error"] == "relogin_failed" {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "login renewal did not fail"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn hq5_verifier_retry_does_not_launch_a_conflicting_selected_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    let id = "1".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("same-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    wait_for_renewal_error(&server, "personal", &id);
+    let before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"startup").unwrap();
+    server.login_request(&server.amir, "start", "personal", &id);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        before,
+        "no refresh process may start against the conflicting journal"
+    );
+}
+
+#[test]
+fn hq5_wrong_grant_fences_a_refresh_process_identified_only_by_its_journal() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "2".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(&server.root.path().join("mode"), b"identity").unwrap();
+    assert_eq!(
+        server
+            .import(&server.alex, "pending", "same-login", "same-seat")
+            .status(),
+        503
+    );
+    let state = account_directory(&server, "alex", "pending");
+    let pid: Value =
+        serde_json::from_slice(&std::fs::read(state.join("runtime/pid")).unwrap()).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("different-login", "same-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "failed");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if unsafe { libc::kill(pid["pid"].as_i64().unwrap() as i32, 0) } != 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "quarantined runtime refresh process is still alive"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn hq5_completed_retirement_retry_does_not_repeat_verification() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let id = "3".repeat(64);
+    server.login_request(&server.amir, "start", "personal", &id);
+    store::atomic_write(
+        &server.root.path().join("login-release"),
+        &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    server.await_login(&server.amir, "personal", &id, "completed");
+    let path =
+        account_directory(&server, "amir", "personal").join(format!("relogin/{id}/record.json"));
+    let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["phase"] = json!("retiring");
+    store::atomic_write(&path, &serde_json::to_vec(&record).unwrap()).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let result: Value = server
+        .login_request(&server.amir, "start", "personal", &id)
+        .json()
+        .unwrap();
+    assert_eq!(result["status"], "completed");
+    assert!(
+        result["error"].is_null(),
+        "completed recovery must not run a second failing verifier"
+    );
+}
+
+#[test]
+fn hq5_unauthenticated_renewal_refuses_before_waiting_for_migration_lock() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
+    std::thread::scope(|scope| {
+        let migration =
+            scope.spawn(|| server.import(&server.alex, "work", "alex-login", "alex-seat"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.root.path().join("refresh-started").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let result = reqwest::blocking::Client::new()
+            .post(format!("{}/v1/relogin/start", server.url))
+            .json(&json!({"alias":"work","id":"4".repeat(64)}))
+            .timeout(Duration::from_millis(400))
+            .send();
+        store::atomic_write(&server.root.path().join("release"), b"go").unwrap();
+        assert_eq!(migration.join().unwrap().status(), 200);
+        assert_eq!(
+            result
+                .expect("authentication must not wait on migration")
+                .status(),
+            401
+        );
+    });
+}
+
+#[test]
+fn hq5_migration_normalizes_the_alias_used_for_lookup() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, " personal ", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "personal");
+    assert_eq!(server.token(&server.amir, " personal ", None).status(), 200);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn legacy_whitespace_alias_keeps_its_disk_reservation_and_can_renew() {
+    use aes_gcm::{
+        Aes256Gcm,
+        aead::{Aead, KeyInit},
+    };
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    server.stop();
+    let canonical = account_directory(&server, "amir", "personal");
+    let legacy = account_directory(&server, "amir", " personal ");
+    let mut saved = saved_vault(&server, &canonical);
+    saved["alias"] = json!(" personal ");
+    let key = std::fs::read(server.root.path().join("key")).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    // Synthetic fixture only; this nonce is used once with this test's random key.
+    let nonce = [123_u8; 12];
+    let encrypted = cipher
+        .encrypt(
+            (&nonce).into(),
+            serde_json::to_vec(&saved).unwrap().as_slice(),
+        )
+        .unwrap();
+    let mut bytes = nonce.to_vec();
+    bytes.extend(encrypted);
+    store::atomic_write(&canonical.join("vault.enc"), &bytes).unwrap();
+    std::fs::rename(&canonical, &legacy).unwrap();
+    server.restart();
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "personal");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert_eq!(
+        server
+            .import(&server.amir, " personal ", "same-login", "same-seat")
+            .status(),
+        200
+    );
+    assert!(!canonical.exists());
+    let id = "b".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "status", " personal ", &id)
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .login_request(&server.amir, "cancel", "personal", &id)
+            .status(),
+        200
+    );
+    server.await_login(&server.amir, "personal", &id, "canceled");
+}
