@@ -45,15 +45,15 @@ typography:
     fontWeight: 600
     lineHeight: 1.08
     letterSpacing: "-0.03em"
-    fontVariation: "\"wdth\" 90"
+    fontVariation: '"wdth" 90'
   figure:
     fontFamily: "Instrument Sans, ui-sans-serif, system-ui, sans-serif"
     fontSize: "2.75rem"
     fontWeight: 600
     lineHeight: 1
     letterSpacing: "-0.03em"
-    fontFeature: "\"tnum\" 1"
-    fontVariation: "\"wdth\" 82"
+    fontFeature: '"tnum" 1'
+    fontVariation: '"wdth" 82'
   headline:
     fontFamily: "Instrument Sans, ui-sans-serif, system-ui, sans-serif"
     fontSize: "1.75rem"
@@ -75,7 +75,7 @@ typography:
     fontSize: "0.875rem"
     fontWeight: 400
     lineHeight: 1.5
-    fontFeature: "\"tnum\" 1"
+    fontFeature: '"tnum" 1'
   body-sm:
     fontFamily: "Instrument Sans, ui-sans-serif, system-ui, sans-serif"
     fontSize: "0.8125rem"
@@ -194,6 +194,7 @@ The system is dense but calm. Body text is 14 px with tabular figures so every c
 v3 keeps the v2 visual world recorded in `README.md` and changes structure, not material. The token deltas from v2 are: `ink-3` darkened from `#686c73` to `#63676e` (light) and `#8e9197` to `#8f9298` (dark) so tertiary text passes AA on the recommended row; `--t-display` replaced by a fixed 36 px answer heading; figures grown from 40 px to 44 px; body leading raised to 1.5; a 0.01em body tracking in dark mode; dark `surface`, `sunken`, `line`, `line-strong`, `accent-soft`, and `meter-track` slightly lifted; `bad-soft` removed; the unknown meter changed from a stripe to a dotted rule; and cobalt withdrawn from "In use" and "Renewal pending".
 
 **Key Characteristics:**
+
 - Warm paper ground, near-black ink, three ink steps for hierarchy.
 - One cobalt accent for action and "use this"; amber and red for exceptions only, each with a word.
 - Hairlines between rows and one stronger rule under each section heading; no cards, no shadows.
@@ -206,16 +207,20 @@ v3 keeps the v2 visual world recorded in `README.md` and changes structure, not 
 A warm-neutral paper and ink palette with a single cobalt accent and two exception hues.
 
 ### Primary
+
 - **Signal Cobalt** (`accent`): the only accent. Primary buttons, links, command flags, the "Recommended" and "Redeemable now" notes, the wordmark caret, and the focus ring. Its pale wash, **Cobalt Wash** (`accent-soft`), tints the recommended ledger row and text selection. **Accent Ink** (`accent-ink`) is text on a cobalt or green fill.
 
 ### Secondary
+
 - **Exception Amber** (`warn`): text for low usage (below 20% left), stale usage, an expiring banked reset, and the usage-based billing note. **Amber Fill** (`warn-fill`) is the meter fill for low usage; **Amber Wash** (`warn-soft`) is the page notice ground.
 - **Exhausted Red** (`bad`): text and dot for an exhausted window and "Login needs attention", and the bold clause in the answer's context line.
 
 ### Tertiary
+
 - **Ledger Green** (`ok`): the dot of "Available" (the word stays ink) and the copied state of a Copy button. Never a text color for content.
 
 ### Neutral
+
 - **Warm Paper** (`paper`): page ground.
 - **White Sheet** (`surface`): secondary button ground.
 - **Sunken Paper** (`sunken`): command blocks, plan tags, the device code.
@@ -228,6 +233,7 @@ A warm-neutral paper and ink palette with a single cobalt accent and two excepti
 Each `-dark` token is the counterpart of the same name under `prefers-color-scheme: dark`.
 
 ### Named Rules
+
 **The One Cobalt Rule.** Cobalt means "act" or "use this". It never marks a status: "In use" is ink with an ink dot, and "Renewal pending" is ink-2 with a hollow dot.
 
 **The Word Beside Every Color Rule.** Amber, red, and green never appear without a word that carries the same meaning. Healthy rows are ink on paper.
@@ -241,6 +247,7 @@ Each `-dark` token is the counterpart of the same name under `prefers-color-sche
 **Character:** A plain workhorse UI sans whose width axis lets large numbers stand condensed and tight, paired with a mono that appears only where text is typed into a terminal. Both are self-hosted Latin subsets; the pages make no third-party request.
 
 ### Hierarchy
+
 - **Answer** (600, 36 px, 1.08, width 90%): the one H1 that answers the page's question ("Use Everyday building", the landing headline). Drops to 28 px below 1040 px.
 - **Figure** (600, 44 px, 1, width 82%, tabular): the two window figures under the answer, with a 20 px ink-3 `%` unit. 36 px on phones.
 - **Headline** (600, 28 px, 1.15): H1 on single-panel pages (approve, connected).
@@ -255,6 +262,7 @@ Each `-dark` token is the counterpart of the same name under `prefers-color-sche
 Headings use weight 600, -0.01em tracking, and balanced wrapping. Paragraphs use pretty wrapping. Rule lines cap at 62ch; ledes cap at 38ch.
 
 ### Named Rules
+
 **The Tabular Figures Rule.** The body enables `tnum`, so every number in every column aligns. Mono and code reset it to normal.
 
 **The Mono Means Typed Rule.** JetBrains Mono appears only for text a person types or reads back to a terminal: aliases, commands, the device code, and the wordmark.
@@ -270,6 +278,7 @@ Two-column pages split on a 12-part grid with a 48 to 64 px gap: the accounts ov
 Breakpoints: at 1040 px the lead gap tightens to 32 px and the answer drops to 28 px; at 900 px two-column pages stack (answer, then attention); at 860 px the account ledger and machines table restyle each row as a two-column grid with inline labels while explicit ARIA roles keep table semantics; at 640 px vertical rhythm tightens and figures drop to 36 px. No page scrolls sideways at 390 px; only long commands scroll inside their block.
 
 ### Named Rules
+
 **The Lines, Not Boxes Rule.** Structure comes from one strong rule under each section heading and hairlines between rows, never from bordered containers.
 
 ## Elevation & Depth
@@ -277,6 +286,7 @@ Breakpoints: at 1040 px the lead gap tightens to 32 px and the answer drops to 2
 The system is flat. There are no shadows anywhere. Depth is tonal: content sits on warm paper, and anything to copy or compare sits on sunken paper one step darker. Hairlines separate rows; the only lift is a 1 px press on an active button.
 
 ### Named Rules
+
 **The Flat Paper Rule.** No `box-shadow`, no elevation tokens. A surface is either paper, sunken paper, or a wash (cobalt for the recommended row, amber for the notice).
 
 ## Shapes
@@ -286,7 +296,9 @@ Corners are gently rounded and consistent by role: 6 px for controls, the notice
 ## Components
 
 ### Buttons
+
 Restrained and solid: they read as controls without ornament.
+
 - **Shape:** gently rounded (6 px), 40 px tall, 1 px border.
 - **Primary:** cobalt fill and border, accent-ink text, weight 600, 16 px side padding. One per decision: the answer's Copy, Sign in, Connect machine.
 - **Secondary:** white sheet ground, strong-rule border, ink text. Hover darkens the border to ink-3.
@@ -296,35 +308,45 @@ Restrained and solid: they read as controls without ornament.
 - **Link button:** inline text with a strong-rule underline that turns to the text color on hover (Sign out).
 
 ### State Indicator
+
 A 7 px dot and one word, weight 500. Available: green dot, ink word. In use: ink dot, ink word. Nearly exhausted and stale: amber. Exhausted and login needs attention: red. Renewal pending: ink-2 word with a hollow dot. Idle: ink-3 with a hollow dot.
 
 ### Meter
+
 A 4 px bar whose fill is what is left, the same quantity as the figure beside it. Meter ink by default, amber fill below 20% left, gray at 55% opacity inside a stale row. Unknown is a 2 px dotted rule with the word "Unknown". Always `aria-hidden`; the number carries the value.
 
 ### Command Block
+
 Sunken paper, 10 px corners, mono 13 px at 1.7 leading, `white-space: pre` with horizontal scroll inside the block. Multi-line commands use `\` continuations; flags are cobalt, placeholders ink-2 italic, the `$ ` prompt ink-3 and unselectable (not copied). The Copy button sits at the right edge. In the answer block, the command grows to 16 px weight 500.
 
 ### Plan Tag
+
 Sunken paper, 4 px corners, 11 px weight 600 with 0.03em tracking, hugging its text. Carries the plan only (PRO, TEAM, PLUS).
 
 ### Notice
+
 Amber wash, 6 px corners, a bold amber lead word and a next-step button. One per page for a page-wide condition (refresh failed, signed out); never repeated on rows.
 
 ### Account Ledger
+
 A full-width table: account (name, mono alias, plan tag, one-line notes), 5-hour window, 7-day window, banked resets, state. Column headers are 12 px ink-3; cells are top-aligned with a hairline above. The recommended row carries a cobalt wash with 6 px rounded ends. Below 860 px each row becomes a two-column grid with the state top right.
 
 ### Answer Figures
+
 Two figures side by side in a band ruled above and below by hairlines: condensed 44 px value, 4 px meter, 13 px ink-2 label with the reset time in ink-3.
 
 ### Section Heading
+
 Title left, quiet ink-3 meta right, an ink-3 count beside the title, and one strong rule underneath.
 
 ### Disclosure
+
 A native `details` summary in ink-2 weight 500 with a 6 px border-drawn chevron that rotates on open. Its open state syncs to the URL.
 
 ## Do's and Don'ts
 
 ### Do:
+
 - **Do** open every page on the answer to its visitor's question, with the action beside it.
 - **Do** fill meters with what is left, matching the figure next to them.
 - **Do** put a word beside every amber, red, or green mark.
@@ -334,6 +356,7 @@ A native `details` summary in ink-2 weight 500 with a 6 px border-drawn chevron 
 - **Do** swap tokens for dark mode; never add dark-specific component rules.
 
 ### Don't:
+
 - **Don't** use cobalt for a status such as "In use" or "Renewal pending"; it marks action and "use this" only.
 - **Don't** wrap content in bordered or shadowed cards; use hairlines and the section rule.
 - **Don't** add shadows or elevation of any kind.

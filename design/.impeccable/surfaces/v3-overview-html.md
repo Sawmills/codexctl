@@ -2,13 +2,13 @@
 version: 1
 slug: "v3-overview-html"
 primary_target: "v3/overview.html"
-related_targets: ["v3/index.html","v3/approve.html","v3/connected.html"]
+related_targets: ["v3/index.html", "v3/approve.html", "v3/connected.html"]
 ---
 
 # Surface: codexctl web UI v3 (overview, landing, approval, connected)
 
 Mode: Operate (all four pages). Build path: code-led (no image generation on this machine).
-Related pages: v3/index.html (signed-out landing), v3/approve.html, v3/connected.html, v3/overview-*.html variants.
+Related pages: v3/index.html (signed-out landing), v3/approve.html, v3/connected.html, v3/overview-\*.html variants.
 
 ## Direction contract
 

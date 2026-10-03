@@ -12,12 +12,12 @@ Three people reach the app. Two of them are the same engineer on different days.
 
 ## The Jobs, Ranked
 
-| Rank | Job | Who | How often | Cost of a slow answer |
-| --- | --- | --- | --- | --- |
-| 1 | Get unblocked now | Stuck engineer | Several times a week per engineer | Work stops; the engineer guesses an alias or pays for credits |
-| 2 | Check that every account is healthy | Owner | Daily | A broken login or an expired reset is found only when it blocks job 1 |
-| 3 | Connect a new machine | New-machine engineer | Once per machine | Setup stalls; the engineer asks a colleague |
-| 4 | Confirm a machine approval is safe | New-machine engineer | Once per machine | A wrong approval gives a stranger token delivery |
+| Rank | Job                                 | Who                  | How often                         | Cost of a slow answer                                                 |
+| ---- | ----------------------------------- | -------------------- | --------------------------------- | --------------------------------------------------------------------- |
+| 1    | Get unblocked now                   | Stuck engineer       | Several times a week per engineer | Work stops; the engineer guesses an alias or pays for credits         |
+| 2    | Check that every account is healthy | Owner                | Daily                             | A broken login or an expired reset is found only when it blocks job 1 |
+| 3    | Connect a new machine               | New-machine engineer | Once per machine                  | Setup stalls; the engineer asks a colleague                           |
+| 4    | Confirm a machine approval is safe  | New-machine engineer | Once per machine                  | A wrong approval gives a stranger token delivery                      |
 
 Jobs 3 and 4 are one flow (install, connect, approve, done), but they happen on different pages and ask different questions, so they stay separate rows.
 
@@ -41,17 +41,18 @@ Jobs 3 and 4 are one flow (install, connect, approve, done), but they happen on 
 - **Question in their head.** "Is anything broken, running out, or about to be wasted? Which machine uses what?"
 - **Answer the page must give.** First, a short list of exceptions with the fix next to each one:
 
-  | Exception | Fix shown |
-  | --- | --- |
-  | Login needs attention (`state == "unavailable"`) | `codexctl login <alias>` |
-  | Renewal pending (`state == "renewal_pending"`) | Finish the OpenAI sign-in on the machine that started it, or `codexctl login <alias> --cancel` |
-  | Exhausted with a redeemable reset | `codexctl reset <alias>` |
-  | Exhausted, no reset | When the window resets |
-  | Nearly exhausted (under 20% left) | When the window resets |
-  | Stale usage | Last observed time; the server refreshes every 60 seconds |
-  | Banked reset expiring within 3 days | Expiry date, and that a reset can only be spent once a window is exhausted |
+  | Exception                                        | Fix shown                                                                                      |
+  | ------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+  | Login needs attention (`state == "unavailable"`) | `codexctl login <alias>`                                                                       |
+  | Renewal pending (`state == "renewal_pending"`)   | Finish the OpenAI sign-in on the machine that started it, or `codexctl login <alias> --cancel` |
+  | Exhausted with a redeemable reset                | `codexctl reset <alias>`                                                                       |
+  | Exhausted, no reset                              | When the window resets                                                                         |
+  | Nearly exhausted (under 20% left)                | When the window resets                                                                         |
+  | Stale usage                                      | Last observed time; the server refreshes every 60 seconds                                      |
+  | Banked reset expiring within 3 days              | Expiry date, and that a reset can only be spent once a window is exhausted                     |
 
   Then the full account list, one row per account with both windows, banked resets, and state. Then the machines: which account each one last received a token for, and when.
+
 - **Action.** Copy a fix command, or read and leave satisfied.
 - **Must not be on screen.** A badge on every healthy row, a "stale" tag repeated on every row when the whole page is stale (one page notice instead), live-connectivity claims for machines (the server only knows the last token delivery), and revoked machines outside a closed disclosure.
 
@@ -77,12 +78,12 @@ Jobs 3 and 4 are one flow (install, connect, approve, done), but they happen on 
 
 The ranking gives this structure. Every page renders from data the server already has; the one small addition is listed below.
 
-| Route | Serves | Order on the page |
-| --- | --- | --- |
-| `/` (signed out) | Job 3, and the sign-in door for jobs 1 and 2 | Sign in first, then three setup steps |
-| `/accounts` (signed in) | Job 1, then job 2 | The answer and its command, then "Needs attention", then all accounts, then machines |
-| `/auth/approve` | Job 4 | Identity, machine, code, approve |
-| Connected page | Job 4 follow-up | Confirmation, next command |
+| Route                   | Serves                                       | Order on the page                                                                    |
+| ----------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------ |
+| `/` (signed out)        | Job 3, and the sign-in door for jobs 1 and 2 | Sign in first, then three setup steps                                                |
+| `/accounts` (signed in) | Job 1, then job 2                            | The answer and its command, then "Needs attention", then all accounts, then machines |
+| `/auth/approve`         | Job 4                                        | Identity, machine, code, approve                                                     |
+| Connected page          | Job 4 follow-up                              | Confirmation, next command                                                           |
 
 Changes from v2:
 

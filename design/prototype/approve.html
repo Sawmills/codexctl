@@ -4,16 +4,32 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="theme-color" content="#f7f7f4" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#121314" media="(prefers-color-scheme: dark)" />
+    <meta
+      name="theme-color"
+      content="#f7f7f4"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#121314"
+      media="(prefers-color-scheme: dark)"
+    />
     <title>Connect this machine · codexctl</title>
-    <link rel="preload" href="fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+    <link
+      rel="preload"
+      href="fonts/instrument-sans.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
     <link rel="stylesheet" href="style.css" />
   </head>
   <body class="enroll">
     <header class="topbar">
       <div class="wrap topbar-inner">
-        <span class="wordmark" translate="no">codexctl<span class="caret" aria-hidden="true"></span></span>
+        <span class="wordmark" translate="no"
+          >codexctl<span class="caret" aria-hidden="true"></span
+        ></span>
         <span class="faint">Machine setup</span>
       </div>
     </header>
@@ -21,10 +37,18 @@
       <section class="panel" aria-labelledby="page-title">
         <p class="eyebrow">Confirm access</p>
         <h1 id="page-title">Connect this machine?</h1>
-        <p class="lede">It will use your server accounts. You can revoke it later.</p>
+        <p class="lede">
+          It will use your server accounts. You can revoke it later.
+        </p>
         <dl class="facts-list">
-          <div><dt>Signed in as</dt><dd translate="no">amir@sawmills.ai</dd></div>
-          <div><dt>Machine</dt><dd>Studio MacBook</dd></div>
+          <div>
+            <dt>Signed in as</dt>
+            <dd translate="no">amir@sawmills.ai</dd>
+          </div>
+          <div>
+            <dt>Machine</dt>
+            <dd>Studio MacBook</dd>
+          </div>
         </dl>
         <div class="code-check">
           <p class="label">Code shown in your terminal</p>
@@ -36,7 +60,10 @@
           <input type="hidden" name="approval" value="{approval}" />
           <button class="button primary" type="submit">Connect machine</button>
         </form>
-        <p class="footnote">Not your account or machine? Close this page. Nothing connects until you approve.</p>
+        <p class="footnote">
+          Not your account or machine? Close this page. Nothing connects until
+          you approve.
+        </p>
       </section>
     </main>
     <footer class="wrap footer">

@@ -5,7 +5,8 @@ The recommendation, the "Needs attention" list, and the ledger order are
 derived here with the same rules the server-rendered page will use, so the
 fixtures double as a worked example for the Rust templates.
 
-Run: python3 design/build_v3.py   (writes design/v3/overview*.html)
+Run: python3 design/build_v3.py && trunk fmt design/v3/overview*.html
+(writes design/v3/overview*.html; trunk fmt applies the repository Prettier style)
 """
 
 from __future__ import annotations
