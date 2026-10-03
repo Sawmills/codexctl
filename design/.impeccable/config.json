@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "instrument sans",
+        "createdAt": "2026-10-03T21:18:47.418Z",
+        "reason": "Same decision, lowercase form reported on HTML pages"
+      }
+    ]
+  }
+}

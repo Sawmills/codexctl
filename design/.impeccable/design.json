@@ -1,0 +1,948 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-03T21:30:48+00:00",
+  "title": "Design System: codexctl web UI",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Signal Cobalt",
+        "canonical": "#2443c4",
+        "oklch": "oklch(45.2% 0.203 266.8)",
+        "cssVar": "--accent",
+        "mode": "light",
+        "purpose": "Primary buttons, links, command flags, Recommended and Redeemable now notes, wordmark caret, focus ring.",
+        "tonalRamp": [
+          "#010134",
+          "#080377",
+          "#1529ab",
+          "#2e51d2",
+          "#4b76fa",
+          "#7da1fe",
+          "#b1c8ff",
+          "#e7eeff"
+        ]
+      },
+      "accent-ink": {
+        "role": "primary",
+        "displayName": "Accent Ink",
+        "canonical": "#ffffff",
+        "oklch": "oklch(100.0% 0.000 89.9)",
+        "cssVar": "--accent-ink",
+        "mode": "light",
+        "purpose": "Text on a cobalt or green fill.",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "accent-soft": {
+        "role": "primary",
+        "displayName": "Cobalt Wash",
+        "canonical": "#e8ecfb",
+        "oklch": "oklch(94.4% 0.021 274.0)",
+        "cssVar": "--accent-soft",
+        "mode": "light",
+        "purpose": "Recommended ledger row tint and text selection.",
+        "tonalRamp": [
+          "#080a14",
+          "#22242f",
+          "#3e414d",
+          "#5d616d",
+          "#7e828f",
+          "#a1a4b2",
+          "#c5c8d7",
+          "#eaeefd"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "Warm Paper",
+        "canonical": "#f7f7f4",
+        "oklch": "oklch(97.5% 0.004 106.5)",
+        "cssVar": "--bg",
+        "mode": "light",
+        "purpose": "Page ground.",
+        "tonalRamp": [
+          "#0b0b09",
+          "#252523",
+          "#424240",
+          "#61615f",
+          "#828280",
+          "#a5a5a2",
+          "#c9c9c6",
+          "#efefec"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "White Sheet",
+        "canonical": "#ffffff",
+        "oklch": "oklch(100.0% 0.000 89.9)",
+        "cssVar": "--surface",
+        "mode": "light",
+        "purpose": "Secondary button ground.",
+        "tonalRamp": [
+          "#0b0b0b",
+          "#252525",
+          "#424242",
+          "#616161",
+          "#828282",
+          "#a5a5a5",
+          "#c9c9c9",
+          "#eeeeee"
+        ]
+      },
+      "sunken": {
+        "role": "neutral",
+        "displayName": "Sunken Paper",
+        "canonical": "#efefea",
+        "oklch": "oklch(95.1% 0.007 106.5)",
+        "cssVar": "--sunken",
+        "mode": "light",
+        "purpose": "Command blocks, plan tags, device code.",
+        "tonalRamp": [
+          "#0b0b08",
+          "#252522",
+          "#42423e",
+          "#61615d",
+          "#83837e",
+          "#a5a5a1",
+          "#c9c9c5",
+          "#efefea"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ledger Ink",
+        "canonical": "#18191b",
+        "oklch": "oklch(21.3% 0.004 264.5)",
+        "cssVar": "--ink",
+        "mode": "light",
+        "purpose": "Primary text, headings, In use.",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#242527",
+          "#414244",
+          "#606164",
+          "#818285",
+          "#a4a5a8",
+          "#c8c9cc",
+          "#edeef1"
+        ]
+      },
+      "ink-2": {
+        "role": "neutral",
+        "displayName": "Ink Two",
+        "canonical": "#4f5258",
+        "oklch": "oklch(43.8% 0.011 264.5)",
+        "cssVar": "--ink-2",
+        "mode": "light",
+        "purpose": "Secondary text, context lines, Renewal pending, stale figures.",
+        "tonalRamp": [
+          "#090b10",
+          "#22252a",
+          "#3f4248",
+          "#5e6167",
+          "#7f8289",
+          "#a2a5ac",
+          "#c6c9d0",
+          "#ebeff6"
+        ]
+      },
+      "ink-3": {
+        "role": "neutral",
+        "displayName": "Ink Three",
+        "canonical": "#63676e",
+        "oklch": "oklch(51.3% 0.012 261.8)",
+        "cssVar": "--ink-3",
+        "mode": "light",
+        "purpose": "Tertiary text: column headers, counts, captions, reset times, aliases, footer.",
+        "tonalRamp": [
+          "#080b10",
+          "#22252b",
+          "#3e4249",
+          "#5d6168",
+          "#7e828a",
+          "#a1a5ad",
+          "#c5c9d1",
+          "#eaeff7"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Hairline",
+        "canonical": "#e3e3dd",
+        "oklch": "oklch(91.4% 0.008 106.6)",
+        "cssVar": "--line",
+        "mode": "light",
+        "purpose": "Row dividers and figure-band rules.",
+        "tonalRamp": [
+          "#0b0b08",
+          "#252521",
+          "#42423d",
+          "#62625c",
+          "#83837d",
+          "#a5a5a0",
+          "#c9c9c4",
+          "#efefe9"
+        ]
+      },
+      "line-strong": {
+        "role": "neutral",
+        "displayName": "Strong Rule",
+        "canonical": "#cfcfc8",
+        "oklch": "oklch(85.3% 0.010 106.6)",
+        "cssVar": "--line-strong",
+        "mode": "light",
+        "purpose": "Section-heading rule, button borders, dotted unknown meter.",
+        "tonalRamp": [
+          "#0c0b07",
+          "#252520",
+          "#42423d",
+          "#62625b",
+          "#83837c",
+          "#a5a59f",
+          "#cacac3",
+          "#efefe8"
+        ]
+      },
+      "ok": {
+        "role": "tertiary",
+        "displayName": "Ledger Green",
+        "canonical": "#1d7646",
+        "oklch": "oklch(50.2% 0.112 154.7)",
+        "cssVar": "--ok",
+        "mode": "light",
+        "purpose": "Available dot and the copied button state only.",
+        "tonalRamp": [
+          "#001005",
+          "#022e16",
+          "#05502b",
+          "#197343",
+          "#429664",
+          "#67ba85",
+          "#8cdfa9",
+          "#c6ffd8"
+        ]
+      },
+      "warn": {
+        "role": "secondary",
+        "displayName": "Exception Amber",
+        "canonical": "#8a5300",
+        "oklch": "oklch(49.4% 0.109 66.9)",
+        "cssVar": "--warn",
+        "mode": "light",
+        "purpose": "Low usage, stale usage, expiring reset, usage-based note.",
+        "tonalRamp": [
+          "#140800",
+          "#371f02",
+          "#5e3805",
+          "#88540d",
+          "#ae7431",
+          "#d39756",
+          "#f9bb7a",
+          "#ffebd7"
+        ]
+      },
+      "warn-fill": {
+        "role": "secondary",
+        "displayName": "Amber Fill",
+        "canonical": "#b06d00",
+        "oklch": "oklch(59.4% 0.130 68.2)",
+        "cssVar": "--warn-fill",
+        "mode": "light",
+        "purpose": "Meter fill below 20% left.",
+        "tonalRamp": [
+          "#140800",
+          "#371f00",
+          "#5e3801",
+          "#885405",
+          "#b4710b",
+          "#da943f",
+          "#feb96c",
+          "#ffebd7"
+        ]
+      },
+      "warn-soft": {
+        "role": "secondary",
+        "displayName": "Amber Wash",
+        "canonical": "#fbf1df",
+        "oklch": "oklch(96.1% 0.026 82.4)",
+        "cssVar": "--warn-soft",
+        "mode": "light",
+        "purpose": "Page notice ground.",
+        "tonalRamp": [
+          "#110a01",
+          "#2b2416",
+          "#494132",
+          "#696051",
+          "#8a8171",
+          "#ada493",
+          "#d2c8b7",
+          "#f7eddb"
+        ]
+      },
+      "bad": {
+        "role": "secondary",
+        "displayName": "Exhausted Red",
+        "canonical": "#b3261e",
+        "oklch": "oklch(50.1% 0.178 28.7)",
+        "cssVar": "--bad",
+        "mode": "light",
+        "purpose": "Exhausted window and Login needs attention.",
+        "tonalRamp": [
+          "#1f0000",
+          "#4d0101",
+          "#800304",
+          "#b0221b",
+          "#d84c3f",
+          "#fd7565",
+          "#fdb4a9",
+          "#fee9e5"
+        ]
+      },
+      "meter": {
+        "role": "neutral",
+        "displayName": "Meter Ink",
+        "canonical": "#2c2e33",
+        "oklch": "oklch(30.1% 0.009 268.4)",
+        "cssVar": "--meter",
+        "mode": "light",
+        "purpose": "Default meter fill.",
+        "tonalRamp": [
+          "#090b0f",
+          "#23252a",
+          "#404247",
+          "#5f6167",
+          "#808288",
+          "#a2a5ab",
+          "#c6c9cf",
+          "#eceef5"
+        ]
+      },
+      "meter-track": {
+        "role": "neutral",
+        "displayName": "Meter Track",
+        "canonical": "#e3e3dc",
+        "oklch": "oklch(91.4% 0.009 106.6)",
+        "cssVar": "--meter-track",
+        "mode": "light",
+        "purpose": "Meter track.",
+        "tonalRamp": [
+          "#0c0b07",
+          "#252520",
+          "#42423d",
+          "#62625c",
+          "#83837c",
+          "#a5a59f",
+          "#cacac3",
+          "#efefe8"
+        ]
+      },
+      "accent-dark": {
+        "role": "primary",
+        "displayName": "Signal Cobalt (dark)",
+        "canonical": "#93a6ff",
+        "oklch": "oklch(74.7% 0.130 273.7)",
+        "cssVar": "--accent",
+        "mode": "dark",
+        "purpose": "Primary buttons, links, command flags, Recommended and Redeemable now notes, wordmark caret, focus ring.",
+        "tonalRamp": [
+          "#050032",
+          "#161562",
+          "#2f3786",
+          "#4b58aa",
+          "#6a7bd0",
+          "#8b9ef6",
+          "#b9c6fd",
+          "#e9eefe"
+        ]
+      },
+      "accent-ink-dark": {
+        "role": "primary",
+        "displayName": "Accent Ink (dark)",
+        "canonical": "#0d1330",
+        "oklch": "oklch(20.0% 0.058 271.4)",
+        "cssVar": "--accent-ink",
+        "mode": "dark",
+        "purpose": "Text on a cobalt or green fill.",
+        "tonalRamp": [
+          "#050723",
+          "#1b2341",
+          "#374061",
+          "#556083",
+          "#7581a6",
+          "#98a4ca",
+          "#bbc8f0",
+          "#e9eeff"
+        ]
+      },
+      "accent-soft-dark": {
+        "role": "primary",
+        "displayName": "Cobalt Wash (dark)",
+        "canonical": "#1f2645",
+        "oklch": "oklch(27.9% 0.058 272.5)",
+        "cssVar": "--accent-soft",
+        "mode": "dark",
+        "purpose": "Recommended ledger row tint and text selection.",
+        "tonalRamp": [
+          "#050723",
+          "#1c2241",
+          "#374061",
+          "#565f83",
+          "#7681a6",
+          "#98a3ca",
+          "#bcc8f0",
+          "#e9eeff"
+        ]
+      },
+      "paper-dark": {
+        "role": "neutral",
+        "displayName": "Warm Paper (dark)",
+        "canonical": "#121314",
+        "oklch": "oklch(18.6% 0.003 248.0)",
+        "cssVar": "--bg",
+        "mode": "dark",
+        "purpose": "Page ground.",
+        "tonalRamp": [
+          "#0a0b0c",
+          "#242526",
+          "#414243",
+          "#606163",
+          "#818284",
+          "#a4a5a6",
+          "#c8c9cb",
+          "#edeff0"
+        ]
+      },
+      "surface-dark": {
+        "role": "neutral",
+        "displayName": "White Sheet (dark)",
+        "canonical": "#1a1b1d",
+        "oklch": "oklch(22.2% 0.004 264.5)",
+        "cssVar": "--surface",
+        "mode": "dark",
+        "purpose": "Secondary button ground.",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#242527",
+          "#414244",
+          "#606164",
+          "#818285",
+          "#a4a5a8",
+          "#c8c9cc",
+          "#edeef1"
+        ]
+      },
+      "sunken-dark": {
+        "role": "neutral",
+        "displayName": "Sunken Paper (dark)",
+        "canonical": "#1f2123",
+        "oklch": "oklch(24.6% 0.005 248.0)",
+        "cssVar": "--sunken",
+        "mode": "dark",
+        "purpose": "Command blocks, plan tags, device code.",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#232527",
+          "#404244",
+          "#5f6164",
+          "#808385",
+          "#a3a5a8",
+          "#c7c9cc",
+          "#eceff2"
+        ]
+      },
+      "ink-dark": {
+        "role": "neutral",
+        "displayName": "Ledger Ink (dark)",
+        "canonical": "#ececea",
+        "oklch": "oklch(94.3% 0.003 106.5)",
+        "cssVar": "--ink",
+        "mode": "dark",
+        "purpose": "Primary text, headings, In use.",
+        "tonalRamp": [
+          "#0b0b0a",
+          "#252524",
+          "#424240",
+          "#616160",
+          "#828281",
+          "#a5a5a3",
+          "#c9c9c7",
+          "#eeeeec"
+        ]
+      },
+      "ink-2-dark": {
+        "role": "neutral",
+        "displayName": "Ink Two (dark)",
+        "canonical": "#b0b2b7",
+        "oklch": "oklch(76.3% 0.007 268.5)",
+        "cssVar": "--ink-2",
+        "mode": "dark",
+        "purpose": "Secondary text, context lines, Renewal pending, stale figures.",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#232529",
+          "#404246",
+          "#5f6166",
+          "#808287",
+          "#a3a5aa",
+          "#c7c9ce",
+          "#eceef4"
+        ]
+      },
+      "ink-3-dark": {
+        "role": "neutral",
+        "displayName": "Ink Three (dark)",
+        "canonical": "#8f9298",
+        "oklch": "oklch(65.9% 0.010 264.5)",
+        "cssVar": "--ink-3",
+        "mode": "dark",
+        "purpose": "Tertiary text: column headers, counts, captions, reset times, aliases, footer.",
+        "tonalRamp": [
+          "#090b0f",
+          "#23252a",
+          "#3f4247",
+          "#5e6167",
+          "#7f8288",
+          "#a2a5ab",
+          "#c6c9d0",
+          "#ebeef5"
+        ]
+      },
+      "line-dark": {
+        "role": "neutral",
+        "displayName": "Hairline (dark)",
+        "canonical": "#27292c",
+        "oklch": "oklch(28.0% 0.006 258.4)",
+        "cssVar": "--line",
+        "mode": "dark",
+        "purpose": "Row dividers and figure-band rules.",
+        "tonalRamp": [
+          "#0a0b0e",
+          "#232528",
+          "#404245",
+          "#5f6165",
+          "#808286",
+          "#a3a5a9",
+          "#c7c9cd",
+          "#eceff3"
+        ]
+      },
+      "line-strong-dark": {
+        "role": "neutral",
+        "displayName": "Strong Rule (dark)",
+        "canonical": "#383b3f",
+        "oklch": "oklch(35.1% 0.008 255.5)",
+        "cssVar": "--line-strong",
+        "mode": "dark",
+        "purpose": "Section-heading rule, button borders, dotted unknown meter.",
+        "tonalRamp": [
+          "#090b0f",
+          "#222529",
+          "#3f4246",
+          "#5e6166",
+          "#7f8387",
+          "#a2a5aa",
+          "#c6c9ce",
+          "#ebeff4"
+        ]
+      },
+      "ok-dark": {
+        "role": "tertiary",
+        "displayName": "Ledger Green (dark)",
+        "canonical": "#5cc98e",
+        "oklch": "oklch(75.6% 0.133 157.3)",
+        "cssVar": "--ok",
+        "mode": "dark",
+        "purpose": "Available dot and the copied button state only.",
+        "tonalRamp": [
+          "#000f06",
+          "#012e19",
+          "#034f2f",
+          "#097446",
+          "#229962",
+          "#50be83",
+          "#77e3a7",
+          "#c5ffdb"
+        ]
+      },
+      "warn-dark": {
+        "role": "secondary",
+        "displayName": "Exception Amber (dark)",
+        "canonical": "#f0b44c",
+        "oklch": "oklch(80.7% 0.137 78.2)",
+        "cssVar": "--warn",
+        "mode": "dark",
+        "purpose": "Low usage, stale usage, expiring reset, usage-based note.",
+        "tonalRamp": [
+          "#120900",
+          "#332100",
+          "#583c01",
+          "#805905",
+          "#aa770b",
+          "#d4992a",
+          "#fabd56",
+          "#feecd0"
+        ]
+      },
+      "warn-fill-dark": {
+        "role": "secondary",
+        "displayName": "Amber Fill (dark)",
+        "canonical": "#e3a33a",
+        "oklch": "oklch(75.9% 0.139 75.6)",
+        "cssVar": "--warn-fill",
+        "mode": "dark",
+        "purpose": "Meter fill below 20% left.",
+        "tonalRamp": [
+          "#130900",
+          "#342100",
+          "#5a3b01",
+          "#825805",
+          "#ad760a",
+          "#d6972a",
+          "#fdbc56",
+          "#ffebd1"
+        ]
+      },
+      "warn-soft-dark": {
+        "role": "secondary",
+        "displayName": "Amber Wash (dark)",
+        "canonical": "#2a2213",
+        "oklch": "oklch(25.7% 0.028 82.5)",
+        "cssVar": "--warn-soft",
+        "mode": "dark",
+        "purpose": "Page notice ground.",
+        "tonalRamp": [
+          "#110a01",
+          "#2c2415",
+          "#494131",
+          "#69604f",
+          "#8b816f",
+          "#aea491",
+          "#d2c8b5",
+          "#f8edda"
+        ]
+      },
+      "bad-dark": {
+        "role": "secondary",
+        "displayName": "Exhausted Red (dark)",
+        "canonical": "#ff8a80",
+        "oklch": "oklch(75.9% 0.144 26.1)",
+        "cssVar": "--bad",
+        "mode": "dark",
+        "purpose": "Exhausted window and Login needs attention.",
+        "tonalRamp": [
+          "#1f0001",
+          "#4c0105",
+          "#7d0e13",
+          "#a33733",
+          "#ca5b53",
+          "#f27e75",
+          "#ffb3aa",
+          "#fee9e6"
+        ]
+      },
+      "meter-dark": {
+        "role": "neutral",
+        "displayName": "Meter Ink (dark)",
+        "canonical": "#d4d5d8",
+        "oklch": "oklch(87.3% 0.004 271.4)",
+        "cssVar": "--meter",
+        "mode": "dark",
+        "purpose": "Default meter fill.",
+        "tonalRamp": [
+          "#0a0b0d",
+          "#242527",
+          "#414244",
+          "#606164",
+          "#818285",
+          "#a4a5a8",
+          "#c8c9cc",
+          "#edeef1"
+        ]
+      },
+      "meter-track-dark": {
+        "role": "neutral",
+        "displayName": "Meter Track (dark)",
+        "canonical": "#2c2e32",
+        "oklch": "oklch(30.1% 0.008 264.5)",
+        "cssVar": "--meter-track",
+        "mode": "dark",
+        "purpose": "Meter track.",
+        "tonalRamp": [
+          "#090b0e",
+          "#232529",
+          "#404246",
+          "#5f6166",
+          "#808287",
+          "#a2a5aa",
+          "#c7c9ce",
+          "#eceef4"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "answer": {
+        "displayName": "Answer",
+        "purpose": "The one H1 that answers the page's question. CSS sets width with font-stretch: 90%. 28 px below 1040 px."
+      },
+      "figure": {
+        "displayName": "Figure",
+        "purpose": "The two window figures under the answer. CSS sets width with font-stretch: 82%. 36 px below 640 px."
+      },
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "H1 on single-panel pages (approve, connected)."
+      },
+      "title-lg": {
+        "displayName": "Title Large",
+        "purpose": "Landing steps heading; 20 px figure unit at weight 500."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "Section headings, ledger usage values, step headings; ledes at weight 400."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "All running and table text, tabular figures on."
+      },
+      "body-sm": {
+        "displayName": "Body Small",
+        "purpose": "Descriptions, captions, hints, small buttons."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Column headers, account notes, reset times, status details."
+      },
+      "tag": {
+        "displayName": "Tag",
+        "purpose": "Plan tag only."
+      },
+      "mono-command": {
+        "displayName": "Mono Command",
+        "purpose": "Command blocks; 16 px weight 500 inside the answer."
+      },
+      "mono-alias": {
+        "displayName": "Mono Alias",
+        "purpose": "Aliases beside account names, in ink-3."
+      },
+      "mono-code": {
+        "displayName": "Mono Code",
+        "purpose": "The device code on the approval page only."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(0.16, 1, 0.3, 1)",
+        "purpose": "Every state transition (button colors, disclosure chevron)."
+      },
+      {
+        "name": "duration-state",
+        "value": "150ms",
+        "purpose": "Button color changes and the disclosure chevron rotation."
+      },
+      {
+        "name": "copied-hold",
+        "value": "2000ms",
+        "purpose": "How long a Copy button shows Copied before reverting."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "transition: none",
+        "purpose": "All transitions off under prefers-reduced-motion: reduce."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "lead-tight",
+        "value": "1040px",
+        "purpose": "Lead gap 32 px; answer heading 28 px."
+      },
+      {
+        "name": "stack",
+        "value": "900px",
+        "purpose": "Two-column pages stack to one column."
+      },
+      {
+        "name": "table-stack",
+        "value": "860px",
+        "purpose": "Ledger and machines rows restyle as grids with inline labels; ARIA roles keep table semantics."
+      },
+      {
+        "name": "phone",
+        "value": "640px",
+        "purpose": "Tighter vertical rhythm; figures 36 px; answer command 14 px."
+      },
+      {
+        "name": "coarse-pointer",
+        "value": "(pointer: coarse)",
+        "purpose": "Standalone text controls grow from 24 px to 44 px."
+      }
+    ],
+    "layout": {
+      "page": "1200px",
+      "gutter": "clamp(16px, 4vw, 40px)",
+      "panel": "440px",
+      "measureRule": "62ch",
+      "measureLede": "38ch"
+    }
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "One per decision: the answer's Copy, Sign in, Connect machine.",
+      "html": "<button class=\"ds-btn ds-btn-primary\" type=\"button\">Copy</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 16px; border: 1px solid var(--line-strong, #cfcfc8); border-radius: 6px; background: var(--surface, #ffffff); color: var(--ink, #18191b); font: 600 14px/1 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; white-space: nowrap; cursor: pointer; transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms cubic-bezier(0.16, 1, 0.3, 1), color 150ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn:hover { border-color: var(--ink-3, #63676e); } .ds-btn:active { transform: translateY(1px); } .ds-btn:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; } .ds-btn-primary { border-color: var(--accent, #2443c4); background: var(--accent, #2443c4); color: var(--accent-ink, #ffffff); } .ds-btn-primary:hover { background: color-mix(in srgb, var(--accent, #2443c4) 86%, var(--ink, #18191b)); border-color: color-mix(in srgb, var(--accent, #2443c4) 86%, var(--ink, #18191b)); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Default control: white sheet, strong-rule border.",
+      "html": "<button class=\"ds-btn\" type=\"button\">Retry now</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 16px; border: 1px solid var(--line-strong, #cfcfc8); border-radius: 6px; background: var(--surface, #ffffff); color: var(--ink, #18191b); font: 600 14px/1 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; white-space: nowrap; cursor: pointer; transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms cubic-bezier(0.16, 1, 0.3, 1), color 150ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn:hover { border-color: var(--ink-3, #63676e); } .ds-btn:active { transform: translateY(1px); } .ds-btn:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; }"
+    },
+    {
+      "name": "Small Copy Button",
+      "kind": "button",
+      "refersTo": "button-small",
+      "description": "Copy beside list commands; turns green for 2 s after copying.",
+      "html": "<button class=\"ds-btn ds-btn-small\" type=\"button\">Copy</button> <button class=\"ds-btn ds-btn-small ds-copied\" type=\"button\">Copied</button>",
+      "css": ".ds-btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 16px; border: 1px solid var(--line-strong, #cfcfc8); border-radius: 6px; background: var(--surface, #ffffff); color: var(--ink, #18191b); font: 600 14px/1 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; white-space: nowrap; cursor: pointer; transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms cubic-bezier(0.16, 1, 0.3, 1), color 150ms cubic-bezier(0.16, 1, 0.3, 1); } .ds-btn:hover { border-color: var(--ink-3, #63676e); } .ds-btn:active { transform: translateY(1px); } .ds-btn:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; } .ds-btn-small { min-height: 28px; padding: 0 12px; font-size: 13px; } .ds-copied { border-color: var(--ok, #1d7646); color: var(--ok, #1d7646); }"
+    },
+    {
+      "name": "Link Button",
+      "kind": "button",
+      "description": "Inline text control such as Sign out.",
+      "html": "<button class=\"ds-link-btn\" type=\"button\">Sign out</button>",
+      "css": ".ds-link-btn { display: inline-flex; align-items: center; min-height: 24px; padding: 0; border: 0; background: none; color: var(--ink, #18191b); font: 400 13px/1.5 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; text-decoration: underline; text-decoration-color: var(--line-strong, #cfcfc8); text-underline-offset: 3px; cursor: pointer; } .ds-link-btn:hover { text-decoration-color: currentColor; } .ds-link-btn:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; border-radius: 3px; }"
+    },
+    {
+      "name": "State Indicator",
+      "kind": "chip",
+      "description": "A 7 px dot and one word; color only for exceptions, cobalt never.",
+      "html": "<span class=\"ds-state ds-ok\">Available</span> <span class=\"ds-state\">In use</span> <span class=\"ds-state ds-warn\">Stale usage</span> <span class=\"ds-state ds-bad\">Exhausted</span> <span class=\"ds-state ds-pending\">Renewal pending</span> <span class=\"ds-state ds-idle\">Idle</span>",
+      "css": ".ds-state { display: inline-flex; align-items: center; gap: 6px; margin-right: 16px; color: var(--ink, #18191b); font: 500 14px/1.5 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; white-space: nowrap; } .ds-state::before { content: \"\"; flex: none; width: 7px; height: 7px; border-radius: 50%; background: currentColor; } .ds-ok::before { background: var(--ok, #1d7646); } .ds-warn { color: var(--warn, #8a5300); } .ds-bad { color: var(--bad, #b3261e); } .ds-pending { color: var(--ink-2, #4f5258); } .ds-idle { color: var(--ink-3, #63676e); } .ds-pending::before, .ds-idle::before { background: transparent; border: 1.5px solid currentColor; }"
+    },
+    {
+      "name": "Plan Tag",
+      "kind": "chip",
+      "refersTo": "tag-plan",
+      "description": "Plan only, beside the mono alias.",
+      "html": "<span class=\"ds-alias\">studio</span> <span class=\"ds-tag\">PRO</span>",
+      "css": ".ds-tag { display: inline-block; padding: 0 5px; border-radius: 4px; background: var(--sunken, #efefea); color: var(--ink-2, #4f5258); font: 600 11px/18px \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; letter-spacing: 0.03em; white-space: nowrap; } .ds-alias { margin-right: 8px; color: var(--ink-3, #63676e); font: 400 12px/1.5 \"JetBrains Mono\", ui-monospace, \"SF Mono\", Menlo, monospace; }"
+    },
+    {
+      "name": "Meter",
+      "kind": "custom",
+      "refersTo": "meter",
+      "description": "Fill is what is left. Default, low (amber), and unknown (dotted rule).",
+      "html": "<div class=\"ds-meter\"><i style=\"width:76%\"></i></div><div class=\"ds-meter ds-meter-warn\"><i style=\"width:4%\"></i></div><div class=\"ds-meter ds-meter-unknown\"></div>",
+      "css": ".ds-meter { position: relative; width: 200px; height: 4px; margin: 12px 0; border-radius: 2px; background: var(--meter-track, #e3e3dc); overflow: hidden; } .ds-meter > i { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--meter, #2c2e33); } .ds-meter-warn > i { background: var(--warn-fill, #b06d00); } .ds-meter-unknown { height: 0; margin-block: 14px; border-top: 2px dotted var(--line-strong, #cfcfc8); border-radius: 0; background: none; }"
+    },
+    {
+      "name": "Command Block",
+      "kind": "custom",
+      "refersTo": "command-block",
+      "description": "Commands exactly as typed; flags cobalt, prompt unselectable, long lines scroll inside.",
+      "html": "<div class=\"ds-command\"><pre><code><span class=\"ds-prompt\">$ </span>codexctl connect \\\n  <span class=\"ds-flag\">--name</span> \"<span class=\"ds-ph\">&lt;machine&gt;</span>\"</code></pre><button class=\"ds-copy\" type=\"button\">Copy</button></div>",
+      "css": ".ds-command { display: flex; align-items: flex-start; gap: 8px; max-width: 420px; border-radius: 10px; background: var(--sunken, #efefea); } .ds-command pre { flex: 1; min-width: 0; margin: 0; padding: 12px 0 12px 16px; overflow-x: auto; color: var(--ink, #18191b); font: 400 13px/1.7 \"JetBrains Mono\", ui-monospace, \"SF Mono\", Menlo, monospace; white-space: pre; } .ds-flag { color: var(--accent, #2443c4); } .ds-ph { color: var(--ink-2, #4f5258); font-style: italic; } .ds-prompt { color: var(--ink-3, #63676e); user-select: none; } .ds-copy { flex: none; margin: 8px 8px 8px 0; min-height: 28px; padding: 0 12px; border: 1px solid var(--line-strong, #cfcfc8); border-radius: 6px; background: var(--surface, #ffffff); color: var(--ink, #18191b); font: 600 13px/1 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; cursor: pointer; } .ds-copy:hover { border-color: var(--ink-3, #63676e); } .ds-copy:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; }"
+    },
+    {
+      "name": "Notice",
+      "kind": "card",
+      "refersTo": "notice",
+      "description": "One per page for a page-wide condition, with its next step.",
+      "html": "<div class=\"ds-notice\"><p><strong>Refresh failed.</strong> Showing the last observation from 4 min ago.</p><button class=\"ds-notice-btn\" type=\"button\">Retry now</button></div>",
+      "css": ".ds-notice { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 16px; padding: 12px 12px 12px 16px; border-radius: 6px; background: var(--warn-soft, #fbf1df); color: var(--ink, #18191b); font: 400 14px/1.5 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; } .ds-notice p { margin: 0; } .ds-notice strong { color: var(--warn, #8a5300); } .ds-notice-btn { min-height: 28px; padding: 0 12px; border: 1px solid var(--line-strong, #cfcfc8); border-radius: 6px; background: var(--surface, #ffffff); color: var(--ink, #18191b); font: 600 13px/1 \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; cursor: pointer; } .ds-notice-btn:hover { border-color: var(--ink-3, #63676e); } .ds-notice-btn:focus-visible { outline: 2px solid var(--accent, #2443c4); outline-offset: 2px; }"
+    },
+    {
+      "name": "Answer Figure",
+      "kind": "custom",
+      "description": "Condensed 44 px figure over a meter and a label, in a hairline-ruled band.",
+      "html": "<div class=\"ds-figures\"><div class=\"ds-figure\"><span class=\"ds-fv\">76<small>%</small></span><div class=\"ds-meter\"><i style=\"width:76%\"></i></div><span class=\"ds-fl\">5-hour left · <span>resets in 3h 31m</span></span></div><div class=\"ds-figure\"><span class=\"ds-fv\">58<small>%</small></span><div class=\"ds-meter\"><i style=\"width:58%\"></i></div><span class=\"ds-fl\">7-day left · <span>resets in 3d 5h</span></span></div></div>",
+      "css": ".ds-figures { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; max-width: 520px; padding-block: 16px; border-block: 1px solid var(--line, #e3e3dd); font-family: \"Instrument Sans\", ui-sans-serif, system-ui, sans-serif; font-feature-settings: \"tnum\" 1; } .ds-figure { display: grid; gap: 6px; } .ds-fv { color: var(--ink, #18191b); font-size: 44px; font-stretch: 82%; font-weight: 600; letter-spacing: -0.03em; line-height: 1; } .ds-fv small { margin-left: 2px; color: var(--ink-3, #63676e); font-size: 20px; font-stretch: 100%; font-weight: 500; letter-spacing: 0; } .ds-meter { position: relative; height: 4px; border-radius: 2px; background: var(--meter-track, #e3e3dc); overflow: hidden; } .ds-meter > i { position: absolute; inset: 0 auto 0 0; background: var(--meter, #2c2e33); } .ds-fl { color: var(--ink-2, #4f5258); font-size: 13px; } .ds-fl span { color: var(--ink-3, #63676e); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Quiet Ledger",
+    "overview": "**Creative North Star: \"The Quiet Ledger\"**\n\nThe web UI reads like a well-kept ledger on warm paper. Ink text, hairline rules, and one cobalt accent do all the work; there are no cards, no shadows, and no decorative surfaces. Hierarchy comes from size, weight, and three gray steps of ink, never from boxes or fills. The few filled surfaces (command blocks, the plan tag, the device code, the single page notice, and the recommended ledger row) are filled because they hold something to copy, compare, or act on.\n\nThe system is dense but calm. Body text is 14 px with tabular figures so every column of numbers aligns. Numbers that answer the visitor's question are set large and condensed, using the variable width axis of Instrument Sans. Commands are set in JetBrains Mono exactly as typed, and they never wrap mid-token. Status color appears only for exceptions and always sits beside a word, so a monochrome reading loses nothing.\n\nv3 keeps the v2 visual world recorded in `README.md` and changes structure, not material. The token deltas from v2 are: `ink-3` darkened from `#686c73` to `#63676e` (light) and `#8e9197` to `#8f9298` (dark) so tertiary text passes AA on the recommended row; `--t-display` replaced by a fixed 36 px answer heading; figures grown from 40 px to 44 px; body leading raised to 1.5; a 0.01em body tracking in dark mode; dark `surface`, `sunken`, `line`, `line-strong`, `accent-soft`, and `meter-track` slightly lifted; `bad-soft` removed; the unknown meter changed from a stripe to a dotted rule; and cobalt withdrawn from \"In use\" and \"Renewal pending\".",
+    "keyCharacteristics": [
+      "Warm paper ground, near-black ink, three ink steps for hierarchy.",
+      "One cobalt accent for action and \"use this\"; amber and red for exceptions only, each with a word.",
+      "Hairlines between rows and one stronger rule under each section heading; no cards, no shadows.",
+      "Instrument Sans with tabular figures; condensed width for the answer heading and figures only.",
+      "JetBrains Mono for aliases, commands, the device code, and the wordmark only.",
+      "Dark mode swaps tokens; no component has dark-specific rules."
+    ],
+    "rules": [
+      {
+        "name": "The One Cobalt Rule",
+        "body": "Cobalt means \"act\" or \"use this\". It never marks a status: \"In use\" is ink with an ink dot, and \"Renewal pending\" is ink-2 with a hollow dot.",
+        "section": "colors"
+      },
+      {
+        "name": "The Word Beside Every Color Rule",
+        "body": "Amber, red, and green never appear without a word that carries the same meaning. Healthy rows are ink on paper.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tabular Figures Rule",
+        "body": "The body enables `tnum`, so every number in every column aligns. Mono and code reset it to normal.",
+        "section": "typography"
+      },
+      {
+        "name": "The Mono Means Typed Rule",
+        "body": "JetBrains Mono appears only for text a person types or reads back to a terminal: aliases, commands, the device code, and the wordmark.",
+        "section": "typography"
+      },
+      {
+        "name": "The Condensed Answer Rule",
+        "body": "The width axis narrows only the answer heading (90%) and figures (82%). Nothing else is condensed.",
+        "section": "typography"
+      },
+      {
+        "name": "The Lines, Not Boxes Rule",
+        "body": "Structure comes from one strong rule under each section heading and hairlines between rows, never from bordered containers.",
+        "section": "layout"
+      },
+      {
+        "name": "The Flat Paper Rule",
+        "body": "No `box-shadow`, no elevation tokens. A surface is either paper, sunken paper, or a wash (cobalt for the recommended row, amber for the notice).",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do open every page on the answer to its visitor's question, with the action beside it.",
+      "Do fill meters with what is left, matching the figure next to them.",
+      "Do put a word beside every amber, red, or green mark.",
+      "Do show \"Unknown\" with a dotted rule, and keep stale figures in ink-2 with \"Last observed\" and an age.",
+      "Do set commands exactly as typed in a sunken block with a Copy button; scroll long lines inside the block.",
+      "Do keep standalone text controls at least 24 px tall, and 44 px on coarse pointers.",
+      "Do swap tokens for dark mode; never add dark-specific component rules."
+    ],
+    "donts": [
+      "Don't use cobalt for a status such as \"In use\" or \"Renewal pending\"; it marks action and \"use this\" only.",
+      "Don't wrap content in bordered or shadowed cards; use hairlines and the section rule.",
+      "Don't add shadows or elevation of any kind.",
+      "Don't put eyebrow or kicker labels above headings; a heading and a count are enough.",
+      "Don't condense any text other than the answer heading and figures.",
+      "Don't use mono for prose, labels, or numbers that are not typed into a terminal.",
+      "Don't repeat a page-wide notice or badge on every row.",
+      "Don't let a command token break across lines.",
+      "Don't use a patterned or striped fill to mean \"unknown\"."
+    ]
+  }
+}

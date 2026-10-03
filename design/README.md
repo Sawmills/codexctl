@@ -1,5 +1,7 @@
 # codexctl UI v2 Design Direction
 
+> **Superseded by v3.** [`v3/`](v3/) rebuilds the structure from jobs to be done ([`v3/JTBD.md`](v3/JTBD.md)) and keeps this visual world. Published at https://codexctl-ui-v3.brisk.sm-svc.com/. This document stays as the v2 record.
+
 UI v2 turns the web app into a quiet ledger: one typeface family, hairlines instead of cards, one accent color, and numbers that read at a glance. Every page answers its main question in the first screen. On `/accounts` that question is "which account does each machine use, and how much does it have left?"
 
 Prototype: [`prototype/`](prototype/) (published at https://codexctl-ui-v2.brisk.sm-svc.com/). Screenshots: [`prototype/shots/`](prototype/shots/), each page at 1440 px and 390 px in light and dark. The current UI for comparison is in [`current/`](current/).

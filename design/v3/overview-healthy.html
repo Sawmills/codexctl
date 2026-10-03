@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f7f7f4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121314" media="(prefers-color-scheme: dark)" />
+    <title>Accounts · codexctl</title>
+    <link rel="preload" href="fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <a class="wordmark" href="overview.html" translate="no" aria-label="codexctl accounts">codexctl<span class="caret" aria-hidden="true"></span></a>
+        <div class="identity">
+          <span class="email" translate="no" title="amir@example.com">amir@example.com</span>
+          <form action="index.html" method="get"><button class="link-button" type="submit">Sign out</button></form>
+        </div>
+      </div>
+    </header>
+    <main id="main" class="wrap">
+
+<div class="lead">
+<section class="answer" aria-labelledby="answer-title">
+<h1 id="answer-title">Feature sprint <span class="alias" translate="no">sprint</span> is the best account now</h1>
+<p class="context">Studio MacBook already uses it. Nothing needs a switch.</p>
+<div class="figures">
+<div class="figure">
+  <span class="figure-value">64<small>%</small></span>
+  <div class="meter" aria-hidden="true"><i style="--left: 64%"></i></div>
+  <span class="figure-label">5-hour left · <span>resets in <time datetime="2026-10-03T16:20:00Z" title="Oct 3, 12:20 PM EDT">2h 40m</time></span></span>
+</div>
+<div class="figure">
+  <span class="figure-value">22<small>%</small></span>
+  <div class="meter" aria-hidden="true"><i style="--left: 22%"></i></div>
+  <span class="figure-label">7-day left · <span>resets in <time datetime="2026-10-05T09:40:00Z" title="Oct 5, 5:40 AM EDT">1d 20h</time></span></span>
+</div>
+</div>
+<p class="next-step">To move another machine to it, run this there:</p>
+<div class="command">
+  <pre><code id="cmd-use" translate="no"><span class="prompt">$ </span>codexctl use sprint</code></pre>
+  <button class="button small copy" type="button" data-copy="cmd-use" aria-label="Copy codexctl use sprint">Copy</button>
+</div>
+<p class="effect">On that machine, running Codex sessions move to Feature sprint within 60 seconds.</p>
+<p class="rule">Chosen like <code translate="no">codexctl use</code>: included usage only, no account at 95% used or more while another is below, soonest 7-day reset first. Updated <time datetime="2026-10-03T13:39:52Z" title="Oct 3, 9:39:52 AM EDT">8 s ago</time>.</p>
+</section>
+<section class="attention" aria-labelledby="attention-title">
+<div class="section-head"><h2 id="attention-title">Needs attention</h2></div>
+<div class="all-clear"><span class="state ok">Nothing needs attention</span><p>All 4 accounts can deliver tokens.</p></div>
+<p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
+</section>
+</div>
+<section class="section" aria-labelledby="accounts-title">
+<div class="section-head">
+  <h2 id="accounts-title">Accounts <span class="count">4</span></h2>
+  <p>In use first, then the recommendation, then most room; stale and unknown last</p>
+</div>
+<table class="ledger" role="table" aria-labelledby="accounts-title">
+<thead role="rowgroup"><tr role="row">
+  <th role="columnheader" scope="col">Account</th>
+  <th role="columnheader" scope="col" class="col-usage">5-hour window</th>
+  <th role="columnheader" scope="col" class="col-usage">7-day window</th>
+  <th role="columnheader" scope="col" class="col-banked">Banked resets</th>
+  <th role="columnheader" scope="col" class="col-state">State</th>
+</tr></thead>
+<tbody role="rowgroup">
+<tr role="row" class="recommended">
+<td role="cell" class="cell-account"><div class="account-name"><strong>Feature sprint</strong><span class="line"><span class="alias" translate="no">sprint</span><span class="tag">PRO</span></span><span class="note live">In use on Studio MacBook</span><span class="note pick">Recommended</span></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">5-hour</span><div class="usage"><div class="usage-top"><span class="usage-value">64%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-03T16:20:00Z" title="Oct 3, 12:20 PM EDT">2h 40m</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 64%"></i></div></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">7-day</span><div class="usage"><div class="usage-top"><span class="usage-value">22%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-05T09:40:00Z" title="Oct 5, 5:40 AM EDT">1d 20h</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 22%"></i></div></div></td>
+<td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>1</b><span>expires Oct 19</span></div></td>
+<td role="cell" class="cell-state"><div class="status"><span class="state ok">Available</span></div></td>
+</tr>
+<tr role="row">
+<td role="cell" class="cell-account"><div class="account-name"><strong>Extra capacity</strong><span class="line"><span class="alias" translate="no">reserve</span><span class="tag">PRO</span></span><span class="note live">In use on Linux build machine</span></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">5-hour</span><div class="usage"><div class="usage-top"><span class="usage-value">88%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-03T17:35:00Z" title="Oct 3, 1:35 PM EDT">3h 55m</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 88%"></i></div></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">7-day</span><div class="usage"><div class="usage-top"><span class="usage-value">84%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-08T12:40:00Z" title="Oct 8, 8:40 AM EDT">4d 23h</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 84%"></i></div></div></td>
+<td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><span>None</span></div></td>
+<td role="cell" class="cell-state"><div class="status"><span class="state ok">Available</span></div></td>
+</tr>
+<tr role="row">
+<td role="cell" class="cell-account"><div class="account-name"><strong>Team credits</strong><span class="line"><span class="alias" translate="no">credits</span><span class="tag">TEAM</span></span><span class="note billing">Usage-based · bills credits</span></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">5-hour</span><div class="usage"><div class="usage-top"><span class="usage-value">92%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-03T16:02:00Z" title="Oct 3, 12:02 PM EDT">2h 22m</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 92%"></i></div></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">7-day</span><div class="usage"><div class="usage-top"><span class="usage-value">95%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-09T15:00:00Z" title="Oct 9, 11:00 AM EDT">6d 1h</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 95%"></i></div></div></td>
+<td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><span>None</span></div></td>
+<td role="cell" class="cell-state"><div class="status"><span class="state ok">Available</span><span class="status-detail">Never chosen automatically</span></div></td>
+</tr>
+<tr role="row">
+<td role="cell" class="cell-account"><div class="account-name"><strong>Everyday building</strong><span class="line"><span class="alias" translate="no">studio</span><span class="tag">PRO</span></span></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">5-hour</span><div class="usage"><div class="usage-top"><span class="usage-value">76%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-03T17:11:00Z" title="Oct 3, 1:11 PM EDT">3h 31m</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 76%"></i></div></div></td>
+<td role="cell" class="cell-usage"><span class="cell-label" aria-hidden="true">7-day</span><div class="usage"><div class="usage-top"><span class="usage-value">58%<small>left</small></span><span class="usage-reset">resets in <time datetime="2026-10-06T18:40:00Z" title="Oct 6, 2:40 PM EDT">3d 5h</time></span></div><div class="meter" aria-hidden="true"><i style="--left: 58%"></i></div></div></td>
+<td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>2</b><span>next expires Oct 17</span></div></td>
+<td role="cell" class="cell-state"><div class="status"><span class="state ok">Available</span></div></td>
+</tr>
+</tbody>
+</table>
+</section>
+<section class="section" aria-labelledby="machines-title">
+<div class="section-head">
+  <h2 id="machines-title">Machines <span class="count">3</span></h2>
+  <p>The account each machine last received a token for</p>
+</div>
+<table class="machines" role="table" aria-labelledby="machines-title">
+<thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Machine</th><th role="columnheader" scope="col">Account</th><th role="columnheader" scope="col" class="col-seen">Last token delivery</th><th role="columnheader" scope="col" class="col-state">State</th></tr></thead>
+<tbody role="rowgroup">
+<tr role="row"><td role="cell">Studio MacBook</td><td role="cell" class="cell-account">Feature sprint<span class="alias" translate="no">sprint</span></td><td role="cell" class="cell-seen"><span class="seen"><time datetime="2026-10-03T13:39:40Z" title="Oct 3, 9:39 AM EDT">Just now</time></span></td><td role="cell" class="cell-state"><span class="state live">In use</span></td></tr>
+<tr role="row"><td role="cell">Linux build machine</td><td role="cell" class="cell-account">Extra capacity<span class="alias" translate="no">reserve</span></td><td role="cell" class="cell-seen"><span class="seen"><time datetime="2026-10-03T13:37:40Z" title="Oct 3, 9:37 AM EDT">2 min ago</time></span></td><td role="cell" class="cell-state"><span class="state live">In use</span></td></tr>
+<tr role="row" class="idle"><td role="cell">Travel Air</td><td role="cell" class="cell-account">Everyday building<span class="alias" translate="no">studio</span></td><td role="cell" class="cell-seen"><span class="seen"><time datetime="2026-09-30T22:12:00Z" title="Sep 30, 6:12 PM EDT">Sep 30, 6:12 PM</time></span></td><td role="cell" class="cell-state"><span class="state idle">Idle</span></td></tr>
+</tbody>
+</table>
+<p class="machines-note">“In use” means a token delivery in the last 5 minutes. The server cannot see whether a session is still running.</p>
+<details class="revoked" data-param="revoked" data-value="show"><summary>1 revoked machine</summary><ul><li><b>Old iMac</b><span>Revoked</span><span>Last token delivery <time datetime="2026-08-12T15:02:00Z" title="Aug 12, 11:02 AM EDT">Aug 12</time></span></li></ul></details>
+</section>
+    </main>
+    <footer class="wrap footer">
+      <span translate="no">codexctl v0.1.37</span>
+      <a href="https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md">Documentation</a>
+      <nav class="proto-nav" aria-label="Prototype pages">
+        <span>Prototype:</span>
+<a href="index.html">Signed out</a>
+<a href="overview.html">Accounts</a>
+<a href="overview-healthy.html" aria-current="page">Accounts, all healthy</a>
+<a href="overview-blocked.html">Accounts, nothing left</a>
+<a href="overview-stale.html">Accounts, refresh failed</a>
+<a href="approve.html">Approve machine</a>
+<a href="connected.html">Connected</a>
+      </nav>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>
