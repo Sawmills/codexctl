@@ -194,6 +194,13 @@ fn instance_holder_id() -> String {
     let boot_nonce = vault::digest(&enrollment::random_bytes());
     vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
 }
+
+fn credential_revision(auth: &Value) -> i64 {
+    vault::token(auth)
+        .ok()
+        .and_then(|token| api::token_issued_at(token).or_else(|| api::token_expiry(token)))
+        .unwrap_or(0)
+}
 fn account_summary(owner: &Owner) -> Account {
     let limits = owner.limits.as_ref().map(|v| &v["rateLimits"]);
     let usage = owner
@@ -261,13 +268,15 @@ impl Broker {
             return Ok(());
         };
         let record = CredentialRecord {
-            account_id: vault::account(&owner.vault.auth)?,
+            account_id: account_key(&owner.vault.user, &owner.vault.alias),
             user_id: Some(owner.vault.user.clone()),
             alias: owner.vault.alias.clone(),
-            workspace: None,
-            login: None,
+            workspace: Some(vault::account(&owner.vault.auth)?),
+            login: vault::token(&owner.vault.auth)
+                .ok()
+                .and_then(api::token_subject),
             vault: serde_json::to_value(&owner.vault)?,
-            revision: chrono::Utc::now().timestamp_micros(),
+            revision: credential_revision(&owner.vault.auth),
         };
         central.save_account(&record).await
     }
@@ -391,8 +400,7 @@ async fn token(
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
         let mut owner = owner.lock().await;
-        let account_id = vault::account(&owner.vault.auth)
-            .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         let lease = if request.previous_revision.is_some() {
             if let Some(central) = worker.central.as_ref() {
                 // Ensure the FK target exists before the first forced refresh
@@ -426,11 +434,17 @@ async fn token(
             account_id: account_id.clone(),
             user_id: Some(owner.vault.user.clone()),
             alias: owner.vault.alias.clone(),
-            workspace: None,
-            login: None,
+            workspace: Some(
+                vault::account(&owner.vault.auth).map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })?,
+            ),
+            login: vault::token(&owner.vault.auth)
+                .ok()
+                .and_then(api::token_subject),
             vault: serde_json::to_value(&owner.vault)
                 .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?,
-            revision: chrono::Utc::now().timestamp_micros(),
+            revision: credential_revision(&owner.vault.auth),
         };
         let written = if let Some(central) = worker.central.as_ref() {
             if let Some(lease) = lease {
@@ -438,9 +452,12 @@ async fn token(
                     worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?
             } else {
-                central.save_account(&record).await.map_err(|_| {
-                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?;
+                if let Err(error) = central.save_account(&record).await {
+                    // The local vault remains authoritative in dual mode for
+                    // cached-token delivery. Readiness exposes the DB outage;
+                    // token delivery stays available while the mirror recovers.
+                    eprintln!("central store cached-token mirror: {error:#}");
+                }
                 true
             }
         } else {
@@ -789,16 +806,18 @@ impl Broker {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
                 let owner_record = CredentialRecord {
-                    account_id: vault::account(&saved.auth)
-                        .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                    account_id: account_key(&saved.user, &saved.alias),
                     user_id: Some(saved.user.clone()),
                     alias: saved.alias.clone(),
-                    workspace: None,
-                    login: None,
+                    workspace: Some(
+                        vault::account(&saved.auth)
+                            .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                    ),
+                    login: vault::token(&saved.auth).ok().and_then(api::token_subject),
                     vault: serde_json::to_value(&saved).map_err(|_| {
                         self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                     })?,
-                    revision: chrono::Utc::now().timestamp_micros(),
+                    revision: credential_revision(&saved.auth),
                 };
                 if let Some(central) = self.central.as_ref() {
                     central.save_account(&owner_record).await.map_err(|_| {
@@ -821,16 +840,18 @@ impl Broker {
             vault::save(&state, &self.key, &vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             let owner_record = CredentialRecord {
-                account_id: vault::account(&vault.auth)
-                    .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                account_id: account_key(&vault.user, &vault.alias),
                 user_id: Some(vault.user.clone()),
                 alias: vault.alias.clone(),
-                workspace: None,
-                login: None,
+                workspace: Some(
+                    vault::account(&vault.auth)
+                        .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                ),
+                login: vault::token(&vault.auth).ok().and_then(api::token_subject),
                 vault: serde_json::to_value(&vault).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?,
-                revision: chrono::Utc::now().timestamp_micros(),
+                revision: credential_revision(&vault.auth),
             };
             if let Some(central) = self.central.as_ref() {
                 central.save_account(&owner_record).await.map_err(|_| {
