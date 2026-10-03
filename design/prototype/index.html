@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f7f7f4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121314" media="(prefers-color-scheme: dark)" />
+    <meta name="description" content="Manage your OpenAI Codex accounts across all your machines." />
+    <title>codexctl · Your Codex accounts on every machine</title>
+    <link rel="preload" href="fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <a class="wordmark" href="index.html" translate="no" aria-label="codexctl home">codexctl<span class="caret" aria-hidden="true"></span></a>
+        <a class="identity" href="accounts.html">Sign in</a>
+      </div>
+    </header>
+
+    <main id="main" class="wrap landing">
+      <section class="intro" aria-labelledby="title">
+        <h1 id="title">Your Codex accounts, on every machine.</h1>
+        <p class="lede">
+          codexctl keeps your OpenAI Codex logins on a private account server.
+          Every machine you connect can use them, and you can see what each one
+          has left.
+        </p>
+        <div class="actions">
+          <a class="button primary" href="accounts.html">Sign in with company SSO</a>
+          <p>Already connected a machine? Sign in to see your accounts.</p>
+        </div>
+        <ul class="facts" aria-label="After you sign in">
+          <li>Which account each machine uses now</li>
+          <li>5-hour and 7-day usage, with reset times</li>
+          <li>Banked resets and when they expire</li>
+          <li>Accounts that need a new login</li>
+        </ul>
+        <p class="server-status" role="status" aria-live="polite">
+          <span class="state ok">Server ready</span>
+        </p>
+      </section>
+
+      <section aria-labelledby="connect-title">
+        <div class="steps-head">
+          <h2 id="connect-title">Connect a machine</h2>
+          <span class="faint">About 2 minutes</span>
+        </div>
+        <ol class="steps">
+          <li class="step">
+            <div class="step-body">
+              <h3>Install codexctl</h3>
+              <p class="platform">macOS <span>Homebrew</span></p>
+              <div class="command">
+                <pre><code id="mac-install" translate="no">brew install sawmills/tap/codexctl</code></pre>
+                <button class="button small copy" type="button" data-copy="mac-install" aria-label="Copy macOS install command">Copy</button>
+              </div>
+              <details data-param="platform" data-value="linux">
+                <summary>Linux <span class="faint">arm64 and x86_64</span></summary>
+                <p class="muted">
+                  Pinned to v0.1.36. The script checks the SHA-256 checksum before
+                  it installs. Requires curl, tar, and sha256sum.
+                </p>
+                <div class="command">
+                  <pre><code id="linux-install" translate="no">(
+  set -eu
+  case "$(uname -m)" in
+    aarch64|arm64) arch=arm64 ;;
+    x86_64) arch=x86_64 ;;
+    *) echo "Unsupported architecture" &gt;&amp;2; exit 1 ;;
+  esac
+  version=v0.1.36
+  archive="codexctl_${version}_Linux_${arch}.tar.gz"
+  base="https://github.com/Sawmills/codexctl/releases/download/${version}"
+  work=$(mktemp -d)
+  trap 'rm -rf "$work"' EXIT
+  cd "$work"
+  curl -fLO "$base/$archive"
+  curl -fLO "$base/$archive.sha256"
+  sha256sum --check "$archive.sha256"
+  tar -xzf "$archive"
+  mkdir -p "$HOME/.local/bin"
+  install -m 755 codexctl "$HOME/.local/bin/codexctl"
+)
+export PATH="$HOME/.local/bin:$PATH"
+codexctl --version</code></pre>
+                  <button class="button small copy" type="button" data-copy="linux-install" aria-label="Copy Linux install commands">Copy</button>
+                </div>
+                <p class="hint">
+                  Add <code translate="no">$HOME/.local/bin</code> to your shell’s
+                  PATH so new terminals find the command.
+                </p>
+              </details>
+            </div>
+          </li>
+          <li class="step">
+            <div class="step-body">
+              <h3>Connect to your account server</h3>
+              <div class="command">
+                <pre><code id="connect-command" translate="no">codexctl connect \
+  <span class="flag">--server</span> 'https://codexctl.ue1.staging.plat.sm-svc.com' \
+  <span class="flag">--name</span> "<span class="placeholder">&lt;machine&gt;</span>"</code></pre>
+                <button class="button small copy" type="button" data-copy="connect-command" aria-label="Copy machine connection command">Copy</button>
+              </div>
+              <p>Replace <code translate="no">&lt;machine&gt;</code> with a name you will recognize, such as “Studio MacBook”.</p>
+            </div>
+          </li>
+          <li class="step">
+            <div class="step-body">
+              <h3>Approve it in your browser</h3>
+              <p>
+                codexctl opens a page. Sign in with company SSO, check that the
+                code matches your terminal, then approve the machine.
+              </p>
+              <p class="hint">
+                No browser on that machine? Add <code translate="no">--no-browser</code>
+                and open the printed link on another device.
+              </p>
+            </div>
+          </li>
+        </ol>
+        <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
+      </section>
+    </main>
+
+    <footer class="wrap footer">
+      <span translate="no">codexctl v0.1.36</span>
+      <a href="https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md">Documentation</a>
+      <nav class="proto-nav" aria-label="Prototype pages">
+        <span>Prototype:</span>
+        <a href="index.html" aria-current="page">Landing</a>
+        <a href="accounts.html">Accounts</a>
+        <a href="accounts-stale.html">Accounts, refresh failed</a>
+        <a href="approve.html">Approve machine</a>
+        <a href="connected.html">Connected</a>
+      </nav>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>

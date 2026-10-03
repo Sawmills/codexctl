@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#f7f7f4" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#121314" media="(prefers-color-scheme: dark)" />
+    <title>Connect this machine · codexctl</title>
+    <link rel="preload" href="fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body class="enroll">
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <span class="wordmark" translate="no">codexctl<span class="caret" aria-hidden="true"></span></span>
+        <span class="faint">Machine setup</span>
+      </div>
+    </header>
+    <main id="main" class="wrap">
+      <section class="panel" aria-labelledby="page-title">
+        <p class="eyebrow">Confirm access</p>
+        <h1 id="page-title">Connect this machine?</h1>
+        <p class="lede">It will use your server accounts. You can revoke it later.</p>
+        <dl class="facts-list">
+          <div><dt>Signed in as</dt><dd translate="no">amir@sawmills.ai</dd></div>
+          <div><dt>Machine</dt><dd>Studio MacBook</dd></div>
+        </dl>
+        <div class="code-check">
+          <p class="label">Code shown in your terminal</p>
+          <code translate="no">WDJB-MJHT</code>
+          <p>Connect only if this code matches your terminal exactly.</p>
+        </div>
+        <!-- Production: method="post" action="/auth/approve" with the hidden approval field. -->
+        <form method="get" action="connected.html">
+          <input type="hidden" name="approval" value="{approval}" />
+          <button class="button primary" type="submit">Connect machine</button>
+        </form>
+        <p class="footnote">Not your account or machine? Close this page. Nothing connects until you approve.</p>
+      </section>
+    </main>
+    <footer class="wrap footer">
+      <span translate="no">codexctl v0.1.36</span>
+      <nav class="proto-nav" aria-label="Prototype pages">
+        <span>Prototype:</span>
+        <a href="index.html">Landing</a>
+        <a href="accounts.html">Accounts</a>
+        <a href="accounts-stale.html">Accounts, refresh failed</a>
+        <a href="approve.html" aria-current="page">Approve machine</a>
+        <a href="connected.html">Connected</a>
+      </nav>
+    </footer>
+  </body>
+</html>
