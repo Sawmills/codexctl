@@ -793,16 +793,17 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     let mut server_rows: Vec<_> = accounts
         .iter()
         .map(|account| {
+            let is_active = active.as_deref() == Some(&account.alias);
             let state = if !account.available {
                 "unavailable"
-            } else if active.as_deref() == Some(&account.alias) {
+            } else if is_active {
                 "active"
             } else {
                 "server"
             };
             DisplayRow {
                 cells: vec![
-                    account.alias.clone(),
+                    display_alias(&account.alias, is_active),
                     account.label.clone().unwrap_or_else(|| "-".into()),
                     account.plan.clone().unwrap_or_else(|| "-".into()),
                     percentage(account.primary_used),
@@ -833,7 +834,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     source: Source::Server,
                     state: if !account.available {
                         State::Unavailable
-                    } else if active.as_deref() == Some(&account.alias) {
+                    } else if is_active {
                         State::Active
                     } else {
                         State::Server
@@ -914,6 +915,15 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     }
     Ok(true)
 }
+
+fn display_alias(alias: &str, is_active: bool) -> String {
+    if is_active {
+        format!("* {alias}")
+    } else {
+        alias.to_owned()
+    }
+}
+
 pub fn whoami() -> Result<bool> {
     let Some(alias) = native::active_alias()? else {
         return Ok(false);

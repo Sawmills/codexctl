@@ -1132,6 +1132,32 @@ fn connected_status_formats_server_reset() {
 }
 
 #[test]
+fn connected_server_status_and_list_mark_the_active_account() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+
+    for command in [["status"], ["list"]] {
+        let output = server.cli(home.path(), &command);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{command:?}: {stdout}");
+        assert!(stdout.contains("* personal"), "{command:?}: {stdout}");
+        if command == ["status"] {
+            assert!(
+                stdout.contains("State") && stdout.contains("active"),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn connected_list_before_migration_shows_local_profiles() {
     let server = Server::start();
     let home = server.connected_home();
