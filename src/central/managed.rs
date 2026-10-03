@@ -1159,6 +1159,7 @@ pub async fn serve(
                 "catalog_owner_unavailable",
                 "reset_read_failed",
                 "reset_redeem_failed",
+                "reset_rejected",
                 "reset_auth_rejected",
                 "catalog_usage_failed",
                 "catalog_usage_timeout",

@@ -518,14 +518,14 @@ pub fn redeem_reset(alias: &str) -> Result<api::ConsumeResetResponse> {
         let reason = match error["error"].as_str() {
             Some("nothing_to_reset") => "no exhausted window; no reset was spent",
             Some("no_reset_credit") => "no qualifying banked reset is available",
-            Some("reset_pending") => {
-                "an earlier reset is unresolved; retry from the machine that started it"
+            Some("reset_rejected") => {
+                "provider rejected this operation; retry to start a new redemption"
             }
             _ => "reset outcome unknown; rerun the same command on this machine to retry safely",
         };
         if matches!(
             error["error"].as_str(),
-            Some("nothing_to_reset" | "no_reset_credit")
+            Some("nothing_to_reset" | "no_reset_credit" | "reset_rejected")
         ) {
             std::fs::remove_file(&pending)?;
             store::sync_directory(&directory)?;

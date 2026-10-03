@@ -201,7 +201,8 @@ pub fn run_redeem(alias: Option<&str>, assume_yes: bool, credit_id: Option<&str>
         }
     };
     #[cfg(feature = "central-prototype")]
-    if let Some(inventory) = codexctl::central::remote::resets()?
+    if !codexctl::central::native::known_local_alias(&alias)?
+        && let Some(inventory) = codexctl::central::remote::resets()?
         && inventory
             .accounts
             .iter()

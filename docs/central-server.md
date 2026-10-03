@@ -111,7 +111,9 @@ Redeem a server-account reset with `codexctl resets --redeem <alias>` (add `--ye
 The list command never spends a reset or approves credit billing.
 Both server and local redemption require an exhausted window and select the qualifying reset closest to expiry.
 `codexctl use --allow-resets` can redeem when no account has included headroom.
-Automatic selection excludes usage-based accounts and still checks billing before activation.
+Automatic selection excludes usage-based accounts and checks every local activation fence before spending.
+After redemption it retries billing reads briefly to allow usage to settle, without approving credit billing.
+If included usage remains unconfirmed, it reports that the reset was spent and activation is incomplete; wait and retry `codexctl use` without `--allow-resets`.
 Explicit account selection never redeems a reset. `--allow-resets` and `--allow-billing` remain separate approvals.
 
 The read-only `GET /v1/resets` endpoint requires a registered machine credential.
@@ -128,12 +130,18 @@ It saves the credit and provider idempotency key before sending, then saves the 
 Concurrent requests for one account are serialized. Repeating a completed request returns `already_redeemed`.
 An uncertain result retains the original credit and key across retries and server restarts;
 another operation cannot spend a second reset until that result is resolved.
-The client also persists its request ID. After a timeout or server error, rerun the same command on the same machine.
+The client also persists its request ID. After a timeout or server error, rerun the same redemption command.
+If that machine is lost, another registered machine of the same company user can reconcile the pending operation.
+The server reuses the original credit and provider key and records the result for both request IDs; it never starts a second spend during reconciliation.
+Definitive non-retryable provider 4xx responses and unrecognized redemption codes close the operation with `reset_rejected`.
+The failure receipt prevents a repeated ID from sending again, and the client clears its pending ID so a deliberate new command can try again.
+Transport failures, HTTP 408/429, server errors, and unreadable responses retain the pending operation.
 Do not delete the pending request files to bypass an unresolved outcome.
 A retry of an already-sent operation may query the provider even after the exhausted window has cleared;
 it uses the original idempotency key and cannot authorize another spend.
 The server finishes persistence after a client disconnect and drains redemptions during graceful shutdown.
-Provider and persistence failures increment the bounded `reset_redeem_failed` metric, included in the existing operational alert.
+Provider and persistence failures increment the bounded `reset_redeem_failed` metric; terminal provider rejections use `reset_rejected`.
+Both are included in the existing operational alert. Structured diagnostics retain the cause, redact stored credential strings, and limit the payload.
 This endpoint requires deployment of the new account server; upgrading the CLI alone is insufficient.
 Alert routing and notification delivery still require deployment checks.
 

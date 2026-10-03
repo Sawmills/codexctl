@@ -5766,11 +5766,6 @@ fn server_reset_cli_retries_an_ambiguous_response_with_the_same_request_id() {
 
 #[test]
 fn server_automatic_reset_requires_reset_approval_and_never_runs_for_explicit_aliases() {
-    use axum::{
-        Json, Router,
-        routing::{get, post},
-    };
-    use std::sync::{Arc, Mutex};
     for (args, plan, used, expected) in [
         (vec!["use", "--allow-resets"], "pro", 100.0, 1),
         (vec!["use"], "pro", 100.0, 0),
@@ -5784,58 +5779,170 @@ fn server_automatic_reset_requires_reset_approval_and_never_runs_for_explicit_al
         (vec!["use", "--allow-resets"], "team_usage_based", 100.0, 0),
         (vec!["use", "--allow-resets"], "pro", 20.0, 0),
     ] {
-        let home = tempfile::tempdir().unwrap();
-        let directory = home.path().join(".codexctl/central");
-        let credential = directory.join("device.token");
-        store::atomic_write(&credential, b"synthetic-device").unwrap();
-        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
-        let requests = received.clone();
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        let server = format!("http://{}", listener.local_addr().unwrap());
+        let (count, _) = automatic_reset_attempt(&args, plan, used, None);
+        assert_eq!(count, expected, "{args:?}, {plan}, {used}");
+    }
+}
+
+fn automatic_reset_attempt(
+    args: &[&str],
+    plan: &str,
+    used: f64,
+    fence: Option<&str>,
+) -> (usize, std::process::Output) {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use std::sync::{Arc, Mutex};
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/central");
+    let credential = directory.join("device.token");
+    store::atomic_write(&credential, b"synthetic-device").unwrap();
+    let paths = codexctl::config::Paths::from_home(home.path().to_path_buf());
+    let _store_lock = if fence == Some("store") {
+        Some(store::lock(&paths).unwrap())
+    } else {
+        None
+    };
+    if fence == Some("profile") {
         store::atomic_write(
-            &directory.join(".server.json"),
-            &serde_json::to_vec(
-                &json!({"server":server,"token_file":credential,"user_id":"synthetic-user"}),
-            )
-            .unwrap(),
+            &home.path().join(".codex/config.toml"),
+            b"profile = 'blocked'\n[profiles.blocked]\nmodel_provider = 'other'\n",
         )
         .unwrap();
-        let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":false});
-        let app = Router::new()
+    }
+    if fence == Some("provider") {
+        store::atomic_write(
+            &home.path().join(".codex/config.toml"),
+            b"[model_providers.codexctl-central]\nname = 'reserved'\n",
+        )
+        .unwrap();
+    }
+    if fence == Some("handoff") {
+        store::atomic_write(
+            &home.path().join(".codex/auth.json"),
+            &serde_json::to_vec(&auth("synthetic-login", "synthetic-seat")).unwrap(),
+        )
+        .unwrap();
+    }
+    let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let requests = received.clone();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let server = format!("http://{}", listener.local_addr().unwrap());
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(
+            &json!({"server":server,"token_file":credential,"user_id":"synthetic-user"}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":false});
+    let token_auth = auth("synthetic-login", "synthetic-seat");
+    let token = json!({"userId":"synthetic-user","accessToken":token_auth["tokens"]["access_token"],"chatgptAccountId":"synthetic-seat","chatgptPlanType":plan,"revision":"synthetic-revision","billingClass":"unknown","nativeRoutingSupported":true});
+    let token_calls = Arc::new(Mutex::new(0));
+    let settles = fence == Some("settles");
+    let successful_reset = settles || fence == Some("never-settles");
+    let app = Router::new()
+            .route("/v1/token", post(move || async move {
+                let mut count = token_calls.lock().unwrap();
+                *count += 1;
+                let mut token = token;
+                if settles && *count >= 3 { token["billingClass"] = json!("rate_limited"); }
+                Json(token)
+            }))
             .route("/v1/accounts", get(move || async move { Json(json!([account])) }))
             .route("/v1/resets", get(|| async { Json(json!({"userId":"synthetic-user","accounts":[{"alias":"personal","available":1,"applicable":1,"credits":[{"id":"soon","status":"available","expires_at":"2036-07-26T00:00:00Z"}]}]})) }))
             .route("/v1/resets/redeem", post(move |Json(body): Json<Value>| async move {
                 requests.lock().unwrap().push(body);
-                axum::http::StatusCode::BAD_GATEWAY
+                use axum::response::IntoResponse;
+                if successful_reset {
+                    Json(json!({"code":"reset","windows_reset":1})).into_response()
+                } else { axum::http::StatusCode::BAD_GATEWAY.into_response() }
             }));
-        let (stop, stopped) = tokio::sync::oneshot::channel();
-        let thread = std::thread::spawn(move || {
-            runtime.block_on(async {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async {
-                        let _ = stopped.await;
-                    })
-                    .await
-                    .unwrap();
-            })
-        });
-        let _output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
-            .env("HOME", home.path())
-            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
-            .env_remove("CODEX_HOME")
-            .env_remove("CODEXCTL_PINNED_ALIAS")
-            .args(&args)
-            .output()
-            .unwrap();
-        stop.send(()).unwrap();
-        thread.join().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let thread = std::thread::spawn(move || {
+        runtime.block_on(async {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        })
+    });
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .args(args)
+        .output()
+        .unwrap();
+    stop.send(()).unwrap();
+    thread.join().unwrap();
+    let count = received.lock().unwrap().len();
+    (count, output)
+}
+
+#[test]
+fn automatic_reset_waits_for_all_local_activation_fences() {
+    for fence in ["profile", "store", "handoff", "provider"] {
+        let (count, output) =
+            automatic_reset_attempt(&["use", "--allow-resets"], "pro", 100.0, Some(fence));
+        assert!(!output.status.success());
         assert_eq!(
-            received.lock().unwrap().len(),
-            expected,
-            "{args:?}, {plan}, {used}"
+            count,
+            0,
+            "spent before {fence} refusal: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
+    }
+}
+
+#[test]
+fn local_reset_does_not_contact_a_configured_unavailable_account_server() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl");
+    store::atomic_write(&directory.join("central/.server.json"), &serde_json::to_vec(&json!({"server":"http://127.0.0.1:1","token_file":directory.join("central/device.token"),"user_id":"synthetic-user"})).unwrap()).unwrap();
+    store::atomic_write(&directory.join("central/device.token"), b"synthetic-device").unwrap();
+    store::atomic_write(
+        &directory.join("profiles/local/meta.json"),
+        br#"{"alias":"local","saved_at":"2036-01-01"}"#,
+    )
+    .unwrap();
+    store::atomic_write(&directory.join("profiles/local/auth.json"), b"{}").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .args(["reset", "local", "--yes"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("access_token"),
+        "local auth validation should run: {error}"
+    );
+    assert!(!error.contains("account server"), "{error}");
+}
+
+#[test]
+fn automatic_reset_rechecks_included_usage_and_reports_a_spend_before_a_lag_refusal() {
+    for (mode, success) in [("settles", true), ("never-settles", false)] {
+        let (count, output) =
+            automatic_reset_attempt(&["use", "--allow-resets"], "pro", 100.0, Some(mode));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(count, 1, "{error}");
+        assert_eq!(output.status.success(), success, "{mode}: {error}");
+        if !success {
+            assert!(error.contains("a reset was redeemed"), "{error}");
+            assert!(error.contains("without --allow-resets"), "{error}");
+        }
     }
 }

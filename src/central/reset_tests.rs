@@ -428,14 +428,10 @@ async fn reset_redemption_retry_returns_already_redeemed_without_a_second_spend(
 }
 
 #[tokio::test]
-async fn reset_redemption_ambiguous_retry_keeps_the_credit_and_key_and_blocks_new_spends() {
+async fn reset_redemption_ambiguous_retry_keeps_the_credit_and_key() {
     let (base, received, upstream) = redemption_upstream(true).await;
     let fixture = Fixture::start(&base).await;
     assert_eq!(fixture.redeem("uncertain").await.0, StatusCode::BAD_GATEWAY);
-    assert_eq!(
-        fixture.redeem("new-operation").await,
-        (StatusCode::CONFLICT, json!({"error":"reset_pending"}))
-    );
     let mut broker = fixture.broker.clone();
     broker.reset_reader = crate::central::resets::Reader::with_base(&base);
     let retry = Fixture {
@@ -474,4 +470,123 @@ async fn concurrent_reset_retries_spend_only_once() {
     codes.sort();
     assert_eq!(codes, ["already_redeemed", "reset"]);
     assert_eq!(received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn definitive_reset_rejections_are_terminal_and_allow_a_new_operation() {
+    for rejection in [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(StdMutex::new(0));
+        let consumed = calls.clone();
+        let app = Router::new()
+            .route("/usage", get(|| async { Json(json!({"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":1}})) }))
+            .route("/credits", get(|| async { Json(json!({"credits":[{"id":"credit","status":"available"}]})) }))
+            .route("/credits/consume", post(move || async move {
+                let mut calls = consumed.lock().unwrap();
+                *calls += 1;
+                if *calls == 1 {
+                    (rejection, Json(json!({"code":"provider_rejection"}))).into_response()
+                } else {
+                    Json(json!({"code":"reset","windows_reset":1})).into_response()
+                }
+            }));
+        let upstream = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fixture = Fixture::start(&base).await;
+        let rejected = fixture.redeem("rejected-operation").await;
+        let replay = fixture.redeem("rejected-operation").await;
+        let fresh = fixture.redeem("fresh-operation").await;
+        fixture.stop().await;
+        upstream.abort();
+        assert_eq!(
+            rejected,
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error":"reset_rejected"})
+            ),
+            "provider {rejection}"
+        );
+        assert_eq!(replay, rejected);
+        assert_eq!(fresh.0, StatusCode::OK);
+        assert_eq!(fresh.1["code"], "reset");
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+}
+
+#[test]
+fn reset_failure_logs_the_underlying_cause_without_credentials() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "central::managed::reset_tests::reset_log_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        log.contains("reset credits API returned 502 Bad Gateway"),
+        "{log}"
+    );
+    assert!(log.contains("\"operation\":\"reset_redemption\""), "{log}");
+    assert!(!log.contains("synthetic-refresh"));
+    assert!(!log.contains("eyJhbGci"));
+}
+
+#[tokio::test]
+#[ignore = "subprocess fixture for structured error logging"]
+async fn reset_log_fixture() {
+    let (base, _, upstream) = redemption_upstream(true).await;
+    let fixture = Fixture::start(&base).await;
+    assert_eq!(fixture.redeem("log-cause").await.0, StatusCode::BAD_GATEWAY);
+    fixture.stop().await;
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn another_machine_of_the_same_company_user_can_resolve_a_pending_reset() {
+    let (base, received, upstream) = redemption_upstream(true).await;
+    let fixture = Fixture::start(&base).await;
+    assert_eq!(
+        fixture.redeem("lost-machine-request").await.0,
+        StatusCode::BAD_GATEWAY
+    );
+    let credential = fixture._root.path().join("second-device");
+    crate::central::register(
+        &fixture.broker.state,
+        "second",
+        "sawmills",
+        "test-user",
+        &credential,
+    )
+    .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!(
+            "Bearer {}",
+            std::fs::read_to_string(&credential).unwrap().trim()
+        )
+        .parse()
+        .unwrap(),
+    );
+    let second = Fixture {
+        _root: tempfile::tempdir().unwrap(),
+        broker: fixture.broker.clone(),
+        headers,
+    };
+    let resolved = second.redeem("replacement-machine-request").await;
+    let replay = fixture.redeem("lost-machine-request").await;
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(resolved.0, StatusCode::OK);
+    assert_eq!(resolved.1["code"], "already_redeemed");
+    assert_eq!(replay.1["code"], "already_redeemed");
+    let calls = received.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
 }

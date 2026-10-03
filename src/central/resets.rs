@@ -225,8 +225,16 @@ async fn redeem(
             .redeem(&mut owner, &request)
             .await
             .map_err(|error| {
+                if !error.is::<Refusal>() {
+                    let mut detail = format!("{error:#}");
+                    redact_auth_strings(&owner.vault.auth, &mut detail);
+                    let detail: String = detail.chars().take(4096).collect();
+                    eprintln!("{}", serde_json::json!({"operation":"reset_redemption","stage":"redeem","error":detail}));
+                }
                 if let Some(refusal) = error.downcast_ref::<Refusal>() {
                     worker.error(StatusCode::CONFLICT, refusal.0)
+                } else if error.is::<TerminalRejection>() {
+                    worker.error(StatusCode::UNPROCESSABLE_ENTITY, "reset_rejected")
                 } else {
                     worker.error(StatusCode::BAD_GATEWAY, "reset_redeem_failed")
                 }
@@ -237,6 +245,27 @@ async fn redeem(
     Ok(([("cache-control", "no-store")], Json(response)).into_response())
 }
 
+// Owner errors can carry a dependency's diagnostics. Keep stored credentials out
+// of those logs and bound the payload while retaining the useful cause chain.
+fn redact_auth_strings(value: &serde_json::Value, detail: &mut String) {
+    match value {
+        serde_json::Value::String(secret) if !secret.is_empty() => {
+            *detail = detail.replace(secret, "[redacted]");
+        }
+        serde_json::Value::Object(fields) => {
+            for value in fields.values() {
+                redact_auth_strings(value, detail);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_auth_strings(value, detail);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug)]
 struct Refusal(&'static str);
 impl std::fmt::Display for Refusal {
@@ -245,6 +274,15 @@ impl std::fmt::Display for Refusal {
     }
 }
 impl std::error::Error for Refusal {}
+
+#[derive(Debug)]
+struct TerminalRejection(String);
+impl std::fmt::Display for TerminalRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for TerminalRejection {}
 
 #[derive(Serialize, Deserialize)]
 struct Pending {
@@ -270,6 +308,9 @@ impl Reader {
             Journal::default()
         };
         if let Some(response) = journal.completed.get(&request.redeem_request_id) {
+            if response.code == api::ConsumeResetCode::Unknown {
+                return Err(TerminalRejection("provider rejected this operation".into()).into());
+            }
             let mut response = response.clone();
             if matches!(
                 response.code,
@@ -279,19 +320,27 @@ impl Reader {
             }
             return Ok(response);
         }
-        if journal
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.request_id != request.redeem_request_id)
-        {
-            return Err(Refusal("reset_pending").into());
-        }
+        // An authorized machine may resolve another machine's uncertain attempt,
+        // but it must reuse that attempt's credit and provider key.
         let mut token_request = TokenRequest::default();
         for attempt in 0..2 {
             let token = owner
                 .tokens(token_request)
                 .await
-                .map_err(|_| anyhow::anyhow!("owner unavailable"))?;
+                .map_err(|error| match error {
+                    super::server::TokenFailure::Unavailable(error) => {
+                        error.context("refresh owner token request failed")
+                    }
+                    super::server::TokenFailure::AccountMismatch => {
+                        anyhow::anyhow!("refresh owner account mismatch")
+                    }
+                    super::server::TokenFailure::RefreshDisabled => {
+                        anyhow::anyhow!("refresh owner is disabled")
+                    }
+                    super::server::TokenFailure::UnsupportedRouting => {
+                        anyhow::anyhow!("refresh owner workspace routing is unsupported")
+                    }
+                })?;
             anyhow::ensure!(
                 token.native_routing_supported,
                 "unsupported workspace routing"
@@ -349,16 +398,37 @@ impl Reader {
                     &pending.upstream_id,
                     Some(&pending.credit_id),
                 )
-                .await?;
-                anyhow::ensure!(
-                    response.code != api::ConsumeResetCode::Unknown,
-                    "unknown redemption outcome"
-                );
+                .await;
+                let (response, rejection) = match response {
+                    Ok(response) if response.code == api::ConsumeResetCode::Unknown => (
+                        response,
+                        Some("provider returned an unrecognized redemption code".to_owned()),
+                    ),
+                    Ok(response) => (response, None),
+                    Err(error)
+                        if error.is::<api::ResetRejected>()
+                            || (attempt == 1 && error.is::<api::AuthExpired>()) =>
+                    {
+                        (
+                            api::ConsumeResetResponse {
+                                code: api::ConsumeResetCode::Unknown,
+                                windows_reset: 0,
+                            },
+                            Some(format!("{error:#}")),
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
+                let original_request = pending.request_id.clone();
+                journal.completed.insert(original_request, response.clone());
                 journal
                     .completed
                     .insert(request.redeem_request_id.clone(), response.clone());
                 journal.pending = None;
                 crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
+                if let Some(reason) = rejection {
+                    return Err(TerminalRejection(reason).into());
+                }
                 Ok(response)
             }
             .await;

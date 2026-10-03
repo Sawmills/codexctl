@@ -401,6 +401,15 @@ impl std::fmt::Display for AuthExpired {
 }
 impl std::error::Error for AuthExpired {}
 
+#[derive(Debug)]
+pub(crate) struct ResetRejected(pub reqwest::StatusCode);
+impl std::fmt::Display for ResetRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reset credits API rejected redemption (HTTP {})", self.0)
+    }
+}
+impl std::error::Error for ResetRejected {}
+
 pub(crate) const RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
 
@@ -493,6 +502,14 @@ pub(crate) async fn consume_reset_credit_at(
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(AuthExpired.into());
+    }
+    if status.is_client_error()
+        && !matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
+    {
+        return Err(ResetRejected(status).into());
     }
     if !status.is_success() {
         anyhow::bail!("reset credits API returned {status}");
