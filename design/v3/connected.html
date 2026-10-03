@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="theme-color"
+      content="#f7f7f4"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#121314"
+      media="(prefers-color-scheme: dark)"
+    />
+    <title>Machine connected · codexctl</title>
+    <link
+      rel="preload"
+      href="fonts/instrument-sans.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body class="enroll">
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <span class="wordmark" translate="no"
+          >codexctl<span class="caret" aria-hidden="true"></span
+        ></span>
+      </div>
+    </header>
+    <main id="main" class="wrap">
+      <section class="panel" aria-labelledby="page-title">
+        <span class="done-mark" aria-hidden="true"
+          ><svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+            <path
+              d="M4.5 10.5l3.5 3.5 7.5-8"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            /></svg
+        ></span>
+        <h1 id="page-title">Studio MacBook is connected</h1>
+        <p class="lede">Go back to your terminal. You can close this page.</p>
+        <div class="next">
+          <h2>Pick an account</h2>
+          <div class="command">
+            <pre><code id="next-use" translate="no"><span class="prompt">$ </span>codexctl use</code></pre>
+            <button
+              class="button primary copy"
+              type="button"
+              data-copy="next-use"
+              aria-label="Copy codexctl use"
+            >
+              Copy
+            </button>
+          </div>
+          <p>
+            Chooses the account with included usage left and switches this
+            machine to it.
+          </p>
+        </div>
+        <div class="next">
+          <h2>First machine with local Codex profiles?</h2>
+          <div class="command">
+            <pre><code id="next-migrate" translate="no"><span class="prompt">$ </span>codexctl migrate</code></pre>
+            <button
+              class="button small copy"
+              type="button"
+              data-copy="next-migrate"
+              aria-label="Copy codexctl migrate"
+            >
+              Copy
+            </button>
+          </div>
+          <p>Moves them to the account server so every machine can use them.</p>
+        </div>
+        <p
+          id="copy-status"
+          class="copy-status"
+          role="status"
+          aria-live="polite"
+        ></p>
+        <p class="footnote">
+          See all your accounts and machines on the
+          <a href="overview.html">Accounts</a> page.
+        </p>
+      </section>
+    </main>
+    <footer class="wrap footer">
+      <span translate="no">codexctl v0.1.37</span>
+      <nav class="proto-nav" aria-label="Prototype pages">
+        <span>Prototype:</span>
+        <a href="index.html">Signed out</a>
+        <a href="overview.html">Accounts</a>
+        <a href="overview-healthy.html">Accounts, all healthy</a>
+        <a href="overview-blocked.html">Accounts, nothing left</a>
+        <a href="overview-stale.html">Accounts, refresh failed</a>
+        <a href="approve.html">Approve machine</a>
+        <a href="connected.html" aria-current="page">Connected</a>
+      </nav>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>
