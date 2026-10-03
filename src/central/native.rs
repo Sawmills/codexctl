@@ -14,6 +14,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
 pub use launch::run_pinned_codex;
+pub(super) use launch::sweep_stale_launches;
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
@@ -246,6 +247,15 @@ fn run_child_with_lease(
     guard: &std::fs::File,
     command: &mut std::process::Command,
 ) -> Result<std::process::ExitStatus> {
+    spawn_child_with_lease(guard, command)?
+        .wait()
+        .context("Codex process failed to wait")
+}
+
+fn spawn_child_with_lease(
+    guard: &std::fs::File,
+    command: &mut std::process::Command,
+) -> Result<std::process::Child> {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let fd = guard.as_raw_fd();
     // The child retains the mode lease if its launcher dies.
@@ -258,7 +268,7 @@ fn run_child_with_lease(
             Ok(())
         });
     }
-    command.status().context("Codex process failed to run")
+    command.spawn().context("Codex process failed to run")
 }
 
 /// Launch the active server account without restoring a resumed thread's old provider.
@@ -471,6 +481,10 @@ fn finish_token(
 ) -> Result<()> {
     let alias = connection_alias(path, connection);
     validate_token_account(&token.access_token, &connection.account_id)?;
+    let _launch = connection
+        .launch_pinned
+        .then(|| launch::lock_live_launch(path))
+        .transpose()?;
     if connection.launch_pinned {
         launch::require_headroom(&alias, &token)?;
     }
@@ -519,6 +533,9 @@ pub fn print_token(path: &Path) -> Result<()> {
             || std::env::var_os("CODEX_HOME").is_some())
     {
         bail!("remote credentials cannot be supplied to this pinned launch");
+    }
+    if connection.launch_pinned {
+        launch::require_live_launch(path)?;
     }
     let token = fetch(&connection, true)?;
     let _lock = native_lock(directory)?;

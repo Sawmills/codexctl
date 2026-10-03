@@ -2,6 +2,104 @@
 use super::*;
 use std::io::IsTerminal;
 use std::os::unix::process::ExitStatusExt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
+// This exclusive lock serializes directory creation and sweeping independently
+// of the mode lease: other live server lanes must be able to keep running.
+pub(crate) fn sweep_stale_launches() -> Result<()> {
+    let lanes = root()?.join("lanes");
+    if !lanes.try_exists()? {
+        return Ok(());
+    }
+    let _sweep = vault::registry_lock(&lanes, "sweep.lock")?;
+    for entry in std::fs::read_dir(&lanes)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("launch-")
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        let owner = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(entry.path().join("owner.lock"))
+        {
+            Ok(owner) => match owner.try_lock() {
+                Ok(()) => Some(owner),
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        // The owner lock is CLOEXEC and belongs only to the launcher. It avoids
+        // PID reuse and releases even after SIGKILL. Legacy dirs have no owner.
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        drop(owner);
+    }
+    Ok(())
+}
+
+// Hold this through helper persistence/output so cleanup cannot race a token
+// refresh and recreate an approved connection after its directory was removed.
+pub(super) fn lock_live_launch(connection: &Path) -> Result<vault::Lock> {
+    let guard = vault::registry_lock(&root()?.join("lanes"), "sweep.lock")?;
+    require_live_launch(connection)?;
+    Ok(guard)
+}
+
+fn close_launch(directory: tempfile::TempDir) -> Result<()> {
+    let _sweep = vault::registry_lock(&root()?.join("lanes"), "sweep.lock")?;
+    directory.close().context("cannot remove launch connection")
+}
+
+pub(super) fn require_live_launch(connection: &Path) -> Result<()> {
+    let owner = std::fs::File::open(connection.with_file_name("owner.lock"))
+        .context("launch is no longer active")?;
+    match owner.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Ok(()) => bail!("launch is no longer active"),
+        Err(error) => Err(error).context("cannot check launch owner"),
+    }
+}
+
+struct LaunchSignals {
+    received: Arc<AtomicUsize>,
+    handlers: Vec<signal_hook::SigId>,
+}
+impl LaunchSignals {
+    fn register() -> Result<Self> {
+        let mut signals = Self {
+            received: Arc::new(AtomicUsize::new(0)),
+            handlers: Vec::new(),
+        };
+        for signal in [libc::SIGHUP, libc::SIGTERM] {
+            signals.handlers.push(signal_hook::flag::register_usize(
+                signal,
+                signals.received.clone(),
+                signal as usize,
+            )?);
+        }
+        Ok(signals)
+    }
+    fn received(&self) -> i32 {
+        self.received.load(Ordering::Relaxed) as i32
+    }
+}
+impl Drop for LaunchSignals {
+    fn drop(&mut self) {
+        for handler in &self.handlers {
+            signal_hook::low_level::unregister(*handler);
+        }
+    }
+}
 
 pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()> {
     if token.statusline_usage.as_ref().is_some_and(|usage| {
@@ -77,6 +175,8 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     }
     let paths = config::default_paths()?;
     let directory = root()?;
+    sweep_stale_launches()?;
+    let signals = LaunchSignals::register()?;
     let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
     let catalog = super::super::remote::catalog()?
         .context("--account requires a connected account server")?;
@@ -129,7 +229,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
     connection.approved_billing_class = bills.then_some(token.billing_class).flatten();
     connection.revision = token.revision.clone();
-    let prepared = {
+    let (prepared, _owner) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
         let _native = native_lock(&directory)?;
@@ -140,11 +240,13 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         )?;
         let launches = directory.join("lanes");
         store::ensure_private_dir(&launches)?;
+        let _sweep = vault::registry_lock(&launches, "sweep.lock")?;
         let prepared = tempfile::Builder::new()
             .prefix("launch-")
             .tempdir_in(launches)?;
+        let owner = vault::lock(prepared.path(), "owner.lock")?;
         save_connection(&prepared.path().join("connection.json"), &connection)?;
-        prepared
+        (prepared, owner)
     };
     let path = prepared.path().join("connection.json");
     let helper_args = serde_json::to_string(&[
@@ -195,8 +297,36 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     command
         .args(args)
         .env("CODEXCTL_PINNED_ALIAS", &account.alias);
-    let status = run_child_with_lease(&lease, &mut command)?;
-    Ok(status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+    if signals.received() != 0 {
+        close_launch(prepared)?;
+        return Ok(128 + signals.received());
+    }
+    let mut child = spawn_child_with_lease(&lease, &mut command)?;
+    loop {
+        let signal = signals.received();
+        if signal != 0 {
+            // Revoke approval before forwarding the signal, even if Codex ignores it.
+            close_launch(prepared)?;
+            unsafe {
+                libc::kill(child.id() as i32, signal);
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            while child.try_wait()?.is_none() {
+                if std::time::Instant::now() >= deadline {
+                    child.kill()?;
+                    child.wait()?;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return Ok(128 + signal);
+        }
+        if let Some(status) = child.try_wait()? {
+            close_launch(prepared)?;
+            return Ok(status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

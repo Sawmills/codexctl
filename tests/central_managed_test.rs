@@ -7290,9 +7290,20 @@ sys.exit(23)
 #[test]
 fn b21_rate_reads_a_fixture_database_without_writing_it_or_inventing_token_rates() {
     let server = Server::start();
-    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
-    server.import(&server.amir, "personal", "personal-login", "personal-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"rate-distinct-reset").unwrap();
+    server.import(
+        &server.amir,
+        "unattributed",
+        "personal-login",
+        "personal-seat",
+    );
     let home = server.connected_home();
+    let status = server.cli(home.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_ne!(
+        status["accounts"][0]["primary_resets_at"],
+        status["accounts"][0]["secondary_resets_at"]
+    );
     let database = home.path().join(".codex/logs_2.sqlite");
     std::fs::create_dir_all(database.parent().unwrap()).unwrap();
     let fixture = Command::new("python3").args(["-c", r#"
@@ -7301,12 +7312,12 @@ now = int(time.time())
 db = sqlite3.connect(sys.argv[1])
 db.execute('CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)')
 db.executemany('INSERT INTO logs VALUES (?, ?, ?)', [
-    (now-2000, 'old:300', '/codex/responses status=429'),
-    (now-15, 'one:301', '/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}'),
-    (now-10, 'one:301', '/codex/responses status=429'),
-    (now-8, 'two:302', '/codex/responses status=429'),
-    (now-7, 'one:301', '/codex/responses status=500'),
-    (now-5, 'one:301', '/other/endpoint status=200'),
+    (now-2000, 'pid:300:00000000-0000-0000-0000-000000000000', '/codex/responses status=429'),
+    (now-15, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}'),
+    (now-10, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=429'),
+    (now-8, 'pid:302:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '/codex/responses status=429'),
+    (now-7, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=500'),
+    (now-5, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/other/endpoint status=200'),
 ])
 db.commit()
 db.close()
@@ -7327,18 +7338,20 @@ db.close()
     let rows = report["accounts"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(
-        rows.iter().find(|r| r["account"] == "personal").unwrap(),
+        rows.iter()
+            .find(|r| r["account"] == "unattributed")
+            .unwrap(),
         &json!({
-            "account":"personal", "weekly_used_percent":37.0, "responses_ok":1,
+            "account":"unattributed", "weekly_used_percent":37.0, "responses_ok":1,
             "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]
         })
     );
     assert_eq!(
         rows.iter()
-            .find(|r| r["account"] == "unattributed")
+            .find(|r| r["account"] == ".unattributed")
             .unwrap(),
         &json!({
-            "account":"unattributed", "weekly_used_percent":null, "responses_ok":0,
+            "account":".unattributed", "weekly_used_percent":null, "responses_ok":0,
             "responses_429":1, "rate_429":1.0, "processes":1, "pids":[302]
         })
     );
@@ -7458,11 +7471,17 @@ fn b21_rate_reads_wal_and_keeps_ambiguous_or_missing_process_evidence_unattribut
     let now = chrono::Utc::now().timestamp();
     for (process, body) in [
         (
-            Some("one:301"),
+            Some("pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
             "/codex/responses status=200 headers={\"x-codex-primary-reset-at\": \"4102444800\"}",
         ),
-        (Some("one:301"), "/codex/responses status=429"),
-        (Some("two:301"), "/codex/responses status=429"),
+        (
+            Some("pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "/codex/responses status=429",
+        ),
+        (
+            Some("pid:301:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            "/codex/responses status=429",
+        ),
         (None, "/codex/responses status=429"),
         (Some("unknown-format"), "/codex/responses status=201"),
     ] {
@@ -7482,11 +7501,156 @@ fn b21_rate_reads_wal_and_keeps_ambiguous_or_missing_process_evidence_unattribut
     assert_eq!(
         report["accounts"],
         json!([{
-            "account":"unattributed", "weekly_used_percent":null,
+            "account":".unattributed", "weekly_used_percent":null,
             "responses_ok":2, "responses_429":3, "rate_429":0.6,
             "processes":3, "pids":[301]
         }])
     );
     // Keep the writer open until after the command so the response rows are in WAL.
     drop(db);
+}
+
+struct B21Lane {
+    launcher: std::process::Child,
+    child_pid: i32,
+    connection: std::path::PathBuf,
+}
+
+impl B21Lane {
+    fn start(home: &std::path::Path, name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        store::atomic_write(&bin.join("codex"), br#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+for arg in sys.argv:
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+        path = helper[helper.index('--connection') + 1]
+pathlib.Path(os.environ['B21_READY']).write_text(json.dumps({'pid': os.getpid(), 'connection': path}))
+while True: time.sleep(0.1)
+"#).unwrap();
+        std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let ready = home.join(name);
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["codex", "--account", "lane", "--allow-billing", "a prompt"])
+            .env("HOME", home)
+            .env("PATH", path)
+            .env("B21_READY", &ready)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let data: Value = loop {
+            if let Ok(bytes) = std::fs::read(&ready)
+                && let Ok(data) = serde_json::from_slice(&bytes)
+            {
+                break data;
+            }
+            assert!(
+                launcher.try_wait().unwrap().is_none(),
+                "launcher exited before child ready"
+            );
+            assert!(std::time::Instant::now() < deadline, "child did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Self {
+            launcher,
+            child_pid: data["pid"].as_i64().unwrap() as i32,
+            connection: data["connection"].as_str().unwrap().into(),
+        }
+    }
+
+    fn signal_and_wait(&mut self, signal: i32) -> std::process::ExitStatus {
+        assert_eq!(unsafe { libc::kill(self.launcher.id() as i32, signal) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.launcher.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher ignored signal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for B21Lane {
+    fn drop(&mut self) {
+        let _ = self.launcher.kill();
+        let _ = self.launcher.wait();
+        unsafe {
+            libc::kill(self.child_pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn b21_signals_remove_launch_approval_and_reap_the_child() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        let mut lane = B21Lane::start(home.path(), &format!("ready-{signal}"));
+        let status = lane.signal_and_wait(signal);
+        assert!(
+            !lane.connection.parent().unwrap().exists(),
+            "signal left launch approval behind"
+        );
+        assert_eq!(status.code(), Some(128 + signal));
+        assert_ne!(
+            unsafe { libc::kill(lane.child_pid, 0) },
+            0,
+            "child was not reaped"
+        );
+    }
+}
+
+#[test]
+fn b21_launch_and_disconnect_sweep_orphans_but_keep_live_lanes() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let mut orphan = B21Lane::start(home.path(), "orphan");
+    orphan.signal_and_wait(libc::SIGKILL);
+    assert!(orphan.connection.exists());
+    let output = server.cli(
+        home.path(),
+        &[
+            "central-token",
+            "--connection",
+            orphan.connection.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "orphaned approval remained usable"
+    );
+    let mut live = B21Lane::start(home.path(), "live");
+    assert!(!orphan.connection.parent().unwrap().exists());
+    let mut second = B21Lane::start(home.path(), "second");
+    assert!(live.connection.exists(), "sweep removed a live lane");
+    second.signal_and_wait(libc::SIGKILL);
+    let disconnected = server.cli(home.path(), &["disconnect"]);
+    assert!(
+        disconnected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disconnected.stderr)
+    );
+    assert!(!second.connection.parent().unwrap().exists());
+    assert!(
+        live.connection.exists(),
+        "disconnect sweep removed a live lane"
+    );
+    live.signal_and_wait(libc::SIGTERM);
 }

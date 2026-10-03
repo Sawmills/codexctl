@@ -311,7 +311,12 @@ arguments. It preserves the working directory and resumed session; the host's
 configuration, active pointer, and auth file stay unchanged. Later `codexctl use`
 switches do not move this session. No static `ChatGPT-Account-ID` header is sent:
 the token workspace claim must match the selected account on every helper refresh.
-Billing approval applies only to this launch. Accounts that may bill credits require
+Billing approval applies only to this launch. SIGHUP and SIGTERM remove its private
+connection before forwarding the signal to Codex; an unresponsive child is killed
+and reaped after one second. Helpers refuse connections whose launcher no longer
+holds its owner lock, including after SIGKILL. The next launch and `disconnect`
+sweep orphaned `lanes/launch-*` directories under an exclusive lane-directory lock,
+while preserving directories owned by live launchers. Accounts that may bill credits require
 confirmation on a terminal or `--allow-billing` for unattended use. Exhausted accounts
 refuse even with billing approval; an exhausted account also refuses subsequent
 helper refreshes. This launch never redeems a reset and rejects `--allow-resets`.
@@ -337,11 +342,11 @@ and endpoints are excluded. Accounts without matching traffic have no row.
 
 The `x-codex-primary-reset-at` response header is matched to the account's weekly
 reset, allowing 120 seconds of drift. Multiple candidates, unknown reset times, and
-missing evidence stay `unattributed`. Headerless replies inherit the last observed
+missing evidence stay `.unattributed` (a reserved label that cannot be an account alias). Headerless replies inherit the last observed
 assignment for the same process within the requested window; an unrecognized header
 clears that assignment. An account switch without a logged header cannot be detected.
 `processes` counts distinct process identifiers observed in the logs, not live OS
-processes. `pids` contains their parseable PID suffixes, deduplicated and sorted;
+processes. `pids` contains the parseable PID segment in `pid:<pid>:<uuid>` identifiers, deduplicated and sorted;
 reused PIDs can correspond to multiple process identifiers.
 
 JSON contains `host`, `window_minutes`, `generated_at`, and `accounts`, whose rows

@@ -124,7 +124,7 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
         let row = totals
             .entry(account.map(|a| a.alias.clone()))
             .or_insert_with(|| AccountRate {
-                account: account.map_or("unattributed", |a| &a.alias).to_owned(),
+                account: account.map_or(".unattributed", |a| &a.alias).to_owned(),
                 weekly_used_percent: account.and_then(|a| a.secondary_used_percent),
                 ..Default::default()
             });
@@ -135,8 +135,9 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
         }
         if let Some(process) = process.filter(|p| !p.is_empty()) {
             if let Some(pid) = process
-                .rsplit_once(':')
-                .and_then(|(_, pid)| pid.parse::<u32>().ok())
+                .strip_prefix("pid:")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|pid| pid.parse::<u32>().ok())
                 .filter(|pid| *pid > 0)
             {
                 row.pids.insert(pid);
