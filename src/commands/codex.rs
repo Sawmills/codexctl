@@ -27,12 +27,23 @@ const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
 pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
 pub fn run(
+    account: Option<&str>,
     args: &[String],
     recovery_prompt: &str,
     allow_billing: bool,
     allow_resets: bool,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    if let Some(alias) = account {
+        #[cfg(feature = "central-prototype")]
+        return codexctl::central::native::run_pinned_codex(
+            alias,
+            &invocation_args_for_cwd(args, &cwd),
+            allow_billing,
+        );
+        #[cfg(not(feature = "central-prototype"))]
+        bail!("server account launch for {alias} requires central support");
+    }
     #[cfg(feature = "central-prototype")]
     if let Some(code) = codexctl::central::native::run_codex(&invocation_args_for_cwd(args, &cwd))?
     {

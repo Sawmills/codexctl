@@ -7208,16 +7208,31 @@ fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
     std::fs::create_dir(&cwd).unwrap();
     let capture = home.path().join("child.json");
     store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
-import json, os, pathlib, sys
+import base64, json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
 connection = None
+helper_command = None
 for arg in args:
+    command_prefix = 'model_providers.codexctl-central.auth.command='
+    if arg.startswith(command_prefix):
+        helper_command = json.loads(arg[len(command_prefix):])
     prefix = 'model_providers.codexctl-central.auth.args='
     if arg.startswith(prefix):
         helper = json.loads(arg[len(prefix):])
         if '--connection' in helper:
             saved = json.loads(pathlib.Path(helper[helper.index('--connection') + 1]).read_text())
             connection = {'alias': saved.get('alias'), 'account_id': saved['account_id']}
+token = subprocess.run([helper_command] + helper, capture_output=True, text=True)
+assert token.returncode == 0, token.stderr
+payload = token.stdout.strip().split('.')[1]
+claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat'
+active = subprocess.run([helper_command, 'central-token', '--active'], capture_output=True)
+assert active.returncode == 1
+pathlib.Path(os.environ['B21_MODE']).write_text('exhausted-weekly')
+exhausted = subprocess.run([helper_command] + helper, capture_output=True, text=True)
+assert exhausted.returncode == 1 and 'exhausted' in exhausted.stderr, exhausted.stderr
+pathlib.Path(os.environ['B21_MODE']).write_text('normal')
 pathlib.Path(os.environ['B21_CAPTURE']).write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'connection': connection}))
 sys.exit(23)
 "##).unwrap();
@@ -7236,6 +7251,7 @@ sys.exit(23)
             .env("HOME", home.path())
             .env("PATH", &search_path)
             .env("B21_CAPTURE", &capture)
+            .env("B21_MODE", server.root.path().join("mode"))
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -7261,10 +7277,7 @@ sys.exit(23)
             .collect();
         assert!(argv.ends_with(&args));
         assert!(!argv.contains(&"--account"));
-        assert!(
-            argv.iter()
-                .any(|a| *a == "model_provider=\"codexctl-central\"")
-        );
+        assert!(argv.contains(&"model_provider=\"codexctl-central\""));
         assert!(!argv.iter().any(|a| a.contains("ChatGPT-Account-ID")));
         assert_eq!(child["cwd"], cwd.canonicalize().unwrap().to_str().unwrap());
         assert_eq!(std::fs::read(&config).unwrap(), before_config);
@@ -7345,10 +7358,11 @@ db.close()
 }
 
 #[test]
-fn b21_lane_account_refuses_billing_without_consent_and_exhaustion_even_with_consent() {
+fn b21_lane_account_scopes_billing_consent_and_refuses_exhaustion() {
     use std::os::unix::fs::PermissionsExt;
     for (mode, plan, allow_billing, message) in [
         ("open-spend-cap", "business", false, "--allow-billing"),
+        ("open-spend-cap", "business", true, ""),
         ("exhausted-weekly", "pro", false, "exhausted"),
         ("exhausted-weekly", "pro", true, "exhausted"),
     ] {
@@ -7410,12 +7424,69 @@ fn b21_lane_account_refuses_billing_without_consent_and_exhaustion_even_with_con
             .unwrap();
         assert_eq!(
             output.status.code(),
-            Some(1),
+            Some(if message.is_empty() { 0 } else { 1 }),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stderr).contains(message));
-        assert!(!capture.exists());
+        assert_eq!(capture.exists(), message.is_empty());
+        assert!(!home.path().join(".codexctl/central/lane.json").exists());
+        if message.is_empty() {
+            let unapproved = server.cli(home.path(), &["codex", "--account", "lane", "a prompt"]);
+            assert_eq!(unapproved.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&unapproved.stderr).contains("--allow-billing"));
+        }
         assert_eq!(std::fs::read(&config).unwrap(), before);
     }
+}
+
+#[test]
+fn b21_rate_reads_wal_and_keeps_ambiguous_or_missing_process_evidence_unattributed() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "first", "first-login", "first-seat");
+    server.import(&server.amir, "second", "second-login", "second-seat");
+    let home = server.connected_home();
+    let database = home.path().join(".codex/logs_2.sqlite");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT);",
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for (process, body) in [
+        (
+            Some("one:301"),
+            "/codex/responses status=200 headers={\"x-codex-primary-reset-at\": \"4102444800\"}",
+        ),
+        (Some("one:301"), "/codex/responses status=429"),
+        (Some("two:301"), "/codex/responses status=429"),
+        (None, "/codex/responses status=429"),
+        (Some("unknown-format"), "/codex/responses status=201"),
+    ] {
+        db.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3)",
+            rusqlite::params![now, process, body],
+        )
+        .unwrap();
+    }
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["accounts"],
+        json!([{
+            "account":"unattributed", "weekly_used_percent":null,
+            "responses_ok":2, "responses_429":3, "rate_429":0.6,
+            "processes":3, "pids":[301]
+        }])
+    );
+    // Keep the writer open until after the command so the response rows are in WAL.
+    drop(db);
 }

@@ -198,9 +198,17 @@ Account selection during recovery:
 
 ### Pinned launches
 
-Pinned launches support saved local profiles only. Server-account pinning is unsupported;
-use `codexctl use <alias>` followed by `codexctl codex` for a server account, which changes
-the active account for new and running sessions; running sessions follow it within 60 seconds.
+For one server-account lane, use `codexctl codex --account <alias> [codex args...]`,
+including `resume <session-id>`. It preserves the host account and keeps this session
+pinned when other lanes switch. Billing accounts require terminal approval or
+`--allow-billing`; exhausted accounts refuse and no reset is redeemed.
+See [server-account launches](docs/central-server.md) for policy and exit codes.
+
+`codexctl rate [--json] [--minutes 10]` reports successful responses, 429s, their ratio,
+observed processes/PIDs, and weekly usage from read-only Codex logs and account status.
+Uncertain attribution has its own row. Token-per-minute data is not available.
+
+`codexctl exec` supports saved local profiles only.
 
 `codexctl use` changes the account for the whole machine. When two agent lanes start at the same
 time, the second `use` can take the first lane's account before it launches. `codexctl exec` pins
@@ -338,6 +346,8 @@ codexctl login <alias>        # isolated Codex login and save
 codexctl whoami               # show active account
 codexctl label <alias> [text] # name an account (omit text to clear)
 codexctl codex -- ...         # run Codex with spend-cap recovery
+codexctl codex --account ALIAS resume SESSION # pin one server-account lane
+codexctl rate --json          # read per-account response/429 counts
 codexctl exec --account <alias> -- <command>  # pinned, non-mutating launch
 codexctl resets               # list banked rate-limit resets
 codexctl reset [alias]        # redeem a banked reset
