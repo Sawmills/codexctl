@@ -2202,6 +2202,44 @@ fn when_remote_use_succeeds_then_provider_refreshes_every_minute() {
         config["model_providers"]["codexctl-central"]["auth"]["refresh_interval_ms"].as_integer(),
         Some(60_000)
     );
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["request_max_retries"].as_integer(),
+        Some(12)
+    );
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+        Some(12)
+    );
+}
+
+#[test]
+fn when_remote_use_rewrites_provider_then_retry_limits_are_preserved() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let path = client.home.join(".codex/config.toml");
+    let mut config: toml_edit::DocumentMut =
+        std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config["model_providers"]["codexctl-central"]["request_max_retries"] = toml_edit::value(4);
+    config["model_providers"]["codexctl-central"]["stream_max_retries"] = toml_edit::value(7);
+    std::fs::write(&path, config.to_string()).unwrap();
+
+    let selected = client.select();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let rewritten: toml_edit::DocumentMut = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    assert_eq!(
+        rewritten["model_providers"]["codexctl-central"]["request_max_retries"].as_integer(),
+        Some(4)
+    );
+    assert_eq!(
+        rewritten["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+        Some(7)
+    );
 }
 
 #[test]
