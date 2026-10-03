@@ -20,7 +20,7 @@ fn billing_switch_prompt() -> String {
     format!("This remote account may bill credits. {BILLING_SWITCH_NOTICE} Switch?")
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Connection {
     #[serde(default)]
@@ -108,40 +108,113 @@ fn write_config_with(
     sync_parent(parent)?;
     Ok(())
 }
-fn config_not_installed(destination: &Path, bytes: &[u8]) -> Result<bool> {
-    match std::fs::read(destination) {
-        Ok(installed) => Ok(installed != bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
-        Err(error) => {
-            Err(error).context("cannot verify whether the new Codex configuration was installed")
-        }
+fn restore_active_pointer(pointer: &Path, previous_pointer: Option<&[u8]>) -> Result<()> {
+    match previous_pointer {
+        Some(bytes) => store::atomic_write(pointer, bytes),
+        None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path)),
     }
 }
-fn rollback_pointer_if_config_not_installed(
-    destination: &Path,
-    bytes: &[u8],
-    pointer: &Path,
-    previous_pointer: Option<&[u8]>,
-) -> Result<bool> {
-    let not_installed = match config_not_installed(destination, bytes) {
-        Ok(not_installed) => not_installed,
-        Err(error) => {
-            // An unreadable destination leaves installation indeterminate. Restore the
-            // prior pointer (or remove the new one) so token delivery fails closed.
-            match previous_pointer {
-                Some(bytes) => store::atomic_write(pointer, bytes)?,
-                None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
-            }
-            return Err(error);
-        }
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+fn restore_optional_file(path: &Path, previous: Option<&[u8]>) -> Result<()> {
+    match previous {
+        Some(bytes) => store::atomic_write(path, bytes),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+    }
+}
+fn restore_config(path: &Path, previous: Option<&[u8]>, attempted: &[u8]) -> Result<()> {
+    let current = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
-    if not_installed {
-        match previous_pointer {
-            Some(bytes) => store::atomic_write(pointer, bytes)?,
-            None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
+    if current.as_deref() == previous {
+        return Ok(());
+    }
+    if current.as_deref() != Some(attempted) {
+        bail!("Codex configuration changed during activation; preserving the newer file");
+    }
+    match previous {
+        Some(bytes) => write_config(path, bytes),
+        None => restore_optional_file(path, None),
+    }
+}
+struct ActivationRollback<'a> {
+    connection_path: &'a Path,
+    previous_connection: &'a [u8],
+    config: &'a Path,
+    previous_config: Option<&'a [u8]>,
+    attempted_config: &'a [u8],
+    marker: &'a Path,
+    previous_marker: Option<&'a [u8]>,
+    pointer: &'a Path,
+    previous_pointer: Option<&'a [u8]>,
+}
+fn rollback_activation(state: ActivationRollback<'_>) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = restore_active_pointer(state.pointer, state.previous_pointer) {
+        failures.push(format!("active account pointer: {error:#}"));
+    }
+    if let Err(error) = restore_config(state.config, state.previous_config, state.attempted_config)
+    {
+        failures.push(format!("Codex configuration: {error:#}"));
+    }
+    if let Err(error) = restore_optional_file(state.marker, state.previous_marker) {
+        failures.push(format!("remote activation marker: {error:#}"));
+    }
+    if let Err(error) = store::atomic_write(state.connection_path, state.previous_connection) {
+        failures.push(format!("saved remote connection: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("activation rollback failed: {}", failures.join("; "))
+    }
+}
+fn write_pointer_after_connection(
+    connection_path: &Path,
+    expected_connection: &Connection,
+    pointer: &Path,
+    pointer_bytes: &[u8],
+    write_pointer: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let saved = read_connection(connection_path)?;
+    if saved != *expected_connection {
+        bail!("activation approval was not saved before moving the active account pointer");
+    }
+    write_pointer(pointer, pointer_bytes)
+}
+fn write_pointer_with_rollback(
+    connection_path: &Path,
+    expected_connection: &Connection,
+    pointer: &Path,
+    pointer_bytes: &[u8],
+    write_pointer: impl FnOnce(&Path, &[u8]) -> Result<()>,
+) -> Result<()> {
+    write_pointer_after_connection(
+        connection_path,
+        expected_connection,
+        pointer,
+        pointer_bytes,
+        write_pointer,
+    )
+}
+fn rollback_or_context(error: anyhow::Error, state: ActivationRollback<'_>) -> anyhow::Error {
+    match rollback_activation(state) {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            error.context(format!("activation rollback failed: {rollback_error:#}"))
         }
     }
-    Ok(not_installed)
 }
 fn remove_active_pointer_with(
     pointer: &Path,
@@ -696,11 +769,6 @@ pub fn activate(
         }
     }
     let approve_billing = usage_based && !redeem_reset;
-    connection.allow_billing = approve_billing;
-    connection.approved_billing_plan = approve_billing
-        .then(|| token.chatgpt_plan_type.clone())
-        .flatten();
-    connection.approved_billing_class = approve_billing.then_some(token.billing_class).flatten();
     let _lock = native_lock(&root()?)?;
     if let Some(catalog) = catalog.as_ref() {
         super::remote::require_current_connection(&catalog.connection)?;
@@ -819,9 +887,18 @@ pub fn activate(
     {
         bail!("remote connection changed during activation");
     }
-    connection.revision = latest.revision;
+    let previous_connection = serde_json::to_vec(&latest)?;
+    connection = latest;
+    connection.allow_billing = approve_billing;
+    connection.approved_billing_plan = approve_billing
+        .then(|| token.chatgpt_plan_type.clone())
+        .flatten();
+    connection.approved_billing_class = approve_billing.then_some(token.billing_class).flatten();
     let destination = config_path(&home)?;
-    let had_marker = marker.try_exists()?;
+    let activation_bytes = serde_json::to_vec(&activation)?;
+    let previous_config = read_optional_file(&destination)?;
+    let desired_config = doc.to_string().into_bytes();
+    let previous_marker = read_optional_file(&marker)?;
     // All local refusal checks have passed. Hold both mutation locks through the
     // spend and activation so another local command cannot invalidate the checks.
     if redeem_reset {
@@ -851,22 +928,79 @@ pub fn activate(
             );
         }
     }
-    store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
-    store::atomic_write(&pointer, format!("{alias}\n").as_bytes())?;
-    if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
-        let not_installed = rollback_pointer_if_config_not_installed(
-            &destination,
-            doc.to_string().as_bytes(),
-            &pointer,
-            previous_pointer.as_deref(),
-        )?;
-        if !had_marker && not_installed {
-            std::fs::remove_file(&marker)
-                .context("failed to roll back prepared remote activation")?;
-        }
-        return Err(error);
+    if let Err(error) = save_connection(&path, &connection) {
+        return Err(rollback_or_context(
+            error,
+            ActivationRollback {
+                connection_path: &path,
+                previous_connection: &previous_connection,
+                config: &destination,
+                previous_config: previous_config.as_deref(),
+                attempted_config: &desired_config,
+                marker: &marker,
+                previous_marker: previous_marker.as_deref(),
+                pointer: &pointer,
+                previous_pointer: previous_pointer.as_deref(),
+            },
+        ));
     }
-    save_connection(&path, &connection)?;
+    if let Err(error) = store::atomic_write(&marker, &activation_bytes) {
+        return Err(rollback_or_context(
+            error,
+            ActivationRollback {
+                connection_path: &path,
+                previous_connection: &previous_connection,
+                config: &destination,
+                previous_config: previous_config.as_deref(),
+                attempted_config: &desired_config,
+                marker: &marker,
+                previous_marker: previous_marker.as_deref(),
+                pointer: &pointer,
+                previous_pointer: previous_pointer.as_deref(),
+            },
+        ));
+    }
+    if let Err(error) = write_config(&destination, &desired_config) {
+        return Err(rollback_or_context(
+            error,
+            ActivationRollback {
+                connection_path: &path,
+                previous_connection: &previous_connection,
+                config: &destination,
+                previous_config: previous_config.as_deref(),
+                attempted_config: &desired_config,
+                marker: &marker,
+                previous_marker: previous_marker.as_deref(),
+                pointer: &pointer,
+                previous_pointer: previous_pointer.as_deref(),
+            },
+        ));
+    }
+    if let Err(error) = write_pointer_with_rollback(
+        &path,
+        &connection,
+        &pointer,
+        format!("{alias}\n").as_bytes(),
+        store::atomic_write,
+    ) {
+        return Err(rollback_or_context(
+            error,
+            ActivationRollback {
+                connection_path: &path,
+                previous_connection: &previous_connection,
+                config: &destination,
+                previous_config: previous_config.as_deref(),
+                attempted_config: &desired_config,
+                marker: &marker,
+                previous_marker: previous_marker.as_deref(),
+                pointer: &pointer,
+                previous_pointer: previous_pointer.as_deref(),
+            },
+        ));
+    }
+    // Configuration, marker, connection, and pointer are committed together before
+    // session repair. Keep that activation available so the operator can retry the
+    // explicit repair command without exposing a half-installed provider.
     repair_sessions_if_active(SessionProviderAction::Rewrite).with_context(|| {
         format!("server account {alias} is active; session repair failed; resolve the reported cause and retry codexctl session-provider rewrite")
     })?;
@@ -1104,10 +1238,12 @@ pub(crate) fn statusline_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        BILLING_SWITCH_NOTICE, billing_switch_prompt, remove_active_pointer_with,
-        remove_pointer_then_marker_with, rollback_pointer_if_config_not_installed,
-        validate_token_account, write_config_with,
+        ActivationRollback, BILLING_SWITCH_NOTICE, Connection, billing_switch_prompt,
+        remove_active_pointer_with, remove_pointer_then_marker_with, restore_active_pointer,
+        rollback_or_context, save_connection, validate_token_account,
+        write_pointer_after_connection, write_pointer_with_rollback,
     };
+    use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
 
@@ -1135,42 +1271,147 @@ mod tests {
     }
 
     #[test]
-    fn late_config_fsync_failure_keeps_the_new_pointer_after_persist() {
+    fn pointer_fsync_failure_rolls_back_after_persist() {
         let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("config.toml");
+        let connection_path = root.path().join("remote.json");
         let pointer = root.path().join(".active-account");
-        let bytes = b"model_provider = 'codexctl-central'\n";
-        let error = write_config_with(&destination, bytes, |_| {
-            anyhow::bail!("synthetic late directory fsync failure")
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("late directory fsync"));
-        fs::write(&pointer, b"new\n").unwrap();
+        let connection = Connection {
+            user_id: Some("user".into()),
+            alias: Some("remote".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: root.path().join("device.token"),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: true,
+            approved_billing_plan: Some("usage_based".into()),
+            approved_billing_class: Some(api::BillingClass::Unknown),
+        };
+        save_connection(&connection_path, &connection).unwrap();
+        fs::write(&pointer, b"old\n").unwrap();
 
-        let not_installed =
-            rollback_pointer_if_config_not_installed(&destination, bytes, &pointer, None).unwrap();
-        assert!(!not_installed);
-        assert_eq!(fs::read(pointer).unwrap(), b"new\n");
-    }
-
-    #[test]
-    fn indeterminate_config_read_restores_the_previous_pointer_and_fails_closed() {
-        let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("config.toml");
-        let pointer = root.path().join(".active-account");
-        fs::create_dir(&destination).unwrap();
-        fs::write(&pointer, b"new\n").unwrap();
-
-        let error = rollback_pointer_if_config_not_installed(
-            &destination,
-            b"model_provider = 'codexctl-central'\n",
+        let error = write_pointer_with_rollback(
+            &connection_path,
+            &connection,
             &pointer,
-            Some(b"old\n"),
+            b"new\n",
+            |path, bytes| {
+                fs::write(path, bytes)?;
+                anyhow::bail!("synthetic late pointer fsync failure")
+            },
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("cannot verify"));
+        assert!(error.to_string().contains("late pointer fsync"));
+        restore_active_pointer(&pointer, Some(b"old\n")).unwrap();
         assert_eq!(fs::read(pointer).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn rollback_attempts_marker_and_connection_when_config_restore_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = root.path().join("remote.json");
+        let config = root.path().join("config.toml");
+        let marker = root.path().join(".native-active.json");
+        let pointer = root.path().join(".active-account");
+        fs::create_dir(&config).unwrap();
+        fs::write(&connection, b"new-connection").unwrap();
+        fs::write(&marker, b"new-marker").unwrap();
+        fs::write(&pointer, b"new-pointer\n").unwrap();
+
+        let error = rollback_or_context(
+            anyhow::anyhow!("original write error"),
+            ActivationRollback {
+                connection_path: &connection,
+                previous_connection: b"old-connection",
+                config: &config,
+                previous_config: Some(b"old-config"),
+                attempted_config: b"new-config",
+                marker: &marker,
+                previous_marker: Some(b"old-marker"),
+                pointer: &pointer,
+                previous_pointer: Some(b"old-pointer\n"),
+            },
+        );
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("original write error"));
+        assert!(rendered.contains("Codex configuration"));
+        assert_eq!(fs::read(connection).unwrap(), b"old-connection");
+        assert_eq!(fs::read(marker).unwrap(), b"old-marker");
+        assert_eq!(fs::read(pointer).unwrap(), b"old-pointer\n");
+    }
+
+    #[test]
+    fn rollback_preserves_a_config_edit_outside_this_activation() {
+        let root = tempfile::tempdir().unwrap();
+        let connection = root.path().join("remote.json");
+        let config = root.path().join("config.toml");
+        let marker = root.path().join(".native-active.json");
+        let pointer = root.path().join(".active-account");
+        fs::write(&connection, b"new-connection").unwrap();
+        fs::write(&config, b"operator-edit").unwrap();
+        fs::write(&marker, b"new-marker").unwrap();
+        fs::write(&pointer, b"new-pointer\n").unwrap();
+
+        let error = rollback_or_context(
+            anyhow::anyhow!("original write error"),
+            ActivationRollback {
+                connection_path: &connection,
+                previous_connection: b"old-connection",
+                config: &config,
+                previous_config: Some(b"old-config"),
+                attempted_config: b"new-config",
+                marker: &marker,
+                previous_marker: Some(b"old-marker"),
+                pointer: &pointer,
+                previous_pointer: Some(b"old-pointer\n"),
+            },
+        );
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("original write error"));
+        assert!(rendered.contains("configuration changed"));
+        assert_eq!(fs::read(config).unwrap(), b"operator-edit");
+        assert_eq!(fs::read(connection).unwrap(), b"old-connection");
+        assert_eq!(fs::read(marker).unwrap(), b"old-marker");
+        assert_eq!(fs::read(pointer).unwrap(), b"old-pointer\n");
+    }
+
+    #[test]
+    fn pointer_moves_only_after_saved_billing_approval() {
+        let root = tempfile::tempdir().unwrap();
+        let connection_path = root.path().join("remote.json");
+        let pointer = root.path().join(".active-account");
+        let connection = Connection {
+            user_id: Some("user".into()),
+            alias: Some("remote".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: root.path().join("device.token"),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: true,
+            approved_billing_plan: Some("usage_based".into()),
+            approved_billing_class: Some(api::BillingClass::Unknown),
+        };
+        save_connection(&connection_path, &connection).unwrap();
+        fs::write(&pointer, b"old\n").unwrap();
+
+        write_pointer_after_connection(
+            &connection_path,
+            &connection,
+            &pointer,
+            b"new\n",
+            |path, bytes| {
+                let saved = super::read_connection(&connection_path)?;
+                assert!(saved.allow_billing);
+                assert_eq!(fs::read(path)?, b"old\n");
+                fs::write(path, bytes)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(pointer).unwrap(), b"new\n");
     }
 
     #[test]
