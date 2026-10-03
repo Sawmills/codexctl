@@ -107,8 +107,13 @@ It reads those values through the account server. Migration does not require loc
 Unmigrated profiles retain their local reset lookup.
 A failed account read shows an error and an incomplete total. The command exits with failure in both server and local modes.
 An account server without the reset endpoint rejects this command until the operator deploys the new server.
-Server-account reset redemption remains unsupported. The list command never spends a reset or approves credit billing.
-Local redemption still requires an exhausted window and selects the qualifying reset closest to expiry.
+Redeem a server-account reset with `codexctl resets --redeem <alias>` (add `--yes` for unattended use).
+The list command never spends a reset or approves credit billing.
+Both server and local redemption require an exhausted window and select the qualifying reset closest to expiry.
+`codexctl use --allow-resets` can redeem when no account has included headroom.
+Automatic selection excludes usage-based accounts and checks every local activation fence before spending.
+After redemption it retries billing reads briefly to allow usage to settle, without approving credit billing.
+If included usage remains unconfirmed, it reports that the reset was spent and activation is incomplete; wait and retry `codexctl use` without `--allow-resets`.
 Explicit account selection never redeems a reset. `--allow-resets` and `--allow-billing` remain separate approvals.
 
 The read-only `GET /v1/resets` endpoint requires a registered machine credential.
@@ -119,6 +124,25 @@ A successful retry does not trigger the operational failure alert.
 Each failed account read increments `codexctl_central_failed_requests_total{reason="reset_read_failed"}` once.
 A structured log identifies the `resets` stage. The existing `CodexctlCredentialOperationFailed` alert includes this reason.
 The server rechecks machine authorization before delivery.
+The company-user-scoped `POST /v1/resets/redeem` endpoint accepts an alias and a redemption request ID.
+The server rechecks applicability, chooses the credit, and keeps OpenAI credentials with the refresh owner.
+It saves the credit and provider idempotency key before sending, then saves the result.
+Concurrent requests for one account are serialized. Repeating a completed request returns `already_redeemed`.
+An uncertain result retains the original credit and key across retries and server restarts;
+another operation cannot spend a second reset until that result is resolved.
+The client also persists its request ID. After a timeout or server error, rerun the same redemption command.
+If that machine is lost, another registered machine of the same company user can reconcile the pending operation.
+The server reuses the original credit and provider key and records the result for both request IDs; it never starts a second spend during reconciliation.
+Definitive non-retryable provider 4xx responses and unrecognized redemption codes close the operation with `reset_rejected`.
+The failure receipt prevents a repeated ID from sending again, and the client clears its pending ID so a deliberate new command can try again.
+Transport failures, HTTP 408/429, server errors, and unreadable responses retain the pending operation.
+Do not delete the pending request files to bypass an unresolved outcome.
+A retry of an already-sent operation may query the provider even after the exhausted window has cleared;
+it uses the original idempotency key and cannot authorize another spend.
+The server finishes persistence after a client disconnect and drains redemptions during graceful shutdown.
+Provider and persistence failures increment the bounded `reset_redeem_failed` metric; terminal provider rejections use `reset_rejected`.
+Both are included in the existing operational alert. Structured diagnostics retain the cause, redact stored credential strings, and limit the payload.
+This endpoint requires deployment of the new account server; upgrading the CLI alone is insufficient.
 Alert routing and notification delivery still require deployment checks.
 
 Account listing never calls the refresh owner or changes its availability.
@@ -170,7 +194,7 @@ A helper failure supplies no replacement token.
 The interval does not stop an in-flight response, revoke an issued token, or remove delays in OpenAI usage reporting.
 Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
 Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
-No remote command redeems a banked reset implicitly.
+Server reset redemption requires an explicit redemption command or automatic selection with `--allow-resets`.
 Switching between server accounts updates the provider for new sessions.
 Existing sessions keep their startup account until restarted.
 If the daemon is running, use `codexctl use <alias> --restart-daemon` to apply the switch.

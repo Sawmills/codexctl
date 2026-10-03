@@ -22,7 +22,7 @@ spec:
             description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlCredentialOperationFailed
-          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|reset_read_failed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
+          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|reset_read_failed|reset_redeem_failed|reset_rejected"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
           for: 0m
           labels:
             severity: warning

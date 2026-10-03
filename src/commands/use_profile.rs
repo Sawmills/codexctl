@@ -24,7 +24,7 @@ pub fn run(
     restart_daemon: bool,
 ) -> Result<()> {
     #[cfg(feature = "central-prototype")]
-    if codexctl::central::native::activate(alias, _allow_billing, restart_daemon).map_err(|error| {
+    if codexctl::central::native::activate(alias, _allow_billing, allow_resets, restart_daemon).map_err(|error| {
         if restart_daemon
             && config::default_paths()
                 .is_ok_and(|paths| crate::daemon::running_pid(&paths.codex_home()).is_some())

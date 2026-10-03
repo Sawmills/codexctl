@@ -99,7 +99,7 @@ impl RateLimitResponse {
     }
 }
 
-fn is_known_rate_limited_plan(plan: &str) -> bool {
+pub(crate) fn is_known_rate_limited_plan(plan: &str) -> bool {
     matches!(
         plan,
         "free"
@@ -369,7 +369,7 @@ fn parse_rfc3339(value: &str) -> Option<i64> {
 }
 
 /// Outcome of redeeming a banked reset.
-#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsumeResetCode {
     /// The credit was spent and the window(s) cleared.
@@ -384,7 +384,7 @@ pub enum ConsumeResetCode {
     Unknown,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct ConsumeResetResponse {
     pub code: ConsumeResetCode,
     #[serde(default)]
@@ -400,6 +400,15 @@ impl std::fmt::Display for AuthExpired {
     }
 }
 impl std::error::Error for AuthExpired {}
+
+#[derive(Debug)]
+pub(crate) struct ResetRejected(pub reqwest::StatusCode);
+impl std::fmt::Display for ResetRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reset credits API rejected redemption (HTTP {})", self.0)
+    }
+}
+impl std::error::Error for ResetRejected {}
 
 pub(crate) const RESET_CREDITS_URL: &str =
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
@@ -453,13 +462,32 @@ pub async fn consume_reset_credit_async(
     redeem_request_id: &str,
     credit_id: Option<&str>,
 ) -> Result<ConsumeResetResponse> {
+    consume_reset_credit_at(
+        client,
+        RESET_CREDITS_URL,
+        access_token,
+        account_id,
+        redeem_request_id,
+        credit_id,
+    )
+    .await
+}
+
+pub(crate) async fn consume_reset_credit_at(
+    client: &reqwest::Client,
+    credits_url: &str,
+    access_token: &str,
+    account_id: Option<&str>,
+    redeem_request_id: &str,
+    credit_id: Option<&str>,
+) -> Result<ConsumeResetResponse> {
     let mut body = serde_json::json!({ "redeem_request_id": redeem_request_id });
     if let Some(credit_id) = credit_id {
         body["credit_id"] = serde_json::Value::String(credit_id.to_string());
     }
 
     let mut request = client
-        .post(format!("{RESET_CREDITS_URL}/consume"))
+        .post(format!("{credits_url}/consume"))
         .bearer_auth(access_token)
         .json(&body);
     if let Some(account_id) = account_id {
@@ -473,7 +501,15 @@ pub async fn consume_reset_credit_async(
 
     let status = resp.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("expired");
+        return Err(AuthExpired.into());
+    }
+    if status.is_client_error()
+        && !matches!(
+            status,
+            reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS
+        )
+    {
+        return Err(ResetRejected(status).into());
     }
     if !status.is_success() {
         anyhow::bail!("reset credits API returned {status}");

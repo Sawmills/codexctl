@@ -380,7 +380,7 @@ fn document(home: &Path) -> Result<DocumentMut> {
 }
 
 /// Resolve explicit unmigrated local names without requiring an online catalog.
-pub(super) fn known_local_alias(alias: &str) -> Result<bool> {
+pub fn known_local_alias(alias: &str) -> Result<bool> {
     let paths = config::default_paths()?;
     let local = store::profile_dir(&paths, alias)?;
     if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
@@ -393,7 +393,12 @@ pub(super) fn known_local_alias(alias: &str) -> Result<bool> {
     Ok(false)
 }
 
-pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) -> Result<bool> {
+pub fn activate(
+    alias: Option<&str>,
+    allow_billing: bool,
+    allow_resets: bool,
+    restart_daemon: bool,
+) -> Result<bool> {
     let explicit = alias.is_some();
     if let Some(alias) = alias
         && known_local_alias(alias)?
@@ -401,6 +406,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) 
         return Ok(false);
     }
     let catalog = super::remote::catalog()?;
+    let mut redeem_reset = false;
     let selected_remote = catalog
         .as_ref()
         .map(|catalog| {
@@ -412,7 +418,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) 
                     .map(|a| a.alias.clone())
                     .context("server account alias not found")
             } else {
-                super::remote::select(accounts)
+                let (alias, redeem) = super::remote::select_for_activation(accounts, allow_resets)?;
+                redeem_reset = redeem;
+                Ok(alias)
             }
         })
         .transpose()?;
@@ -499,10 +507,18 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) 
     drop(_lock);
     let token = fetch(&connection, false)?;
     let usage_based = token.billing_class != Some(api::BillingClass::RateLimited);
-    if usage_based && !explicit {
+    if redeem_reset
+        && !token
+            .chatgpt_plan_type
+            .as_deref()
+            .is_some_and(api::is_known_rate_limited_plan)
+    {
+        bail!("automatic reset selection refuses usage-based or unknown plans");
+    }
+    if usage_based && !explicit && !redeem_reset {
         bail!("automatic remote selection refuses usage-based or unknown billing");
     }
-    if usage_based && !allow_billing {
+    if usage_based && !allow_billing && !redeem_reset {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
             bail!("remote account may bill credits; use --allow-billing explicitly");
@@ -515,11 +531,12 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) 
             bail!("remote billing switch declined");
         }
     }
-    connection.allow_billing = usage_based;
-    connection.approved_billing_plan = usage_based
+    let approve_billing = usage_based && !redeem_reset;
+    connection.allow_billing = approve_billing;
+    connection.approved_billing_plan = approve_billing
         .then(|| token.chatgpt_plan_type.clone())
         .flatten();
-    connection.approved_billing_class = usage_based.then_some(token.billing_class).flatten();
+    connection.approved_billing_class = approve_billing.then_some(token.billing_class).flatten();
     let _lock = native_lock(&root()?)?;
     if let Some(catalog) = catalog.as_ref() {
         super::remote::require_current_connection(&catalog.connection)?;
@@ -621,6 +638,35 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, restart_daemon: bool) 
     connection.revision = latest.revision;
     let destination = config_path(&home)?;
     let had_marker = marker.try_exists()?;
+    // All local refusal checks have passed. Hold both mutation locks through the
+    // spend and activation so another local command cannot invalidate the checks.
+    if redeem_reset {
+        let response = super::remote::redeem_reset(alias)?;
+        if !matches!(
+            response.code,
+            api::ConsumeResetCode::Reset | api::ConsumeResetCode::AlreadyRedeemed
+        ) {
+            bail!("banked reset did not clear the account's exhausted window");
+        }
+        eprintln!("codexctl: redeemed a banked reset for {alias}; checking included usage");
+        let mut included = false;
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            let refreshed = fetch(&connection, false)
+                .context("a reset was redeemed, but activation could not confirm included usage; wait and retry codexctl use without --allow-resets")?;
+            if refreshed.billing_class == Some(api::BillingClass::RateLimited) {
+                included = true;
+                break;
+            }
+        }
+        if !included {
+            bail!(
+                "a reset was redeemed, but included usage is not yet confirmed; activation was not completed; wait and retry codexctl use without --allow-resets"
+            );
+        }
+    }
     store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
     if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
         let not_installed = match std::fs::read(&destination) {

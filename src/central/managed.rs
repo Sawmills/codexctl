@@ -1158,6 +1158,8 @@ pub async fn serve(
                 "owner_unavailable",
                 "catalog_owner_unavailable",
                 "reset_read_failed",
+                "reset_redeem_failed",
+                "reset_rejected",
                 "reset_auth_rejected",
                 "catalog_usage_failed",
                 "catalog_usage_timeout",
@@ -1198,7 +1200,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
-        .route("/v1/resets", get(super::resets::list))
+        .merge(super::resets::routes())
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))
         .route("/v1/devices/revoke", post(revoke_device))
