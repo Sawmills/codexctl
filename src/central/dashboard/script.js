@@ -27,9 +27,10 @@
   };
   const countdown = (seconds) => {
     if (seconds <= 0) return "Reset due · awaiting observation";
-    const d = Math.floor(seconds / 86400),
-      h = Math.floor((seconds % 86400) / 3600),
-      m = Math.ceil((seconds % 3600) / 60);
+    const minutes = Math.ceil(seconds / 60),
+      d = Math.floor(minutes / 1440),
+      h = Math.floor((minutes % 1440) / 60),
+      m = minutes % 60;
     return `Resets in ${d ? `${number(d)}d ${number(h)}h` : h ? `${number(h)}h ${number(m)}m` : `${number(m)}m`}`;
   };
   const localTime = (seconds) =>

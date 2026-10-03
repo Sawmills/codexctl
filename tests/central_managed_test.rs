@@ -6437,6 +6437,45 @@ fn dashboard_root_is_public_without_account_data_and_redirects_signed_in_browser
 }
 
 #[test]
+fn dashboard_disabled_session_can_view_public_landing_but_not_accounts() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    let state = issuer.server.root.path().join("state");
+    let user = central::managed::users(&state)
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id != "amir" && u.id != "alex")
+        .unwrap();
+    central::managed::set_user(&state, &user.id, false).unwrap();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = http
+        .get(format!("{}/", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let html = response.text().unwrap();
+    assert!(html.contains("Sign in with company SSO"));
+    assert!(html.contains("id=\"connect-command\""));
+    assert!(!html.contains(&user.email));
+    for path in ["/accounts", "/accounts/data"] {
+        assert_eq!(
+            http.get(format!("{}{path}", issuer.server.url))
+                .header("cookie", &cookie)
+                .send()
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+}
+
+#[test]
 fn dashboard_pages_pin_bundled_assets_and_contain_no_credentials() {
     use base64::engine::general_purpose::STANDARD;
     use sha2::{Digest, Sha256};

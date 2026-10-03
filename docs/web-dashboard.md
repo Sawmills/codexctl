@@ -11,7 +11,9 @@ check the release's SHA-256 file before extracting or installing.
 
 `/accounts` is a read-only overview of the signed-in company user's server accounts
 and registered machines. The browser polls `/accounts/data` every 60 seconds after
-the preceding request finishes. Countdown clocks and observation ages update locally every minute.
+the preceding request finishes. Countdown clocks and observation ages update locally
+every minute. Remaining time rounds up to a whole minute before carrying minutes
+into hours and days.
 Missing percentages, durations, reset times, and inventory counts remain unknown.
 The page labels windows by their declared duration, including nonstandard windows;
 it does not infer five hours or a week from their position. High usage starts at
@@ -54,8 +56,10 @@ stores their hashes in memory for one hour. HTTPS cookies use `Secure`, `HttpOnl
 under the existing development configuration. Restarting the account server ends
 browser sessions. The existing machine enrollment and approval flow is unchanged.
 An approved company identity can open an empty overview without enrolling a machine.
-Disabled company users cannot sign in or use an existing session. Authorization is
-checked again after asynchronous data reads. The header shows the signed-in email.
+Disabled company users cannot sign in or use an existing session for account data.
+The public landing page ignores sessions that cannot identify an enabled company user
+and shows its signed-out view; account pages and JSON still enforce authorization.
+Authorization is checked again after asynchronous data reads. The header shows the signed-in email.
 Sign out submits a same-origin POST to `/accounts/sign-out`, revokes only the current
 browser session, clears its cookie, and returns to the landing page. Other browser
 sessions and machine credentials are unaffected. Missing or foreign Origin headers

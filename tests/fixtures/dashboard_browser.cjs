@@ -486,6 +486,29 @@ const server = http.createServer((req, res) => {
     assert.equal(await page.locator(":focus").textContent(), "Skip to content");
     // Exercise actual DOM escaping, polling and session-loss clearing.
     await page.clock.install();
+    const savedReset = snapshot.accounts[0].secondary.resets_at;
+    for (const [seconds, expected] of [
+      [3570, "Resets in 1h 0m"], // 59.5 minutes
+      [7176, "Resets in 2h 0m"], // 1 hour, 59.6 minutes
+      [86376, "Resets in 1d 0h"], // Carry into the next day, too.
+      [0, "Reset due · awaiting observation"],
+    ]) {
+      snapshot.accounts[0].secondary.resets_at = now + seconds;
+      await page.goto(origin + "/accounts");
+      await page.locator(".hero-capacity > time").first().waitFor();
+      assert.equal(
+        await page.locator(".hero-capacity > time").first().textContent(),
+        expected,
+      );
+      const studioCard = page
+        .locator("#accounts > article")
+        .filter({ has: page.locator(".alias", { hasText: /^studio$/ }) });
+      assert.equal(
+        await studioCard.locator(".window time").nth(1).textContent(),
+        expected,
+      );
+    }
+    snapshot.accounts[0].secondary.resets_at = savedReset;
     await page.goto(origin + "/accounts");
     await page
       .getByText("Everyday building", { exact: true })

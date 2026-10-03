@@ -157,7 +157,8 @@ async fn landing(
     headers: HeaderMap,
     content: String,
 ) -> Result<Response, HttpError> {
-    if enrollment::browser_user(&broker, &headers)?.is_some() {
+    // Session lookup is optional on the public page. Only an enabled identity redirects.
+    if matches!(enrollment::browser_user(&broker, &headers), Ok(Some(_))) {
         return Ok(([("cache-control", "no-store")], Redirect::to("/accounts")).into_response());
     }
     Ok(document(&content))
