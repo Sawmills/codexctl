@@ -9,7 +9,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
-    routing::get,
+    routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::json;
@@ -26,8 +26,9 @@ async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Result<Respon
     Ok(document(include_str!("dashboard/accounts.html")))
 }
 async fn data(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
-    let user = enrollment::browser_user(&broker, &headers)?
+    let identity = enrollment::browser_user(&broker, &headers)?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
+    let user = identity.id;
     let catalog = managed::account_catalog(&broker, &user).await?;
     let sampled_at = std::time::Instant::now();
     let tasks = catalog
@@ -53,14 +54,14 @@ async fn data(State(broker): State<Broker>, headers: HeaderMap) -> Result<Respon
             if let Some(last_use) = last_use { machine["last_used_alias"] = json!(last_use.alias); }
             machine
         }).collect();
-    enrollment::browser_user(&broker, &headers)?
+    let identity = enrollment::browser_user(&broker, &headers)?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     Ok((
         [
             ("cache-control", "no-store"),
             ("x-content-type-options", "nosniff"),
         ],
-        Json(json!({"version":1,"server_time":chrono::Utc::now().timestamp(),"accounts":accounts,"machines":machines})),
+        Json(json!({"version":1,"identity":{"email":identity.email},"server_time":chrono::Utc::now().timestamp(),"accounts":accounts,"machines":machines})),
     )
         .into_response())
 }
@@ -137,6 +138,7 @@ pub(super) fn routes() -> Router<Broker> {
         .route("/accounts", get(page))
         .route("/accounts/data", get(data))
         .route("/accounts/sign-in", get(enrollment::accounts_sign_in))
+        .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
 }
 
 async fn landing(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
@@ -156,11 +158,12 @@ fn document(content: &str) -> Response {
     let html = include_str!("dashboard/page.html")
         .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))
         .replace("<!-- CONTENT -->", content)
-        .replace("<!-- SCRIPT -->", &format!("<script>{script}</script>"));
+        .replace("<!-- SCRIPT -->", &format!("<script>{script}</script>"))
+        .replace("<!-- VERSION -->", env!("CARGO_PKG_VERSION"));
     (
         [
             ("cache-control", "no-store"),
-            ("referrer-policy", "no-referrer"),
+            ("referrer-policy", "same-origin"),
             ("x-content-type-options", "nosniff"),
             ("content-security-policy", policy.as_str()),
         ],

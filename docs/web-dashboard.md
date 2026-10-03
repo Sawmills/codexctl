@@ -21,16 +21,23 @@ No credentials are recorded. A failed request leaves the last successful observa
 unchanged. Restarting the account server clears these observations; unseen machines
 show last seen as unknown and omit account associations.
 
-The hero shows “In Use Now” for non-revoked machines with a token delivery in the last
-five minutes. It lists each machine, its alias and observation age, with the most
-recent machine's account and long-window capacity featured. This is a token-delivery
-observation, not proof of a running session or every session's account. If none are
-recent, “Suggested” features the available account with the most fresh, included
-headroom. It does not switch anything. Unmigrated local profiles are not visible to
-the account server. Cards sort recently used accounts first, then by headroom, with
-exhausted and unavailable accounts last. Registered and
-revoked describe machine registration, not live connectivity. Names use the recorded
-machine identifier, including enrollment's uniqueness suffix when present.
+The hero shows “In use now” for non-revoked machines with a token delivery in the last
+five minutes. Each machine gets its own row with its account label and alias, plan,
+large long-window capacity, short-window capacity, reset countdown, and last delivery.
+This is a token-delivery observation, not proof of a running session or every session's
+account. If none are recent, “Suggested” features the available account with the most
+fresh, included long-window headroom. It does not switch anything. Unmigrated local
+profiles are not visible to the account server.
+
+Cards sort in-use accounts by machine recency, then available accounts by long-window
+headroom, high usage (at least 80% used), exhausted, unknown/stale usage, renewal pending,
+and unavailable. Empty reset inventories say “No banked resets”; positive redeemable
+counts stand out. Observation ages use seconds below a minute and minutes thereafter,
+with a separate Stale pill for an individually old observation. When all observations
+are stale, a single banner replaces repeated pills. Registered machines are prominent; revoked machines sit
+under a collapsed disclosure, whose state is represented by `?revoked=show`.
+Registration is not live connectivity. Names use the recorded machine identifier,
+including enrollment's uniqueness suffix when present.
 
 ## Authentication and delivery
 
@@ -46,7 +53,12 @@ under the existing development configuration. Restarting the account server ends
 browser sessions. The existing machine enrollment and approval flow is unchanged.
 An approved company identity can open an empty overview without enrolling a machine.
 Disabled company users cannot sign in or use an existing session. Authorization is
-checked again after asynchronous data reads.
+checked again after asynchronous data reads. The header shows the signed-in email.
+Sign out submits a same-origin POST to `/accounts/sign-out`, revokes only the current
+browser session, clears its cookie, and returns to the landing page. Other browser
+sessions and machine credentials are unaffected. Missing or foreign Origin headers
+are rejected. Pages use a same-origin referrer policy so native form submissions
+retain their Origin while external documentation links disclose no referrer.
 
 The page and JSON use `Cache-Control: no-store`. Embedded CSS and JavaScript are
 pinned by SHA-256 in the CSP; connections and forms are restricted to the same origin,
@@ -78,6 +90,7 @@ proof of capacity or permission to spend.
 ```json
 {
   "version": 1,
+  "identity": { "email": "amir@sawmills.ai" },
   "server_time": 4102434000,
   "accounts": [
     {

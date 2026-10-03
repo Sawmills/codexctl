@@ -606,7 +606,7 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 pub(super) fn browser_user(
     broker: &Broker,
     headers: &HeaderMap,
-) -> Result<Option<String>, HttpError> {
+) -> Result<Option<managed::User>, HttpError> {
     let Some(sso) = broker.sso.as_deref() else {
         return Ok(None);
     };
@@ -621,16 +621,50 @@ pub(super) fn browser_user(
             .get(&vault::digest(token.as_bytes()))
             .map(|s| s.user.clone())
     };
-    if let Some(user) = &user
-        && !managed::users(&broker.state)
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
-            .iter()
-            .any(|u| &u.id == user && u.enabled)
-    {
-        return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
-    }
-    Ok(user)
+    let Some(user) = user else {
+        return Ok(None);
+    };
+    let identity = managed::users(&broker.state)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+        .into_iter()
+        .find(|u| u.id == user && u.enabled)
+        .ok_or_else(|| broker.error(StatusCode::FORBIDDEN, "user_disabled"))?;
+    Ok(Some(identity))
 }
+
+pub(super) async fn accounts_sign_out(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let sso = sso(&broker)?;
+    // A link-styled form submits same-origin POST; cross-site forms cannot end a session.
+    if headers.get("origin").and_then(|h| h.to_str().ok()) != Some(sso.public_url.as_str()) {
+        return Err(broker.error(StatusCode::FORBIDDEN, "invalid_browser_origin"));
+    }
+    if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
+        sso.flows
+            .lock()
+            .expect("enrollment lock")
+            .sessions
+            .remove(&vault::digest(token.as_bytes()));
+    }
+    let mut response = (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        Redirect::to("/"),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "set-cookie",
+        sso.cookie("session", "", 0)
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
+}
+
 pub(super) async fn accounts_sign_in(State(broker): State<Broker>) -> Result<Response, HttpError> {
     let sso = sso(&broker)?;
     let binding = secret();

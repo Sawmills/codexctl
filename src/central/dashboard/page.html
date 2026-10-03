@@ -22,14 +22,21 @@
     <header class="topbar wrap">
       <a class="wordmark" translate="no" href="/" aria-label="codexctl home"
         ><span aria-hidden="true">&gt;_</span> codexctl</a
-      ><span class="topnote">ACCOUNT SERVER</span>
+      >
+      <div id="browser-identity" class="browser-identity" hidden>
+        <span id="identity-email" translate="no"></span>
+        <form action="/accounts/sign-out" method="post">
+          <button class="link-button" type="submit">Sign out</button>
+        </form>
+      </div>
     </header>
     <main id="main" class="wrap"><!-- CONTENT --></main>
     <footer class="wrap footer">
-      <span
-        >codexctl <span aria-hidden="true">/</span> Your accounts. Your
-        machines.</span
-      ><span>Connected by company SSO.</span>
+      <span translate="no">codexctl v<!-- VERSION --></span>
+      <a
+        href="https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md"
+        >Documentation</a
+      >
     </footer>
     <!-- SCRIPT -->
   </body>

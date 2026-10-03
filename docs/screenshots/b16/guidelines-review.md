@@ -2,12 +2,12 @@
 
 Checked against `/home/amir/b16-design-spec.md` and
 `/home/amir/web-interface-guidelines.md`, including HQ's subsequent machine-activity
-clarification. Synthetic preview: 7 server accounts; no local-profile invention.
+clarification and all items in `/home/amir/b16-design-review-1.md` and `/home/amir/b16-design-review-2.md`. Synthetic preview: 7 server accounts; no local-profile invention.
 
 ## src/central/dashboard/accounts.html
 
-- PASS — hierarchy: recent token deliveries in “In Use Now”; machine → alias and
-  last-seen age; featured label, alias, plan, large long-window percentage and reset.
+- PASS — hierarchy: recent token deliveries in “In use now”; one row per machine with
+  label, alias, plan, large long-window percentage, short-window capacity, reset and delivery age.
 - PASS — no recent delivery: “Suggested” uses fresh included headroom, with no switch.
 - PASS — loading skeleton, migration empty state, retryable error retaining stale
   data, session-ended state, explicit local-profile limitation.
@@ -24,7 +24,7 @@ clarification. Synthetic preview: 7 server accounts; no local-profile invention.
 - PASS — readiness pill distinguishes ready, not ready and unknown.
 - PASS — code uses `translate="no"`; `<machine>` and shell quotes remain literal code.
 - PASS — Linux disclosure uses native keyboard interaction and URL `platform=linux` state.
-- PASS — static headings use title case; exact requested SSO button text is preserved.
+- PASS — sentence case throughout, following HQ round 1 (overrides the general title-case rule).
 
 ## src/central/dashboard/page.html
 
@@ -35,7 +35,7 @@ clarification. Synthetic preview: 7 server accounts; no local-profile invention.
 
 ## src/central/dashboard/style.css
 
-- FIX → PASS — hero percentage specificity: 72 px desktop, 56 px phone; browser assertion.
+- FIX → PASS — hero percentages: 56 px desktop (72 px for a single machine), 44 px phone.
 - FIX → PASS — content-visibility applies only above 50 cards, avoiding blank preview cards.
 - PASS — 1200 px maximum width; 1/2/3-column grid; 16 px phone gutters; safe-area insets.
 - PASS — 4/8 px spacing, system UI type, tabular numerals, balanced headings.
@@ -51,12 +51,14 @@ clarification. Synthetic preview: 7 server accounts; no local-profile invention.
 
 ## src/central/dashboard/script.js
 
-- PASS — recent accounts sort first, then headroom, then exhausted/unavailable.
+- PASS — sort: in-use by machine, available by long-window headroom, high usage,
+  exhausted, unknown/stale usage, renewal pending, unavailable; browser order assertion.
 - PASS — percent left is primary; used is secondary; declared durations only; Unknown
   remains text, never a fabricated 0% or dash.
 - PASS — semantic progress bars, explicit min/max/now, names and percentage alternatives.
 - PASS — countdowns update every minute; reset timestamps have local-time title/ARIA text.
-- PASS — banked-reset chip includes count, expiry, redeemable count and stale state.
+- PASS — banked-reset inventory includes count/expiry and stale state; zero inventory
+  is one muted line; redeemable count shown prominently only above zero.
 - PASS — Intl number/date formatting; browser locale, no IP language detection.
 - PASS — safe DOM text for user-controlled labels/aliases; hostile-looking label browser test.
 - PASS — native buttons/links/disclosure supply keyboard actions; keyboard skip-link test.
@@ -69,7 +71,7 @@ clarification. Synthetic preview: 7 server accounts; no local-profile invention.
 ## Not applicable to these pages
 
 - Forms: no text inputs, labels, input types/modes, autocomplete, spellcheck, paste
-  handlers, checkboxes, validation, placeholders, unsaved input or submit mutation.
+  handlers, checkboxes, validation, placeholders or unsaved input. Sign-out uses a native POST form.
 - Images/media: no img, SVG, video, GIF, audio, captions, lazy media or autoplay loops.
 - Compound controls/overlays: no custom composite controls, modals, drawers or sticky overlays.
 - Drag/gesture: no drag, swipe or gesture-only operation; no autofocus.
@@ -77,11 +79,38 @@ clarification. Synthetic preview: 7 server accounts; no local-profile invention.
 - Destructive actions: none; dashboard does not select, redeem, remove or mutate accounts.
 - Controlled inputs/hydration: none; no hydration suppression or expensive per-key rendering.
 
+## Round 1 fixes
+
+1. PASS — separate machine hero rows, no winner account; two-machine and suggested screenshots.
+2. PASS — requested category order; exact seven-account order asserted.
+3. PASS — compact label/left/reset row, meter and used caption; all desktop cards ≤260 px.
+4. PASS — “No banked resets” and no zero redeemable noise; positive count emphasized.
+5. PASS — sentence case in UI copy and window labels; user-provided labels preserved.
+6. PASS — seconds below 60, minutes thereafter; Stale is a pill.
+7. PASS — scoped identity email and Sign out; real HTTP isolation/CSRF checks and browser form check.
+8. PASS — revoked disclosure, active machine account pills, URL-backed expanded state.
+9. PASS — terminal has no decorative action arrows or rotation.
+10. PASS — command pre-wrap with normal overflow wrapping and internal horizontal scrolling.
+11. PASS — footer version comes from Cargo package metadata and links to documentation.
+
+## Round 2 fixes
+
+1. PASS — nonbreaking command flag spans; checked at 1440, 768 and 390 px.
+2. PASS — whole-page stale observations use one banner; individual older observations
+   keep their own pills; hero pills hug the text.
+3. PASS — account and plan chips share a row at every checked width.
+4. PASS — footer uses `CARGO_PKG_VERSION`; HTTP test checks the rendered footer on both
+   routes against the build version. This branch remains v0.1.34; release metadata was not changed.
+
+Only the four requested images were recaptured for round 2: `landing-light.png`,
+`landing-light-phone.png`, `accounts-error-stale.png`, and
+`accounts-dark-phone-first-screen.png`. Other images retain the round 1 capture.
+
 ## Execution evidence
 
 - Real Chromium, production bundled HTML/CSS/JS and exact CSP, synthetic JSON only.
 - 1440 px and 390 px, light and dark; 7 accounts, 3 machines; error/stale and suggested views.
-- Browser checks: axe WCAG A/AA, no horizontal overflow, visible hero percentage, copy,
+- Browser checks: axe WCAG A/AA, no horizontal overflow, per-machine hero, card heights ≤260 px, native sign-out, copy,
   60-second polling, retry, safe labels, session loss, empty and suggested states,
   keyboard skip link and reduced-motion behavior.
 - This is a self-review and local browser evidence, not HQ's design/code review or deployment.

@@ -6418,12 +6418,24 @@ fn dashboard_pages_pin_bundled_assets_and_contain_no_credentials() {
         }
         let response = request.send().unwrap();
         assert_eq!(response.status(), 200);
-        assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+        assert_eq!(response.headers()["referrer-policy"], "same-origin");
         let csp = response.headers()["content-security-policy"]
             .to_str()
             .unwrap()
             .to_owned();
         let html = response.text().unwrap();
+        let footer = html
+            .split("<footer")
+            .nth(1)
+            .unwrap()
+            .split("</footer>")
+            .next()
+            .unwrap();
+        assert!(
+            footer.contains(&format!("codexctl v{}", env!("CARGO_PKG_VERSION"))),
+            "footer must follow the binary build version"
+        );
+        assert!(!footer.contains("<!-- VERSION -->"));
         for tag in ["style", "script"] {
             let asset = html
                 .split(&format!("<{tag}>"))
@@ -6564,4 +6576,73 @@ fn dashboard_machine_activity_tracks_only_successful_token_delivery_with_user_is
     ] {
         assert!(!text.contains(secret));
     }
+}
+
+#[test]
+fn dashboard_identity_and_sign_out_are_scoped_to_the_browser_session() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    let other_session = issuer.dashboard_cookie();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let snapshot = || {
+        http.get(format!("{}/accounts/data", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap()
+    };
+    let data: Value = snapshot().json().unwrap();
+    assert_eq!(data["identity"]["email"], "amir@sawmills.ai");
+    let public = http
+        .get(format!("{}/", issuer.server.url))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(!public.contains("amir@sawmills.ai"));
+    assert_eq!(
+        http.get(format!("{}/accounts/sign-out", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap()
+            .status(),
+        405
+    );
+    for origin in [None, Some("https://unrelated.example")] {
+        let mut request = http
+            .post(format!("{}/accounts/sign-out", issuer.server.url))
+            .header("cookie", &cookie);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().unwrap().status(), 403);
+        assert_eq!(snapshot().status(), 200);
+    }
+    let signed_out = http
+        .post(format!("{}/accounts/sign-out", issuer.server.url))
+        .header("cookie", &cookie)
+        .header("origin", &issuer.server.url)
+        .send()
+        .unwrap();
+    assert_eq!(signed_out.status(), 303);
+    assert_eq!(signed_out.headers()["location"], "/");
+    assert_eq!(signed_out.headers()["cache-control"], "no-store");
+    assert!(
+        signed_out.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    assert_eq!(snapshot().status(), 401);
+    assert_eq!(
+        http.get(format!("{}/accounts/data", issuer.server.url))
+            .header("cookie", other_session)
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
 }
