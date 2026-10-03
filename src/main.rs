@@ -2,6 +2,8 @@ mod commands;
 
 use codexctl::{api, config, daemon, profile, store};
 
+#[cfg(feature = "central-prototype")]
+use clap::ArgGroup;
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
@@ -56,9 +58,12 @@ enum Commands {
     },
     #[cfg(feature = "central-prototype")]
     #[command(hide = true)]
+    #[command(group(ArgGroup::new("token_source").required(true).args(["connection", "active"])))]
     CentralToken {
         #[arg(long)]
-        connection: std::path::PathBuf,
+        connection: Option<std::path::PathBuf>,
+        #[arg(long)]
+        active: bool,
     },
     /// Show rate limit status for all accounts
     Status {
@@ -297,9 +302,16 @@ fn main() {
             ref text,
         } => commands::label::run(alias, text.as_deref()),
         #[cfg(feature = "central-prototype")]
-        Commands::CentralToken { ref connection } => {
-            codexctl::central::native::print_token(connection)
-        }
+        Commands::CentralToken {
+            ref connection,
+            active,
+        } => match (connection, active) {
+            (Some(connection), false) => codexctl::central::native::print_token(connection),
+            (None, true) => codexctl::central::native::print_active_token(),
+            _ => Err(anyhow::anyhow!(
+                "pass exactly one of --connection <path> or --active"
+            )),
+        },
         Commands::Use {
             ref alias,
             allow_billing,
