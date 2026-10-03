@@ -403,12 +403,32 @@ fn save_backup(path: &Path, line: &[u8]) -> Result<()> {
 }
 
 fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
-    let output = Command::new("lsof")
-        .args(["-nP"])
+    let mut command = Command::new("lsof");
+    command.arg("-nP");
+    #[cfg(target_os = "linux")]
+    {
+        // Unprivileged lsof cannot stat tracefs on some Linux hosts. These
+        // kernel tracing files cannot hold rollouts. Exempt only confirmed
+        // tracefs mounts, retaining diagnostics for every session filesystem.
+        let mounts = fs::read_to_string("/proc/self/mountinfo")
+            .context("cannot inspect mounts for OS open-file check")?;
+        for path in ["/sys/kernel/debug/tracing", "/sys/kernel/tracing"] {
+            if mounts.lines().any(|line| {
+                line.split_once(" - ").is_some_and(|(mount, filesystem)| {
+                    mount.split_whitespace().nth(4) == Some(path)
+                        && filesystem.split_whitespace().next() == Some("tracefs")
+                })
+            }) {
+                command.args(["-e", path]);
+            }
+        }
+    }
+    let output = command
         .args(args)
         .output()
         .context("cannot run lsof; no session was rewritten")?;
-    if !output.stderr.is_empty() || !matches!(output.status.code(), Some(0 | 1)) {
+    let no_matches = output.status.code() == Some(1) && output.stdout.is_empty();
+    if !output.stderr.is_empty() || !(output.status.success() || no_matches) {
         bail!("OS open-file check failed; no further session will be rewritten");
     }
     Ok(output)
@@ -423,9 +443,6 @@ fn is_open(path: &Path) -> Result<bool> {
 }
 fn open_files() -> Result<HashSet<(u64, u64)>> {
     let output = lsof(&["-F".as_ref(), "pDi".as_ref()])?;
-    if !output.status.success() {
-        bail!("cannot inventory open files");
-    }
     let mut files = HashSet::new();
     let mut device = None;
     for line in output.stdout.split(|&b| b == b'\n') {

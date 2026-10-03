@@ -171,7 +171,9 @@ The interval does not stop an in-flight response, revoke an issued token, or rem
 Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
 Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
 No remote command redeems a banked reset implicitly.
-Finish existing TUI sessions and stop the daemon before switching accounts.
+Switching between server accounts updates the provider for new sessions.
+Existing sessions keep their startup account until restarted.
+Stop the daemon before switching accounts; its sessions need a restart to load the new provider.
 Pending local logins and local recovery wrappers also block remote activation.
 Parallel local commands remain supported.
 An explicit saved local alias can restore local mode before migration, even when the server is unavailable.
@@ -220,8 +222,9 @@ For a direct launch, use `codex resume <session-id> -c 'model_provider="codexctl
 The account-server provider uses local compaction through its authenticated Responses connection.
 The launcher preserves the current directory, arguments, and child exit status.
 Codex and its child processes inherit a mode lease.
-Account selection and disconnect refuse while any process holds that lease, including background tools that outlive Codex.
-Stop those processes before you retry account selection or disconnect.
+Entry from local mode and migration require an exclusive lease, including when a local login child outlives its launcher.
+Switching an already active server provider shares the session leases and serializes configuration writes.
+If disconnect or local selection restores the provider during that switch, selection refuses and asks for a retry.
 It refuses inherited or pinned Codex homes.
 Server-account launches use the provider token helper without local account failover or banked resets.
 Local-account launches retain the existing recovery behavior.
@@ -445,6 +448,10 @@ Migration also runs the repair if a server account is already active.
 Otherwise, migration defers the repair until `codexctl use` activates one.
 The repair requires `lsof` on the machine. macOS includes it; install the `lsof` package on Linux.
 A failed OS inspection stops the repair and reports any completed changes.
+An empty `lsof` result with exit status 1 means no open files.
+On Linux, inspection exempts confirmed kernel tracefs mounts at `/sys/kernel/debug/tracing` and `/sys/kernel/tracing`;
+these cannot contain session rollouts, and their restricted permissions can otherwise prevent inspection.
+Other inspection diagnostics, error exits, and ambiguous exit-1 output still stop repair.
 If repair fails after account activation or migration, the error names that completed step.
 Resolve the reported cause before you retry the repair.
 

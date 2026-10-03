@@ -458,7 +458,25 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     if catalog.is_none() && !path.try_exists()? {
         return Ok(false);
     }
-    let _mode = exclusive_mode(&config::default_paths()?)?;
+    let paths = config::default_paths()?;
+    let directory = root()?;
+    let shared = vault::mode_lock(&directory, vault::LockMode::Shared)?;
+    let switching_server = {
+        let _lock = native_lock(&directory)?;
+        directory.join(".native-active.json").try_exists()?
+            && document(&paths.codex_home())?
+                .get("model_provider")
+                .and_then(Item::as_str)
+                == Some(PROVIDER)
+    };
+    // Server sessions keep their launch-time provider. Only entry from local
+    // mode must exclude credential owners; native.lock serializes config writes.
+    let _mode = if switching_server {
+        shared
+    } else {
+        drop(shared);
+        exclusive_mode(&paths)?
+    };
     if let Some(catalog) = catalog.as_ref() {
         let _lock = native_lock(&root()?)?;
         super::remote::require_current_connection(&catalog.connection)?;
@@ -536,6 +554,11 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         );
     }
     let marker = root()?.join(".native-active.json");
+    // Disconnect or local selection can restore the provider during token fetch.
+    // A shared lease must never turn that into a fresh activation from local mode.
+    if switching_server && !marker.try_exists()? {
+        bail!("remote provider was disconnected during selection; retry codexctl use");
+    }
     let activation = if marker.try_exists()? {
         let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
         if active.home != home {
