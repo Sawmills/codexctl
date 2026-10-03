@@ -541,6 +541,7 @@ pub async fn serve(
         bail!("prototype binds only to loopback; use an SSH tunnel for other machines");
     }
     let _lock = vault::lock(state, "owner.lock")?;
+    super::storage::maybe_migrate(state, key).await?;
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .context("could not bind broker")?;

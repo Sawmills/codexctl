@@ -152,25 +152,45 @@ fn cipher(key: &Path) -> Result<Aes256Gcm> {
         .map_err(|_| anyhow::anyhow!("vault key must contain exactly 32 bytes"))
 }
 
-pub fn save(state: &Path, key: &Path, vault: &Vault) -> Result<()> {
+/// Encrypt a value for storage outside the local vault file.
+///
+/// The key is deliberately still read from the mounted secret file. Database
+/// rows contain only this nonce-prefixed ciphertext, so a database dump does
+/// not grant access to credentials without the vault key.
+pub(super) fn encrypt_bytes(key: &Path, plaintext: &[u8]) -> Result<Vec<u8>> {
     let cipher = cipher(key)?;
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
     let encrypted = cipher
-        .encrypt(&nonce, serde_json::to_vec(vault)?.as_ref())
+        .encrypt(&nonce, plaintext)
         .map_err(|_| anyhow::anyhow!("vault encryption failed"))?;
     let mut bytes = nonce.to_vec();
     bytes.extend(encrypted);
+    Ok(bytes)
+}
+
+pub(super) fn decrypt_bytes(key: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() < 28 {
+        bail!("encrypted value is truncated");
+    }
+    cipher(key)?
+        .decrypt(bytes[..12].into(), &bytes[12..])
+        .map_err(|_| anyhow::anyhow!("vault authentication failed"))
+}
+
+pub fn save(state: &Path, key: &Path, vault: &Vault) -> Result<()> {
+    let bytes = encrypt_bytes(key, &serde_json::to_vec(vault)?)?;
     store::atomic_write(&state.join("vault.enc"), &bytes)
 }
 
 pub fn load(state: &Path, key: &Path) -> Result<Vault> {
     let bytes = private_read(&state.join("vault.enc"))?;
-    if bytes.len() < 28 {
-        bail!("vault is truncated");
-    }
-    let plaintext = cipher(key)?
-        .decrypt(bytes[..12].into(), &bytes[12..])
-        .map_err(|_| anyhow::anyhow!("vault authentication failed"))?;
+    let plaintext = decrypt_bytes(key, &bytes).map_err(|error| {
+        if bytes.len() < 28 {
+            anyhow::anyhow!("vault is truncated")
+        } else {
+            error
+        }
+    })?;
     serde_json::from_slice(&plaintext).context("invalid vault data")
 }
 

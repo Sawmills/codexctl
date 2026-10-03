@@ -75,6 +75,13 @@ enum Commands {
         #[arg(long)]
         device: String,
     },
+    /// Apply central PostgreSQL schema migrations when PostgreSQL storage is enabled.
+    Migrate {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
     /// Serve the account API behind a private HTTPS ingress.
     Serve {
         #[arg(long)]
@@ -186,6 +193,9 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             token_file,
         } => central::register(&state, &device, &tenant, &user, &token_file)?,
         Commands::Revoke { state, device } => central::revoke(&state, &device)?,
+        Commands::Migrate { state, key_file } => {
+            central::storage::maybe_migrate(&state, &key_file).await?
+        }
         Commands::Serve {
             state,
             key_file,
