@@ -181,6 +181,7 @@ Selection prefers the soonest long-window reset.
 Within each billing class, automatic selection skips any candidate with a reported usage window at
 or above 95% whenever another candidate in that class is below 95%; this applies to both local and
 server-account selection.
+Thus a server seat at 97% is skipped in favor of a 10% seat even when the 97% seat resets sooner.
 An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
 Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
 Usage-based accounts never qualify for automatic selection.
