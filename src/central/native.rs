@@ -13,6 +13,7 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
+const ACTIVE_POINTER: &str = ".active-account";
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -323,6 +324,94 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     Ok(())
 }
 
+fn active_pointer_path() -> Result<PathBuf> {
+    Ok(root()?.join(ACTIVE_POINTER))
+}
+fn read_active_alias() -> Result<String> {
+    let path = active_pointer_path()?;
+    if !path.try_exists()? {
+        bail!("active account pointer is missing; run codexctl use again");
+    }
+    let raw = String::from_utf8(vault::private_read(&path)?)
+        .context("invalid active account pointer; run codexctl use again")?;
+    let alias = raw.trim();
+    if alias.is_empty()
+        || (raw != alias && raw != format!("{alias}\n") && raw != format!("{alias}\r\n"))
+    {
+        bail!("invalid active account pointer; run codexctl use again");
+    }
+    store::validate_alias(alias)
+        .map(|alias| alias.to_owned())
+        .map_err(|_| anyhow::anyhow!("invalid active account pointer; run codexctl use again"))
+}
+
+fn connection_alias(path: &Path, connection: &Connection) -> String {
+    connection
+        .alias
+        .clone()
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn billing_error(alias: &str, token: &TokenResponse) -> anyhow::Error {
+    if token.billing_class == Some(api::BillingClass::Unknown)
+        && token.statusline_usage.as_ref().is_some_and(|usage| {
+            usage
+                .five_hour_used_percent
+                .is_some_and(|used| used >= 100.0)
+                || usage.weekly_used_percent.is_some_and(|used| used >= 100.0)
+        })
+    {
+        anyhow::anyhow!("remote account {alias} is exhausted; run codexctl use")
+    } else {
+        anyhow::anyhow!("remote billing changed; select the account again with billing approval")
+    }
+}
+
+fn finish_token(
+    path: &Path,
+    connection: &Connection,
+    token: TokenResponse,
+    expected_active: Option<&str>,
+) -> Result<()> {
+    let alias = connection_alias(path, connection);
+    let mut latest = read_connection(path)?;
+    if let Some(expected) = expected_active
+        && read_active_alias()?.as_str() != expected
+    {
+        bail!("active account changed during token retrieval; retry");
+    }
+    if latest.account_id != connection.account_id
+        || latest.server != connection.server
+        || latest.device_token_file != connection.device_token_file
+    {
+        bail!("remote connection changed during token retrieval");
+    }
+    if token.billing_class != Some(api::BillingClass::RateLimited)
+        && (!latest.allow_billing
+            || latest.approved_billing_plan != token.chatgpt_plan_type
+            || latest.approved_billing_class != token.billing_class)
+    {
+        return Err(billing_error(&alias, &token));
+    }
+    if latest.revision == connection.revision {
+        latest.revision = token.revision;
+        save_connection(path, &latest)?;
+    }
+    if let (Ok(paths), Ok(selection), Some(usage)) = (
+        config::default_paths(),
+        statusline_identity(path, connection),
+        token.statusline_usage,
+    ) {
+        crate::statusline::record(&paths, selection, token.label.as_deref(), Some(usage));
+    }
+    println!("{}", token.access_token);
+    Ok(())
+}
 pub fn print_token(path: &Path) -> Result<()> {
     if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
         bail!("remote credentials cannot be supplied to a pinned local launch");
@@ -333,43 +422,29 @@ pub fn print_token(path: &Path) -> Result<()> {
         read_connection(path)?
     };
     let token = fetch(&connection, true)?;
-    if token.billing_class != Some(api::BillingClass::RateLimited)
-        && (!connection.allow_billing
-            || connection.approved_billing_plan != token.chatgpt_plan_type
-            || connection.approved_billing_class != token.billing_class)
-    {
-        bail!("remote billing changed; select the account again with billing approval");
+    let _lock = native_lock(directory)?;
+    finish_token(path, &connection, token, None)
+}
+pub fn print_active_token() -> Result<()> {
+    if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
+        bail!("remote credentials cannot be supplied to a pinned local launch");
     }
-    {
-        let _lock = native_lock(directory)?;
-        let mut latest = read_connection(path)?;
-        if latest.account_id != connection.account_id
-            || latest.server != connection.server
-            || latest.device_token_file != connection.device_token_file
-        {
-            bail!("remote connection changed during token retrieval");
+    let directory = root()?;
+    let (alias, path, connection) = {
+        let _lock = native_lock(&directory)?;
+        let alias = read_active_alias()?;
+        let path = connection_path(&alias)?;
+        if !path.try_exists()? {
+            bail!(
+                "active account pointer names missing connection {alias}; run codexctl use again"
+            );
         }
-        if token.billing_class != Some(api::BillingClass::RateLimited)
-            && (!latest.allow_billing
-                || latest.approved_billing_plan != token.chatgpt_plan_type
-                || latest.approved_billing_class != token.billing_class)
-        {
-            bail!("remote billing approval changed during token retrieval");
-        }
-        if latest.revision == connection.revision {
-            latest.revision = token.revision;
-            save_connection(path, &latest)?;
-        }
-    }
-    if let (Ok(paths), Ok(selection), Some(usage)) = (
-        config::default_paths(),
-        statusline_identity(path, &connection),
-        token.statusline_usage,
-    ) {
-        crate::statusline::record(&paths, selection, token.label.as_deref(), Some(usage));
-    }
-    println!("{}", token.access_token);
-    Ok(())
+        let connection = read_connection(&path)?;
+        (alias, path, connection)
+    };
+    let token = fetch(&connection, true)?;
+    let _lock = native_lock(&directory)?;
+    finish_token(&path, &connection, token, Some(&alias))
 }
 fn document(home: &Path) -> Result<DocumentMut> {
     match std::fs::read_to_string(home.join("config.toml")) {
@@ -571,6 +646,12 @@ pub fn activate(
         );
     }
     let marker = root()?.join(".native-active.json");
+    let pointer = active_pointer_path()?;
+    let previous_pointer = match std::fs::read(&pointer) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     // Disconnect or local selection can restore the provider during token fetch.
     // A shared lease must never turn that into a fresh activation from local mode.
     if switching_server && !marker.try_exists()? {
@@ -608,12 +689,10 @@ pub fn activate(
     provider["base_url"] = value("https://chatgpt.com/backend-api/codex");
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(false);
-    provider["http_headers"]["ChatGPT-Account-ID"] = value(&connection.account_id);
     provider["auth"]["command"] = value(helper.to_str().context("helper path must be UTF-8")?);
     let mut args = toml_edit::Array::new();
     args.push("central-token");
-    args.push("--connection");
-    args.push(path.to_str().context("connection path must be UTF-8")?);
+    args.push("--active");
     provider["auth"]["args"] = value(args);
     // Codex checks cached helper-token age before requests. This bounds normal
     // reuse to one minute; it does not cancel in-flight work or revoke tokens.
@@ -668,6 +747,7 @@ pub fn activate(
         }
     }
     store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
+    store::atomic_write(&pointer, format!("{alias}\n").as_bytes())?;
     if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
         let not_installed = match std::fs::read(&destination) {
             Ok(bytes) => bytes != doc.to_string().as_bytes(),
@@ -676,6 +756,12 @@ pub fn activate(
         if !had_marker && not_installed {
             std::fs::remove_file(&marker)
                 .context("failed to roll back prepared remote activation")?;
+        }
+        match previous_pointer {
+            Some(bytes) => store::atomic_write(&pointer, &bytes)?,
+            None => {
+                let _ = std::fs::remove_file(&pointer);
+            }
         }
         return Err(error);
     }
@@ -723,6 +809,7 @@ pub(super) fn deactivate_locked() -> Result<()> {
     }
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
     std::fs::remove_file(marker)?;
+    let _ = std::fs::remove_file(active_pointer_path()?);
     Ok(())
 }
 
@@ -784,13 +871,20 @@ pub fn active_alias() -> Result<Option<String>> {
     if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
         return Ok(None);
     }
-    let path = doc
+    let args = doc
         .get("model_providers")
         .and_then(|p| p.get(PROVIDER))
         .and_then(|p| p.get("auth"))
         .and_then(|a| a.get("args"))
         .and_then(Item::as_array)
-        .and_then(|args| args.get(2))
+        .context("invalid central provider command")?;
+    if args.iter().any(|arg| arg.as_str() == Some("--active")) {
+        return Ok(Some(read_active_alias()?));
+    }
+    let path = args
+        .iter()
+        .position(|arg| arg.as_str() == Some("--connection"))
+        .and_then(|i| args.get(i + 1))
         .and_then(toml_edit::Value::as_str)
         .context("invalid central provider command")?;
     Ok(std::path::Path::new(path)
@@ -870,15 +964,23 @@ pub(crate) fn statusline_selection(
     if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
         return Ok(None);
     }
-    let path = doc
+    let args = doc
         .get("model_providers")
         .and_then(|p| p.get(PROVIDER))
         .and_then(|p| p.get("auth"))
         .and_then(|p| p.get("args"))
         .and_then(Item::as_array)
-        .and_then(|args| args.get(2))
-        .and_then(toml_edit::Value::as_str)
         .context("invalid central provider command")?;
-    let path = Path::new(path);
-    statusline_identity(path, &read_connection(path)?).map(Some)
+    let path = if args.iter().any(|arg| arg.as_str() == Some("--active")) {
+        connection_path(&read_active_alias()?)?
+    } else {
+        let path = args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--connection"))
+            .and_then(|i| args.get(i + 1))
+            .and_then(toml_edit::Value::as_str)
+            .context("invalid central provider command")?;
+        PathBuf::from(path)
+    };
+    statusline_identity(&path, &read_connection(&path)?).map(Some)
 }

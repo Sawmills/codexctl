@@ -783,6 +783,12 @@ impl NativeClient {
             ],
         )
     }
+    fn helper_active(&self) -> std::process::Output {
+        self.run(
+            env!("CARGO_BIN_EXE_codexctl"),
+            &["central-token", "--active"],
+        )
+    }
 
     fn launch_command(&self, args: &[&str]) -> Command {
         use std::os::unix::fs::PermissionsExt;
@@ -1790,6 +1796,51 @@ fn when_a_pinned_shell_sees_the_remote_provider_then_the_helper_refuses_credenti
 }
 
 #[test]
+fn active_token_helper_reads_the_pointer_and_fails_closed_when_it_is_invalid() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let config = std::fs::read_to_string(client.home.join(".codex/config.toml")).unwrap();
+    assert!(config.contains("central-token"));
+    assert!(config.contains("--active"), "{config}");
+
+    let pointer = client.home.join(".codexctl/central/.active-account");
+    std::fs::write(&pointer, "remote \n").unwrap();
+    let output = client.helper_active();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active account pointer"));
+}
+
+#[test]
+fn a_slow_token_fetch_does_not_hold_native_lock() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    std::fs::write(client.broker.root.path().join("mode"), "billing-slow").unwrap();
+    let first = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["central-token", "--active"])
+        .env("HOME", &client.home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let marker = client.broker.root.path().join("billing-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let second = client.helper_active();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(first.wait_with_output().unwrap().status.success());
+}
+
+#[test]
 fn when_an_inherited_home_is_local_then_global_save_still_refuses_remote_mode() {
     let client = NativeClient::start();
     client.connect();
@@ -2076,6 +2127,12 @@ fn when_included_headroom_exhausts_then_helper_returns_no_token() {
     assert!(selected.status.success() && initial.status.success());
     assert!(!helper.status.success());
     assert!(helper.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&helper.stderr);
+    assert!(
+        stderr.contains("remote account remote is exhausted"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("run codexctl use"), "{stderr}");
 }
 
 #[test]

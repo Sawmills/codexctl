@@ -389,6 +389,17 @@ fn empty_os_inventory_allows_rewrite() {
 }
 
 #[test]
+fn lsof_warnings_are_suppressed_with_w_flag() {
+    let f = Fixture::new();
+    let result = f.run_with_lsof("for arg do\nif [ \"$arg\" = -w ]; then echo unexpected >&2; exit 2; fi\nif [ \"$arg\" = pDi ]; then echo \"lsof: WARNING: can't stat() nsfs file system /run/docker/netns/test\" >&2; echo \"      Output information may be incomplete.\" >&2; exit 0; fi\ndone\necho \"lsof: WARNING: can't stat() nsfs file system /run/docker/netns/test\" >&2\necho \"      Output information may be incomplete.\" >&2\nexit 1");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn uncertain_os_inventory_refuses_to_modify_rollouts() {
     for failure in [
         "echo 'cannot inspect file system' >&2\nexit 0",

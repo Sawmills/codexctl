@@ -428,10 +428,32 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
         .output()
         .context("cannot run lsof; no session was rewritten")?;
     let no_matches = output.status.code() == Some(1) && output.stdout.is_empty();
-    if !output.stderr.is_empty() || !(output.status.success() || no_matches) {
+    let mut after_warning = false;
+    let has_real_diagnostic = output.stderr.split(|byte| *byte == b'\n').any(|line| {
+        if line.is_empty() {
+            return false;
+        }
+        if harmless_lsof_warning(line) {
+            after_warning = true;
+            return false;
+        }
+        let continuation = after_warning
+            && String::from_utf8_lossy(line).trim() == "Output information may be incomplete.";
+        after_warning = false;
+        !continuation
+    });
+    if has_real_diagnostic || !(output.status.success() || no_matches) {
         bail!("OS open-file check failed; no further session will be rewritten");
     }
     Ok(output)
+}
+fn harmless_lsof_warning(line: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(line);
+    line.contains("WARNING: can't stat() nsfs file system /run/docker/netns/")
+        || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing")
+        || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/tracing")
+        || line
+            .contains("WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/")
 }
 fn is_open(path: &Path) -> Result<bool> {
     let output = lsof(&["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()])?;
