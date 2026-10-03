@@ -1,5 +1,9 @@
 # Clerk OIDC for Central Staging
 
+Clerk remains the active staging configuration until the planned Google Workspace
+cutover. Use the [Google configuration and cutover runbook](../central-server.md#one-time-clerk-identity-cutover)
+for that later switch; the Google preparation files are not referenced by staging.
+
 Use a dedicated confidential Clerk OAuth application for the codexctl server.
 Keep `public: false`, require PKCE, and register the exact HTTPS callback.
 The current Rust flow fits the documented Clerk contract. Public discovery and

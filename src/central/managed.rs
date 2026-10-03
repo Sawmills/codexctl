@@ -34,6 +34,9 @@ pub struct User {
     pub id: String,
     pub email: String,
     pub enabled: bool,
+    /// A replacement OIDC identity; the company-user ID and all ownership stay stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_identity: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +171,7 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnr
             id: id.into(),
             email: email.into(),
             enabled: true,
+            oidc_identity: None,
         });
     }
     store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)?;

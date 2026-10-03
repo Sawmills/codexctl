@@ -16,7 +16,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    core::{CoreAuthenticationFlow, CoreProviderMetadata},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -27,6 +27,46 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+
+// Keep provider extension claims inside the library's signature/issuer/nonce verification.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CompanyClaims {
+    #[serde(default)]
+    hd: Option<String>,
+}
+impl openidconnect::AdditionalClaims for CompanyClaims {}
+type CompanyTokenResponse = openidconnect::StandardTokenResponse<
+    openidconnect::IdTokenFields<
+        CompanyClaims,
+        openidconnect::EmptyExtraTokenFields,
+        openidconnect::core::CoreGenderClaim,
+        openidconnect::core::CoreJweContentEncryptionAlgorithm,
+        openidconnect::core::CoreJwsSigningAlgorithm,
+    >,
+    openidconnect::core::CoreTokenType,
+>;
+type CompanyClient = openidconnect::Client<
+    CompanyClaims,
+    openidconnect::core::CoreAuthDisplay,
+    openidconnect::core::CoreGenderClaim,
+    openidconnect::core::CoreJweContentEncryptionAlgorithm,
+    openidconnect::core::CoreJsonWebKey,
+    openidconnect::core::CoreAuthPrompt,
+    openidconnect::StandardErrorResponse<openidconnect::core::CoreErrorResponseType>,
+    CompanyTokenResponse,
+    openidconnect::core::CoreTokenIntrospectionResponse,
+    openidconnect::core::CoreRevocableToken,
+    openidconnect::core::CoreRevocationErrorResponse,
+    openidconnect::EndpointSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointNotSet,
+    openidconnect::EndpointMaybeSet,
+    openidconnect::EndpointMaybeSet,
+>;
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+
+mod identity;
 
 pub fn random_bytes() -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -44,6 +84,28 @@ struct Configuration {
     client_id: String,
     client_secret_file: std::path::PathBuf,
     allowed_domains: Vec<String>,
+    #[serde(default)]
+    allowed_hosted_domains: Option<Vec<String>>,
+    #[serde(default)]
+    clerk_migration: Option<ClerkMigration>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClerkMigration {
+    users: Vec<ClerkLink>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClerkLink {
+    user_id: String,
+    email: String,
+}
+impl Configuration {
+    fn hosted_domains(&self) -> Option<&[String]> {
+        self.allowed_hosted_domains
+            .as_deref()
+            .or_else(|| (self.issuer == GOOGLE_ISSUER).then_some(self.allowed_domains.as_slice()))
+    }
 }
 struct Pending {
     name: String,
@@ -97,6 +159,37 @@ impl Sso {
                 .any(|d| d.is_empty() || d.contains('@'))
         {
             bail!("SSO requires allowed company email domains");
+        }
+        if config.hosted_domains().is_some_and(|domains| {
+            domains.is_empty() || domains.iter().any(|d| d.is_empty() || d.contains('@'))
+        }) {
+            bail!("SSO requires nonempty allowed hosted domains");
+        }
+        if let Some(migration) = &config.clerk_migration {
+            if config.hosted_domains().is_none() || migration.users.is_empty() {
+                bail!("Clerk migration requires company users and hosted domains");
+            }
+            let mut user_ids = std::collections::BTreeSet::new();
+            let mut emails = std::collections::BTreeSet::new();
+            for user in &migration.users {
+                if user.user_id.len() != 64
+                    || !user
+                        .user_id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || !user_ids.insert(&user.user_id)
+                    || !emails.insert(user.email.to_ascii_lowercase())
+                    || !user.email.rsplit_once('@').is_some_and(|(local, domain)| {
+                        !local.is_empty()
+                            && config
+                                .allowed_domains
+                                .iter()
+                                .any(|d| d.eq_ignore_ascii_case(domain))
+                    })
+                {
+                    bail!("Clerk migration requires unique company-user IDs and company emails");
+                }
+            }
         }
         let issuer = reqwest::Url::parse(&config.issuer)?;
         if issuer.scheme() != "https"
@@ -305,7 +398,7 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
         .metadata()
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let client = CoreClient::from_provider_metadata(
+    let client = CompanyClient::from_provider_metadata(
         metadata,
         ClientId::new(sso.config.client_id.clone()),
         Some(ClientSecret::new(sso.client_secret.trim().into())),
@@ -315,15 +408,24 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?,
     );
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-    let (url, state, nonce) = client
+    let mut authorization = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
             CsrfToken::new_random,
             Nonce::new_random,
         )
         .add_scope(Scope::new("email".into()))
-        .set_pkce_challenge(challenge)
-        .url();
+        .set_pkce_challenge(challenge);
+    if let Some(domains) = sso.config.hosted_domains() {
+        // This affects Google's account chooser only. The signed claim is enforced below.
+        let hint = if domains.len() == 1 {
+            domains[0].as_str()
+        } else {
+            "*"
+        };
+        authorization = authorization.add_extra_param("hd", hint);
+    }
+    let (url, state, nonce) = authorization.url();
     let mut flows = sso.flows.lock().expect("enrollment lock");
     Sso::cleanup(&mut flows);
     if flows.logins.len() >= 1024 {
@@ -381,7 +483,7 @@ async fn callback(
         .metadata()
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
-    let client = CoreClient::from_provider_metadata(
+    let client = CompanyClient::from_provider_metadata(
         metadata,
         ClientId::new(sso.config.client_id.clone()),
         Some(ClientSecret::new(sso.client_secret.trim().into())),
@@ -431,15 +533,26 @@ async fn callback(
     }) {
         return Err(broker.error(StatusCode::FORBIDDEN, "company_identity_required"));
     }
-    let user =
-        vault::digest(format!("{}\0{}", sso.config.issuer, claims.subject().as_str()).as_bytes());
-    if managed::users(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
-        .iter()
-        .any(|u| u.id == user && !u.enabled)
+    if let Some(domains) = sso.config.hosted_domains()
+        && !claims
+            .additional_claims()
+            .hd
+            .as_deref()
+            .is_some_and(|hd| domains.iter().any(|domain| domain.eq_ignore_ascii_case(hd)))
     {
-        return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
+        return Err(broker.error(StatusCode::FORBIDDEN, "company_identity_required"));
     }
+    let user = match identity::resolve(&broker.state, &sso.config, claims.subject().as_str(), email)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    {
+        identity::Resolution::User(user) => user,
+        identity::Resolution::Disabled => {
+            return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
+        }
+        identity::Resolution::Conflict => {
+            return Err(broker.error(StatusCode::FORBIDDEN, "identity_link_refused"));
+        }
+    };
     let device_hash = match login.destination {
         Destination::Enrollment(hash) => hash,
         Destination::Accounts(_) => {
@@ -691,6 +804,8 @@ impl Sso {
                 client_id: "test".into(),
                 client_secret_file: "/unused".into(),
                 allowed_domains: vec!["example.invalid".into()],
+                allowed_hosted_domains: None,
+                clerk_migration: None,
             },
             public_url: "http://127.0.0.1".into(),
             http: reqwest::Client::new(),
@@ -706,5 +821,25 @@ impl Sso {
                 ..Default::default()
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn google_requires_hosted_domains_by_default_and_allows_an_explicit_list() {
+        let mut config: Configuration = serde_json::from_value(json!({
+            "issuer": GOOGLE_ISSUER, "client_id": "test", "client_secret_file": "/unused",
+            "allowed_domains": ["sawmills.ai"]
+        }))
+        .unwrap();
+        assert_eq!(config.hosted_domains().unwrap(), ["sawmills.ai"]);
+        config.allowed_hosted_domains = Some(vec!["workspace.example".into()]);
+        assert_eq!(config.hosted_domains().unwrap(), ["workspace.example"]);
+        config.allowed_hosted_domains = None;
+        config.issuer = "https://clerk.example".into();
+        assert!(config.hosted_domains().is_none());
     }
 }

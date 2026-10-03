@@ -339,23 +339,117 @@ It saves the device registry before the user registry, which marks completed set
 An interrupted setup can reuse the key and complete both registries.
 Keep the key separate from encrypted storage and backup both.
 
-Create an OIDC configuration file:
+The active staging overlay remains on Clerk. For the planned Google Workspace
+cutover, prepare an OIDC configuration file:
 
 ```json
 {
-  "issuer": "https://YOUR-COMPANY-OIDC-ISSUER",
-  "client_id": "codexctl",
+  "issuer": "https://accounts.google.com",
+  "client_id": "REPLACE_WITH_GOOGLE_WEB_CLIENT_ID.apps.googleusercontent.com",
   "client_secret_file": "/keys/oidc-client-secret",
-  "allowed_domains": ["sawmills.ai"]
+  "allowed_domains": ["sawmills.ai"],
+  "allowed_hosted_domains": ["sawmills.ai"]
 }
 ```
 
-Register the exact callback URL `https://codexctl.ue1.staging.plat.sm-svc.com/auth/callback` with your company identity provider.
-Use a dedicated client secret in a private file with mode `0600` or stricter.
-OIDC verification covers the signature, issuer, audience, expiry, nonce, and verified company email.
-It keys users by issuer and subject, so an email change does not transfer account ownership.
-The browser must approve each device after sign-in.
-Enrollment expires after five minutes and can supply a credential only once.
+The planned company SSO setup uses Google Workspace directly. In the Google Cloud
+project owned by `sawmills.ai`:
+
+1. Open **Google Auth platform** (or **APIs & Services → OAuth consent screen**),
+   configure the application name, support email and developer contact, and set
+   **Audience / User type** to **Internal**. This requires a project within the
+   Workspace organization. Do not select External as a workaround.
+2. Under **Clients → Create client** (or **Credentials → Create credentials →
+   OAuth client ID**), choose **Web application**, named `codexctl-staging`.
+3. Add exactly
+   `https://codexctl.ue1.staging.plat.sm-svc.com/auth/callback`
+   as an **Authorized redirect URI**. No JavaScript origin is required for this
+   server-side authorization-code flow. It requests only `openid email` and uses
+   PKCE. Do not request offline access or an OpenAI scope.
+4. Copy the client ID into `deploy/k8s/cutovers/google-workspace/sso.yaml`. Store the client
+   secret as a **plaintext secret value** in AWS Secrets Manager under
+   `/app/codexctl/oidc-client-secret`; do not store a JSON object around the value.
+   Never commit the secret. The planned cutover ExternalSecret entry reads this name through
+   `ClusterSecretStore/aws-secrets-manager` into `codexctl-secrets`, and the init
+   container copies it to `/keys/oidc-client-secret` as a private real file.
+   The platform administrator must provision/verify that ClusterSecretStore with
+   provider service `SecretsManager` and permission to read this secret before
+   cutover. The existing `aws-parameter-store` store continues serving the vault
+   key and metrics token; it cannot read the new Secrets Manager value.
+5. Schedule the switch and prepare the explicit Clerk links below. Confirm the
+   Google client, matching secret, secret store and reviewed image are ready
+   before manually registering or syncing the Application for cutover. Restart
+   the account server after that planned sync.
+   The files under `deploy/k8s/cutovers/google-workspace/` are unreferenced
+   preparation templates, with a placeholder client ID and Amir's company-user ID/email
+   allowlist. Fill the client ID and verify that allowlist, then promote the manifests into
+   `deploy/k8s/overlays/staging/` in a separate reviewed cutover change. Until then,
+   staging keeps its Clerk client and SSM secret source. See the
+   [cutover checklist](../deploy/k8s/cutovers/google-workspace/README.md).
+
+OIDC verification covers the signature, issuer, audience, expiry, nonce and
+`email_verified == true`. The email must have an allowed company domain. For
+Google, the signed ID token must also carry `hd` matching an
+`allowed_hosted_domains` entry (case-insensitive DNS comparison). This list defaults
+to `allowed_domains` for `https://accounts.google.com`; an empty list is rejected.
+Other OIDC issuers retain email-domain policy unless hosted domains are explicitly
+configured. A consumer Google account can use a company-looking email address, so
+email alone is insufficient. The authorization request sends `hd=sawmills.ai` as
+an account-chooser hint for a single hosted domain (`hd=*` for several); the token
+claim remains mandatory regardless of the hint.
+
+Company users are normally keyed by issuer and subject, so an email change does
+not transfer account ownership. The browser must approve each machine after
+sign-in. Enrollment expires after five minutes and supplies a credential only once.
+
+### One-time Clerk identity cutover
+
+Changing the issuer changes its subject namespace. An administrator with account
+server configuration access may explicitly authorize **individual existing Clerk
+company users** for one link on their first verified Google sign-in. There is no
+browser or machine API for authorizing links. Back up the state and key first,
+list company users with `codexctl-central users --state /data/state`, and confirm
+the stored company-user ID and verified primary company email. The server stores
+only the derived company-user ID, not the raw Clerk subject. Copy that ID from
+`codexctl-central users`; no raw subject lookup is required. An administrator must
+confirm that the selected record is the intended existing company user.
+
+Temporarily add this object to the Google SSO configuration, using the exact
+stored company-user ID and verified email values. The prepared staging allowlist
+authorizes only Amir; it excludes the assistbot and CLI integration company users:
+
+```json
+"clerk_migration": {
+  "users": [
+    {
+      "user_id": "6334462fa3dac53bdd9836507666cdde920a73768c3b52b632297d08130e1fd4",
+      "email": "amir@sawmills.ai"
+    }
+  ]
+}
+```
+
+Configuration write access is administrative authority: restrict it with the same
+filesystem permissions and deployment RBAC as the server configuration. Do not
+populate the allowlist from an untrusted email list. The account server requires
+the exact approved company-user ID and agreement between the approved email,
+the existing company user's email, and the verified arriving Google email. It
+refuses ambiguous emails, disabled company users, a missing source, and any second
+Google identity for a consumed source.
+An existing company email without explicit authorization is refused rather than
+creating a competing company user. New Workspace members with unused emails can
+still enroll normally.
+
+The link is recorded atomically under the user-registry lock. It keeps the
+company-user ID, server accounts, encrypted vault paths and machine credentials
+unchanged, and emits `SSO_IDENTITY_LINKED` with bounded identity digests (no email
+or tokens). Subsequent sign-ins use the recorded identity without linking again.
+Remove `clerk_migration` and restart after the approved cutover; recorded links
+keep working and further links are disabled. The old Clerk identity cannot sign
+in to a linked company user if the issuer configuration is switched back. Do not
+roll back to a binary predating identity links against migrated state; use the
+planned state-backup recovery procedure instead. See
+[ADR 0003](adr/0003-explicit-company-identity-cutover.md).
 
 Run behind the private HTTPS load balancer:
 
@@ -387,8 +481,12 @@ Before registration, pin both workload images to that digest in the staging over
 
 The staging application lives in `Sawmills/argocd-deploy` at
 `plat/ue1-staging/argocd/codexctl-application.yaml`.
-Its parent application registers it from Git. Automatic sync, prune, and self-heal
-then reconcile `deploy/k8s/overlays/staging` from this repository.
+The checked-in [Application](../deploy/k8s/staging-application.yaml) tracks `main`
+and `deploy/k8s/overlays/staging`; its sync policy sets `CreateNamespace=true` but
+has no automated sync, prune, or self-heal. Review and manually register the
+Application if it is not installed; sync is also an explicit operator action.
+Verify the installed Application's policy and the Google client/secret readiness
+before the planned cutover sync.
 The internal ALB terminates HTTPS. The broker uses a ClusterIP service.
 
 One StatefulSet replica owns an encrypted `ReadWriteOncePod` volume.
@@ -400,18 +498,23 @@ Confirm CSI support for `ReadWriteOncePod` before deployment.
 Create these SSM SecureString values through the operator secret workflow:
 
 - `/app/codexctl/vault-key`: base64 of the 32-byte encryption key.
-- `/app/codexctl/oidc-client-secret`: the dedicated company OIDC client secret.
+- `/app/codexctl/oidc-client-secret`: the current Clerk client secret.
 - `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 visible ASCII characters. The server trims surrounding whitespace.
 
+For the later Google cutover, prepare a separate AWS Secrets Manager value at
+`/app/codexctl/oidc-client-secret`, as described above. The active ExternalSecret
+continues reading the Clerk secret from SSM until that reviewed cutover.
 External Secrets supplies the pod secret.
 An init container copies the projected files into private real files for the broker.
 Key rotation needs a separate re-encryption procedure. Do not rotate the key independently of the stored vaults.
 
-The SSO overlay uses the company production identity issuer `https://clerk.sawmills.ai`.
-Its test mode is disabled. The service deployment and dedicated client remain in staging. A dedicated confidential application requires PKCE and has one exact
-HTTPS callback. Google sign-in is enabled. Enrollment requires a verified
-`sawmills.ai` primary email. The broker requests only `openid email`.
-See [the OIDC configuration research](research/central-staging-oidc.md).
+The active SSO overlay uses `https://clerk.sawmills.ai`. The unreferenced Google
+cutover files target `https://accounts.google.com` and the `sawmills.ai` Workspace;
+they require the administrator-created Internal web client and verified migration
+allowlist described above. The [Clerk OIDC research](research/central-staging-oidc.md)
+describes the current provider, not the planned Google setup. Google documents
+[Workspace `hd` verification](https://developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo)
+and [web client creation](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred).
 
 The staging VPC CNI currently has NetworkPolicy enforcement disabled.
 The supplied policy does not yet restrict pod traffic in that cluster.
