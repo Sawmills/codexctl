@@ -60,6 +60,17 @@ fn claude_only_server_starts_without_codex_and_does_not_expand_old_machine_acces
         .unwrap();
     let address: Value = serde_json::from_str(&line).unwrap();
     let url = format!("http://{}", address["listening"].as_str().unwrap());
+    let probe = || {
+        Command::new(env!("CARGO_BIN_EXE_account-server"))
+            .args([
+                "health-check",
+                "--address",
+                address["listening"].as_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let running_probe = probe();
     let http = reqwest::blocking::Client::builder()
         .no_proxy()
         .build()
@@ -98,6 +109,9 @@ fn claude_only_server_starts_without_codex_and_does_not_expand_old_machine_acces
         .status();
     child.kill().unwrap();
     child.wait().unwrap();
+    let stopped_probe = probe();
+    assert!(running_probe.status.success());
+    assert!(!stopped_probe.status.success());
     assert_eq!(ready, 200);
     assert_eq!(old_machine, 403);
     assert_eq!(granted, 200);

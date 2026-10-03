@@ -18,4 +18,5 @@ COPY --from=build /source/target/release/account-server /account-server
 USER 10001:10001
 ENV HOME=/state
 EXPOSE 8787
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["/account-server", "health-check"]
 ENTRYPOINT ["/account-server"]

@@ -11,6 +11,11 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Commands {
+    /// Check a local server's readiness without loading credentials or contacting providers.
+    HealthCheck {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        address: SocketAddr,
+    },
     Setup {
         #[arg(long)]
         state: PathBuf,
@@ -71,6 +76,21 @@ async fn main() {
 }
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
+        Commands::HealthCheck { address } => {
+            anyhow::ensure!(address.ip().is_loopback(), "health checks require loopback");
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(3))
+                .build()?
+                .get(format!("http://{address}/ready"))
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status() == reqwest::StatusCode::OK,
+                "account server is not ready"
+            );
+        }
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {
             state,

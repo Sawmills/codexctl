@@ -19,6 +19,9 @@ The image uses an unprivileged UID/GID 10001. Mount a private writable volume at
 `/state` owned by that user and an independently protected key/SSO-secret mount.
 The runtime contains the server, matching shared libraries, and CA certificates.
 The existing OpenAI Dockerfile and deployment stay available separately.
+The container health check runs `account-server health-check` against the local
+`/ready` endpoint on port 8787. Override the check's `--address` if changing the
+listener port. The probe does not read credentials or contact either provider.
 
 ```sh
 account-server setup --state /state/accounts --key-file /keys/vault
