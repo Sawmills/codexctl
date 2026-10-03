@@ -22,10 +22,14 @@ for the runtime after setting the acknowledgement). TLS is required by default, 
 `sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
 the server certificate is signed by a private Amazon RDS authority.
 
-Phase 2 `central_registry` rows are encrypted, non-authoritative startup
-snapshots used for migration accounting. Authorization continues to read the
-local users and device registries in this phase; those rows are never read as
-truth, so a stale snapshot cannot revive a disabled user or revoked device.
+Phase 2 `central_registry` rows are encrypted and are the shared authorization
+registry when central storage is enabled. A pod seeds each row from its local
+registry only when the central row does not exist; enrollment and revocation
+write the central row and refresh the process-local cache.
+
+Backfill reports relogin journals as `observed_relogins`; these operation
+records are not copied into a central table yet and do not count as migrated
+state.
 
 ## 1. State inventory
 

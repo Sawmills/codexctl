@@ -98,6 +98,7 @@ impl Fixture {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: None,
             holder_id: "test-holder".into(),
+            registry: None,
         };
         Self {
             _root: root,

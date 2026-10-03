@@ -110,6 +110,12 @@ pub(super) struct Broker {
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     pub(super) central: Option<CentralStore>,
     pub(super) holder_id: String,
+    pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
+}
+#[derive(Clone)]
+pub(super) struct RegistryState {
+    pub users: Vec<User>,
+    pub devices: Vec<vault::Device>,
 }
 pub(super) struct HttpError {
     status: StatusCode,
@@ -263,6 +269,26 @@ fn account_summary(owner: &Owner) -> Account {
 }
 
 impl Broker {
+    pub(super) async fn sync_registry(&self) -> Result<()> {
+        let users = users(&self.state)?;
+        let devices = vault::devices(&self.state)?;
+        if let Some(central) = self.central.as_ref() {
+            central
+                .save_registry("users", &serde_json::to_vec(&users)?)
+                .await?;
+            central
+                .save_registry("devices", &serde_json::to_vec(&devices)?)
+                .await?;
+        }
+        if let Some(registry) = self.registry.as_ref() {
+            *registry
+                .write()
+                .map_err(|_| anyhow::anyhow!("registry lock poisoned"))? =
+                RegistryState { users, devices };
+        }
+        Ok(())
+    }
+
     async fn persist_owner(&self, owner: &Owner) -> Result<()> {
         let Some(central) = self.central.as_ref() else {
             return Ok(());
@@ -307,15 +333,21 @@ impl Broker {
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-        let devices = vault::devices(&self.state)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let devices = self
+            .registry
+            .as_ref()
+            .and_then(|r| r.read().ok().map(|r| r.devices.clone()))
+            .unwrap_or_else(|| vault::devices(&self.state).unwrap_or_default());
         let hash = vault::digest(bearer.as_bytes());
         let device = devices
             .into_iter()
             .find(|d| d.token_hash == hash && !d.revoked && d.tenant == "sawmills")
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-        if !users(&self.state)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+        if !self
+            .registry
+            .as_ref()
+            .and_then(|r| r.read().ok().map(|r| r.users.clone()))
+            .unwrap_or_else(|| users(&self.state).unwrap_or_default())
             .iter()
             .any(|u| u.id == device.user && u.enabled)
         {
@@ -401,7 +433,7 @@ async fn token(
         let _permit = permit;
         let mut owner = owner.lock().await;
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
-        let lease = if request.previous_revision.is_some() {
+        let lease = if request.previous_revision.is_some() || request.billing {
             if let Some(central) = worker.central.as_ref() {
                 // Ensure the FK target exists before the first forced refresh
                 // after cutover or a locally imported account.
@@ -426,47 +458,55 @@ async fn token(
         } else {
             None
         };
-        let token = owner
-            .tokens(request)
-            .await
-            .map_err(|e| worker.owner_failure(e))?;
-        let record = CredentialRecord {
-            account_id: account_id.clone(),
-            user_id: Some(owner.vault.user.clone()),
-            alias: owner.vault.alias.clone(),
-            workspace: Some(
-                vault::account(&owner.vault.auth).map_err(|_| {
+        let result = async {
+            let token = owner
+                .tokens(request)
+                .await
+                .map_err(|e| worker.owner_failure(e))?;
+            let record = CredentialRecord {
+                account_id: account_id.clone(),
+                user_id: Some(owner.vault.user.clone()),
+                alias: owner.vault.alias.clone(),
+                workspace: Some(vault::account(&owner.vault.auth).map_err(|_| {
                     worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                })?,
-            ),
-            login: vault::token(&owner.vault.auth)
-                .ok()
-                .and_then(api::token_subject),
-            vault: serde_json::to_value(&owner.vault)
-                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?,
-            revision: credential_revision(&owner.vault.auth),
-        };
-        let written = if let Some(central) = worker.central.as_ref() {
-            if let Some(lease) = lease {
-                central.fenced_write(&lease, &record).await.map_err(|_| {
+                })?),
+                login: vault::token(&owner.vault.auth)
+                    .ok()
+                    .and_then(api::token_subject),
+                vault: serde_json::to_value(&owner.vault).map_err(|_| {
                     worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?
-            } else {
-                if let Err(error) = central.save_account(&record).await {
-                    // The local vault remains authoritative in dual mode for
-                    // cached-token delivery. Readiness exposes the DB outage;
-                    // token delivery stays available while the mirror recovers.
-                    eprintln!("central store cached-token mirror: {error:#}");
+                })?,
+                revision: credential_revision(&owner.vault.auth),
+            };
+            let written = if let Some(central) = worker.central.as_ref() {
+                if let Some(lease) = lease.as_ref() {
+                    central.fenced_write(lease, &record).await.map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?
+                } else {
+                    if let Err(error) = central.save_account(&record).await {
+                        // The local vault remains authoritative in dual mode for
+                        // cached-token delivery. Readiness exposes the DB outage;
+                        // token delivery stays available while the mirror recovers.
+                        eprintln!("central store cached-token mirror: {error:#}");
+                    }
+                    true
                 }
+            } else {
                 true
+            };
+            if !written {
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
             }
-        } else {
-            true
-        };
-        if !written {
-            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
         }
-        Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
+        .await;
+        if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
+            && let Err(error) = central.release_lease(lease).await
+        {
+            eprintln!("central lease release: {error:#}");
+        }
+        result
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
@@ -955,6 +995,10 @@ async fn revoke_device(
     device.revoked = true;
     vault::save_devices(&broker.state, &devices)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    broker
+        .sync_registry()
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
@@ -1004,7 +1048,11 @@ async fn ready(State(broker): State<Broker>) -> Response {
         Some(store) => store.reachable().await,
         None => true,
     };
-    let status = if local && reachable {
+    let mirror_outage_is_degraded = broker
+        .central
+        .as_ref()
+        .is_some_and(|store| store.mode() == super::storage::StoreMode::Dual);
+    let status = if local && (reachable || mirror_outage_is_degraded) {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1018,6 +1066,27 @@ async fn ready(State(broker): State<Broker>) -> Response {
         Json(json!({"mode": mode, "databaseReachable": reachable})),
     )
         .into_response()
+}
+
+async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> Result<()> {
+    for record in central.list_accounts().await? {
+        let account_vault: Vault = serde_json::from_value(record.vault.clone())?;
+        vault::validate_auth(&account_vault.auth)?;
+        let account_state = state
+            .join("accounts")
+            .join(account_key(&account_vault.user, &account_vault.alias));
+        let replace = if account_state.join("vault.enc").exists() {
+            let local = vault::load(&account_state, key)?;
+            credential_revision(&local.auth) < record.revision
+        } else {
+            true
+        };
+        if replace {
+            store::ensure_private_dir(&account_state)?;
+            vault::save(&account_state, key, &account_vault)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
@@ -1171,21 +1240,11 @@ pub async fn serve(
     // vault remains the authoritative local path with no token-request cost.
     let central = match configured {
         CentralStore::File(_) => None,
-        store => {
-            // These rows are migration snapshots only. Authorization always
-            // reads the local registry in this phase and never this snapshot.
-            store
-                .save_registry("users", &vault::private_read(&state.join("users.json"))?)
-                .await?;
-            store
-                .save_registry(
-                    "devices",
-                    &vault::private_read(&state.join("devices.json"))?,
-                )
-                .await?;
-            Some(store)
-        }
+        store => Some(store),
     };
+    if let Some(central) = central.as_ref() {
+        hydrate_accounts(state, key, central).await?;
+    }
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -1341,6 +1400,34 @@ pub async fn serve(
         }
     }
     drop(startup_import);
+    let registry = if let Some(central) = central.as_ref() {
+        let users = match central.load_registry("users").await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => {
+                let local = users(state)?;
+                central
+                    .save_registry("users", &serde_json::to_vec(&local)?)
+                    .await?;
+                local
+            }
+        };
+        let devices = match central.load_registry("devices").await? {
+            Some(bytes) => serde_json::from_slice(&bytes)?,
+            None => {
+                let local = vault::devices(state)?;
+                central
+                    .save_registry("devices", &serde_json::to_vec(&local)?)
+                    .await?;
+                local
+            }
+        };
+        Some(Arc::new(std::sync::RwLock::new(RegistryState {
+            users,
+            devices,
+        })))
+    } else {
+        None
+    };
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -1378,6 +1465,7 @@ pub async fn serve(
         stopping: Arc::new(AtomicBool::new(false)),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         holder_id: instance_holder_id(),
+        registry,
         central,
         metrics_hash: metrics_token_file
             .map(|p| {
@@ -1537,6 +1625,7 @@ mod tests {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: Some(central),
             holder_id: "test-holder".into(),
+            registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});

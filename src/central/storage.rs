@@ -18,6 +18,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+const DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(DB_TIMEOUT, future)
+        .await
+        .context("central PostgreSQL operation timed out")?
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreMode {
     File,
@@ -133,7 +141,7 @@ pub struct BackfillCounts {
     pub accounts: usize,
     pub users: usize,
     pub devices: usize,
-    pub relogins: usize,
+    pub observed_relogins: usize,
 }
 
 const SCHEMA: &str = r#"
@@ -216,8 +224,8 @@ impl CentralStore {
     pub async fn reachable(&self) -> bool {
         match self {
             Self::File(file) => file.path().exists() || file.state.exists(),
-            Self::Postgres(db) => db.client().await.is_ok(),
-            Self::Dual { postgres, .. } => postgres.client().await.is_ok(),
+            Self::Postgres(db) => bounded_db(db.client()).await.is_ok(),
+            Self::Dual { postgres, .. } => bounded_db(postgres.client()).await.is_ok(),
         }
     }
 
@@ -243,6 +251,14 @@ impl CentralStore {
         }
     }
 
+    pub async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => bounded_db(db.load_registry(name)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.load_registry(name)).await,
+        }
+    }
+
     pub async fn backfill(&self, state: &Path, key: &Path) -> Result<BackfillCounts> {
         let target = match self {
             Self::Postgres(db) => db,
@@ -254,7 +270,7 @@ impl CentralStore {
             accounts: 0,
             users: 0,
             devices: 0,
-            relogins: 0,
+            observed_relogins: 0,
         };
         let accounts = state.join("accounts");
         if accounts.exists() {
@@ -322,7 +338,7 @@ impl CentralStore {
         }
         let relogin = state.join("relogin");
         if relogin.exists() {
-            counts.relogins = std::fs::read_dir(relogin)?
+            counts.observed_relogins = std::fs::read_dir(relogin)?
                 .filter_map(Result::ok)
                 .filter(|e| e.path().join("record.json").exists())
                 .count();
@@ -333,13 +349,13 @@ impl CentralStore {
     pub async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
         match self {
             Self::File(file) => file.save_account(record),
-            Self::Postgres(db) => db.save_account(record).await,
+            Self::Postgres(db) => bounded_db(db.save_account(record)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                postgres.save_account(record).await?;
+                bounded_db(postgres.save_account(record)).await?;
                 let mirror = file.clone();
                 let record = record.clone();
                 let result =
@@ -369,6 +385,14 @@ impl CentralStore {
         }
     }
 
+    pub async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.list_accounts()).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.list_accounts()).await,
+        }
+    }
+
     pub async fn acquire_lease(
         &self,
         account_id: &str,
@@ -377,7 +401,7 @@ impl CentralStore {
     ) -> Result<Lease> {
         match self {
             Self::File(file) => file.acquire_lease(account_id, holder_id, ttl),
-            Self::Postgres(db) => db.acquire_lease(account_id, holder_id, ttl).await,
+            Self::Postgres(db) => bounded_db(db.acquire_lease(account_id, holder_id, ttl)).await,
             Self::Dual {
                 file,
                 postgres,
@@ -385,7 +409,7 @@ impl CentralStore {
             } => {
                 // PostgreSQL is the fencing authority in dual mode.  Mirroring
                 // to disk is useful during migration, but never grants a lease.
-                let lease = postgres.acquire_lease(account_id, holder_id, ttl).await?;
+                let lease = bounded_db(postgres.acquire_lease(account_id, holder_id, ttl)).await?;
                 let mirror = file.clone();
                 let lease_copy = lease.clone();
                 let result =
@@ -412,13 +436,13 @@ impl CentralStore {
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         match self {
             Self::File(file) => file.fenced_write(lease, record),
-            Self::Postgres(db) => db.fenced_write(lease, record).await,
+            Self::Postgres(db) => bounded_db(db.fenced_write(lease, record)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                let written = postgres.fenced_write(lease, record).await?;
+                let written = bounded_db(postgres.fenced_write(lease, record)).await?;
                 if written {
                     let mirror = file.clone();
                     let lease_copy = lease.clone();
@@ -457,6 +481,20 @@ impl CentralStore {
                     }
                 }
                 Ok(written)
+            }
+        }
+    }
+
+    pub async fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        match self {
+            Self::File(file) => file.release_lease(lease),
+            Self::Postgres(db) => bounded_db(db.release_lease(lease)).await,
+            Self::Dual { file, postgres, .. } => {
+                let released = bounded_db(postgres.release_lease(lease)).await?;
+                let mirror = file.clone();
+                let lease = lease.clone();
+                let _ = tokio::task::spawn_blocking(move || mirror.release_lease(&lease)).await;
+                Ok(released)
             }
         }
     }
@@ -707,6 +745,19 @@ impl FileStore {
         })
     }
 
+    fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        let _lock = vault::registry_lock(&self.state, "central-storage.lock")?;
+        let mut state = self.read_state()?;
+        let released = state.leases.get(&lease.account_id).is_some_and(|current| {
+            current.holder_id == lease.holder_id && current.epoch == lease.epoch
+        });
+        if released {
+            state.leases.remove(&lease.account_id);
+            self.write_state(&state)?;
+        }
+        Ok(released)
+    }
+
     fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         let now = now_secs();
         let _lock = vault::registry_lock(&self.state, "central-storage.lock")?;
@@ -797,6 +848,7 @@ impl PostgresStore {
             .url
             .parse()
             .context("invalid DATABASE_URL for PostgreSQL central storage")?;
+        config.connect_timeout(DB_TIMEOUT);
         let client = if self.tls_enabled {
             if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
                 bail!(
@@ -826,16 +878,27 @@ impl PostgresStore {
             });
             client
         };
+        tokio::time::timeout(
+            DB_TIMEOUT,
+            client.batch_execute("SET statement_timeout = '2s'"),
+        )
+        .await
+        .context("central PostgreSQL statement timeout setup timed out")??;
         Ok(Arc::new(client))
     }
 
     async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
-        if let Some(client) = self.client.lock().await.clone()
-            && client.simple_query("SELECT 1").await.is_ok()
+        let current = self.client.lock().await.clone();
+        if let Some(client) = current
+            && tokio::time::timeout(DB_TIMEOUT, client.simple_query("SELECT 1"))
+                .await
+                .is_ok_and(|result| result.is_ok())
         {
             return Ok(client);
         }
-        let client = self.establish().await?;
+        let client = tokio::time::timeout(DB_TIMEOUT, self.establish())
+            .await
+            .context("central PostgreSQL connect timed out")??;
         *self.client.lock().await = Some(client.clone());
         Ok(client)
     }
@@ -848,6 +911,15 @@ impl PostgresStore {
                 &[&lease.account_id, &lease.holder_id, &(ttl.as_secs() as i64), &lease.epoch],
             )
             .await?;
+        Ok(changed == 1)
+    }
+
+    async fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        let client = self.client().await?;
+        let changed = client.execute(
+            "DELETE FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
+            &[&lease.account_id, &lease.holder_id, &lease.epoch],
+        ).await?;
         Ok(changed == 1)
     }
 
@@ -883,6 +955,21 @@ impl PostgresStore {
         Ok(())
     }
 
+    async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let client = self.client().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT encrypted_payload FROM central_registry WHERE name=$1",
+                &[&name],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let encrypted: Vec<u8> = row.get(0);
+        Ok(Some(vault::decrypt_bytes(&self.key, &encrypted)?))
+    }
+
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         let client = self.client().await?;
         let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1", &[&account_id]).await?;
@@ -899,6 +986,25 @@ impl PostgresStore {
             })
         })
         .transpose()
+    }
+
+    async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
+        let client = self.client().await?;
+        let rows = client.query("SELECT account_id,user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts", &[]).await?;
+        rows.into_iter()
+            .map(|row| {
+                let encrypted: Vec<u8> = row.get(5);
+                Ok(CredentialRecord {
+                    account_id: row.get(0),
+                    user_id: row.get(1),
+                    alias: row.get(2),
+                    workspace: row.get(3),
+                    login: row.get(4),
+                    vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
+                    revision: row.get(6),
+                })
+            })
+            .collect()
     }
 
     async fn acquire_lease(
@@ -1103,6 +1209,33 @@ mod tests {
             left.is_ok() ^ right.is_ok(),
             "exactly one instance may hold a live lease"
         );
+    }
+
+    #[tokio::test]
+    async fn releasing_a_lease_allows_a_restarted_holder_to_refresh_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[7; 32]).unwrap();
+        let first = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        let restarted = first.clone();
+        first.migrate().await.unwrap();
+        first
+            .save_account(&record("restart-account", 1))
+            .await
+            .unwrap();
+        let lease = first
+            .acquire_lease("restart-account", "pod-a:boot-a", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert!(first.release_lease(&lease).await.unwrap());
+        let replacement = restarted
+            .acquire_lease("restart-account", "pod-b:boot-b", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert_eq!(replacement.holder_id, "pod-b:boot-b");
     }
 
     #[tokio::test]
