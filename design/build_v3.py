@@ -728,7 +728,11 @@ def self_check():
     # With nothing below 95%, the cutoff does not apply.
     assert recommend([acct("hot", 4, 4, reset="2026-10-04")]).alias == "hot"
     # Same 7-day reset: lower availability score (5-hour used counts double) wins.
-    assert recommend([acct("a", 50, 90), acct("b", 70, 50)]).alias == "a"
+    # "a" scores 20*2 + 60 = 100 and "b" scores 50*2 + 30 = 130; the old
+    # min-left rule would pick "b" (50 > 40). Both input orders must agree.
+    a, b = acct("a", 80, 40), acct("b", 50, 70)
+    assert availability_score(a) == 100 and availability_score(b) == 130
+    assert recommend([a, b]) is a and recommend([b, a]) is a
     # Unknown and usage-based billing are never chosen; stale is never chosen.
     assert recommend([acct("u", 90, 90, billing="unknown"),
                       acct("c", 90, 90, billing="usage_based"),
