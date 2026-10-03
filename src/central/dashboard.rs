@@ -132,20 +132,35 @@ fn window(used: Option<f64>, seconds: Option<u64>, reset: Option<i64>) -> serde_
     json!({"used_percent":used,"left_percent":used.map(|n| (100.0-n).max(0.0)),"window_seconds":seconds,"resets_at":reset})
 }
 
-pub(super) fn routes() -> Router<Broker> {
+pub(super) fn routes(public_url: &str) -> Router<Broker> {
+    // This is operator configuration validated at startup, never a request header.
+    // Quote for the shell, then escape for the HTML text node.
+    let server = format!(
+        "'{}'",
+        public_url.trim_end_matches('/').replace('\'', "'\\''")
+    );
+    let content = include_str!("dashboard/landing.html")
+        .replace("<!-- SERVER -->", &enrollment::escape(&server));
     Router::new()
-        .route("/", get(landing))
+        .route(
+            "/",
+            get(move |state, headers| landing(state, headers, content.clone())),
+        )
         .route("/accounts", get(page))
         .route("/accounts/data", get(data))
         .route("/accounts/sign-in", get(enrollment::accounts_sign_in))
         .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
 }
 
-async fn landing(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
+async fn landing(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    content: String,
+) -> Result<Response, HttpError> {
     if enrollment::browser_user(&broker, &headers)?.is_some() {
         return Ok(([("cache-control", "no-store")], Redirect::to("/accounts")).into_response());
     }
-    Ok(document(include_str!("dashboard/landing.html")))
+    Ok(document(&content))
 }
 fn document(content: &str) -> Response {
     let styles = include_str!("dashboard/style.css");

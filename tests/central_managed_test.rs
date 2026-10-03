@@ -6358,6 +6358,40 @@ fn dashboard_snapshot_is_scoped_secret_free_and_preserves_unknown_windows() {
 }
 
 #[test]
+fn dashboard_connect_command_uses_configured_origin_not_request_headers() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let without_sso = Server::start();
+    for (server, configured) in [
+        (&issuer.server, issuer.server.url.as_str()),
+        (&without_sso, "http://127.0.0.1:8787"),
+    ] {
+        let response = server
+            .http
+            .get(format!("{}/", server.url))
+            .header("host", "untrusted.example")
+            .header("forwarded", "host=untrusted.example;proto=https")
+            .header("x-forwarded-host", "untrusted.example")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let html = response.text().unwrap();
+        let command = html
+            .split("id=\"connect-command\">")
+            .nth(1)
+            .unwrap()
+            .split("</code>")
+            .next()
+            .unwrap();
+        assert!(
+            command.contains(configured),
+            "connect command must target the configured server: {command}"
+        );
+        assert!(!command.contains("staging.plat.sm-svc.com"));
+        assert!(!command.contains("untrusted.example"));
+    }
+}
+
+#[test]
 fn dashboard_root_is_public_without_account_data_and_redirects_signed_in_browsers() {
     let issuer = EnrollmentServer::start(company_identity());
     issuer.server.import(

@@ -2,6 +2,8 @@
 
 Open the account server's root URL to install codexctl, connect a machine, or sign
 in with company SSO. A signed-in browser goes directly to `/accounts`.
+The connect command uses the server’s configured `--public-url`, including behind
+a reverse proxy. Request Host and forwarding headers cannot change its destination.
 The public landing page shows no account or machine data. Its status pill polls
 `/ready` every 60 seconds and distinguishes ready, not ready, and unknown.
 Installation commands pin Linux downloads to the published v0.1.34 release and

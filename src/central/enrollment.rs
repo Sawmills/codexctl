@@ -178,7 +178,7 @@ fn page(html: String) -> Response {
     )
         .into_response()
 }
-fn escape(s: &str) -> String {
+pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

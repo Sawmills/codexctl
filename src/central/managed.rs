@@ -1233,7 +1233,7 @@ pub async fn serve(
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }));
-    let app = enrollment::routes(app.merge(super::dashboard::routes()))
+    let app = enrollment::routes(app.merge(super::dashboard::routes(public_url)))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(broker.clone(), observe))
         .with_state(broker.clone());

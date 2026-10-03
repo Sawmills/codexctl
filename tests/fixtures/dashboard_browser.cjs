@@ -346,6 +346,20 @@ const server = http.createServer((req, res) => {
         fullPage: true,
       });
       if (name === "landing") {
+        const connectionCommand = await page
+          .locator("#connect-command")
+          .textContent();
+        await page
+          .getByRole("button", { name: "Copy machine connection command" })
+          .click();
+        assert.equal(
+          await page.evaluate(() => navigator.clipboard.readText()),
+          connectionCommand,
+        );
+        assert.match(
+          connectionCommand,
+          /^codexctl connect --server 'http:\/\/127\.0\.0\.1:\d+' --name "<machine>"$/,
+        );
         await page
           .getByRole("button", { name: "Copy macOS install command" })
           .click();

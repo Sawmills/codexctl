@@ -459,7 +459,8 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/accounts/data", listener.local_addr().unwrap());
-    let app = super::super::dashboard::routes().with_state(f.broker.clone());
+    let app =
+        super::super::dashboard::routes("https://accounts.example").with_state(f.broker.clone());
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
