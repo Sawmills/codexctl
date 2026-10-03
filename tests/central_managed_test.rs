@@ -6005,6 +6005,39 @@ fn when_subscription_has_included_headroom_then_catalog_allows_automatic_selecti
 }
 
 #[test]
+fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
+    let account = |alias: &str, primary_used: f64, resets_at: i64, usage_score: f64| {
+        central::managed::Account {
+            user_id: "synthetic-user".into(),
+            alias: alias.into(),
+            label: None,
+            account_id: format!("{alias}-seat"),
+            plan: Some("pro".into()),
+            billing_class: codexctl::api::BillingClass::RateLimited,
+            primary_used: Some(primary_used),
+            secondary_used: Some(10.0),
+            primary_window_seconds: Some(5 * 60 * 60),
+            secondary_window_seconds: Some(7 * 24 * 60 * 60),
+            primary_resets_at: Some(resets_at),
+            resets_at: Some(resets_at),
+            available: true,
+            usage_score: Some(usage_score),
+            usage_age_seconds: Some(1),
+            usage_stale: false,
+            usage_error: None,
+            statusline_usage: None,
+        }
+    };
+    let selected = central::remote::select(&[
+        account("soon-but-nearly-exhausted", 97.0, 100, 3.0),
+        account("headroom", 10.0, 200, 90.0),
+    ])
+    .unwrap();
+
+    assert_eq!(selected, "headroom");
+}
+
+#[test]
 fn reset_listing_requires_a_registered_machine() {
     let server = Server::start();
 

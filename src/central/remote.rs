@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const RATE_LIMIT_SWITCH_THRESHOLD: f64 = 95.0;
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
@@ -1134,7 +1136,34 @@ pub fn select(accounts: &[Account]) -> Result<String> {
         )
     });
     let score = |a: &Account| a.usage_score.unwrap_or(f64::MAX);
-    accounts.iter().filter(|a|a.available&&!a.usage_stale&&a.billing_class==api::BillingClass::RateLimited&&(a.primary_used.is_some()||a.secondary_used.is_some())).min_by(|a,b|{
+    let eligible: Vec<_> = accounts
+        .iter()
+        .filter(|a| {
+            a.available
+                && !a.usage_stale
+                && a.billing_class == api::BillingClass::RateLimited
+                && (a.primary_used.is_some() || a.secondary_used.is_some())
+        })
+        .collect();
+    // Rate-limited accounts are the no-bill class. Keep it ahead of accounts
+    // that need credit billing, and avoid moving to a nearly exhausted seat
+    // while another rate-limited seat still has headroom.
+    let has_below_switch_threshold = eligible.iter().any(|a| {
+        [a.primary_used, a.secondary_used]
+            .into_iter()
+            .flatten()
+            .any(|used| used.is_finite() && used < RATE_LIMIT_SWITCH_THRESHOLD)
+    });
+    eligible
+        .into_iter()
+        .filter(|a| {
+            !has_below_switch_threshold
+                || [a.primary_used, a.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .all(|used| !used.is_finite() || used < RATE_LIMIT_SWITCH_THRESHOLD)
+        })
+        .min_by(|a,b|{
         let by_score=score(a).total_cmp(&score(b));
         let exhausted_a=score(a)>=500.0;let exhausted_b=score(b)>=500.0;
         exhausted_a.cmp(&exhausted_b).then_with(||if most||exhausted_a{by_score}else{a.resets_at.unwrap_or(i64::MAX).cmp(&b.resets_at.unwrap_or(i64::MAX)).then(by_score)})
