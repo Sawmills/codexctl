@@ -224,10 +224,8 @@ fn main() {
     }
 
     #[cfg(feature = "central-prototype")]
-    if matches!(
-        &cli.command,
-        Commands::Login { .. } | Commands::Save { .. } | Commands::Switch
-    ) && let Err(error) = codexctl::central::native::require_local_mode()
+    if matches!(&cli.command, Commands::Save { .. } | Commands::Switch)
+        && let Err(error) = codexctl::central::native::require_local_mode()
     {
         eprintln!("error: {error:#}");
         std::process::exit(1);
@@ -282,6 +280,8 @@ fn main() {
             )? {
                 return Ok(());
             }
+            #[cfg(feature = "central-prototype")]
+            codexctl::central::native::require_local_mode()?;
             if no_browser || cancel {
                 anyhow::bail!("--no-browser and --cancel require an existing server account");
             }

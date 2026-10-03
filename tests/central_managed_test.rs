@@ -378,6 +378,20 @@ fn hq_same_device_resumes_but_other_devices_cannot_read_or_cancel() {
 
 #[test]
 fn server_login_uses_the_existing_cli_without_changing_local_credentials() {
+    server_login_cli_scenario(false, true);
+}
+
+#[test]
+fn server_login_renews_while_a_server_provider_is_active() {
+    server_login_cli_scenario(true, true);
+}
+
+#[test]
+fn server_login_discovers_an_alias_without_a_cached_catalog() {
+    server_login_cli_scenario(false, false);
+}
+
+fn server_login_cli_scenario(active: bool, cached: bool) {
     let server = Server::start();
     assert!(
         server
@@ -396,36 +410,48 @@ fn server_login_uses_the_existing_cli_without_changing_local_credentials() {
             .unwrap(),
     )
     .unwrap();
-    assert!(server.cli(home.path(), &["list"]).status.success());
+    if cached {
+        assert!(server.cli(home.path(), &["list"]).status.success());
+    } else {
+        assert!(!directory.join(".catalog.json").exists());
+    }
+    if active {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    let marker = directory.join(".native-active.json");
+    let active_before = std::fs::read(&marker).ok();
+    let config_file = home.path().join(".codex/config.toml");
+    let config_before = std::fs::read(&config_file).ok();
     let auth_file = home.path().join(".codex/auth.json");
     store::ensure_private_dir(auth_file.parent().unwrap()).unwrap();
     store::atomic_write(&auth_file, b"local-auth-sentinel").unwrap();
-    let cli = Command::new(env!("CARGO_BIN_EXE_codexctl"))
-        .env("HOME", home.path())
-        .env_remove("CODEX_HOME")
-        .env_remove("CODEXCTL_PINNED_ALIAS")
-        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
-        .args(["login", "personal", "--no-browser"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let current = server.await_login(&server.amir, "personal", "", "pending");
-    assert_eq!(current["userCode"], "TEST-LOGIN");
     store::atomic_write(
         &server.root.path().join("login-release"),
         &serde_json::to_vec(&auth("amir-login", "amir-seat")).unwrap(),
     )
     .unwrap();
-    let output = cli.wait_with_output().unwrap();
+    let output = server.cli(home.path(), &["login", "personal", "--no-browser"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("Server login renewed"));
+    assert_eq!(std::fs::read(&marker).ok(), active_before);
+    assert_eq!(std::fs::read(&config_file).ok(), config_before);
     assert_eq!(std::fs::read(auth_file).unwrap(), b"local-auth-sentinel");
     assert!(!home.path().join(".codexctl/login-homes").exists());
+    if active {
+        let local = server.cli(home.path(), &["login", "new-local-profile"]);
+        assert!(!local.status.success());
+        assert!(String::from_utf8_lossy(&local.stderr).contains("remote provider is active"));
+        assert!(!home.path().join(".codexctl/login-homes").exists());
+    }
 }
 
 #[test]
@@ -5156,7 +5182,7 @@ fn hq7_migration_can_repair_quarantine_without_an_existing_server_account() {
 }
 
 #[test]
-fn p3_new_local_login_skips_discovery_but_known_server_aliases_stay_fenced() {
+fn p3_new_local_login_survives_failed_discovery_but_known_server_aliases_stay_fenced() {
     use std::os::unix::fs::PermissionsExt;
     let mut server = Server::start();
     assert_eq!(
@@ -5220,8 +5246,8 @@ fn p3_new_local_login_skips_discovery_but_known_server_aliases_stay_fenced() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(
-        !contacted_server,
-        "a new local alias must not query the catalog"
+        contacted_server,
+        "login must try fresh discovery before falling back to local login"
     );
     let collision = home.path().join(".codexctl/profiles/personal");
     store::ensure_private_dir(&collision).unwrap();
