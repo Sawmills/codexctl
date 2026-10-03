@@ -413,17 +413,24 @@ impl Client {
     ///
     /// Returns once the new turn runs. The daemon never unloads a running
     /// thread, so the turn outlives this connection.
-    pub fn resume(&mut self, thread_id: &str, prompt: &str) -> Result<Resumed> {
-        self.request_within(
-            self.timeouts.resume,
-            "thread/resume",
-            json!({
-                "threadId": thread_id,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access",
-                "excludeTurns": true,
-            }),
-        )?;
+    /// `model_provider` overrides a saved provider and must be confirmed before
+    /// starting work; `None` preserves Codex's saved-provider behavior.
+    pub fn resume(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        model_provider: Option<&str>,
+    ) -> Result<Resumed> {
+        let mut params = json!({
+            "threadId": thread_id,
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "excludeTurns": true,
+        });
+        if let Some(provider) = model_provider {
+            params["modelProvider"] = json!(provider);
+        }
+        self.request_within(self.timeouts.resume, "thread/resume", params)?;
         if self
             .last_turn(thread_id)?
             .as_ref()
@@ -445,11 +452,16 @@ impl Client {
                 "sandboxPolicy": {"type": "dangerFullAccess"},
             }),
         )?;
-        let effective = self.request_within(
-            self.timeouts.resume,
-            "thread/resume",
-            json!({"threadId": thread_id, "excludeTurns": true}),
-        )?;
+        let mut params = json!({"threadId": thread_id, "excludeTurns": true});
+        if let Some(provider) = model_provider {
+            params["modelProvider"] = json!(provider);
+        }
+        let effective = self.request_within(self.timeouts.resume, "thread/resume", params)?;
+        if let Some(provider) = model_provider
+            && effective.get("modelProvider").and_then(Value::as_str) != Some(provider)
+        {
+            bail!("daemon did not apply the requested resume provider for {thread_id}");
+        }
         if effective.get("approvalPolicy").and_then(Value::as_str) != Some("never")
             || effective.pointer("/sandbox/type").and_then(Value::as_str)
                 != Some("dangerFullAccess")
@@ -642,14 +654,22 @@ pub fn inspect(codex_home: &Path, exclude: Option<&str>) -> Result<Option<Inspec
 ///
 /// Each resume is reported as it lands. A failed resume does not stop the
 /// others. A failed restart is an error; the sessions that did not resume are
-/// returned by id.
+/// returned by id. `model_provider` overrides each resumed session's saved provider.
 pub fn restart_and_resume(
     codex_home: &Path,
     sessions: &[StoppedSession],
     prompt: &str,
+    model_provider: Option<&str>,
     out: &mut impl Write,
 ) -> Result<Vec<String>> {
-    restart_and_resume_with(Command::new("codex"), codex_home, sessions, prompt, out)
+    restart_and_resume_with(
+        Command::new("codex"),
+        codex_home,
+        sessions,
+        prompt,
+        model_provider,
+        out,
+    )
 }
 
 fn restart_and_resume_with(
@@ -657,6 +677,7 @@ fn restart_and_resume_with(
     codex_home: &Path,
     sessions: &[StoppedSession],
     prompt: &str,
+    model_provider: Option<&str>,
     out: &mut impl Write,
 ) -> Result<Vec<String>> {
     if sessions
@@ -702,7 +723,7 @@ fn restart_and_resume_with(
     };
     let mut failed = Vec::new();
     for session in sessions {
-        match client.resume(&session.thread_id, prompt) {
+        match client.resume(&session.thread_id, prompt, model_provider) {
             Ok(Resumed::Started) => {
                 let _ = writeln!(
                     out,
@@ -1079,7 +1100,7 @@ mod tests {
                         _ => json!({"data": [{"id": "u", "status": "inProgress"}]}),
                     },
                     "thread/resume" => json!({
-                        "thread": {}, "approvalPolicy": if request["params"]["threadId"] == "approval-required" { "on-request" } else { "never" },
+                        "thread": {}, "modelProvider": "openai", "approvalPolicy": if request["params"]["threadId"] == "approval-required" { "on-request" } else { "never" },
                         "sandbox": {"type": if full_access.contains(request["params"]["threadId"].as_str().unwrap()) { "dangerFullAccess" } else { "workspaceWrite" }},
                     }),
                     "thread/settings/update" => {
@@ -1156,7 +1177,7 @@ mod tests {
         );
 
         client
-            .resume("t1", "Continue the previous request.")
+            .resume("t1", "Continue the previous request.", None)
             .unwrap();
         drop(client);
 
@@ -1167,6 +1188,11 @@ mod tests {
             .unwrap();
         assert_eq!(resume["params"]["approvalPolicy"], "never");
         assert_eq!(resume["params"]["sandbox"], "danger-full-access");
+        assert!(
+            seen.iter()
+                .filter(|r| r["method"] == "thread/resume")
+                .all(|r| r["params"].get("modelProvider").is_none())
+        );
         let turn = seen.iter().find(|r| r["method"] == "turn/start").unwrap();
         assert_eq!(turn["params"]["threadId"], "t1");
         assert_eq!(turn["params"]["approvalPolicy"], "never");
@@ -1178,13 +1204,33 @@ mod tests {
     }
 
     #[test]
+    fn resume_refuses_a_daemon_that_keeps_the_saved_provider() {
+        let dir = short_tempdir();
+        let socket_path = dir.path().join("s.sock");
+        let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
+        let mut client = Client::connect_socket(&socket_path).unwrap();
+
+        let result = client.resume("t1", "go", Some("codexctl-central"));
+        drop(client);
+        let seen = daemon.join().unwrap();
+
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("did not apply the requested resume provider")
+        );
+        assert!(!seen.iter().any(|r| r["method"] == "turn/start"));
+    }
+
+    #[test]
     fn resume_updates_loaded_thread_settings_before_starting_work() {
         let dir = short_tempdir();
         let socket_path = dir.path().join("s.sock");
         let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
         let mut client = Client::connect_socket(&socket_path).unwrap();
 
-        let result = client.resume("t3", "go");
+        let result = client.resume("t3", "go", None);
         drop(client);
         let seen = daemon.join().unwrap();
 
@@ -1213,7 +1259,7 @@ mod tests {
         let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
         let mut client = Client::connect_socket(&socket_path).unwrap();
 
-        let result = client.resume("restricted", "go");
+        let result = client.resume("restricted", "go", None);
         drop(client);
         let seen = daemon.join().unwrap();
 
@@ -1237,7 +1283,7 @@ mod tests {
         let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
         let mut client = Client::connect_socket(&socket_path).unwrap();
 
-        let result = client.resume("approval-required", "go");
+        let result = client.resume("approval-required", "go", None);
         drop(client);
         let seen = daemon.join().unwrap();
 
@@ -1261,7 +1307,7 @@ mod tests {
         let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
         let mut client = Client::connect_socket(&socket_path).unwrap();
 
-        let result = client.resume("unsupported", "go");
+        let result = client.resume("unsupported", "go", None);
         drop(client);
         let seen = daemon.join().unwrap();
 
@@ -1280,7 +1326,7 @@ mod tests {
         let daemon = fake_daemon(UnixListener::bind(&socket_path).unwrap());
         let mut client = Client::connect_socket(&socket_path).unwrap();
 
-        let result = client.resume("t2", "go");
+        let result = client.resume("t2", "go", None);
         drop(client);
         let seen = daemon.join().unwrap();
 
@@ -1309,7 +1355,7 @@ mod tests {
             Duration::from_millis(900),
         );
         let mut client = Client::connect_socket_with(&slow_resume, timeouts).unwrap();
-        assert_eq!(client.resume("t1", "go").unwrap(), Resumed::Started);
+        assert_eq!(client.resume("t1", "go", None).unwrap(), Resumed::Started);
         drop(client);
         daemon.join().unwrap();
 
@@ -1369,7 +1415,7 @@ mod tests {
 
         let mut out = Vec::new();
         let unresumed =
-            restart_and_resume_with(codex, home.path(), &sessions, "go", &mut out).unwrap();
+            restart_and_resume_with(codex, home.path(), &sessions, "go", None, &mut out).unwrap();
         daemon.join().unwrap();
 
         assert_eq!(unresumed, vec!["bad".to_string()]);
@@ -1388,8 +1434,9 @@ mod tests {
         let home = short_tempdir();
         let codex = fake_codex(home.path(), "echo boom >&2; exit 1");
         let sessions = [stopped("t1", StopReason::UsageLimit)];
-        let error = restart_and_resume_with(codex, home.path(), &sessions, "go", &mut Vec::new())
-            .unwrap_err();
+        let error =
+            restart_and_resume_with(codex, home.path(), &sessions, "go", None, &mut Vec::new())
+                .unwrap_err();
         assert!(format!("{error:#}").contains("boom"), "{error:#}");
     }
 

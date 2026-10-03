@@ -393,7 +393,12 @@ pub fn known_local_alias(alias: &str) -> Result<bool> {
     Ok(false)
 }
 
-pub fn activate(alias: Option<&str>, allow_billing: bool, allow_resets: bool) -> Result<bool> {
+pub fn activate(
+    alias: Option<&str>,
+    allow_billing: bool,
+    allow_resets: bool,
+    restart_daemon: bool,
+) -> Result<bool> {
     let explicit = alias.is_some();
     if let Some(alias) = alias
         && known_local_alias(alias)?
@@ -545,9 +550,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool, allow_resets: bool) ->
         &serde_json::json!({"tokens":{"access_token":token.access_token,"account_id":token.chatgpt_account_id}}),
     )?;
     let home = codex_home()?;
-    if crate::daemon::running_pid(&home).is_some() {
+    if !restart_daemon && crate::daemon::running_pid(&home).is_some() {
         bail!(
-            "Codex daemon is running; finish its sessions and run codex app-server daemon stop before remote activation"
+            "Codex daemon is running; use --restart-daemon to apply the switch and resume its sessions, or finish its sessions and run codex app-server daemon stop before remote activation"
         );
     }
     if !home.try_exists()? {

@@ -1,7 +1,7 @@
 //! Bring Codex's shared app-server daemon onto the account a switch installed.
 //!
-//! A switch only swaps `auth.json`. A running daemon keeps the account it
-//! started with, so every TUI attached to it keeps that account too. Applying
+//! A switch swaps `auth.json` or rewrites the server provider. A running daemon
+//! keeps its startup account, so every TUI attached to it keeps that account too. Applying
 //! the switch means restarting the daemon, which stops its running turns; the
 //! sessions that stopped, whether on the usage limit or by the restart, get a
 //! new turn afterwards so nobody has to resume them one by one.
@@ -122,7 +122,24 @@ pub fn after_switch(
             approved
         }
     };
-    daemon::restart_and_resume(&codex_home, &sessions, prompt, &mut std::io::stderr())
+    daemon::restart_and_resume(&codex_home, &sessions, prompt, None, &mut std::io::stderr())
+}
+
+/// Apply an explicitly requested server-provider switch to the daemon.
+/// The preserved local auth file cannot prove which server account it runs.
+#[cfg(feature = "central-prototype")]
+pub fn after_server_switch(codex_home: &Path, prompt: &str) -> Result<Vec<String>> {
+    let Some(inspection) = inspect_or_assume_stale(codex_home, None) else {
+        return Ok(Vec::new());
+    };
+    daemon::restart_and_resume(
+        codex_home,
+        &inspection.sessions,
+        prompt,
+        Some("codexctl-central"),
+        &mut std::io::stderr(),
+    )
+    .map_err(|error| error.context("server account is active; daemon restart failed"))
 }
 
 /// Inspect the daemon, or `None` when none runs.
