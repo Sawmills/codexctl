@@ -13,6 +13,12 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
+const ACTIVE_POINTER: &str = ".active-account";
+const BILLING_SWITCH_NOTICE: &str = "ALL running Codex sessions on this machine will also move to this account within 60 seconds and may bill credits.";
+
+fn billing_switch_prompt() -> String {
+    format!("This remote account may bill credits. {BILLING_SWITCH_NOTICE} Switch?")
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +79,16 @@ fn config_path(home: &Path) -> Result<PathBuf> {
     }
 }
 fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
+    write_config_with(destination, bytes, |parent| {
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })
+}
+fn write_config_with(
+    destination: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     use std::io::Write;
     let parent = destination
         .parent()
@@ -89,7 +105,67 @@ fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
     }
     file.as_file().sync_all()?;
     file.persist(destination).map_err(|e| e.error)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent(parent)?;
+    Ok(())
+}
+fn config_not_installed(destination: &Path, bytes: &[u8]) -> Result<bool> {
+    match std::fs::read(destination) {
+        Ok(installed) => Ok(installed != bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).context("cannot verify whether the new Codex configuration was installed")
+        }
+    }
+}
+fn rollback_pointer_if_config_not_installed(
+    destination: &Path,
+    bytes: &[u8],
+    pointer: &Path,
+    previous_pointer: Option<&[u8]>,
+) -> Result<bool> {
+    let not_installed = match config_not_installed(destination, bytes) {
+        Ok(not_installed) => not_installed,
+        Err(error) => {
+            // An unreadable destination leaves installation indeterminate. Restore the
+            // prior pointer (or remove the new one) so token delivery fails closed.
+            match previous_pointer {
+                Some(bytes) => store::atomic_write(pointer, bytes)?,
+                None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
+            }
+            return Err(error);
+        }
+    };
+    if not_installed {
+        match previous_pointer {
+            Some(bytes) => store::atomic_write(pointer, bytes)?,
+            None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
+        }
+    }
+    Ok(not_installed)
+}
+fn remove_active_pointer_with(
+    pointer: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match remove(pointer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove active account pointer {}",
+                pointer.display()
+            )
+        }),
+    }
+}
+fn remove_pointer_then_marker_with(
+    pointer: &Path,
+    marker: &Path,
+    remove_pointer: impl FnOnce(&Path) -> std::io::Result<()>,
+    remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    remove_active_pointer_with(pointer, remove_pointer)?;
+    remove_marker(marker).context("failed to remove prepared remote activation")?;
     Ok(())
 }
 pub fn require_local_mode() -> Result<()> {
@@ -323,6 +399,105 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     Ok(())
 }
 
+fn active_pointer_path() -> Result<PathBuf> {
+    Ok(root()?.join(ACTIVE_POINTER))
+}
+fn read_active_alias() -> Result<String> {
+    let path = active_pointer_path()?;
+    if !path.try_exists()? {
+        bail!("active account pointer is missing; run codexctl use again");
+    }
+    let raw = String::from_utf8(vault::private_read(&path)?)
+        .context("invalid active account pointer; run codexctl use again")?;
+    let alias = raw.trim();
+    if alias.is_empty()
+        || (raw != alias && raw != format!("{alias}\n") && raw != format!("{alias}\r\n"))
+    {
+        bail!("invalid active account pointer; run codexctl use again");
+    }
+    store::validate_alias(alias)
+        .map(|alias| alias.to_owned())
+        .map_err(|_| anyhow::anyhow!("invalid active account pointer; run codexctl use again"))
+}
+
+fn connection_alias(path: &Path, connection: &Connection) -> String {
+    connection
+        .alias
+        .clone()
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn validate_token_account(token: &str, expected_account: &str) -> Result<()> {
+    let actual = api::token_identity(token)
+        .and_then(|identity| identity.account_id)
+        .context("central access token has no workspace claim")?;
+    if actual != expected_account {
+        bail!("central access token workspace does not match the selected account");
+    }
+    Ok(())
+}
+
+fn billing_error(alias: &str, token: &TokenResponse) -> anyhow::Error {
+    if token.billing_class == Some(api::BillingClass::Unknown)
+        && token.statusline_usage.as_ref().is_some_and(|usage| {
+            usage
+                .five_hour_used_percent
+                .is_some_and(|used| used >= 100.0)
+                || usage.weekly_used_percent.is_some_and(|used| used >= 100.0)
+        })
+    {
+        anyhow::anyhow!("remote account {alias} is exhausted; run codexctl use")
+    } else {
+        anyhow::anyhow!("remote billing changed; select the account again with billing approval")
+    }
+}
+
+fn finish_token(
+    path: &Path,
+    connection: &Connection,
+    token: TokenResponse,
+    expected_active: Option<&str>,
+) -> Result<()> {
+    let alias = connection_alias(path, connection);
+    validate_token_account(&token.access_token, &connection.account_id)?;
+    let mut latest = read_connection(path)?;
+    if let Some(expected) = expected_active
+        && read_active_alias()?.as_str() != expected
+    {
+        bail!("active account changed during token retrieval; retry");
+    }
+    if latest.account_id != connection.account_id
+        || latest.server != connection.server
+        || latest.device_token_file != connection.device_token_file
+    {
+        bail!("remote connection changed during token retrieval");
+    }
+    if token.billing_class != Some(api::BillingClass::RateLimited)
+        && (!latest.allow_billing
+            || latest.approved_billing_plan != token.chatgpt_plan_type
+            || latest.approved_billing_class != token.billing_class)
+    {
+        return Err(billing_error(&alias, &token));
+    }
+    if latest.revision == connection.revision {
+        latest.revision = token.revision;
+        save_connection(path, &latest)?;
+    }
+    if let (Ok(paths), Ok(selection), Some(usage)) = (
+        config::default_paths(),
+        statusline_identity(path, connection),
+        token.statusline_usage,
+    ) {
+        crate::statusline::record(&paths, selection, token.label.as_deref(), Some(usage));
+    }
+    println!("{}", token.access_token);
+    Ok(())
+}
 pub fn print_token(path: &Path) -> Result<()> {
     if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
         bail!("remote credentials cannot be supplied to a pinned local launch");
@@ -333,43 +508,29 @@ pub fn print_token(path: &Path) -> Result<()> {
         read_connection(path)?
     };
     let token = fetch(&connection, true)?;
-    if token.billing_class != Some(api::BillingClass::RateLimited)
-        && (!connection.allow_billing
-            || connection.approved_billing_plan != token.chatgpt_plan_type
-            || connection.approved_billing_class != token.billing_class)
-    {
-        bail!("remote billing changed; select the account again with billing approval");
+    let _lock = native_lock(directory)?;
+    finish_token(path, &connection, token, None)
+}
+pub fn print_active_token() -> Result<()> {
+    if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
+        bail!("remote credentials cannot be supplied to a pinned local launch");
     }
-    {
-        let _lock = native_lock(directory)?;
-        let mut latest = read_connection(path)?;
-        if latest.account_id != connection.account_id
-            || latest.server != connection.server
-            || latest.device_token_file != connection.device_token_file
-        {
-            bail!("remote connection changed during token retrieval");
+    let directory = root()?;
+    let (alias, path, connection) = {
+        let _lock = native_lock(&directory)?;
+        let alias = read_active_alias()?;
+        let path = connection_path(&alias)?;
+        if !path.try_exists()? {
+            bail!(
+                "active account pointer names missing connection {alias}; run codexctl use again"
+            );
         }
-        if token.billing_class != Some(api::BillingClass::RateLimited)
-            && (!latest.allow_billing
-                || latest.approved_billing_plan != token.chatgpt_plan_type
-                || latest.approved_billing_class != token.billing_class)
-        {
-            bail!("remote billing approval changed during token retrieval");
-        }
-        if latest.revision == connection.revision {
-            latest.revision = token.revision;
-            save_connection(path, &latest)?;
-        }
-    }
-    if let (Ok(paths), Ok(selection), Some(usage)) = (
-        config::default_paths(),
-        statusline_identity(path, &connection),
-        token.statusline_usage,
-    ) {
-        crate::statusline::record(&paths, selection, token.label.as_deref(), Some(usage));
-    }
-    println!("{}", token.access_token);
-    Ok(())
+        let connection = read_connection(&path)?;
+        (alias, path, connection)
+    };
+    let token = fetch(&connection, true)?;
+    let _lock = native_lock(&directory)?;
+    finish_token(&path, &connection, token, Some(&alias))
 }
 fn document(home: &Path) -> Result<DocumentMut> {
     match std::fs::read_to_string(home.join("config.toml")) {
@@ -477,8 +638,9 @@ pub fn activate(
                 .and_then(Item::as_str)
                 == Some(PROVIDER)
     };
-    // Server sessions keep their launch-time provider. Only entry from local
-    // mode must exclude credential owners; native.lock serializes config writes.
+    // Server sessions share the active provider and resolve the selected account
+    // on each helper refresh. Only entry from local mode must exclude credential
+    // owners; native.lock serializes configuration writes.
     let _mode = if switching_server {
         shared
     } else {
@@ -521,10 +683,12 @@ pub fn activate(
     if usage_based && !allow_billing && !redeem_reset {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            bail!("remote account may bill credits; use --allow-billing explicitly");
+            bail!(
+                "remote account may bill credits; {BILLING_SWITCH_NOTICE} Use --allow-billing explicitly"
+            );
         }
         if !dialoguer::Confirm::new()
-            .with_prompt("This remote account may bill credits. Switch?")
+            .with_prompt(billing_switch_prompt())
             .default(false)
             .interact()?
         {
@@ -571,6 +735,12 @@ pub fn activate(
         );
     }
     let marker = root()?.join(".native-active.json");
+    let pointer = active_pointer_path()?;
+    let previous_pointer = match std::fs::read(&pointer) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
     // Disconnect or local selection can restore the provider during token fetch.
     // A shared lease must never turn that into a fresh activation from local mode.
     if switching_server && !marker.try_exists()? {
@@ -603,22 +773,36 @@ pub fn activate(
         }
     };
     let helper = std::env::current_exe()?;
+    let existing_provider = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(PROVIDER))
+        .cloned();
     let mut provider = Table::new();
     provider["name"] = value("Central Codex");
     provider["base_url"] = value("https://chatgpt.com/backend-api/codex");
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(false);
-    provider["http_headers"]["ChatGPT-Account-ID"] = value(&connection.account_id);
     provider["auth"]["command"] = value(helper.to_str().context("helper path must be UTF-8")?);
     let mut args = toml_edit::Array::new();
     args.push("central-token");
-    args.push("--connection");
-    args.push(path.to_str().context("connection path must be UTF-8")?);
+    args.push("--active");
     provider["auth"]["args"] = value(args);
     // Codex checks cached helper-token age before requests. This bounds normal
     // reuse to one minute; it does not cancel in-flight work or revoke tokens.
     provider["auth"]["refresh_interval_ms"] = value(60_000);
     provider["auth"]["timeout_ms"] = value(210_000);
+    // OpenAI's short edge-rate-limit bursts are retried by default. Preserve
+    // an operator's explicit values when an active provider is rewritten.
+    provider["request_max_retries"] = existing_provider
+        .as_ref()
+        .and_then(|item| item.get("request_max_retries"))
+        .cloned()
+        .unwrap_or_else(|| value(12));
+    provider["stream_max_retries"] = existing_provider
+        .as_ref()
+        .and_then(|item| item.get("stream_max_retries"))
+        .cloned()
+        .unwrap_or_else(|| value(12));
     if let Some(inline) = doc.get("model_providers").and_then(Item::as_inline_table) {
         doc["model_providers"] = Item::Table(inline.clone().into_table());
     } else if doc.get("model_providers").is_none() {
@@ -668,11 +852,14 @@ pub fn activate(
         }
     }
     store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
+    store::atomic_write(&pointer, format!("{alias}\n").as_bytes())?;
     if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
-        let not_installed = match std::fs::read(&destination) {
-            Ok(bytes) => bytes != doc.to_string().as_bytes(),
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        };
+        let not_installed = rollback_pointer_if_config_not_installed(
+            &destination,
+            doc.to_string().as_bytes(),
+            &pointer,
+            previous_pointer.as_deref(),
+        )?;
         if !had_marker && not_installed {
             std::fs::remove_file(&marker)
                 .context("failed to roll back prepared remote activation")?;
@@ -683,9 +870,15 @@ pub fn activate(
     repair_sessions_if_active(SessionProviderAction::Rewrite).with_context(|| {
         format!("server account {alias} is active; session repair failed; resolve the reported cause and retry codexctl session-provider rewrite")
     })?;
-    println!(
-        "switched to remote account {alias}; start codexctl codex (resume: codexctl codex resume <session-id>)"
-    );
+    if usage_based {
+        println!(
+            "switched to remote account {alias}; {BILLING_SWITCH_NOTICE} Start codexctl codex (resume: codexctl codex resume <session-id>)"
+        );
+    } else {
+        println!(
+            "switched to remote account {alias}; running Codex sessions on this machine will move to it within 60 seconds. Start codexctl codex (resume: codexctl codex resume <session-id>)"
+        );
+    }
     Ok(true)
 }
 
@@ -697,6 +890,10 @@ pub fn deactivate() -> Result<()> {
 pub(super) fn deactivate_locked() -> Result<()> {
     let marker = root()?.join(".native-active.json");
     if !marker.try_exists()? {
+        let pointer = active_pointer_path()?;
+        if pointer.try_exists()? {
+            remove_active_pointer_with(&pointer, |path| std::fs::remove_file(path))?;
+        }
         return Ok(());
     }
     let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
@@ -722,7 +919,13 @@ pub(super) fn deactivate_locked() -> Result<()> {
         }
     }
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
-    std::fs::remove_file(marker)?;
+    let pointer = active_pointer_path()?;
+    remove_pointer_then_marker_with(
+        &pointer,
+        &marker,
+        |path| std::fs::remove_file(path),
+        |path| std::fs::remove_file(path),
+    )?;
     Ok(())
 }
 
@@ -784,13 +987,20 @@ pub fn active_alias() -> Result<Option<String>> {
     if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
         return Ok(None);
     }
-    let path = doc
+    let args = doc
         .get("model_providers")
         .and_then(|p| p.get(PROVIDER))
         .and_then(|p| p.get("auth"))
         .and_then(|a| a.get("args"))
         .and_then(Item::as_array)
-        .and_then(|args| args.get(2))
+        .context("invalid central provider command")?;
+    if args.iter().any(|arg| arg.as_str() == Some("--active")) {
+        return Ok(Some(read_active_alias()?));
+    }
+    let path = args
+        .iter()
+        .position(|arg| arg.as_str() == Some("--connection"))
+        .and_then(|i| args.get(i + 1))
         .and_then(toml_edit::Value::as_str)
         .context("invalid central provider command")?;
     Ok(std::path::Path::new(path)
@@ -870,15 +1080,153 @@ pub(crate) fn statusline_selection(
     if doc.get("model_provider").and_then(Item::as_str) != Some(PROVIDER) {
         return Ok(None);
     }
-    let path = doc
+    let args = doc
         .get("model_providers")
         .and_then(|p| p.get(PROVIDER))
         .and_then(|p| p.get("auth"))
         .and_then(|p| p.get("args"))
         .and_then(Item::as_array)
-        .and_then(|args| args.get(2))
-        .and_then(toml_edit::Value::as_str)
         .context("invalid central provider command")?;
-    let path = Path::new(path);
-    statusline_identity(path, &read_connection(path)?).map(Some)
+    let path = if args.iter().any(|arg| arg.as_str() == Some("--active")) {
+        connection_path(&read_active_alias()?)?
+    } else {
+        let path = args
+            .iter()
+            .position(|arg| arg.as_str() == Some("--connection"))
+            .and_then(|i| args.get(i + 1))
+            .and_then(toml_edit::Value::as_str)
+            .context("invalid central provider command")?;
+        PathBuf::from(path)
+    };
+    statusline_identity(&path, &read_connection(&path)?).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BILLING_SWITCH_NOTICE, billing_switch_prompt, remove_active_pointer_with,
+        remove_pointer_then_marker_with, rollback_pointer_if_config_not_installed,
+        validate_token_account, write_config_with,
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::fs;
+
+    #[test]
+    fn billing_confirmation_warns_about_all_running_sessions() {
+        let prompt = billing_switch_prompt();
+        assert!(prompt.contains("ALL running Codex sessions on this machine"));
+        assert!(prompt.contains("move to this account within 60 seconds"));
+        assert!(prompt.contains("may bill credits"));
+        assert!(prompt.ends_with("Switch?"));
+        assert!(prompt.contains(BILLING_SWITCH_NOTICE));
+    }
+
+    #[test]
+    fn token_workspace_mismatch_is_refused_before_printing() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "workspace-b"}
+            }))
+            .unwrap(),
+        );
+        let token = format!("header.{payload}.signature");
+        let error = validate_token_account(&token, "workspace-a").unwrap_err();
+        assert!(error.to_string().contains("workspace does not match"));
+    }
+
+    #[test]
+    fn late_config_fsync_failure_keeps_the_new_pointer_after_persist() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("config.toml");
+        let pointer = root.path().join(".active-account");
+        let bytes = b"model_provider = 'codexctl-central'\n";
+        let error = write_config_with(&destination, bytes, |_| {
+            anyhow::bail!("synthetic late directory fsync failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("late directory fsync"));
+        fs::write(&pointer, b"new\n").unwrap();
+
+        let not_installed =
+            rollback_pointer_if_config_not_installed(&destination, bytes, &pointer, None).unwrap();
+        assert!(!not_installed);
+        assert_eq!(fs::read(pointer).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn indeterminate_config_read_restores_the_previous_pointer_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("config.toml");
+        let pointer = root.path().join(".active-account");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&pointer, b"new\n").unwrap();
+
+        let error = rollback_pointer_if_config_not_installed(
+            &destination,
+            b"model_provider = 'codexctl-central'\n",
+            &pointer,
+            Some(b"old\n"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot verify"));
+        assert_eq!(fs::read(pointer).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn active_pointer_unlink_failure_is_reported() {
+        let pointer = std::path::Path::new("/tmp/.active-account");
+        let error = remove_active_pointer_with(pointer, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic unlink failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to remove active account pointer")
+        );
+        assert!(format!("{error:#}").contains("synthetic unlink failure"));
+    }
+
+    #[test]
+    fn active_pointer_unlink_failure_leaves_marker_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join(".native-active.json");
+        let pointer = root.path().join(".active-account");
+        fs::write(&marker, b"marker").unwrap();
+        fs::write(&pointer, b"account\n").unwrap();
+
+        let error = remove_pointer_then_marker_with(
+            &pointer,
+            &marker,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic unlink failure",
+                ))
+            },
+            |path| fs::remove_file(path),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to remove active account pointer")
+        );
+        assert!(marker.exists());
+        assert!(pointer.exists());
+
+        remove_pointer_then_marker_with(
+            &pointer,
+            &marker,
+            |path| fs::remove_file(path),
+            |path| fs::remove_file(path),
+        )
+        .unwrap();
+        assert!(!marker.exists());
+        assert!(!pointer.exists());
+    }
 }

@@ -15,6 +15,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+const RATE_LIMIT_SWITCH_THRESHOLD: f64 = 95.0;
+
+fn at_switch_threshold(account: &Account) -> bool {
+    [account.primary_used, account.secondary_used]
+        .into_iter()
+        .flatten()
+        .any(|used| used.is_finite() && used >= RATE_LIMIT_SWITCH_THRESHOLD)
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
@@ -793,16 +802,17 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     let mut server_rows: Vec<_> = accounts
         .iter()
         .map(|account| {
+            let is_active = active.as_deref() == Some(&account.alias);
             let state = if !account.available {
                 "unavailable"
-            } else if active.as_deref() == Some(&account.alias) {
+            } else if is_active {
                 "active"
             } else {
                 "server"
             };
             DisplayRow {
                 cells: vec![
-                    account.alias.clone(),
+                    display_alias(&account.alias, is_active),
                     account.label.clone().unwrap_or_else(|| "-".into()),
                     account.plan.clone().unwrap_or_else(|| "-".into()),
                     percentage(account.primary_used),
@@ -833,7 +843,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     source: Source::Server,
                     state: if !account.available {
                         State::Unavailable
-                    } else if active.as_deref() == Some(&account.alias) {
+                    } else if is_active {
                         State::Active
                     } else {
                         State::Server
@@ -914,6 +924,15 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     }
     Ok(true)
 }
+
+fn display_alias(alias: &str, is_active: bool) -> String {
+    if is_active {
+        format!("* {alias}")
+    } else {
+        alias.to_owned()
+    }
+}
+
 pub fn whoami() -> Result<bool> {
     let Some(alias) = native::active_alias()? else {
         return Ok(false);
@@ -1124,7 +1143,23 @@ pub fn select(accounts: &[Account]) -> Result<String> {
         )
     });
     let score = |a: &Account| a.usage_score.unwrap_or(f64::MAX);
-    accounts.iter().filter(|a|a.available&&!a.usage_stale&&a.billing_class==api::BillingClass::RateLimited&&(a.primary_used.is_some()||a.secondary_used.is_some())).min_by(|a,b|{
+    let eligible: Vec<_> = accounts
+        .iter()
+        .filter(|a| {
+            a.available
+                && !a.usage_stale
+                && a.billing_class == api::BillingClass::RateLimited
+                && (a.primary_used.is_some() || a.secondary_used.is_some())
+        })
+        .collect();
+    // Rate-limited accounts are the no-bill class. Keep it ahead of accounts
+    // that need credit billing, and avoid moving to a nearly exhausted seat
+    // while another rate-limited seat still has headroom.
+    let has_below_switch_threshold = eligible.iter().any(|a| !at_switch_threshold(a));
+    eligible
+        .into_iter()
+        .filter(|a| !has_below_switch_threshold || !at_switch_threshold(a))
+        .min_by(|a,b|{
         let by_score=score(a).total_cmp(&score(b));
         let exhausted_a=score(a)>=500.0;let exhausted_b=score(b)>=500.0;
         exhausted_a.cmp(&exhausted_b).then_with(||if most||exhausted_a{by_score}else{a.resets_at.unwrap_or(i64::MAX).cmp(&b.resets_at.unwrap_or(i64::MAX)).then(by_score)})

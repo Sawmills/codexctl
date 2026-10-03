@@ -200,7 +200,7 @@ Account selection during recovery:
 
 Pinned launches support saved local profiles only. Server-account pinning is unsupported;
 use `codexctl use <alias>` followed by `codexctl codex` for a server account, which changes
-the active account for new sessions.
+the active account for new and running sessions; running sessions follow it within 60 seconds.
 
 `codexctl use` changes the account for the whole machine. When two agent lanes start at the same
 time, the second `use` can take the first lane's account before it launches. `codexctl exec` pins
@@ -255,6 +255,10 @@ filling and resetting in a single cluster (which would otherwise leave the whole
 stretch before the cluster refreshes). Every other guarantee is unchanged: usage-based accounts are
 never auto-selected, exhausted windows are skipped, and no-bill accounts win over credit-billing
 ones (reset is only a tiebreak within a bill class).
+Within each billing class, automatic selection skips any candidate with a reported usage window at
+or above 95% whenever another candidate in that class is below 95%; this applies to both local and
+server-account selection.
+Thus a server seat at 97% is skipped in favor of a 10% seat even when the 97% seat resets sooner.
 
 This is the default. To opt out and restore the legacy most-headroom-first pick:
 
@@ -490,10 +494,18 @@ previous alias. Status reads then use saved profile auth instead of attributing 
 to the old alias. Run `codexctl use <alias>` again to reconcile both files.
 
 Rate limits are fetched from `chatgpt.com/backend-api/wham/usage` using the stored access tokens.
-When an account ID is available, codexctl sends it as `chatgpt-account-id` so the usage response is
-scoped to the intended account/workspace. Windows are matched by their declared duration rather
-than by position, since plans that publish only a weekly limit return it in the `primary_window`
-slot.
+Usage requests send the account ID when available so that the usage response is scoped to the
+intended account/workspace. Native Codex inference requests use the access token's
+`chatgpt_account_id` workspace claim for scoping; the helper verifies that claim against the
+selected connection and does not write a static `chatgpt-account-id` header. A static header would become stale when
+`codexctl use` moves running sessions to another seat of the same login. Windows are matched by
+their declared duration rather than by position, since plans that publish only a weekly limit
+return it in the `primary_window` slot.
+
+Live validation covered one login with personal and team seats: requests without the static header
+returned `ok` for the personal workspace and that workspace's out-of-credits error for the team
+workspace, matching requests with the corresponding header. This confirms that the token claim
+scopes Codex inference to the selected workspace.
 
 Banked resets use `wham/rate-limit-reset-credits` to list credits and
 `wham/rate-limit-reset-credits/consume` to redeem one. Redemptions carry a client-generated

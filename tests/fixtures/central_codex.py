@@ -150,6 +150,9 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
+        if mode == "billing-slow":
+            pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("billing-started").write_text("started")
+            time.sleep(6)
         if mode == "billing-rotation" and not billing_rotated:
             rotate()
             billing_rotated = True

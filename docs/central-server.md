@@ -186,6 +186,10 @@ reported usage window has headroom, even when credits are available and the cap 
 Both bare `codexctl use` and `codexctl use <alias>` allow this selection without `--allow-billing`.
 Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
+Within each billing class, automatic selection skips any candidate with a reported usage window at
+or above 95% whenever another candidate in that class is below 95%; this applies to both local and
+server-account selection.
+Thus a server seat at 97% is skipped in favor of a 10% seat even when the 97% seat resets sooner.
 An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
 Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
 Usage-based accounts never qualify for automatic selection.
@@ -212,8 +216,8 @@ The interval does not stop an in-flight response, revoke an issued token, or rem
 Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
 Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
 Server reset redemption requires an explicit redemption command or automatic selection with `--allow-resets`.
-Switching between server accounts updates the provider for new sessions.
-Existing sessions keep their startup account until restarted.
+Switching between server accounts updates the provider and the active pointer.
+Existing sessions refresh their helper token from that pointer within 60 seconds.
 If the daemon is running, use `codexctl use <alias> --restart-daemon` to apply the switch.
 After the provider rewrite and session repair, this restarts the daemon and resumes
 the running and usage-limited sessions with the same continuation prompt and permissions as local switching:
@@ -266,9 +270,20 @@ Local login keeps the existing migration and active-provider checks.
 After disconnect, it reports a local profile only when local credentials remain active.
 The native provider currently supports the global ChatGPT backend with no regional routing constraint.
 Before each token delivery, the server checks workspace routing.
+The access token's `chatgpt_account_id` claim scopes native requests to its workspace. The helper
+verifies that claim against the selected connection before printing a token, and activation does
+not write a static `ChatGPT-Account-ID` header: a static value would become stale when the active
+pointer moves running sessions between seats held by one login.
 Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
 Read-only brokers cannot verify native routing and cannot supply the native provider.
-Existing sessions keep the account they selected at startup.
+Live validation covered one login with personal and team seats: a request without the static header
+returned `ok` for the personal workspace and that workspace's out-of-credits response for the team
+workspace, matching requests with the corresponding header. The token claim therefore scopes Codex
+inference to the selected workspace.
+Running server sessions use the active account pointer when they refresh their helper token.
+After `codexctl use <alias>`, every running session on this machine moves to the selected
+account within 60 seconds. If that account can bill credits, all of those sessions can bill
+credits after their included usage ends; the switch still requires billing approval.
 Use `codexctl codex resume <session-id>` to resume a session from before migration.
 The launcher passes `-c 'model_provider="codexctl-central"'` to Codex.
 Codex 0.160.0 otherwise restores the session's saved provider, even when the base configuration selects a server account.
@@ -285,8 +300,9 @@ Server-account launches use the provider token helper without local account fail
 `codexctl exec --account <alias> -- <command>` supports saved local profiles only.
 Pinned execution of server accounts is not supported: the server provider and its
 token helper refuse pinned homes. To launch Codex with a server account, run
-`codexctl use <alias>` followed by `codexctl codex`. This changes the active account
-for new sessions; it is not an isolated pinned launch.
+`codexctl use <alias>` followed by `codexctl codex`. This changes the active account for
+new and running sessions; running sessions follow it within 60 seconds. It is not an
+isolated pinned launch.
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 

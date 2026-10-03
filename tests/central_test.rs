@@ -725,6 +725,22 @@ impl NativeClient {
         let broker = BrokerTest::start_with_plan(&[], plan);
         let home = broker.root.path().join("client");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
+        // The host's container overlay mount emits an lsof diagnostic that
+        // production must treat as an uncertain inventory. Keep these tests
+        // focused on session behavior by wrapping the real lsof with -w.
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let lsof = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("lsof"))
+            .find(|path| path.is_file())
+            .expect("lsof must be installed for central session tests");
+        std::fs::write(
+            bin.join("lsof"),
+            format!("#!/bin/sh\nexec {} -w \"$@\"\n", lsof.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("lsof"), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             home.join(".codex/config.toml"),
             "# Personal preference\nmodel = 'gpt-6.1-sol'\nmodel_provider = 'openai'\n",
@@ -738,6 +754,14 @@ impl NativeClient {
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(args)
             .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.home.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .output()
@@ -781,6 +805,12 @@ impl NativeClient {
                     .to_str()
                     .unwrap(),
             ],
+        )
+    }
+    fn helper_active(&self) -> std::process::Output {
+        self.run(
+            env!("CARGO_BIN_EXE_codexctl"),
+            &["central-token", "--active"],
         )
     }
 
@@ -1466,7 +1496,7 @@ fn server_restart_command(client: &NativeClient) -> Command {
     )
     .unwrap();
     let bin = client.home.join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(
         bin.join("codex"),
         "#!/bin/sh\n[ \"$*\" = 'app-server daemon restart' ] || exit 2\n/bin/cat \"$CODEX_HOME/config.toml\" > \"$CODEX_HOME/restart-config.toml\"\necho '{\"status\":\"restarted\"}'\n",
@@ -1790,6 +1820,66 @@ fn when_a_pinned_shell_sees_the_remote_provider_then_the_helper_refuses_credenti
 }
 
 #[test]
+fn active_token_helper_reads_the_pointer_and_fails_closed_when_it_is_invalid() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    let config = std::fs::read_to_string(client.home.join(".codex/config.toml")).unwrap();
+    assert!(config.contains("central-token"));
+    assert!(config.contains("--active"), "{config}");
+
+    let pointer = client.home.join(".codexctl/central/.active-account");
+    std::fs::write(&pointer, "remote \n").unwrap();
+    let output = client.helper_active();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active account pointer"));
+}
+
+#[test]
+fn a_slow_token_fetch_does_not_hold_native_lock() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+    std::fs::write(client.broker.root.path().join("mode"), "billing-slow").unwrap();
+    let first = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["central-token", "--active"])
+        .env("HOME", &client.home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let marker = client.broker.root.path().join("billing-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !marker.exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let lock_probe_started = std::time::Instant::now();
+    let lock_probe = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["session-provider", "dry-run"],
+    );
+    let lock_probe_elapsed = lock_probe_started.elapsed();
+    assert!(
+        lock_probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock_probe.stderr)
+    );
+    assert!(
+        lock_probe_elapsed < Duration::from_secs(2),
+        "native lock was held during the slow fetch: {lock_probe_elapsed:?}"
+    );
+    let second = client.helper_active();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(first.wait_with_output().unwrap().status.success());
+}
+
+#[test]
 fn when_an_inherited_home_is_local_then_global_save_still_refuses_remote_mode() {
     let client = NativeClient::start();
     client.connect();
@@ -2076,6 +2166,12 @@ fn when_included_headroom_exhausts_then_helper_returns_no_token() {
     assert!(selected.status.success() && initial.status.success());
     assert!(!helper.status.success());
     assert!(helper.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&helper.stderr);
+    assert!(
+        stderr.contains("remote account remote is exhausted"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("run codexctl use"), "{stderr}");
 }
 
 #[test]
@@ -2105,6 +2201,44 @@ fn when_remote_use_succeeds_then_provider_refreshes_every_minute() {
     assert_eq!(
         config["model_providers"]["codexctl-central"]["auth"]["refresh_interval_ms"].as_integer(),
         Some(60_000)
+    );
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["request_max_retries"].as_integer(),
+        Some(12)
+    );
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+        Some(12)
+    );
+}
+
+#[test]
+fn when_remote_use_rewrites_provider_then_retry_limits_are_preserved() {
+    let client = NativeClient::start();
+    client.connect();
+    assert!(client.select().status.success());
+
+    let path = client.home.join(".codex/config.toml");
+    let mut config: toml_edit::DocumentMut =
+        std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config["model_providers"]["codexctl-central"]["request_max_retries"] = toml_edit::value(4);
+    config["model_providers"]["codexctl-central"]["stream_max_retries"] = toml_edit::value(7);
+    std::fs::write(&path, config.to_string()).unwrap();
+
+    let selected = client.select();
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let rewritten: toml_edit::DocumentMut = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    assert_eq!(
+        rewritten["model_providers"]["codexctl-central"]["request_max_retries"].as_integer(),
+        Some(4)
+    );
+    assert_eq!(
+        rewritten["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+        Some(7)
     );
 }
 

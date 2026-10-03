@@ -1134,6 +1134,32 @@ fn connected_status_formats_server_reset() {
 }
 
 #[test]
+fn connected_server_status_and_list_mark_the_active_account() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+
+    for command in [["status"], ["list"]] {
+        let output = server.cli(home.path(), &command);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success(), "{command:?}: {stdout}");
+        assert!(stdout.contains("* personal"), "{command:?}: {stdout}");
+        if command == ["status"] {
+            assert!(
+                stdout.contains("State") && stdout.contains("active"),
+                "{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn connected_list_before_migration_shows_local_profiles() {
     let server = Server::start();
     let home = server.connected_home();
@@ -4409,21 +4435,43 @@ fn server_selection_succeeds_while_a_session_or_its_orphaned_child_holds_a_lease
             .parse()
             .unwrap();
     let provider = &config["model_providers"]["codexctl-central"];
-    assert_eq!(
-        provider["http_headers"]["ChatGPT-Account-ID"].as_str(),
-        Some("second-seat")
+    assert!(
+        provider
+            .get("http_headers")
+            .and_then(|headers| headers.get("ChatGPT-Account-ID"))
+            .is_none()
     );
     assert!(
         provider["auth"]["args"]
             .as_array()
             .unwrap()
-            .get(2)
+            .get(1)
             .unwrap()
             .as_str()
             .unwrap()
-            .ends_with("/second.json")
+            == "--active"
     );
-    // A running session's saved helper command must still supply its first account.
+    // A running session's saved helper command follows the newly active account.
+    let active = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(active.status.success());
+    let active_payload: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                String::from_utf8(active.stdout)
+                    .unwrap()
+                    .trim()
+                    .split('.')
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        active_payload["https://api.openai.com/auth"]["chatgpt_account_id"],
+        "second-seat"
+    );
+    // The legacy explicit helper command remains supported.
     let first = home.path().join(".codexctl/central/first.json");
     let token = server.cli(
         home.path(),
@@ -5954,6 +6002,44 @@ fn when_subscription_has_included_headroom_then_catalog_allows_automatic_selecti
     );
 
     assert_eq!(selected.unwrap(), "personal");
+}
+
+#[test]
+fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
+    let account = |alias: &str, primary_used: f64, resets_at: i64, usage_score: f64| {
+        central::managed::Account {
+            user_id: "synthetic-user".into(),
+            alias: alias.into(),
+            label: None,
+            account_id: format!("{alias}-seat"),
+            plan: Some("pro".into()),
+            billing_class: codexctl::api::BillingClass::RateLimited,
+            primary_used: Some(primary_used),
+            secondary_used: Some(10.0),
+            primary_window_seconds: Some(5 * 60 * 60),
+            secondary_window_seconds: Some(7 * 24 * 60 * 60),
+            primary_resets_at: Some(resets_at),
+            resets_at: Some(resets_at),
+            available: true,
+            usage_score: Some(usage_score),
+            usage_age_seconds: Some(1),
+            usage_stale: false,
+            usage_error: None,
+            statusline_usage: None,
+        }
+    };
+    let selected = central::remote::select(&[
+        account("soon-but-nearly-exhausted", 97.0, 100, 3.0),
+        account("headroom", 10.0, 200, 90.0),
+    ])
+    .unwrap();
+
+    assert_eq!(selected, "headroom");
+
+    assert_eq!(
+        central::remote::select(&[account("mixed-windows", 97.0, 100, 3.0)]).unwrap(),
+        "mixed-windows"
+    );
 }
 
 #[test]
