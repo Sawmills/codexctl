@@ -66,6 +66,27 @@ impl Reader {
         }
     }
 
+    pub(super) async fn reset_counts(&self, key: &str) -> (Option<i64>, Option<i64>) {
+        let entry = self
+            .entries
+            .lock()
+            .expect("usage cache lock")
+            .get(key)
+            .cloned();
+        let Some(entry) = entry else {
+            return (None, None);
+        };
+        let entry = entry.lock().await;
+        let summary = entry
+            .sample
+            .as_ref()
+            .and_then(|(u, _)| u.rate_limit_reset_credits.as_ref());
+        (
+            summary.map(|s| s.available_count),
+            summary.map(|s| s.applicable_available_count),
+        )
+    }
+
     pub(super) async fn read(
         &self,
         key: &str,

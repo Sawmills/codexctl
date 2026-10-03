@@ -9,7 +9,25 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+#[derive(Default)]
+struct CachedExpiry {
+    revision: String,
+    attempted: Option<Instant>,
+    observation: ResetObservation,
+}
+#[derive(Clone, Default)]
+pub(super) struct ResetObservation {
+    pub count: Option<i64>,
+    pub nearest_expiry: Option<i64>,
+    pub stale: bool,
+}
+type ExpiryEntries = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<CachedExpiry>>>>>;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +61,7 @@ pub(super) struct Reader {
     client: reqwest::Client,
     usage_url: String,
     credits_url: String,
+    expiry_entries: ExpiryEntries,
 }
 impl Reader {
     pub(super) fn new() -> Result<Self> {
@@ -54,6 +73,7 @@ impl Reader {
                 .build()?,
             usage_url: api::USAGE_URL.into(),
             credits_url: api::RESET_CREDITS_URL.into(),
+            expiry_entries: Arc::default(),
         })
     }
 
@@ -63,6 +83,66 @@ impl Reader {
         reader.usage_url = format!("{base}/usage");
         reader.credits_url = format!("{base}/credits");
         reader
+    }
+
+    /// Dashboard reads use the saved access credential only, with a shared 60-second
+    /// cooldown on success and failure. They never start the refresh owner.
+    pub(super) async fn dashboard_expiry(
+        &self,
+        key: &str,
+        revision: &str,
+        token: Option<&str>,
+        account: &str,
+    ) -> ResetObservation {
+        let entry = self
+            .expiry_entries
+            .lock()
+            .expect("reset expiry cache lock")
+            .entry(key.into())
+            .or_default()
+            .clone();
+        let mut entry = entry.lock().await;
+        if entry.revision != revision {
+            *entry = CachedExpiry {
+                revision: revision.into(),
+                ..Default::default()
+            };
+        }
+        if token.is_none_or(api::is_token_expired) {
+            return ResetObservation {
+                stale: true,
+                ..entry.observation.clone()
+            };
+        }
+        if entry
+            .attempted
+            .is_none_or(|at| at.elapsed() >= super::catalog::TTL)
+        {
+            let result = api::fetch_reset_credits_at(
+                &self.client,
+                &self.credits_url,
+                token.unwrap_or_default(),
+                Some(account),
+            )
+            .await;
+            entry.attempted = Some(Instant::now());
+            match result {
+                Ok(details) => {
+                    let now = chrono::Utc::now().timestamp();
+                    entry.observation.count = Some(details.available_count);
+                    entry.observation.nearest_expiry = details
+                        .credits
+                        .iter()
+                        .filter(|c| c.is_available())
+                        .filter_map(api::ResetCredit::expires_at_timestamp)
+                        .filter(|at| *at > now)
+                        .min();
+                    entry.observation.stale = false;
+                }
+                Err(_) => entry.observation.stale = true,
+            }
+        }
+        entry.observation.clone()
     }
 
     async fn read(&self, token: &str, account: &str) -> Result<Outcome> {

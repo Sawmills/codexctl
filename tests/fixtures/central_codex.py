@@ -164,6 +164,8 @@ for line in sys.stdin:
             result["rateLimits"]["primary"] = {"usedPercent": 100 if mode == "exhausted-weekly" else 15, "windowDurationMins":10080,"resetsAt":4102444800}
             result["rateLimits"]["credits"] = {"hasCredits":True,"unlimited":False,"balance":"10"}
             result["rateLimits"]["spendControlReached"] = False
+        if mode == "dashboard-unknown":
+            result["rateLimits"]["primary"] = {"usedPercent":15}
         if mode == "status-reset":
             result["rateLimits"]["secondary"] = {"usedPercent":37,"windowDurationMins":10080,"resetsAt":4102444800}
         if mode == "billing-late-change":

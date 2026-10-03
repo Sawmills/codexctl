@@ -61,7 +61,7 @@ impl Fixture {
                     started.add_permits(1);
                     if hold.load(Ordering::SeqCst) { release.acquire().await.unwrap().forget(); }
                     if fail.load(Ordering::SeqCst) { return StatusCode::BAD_GATEWAY.into_response(); }
-                    Json(json!({"plan_type":"pro","rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                    Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
                 }
             }
         }));
@@ -88,6 +88,7 @@ impl Fixture {
             )]))),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::testing(endpoint, timeout)),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
@@ -433,4 +434,56 @@ async fn catalog_carries_declared_duration_through_fresh_and_stale_samples() {
     let stale = fixture.list().await;
     assert_eq!(stale["primaryWindowSeconds"], 18000);
     assert_eq!(stale["usageStale"], true);
+}
+
+#[tokio::test]
+async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials() {
+    let mut f = Fixture::new(Duration::from_secs(2)).await;
+    f.broker.sso = Some(Arc::new(enrollment::Sso::testing_session("test")));
+    let credits_requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    f.broker.reset_reader = super::super::resets::Reader::with_base(&format!(
+        "http://{}",
+        listener.local_addr().unwrap()
+    ));
+    let credits = Router::new().route("/credits", get({ let requests = credits_requests.clone(); move || {
+        requests.fetch_add(1, Ordering::SeqCst);
+        async { Json(json!({"available_count":2,"credits":[
+            {"id":"private-reset-id","status":"available","expires_at":"2099-12-01T00:00:00Z"},
+            {"id":"spent-id","status":"consumed","expires_at":"2099-01-01T00:00:00Z"},
+            {"id":"second-id","status":"available","expires_at":"2099-11-01T00:00:00Z"}
+        ]})) }
+    }}));
+    let credits_task = tokio::spawn(async move {
+        axum::serve(listener, credits).await.unwrap();
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/accounts/data", listener.local_addr().unwrap());
+    let app = super::super::dashboard::routes().with_state(f.broker.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..2 {
+        let response = client
+            .get(&url)
+            .header("cookie", "codexctl-session=synthetic-session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("private-reset-id"));
+        let data: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(data["accounts"][0]["banked_resets"]["count"], 2);
+        assert_eq!(data["accounts"][0]["banked_resets"]["redeemable_now"], 0);
+        assert_eq!(
+            data["accounts"][0]["banked_resets"]["nearest_expiry"],
+            4097174400_i64
+        );
+    }
+    assert_eq!(f.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(credits_requests.load(Ordering::SeqCst), 1);
+    credits_task.abort();
+    server.abort();
 }
