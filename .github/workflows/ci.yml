@@ -21,7 +21,7 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
           POSTGRES_DB: codexctl
         ports:
           - 5432:5432
@@ -31,7 +31,7 @@ jobs:
           --health-timeout 5s
           --health-retries 12
     env:
-      DATABASE_URL: postgres://postgres:postgres@localhost:5432/codexctl?sslmode=disable
+      DATABASE_URL: postgres://postgres@localhost:5432/codexctl?sslmode=disable
       CODEXCTL_CENTRAL_DB_TLS: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

@@ -48,7 +48,9 @@ tokio-postgres-rustls = { version = "0.14", optional = true, features = [
   "ring",
   "webpki-roots",
 ] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+  "ring",
+] }
 rustls-pemfile = { version = "1", optional = true }
 webpki-roots = { version = "1", optional = true }
 anyhow = "1"
