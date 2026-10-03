@@ -218,7 +218,7 @@ impl CentralStore {
                 // PostgreSQL is the fencing authority in dual mode.  Mirroring
                 // to disk is useful during migration, but never grants a lease.
                 let lease = postgres.acquire_lease(account_id, holder_id, ttl).await?;
-                if let Err(error) = file.acquire_lease(account_id, holder_id, ttl) {
+                if let Err(error) = file.mirror_lease(&lease, ttl) {
                     mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "{}",
@@ -301,10 +301,40 @@ impl CentralStore {
         match self {
             Self::File(file) => file.consume_enrollment(challenge),
             Self::Postgres(db) => db.consume_enrollment(challenge).await,
-            Self::Dual { file, postgres, .. } => {
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
                 let value = postgres.consume_enrollment(challenge).await?;
                 if value.is_some() {
-                    let _ = file.consume_enrollment(challenge)?;
+                    match file.consume_enrollment(challenge) {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "operation": "central_store_mirror",
+                                    "backend": "file",
+                                    "stage": "consume_enrollment",
+                                    "reason": "challenge missing from file mirror",
+                                })
+                            );
+                        }
+                        Err(error) => {
+                            mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "operation": "central_store_mirror",
+                                    "backend": "file",
+                                    "stage": "consume_enrollment",
+                                    "reason": error.to_string(),
+                                })
+                            );
+                        }
+                    }
                 }
                 Ok(value)
             }
@@ -445,6 +475,20 @@ impl FileStore {
                 holder_id: holder_id.into(),
                 epoch,
             })
+        })
+    }
+
+    fn mirror_lease(&self, lease: &Lease, ttl: Duration) -> Result<()> {
+        self.with_lock(|state| {
+            state.leases.insert(
+                lease.account_id.clone(),
+                FileLeaseOnDisk {
+                    holder_id: lease.holder_id.clone(),
+                    epoch: lease.epoch,
+                    expires_at: now_secs() + ttl.as_secs(),
+                },
+            );
+            Ok(())
         })
     }
 
@@ -685,12 +729,12 @@ fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
     if let Ok(path) = std::env::var("CODEXCTL_CENTRAL_DB_CA_FILE") {
         let file = std::fs::File::open(&path)
             .with_context(|| format!("read CODEXCTL_CENTRAL_DB_CA_FILE {path:?}"))?;
-        let mut reader = BufReader::new(file);
-        for certificate in
-            rustls_pemfile::certs(&mut reader).context("parse central PostgreSQL CA bundle")?
-        {
+        let reader = BufReader::new(file);
+        use rustls::pki_types::pem::PemObject;
+        for certificate in rustls::pki_types::CertificateDer::pem_reader_iter(reader) {
+            let certificate = certificate.context("parse central PostgreSQL CA bundle")?;
             roots
-                .add(rustls::pki_types::CertificateDer::from(certificate))
+                .add(certificate)
                 .context("add central PostgreSQL CA certificate")?;
         }
     }
@@ -854,7 +898,7 @@ mod tests {
             db.client
                 .execute(
                     "DELETE FROM enrollment_challenges WHERE challenge_hash=$1",
-                    &[&id],
+                    &[&vault::digest(id.as_bytes())],
                 )
                 .await
                 .unwrap();

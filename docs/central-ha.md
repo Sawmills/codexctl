@@ -15,9 +15,10 @@ Phase 1 provisions the PostgreSQL schema and validates its fencing primitives;
 the running broker still reads and writes the encrypted file vault. Server
 startup therefore refuses `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until
 runtime integration is complete. Provision the schema explicitly with
-`CODEXCTL_CENTRAL_STORE=postgres codexctl-central migrate` (or `dual` mode).
-TLS is required by default; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA
-bundle when the server certificate is signed by a private Amazon RDS authority.
+`CODEXCTL_CENTRAL_STORE=postgres DATABASE_URL='postgres://USER@HOST/DB?sslmode=require' codexctl-central migrate --state /path/to/state --key-file /path/to/key`
+(or use `dual` mode). TLS is required by default, and `DATABASE_URL` must set
+`sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
+the server certificate is signed by a private Amazon RDS authority.
 
 ## 1. State inventory
 
