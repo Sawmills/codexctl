@@ -87,17 +87,35 @@ pub fn login(
     let Some(connection) = connection()? else {
         return Ok(false);
     };
-    if !known_server_alias(&connection, alias)? {
-        return Ok(false);
-    }
-    let catalog = catalog()
-        .with_context(|| format!("cannot renew server account {alias}; local login is disabled"))?
-        .context("machine registration removed; local login is disabled for this server account")?;
+    // Retain prior alias evidence before discovery replaces the cache. A fresh
+    // catalog can discover accounts created on another machine; failed discovery
+    // must still allow unrelated local logins without weakening existing fences.
+    let known = known_server_alias(&connection, alias);
+    let catalog = match catalog() {
+        Ok(Some(catalog)) => catalog,
+        Err(error) => {
+            if !known? {
+                return Ok(false);
+            }
+            return Err(error).with_context(|| {
+                format!("cannot renew server account {alias}; local login is disabled")
+            });
+        }
+        Ok(None) => {
+            if !known? {
+                return Ok(false);
+            }
+            bail!("machine registration removed; local login is disabled for this server account");
+        }
+    };
     let Some(account) = catalog
         .accounts
         .iter()
         .find(|a| a.alias.eq_ignore_ascii_case(alias))
     else {
+        if !known? {
+            return Ok(false);
+        }
         bail!(
             "known server account {alias} is absent from the catalog; local login is disabled; reconcile its migration or connection records"
         );

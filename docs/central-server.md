@@ -238,10 +238,12 @@ A migration whose login identity conflicts with retained credentials returns HTT
 The account stays fenced. This refusal does not record a recovery failure or trigger the credential-operation alert.
 
 Without server registration, `codexctl login` keeps its local behavior.
-The machine remembers server aliases from its last successful account discovery.
-Run `codexctl list` to discover server accounts created on another machine.
-Aliases absent from that catalog and the machine's migration or connection records use local login without contacting the account server.
+Login first fetches the current account catalog, so accounts created on another machine
+can renew without a prior `list` or `status` command, even while a server provider is active.
+If discovery fails, the machine uses its last successful catalog and retained migration
+or connection records to distinguish known server aliases from local aliases.
 Known server aliases require the account server; an outage never starts local login for them.
+Other aliases can still start local login when the server is unavailable.
 Local login keeps the existing migration and active-provider checks.
 `whoami` reports the active account. Retiring live credentials also clears the local active marker.
 After disconnect, it reports a local profile only when local credentials remain active.
