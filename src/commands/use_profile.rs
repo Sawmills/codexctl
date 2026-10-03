@@ -24,7 +24,14 @@ pub fn run(
     restart_daemon: bool,
 ) -> Result<()> {
     #[cfg(feature = "central-prototype")]
-    if codexctl::central::native::activate(alias, _allow_billing)? {
+    if codexctl::central::native::activate(alias, _allow_billing, restart_daemon)? {
+        if restart_daemon {
+            let unresumed = daemon_sync::after_server_switch(
+                &config::default_paths()?.codex_home(),
+                codex::DEFAULT_RECOVERY_PROMPT,
+            )?;
+            daemon_sync::require_resumed(unresumed)?;
+        }
         return Ok(());
     }
     run_to_auth_json(
