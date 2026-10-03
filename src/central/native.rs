@@ -692,6 +692,10 @@ pub fn activate(
         }
     };
     let helper = std::env::current_exe()?;
+    let existing_provider = doc
+        .get("model_providers")
+        .and_then(|providers| providers.get(PROVIDER))
+        .cloned();
     let mut provider = Table::new();
     provider["name"] = value("Central Codex");
     provider["base_url"] = value("https://chatgpt.com/backend-api/codex");
@@ -706,6 +710,18 @@ pub fn activate(
     // reuse to one minute; it does not cancel in-flight work or revoke tokens.
     provider["auth"]["refresh_interval_ms"] = value(60_000);
     provider["auth"]["timeout_ms"] = value(210_000);
+    // OpenAI's short edge-rate-limit bursts are retried by default. Preserve
+    // an operator's explicit values when an active provider is rewritten.
+    provider["request_max_retries"] = existing_provider
+        .as_ref()
+        .and_then(|item| item.get("request_max_retries"))
+        .cloned()
+        .unwrap_or_else(|| value(12));
+    provider["stream_max_retries"] = existing_provider
+        .as_ref()
+        .and_then(|item| item.get("stream_max_retries"))
+        .cloned()
+        .unwrap_or_else(|| value(12));
     if let Some(inline) = doc.get("model_providers").and_then(Item::as_inline_table) {
         doc["model_providers"] = Item::Table(inline.clone().into_table());
     } else if doc.get("model_providers").is_none() {
