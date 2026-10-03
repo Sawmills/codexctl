@@ -3788,6 +3788,109 @@ fn a_monitoring_token_with_a_trailing_newline_authenticates_scrapes() {
 
 #[cfg(unix)]
 #[test]
+fn server_selection_succeeds_while_a_session_or_its_orphaned_child_holds_a_lease() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    for (alias, subject, account) in [
+        ("first", "first-login", "first-seat"),
+        ("second", "second-login", "second-seat"),
+    ] {
+        assert_eq!(
+            server
+                .import(&server.amir, alias, subject, account)
+                .status(),
+            200
+        );
+    }
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "first"]).status.success());
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("codex"),
+        "#!/bin/sh\nprintf 'ready\\n'\nread -r finish\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .arg("codex")
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut output = BufReader::new(launcher.stdout.take().unwrap());
+    let mut ready = String::new();
+    output.read_line(&mut ready).unwrap();
+    assert_eq!(ready, "ready\n");
+
+    let selected = server.cli(home.path(), &["use", "second"]);
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+    // The Codex child still owns its inherited descriptor after launcher death.
+    let reselected = server.cli(home.path(), &["use", "second"]);
+    drop(launcher.stdin.take());
+    let mut end = String::new();
+    assert_eq!(output.read_line(&mut end).unwrap(), 0);
+
+    for result in [selected, reselected] {
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let config: toml_edit::DocumentMut =
+        std::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    let provider = &config["model_providers"]["codexctl-central"];
+    assert_eq!(
+        provider["http_headers"]["ChatGPT-Account-ID"].as_str(),
+        Some("second-seat")
+    );
+    assert!(
+        provider["auth"]["args"]
+            .as_array()
+            .unwrap()
+            .get(2)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .ends_with("/second.json")
+    );
+    // A running session's saved helper command must still supply its first account.
+    let first = home.path().join(".codexctl/central/first.json");
+    let token = server.cli(
+        home.path(),
+        &["central-token", "--connection", first.to_str().unwrap()],
+    );
+    assert!(token.status.success());
+    let payload: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                String::from_utf8(token.stdout)
+                    .unwrap()
+                    .trim()
+                    .split('.')
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["https://api.openai.com/auth"]["chatgpt_account_id"],
+        "first-seat"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_pending_local_login_blocks_remote_activation_until_it_finishes() {
     pending_local_login_scenario(false);
 }

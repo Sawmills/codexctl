@@ -76,6 +76,19 @@ impl Fixture {
         self.home
             .join(".codexctl-session-provider-backups/sessions/2026/10/rollout-fixture.jsonl")
     }
+    fn run_with_lsof(&self, script: &str) -> Output {
+        let tools = self.root.path().join("tools");
+        fs::create_dir_all(&tools).unwrap();
+        fs::write(tools.join("lsof"), format!("#!/bin/sh\n{script}\n")).unwrap();
+        fs::set_permissions(tools.join("lsof"), fs::Permissions::from_mode(0o700)).unwrap();
+        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .env("HOME", self.root.path())
+            .env("CODEX_HOME", &self.home)
+            .env("PATH", &tools)
+            .args(["session-provider", "rewrite"])
+            .output()
+            .unwrap()
+    }
 }
 
 #[test]
@@ -361,29 +374,48 @@ fn a_file_opened_during_streaming_is_skipped_before_replace() {
 }
 
 #[test]
-fn uncertain_os_inventory_refuses_to_modify_rollouts() {
+fn empty_os_inventory_allows_rewrite() {
     let f = Fixture::new();
-    let tools = f.root.path().join("tools");
-    fs::create_dir(&tools).unwrap();
-    fs::write(
-        tools.join("lsof"),
-        "#!/bin/sh\necho 'cannot inspect file system' >&2\nexit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(tools.join("lsof"), fs::Permissions::from_mode(0o700)).unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
-        .env("HOME", f.root.path())
-        .env("CODEX_HOME", &f.home)
-        .env("PATH", &tools)
-        .args(["session-provider", "rewrite"])
-        .output()
-        .unwrap();
-    assert!(!result.status.success());
+    let result = f.run_with_lsof("exit 1");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     assert_eq!(
         fs::read(&f.rollout).unwrap(),
-        [HEADER.as_bytes(), TAIL].concat()
+        [migrated().as_bytes(), TAIL].concat()
     );
-    assert!(!f.backup().exists());
+}
+
+#[test]
+fn uncertain_os_inventory_refuses_to_modify_rollouts() {
+    for failure in [
+        "echo 'cannot inspect file system' >&2\nexit 0",
+        "echo 'cannot inspect file system' >&2\nexit 1",
+        "echo p123\nexit 1",
+        "exit 2",
+        "kill -TERM $$",
+    ] {
+        for inventory in [true, false] {
+            let f = Fixture::new();
+            let script = if inventory {
+                failure.to_owned()
+            } else {
+                format!("for arg do\nif [ \"$arg\" = pDi ]; then exit 0; fi\ndone\n{failure}")
+            };
+            let result = f.run_with_lsof(&script);
+            assert!(!result.status.success(), "{script}");
+            assert!(String::from_utf8_lossy(&result.stderr).contains("OS open-file check failed"));
+            assert_eq!(
+                fs::read(&f.rollout).unwrap(),
+                [HEADER.as_bytes(), TAIL].concat()
+            );
+            if inventory {
+                assert!(!f.backup().exists());
+            }
+        }
+    }
 }
 
 #[test]

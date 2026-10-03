@@ -938,7 +938,7 @@ fn when_the_provider_is_local_despite_a_marker_then_the_local_launcher_keeps_its
 }
 
 #[test]
-fn when_a_server_launch_is_running_then_selection_refuses_but_the_token_helper_works() {
+fn when_a_server_launch_is_running_then_selection_and_the_token_helper_work() {
     let client = NativeClient::start();
     client.connect();
     assert!(client.select().status.success());
@@ -958,15 +958,25 @@ fn when_a_server_launch_is_running_then_selection_refuses_but_the_token_helper_w
         .read_line(&mut ready)
         .unwrap();
 
-    let selected = client.select();
+    let (selected, automatic) = std::thread::scope(|scope| {
+        let explicit = scope.spawn(|| client.select());
+        let automatic = scope.spawn(|| client.run(env!("CARGO_BIN_EXE_codexctl"), &["use"]));
+        (explicit.join().unwrap(), automatic.join().unwrap())
+    });
     let token = client.helper();
     drop(child.stdin.take());
     child.wait().unwrap();
 
     assert_eq!(ready, "ready\n");
     assert!(
-        !selected.status.success()
-            && String::from_utf8_lossy(&selected.stderr).contains("credential mode is busy")
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    assert!(
+        automatic.status.success(),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
     );
     assert!(
         token.status.success(),
