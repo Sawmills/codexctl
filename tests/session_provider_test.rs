@@ -53,6 +53,9 @@ impl Fixture {
         .unwrap();
         fs::write(&rollout, [HEADER.as_bytes(), TAIL].concat()).unwrap();
         age(&rollout);
+        let quiet_tools = root.path().join("quiet-tools");
+        fs::create_dir_all(&quiet_tools).unwrap();
+        install_quiet_lsof(&quiet_tools);
         Self {
             root,
             home,
@@ -67,6 +70,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_codexctl"))
             .env("HOME", self.root.path())
             .env("CODEX_HOME", &self.home)
+            .env("PATH", self.root.path().join("quiet-tools"))
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .args(["session-provider", action])
             .output()
@@ -89,6 +93,19 @@ impl Fixture {
             .output()
             .unwrap()
     }
+}
+
+fn install_quiet_lsof(directory: &std::path::Path) {
+    let lsof = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("lsof"))
+        .find(|path| path.is_file())
+        .expect("lsof must be installed for session-provider tests");
+    fs::write(
+        directory.join("lsof"),
+        format!("#!/bin/sh\nexec {} -w \"$@\"\n", lsof.display()),
+    )
+    .unwrap();
+    fs::set_permissions(directory.join("lsof"), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]
@@ -300,6 +317,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_codexctl"))
             .env("HOME", self.root.path())
             .env("CODEX_HOME", &self.home)
+            .env("PATH", self.root.path().join("quiet-tools"))
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .args(["session-provider", "rewrite"])
             .stdout(std::process::Stdio::piped())
@@ -396,6 +414,20 @@ fn lsof_warnings_are_suppressed_with_w_flag() {
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn unknown_lsof_filesystem_warning_refuses_to_modify_rollouts() {
+    let f = Fixture::new();
+    let result = f.run_with_lsof(
+        "echo \"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test\" >&2\necho \"      Output information may be incomplete.\" >&2\nexit 1",
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("OS open-file check failed"));
+    assert_eq!(
+        fs::read(&f.rollout).unwrap(),
+        [HEADER.as_bytes(), TAIL].concat()
     );
 }
 

@@ -452,8 +452,6 @@ fn harmless_lsof_warning(line: &[u8]) -> bool {
     line.contains("WARNING: can't stat() nsfs file system /run/docker/netns/")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/tracing")
-        || line
-            .contains("WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/")
 }
 fn is_open(path: &Path) -> Result<bool> {
     let output = lsof(&["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()])?;
