@@ -11,6 +11,7 @@ use crate::profile;
 use crate::store;
 
 const AUTH_FILE: &str = "auth.json";
+const LOCAL_PROFILE_REQUIRED: &str = "codexctl exec requires a saved local profile; pinned execution of server accounts is not supported. To launch Codex with a server account, run `codexctl use <alias>` then `codexctl codex`; this changes the active account";
 
 /// Names the account a pinned launch selected, for codexctl processes inside it.
 ///
@@ -22,7 +23,8 @@ pub const PINNED_ALIAS_ENV: &str = "CODEXCTL_PINNED_ALIAS";
 pub fn run(account: &str, args: &[String]) -> Result<i32> {
     refuse_inherited_codex_home(std::env::var_os("CODEX_HOME").as_deref())?;
     #[cfg(feature = "central-prototype")]
-    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
+    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)
+        .context(LOCAL_PROFILE_REQUIRED)?;
     run_from(&config::default_paths()?, account, args)
 }
 
@@ -79,7 +81,7 @@ fn run_from(paths: &Paths, account: &str, args: &[String]) -> Result<i32> {
 fn provision_exec_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
     // Resolve the profile first so an unknown alias fails before anything is
     // created on its behalf.
-    profile::get_profile_from(paths, alias)?;
+    profile::get_profile_from(paths, alias).context(LOCAL_PROFILE_REQUIRED)?;
 
     store::ensure_private_dir(&paths.exec_homes_dir())?;
     let home = store::exec_home(paths, alias)?;

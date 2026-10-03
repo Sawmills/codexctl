@@ -455,6 +455,68 @@ fn server_login_cli_scenario(active: bool, cached: bool) {
 }
 
 #[test]
+fn server_exec_explains_unsupported_pinning_with_an_active_provider() {
+    server_exec_unsupported_scenario(true);
+}
+
+#[test]
+fn server_exec_explains_unsupported_pinning_without_prior_discovery() {
+    server_exec_unsupported_scenario(false);
+}
+
+fn server_exec_unsupported_scenario(active: bool) {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let home = server.connected_home();
+    if active {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    let config = home.path().join(".codex/config.toml");
+    let marker = home.path().join(".codexctl/central/.native-active.json");
+    let config_before = std::fs::read(&config).ok();
+    let marker_before = std::fs::read(&marker).ok();
+    let auth_file = home.path().join(".codex/auth.json");
+    store::ensure_private_dir(auth_file.parent().unwrap()).unwrap();
+    store::atomic_write(&auth_file, b"local-auth-sentinel").unwrap();
+    let result = server.cli(
+        home.path(),
+        &[
+            "exec",
+            "--account",
+            "personal",
+            "--",
+            "sh",
+            "-c",
+            "echo CHILD_STARTED",
+        ],
+    );
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(
+        error.contains("pinned execution of server accounts is not supported"),
+        "{error}"
+    );
+    assert!(error.contains("codexctl use <alias>"), "{error}");
+    assert!(error.contains("codexctl codex"), "{error}");
+    assert!(error.contains("changes the active account"), "{error}");
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("CHILD_STARTED"));
+    assert!(!home.path().join(".codexctl/exec-homes/personal").exists());
+    assert_eq!(std::fs::read(&config).ok(), config_before);
+    assert_eq!(std::fs::read(&marker).ok(), marker_before);
+    assert_eq!(std::fs::read(&auth_file).unwrap(), b"local-auth-sentinel");
+}
+
+#[test]
 fn server_login_revocation_stops_the_native_child_and_rejects_future_status_delivery() {
     let server = Server::start();
     assert!(

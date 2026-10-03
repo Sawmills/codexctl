@@ -198,6 +198,10 @@ Account selection during recovery:
 
 ### Pinned launches
 
+Pinned launches support saved local profiles only. Server-account pinning is unsupported;
+use `codexctl use <alias>` followed by `codexctl codex` for a server account, which changes
+the active account for new sessions.
+
 `codexctl use` changes the account for the whole machine. When two agent lanes start at the same
 time, the second `use` can take the first lane's account before it launches. `codexctl exec` pins
 credentials to one child process instead, and never touches `~/.codex/auth.json` or the active
