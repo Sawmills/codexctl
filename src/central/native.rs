@@ -79,6 +79,16 @@ fn config_path(home: &Path) -> Result<PathBuf> {
     }
 }
 fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
+    write_config_with(destination, bytes, |parent| {
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })
+}
+fn write_config_with(
+    destination: &Path,
+    bytes: &[u8],
+    sync_parent: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     use std::io::Write;
     let parent = destination
         .parent()
@@ -95,8 +105,31 @@ fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
     }
     file.as_file().sync_all()?;
     file.persist(destination).map_err(|e| e.error)?;
-    std::fs::File::open(parent)?.sync_all()?;
+    sync_parent(parent)?;
     Ok(())
+}
+fn config_not_installed(destination: &Path, bytes: &[u8]) -> Result<bool> {
+    Ok(match std::fs::read(destination) {
+        Ok(installed) => installed != bytes,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    })
+}
+fn rollback_pointer_if_config_not_installed(
+    destination: &Path,
+    bytes: &[u8],
+    pointer: &Path,
+    previous_pointer: Option<&[u8]>,
+) -> Result<bool> {
+    let not_installed = config_not_installed(destination, bytes)?;
+    if not_installed {
+        match previous_pointer {
+            Some(bytes) => store::atomic_write(pointer, bytes)?,
+            None => {
+                let _ = std::fs::remove_file(pointer);
+            }
+        }
+    }
+    Ok(not_installed)
 }
 pub fn require_local_mode() -> Result<()> {
     require_local_mode_from(&config::default_paths()?)
@@ -362,6 +395,16 @@ fn connection_alias(path: &Path, connection: &Connection) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+fn validate_token_account(token: &str, expected_account: &str) -> Result<()> {
+    let actual = api::token_identity(token)
+        .and_then(|identity| identity.account_id)
+        .context("central access token has no workspace claim")?;
+    if actual != expected_account {
+        bail!("central access token workspace does not match the selected account");
+    }
+    Ok(())
+}
+
 fn billing_error(alias: &str, token: &TokenResponse) -> anyhow::Error {
     if token.billing_class == Some(api::BillingClass::Unknown)
         && token.statusline_usage.as_ref().is_some_and(|usage| {
@@ -384,6 +427,7 @@ fn finish_token(
     expected_active: Option<&str>,
 ) -> Result<()> {
     let alias = connection_alias(path, connection);
+    validate_token_account(&token.access_token, &connection.account_id)?;
     let mut latest = read_connection(path)?;
     if let Some(expected) = expected_active
         && read_active_alias()?.as_str() != expected
@@ -773,19 +817,15 @@ pub fn activate(
     store::atomic_write(&marker, &serde_json::to_vec(&activation)?)?;
     store::atomic_write(&pointer, format!("{alias}\n").as_bytes())?;
     if let Err(error) = write_config(&destination, doc.to_string().as_bytes()) {
-        let not_installed = match std::fs::read(&destination) {
-            Ok(bytes) => bytes != doc.to_string().as_bytes(),
-            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-        };
+        let not_installed = rollback_pointer_if_config_not_installed(
+            &destination,
+            doc.to_string().as_bytes(),
+            &pointer,
+            previous_pointer.as_deref(),
+        )?;
         if !had_marker && not_installed {
             std::fs::remove_file(&marker)
                 .context("failed to roll back prepared remote activation")?;
-        }
-        match previous_pointer {
-            Some(bytes) => store::atomic_write(&pointer, &bytes)?,
-            None => {
-                let _ = std::fs::remove_file(&pointer);
-            }
         }
         return Err(error);
     }
@@ -1017,7 +1057,12 @@ pub(crate) fn statusline_selection(
 
 #[cfg(test)]
 mod tests {
-    use super::{BILLING_SWITCH_NOTICE, billing_switch_prompt};
+    use super::{
+        BILLING_SWITCH_NOTICE, billing_switch_prompt, rollback_pointer_if_config_not_installed,
+        validate_token_account, write_config_with,
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::fs;
 
     #[test]
     fn billing_confirmation_warns_about_all_running_sessions() {
@@ -1027,5 +1072,37 @@ mod tests {
         assert!(prompt.contains("may bill credits"));
         assert!(prompt.ends_with("Switch?"));
         assert!(prompt.contains(BILLING_SWITCH_NOTICE));
+    }
+
+    #[test]
+    fn token_workspace_mismatch_is_refused_before_printing() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "https://api.openai.com/auth": {"chatgpt_account_id": "workspace-b"}
+            }))
+            .unwrap(),
+        );
+        let token = format!("header.{payload}.signature");
+        let error = validate_token_account(&token, "workspace-a").unwrap_err();
+        assert!(error.to_string().contains("workspace does not match"));
+    }
+
+    #[test]
+    fn late_config_fsync_failure_keeps_the_new_pointer_after_persist() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("config.toml");
+        let pointer = root.path().join(".active-account");
+        let bytes = b"model_provider = 'codexctl-central'\n";
+        let error = write_config_with(&destination, bytes, |_| {
+            anyhow::bail!("synthetic late directory fsync failure")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("late directory fsync"));
+        fs::write(&pointer, b"new\n").unwrap();
+
+        let not_installed =
+            rollback_pointer_if_config_not_installed(&destination, bytes, &pointer, None).unwrap();
+        assert!(!not_installed);
+        assert_eq!(fs::read(pointer).unwrap(), b"new\n");
     }
 }

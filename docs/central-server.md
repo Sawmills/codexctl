@@ -178,6 +178,8 @@ reported usage window has headroom, even when credits are available and the cap 
 Both bare `codexctl use` and `codexctl use <alias>` allow this selection without `--allow-billing`.
 Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
+Within a billing class, automatic selection skips any candidate with a reported usage window at
+or above 95% whenever another candidate in that class is below 95%.
 An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
 Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
 Usage-based accounts never qualify for automatic selection.
@@ -258,6 +260,10 @@ Local login keeps the existing migration and active-provider checks.
 After disconnect, it reports a local profile only when local credentials remain active.
 The native provider currently supports the global ChatGPT backend with no regional routing constraint.
 Before each token delivery, the server checks workspace routing.
+The access token's `chatgpt_account_id` claim scopes native requests to its workspace. The helper
+verifies that claim against the selected connection before printing a token, and activation does
+not write a static `ChatGPT-Account-ID` header: a static value would become stale when the active
+pointer moves running sessions between seats held by one login.
 Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
 Read-only brokers cannot verify native routing and cannot supply the native provider.
 Running server sessions use the active account pointer when they refresh their helper token.
