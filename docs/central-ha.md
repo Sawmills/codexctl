@@ -22,6 +22,11 @@ for the runtime after setting the acknowledgement). TLS is required by default, 
 `sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
 the server certificate is signed by a private Amazon RDS authority.
 
+Phase 2 `central_registry` rows are encrypted, non-authoritative startup
+snapshots used for migration accounting. Authorization continues to read the
+local users and device registries in this phase; those rows are never read as
+truth, so a stale snapshot cannot revive a disabled user or revoked device.
+
 ## 1. State inventory
 
 The following inventory distinguishes durable source state from caches and

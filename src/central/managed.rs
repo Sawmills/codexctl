@@ -186,6 +186,14 @@ pub(super) fn normalize_alias(alias: &str) -> Result<&str> {
 pub(super) fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
+
+fn instance_holder_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|v| v.trim().to_owned()))
+        .unwrap_or_else(|_| "unknown-host".into());
+    let boot_nonce = vault::digest(&enrollment::random_bytes());
+    vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
+}
 fn account_summary(owner: &Owner) -> Account {
     let limits = owner.limits.as_ref().map(|v| &v["rateLimits"]);
     let usage = owner
@@ -387,6 +395,11 @@ async fn token(
             .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         let lease = if request.previous_revision.is_some() {
             if let Some(central) = worker.central.as_ref() {
+                // Ensure the FK target exists before the first forced refresh
+                // after cutover or a locally imported account.
+                worker.persist_owner(&owner).await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
                 Some(
                     central
                         .acquire_lease(
@@ -1132,16 +1145,26 @@ pub async fn serve(
         bail!("network listener requires an HTTPS ingress origin");
     }
     let _lock = vault::lock(state, "owner.lock")?;
-    let central = super::storage::runtime_store(state, key).await?;
-    central
-        .save_registry("users", &vault::private_read(&state.join("users.json"))?)
-        .await?;
-    central
-        .save_registry(
-            "devices",
-            &vault::private_read(&state.join("devices.json"))?,
-        )
-        .await?;
+    let configured = super::storage::runtime_store(state, key).await?;
+    // File mode deliberately keeps the central store detached: the existing
+    // vault remains the authoritative local path with no token-request cost.
+    let central = match configured {
+        CentralStore::File(_) => None,
+        store => {
+            // These rows are migration snapshots only. Authorization always
+            // reads the local registry in this phase and never this snapshot.
+            store
+                .save_registry("users", &vault::private_read(&state.join("users.json"))?)
+                .await?;
+            store
+                .save_registry(
+                    "devices",
+                    &vault::private_read(&state.join("devices.json"))?,
+                )
+                .await?;
+            Some(store)
+        }
+    };
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -1333,8 +1356,8 @@ pub async fn serve(
         work: Arc::new(Semaphore::new(128)),
         stopping: Arc::new(AtomicBool::new(false)),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
-        holder_id: vault::digest(format!("{}:{}", std::process::id(), state.display()).as_bytes()),
-        central: Some(central),
+        holder_id: instance_holder_id(),
+        central,
         metrics_hash: metrics_token_file
             .map(|p| {
                 let bytes = vault::private_read(p)?;
@@ -1419,6 +1442,11 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn holder_id_changes_for_each_boot() {
+        assert_ne!(super::instance_holder_id(), super::instance_holder_id());
+    }
+
+    #[test]
     fn interrupted_registry_setup_keeps_the_completion_marker_absent_and_can_retry() {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
@@ -1464,6 +1492,11 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
         store::atomic_write(&binary,format!("#!/bin/sh\nexport CENTRAL_TEST_MODE_FILE={}\nexport CENTRAL_TEST_REFRESH_COUNTER={}\nexec {} \"$@\"\n",quoted(&mode),quoted(&counter),quoted(&fixture)).as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let central =
+            CentralStore::from_mode(crate::central::storage::StoreMode::File, &state, &key)
+                .await
+                .unwrap();
+        central.migrate().await.unwrap();
         let broker = Broker {
             state,
             key,
@@ -1481,7 +1514,7 @@ mod tests {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
-            central: None,
+            central: Some(central),
             holder_id: "test-holder".into(),
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

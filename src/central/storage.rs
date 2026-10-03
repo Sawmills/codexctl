@@ -927,9 +927,11 @@ pub async fn runtime_store(state: &Path, key: &Path) -> Result<CentralStore> {
     }
 }
 
-pub async fn maybe_migrate(state: &Path, key: &Path) -> Result<()> {
-    let _ = runtime_store(state, key).await?;
-    Ok(())
+pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
+    match StoreMode::from_env()? {
+        StoreMode::File => Ok(()),
+        mode => bail!("prototype central server supports file storage only (requested {mode})"),
+    }
 }
 
 /// Apply the configured schema migration. This is intentionally separate from
@@ -990,6 +992,31 @@ mod tests {
             Some(b"payload".to_vec())
         );
         assert_eq!(store.consume_enrollment("challenge").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn two_file_instances_have_one_live_lease_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[4; 32]).unwrap();
+        let first = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        let second = first.clone();
+        first.migrate().await.unwrap();
+        first
+            .save_account(&record("lease-account", 1))
+            .await
+            .unwrap();
+        let (left, right) = tokio::join!(
+            first.acquire_lease("lease-account", "pod-a:boot-a", Duration::from_secs(60)),
+            second.acquire_lease("lease-account", "pod-b:boot-b", Duration::from_secs(60)),
+        );
+        assert!(
+            left.is_ok() ^ right.is_ok(),
+            "exactly one instance may hold a live lease"
+        );
     }
 
     #[cfg(feature = "central-real-db-tests")]
