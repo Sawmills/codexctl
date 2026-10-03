@@ -5683,6 +5683,15 @@ fn resets_redeem_command_accepts_an_alias_and_explicit_consent() {
 
 #[test]
 fn server_reset_cli_retries_an_ambiguous_response_with_the_same_request_id() {
+    server_reset_cli_retry(false);
+}
+
+#[test]
+fn server_reset_cli_starts_a_new_operation_after_a_terminal_rejection() {
+    server_reset_cli_retry(true);
+}
+
+fn server_reset_cli_retry(terminal: bool) {
     use std::io::{Read, Write};
     let server = Server::start();
     let home = server.connected_home();
@@ -5734,7 +5743,12 @@ fn server_reset_cli_retries_an_ambiguous_response_with_the_same_request_id() {
                 assert_eq!(body["alias"], "personal");
                 assert_eq!(body.as_object().unwrap().len(), 2);
                 redemptions.push(body);
-                if redemptions.len() == 1 {
+                if redemptions.len() == 1 && terminal {
+                    (
+                        "422 Unprocessable Entity",
+                        json!({"error":"reset_rejected"}),
+                    )
+                } else if redemptions.len() == 1 {
                     ("502 Bad Gateway", json!({"error":"reset_redeem_failed"}))
                 } else {
                     (
@@ -5761,7 +5775,14 @@ fn server_reset_cli_retries_an_ambiguous_response_with_the_same_request_id() {
         String::from_utf8_lossy(&retry.stderr)
     );
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0], requests[1]);
+    if terminal {
+        assert_ne!(
+            requests[0]["redeem_request_id"],
+            requests[1]["redeem_request_id"]
+        );
+    } else {
+        assert_eq!(requests[0], requests[1]);
+    }
 }
 
 #[test]
@@ -5805,6 +5826,13 @@ fn automatic_reset_attempt(
     } else {
         None
     };
+    if fence == Some("daemon") {
+        store::atomic_write(
+            &home.path().join(".codex/app-server-daemon/daemon.pid"),
+            &serde_json::to_vec(&json!({"pid": std::process::id()})).unwrap(),
+        )
+        .unwrap();
+    }
     if fence == Some("profile") {
         store::atomic_write(
             &home.path().join(".codex/config.toml"),
@@ -5891,7 +5919,7 @@ fn automatic_reset_attempt(
 
 #[test]
 fn automatic_reset_waits_for_all_local_activation_fences() {
-    for fence in ["profile", "store", "handoff", "provider"] {
+    for fence in ["profile", "store", "handoff", "provider", "daemon"] {
         let (count, output) =
             automatic_reset_attempt(&["use", "--allow-resets"], "pro", 100.0, Some(fence));
         assert!(!output.status.success());

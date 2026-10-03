@@ -355,7 +355,7 @@ async fn reset_redemption_refuses_an_account_without_an_exhausted_window() {
 }
 
 async fn redemption_upstream(
-    ambiguous: bool,
+    failures: usize,
 ) -> (
     String,
     Arc<StdMutex<Vec<Value>>>,
@@ -378,10 +378,10 @@ async fn redemption_upstream(
             assert!(headers.contains_key("authorization"));
             let mut requests = requests.lock().unwrap();
             requests.push(body);
-            if ambiguous && requests.len() == 1 {
+            if requests.len() <= failures {
                 return StatusCode::BAD_GATEWAY.into_response();
             }
-            Json(json!({"code":if ambiguous { "already_redeemed" } else { "reset" },"windows_reset":1})).into_response()
+            Json(json!({"code":if failures > 0 { "already_redeemed" } else { "reset" },"windows_reset":1})).into_response()
         }));
     (
         base,
@@ -394,7 +394,7 @@ async fn redemption_upstream(
 
 #[tokio::test]
 async fn reset_redemption_spends_the_closest_expiry_on_an_exhausted_account() {
-    let (base, received, upstream) = redemption_upstream(false).await;
+    let (base, received, upstream) = redemption_upstream(0).await;
     let fixture = Fixture::start(&base).await;
     let (status, body) = fixture.redeem("closest-expiry").await;
     fixture.stop().await;
@@ -408,7 +408,7 @@ async fn reset_redemption_spends_the_closest_expiry_on_an_exhausted_account() {
 
 #[tokio::test]
 async fn reset_redemption_retry_returns_already_redeemed_without_a_second_spend() {
-    let (base, received, upstream) = redemption_upstream(false).await;
+    let (base, received, upstream) = redemption_upstream(0).await;
     let fixture = Fixture::start(&base).await;
     assert_eq!(fixture.redeem("durable-retry").await.0, StatusCode::OK);
     // A new reader has no in-memory request cache; the receipt must be durable.
@@ -429,7 +429,7 @@ async fn reset_redemption_retry_returns_already_redeemed_without_a_second_spend(
 
 #[tokio::test]
 async fn reset_redemption_ambiguous_retry_keeps_the_credit_and_key() {
-    let (base, received, upstream) = redemption_upstream(true).await;
+    let (base, received, upstream) = redemption_upstream(1).await;
     let fixture = Fixture::start(&base).await;
     assert_eq!(fixture.redeem("uncertain").await.0, StatusCode::BAD_GATEWAY);
     let mut broker = fixture.broker.clone();
@@ -456,7 +456,7 @@ async fn reset_redemption_ambiguous_retry_keeps_the_credit_and_key() {
 
 #[tokio::test]
 async fn concurrent_reset_retries_spend_only_once() {
-    let (base, received, upstream) = redemption_upstream(false).await;
+    let (base, received, upstream) = redemption_upstream(0).await;
     let fixture = Fixture::start(&base).await;
     let (first, second) = tokio::join!(fixture.redeem("concurrent"), fixture.redeem("concurrent"));
     fixture.stop().await;
@@ -540,7 +540,7 @@ fn reset_failure_logs_the_underlying_cause_without_credentials() {
 #[tokio::test]
 #[ignore = "subprocess fixture for structured error logging"]
 async fn reset_log_fixture() {
-    let (base, _, upstream) = redemption_upstream(true).await;
+    let (base, _, upstream) = redemption_upstream(1).await;
     let fixture = Fixture::start(&base).await;
     assert_eq!(fixture.redeem("log-cause").await.0, StatusCode::BAD_GATEWAY);
     fixture.stop().await;
@@ -549,7 +549,7 @@ async fn reset_log_fixture() {
 
 #[tokio::test]
 async fn another_machine_of_the_same_company_user_can_resolve_a_pending_reset() {
-    let (base, received, upstream) = redemption_upstream(true).await;
+    let (base, received, upstream) = redemption_upstream(1).await;
     let fixture = Fixture::start(&base).await;
     assert_eq!(
         fixture.redeem("lost-machine-request").await.0,
@@ -589,4 +589,24 @@ async fn another_machine_of_the_same_company_user_can_resolve_a_pending_reset() 
     let calls = received.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0], calls[1]);
+}
+
+#[tokio::test]
+async fn every_machine_that_retries_an_uncertain_reset_gets_the_same_receipt() {
+    let (base, received, upstream) = redemption_upstream(2).await;
+    let fixture = Fixture::start(&base).await;
+    assert_eq!(fixture.redeem("machine-a").await.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.redeem("machine-b").await.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(fixture.redeem("machine-c").await.0, StatusCode::OK);
+    assert_eq!(
+        fixture.redeem("machine-b").await.1["code"],
+        "already_redeemed"
+    );
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(
+        received.lock().unwrap().len(),
+        3,
+        "an intermediate machine retried as a new spend"
+    );
 }

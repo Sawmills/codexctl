@@ -289,6 +289,8 @@ struct Pending {
     request_id: String,
     credit_id: String,
     upstream_id: String,
+    #[serde(default)]
+    joined_requests: std::collections::BTreeSet<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
@@ -322,6 +324,13 @@ impl Reader {
         }
         // An authorized machine may resolve another machine's uncertain attempt,
         // but it must reuse that attempt's credit and provider key.
+        if let Some(pending) = journal.pending.as_mut()
+            && pending
+                .joined_requests
+                .insert(request.redeem_request_id.clone())
+        {
+            crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
+        }
         let mut token_request = TokenRequest::default();
         for attempt in 0..2 {
             let token = owner
@@ -376,6 +385,7 @@ impl Reader {
                         .ok_or(Refusal("no_reset_credit"))?;
                     journal.pending = Some(Pending {
                         request_id: request.redeem_request_id.clone(),
+                        joined_requests: std::collections::BTreeSet::new(),
                         credit_id: credit.id.clone(),
                         upstream_id: super::vault::digest(&serde_json::to_vec(&(
                             &owner.vault.user,
@@ -419,6 +429,9 @@ impl Reader {
                     }
                     Err(error) => return Err(error),
                 };
+                for joined in &pending.joined_requests {
+                    journal.completed.insert(joined.clone(), response.clone());
+                }
                 let original_request = pending.request_id.clone();
                 journal.completed.insert(original_request, response.clone());
                 journal
