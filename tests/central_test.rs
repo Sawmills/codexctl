@@ -1855,6 +1855,21 @@ fn a_slow_token_fetch_does_not_hold_native_lock() {
         assert!(std::time::Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
+    let lock_probe_started = std::time::Instant::now();
+    let lock_probe = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["session-provider", "dry-run"],
+    );
+    let lock_probe_elapsed = lock_probe_started.elapsed();
+    assert!(
+        lock_probe.status.success(),
+        "{}",
+        String::from_utf8_lossy(&lock_probe.stderr)
+    );
+    assert!(
+        lock_probe_elapsed < Duration::from_secs(2),
+        "native lock was held during the slow fetch: {lock_probe_elapsed:?}"
+    );
     let second = client.helper_active();
     assert!(
         second.status.success(),

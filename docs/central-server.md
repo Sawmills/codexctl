@@ -268,7 +268,10 @@ The native provider currently supports the global ChatGPT backend with no region
 Before each token delivery, the server checks workspace routing.
 Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
 Read-only brokers cannot verify native routing and cannot supply the native provider.
-Existing sessions keep the account they selected at startup.
+Running server sessions use the active account pointer when they refresh their helper token.
+After `codexctl use <alias>`, every running session on this machine moves to the selected
+account within 60 seconds. If that account can bill credits, all of those sessions can bill
+credits after their included usage ends; the switch still requires billing approval.
 Use `codexctl codex resume <session-id>` to resume a session from before migration.
 The launcher passes `-c 'model_provider="codexctl-central"'` to Codex.
 Codex 0.160.0 otherwise restores the session's saved provider, even when the base configuration selects a server account.
@@ -285,8 +288,9 @@ Server-account launches use the provider token helper without local account fail
 `codexctl exec --account <alias> -- <command>` supports saved local profiles only.
 Pinned execution of server accounts is not supported: the server provider and its
 token helper refuse pinned homes. To launch Codex with a server account, run
-`codexctl use <alias>` followed by `codexctl codex`. This changes the active account
-for new sessions; it is not an isolated pinned launch.
+`codexctl use <alias>` followed by `codexctl codex`. This changes the active account for
+new and running sessions; running sessions follow it within 60 seconds. It is not an
+isolated pinned launch.
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 

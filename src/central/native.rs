@@ -14,6 +14,11 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
+const BILLING_SWITCH_NOTICE: &str = "ALL running Codex sessions on this machine will also move to this account within 60 seconds and may bill credits.";
+
+fn billing_switch_prompt() -> String {
+    format!("This remote account may bill credits. {BILLING_SWITCH_NOTICE} Switch?")
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -552,8 +557,9 @@ pub fn activate(
                 .and_then(Item::as_str)
                 == Some(PROVIDER)
     };
-    // Server sessions keep their launch-time provider. Only entry from local
-    // mode must exclude credential owners; native.lock serializes config writes.
+    // Server sessions share the active provider and resolve the selected account
+    // on each helper refresh. Only entry from local mode must exclude credential
+    // owners; native.lock serializes configuration writes.
     let _mode = if switching_server {
         shared
     } else {
@@ -596,10 +602,12 @@ pub fn activate(
     if usage_based && !allow_billing && !redeem_reset {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            bail!("remote account may bill credits; use --allow-billing explicitly");
+            bail!(
+                "remote account may bill credits; {BILLING_SWITCH_NOTICE} Use --allow-billing explicitly"
+            );
         }
         if !dialoguer::Confirm::new()
-            .with_prompt("This remote account may bill credits. Switch?")
+            .with_prompt(billing_switch_prompt())
             .default(false)
             .interact()?
         {
@@ -769,9 +777,15 @@ pub fn activate(
     repair_sessions_if_active(SessionProviderAction::Rewrite).with_context(|| {
         format!("server account {alias} is active; session repair failed; resolve the reported cause and retry codexctl session-provider rewrite")
     })?;
-    println!(
-        "switched to remote account {alias}; start codexctl codex (resume: codexctl codex resume <session-id>)"
-    );
+    if usage_based {
+        println!(
+            "switched to remote account {alias}; {BILLING_SWITCH_NOTICE} Start codexctl codex (resume: codexctl codex resume <session-id>)"
+        );
+    } else {
+        println!(
+            "switched to remote account {alias}; running Codex sessions on this machine will move to it within 60 seconds. Start codexctl codex (resume: codexctl codex resume <session-id>)"
+        );
+    }
     Ok(true)
 }
 
@@ -983,4 +997,19 @@ pub(crate) fn statusline_selection(
         PathBuf::from(path)
     };
     statusline_identity(&path, &read_connection(&path)?).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BILLING_SWITCH_NOTICE, billing_switch_prompt};
+
+    #[test]
+    fn billing_confirmation_warns_about_all_running_sessions() {
+        let prompt = billing_switch_prompt();
+        assert!(prompt.contains("ALL running Codex sessions on this machine"));
+        assert!(prompt.contains("move to this account within 60 seconds"));
+        assert!(prompt.contains("may bill credits"));
+        assert!(prompt.ends_with("Switch?"));
+        assert!(prompt.contains(BILLING_SWITCH_NOTICE));
+    }
 }
