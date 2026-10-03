@@ -81,7 +81,8 @@ fn run_from(paths: &Paths, account: &str, args: &[String]) -> Result<i32> {
 fn provision_exec_home(paths: &Paths, alias: &str) -> Result<PathBuf> {
     // Resolve the profile first so an unknown alias fails before anything is
     // created on its behalf.
-    profile::get_profile_from(paths, alias).context(LOCAL_PROFILE_REQUIRED)?;
+    profile::get_profile_from(paths, alias)
+        .with_context(|| format!("cannot pin profile '{alias}': {LOCAL_PROFILE_REQUIRED}"))?;
 
     store::ensure_private_dir(&paths.exec_homes_dir())?;
     let home = store::exec_home(paths, alias)?;
