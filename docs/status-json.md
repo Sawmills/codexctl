@@ -6,7 +6,7 @@ Automation can read account usage without parsing terminal tables.
 
 ```sh
 codexctl status --json | jq .
-codexctl status --json | jq '.accounts[] | {alias, source, weekly: .secondary_used_percent, resets_at, error}'
+codexctl status --json | jq '.accounts[] | {alias, source, secondary_used_percent, secondary_window_seconds, secondary_resets_at, error}'
 codexctl status --json --rate-limited
 codexctl list --json
 ```
@@ -25,6 +25,10 @@ codexctl list --json
       "state": "server",
       "primary_used_percent": 12.5,
       "secondary_used_percent": 37.0,
+      "primary_window_seconds": 18000,
+      "secondary_window_seconds": 604800,
+      "primary_resets_at": "2099-12-25T05:00:00Z",
+      "secondary_resets_at": "2100-01-01T00:00:00Z",
       "resets_at": "2100-01-01T00:00:00Z",
       "billing_class": "rate_limited",
       "error": null,
@@ -51,7 +55,12 @@ An empty result is `{"version":1,"accounts":[]}`.
 - `secondary_used_percent`: The main Codex long-window usage percentage, or `null`.
   This window is normally weekly.
   Window duration determines short and long placement, including a weekly-only primary window.
+- `primary_window_seconds`, `secondary_window_seconds`: Declared duration in seconds of the corresponding short or long window, or `null` when unknown.
+  Durations use the same upstream evidence as the statusline; they are never inferred from plan, position, or reset time.
+  Upstream minutes are converted to seconds. A weekly-only primary window is placed in the secondary fields, alongside its percentage and reset time.
+- `primary_resets_at`, `secondary_resets_at`: Each window's reset time in RFC 3339 UTC format, or `null` when unknown.
 - `resets_at`: The long window's reset time in RFC 3339 UTC format, or `null`.
+  This existing field remains an alias of `secondary_resets_at`.
 - `billing_class`: `rate_limited`, `usage_based`, or `unknown`.
   Failed requests keep unknown billing, regardless of the table's display group.
 - `error`: A brief account error, or `null`.
@@ -60,6 +69,10 @@ An empty result is `{"version":1,"accounts":[]}`.
 - `usage_age_seconds`: Age of the last successful server usage observation, or `null` when unknown or local.
 - `usage_stale`: Whether server usage is stale or missing, or `null` for local rows.
   Stale server rows retain the last usage values and include an `error`; consumers must treat their quota as unknown.
+
+Older account servers omit the duration fields and short-window reset time.
+Their rows report `null` for those values while retaining the known long-window reset time.
+Upgrade the account server as well as the CLI to expose durations for server accounts.
 
 An alias can occur twice when a profile and a server account share it.
 Use `source` with `alias` to distinguish those rows.

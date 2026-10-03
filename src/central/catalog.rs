@@ -151,6 +151,9 @@ impl Reader {
         summary.statusline_usage = None;
         summary.primary_used = None;
         summary.secondary_used = None;
+        summary.primary_window_seconds = None;
+        summary.secondary_window_seconds = None;
+        summary.primary_resets_at = None;
         summary.resets_at = None;
         summary.usage_score = None;
         summary.billing_class = api::BillingClass::Unknown;
@@ -161,6 +164,15 @@ impl Reader {
                 .and_then(|r| r.short_window())
                 .map(|w| w.used_percent);
             summary.secondary_used = limits.and_then(|r| r.long_window()).map(|w| w.used_percent);
+            summary.primary_window_seconds = limits
+                .and_then(api::RateLimit::short_window)
+                .and_then(api::RateLimitWindow::duration_seconds);
+            summary.secondary_window_seconds = limits
+                .and_then(api::RateLimit::long_window)
+                .and_then(api::RateLimitWindow::duration_seconds);
+            summary.primary_resets_at = limits
+                .and_then(api::RateLimit::short_window)
+                .and_then(api::RateLimitWindow::reset_timestamp);
             summary.resets_at = limits
                 .and_then(|r| r.long_window())
                 .and_then(|w| w.reset_timestamp());

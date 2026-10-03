@@ -36,6 +36,8 @@ The token helper also updates this file when the account server supplies usage i
 Server accounts need an account server with statusline support for both update paths.
 Older servers do not prove window durations, so their accounts produce no statusline.
 Their normal `status` and `status --json` output stays available.
+[Status JSON](status-json.md) reports each declared window duration and reset time;
+window durations from older servers remain `null`.
 The cache contains account identity metadata and usage, with no credentials.
 Cache write errors do not fail the original status or token operation.
 

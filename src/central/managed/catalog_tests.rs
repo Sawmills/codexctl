@@ -419,3 +419,18 @@ async fn b8_expired_access_does_not_fetch_or_alert() {
     assert_eq!(fixture.requests.load(Ordering::SeqCst), 0);
     assert!(fixture.broker.failures.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn catalog_carries_declared_duration_through_fresh_and_stale_samples() {
+    let fixture = Fixture::new(Duration::from_secs(2)).await;
+    let fresh = fixture.list().await;
+    assert_eq!(fresh["primaryWindowSeconds"], 18000);
+    assert_eq!(fresh.get("secondaryWindowSeconds"), Some(&Value::Null));
+    assert_eq!(fresh.get("primaryResetsAt"), Some(&Value::Null));
+
+    fixture.broker.catalog.expire().await;
+    fixture.fail.store(true, Ordering::SeqCst);
+    let stale = fixture.list().await;
+    assert_eq!(stale["primaryWindowSeconds"], 18000);
+    assert_eq!(stale["usageStale"], true);
+}

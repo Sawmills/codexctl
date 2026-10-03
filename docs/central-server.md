@@ -152,6 +152,15 @@ for a read-only usage request outside the credential-owner lock, with a 15-secon
 timeout. It never refreshes credentials for listing. A failed fetch retains the
 last observation and delays the next attempt for 60 seconds.
 
+The account API also carries `primaryWindowSeconds`, `secondaryWindowSeconds`,
+and `primaryResetsAt` beside the existing long-window `resetsAt`.
+Durations come from the observed quota windows, in seconds, and are null when unknown.
+Reset times on this API are Unix seconds. The CLI exposes both reset times as UTC
+strings and the durations in [status JSON](status-json.md).
+Both the account server and CLI need this update; an older server leaves the new
+values unknown. Stale observations retain their durations and reset times with
+the same freshness flags as their usage percentages.
+
 The account API returns `usageAgeSeconds`, `usageStale`, and `usageError`.
 Age is null until an observation succeeds. Status and list show stale or missing
 usage in the Error column. Stale usage cannot authorize automatic account selection.

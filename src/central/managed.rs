@@ -46,6 +46,9 @@ pub struct Account {
     pub billing_class: api::BillingClass,
     pub primary_used: Option<f64>,
     pub secondary_used: Option<f64>,
+    pub primary_window_seconds: Option<u64>,
+    pub secondary_window_seconds: Option<u64>,
+    pub primary_resets_at: Option<i64>,
     pub resets_at: Option<i64>,
     pub available: bool,
     pub usage_score: Option<f64>,
@@ -206,6 +209,15 @@ fn account_summary(owner: &Owner) -> Account {
         secondary_used: windows
             .and_then(|r| r.long_window())
             .map(|w| w.used_percent),
+        primary_window_seconds: windows
+            .and_then(api::RateLimit::short_window)
+            .and_then(api::RateLimitWindow::duration_seconds),
+        secondary_window_seconds: windows
+            .and_then(api::RateLimit::long_window)
+            .and_then(api::RateLimitWindow::duration_seconds),
+        primary_resets_at: windows
+            .and_then(api::RateLimit::short_window)
+            .and_then(api::RateLimitWindow::reset_timestamp),
         resets_at: windows
             .and_then(|r| r.long_window())
             .and_then(|w| w.reset_timestamp()),
