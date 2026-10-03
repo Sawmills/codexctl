@@ -4409,21 +4409,43 @@ fn server_selection_succeeds_while_a_session_or_its_orphaned_child_holds_a_lease
             .parse()
             .unwrap();
     let provider = &config["model_providers"]["codexctl-central"];
-    assert_eq!(
-        provider["http_headers"]["ChatGPT-Account-ID"].as_str(),
-        Some("second-seat")
+    assert!(
+        provider
+            .get("http_headers")
+            .and_then(|headers| headers.get("ChatGPT-Account-ID"))
+            .is_none()
     );
     assert!(
         provider["auth"]["args"]
             .as_array()
             .unwrap()
-            .get(2)
+            .get(1)
             .unwrap()
             .as_str()
             .unwrap()
-            .ends_with("/second.json")
+            == "--active"
     );
-    // A running session's saved helper command must still supply its first account.
+    // A running session's saved helper command follows the newly active account.
+    let active = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(active.status.success());
+    let active_payload: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                String::from_utf8(active.stdout)
+                    .unwrap()
+                    .trim()
+                    .split('.')
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        active_payload["https://api.openai.com/auth"]["chatgpt_account_id"],
+        "second-seat"
+    );
+    // The legacy explicit helper command remains supported.
     let first = home.path().join(".codexctl/central/first.json");
     let token = server.cli(
         home.path(),

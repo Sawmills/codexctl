@@ -16,6 +16,7 @@ use crate::profile;
 /// `rate_limit_score` returns at least this whenever a rate-limit window is at
 /// 100% — i.e. the account has no usable headroom right now.
 const RATE_LIMIT_EXHAUSTED: f64 = 500.0;
+const RATE_LIMIT_SWITCH_THRESHOLD: f64 = 95.0;
 
 pub fn run(
     alias: Option<&str>,
@@ -116,11 +117,13 @@ fn find_most_available_excluding(
             let score = usage.as_ref().map_or(f64::MAX, selection_score);
             let bills_credits = usage.as_ref().is_none_or(selection_bills_credits);
             let reset = usage.as_ref().map_or(i64::MAX, secondary_reset_ts);
+            let at_switch_threshold = usage.as_ref().is_some_and(at_switch_threshold);
             SelectionCandidate {
                 alias: alias.clone(),
                 bills_credits,
                 score,
                 secondary_reset_ts: reset,
+                at_switch_threshold,
             }
         })
         .collect();
@@ -240,6 +243,7 @@ struct SelectionCandidate {
     bills_credits: bool,
     score: f64,
     secondary_reset_ts: i64,
+    at_switch_threshold: bool,
 }
 
 /// Pick the most-available alias from scored candidates.
@@ -271,21 +275,41 @@ fn select_most_available(scored: &[SelectionCandidate], reset_aware: bool) -> Op
 /// Both modes put no-bill accounts first. Reset-aware then uses the soonest 7d
 /// reset and most headroom. Default uses most headroom within the billing class.
 fn select_with_headroom(scored: &[SelectionCandidate], reset_aware: bool) -> Option<&str> {
-    scored
+    let no_bill: Vec<_> = scored
         .iter()
-        .filter(|candidate| candidate.score < RATE_LIMIT_EXHAUSTED)
+        .filter(|candidate| !candidate.bills_credits && candidate.score < RATE_LIMIT_EXHAUSTED)
+        .collect();
+    let class = if no_bill.is_empty() {
+        scored
+            .iter()
+            .filter(|candidate| candidate.bills_credits && candidate.score < RATE_LIMIT_EXHAUSTED)
+            .collect()
+    } else {
+        no_bill
+    };
+    let has_below_switch_threshold = class.iter().any(|candidate| !candidate.at_switch_threshold);
+    class
+        .into_iter()
+        .filter(|candidate| !has_below_switch_threshold || !candidate.at_switch_threshold)
         .min_by(|a, b| {
             let by_score = a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal);
             if reset_aware {
-                a.bills_credits
-                    .cmp(&b.bills_credits)
-                    .then(a.secondary_reset_ts.cmp(&b.secondary_reset_ts))
+                a.secondary_reset_ts
+                    .cmp(&b.secondary_reset_ts)
                     .then(by_score)
             } else {
-                a.bills_credits.cmp(&b.bills_credits).then(by_score)
+                by_score
             }
         })
         .map(|candidate| candidate.alias.as_str())
+}
+
+fn at_switch_threshold(usage: &api::RateLimitResponse) -> bool {
+    usage.rate_limit.as_ref().is_some_and(|rate_limit| {
+        rate_limit
+            .windows()
+            .any(|(_, window)| window.used_percent >= RATE_LIMIT_SWITCH_THRESHOLD)
+    })
 }
 
 fn selection_score(usage: &api::RateLimitResponse) -> f64 {
@@ -860,11 +884,28 @@ mod tests {
         score: f64,
         secondary_reset_ts: i64,
     ) -> SelectionCandidate {
+        selection_candidate_with_threshold(
+            alias,
+            bills_credits,
+            score,
+            secondary_reset_ts,
+            score >= RATE_LIMIT_SWITCH_THRESHOLD,
+        )
+    }
+
+    fn selection_candidate_with_threshold(
+        alias: &str,
+        bills_credits: bool,
+        score: f64,
+        secondary_reset_ts: i64,
+        at_switch_threshold: bool,
+    ) -> SelectionCandidate {
         SelectionCandidate {
             alias: alias.to_string(),
             bills_credits,
             score,
             secondary_reset_ts,
+            at_switch_threshold,
         }
     }
 
@@ -1054,6 +1095,33 @@ mod tests {
             ),
         ];
 
+        assert_eq!(select_most_available(&scored, true), Some("no-bill"));
+    }
+
+    #[test]
+    fn auto_selection_skips_accounts_at_switch_threshold_when_headroom_exists() {
+        let scored = vec![
+            selection_candidate_with_threshold("nearly-exhausted", false, 96.0, 1000, true),
+            selection_candidate("fresh", false, 0.0, 2000),
+        ];
+        assert_eq!(select_most_available(&scored, true), Some("fresh"));
+    }
+
+    #[test]
+    fn switch_threshold_uses_window_percent_not_weighted_score() {
+        let scored = vec![
+            selection_candidate_with_threshold("balanced", false, 96.0, 1000, false),
+            selection_candidate("fresh", false, 0.0, 2000),
+        ];
+        assert_eq!(select_most_available(&scored, true), Some("balanced"));
+    }
+
+    #[test]
+    fn no_bill_class_stays_ahead_of_billing_when_near_threshold() {
+        let scored = vec![
+            selection_candidate_with_threshold("no-bill", false, 96.0, 1000, true),
+            selection_candidate("billing", true, 10.0, 2000),
+        ];
         assert_eq!(select_most_available(&scored, true), Some("no-bill"));
     }
 
