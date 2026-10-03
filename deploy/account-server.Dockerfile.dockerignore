@@ -1,0 +1,9 @@
+# The public build receives source only. Local homes, Git metadata, and deployment secrets stay out.
+**
+!Cargo.toml
+!Cargo.lock
+!src
+!src/**
+!deploy
+!deploy/account-server.Dockerfile
+!deploy/account-server.Dockerfile.dockerignore

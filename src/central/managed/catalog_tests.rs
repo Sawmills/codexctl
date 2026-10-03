@@ -71,6 +71,8 @@ impl Fixture {
             axum::serve(listener, app).await.unwrap();
         });
         let broker = Broker {
+            providers: crate::central::providers::legacy(),
+            anthropic: None,
             state,
             key,
             binary: "unused".into(),

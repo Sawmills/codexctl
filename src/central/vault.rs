@@ -34,6 +34,8 @@ pub struct Device {
     pub user: String,
     pub token_hash: String,
     pub revoked: bool,
+    #[serde(default = "super::providers::legacy")]
+    pub providers: Vec<super::providers::Provider>,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -150,6 +152,28 @@ fn cipher(key: &Path) -> Result<Aes256Gcm> {
     let bytes = private_read(key)?;
     Aes256Gcm::new_from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("vault key must contain exactly 32 bytes"))
+}
+
+/// Provider records reuse authenticated encryption and the durable atomic writer.
+pub(super) fn seal<T: Serialize>(path: &Path, key: &Path, value: &T) -> Result<()> {
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let encrypted = cipher(key)?
+        .encrypt(&nonce, serde_json::to_vec(value)?.as_ref())
+        .map_err(|_| anyhow::anyhow!("vault encryption failed"))?;
+    let mut bytes = nonce.to_vec();
+    bytes.extend(encrypted);
+    store::atomic_write(path, &bytes)
+}
+
+pub(super) fn unseal<T: serde::de::DeserializeOwned>(path: &Path, key: &Path) -> Result<T> {
+    let bytes = private_read(path)?;
+    if bytes.len() < 28 {
+        bail!("vault is truncated");
+    }
+    let plaintext = cipher(key)?
+        .decrypt(bytes[..12].into(), &bytes[12..])
+        .map_err(|_| anyhow::anyhow!("vault authentication failed"))?;
+    serde_json::from_slice(&plaintext).map_err(|_| anyhow::anyhow!("invalid provider vault"))
 }
 
 pub fn save(state: &Path, key: &Path, vault: &Vault) -> Result<()> {

@@ -322,7 +322,10 @@ pub fn connect(server: &str, name: Option<&str>, no_browser: bool) -> Result<()>
             "{}/v1/enrollment/start",
             server.trim_end_matches('/')
         ))
-        .json(&Start { name })
+        .json(&Start {
+            name,
+            providers: super::providers::legacy(),
+        })
         .send()?,
     )?
     .json()?;

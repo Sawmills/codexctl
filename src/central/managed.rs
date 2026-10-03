@@ -88,6 +88,8 @@ pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
 }
 #[derive(Clone)]
 pub(super) struct Broker {
+    pub providers: Vec<super::providers::Provider>,
+    pub anthropic: Option<Arc<super::anthropic::Engine>>,
     pub state: PathBuf,
     pub key: PathBuf,
     pub(super) binary: PathBuf,
@@ -837,6 +839,15 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         .into_response())
 }
 async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if path.starts_with("/v1/")
+        && !matches!(path, "/v1/me" | "/v1/devices" | "/v1/devices/revoke")
+        && !path.starts_with("/v1/enrollment/")
+        && let Err(error) =
+            broker.authorize_provider(request.headers(), super::providers::Provider::Openai)
+    {
+        return error.into_response();
+    }
     let response = next.run(request).await;
     if (response.status().is_client_error() || response.status().is_server_error())
         && response.extensions().get::<FailureReason>().is_none()
@@ -994,6 +1005,32 @@ pub async fn serve(
     sso_config: Option<&Path>,
     metrics_token_file: Option<&Path>,
 ) -> Result<()> {
+    serve_providers(
+        state,
+        key,
+        address,
+        binary,
+        read_only,
+        public_url,
+        sso_config,
+        metrics_token_file,
+        super::providers::legacy(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)] // Same server configuration as the legacy entry point.
+pub async fn serve_providers(
+    state: &Path,
+    key: &Path,
+    address: SocketAddr,
+    binary: &Path,
+    read_only: bool,
+    public_url: &str,
+    sso_config: Option<&Path>,
+    metrics_token_file: Option<&Path>,
+    providers: Vec<super::providers::Provider>,
+) -> Result<()> {
     transport::origin(public_url)?;
     if !address.ip().is_loopback() && reqwest::Url::parse(public_url)?.scheme() != "https" {
         bail!("network listener requires an HTTPS ingress origin");
@@ -1015,102 +1052,106 @@ pub async fn serve(
     let mut replacements_blocked = false;
     let mut conflicting_journals = Vec::new();
     let mut repairing = std::collections::BTreeSet::new();
-    // Resolve all durable commits before inventorying quarantines from other accounts.
-    for entry in std::fs::read_dir(state.join("accounts"))? {
-        if relogin::recover(&entry?.path(), key).is_err() {
-            replacements_blocked = true;
-            ownership_unresolved = true;
-        }
-    }
-    for entry in std::fs::read_dir(state.join("accounts"))? {
-        let entry = entry?;
-        let inventory =
-            relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
-        let journal_conflicts = inventory.journal_conflicts();
-        let stopped = inventory.runtime == relogin::ProcessState::Stopped;
-        match inventory.candidates {
-            Ok(candidates) => conflicting_journals.extend(candidates.into_iter().map(|c| c.auth)),
-            Err(_) => {
+    if providers.contains(&super::providers::Provider::Openai) {
+        // Resolve all durable commits before inventorying quarantines from other accounts.
+        for entry in std::fs::read_dir(state.join("accounts"))? {
+            if relogin::recover(&entry?.path(), key).is_err() {
                 replacements_blocked = true;
                 ownership_unresolved = true;
             }
         }
-        let stored = inventory.saved;
-        let account_vault = match stored {
-            Ok(v)
-                if entry.file_type()?.is_dir()
-                    && entry.file_name() == account_key(&v.user, &v.alias).as_str() =>
-            {
-                v
+        for entry in std::fs::read_dir(state.join("accounts"))? {
+            let entry = entry?;
+            let inventory =
+                relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
+            let journal_conflicts = inventory.journal_conflicts();
+            let stopped = inventory.runtime == relogin::ProcessState::Stopped;
+            match inventory.candidates {
+                Ok(candidates) => {
+                    conflicting_journals.extend(candidates.into_iter().map(|c| c.auth))
+                }
+                Err(_) => {
+                    replacements_blocked = true;
+                    ownership_unresolved = true;
+                }
             }
-            _ => {
-                recovery_failures += 1;
+            let stored = inventory.saved;
+            let account_vault = match stored {
+                Ok(v)
+                    if entry.file_type()?.is_dir()
+                        && entry.file_name() == account_key(&v.user, &v.alias).as_str() =>
+                {
+                    v
+                }
+                _ => {
+                    recovery_failures += 1;
+                    ownership_unresolved = true;
+                    replacements_blocked |= !stopped;
+                    match inventory.journal {
+                        Ok(Some(auth)) => conflicting_journals.push(auth),
+                        Ok(None) => {}
+                        Err(_) => replacements_blocked = true,
+                    }
+                    continue;
+                }
+            };
+            let repair = relogin::recover(&entry.path(), key);
+            if repair.is_err() {
+                replacements_blocked = true;
                 ownership_unresolved = true;
+            }
+            let repair = repair.unwrap_or_default();
+            let pending = !account_vault.verified && !repair.verify;
+            let id = account_key(&account_vault.user, &account_vault.alias);
+            if repair.verify {
+                repairing.insert(id.clone());
+            }
+            let prepared =
+                if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false)) {
+                    Err(anyhow::anyhow!("candidate has not started"))
+                } else {
+                    prepare_owner(&entry.path(), key, read_only || pending)
+                };
+            let mut owner = match prepared {
+                Ok(o) => o,
+                Err(_) => {
+                    recovery_failures += 1;
+                    Owner {
+                        vault: account_vault,
+                        rpc: None,
+                        home: entry.path().join("runtime"),
+                        state: entry.path(),
+                        key: key.into(),
+                        available: false,
+                        routing_refused: false,
+                        refresh_enabled: false,
+                        limits: None,
+                        limits_observed: None,
+                        verification_input: None,
+                    }
+                }
+            };
+            if pending || repair.blocked || (read_only && repair.verify) {
+                owner.available = false;
+            }
+            // Use the same complete identity inventory as live import and renewal.
+            if journal_conflicts {
                 replacements_blocked |= !stopped;
                 match inventory.journal {
-                    Ok(Some(auth)) => conflicting_journals.push(auth),
-                    Ok(None) => {}
-                    Err(_) => replacements_blocked = true,
-                }
-                continue;
-            }
-        };
-        let repair = relogin::recover(&entry.path(), key);
-        if repair.is_err() {
-            replacements_blocked = true;
-            ownership_unresolved = true;
-        }
-        let repair = repair.unwrap_or_default();
-        let pending = !account_vault.verified && !repair.verify;
-        let id = account_key(&account_vault.user, &account_vault.alias);
-        if repair.verify {
-            repairing.insert(id.clone());
-        }
-        let prepared = if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false))
-        {
-            Err(anyhow::anyhow!("candidate has not started"))
-        } else {
-            prepare_owner(&entry.path(), key, read_only || pending)
-        };
-        let mut owner = match prepared {
-            Ok(o) => o,
-            Err(_) => {
-                recovery_failures += 1;
-                Owner {
-                    vault: account_vault,
-                    rpc: None,
-                    home: entry.path().join("runtime"),
-                    state: entry.path(),
-                    key: key.into(),
-                    available: false,
-                    routing_refused: false,
-                    refresh_enabled: false,
-                    limits: None,
-                    limits_observed: None,
-                    verification_input: None,
+                    Ok(Some(auth)) if stopped => {
+                        conflicting_journals.push(owner.vault.auth.clone());
+                        conflicting_journals.push(auth);
+                    }
+                    _ => ownership_unresolved = true,
                 }
             }
-        };
-        if pending || repair.blocked || (read_only && repair.verify) {
-            owner.available = false;
+            let identity = AccountIndex {
+                user: owner.vault.user.clone(),
+                alias: owner.vault.alias.trim().into(),
+            };
+            let owner = Arc::new(Mutex::new(owner));
+            owners.insert(id, (identity, owner));
         }
-        // Use the same complete identity inventory as live import and renewal.
-        if journal_conflicts {
-            replacements_blocked |= !stopped;
-            match inventory.journal {
-                Ok(Some(auth)) if stopped => {
-                    conflicting_journals.push(owner.vault.auth.clone());
-                    conflicting_journals.push(auth);
-                }
-                _ => ownership_unresolved = true,
-            }
-        }
-        let identity = AccountIndex {
-            user: owner.vault.user.clone(),
-            alias: owner.vault.alias.trim().into(),
-        };
-        let owner = Arc::new(Mutex::new(owner));
-        owners.insert(id, (identity, owner));
     }
     // Inventory every retained runtime before starting replacements. An unresolved
     // process could hold any seat, so do not launch against incomplete evidence.
@@ -1128,7 +1169,8 @@ pub async fn serve(
             owner.available = false;
             continue;
         }
-        if owner.available
+        if providers.contains(&super::providers::Provider::Openai)
+            && owner.available
             && owner.refresh_enabled
             && !repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
             && async {
@@ -1142,7 +1184,8 @@ pub async fn serve(
             owner.available = false;
             recovery_failures += 1;
         }
-        if owner.available
+        if providers.contains(&super::providers::Provider::Openai)
+            && owner.available
             && owner.refresh_enabled
             && relogin::needs_verification(&owner.state)?
             && relogin::verify_replacement(&mut owner, binary, &startup_import)
@@ -1155,6 +1198,16 @@ pub async fn serve(
     }
     drop(startup_import);
     let broker = Broker {
+        anthropic: if providers.contains(&super::providers::Provider::Anthropic) {
+            Some(Arc::new(super::anthropic::Engine::open(
+                &state.join("providers/anthropic"),
+                key,
+                read_only,
+            )?))
+        } else {
+            None
+        },
+        providers,
         state: state.into(),
         key: key.into(),
         binary: binary.into(),
@@ -1210,6 +1263,7 @@ pub async fn serve(
         );
     }
     let app = Router::new()
+        .merge(super::anthropic_http::routes())
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
         .merge(super::resets::routes())
@@ -1319,6 +1373,8 @@ mod tests {
         store::atomic_write(&binary,format!("#!/bin/sh\nexport CENTRAL_TEST_MODE_FILE={}\nexport CENTRAL_TEST_REFRESH_COUNTER={}\nexec {} \"$@\"\n",quoted(&mode),quoted(&counter),quoted(&fixture)).as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let broker = Broker {
+            providers: super::super::providers::legacy(),
+            anthropic: None,
             state,
             key,
             binary,

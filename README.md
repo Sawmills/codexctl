@@ -520,3 +520,8 @@ Connect your machines with company SSO and keep OpenAI refresh credentials on a 
 Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and `codexctl codex`.
 Resume a session from before migration with `codexctl codex resume <session-id>`.
 See [server setup, migration, and staging deployment](docs/central-server.md).
+
+## Standalone account server (implementation preview)
+
+The neutral `account-server` binary supports Claude-only installations without
+Codex or an OpenAI account. See [deployment, scopes, and recovery](docs/account-server.md).
