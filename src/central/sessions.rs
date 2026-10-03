@@ -428,11 +428,29 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
         .output()
         .context("cannot run lsof; no session was rewritten")?;
     let no_matches = output.status.code() == Some(1) && output.stdout.is_empty();
-    if !output.stderr.is_empty() || !(output.status.success() || no_matches) {
+    if !lsof_stderr_is_ignorable(&output.stderr) || !(output.status.success() || no_matches) {
         bail!("OS open-file check failed; no further session will be rewritten");
     }
     Ok(output)
 }
+
+fn lsof_stderr_is_ignorable(stderr: &[u8]) -> bool {
+    let mut saw_warning = false;
+    for line in String::from_utf8_lossy(stderr).lines() {
+        if line.starts_with("lsof: WARNING: can't stat() ")
+            && (line.contains(" overlay file system ") || line.contains(" nsfs file system "))
+        {
+            saw_warning = true;
+            continue;
+        }
+        if saw_warning && line.trim() == "Output information may be incomplete." {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
 fn is_open(path: &Path) -> Result<bool> {
     let output = lsof(&["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()])?;
     match (output.status.code(), output.stdout.is_empty()) {

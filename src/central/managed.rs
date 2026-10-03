@@ -1013,6 +1013,7 @@ pub async fn serve(
         bail!("network listener requires an HTTPS ingress origin");
     }
     let _lock = vault::lock(state, "owner.lock")?;
+    super::storage::maybe_migrate(state, key).await?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;

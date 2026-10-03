@@ -13,6 +13,7 @@ pub(crate) mod resets;
 mod rpc;
 mod server;
 mod sessions;
+pub mod storage;
 mod transport;
 mod vault;
 

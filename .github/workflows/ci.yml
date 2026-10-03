@@ -17,6 +17,22 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: codexctl
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d codexctl"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://postgres@localhost:5432/codexctl?sslmode=disable
+      CODEXCTL_CENTRAL_DB_TLS: "0"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -33,7 +49,7 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --features central-real-db-tests
 
       - name: Central prototype
         run: |
