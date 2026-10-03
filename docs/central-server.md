@@ -178,6 +178,11 @@ After the provider rewrite and session repair, this restarts the daemon and resu
 the running and usage-limited sessions with the same continuation prompt and permissions as local switching:
 no sandbox and no approval prompts (`approvalPolicy=never`, `sandbox=danger-full-access`).
 Completed sessions receive no new turn. Failed resumes are reported by session ID.
+Server-account resumes explicitly select `codexctl-central`, including when an open
+or recent rollout still records `openai`. The daemon must confirm that provider
+before codexctl starts a continuation; otherwise that session is reported as not resumed.
+If activation fails before the restart, the error warns that the daemon still runs
+the old account. Resolve the activation error, then rerun the switch with `--restart-daemon`.
 Without `--restart-daemon`, server-account selection still refuses a running daemon;
 finish its sessions and stop it manually before switching.
 The flag does not start a daemon when none is running and does not approve credit billing.

@@ -26,6 +26,7 @@ impl Daemon {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = stop.clone();
         let restarted = home.join("restart-config.toml");
+        let sessions = home.join("sessions");
         let worker = std::thread::spawn(move || {
             let mut seen = Vec::new();
             while !stopping.load(Ordering::Relaxed) {
@@ -37,6 +38,8 @@ impl Daemon {
                     }
                     Err(e) => panic!("daemon accept failed: {e}"),
                 };
+                // macOS inherits the listener's nonblocking mode on accept.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -76,7 +79,19 @@ impl Daemon {
                             json!({"data":[{"id":"old","status":"failed","error":{"codexErrorInfo":"usageLimitExceeded"}}]})
                         }
                         "thread/resume" => {
-                            json!({"thread":{"id":thread},"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}})
+                            let saved: Value =
+                                serde_json::from_slice(
+                                    &std::fs::read(sessions.join(format!(
+                                        "rollout-{}.jsonl",
+                                        thread.as_str().unwrap()
+                                    )))
+                                    .unwrap(),
+                                )
+                                .unwrap();
+                            let provider = request["params"]
+                                .get("modelProvider")
+                                .unwrap_or(&saved["payload"]["model_provider"]);
+                            json!({"thread":{"id":thread},"modelProvider":provider,"approvalPolicy":"never","sandbox":{"type":"dangerFullAccess"}})
                         }
                         "thread/settings/update" => json!({}),
                         "turn/start" => json!({"turn":{"id":"new","status":"inProgress"}}),

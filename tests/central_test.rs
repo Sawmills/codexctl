@@ -1479,7 +1479,10 @@ fn server_restart_command(client: &NativeClient) -> Command {
         .args(["use", "remote", "--restart-daemon"])
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env("HOME", &client.home)
-        .env("PATH", &bin)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS");
     command
@@ -1578,6 +1581,20 @@ fn server_restart_sessions(fail_resume: bool, fail_restart: bool) {
     let local_auth = serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"account_id":"unrelated-local-seat"}})).unwrap();
     store::atomic_write(&home.join("auth.json"), &local_auth).unwrap();
     let mut command = server_restart_command(&client);
+    let sessions = home.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let metadata = b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n";
+    for thread in ["running", "limited", "done"] {
+        std::fs::write(sessions.join(format!("rollout-{thread}.jsonl")), metadata).unwrap();
+    }
+    // The running rollout is old but open; the usage-limited rollout is recent.
+    // Both must retain their saved provider when activation repairs other files.
+    let held = std::fs::File::open(sessions.join("rollout-running.jsonl")).unwrap();
+    held.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+    )
+    .unwrap();
     let daemon = daemon_fixture::Daemon::start(&home, fail_resume);
     if fail_restart {
         std::fs::write(
@@ -1589,6 +1606,15 @@ fn server_restart_sessions(fail_resume: bool, fail_restart: bool) {
 
     let output = command.output().unwrap();
     let seen = daemon.finish();
+    assert_eq!(
+        std::fs::read(sessions.join("rollout-running.jsonl")).unwrap(),
+        metadata
+    );
+    assert_eq!(
+        std::fs::read(sessions.join("rollout-limited.jsonl")).unwrap(),
+        metadata
+    );
+    drop(held);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         output.status.success(),
@@ -1615,6 +1641,9 @@ fn server_restart_sessions(fail_resume: bool, fail_restart: bool) {
         return;
     }
     assert!(home.join("restart-config.toml").exists());
+    for request in seen.iter().filter(|r| r["method"] == "thread/resume") {
+        assert_eq!(request["params"]["modelProvider"], "codexctl-central");
+    }
     let resumed: Vec<_> = turns
         .iter()
         .map(|request| request["params"]["threadId"].as_str().unwrap())
@@ -1907,6 +1936,43 @@ fn repair_failure_reports_that_the_server_account_is_already_active() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(std::fs::read(rollout).unwrap(), b"not JSON\n");
+}
+
+#[test]
+fn server_restart_activation_failure_warns_daemon_still_runs_old_account() {
+    let client = NativeClient::start();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-malformed.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(&rollout, b"not JSON\n").unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
+
+    let output = server_restart_command(&client).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("account remote is active; session repair failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon still runs the old account"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--restart-daemon"), "{stderr}");
+    assert!(!client.home.join(".codex/restart-config.toml").exists());
+    let config: toml_edit::DocumentMut =
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("codexctl-central"));
 }
 
 #[test]

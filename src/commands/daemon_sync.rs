@@ -122,7 +122,7 @@ pub fn after_switch(
             approved
         }
     };
-    daemon::restart_and_resume(&codex_home, &sessions, prompt, &mut std::io::stderr())
+    daemon::restart_and_resume(&codex_home, &sessions, prompt, None, &mut std::io::stderr())
 }
 
 /// Apply an explicitly requested server-provider switch to the daemon.
@@ -136,6 +136,7 @@ pub fn after_server_switch(codex_home: &Path, prompt: &str) -> Result<Vec<String
         codex_home,
         &inspection.sessions,
         prompt,
+        Some("codexctl-central"),
         &mut std::io::stderr(),
     )
     .map_err(|error| error.context("server account is active; daemon restart failed"))
