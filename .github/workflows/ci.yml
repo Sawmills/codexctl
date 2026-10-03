@@ -49,7 +49,7 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --all-targets --features central-real-db-tests
 
       - name: Central prototype
         run: |

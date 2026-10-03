@@ -27,6 +27,7 @@ central-prototype = [
   "tokio/time",
   "tokio/signal",
 ]
+central-real-db-tests = ["central-prototype"]
 
 [[bin]]
 name = "codexctl-central"

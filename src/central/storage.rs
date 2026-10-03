@@ -783,6 +783,7 @@ mod tests {
         assert_eq!(store.consume_enrollment("challenge").await.unwrap(), None);
     }
 
+    #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
     async fn postgres_real_store_scenarios() {
         use std::sync::atomic::{AtomicUsize, Ordering};
