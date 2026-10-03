@@ -564,13 +564,13 @@ impl CentralStore {
     pub async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
         match self {
             Self::File(file) => file.renew(lease, ttl),
-            Self::Postgres(db) => db.renew(lease, ttl).await,
+            Self::Postgres(db) => bounded_db(db.renew(lease, ttl)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                let renewed = postgres.renew(lease, ttl).await?;
+                let renewed = bounded_db(postgres.renew(lease, ttl)).await?;
                 if renewed {
                     match file.renew(lease, ttl) {
                         Ok(true) => {}

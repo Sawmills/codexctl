@@ -458,11 +458,33 @@ async fn token(
         } else {
             None
         };
+        let renew_lost = Arc::new(AtomicBool::new(false));
+        let renew_task = match (worker.central.clone(), lease.clone()) {
+            (Some(central), Some(lease)) => {
+                let lost = renew_lost.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        match central
+                            .renew(&lease, std::time::Duration::from_secs(120))
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                lost.store(true, Ordering::Release);
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!("central lease renewal: {error:#}");
+                            }
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
         let result = async {
-            let token = owner
-                .tokens(request)
-                .await
-                .map_err(|e| worker.owner_failure(e))?;
+            let token_result = owner.tokens(request).await;
             let record = CredentialRecord {
                 account_id: account_id.clone(),
                 user_id: Some(owner.vault.user.clone()),
@@ -495,12 +517,16 @@ async fn token(
             } else {
                 true
             };
-            if !written {
+            if !written || renew_lost.load(Ordering::Acquire) {
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
             }
+            let token = token_result.map_err(|error| worker.owner_failure(error))?;
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
         }
         .await;
+        if let Some(task) = renew_task {
+            task.abort();
+        }
         if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
             && let Err(error) = central.release_lease(lease).await
         {
