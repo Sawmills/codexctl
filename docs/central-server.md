@@ -173,7 +173,19 @@ Run `codexctl use` after upgrading the client, then start new sessions so they l
 No remote command redeems a banked reset implicitly.
 Switching between server accounts updates the provider for new sessions.
 Existing sessions keep their startup account until restarted.
-Stop the daemon before switching accounts; its sessions need a restart to load the new provider.
+If the daemon is running, use `codexctl use <alias> --restart-daemon` to apply the switch.
+After the provider rewrite and session repair, this restarts the daemon and resumes
+the running and usage-limited sessions with the same continuation prompt and permissions as local switching:
+no sandbox and no approval prompts (`approvalPolicy=never`, `sandbox=danger-full-access`).
+Completed sessions receive no new turn. Failed resumes are reported by session ID.
+Server-account resumes explicitly select `codexctl-central`, including when an open
+or recent rollout still records `openai`. The daemon must confirm that provider
+before codexctl starts a continuation; otherwise that session is reported as not resumed.
+If activation fails before the restart, the error warns that the daemon still runs
+the old account. Resolve the activation error, then rerun the switch with `--restart-daemon`.
+Without `--restart-daemon`, server-account selection still refuses a running daemon;
+finish its sessions and stop it manually before switching.
+The flag does not start a daemon when none is running and does not approve credit billing.
 Pending local logins and local recovery wrappers also block remote activation.
 Parallel local commands remain supported.
 An explicit saved local alias can restore local mode before migration, even when the server is unavailable.

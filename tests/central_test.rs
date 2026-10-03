@@ -1,5 +1,8 @@
 #![cfg(feature = "central-prototype")]
 
+#[path = "fixtures/daemon.rs"]
+mod daemon_fixture;
+
 use std::os::unix::process::CommandExt;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1453,6 +1456,233 @@ fn when_a_daemon_is_running_then_remote_activation_refuses_without_changes() {
     );
 }
 
+fn server_restart_command(client: &NativeClient) -> Command {
+    use std::os::unix::fs::PermissionsExt;
+    let home = client.home.join(".codex");
+    std::fs::create_dir_all(home.join("app-server-daemon")).unwrap();
+    std::fs::write(
+        home.join("app-server-daemon/daemon.pid"),
+        serde_json::to_vec(&json!({"pid": std::process::id()})).unwrap(),
+    )
+    .unwrap();
+    let bin = client.home.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(
+        bin.join("codex"),
+        "#!/bin/sh\n[ \"$*\" = 'app-server daemon restart' ] || exit 2\n/bin/cat \"$CODEX_HOME/config.toml\" > \"$CODEX_HOME/restart-config.toml\"\necho '{\"status\":\"restarted\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+    command
+        .args(["use", "remote", "--restart-daemon"])
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("HOME", &client.home)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS");
+    command
+}
+
+#[test]
+fn server_switch_with_restart_daemon_restarts_after_provider_rewrite() {
+    let client = NativeClient::start();
+    client.connect();
+    let home = client.home.join(".codex");
+    let output = server_restart_command(&client).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config: toml_edit::DocumentMut = std::fs::read_to_string(home.join("restart-config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("codexctl-central"));
+    assert_eq!(
+        std::fs::read(home.join("auth.json")).unwrap(),
+        NativeClient::local_auth_bytes()
+    );
+}
+
+#[test]
+fn server_restart_flag_does_not_start_an_absent_daemon() {
+    let client = NativeClient::start();
+    client.connect();
+    let mut command = server_restart_command(&client);
+    std::fs::remove_file(client.home.join(".codex/app-server-daemon/daemon.pid")).unwrap();
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!client.home.join(".codex/restart-config.toml").exists());
+}
+
+#[test]
+fn server_restart_flag_does_not_approve_billing_or_restart_a_rejected_switch() {
+    let client = NativeClient::with_plan(Some("usage_based"));
+    client.connect();
+    let before = std::fs::read(client.home.join(".codex/config.toml")).unwrap();
+    let output = server_restart_command(&client).output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--allow-billing"));
+    assert_eq!(
+        std::fs::read(client.home.join(".codex/config.toml")).unwrap(),
+        before
+    );
+    assert!(!client.home.join(".codex/restart-config.toml").exists());
+}
+
+#[test]
+fn server_restart_resumes_running_and_limited_sessions_with_local_flags() {
+    server_restart_sessions(false, false);
+}
+
+#[test]
+fn server_restart_reports_failed_sessions_and_resumes_the_others() {
+    server_restart_sessions(true, false);
+}
+
+#[test]
+fn server_restart_failure_reports_the_provider_is_already_active() {
+    server_restart_sessions(false, true);
+}
+
+fn server_restart_sessions(fail_resume: bool, fail_restart: bool) {
+    // Keep the Unix socket path below macOS's length limit.
+    let short = tempfile::Builder::new()
+        .prefix("b12")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let mut client = NativeClient::start();
+    let relocated = short.path().join("client");
+    std::fs::rename(&client.home, &relocated).unwrap();
+    client.home = relocated;
+    client.connect();
+    let home = client.home.join(".codex");
+    // The old daemon matches the preserved local auth file. That must not
+    // suppress a restart onto the selected server provider.
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({
+            "sub":"unrelated-local-login", "exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":"unrelated-local-seat"},
+            "https://api.openai.com/profile":{"email":"local@test"}
+        }))
+        .unwrap(),
+    );
+    let local_auth = serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"account_id":"unrelated-local-seat"}})).unwrap();
+    store::atomic_write(&home.join("auth.json"), &local_auth).unwrap();
+    let mut command = server_restart_command(&client);
+    let sessions = home.join("sessions");
+    std::fs::create_dir(&sessions).unwrap();
+    let metadata = b"{\"type\":\"session_meta\",\"payload\":{\"model_provider\":\"openai\"}}\n";
+    for thread in ["running", "limited", "done"] {
+        std::fs::write(sessions.join(format!("rollout-{thread}.jsonl")), metadata).unwrap();
+    }
+    // The running rollout is old but open; the usage-limited rollout is recent.
+    // Both must retain their saved provider when activation repairs other files.
+    let held = std::fs::File::open(sessions.join("rollout-running.jsonl")).unwrap();
+    held.set_times(
+        std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+    )
+    .unwrap();
+    let daemon = daemon_fixture::Daemon::start(&home, fail_resume);
+    if fail_restart {
+        std::fs::write(
+            client.home.join("bin/codex"),
+            "#!/bin/sh\necho 'synthetic restart failure' >&2\nexit 1\n",
+        )
+        .unwrap();
+    }
+
+    let output = command.output().unwrap();
+    let seen = daemon.finish();
+    assert_eq!(
+        std::fs::read(sessions.join("rollout-running.jsonl")).unwrap(),
+        metadata
+    );
+    assert_eq!(
+        std::fs::read(sessions.join("rollout-limited.jsonl")).unwrap(),
+        metadata
+    );
+    drop(held);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.success(),
+        !fail_resume && !fail_restart,
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(home.join("auth.json")).unwrap(), local_auth);
+    let config: toml_edit::DocumentMut = std::fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("codexctl-central"));
+    let turns: Vec<_> = seen
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect();
+    if fail_restart {
+        assert!(
+            stderr.contains("server account is active; daemon restart failed"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("synthetic restart failure"), "{stderr}");
+        assert!(turns.is_empty());
+        return;
+    }
+    assert!(home.join("restart-config.toml").exists());
+    for request in seen.iter().filter(|r| r["method"] == "thread/resume") {
+        assert_eq!(request["params"]["modelProvider"], "codexctl-central");
+    }
+    let resumed: Vec<_> = turns
+        .iter()
+        .map(|request| request["params"]["threadId"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        resumed,
+        if fail_resume {
+            vec!["limited"]
+        } else {
+            vec!["running", "limited"]
+        }
+    );
+    for request in turns {
+        assert_eq!(request["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            request["params"]["sandboxPolicy"]["type"],
+            "dangerFullAccess"
+        );
+        assert_eq!(
+            request["params"]["input"][0]["text"],
+            "Continue the previous request."
+        );
+    }
+    for request in seen
+        .iter()
+        .filter(|r| r["method"] == "thread/resume" && r["params"]["approvalPolicy"].is_string())
+    {
+        assert_eq!(request["params"]["approvalPolicy"], "never");
+        assert_eq!(request["params"]["sandbox"], "danger-full-access");
+    }
+    if fail_resume {
+        assert!(stderr.contains("1 session did not resume"), "{stderr}");
+        assert!(
+            stderr.contains("codex resume <id>` for: running"),
+            "{stderr}"
+        );
+    }
+}
+
 #[test]
 fn when_a_new_configuration_write_fails_then_its_marker_and_billing_approval_are_not_installed() {
     use std::os::unix::fs::PermissionsExt;
@@ -1706,6 +1936,43 @@ fn repair_failure_reports_that_the_server_account_is_already_active() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(std::fs::read(rollout).unwrap(), b"not JSON\n");
+}
+
+#[test]
+fn server_restart_activation_failure_warns_daemon_still_runs_old_account() {
+    let client = NativeClient::start();
+    client.connect();
+    let rollout = client.home.join(".codex/sessions/rollout-malformed.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(&rollout, b"not JSON\n").unwrap();
+    std::fs::File::open(&rollout)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)),
+        )
+        .unwrap();
+
+    let output = server_restart_command(&client).output().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("account remote is active; session repair failed"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("daemon still runs the old account"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--restart-daemon"), "{stderr}");
+    assert!(!client.home.join(".codex/restart-config.toml").exists());
+    let config: toml_edit::DocumentMut =
+        std::fs::read_to_string(client.home.join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("codexctl-central"));
 }
 
 #[test]

@@ -24,7 +24,23 @@ pub fn run(
     restart_daemon: bool,
 ) -> Result<()> {
     #[cfg(feature = "central-prototype")]
-    if codexctl::central::native::activate(alias, _allow_billing)? {
+    if codexctl::central::native::activate(alias, _allow_billing, restart_daemon).map_err(|error| {
+        if restart_daemon
+            && config::default_paths()
+                .is_ok_and(|paths| crate::daemon::running_pid(&paths.codex_home()).is_some())
+        {
+            error.context("daemon still runs the old account; no restart was attempted; resolve the activation error and rerun codexctl use with --restart-daemon")
+        } else {
+            error
+        }
+    })? {
+        if restart_daemon {
+            let unresumed = daemon_sync::after_server_switch(
+                &config::default_paths()?.codex_home(),
+                codex::DEFAULT_RECOVERY_PROMPT,
+            )?;
+            daemon_sync::require_resumed(unresumed)?;
+        }
         return Ok(());
     }
     run_to_auth_json(
