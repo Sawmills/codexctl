@@ -100,11 +100,11 @@ clarification and all items in `/home/amir/b16-design-review-1.md` and `/home/am
    keep their own pills; hero pills hug the text.
 3. PASS — account and plan chips share a row at every checked width.
 4. PASS — footer uses `CARGO_PKG_VERSION`; HTTP test checks the rendered footer on both
-   routes against the build version. This branch remains v0.1.34; release metadata was not changed.
+   routes against the build version. After rebasing on main, the build and footer are v0.1.35; release metadata was not edited.
 
-Only the four requested images were recaptured for round 2: `landing-light.png`,
-`landing-light-phone.png`, `accounts-error-stale.png`, and
-`accounts-dark-phone-first-screen.png`. Other images retain the round 1 capture.
+HQ passed design review after the four requested round-2 captures. All 12 images
+were then recaptured from the v0.1.35 build after rebasing on main, so the PR images
+show the final layout and current build footer.
 
 ## Execution evidence
 
