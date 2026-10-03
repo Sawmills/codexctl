@@ -6035,6 +6035,11 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
     .unwrap();
 
     assert_eq!(selected, "headroom");
+
+    assert_eq!(
+        central::remote::select(&[account("mixed-windows", 97.0, 100, 3.0)]).unwrap(),
+        "mixed-windows"
+    );
 }
 
 #[test]

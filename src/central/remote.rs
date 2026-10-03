@@ -17,6 +17,13 @@ use std::{
 
 const RATE_LIMIT_SWITCH_THRESHOLD: f64 = 95.0;
 
+fn at_switch_threshold(account: &Account) -> bool {
+    [account.primary_used, account.secondary_used]
+        .into_iter()
+        .flatten()
+        .any(|used| used.is_finite() && used >= RATE_LIMIT_SWITCH_THRESHOLD)
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
@@ -1148,21 +1155,10 @@ pub fn select(accounts: &[Account]) -> Result<String> {
     // Rate-limited accounts are the no-bill class. Keep it ahead of accounts
     // that need credit billing, and avoid moving to a nearly exhausted seat
     // while another rate-limited seat still has headroom.
-    let has_below_switch_threshold = eligible.iter().any(|a| {
-        [a.primary_used, a.secondary_used]
-            .into_iter()
-            .flatten()
-            .any(|used| used.is_finite() && used < RATE_LIMIT_SWITCH_THRESHOLD)
-    });
+    let has_below_switch_threshold = eligible.iter().any(|a| !at_switch_threshold(a));
     eligible
         .into_iter()
-        .filter(|a| {
-            !has_below_switch_threshold
-                || [a.primary_used, a.secondary_used]
-                    .into_iter()
-                    .flatten()
-                    .all(|used| !used.is_finite() || used < RATE_LIMIT_SWITCH_THRESHOLD)
-        })
+        .filter(|a| !has_below_switch_threshold || !at_switch_threshold(a))
         .min_by(|a,b|{
         let by_score=score(a).total_cmp(&score(b));
         let exhausted_a=score(a)>=500.0;let exhausted_b=score(b)>=500.0;
