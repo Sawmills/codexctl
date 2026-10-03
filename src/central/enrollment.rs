@@ -8,7 +8,7 @@ use anyhow::{Result, bail};
 use axum::{
     Form, Json, Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -52,8 +52,12 @@ struct Pending {
     last_poll: Option<Instant>,
     grant: Option<String>,
 }
+enum Destination {
+    Enrollment(String),
+    Accounts(String),
+}
 struct Login {
-    device_hash: String,
+    destination: Destination,
     nonce: Nonce,
     verifier: PkceCodeVerifier,
     created: Instant,
@@ -64,11 +68,17 @@ struct Approval {
     email: String,
     created: Instant,
 }
+struct Session {
+    user: String,
+    created: Instant,
+}
+const SESSION_TTL: Duration = Duration::from_secs(3600);
 #[derive(Default)]
 struct Flows {
     devices: BTreeMap<String, Pending>,
     logins: BTreeMap<String, Login>,
     approvals: BTreeMap<String, Approval>,
+    sessions: BTreeMap<String, Session>,
 }
 pub(super) struct Sso {
     config: Configuration,
@@ -134,6 +144,9 @@ impl Sso {
         Ok(metadata)
     }
     fn cleanup(flows: &mut Flows) {
+        flows
+            .sessions
+            .retain(|_, s| s.created.elapsed() < SESSION_TTL);
         flows.devices.retain(|_, d| d.created.elapsed() < TTL);
         flows.logins.retain(|_, d| d.created.elapsed() < TTL);
         flows.approvals.retain(|_, d| d.created.elapsed() < TTL);
@@ -165,7 +178,7 @@ fn page(html: String) -> Response {
     )
         .into_response()
 }
-fn escape(s: &str) -> String {
+pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -284,6 +297,10 @@ async fn verify(
             .map(|(k, _)| k.clone())
             .ok_or_else(|| broker.error(StatusCode::GONE, "enrollment_expired"))?
     };
+    begin_login(&broker, Destination::Enrollment(device_hash)).await
+}
+async fn begin_login(broker: &Broker, destination: Destination) -> Result<Response, HttpError> {
+    let sso = sso(broker)?;
     let metadata = sso
         .metadata()
         .await
@@ -315,7 +332,7 @@ async fn verify(
     flows.logins.insert(
         vault::digest(state.secret().as_bytes()),
         Login {
-            device_hash,
+            destination,
             nonce,
             verifier,
             created: Instant::now(),
@@ -338,6 +355,7 @@ struct Callback {
 async fn callback(
     State(broker): State<Broker>,
     Query(input): Query<Callback>,
+    headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let sso = sso(&broker)?;
     let login = {
@@ -348,6 +366,14 @@ async fn callback(
             .remove(&vault::digest(input.state.as_bytes()))
             .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?
     };
+    if let Destination::Accounts(expected) = &login.destination
+        && cookie(&headers, sso.cookie_name("login"))
+            .map(|v| vault::digest(v.as_bytes()))
+            .as_ref()
+            != Some(expected)
+    {
+        return Err(broker.error(StatusCode::UNAUTHORIZED, "invalid_browser_login"));
+    }
     let code = input
         .code
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
@@ -414,11 +440,58 @@ async fn callback(
     {
         return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
     }
+    let device_hash = match login.destination {
+        Destination::Enrollment(hash) => hash,
+        Destination::Accounts(_) => {
+            match managed::record_user(&broker.state, &user, email).map_err(|_| {
+                broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+            })? {
+                managed::UserEnrollment::Recorded => {}
+                managed::UserEnrollment::Disabled => {
+                    return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
+                }
+            }
+            let token = secret();
+            let mut flows = sso.flows.lock().expect("enrollment lock");
+            Sso::cleanup(&mut flows);
+            if flows.sessions.len() >= 1024 {
+                return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "session_capacity"));
+            }
+            flows.sessions.insert(
+                vault::digest(token.as_bytes()),
+                Session {
+                    user,
+                    created: Instant::now(),
+                },
+            );
+            let mut response = (
+                [
+                    ("cache-control", "no-store"),
+                    ("referrer-policy", "no-referrer"),
+                ],
+                Redirect::to("/accounts"),
+            )
+                .into_response();
+            response.headers_mut().append(
+                "set-cookie",
+                sso.cookie("session", &token, SESSION_TTL.as_secs())
+                    .parse()
+                    .expect("generated cookie"),
+            );
+            response.headers_mut().append(
+                "set-cookie",
+                sso.cookie("login", "", 0)
+                    .parse()
+                    .expect("generated cookie"),
+            );
+            return Ok(response);
+        }
+    };
     let mut flows = sso.flows.lock().expect("enrollment lock");
     Sso::cleanup(&mut flows);
     let device = flows
         .devices
-        .get(&login.device_hash)
+        .get(&device_hash)
         .ok_or_else(|| broker.error(StatusCode::GONE, "enrollment_expired"))?;
     let name = escape(&device.name);
     let code = escape(&device.user_code);
@@ -436,7 +509,7 @@ async fn callback(
     flows.approvals.insert(
         vault::digest(approval.as_bytes()),
         Approval {
-            device_hash: login.device_hash,
+            device_hash,
             user,
             email: email.into(),
             created: Instant::now(),
@@ -496,4 +569,142 @@ pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
         .route("/enroll", get(verify))
         .route("/auth/callback", get(callback))
         .route("/auth/approve", post(approve))
+}
+
+impl Sso {
+    fn cookie_name(&self, kind: &str) -> &'static str {
+        match (self.public_url.starts_with("https:"), kind) {
+            (true, "login") => "__Host-codexctl-login",
+            (true, _) => "__Host-codexctl-session",
+            (false, "login") => "codexctl-login",
+            (false, _) => "codexctl-session",
+        }
+    }
+    fn cookie(&self, kind: &str, value: &str, age: u64) -> String {
+        let secure = if self.public_url.starts_with("https:") {
+            "; Secure"
+        } else {
+            ""
+        };
+        format!(
+            "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={age}{secure}",
+            self.cookie_name(kind)
+        )
+    }
+}
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .find_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            (key == name).then_some(value)
+        })
+}
+pub(super) fn browser_user(
+    broker: &Broker,
+    headers: &HeaderMap,
+) -> Result<Option<managed::User>, HttpError> {
+    let Some(sso) = broker.sso.as_deref() else {
+        return Ok(None);
+    };
+    let Some(token) = cookie(headers, sso.cookie_name("session")) else {
+        return Ok(None);
+    };
+    let user = {
+        let mut flows = sso.flows.lock().expect("enrollment lock");
+        Sso::cleanup(&mut flows);
+        flows
+            .sessions
+            .get(&vault::digest(token.as_bytes()))
+            .map(|s| s.user.clone())
+    };
+    let Some(user) = user else {
+        return Ok(None);
+    };
+    let identity = managed::users(&broker.state)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+        .into_iter()
+        .find(|u| u.id == user && u.enabled)
+        .ok_or_else(|| broker.error(StatusCode::FORBIDDEN, "user_disabled"))?;
+    Ok(Some(identity))
+}
+
+pub(super) async fn accounts_sign_out(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let sso = sso(&broker)?;
+    // A link-styled form submits same-origin POST; cross-site forms cannot end a session.
+    if headers.get("origin").and_then(|h| h.to_str().ok()) != Some(sso.public_url.as_str()) {
+        return Err(broker.error(StatusCode::FORBIDDEN, "invalid_browser_origin"));
+    }
+    if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
+        sso.flows
+            .lock()
+            .expect("enrollment lock")
+            .sessions
+            .remove(&vault::digest(token.as_bytes()));
+    }
+    let mut response = (
+        [
+            ("cache-control", "no-store"),
+            ("referrer-policy", "no-referrer"),
+        ],
+        Redirect::to("/"),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "set-cookie",
+        sso.cookie("session", "", 0)
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
+}
+
+pub(super) async fn accounts_sign_in(State(broker): State<Broker>) -> Result<Response, HttpError> {
+    let sso = sso(&broker)?;
+    let binding = secret();
+    let mut response = begin_login(
+        &broker,
+        Destination::Accounts(vault::digest(binding.as_bytes())),
+    )
+    .await?;
+    response.headers_mut().insert(
+        "set-cookie",
+        sso.cookie("login", &binding, TTL.as_secs())
+            .parse()
+            .expect("generated cookie"),
+    );
+    Ok(response)
+}
+
+#[cfg(test)]
+impl Sso {
+    pub(super) fn testing_session(user: &str) -> Self {
+        Self {
+            config: Configuration {
+                issuer: "http://127.0.0.1".into(),
+                client_id: "test".into(),
+                client_secret_file: "/unused".into(),
+                allowed_domains: vec!["example.invalid".into()],
+            },
+            public_url: "http://127.0.0.1".into(),
+            http: reqwest::Client::new(),
+            client_secret: "synthetic".into(),
+            flows: Mutex::new(Flows {
+                sessions: BTreeMap::from([(
+                    vault::digest(b"synthetic-session"),
+                    Session {
+                        user: user.into(),
+                        created: Instant::now(),
+                    },
+                )]),
+                ..Default::default()
+            }),
+        }
+    }
 }

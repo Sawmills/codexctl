@@ -42,3 +42,17 @@ use state::*;
 use worker::*;
 #[cfg(test)]
 mod tests;
+
+/// A display fact only; never authorizes a renewal or credential replacement.
+pub(super) fn renewal_pending(state: &Path) -> Result<bool> {
+    Ok(current(state)?.is_some_and(|r| {
+        matches!(
+            r.phase,
+            Phase::Starting
+                | Phase::Pending
+                | Phase::Committing
+                | Phase::Promoted
+                | Phase::Retiring
+        )
+    }))
+}

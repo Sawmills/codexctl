@@ -1472,6 +1472,11 @@ impl EnrollmentServer {
             .arg(address.to_string())
             .arg("--public-url")
             .arg(&url)
+            // Keep all synthetic OpenAI reads on a closed loopback proxy.
+            .env("HTTPS_PROXY", "http://127.0.0.1:1")
+            .env("https_proxy", "http://127.0.0.1:1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
             .arg("--sso-config")
             .arg(&sso)
             .arg("--metrics-token-file")
@@ -6168,4 +6173,549 @@ fn automatic_reset_rechecks_included_usage_and_reports_a_spend_before_a_lag_refu
             assert!(error.contains("without --allow-resets"), "{error}");
         }
     }
+}
+
+#[test]
+fn dashboard_requires_company_browser_sign_in() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    for credential in [None, Some(issuer.server.amir.as_str())] {
+        let mut request = http.get(format!("{}/accounts/data", issuer.server.url));
+        if let Some(token) = credential {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    let page = http
+        .get(format!("{}/accounts", issuer.server.url))
+        .send()
+        .unwrap();
+    assert_eq!(page.status(), 303);
+    assert_eq!(page.headers()["location"], "/accounts/sign-in");
+}
+
+impl EnrollmentServer {
+    fn dashboard_cookie(&self) -> String {
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let start = http
+            .get(format!("{}/accounts/sign-in", self.server.url))
+            .send()
+            .unwrap();
+        assert_eq!(start.status(), 303);
+        let binding = start.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let authorize = http
+            .get(start.headers()["location"].to_str().unwrap())
+            .send()
+            .unwrap();
+        let callback = http
+            .get(authorize.headers()["location"].to_str().unwrap())
+            .header("cookie", binding)
+            .send()
+            .unwrap();
+        assert_eq!(callback.status(), 303);
+        let cookie = callback
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .find(|c| c.to_str().unwrap().contains("session="))
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("HttpOnly; SameSite=Lax; Max-Age=3600"));
+        cookie.split(';').next().unwrap().to_owned()
+    }
+    fn enrolled_token(&self) -> String {
+        let challenge = self.challenge();
+        let approval = self
+            .browser(challenge["verificationUrl"].as_str().unwrap())
+            .text()
+            .unwrap();
+        assert_eq!(self.approve(&approval).status(), 200);
+        self.poll(&challenge).json::<Value>().unwrap()["deviceToken"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+}
+
+#[test]
+fn dashboard_snapshot_is_scoped_secret_free_and_preserves_unknown_windows() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let token = issuer.enrolled_token();
+    store::atomic_write(
+        &issuer.server.root.path().join("mode"),
+        b"dashboard-unknown",
+    )
+    .unwrap();
+    assert_eq!(
+        issuer
+            .server
+            .import(&token, "mine", "my-login", "private-workspace")
+            .status(),
+        200
+    );
+    assert_eq!(
+        issuer
+            .server
+            .import(
+                &issuer.server.alex,
+                "not-mine",
+                "other-login",
+                "other-workspace"
+            )
+            .status(),
+        200
+    );
+    let cookie = issuer.dashboard_cookie();
+    let response = issuer
+        .server
+        .http
+        .get(format!("{}/accounts/data?user=alex", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let body = response.text().unwrap();
+    for secret in [
+        &token,
+        issuer.server.alex.as_str(),
+        "synthetic-refresh",
+        "private-workspace",
+        "other-workspace",
+        "not-mine",
+        "alex-laptop",
+        "access_token",
+        "refresh_token",
+        "token_hash",
+        "synthetic-company-access",
+    ] {
+        assert!(!body.contains(secret));
+    }
+    let data: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(data["version"], 1);
+    assert_eq!(data["accounts"].as_array().unwrap().len(), 1);
+    let account = &data["accounts"][0];
+    assert_eq!(account["alias"], "mine");
+    assert_eq!(account["label"], "Personal");
+    assert_eq!(account["state"], "available");
+    assert_eq!(account["primary"]["used_percent"], 15.0);
+    assert_eq!(account["primary"]["left_percent"], 85.0);
+    assert!(account["primary"].get("window_seconds").unwrap().is_null());
+    assert!(
+        account["secondary"]
+            .get("window_seconds")
+            .unwrap()
+            .is_null()
+    );
+    assert!(account["banked_resets"].get("count").unwrap().is_null());
+    assert!(account["usage_age_seconds"].as_u64().unwrap() < 10);
+    assert_eq!(data["machines"].as_array().unwrap().len(), 1);
+    assert!(
+        data["machines"][0]["name"]
+            .as_str()
+            .unwrap()
+            .starts_with("Amir MacBook")
+    );
+    assert_eq!(data["machines"][0]["status"], "registered");
+    assert!(data["machines"][0].get("last_seen_at").unwrap().is_null());
+    assert!(data["machines"][0].get("last_used_alias").is_none());
+    // Existing sessions lose access immediately when the company user is disabled.
+    let user = central::managed::users(&issuer.server.root.path().join("state"))
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id != "amir" && u.id != "alex")
+        .unwrap();
+    central::managed::set_user(&issuer.server.root.path().join("state"), &user.id, false).unwrap();
+    for path in ["/accounts", "/accounts/data"] {
+        assert_eq!(
+            issuer
+                .server
+                .http
+                .get(format!("{}{path}", issuer.server.url))
+                .header("cookie", &cookie)
+                .send()
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+}
+
+#[test]
+fn dashboard_connect_command_uses_configured_origin_not_request_headers() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let without_sso = Server::start();
+    for (server, configured) in [
+        (&issuer.server, issuer.server.url.as_str()),
+        (&without_sso, "http://127.0.0.1:8787"),
+    ] {
+        let response = server
+            .http
+            .get(format!("{}/", server.url))
+            .header("host", "untrusted.example")
+            .header("forwarded", "host=untrusted.example;proto=https")
+            .header("x-forwarded-host", "untrusted.example")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let html = response.text().unwrap();
+        let command = html
+            .split("id=\"connect-command\">")
+            .nth(1)
+            .unwrap()
+            .split("</code>")
+            .next()
+            .unwrap();
+        assert!(
+            command.contains(configured),
+            "connect command must target the configured server: {command}"
+        );
+        assert!(!command.contains("staging.plat.sm-svc.com"));
+        assert!(!command.contains("untrusted.example"));
+    }
+}
+
+#[test]
+fn dashboard_root_is_public_without_account_data_and_redirects_signed_in_browsers() {
+    let issuer = EnrollmentServer::start(company_identity());
+    issuer.server.import(
+        &issuer.server.amir,
+        "private-alias",
+        "private-login",
+        "private-seat",
+    );
+    let response = issuer
+        .server
+        .http
+        .get(format!("{}/", issuer.server.url))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let html = response.text().unwrap();
+    assert!(html.contains("Sign in with company SSO"));
+    assert!(html.contains("brew install sawmills/tap/codexctl"));
+    assert!(html.contains("sha256sum --check"));
+    for private in [
+        "private-alias",
+        "private-login",
+        "private-seat",
+        "amir-laptop",
+        "synthetic-refresh",
+    ] {
+        assert!(!html.contains(private));
+    }
+    let cookie = issuer.dashboard_cookie();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = http
+        .get(format!("{}/", issuer.server.url))
+        .header("cookie", cookie)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 303);
+    assert_eq!(response.headers()["location"], "/accounts");
+}
+
+#[test]
+fn dashboard_disabled_session_can_view_public_landing_but_not_accounts() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    let state = issuer.server.root.path().join("state");
+    let user = central::managed::users(&state)
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id != "amir" && u.id != "alex")
+        .unwrap();
+    central::managed::set_user(&state, &user.id, false).unwrap();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = http
+        .get(format!("{}/", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let html = response.text().unwrap();
+    assert!(html.contains("Sign in with company SSO"));
+    assert!(html.contains("id=\"connect-command\""));
+    assert!(!html.contains(&user.email));
+    for path in ["/accounts", "/accounts/data"] {
+        assert_eq!(
+            http.get(format!("{}{path}", issuer.server.url))
+                .header("cookie", &cookie)
+                .send()
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+}
+
+#[test]
+fn dashboard_pages_pin_bundled_assets_and_contain_no_credentials() {
+    use base64::engine::general_purpose::STANDARD;
+    use sha2::{Digest, Sha256};
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    for (path, filename) in [("/", "landing.html"), ("/accounts", "accounts.html")] {
+        let mut request = issuer
+            .server
+            .http
+            .get(format!("{}{path}", issuer.server.url));
+        if path == "/accounts" {
+            request = request.header("cookie", &cookie);
+        }
+        let response = request.send().unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["referrer-policy"], "same-origin");
+        let csp = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let html = response.text().unwrap();
+        let footer = html
+            .split("<footer")
+            .nth(1)
+            .unwrap()
+            .split("</footer>")
+            .next()
+            .unwrap();
+        assert!(
+            footer.contains(&format!("codexctl v{}", env!("CARGO_PKG_VERSION"))),
+            "footer must follow the binary build version"
+        );
+        assert!(!footer.contains("<!-- VERSION -->"));
+        for tag in ["style", "script"] {
+            let asset = html
+                .split(&format!("<{tag}>"))
+                .nth(1)
+                .unwrap()
+                .split(&format!("</{tag}>"))
+                .next()
+                .unwrap();
+            assert!(csp.contains(&format!(
+                "{tag}-src 'sha256-{}'",
+                STANDARD.encode(Sha256::digest(asset))
+            )));
+        }
+        assert!(csp.contains("default-src 'none'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(!csp.contains("unsafe-inline"));
+        for secret in [
+            &cookie,
+            "synthetic-company-client-secret",
+            "synthetic-company-access",
+            "synthetic-refresh",
+            "token_hash",
+        ] {
+            assert!(!html.contains(secret));
+        }
+        if let Ok(directory) = std::env::var("B16_RENDER_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(std::path::Path::new(&directory).join(filename), html).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("{filename}.csp")),
+                csp,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn dashboard_sign_in_refuses_a_callback_from_another_browser() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let start = http
+        .get(format!("{}/accounts/sign-in", issuer.server.url))
+        .send()
+        .unwrap();
+    let authorize = http
+        .get(start.headers()["location"].to_str().unwrap())
+        .send()
+        .unwrap();
+    let url = authorize.headers()["location"].to_str().unwrap();
+    let callback = http.get(url).send().unwrap();
+    assert_eq!(callback.status(), 401);
+    assert!(callback.headers().get("set-cookie").is_none());
+    let replay = http
+        .get(url)
+        .header(
+            "cookie",
+            start.headers()["set-cookie"]
+                .to_str()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap(),
+        )
+        .send()
+        .unwrap();
+    assert_eq!(replay.status(), 400);
+}
+
+#[test]
+fn dashboard_machine_activity_tracks_only_successful_token_delivery_with_user_isolation() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let token = issuer.enrolled_token();
+    assert_eq!(
+        issuer
+            .server
+            .import(&token, "studio", "studio-login", "studio-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        issuer
+            .server
+            .import(&token, "build", "build-login", "build-seat")
+            .status(),
+        200
+    );
+    issuer.server.import(
+        &issuer.server.alex,
+        "alex-private",
+        "alex-login",
+        "alex-seat",
+    );
+    let cookie = issuer.dashboard_cookie();
+    let data = || {
+        issuer
+            .server
+            .http
+            .get(format!("{}/accounts/data", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap()
+            .json::<Value>()
+            .unwrap()
+    };
+    assert!(data()["machines"][0]["last_seen_at"].is_null());
+    let first = issuer.server.token(&token, "STUDIO", None);
+    assert_eq!(first.status(), 200);
+    let credentials: Value = first.json().unwrap();
+    let delivered = data();
+    assert_eq!(delivered["machines"][0]["last_used_alias"], "studio");
+    assert!(
+        delivered["machines"][0]["last_seen_at"].as_i64().unwrap()
+            >= chrono::Utc::now().timestamp() - 10
+    );
+    issuer
+        .server
+        .token(&issuer.server.alex, "alex-private", None);
+    assert_eq!(issuer.server.token(&token, "missing", None).status(), 404);
+    assert_eq!(data()["machines"][0]["last_used_alias"], "studio");
+    assert_eq!(issuer.server.token(&token, "build", None).status(), 200);
+    let latest = data();
+    assert_eq!(latest["machines"][0]["last_used_alias"], "build");
+    assert_eq!(latest["machines"].as_array().unwrap().len(), 1);
+    let text = latest.to_string();
+    for secret in [
+        credentials["accessToken"].as_str().unwrap(),
+        &token,
+        &issuer.server.alex,
+        "alex-private",
+        "alex-laptop",
+        "studio-seat",
+        "synthetic-refresh",
+    ] {
+        assert!(!text.contains(secret));
+    }
+}
+
+#[test]
+fn dashboard_identity_and_sign_out_are_scoped_to_the_browser_session() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    let other_session = issuer.dashboard_cookie();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let snapshot = || {
+        http.get(format!("{}/accounts/data", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap()
+    };
+    let data: Value = snapshot().json().unwrap();
+    assert_eq!(data["identity"]["email"], "amir@sawmills.ai");
+    let public = http
+        .get(format!("{}/", issuer.server.url))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(!public.contains("amir@sawmills.ai"));
+    assert_eq!(
+        http.get(format!("{}/accounts/sign-out", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap()
+            .status(),
+        405
+    );
+    for origin in [None, Some("https://unrelated.example")] {
+        let mut request = http
+            .post(format!("{}/accounts/sign-out", issuer.server.url))
+            .header("cookie", &cookie);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().unwrap().status(), 403);
+        assert_eq!(snapshot().status(), 200);
+    }
+    let signed_out = http
+        .post(format!("{}/accounts/sign-out", issuer.server.url))
+        .header("cookie", &cookie)
+        .header("origin", &issuer.server.url)
+        .send()
+        .unwrap();
+    assert_eq!(signed_out.status(), 303);
+    assert_eq!(signed_out.headers()["location"], "/");
+    assert_eq!(signed_out.headers()["cache-control"], "no-store");
+    assert!(
+        signed_out.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    assert_eq!(snapshot().status(), 401);
+    assert_eq!(
+        http.get(format!("{}/accounts/data", issuer.server.url))
+            .header("cookie", other_session)
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
 }

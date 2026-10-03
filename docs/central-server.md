@@ -5,6 +5,14 @@ Each company user owns a separate account catalog and a set of registered device
 The server keeps the refresh credentials. Regular Codex receives access tokens through its existing provider helper.
 Codex sends inference requests directly to OpenAI and runs tools on your machine.
 
+## Browser Overview
+
+Open the account server's root URL for installation commands and company SSO sign-in.
+The read-only `/accounts` page shows only your server accounts and machines, with
+usage windows, live reset countdowns, banked resets, and observation freshness.
+It refreshes every 60 seconds through the existing usage cache. See the
+[browser overview](web-dashboard.md) for authentication, schema, and cache details.
+
 ## Connect a Machine
 
 Run this command on each machine:

@@ -1,0 +1,67 @@
+<section class="hero overview-hero" aria-labelledby="title">
+  <div id="featured" class="featured">
+    <p class="eyebrow">Your capacity</p>
+    <h1 id="title">Loading your overview…</h1>
+    <div class="skeleton-line" aria-hidden="true"></div>
+  </div>
+</section>
+<div class="section-heading">
+  <div>
+    <p class="eyebrow">Your accounts</p>
+    <h2>
+      Server accounts <span class="count" id="account-count">Unknown</span>
+    </h2>
+  </div>
+  <p id="refresh-status" class="muted" aria-live="polite" aria-atomic="true">
+    Loading…
+  </p>
+</div>
+<div class="feedback">
+  <p id="connection" role="status" aria-live="polite" class="notice">
+    Loading your accounts…
+  </p>
+  <button id="retry" class="button" hidden>Retry now</button
+  ><a id="sign-in" href="/accounts/sign-in" class="button" hidden
+    >Sign in again</a
+  >
+</div>
+<div
+  id="accounts"
+  class="accounts"
+  aria-label="Server accounts"
+  aria-busy="true"
+>
+  <div class="card skeleton" aria-hidden="true">
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+  </div>
+  <div class="card skeleton" aria-hidden="true">
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+  </div>
+  <div class="card skeleton" aria-hidden="true">
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+    <div class="skeleton-line"></div>
+  </div>
+</div>
+<p class="profile-note">Local profiles on a machine are not shown here.</p>
+<section class="machines-section" aria-labelledby="machines-title">
+  <div class="section-heading">
+    <div>
+      <p class="eyebrow">Connected to you</p>
+      <h2 id="machines-title">
+        Machines <span class="count" id="machine-count">Unknown</span>
+      </h2>
+    </div>
+    <span class="muted">Registration status, not live connectivity</span>
+  </div>
+  <div id="machines" class="machines"></div>
+</section>
+<noscript
+  ><p class="notice">
+    Enable JavaScript to load your account overview and live countdowns.
+  </p></noscript
+>

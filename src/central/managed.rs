@@ -96,8 +96,9 @@ pub(super) struct Broker {
     pub(super) owners: Arc<RwLock<Owners>>,
     pub(super) imports: Arc<Mutex<()>>,
     pub sso: Option<Arc<enrollment::Sso>>,
+    pub(super) activity: Arc<super::activity::Activity>,
     pub(super) reset_reader: super::resets::Reader,
-    catalog: Arc<catalog::Reader>,
+    pub(super) catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
@@ -356,30 +357,40 @@ async fn token(
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
-    let mut token = tokio::spawn(async move {
+    let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
-        owner
-            .lock()
-            .await
+        let mut owner = owner.lock().await;
+        let token = owner
             .tokens(request)
             .await
-            .map_err(|e| worker.owner_failure(e))
+            .map_err(|e| worker.owner_failure(e))?;
+        Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers)?;
+    broker.activity.delivered(&device, alias);
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
 async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers)?;
+    let result = account_catalog(&broker, &device.user).await?;
+    broker.authorize(&headers)?;
+    Ok(([("cache-control", "no-store")], Json(result)).into_response())
+}
+
+pub(super) async fn account_catalog(
+    broker: &Broker,
+    user: &str,
+) -> Result<Vec<Account>, HttpError> {
     let owners: Vec<_> = broker
         .owners
         .read()
         .await
         .iter()
-        .filter(|(_, (identity, _))| identity.user == device.user)
+        .filter(|(_, (identity, _))| identity.user == user)
         .map(|(key, (_, owner))| (key.clone(), owner.clone()))
         .collect();
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
@@ -437,8 +448,7 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
         );
     }
     result.sort_by(|a, b| a.alias.cmp(&b.alias));
-    broker.authorize(&headers)?;
-    Ok(([("cache-control", "no-store")], Json(result)).into_response())
+    Ok(result)
 }
 
 async fn import(
@@ -1155,6 +1165,7 @@ pub async fn serve(
     }
     drop(startup_import);
     let broker = Broker {
+        activity: Arc::default(),
         state: state.into(),
         key: key.into(),
         binary: binary.into(),
@@ -1222,7 +1233,7 @@ pub async fn serve(
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }));
-    let app = enrollment::routes(app)
+    let app = enrollment::routes(app.merge(super::dashboard::routes(public_url)))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(broker.clone(), observe))
         .with_state(broker.clone());
@@ -1327,6 +1338,7 @@ mod tests {
             owners: Arc::new(RwLock::new(BTreeMap::new())),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
