@@ -456,16 +456,21 @@ fn server_login_cli_scenario(active: bool, cached: bool) {
 
 #[test]
 fn server_exec_explains_unsupported_pinning_with_an_active_provider() {
-    server_exec_unsupported_scenario(true);
+    server_exec_unsupported_scenario(true, false);
 }
 
 #[test]
 fn server_exec_explains_unsupported_pinning_without_prior_discovery() {
-    server_exec_unsupported_scenario(false);
+    server_exec_unsupported_scenario(false, false);
 }
 
-fn server_exec_unsupported_scenario(active: bool) {
-    let server = Server::start();
+#[test]
+fn server_exec_explains_unsupported_pinning_when_the_cached_server_is_offline() {
+    server_exec_unsupported_scenario(false, true);
+}
+
+fn server_exec_unsupported_scenario(active: bool, offline: bool) {
+    let mut server = Server::start();
     assert_eq!(
         server
             .import(&server.amir, "personal", "amir-login", "amir-seat")
@@ -480,6 +485,10 @@ fn server_exec_unsupported_scenario(active: bool) {
             "{}",
             String::from_utf8_lossy(&selected.stderr)
         );
+    }
+    if offline {
+        assert!(server.cli(home.path(), &["list"]).status.success());
+        server.stop();
     }
     let config = home.path().join(".codex/config.toml");
     let marker = home.path().join(".codexctl/central/.native-active.json");
@@ -514,6 +523,84 @@ fn server_exec_unsupported_scenario(active: bool) {
     assert_eq!(std::fs::read(&config).ok(), config_before);
     assert_eq!(std::fs::read(&marker).ok(), marker_before);
     assert_eq!(std::fs::read(&auth_file).unwrap(), b"local-auth-sentinel");
+}
+
+#[test]
+fn unknown_exec_alias_keeps_the_missing_profile_error_on_a_connected_machine() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let result = server.cli(home.path(), &["exec", "--account", "missing", "--", "true"]);
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(error.contains("profile 'missing' not found"), "{error}");
+    assert!(
+        !error.contains("pinned execution of server accounts is not supported"),
+        "{error}"
+    );
+    assert!(!home.path().join(".codexctl/exec-homes/missing").exists());
+}
+
+#[test]
+fn local_exec_guard_does_not_claim_server_pinning_is_unsupported() {
+    local_exec_error_scenario(true);
+}
+
+#[test]
+fn corrupt_local_exec_metadata_keeps_its_specific_error() {
+    local_exec_error_scenario(false);
+}
+
+fn local_exec_error_scenario(active: bool) {
+    let server = Server::start();
+    let home = server.connected_home();
+    if active {
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal", "--allow-billing"])
+                .status
+                .success()
+        );
+    }
+    let profile = home.path().join(".codexctl/profiles/local");
+    store::ensure_private_dir(&profile).unwrap();
+    store::atomic_write(
+        &profile.join("auth.json"),
+        &serde_json::to_vec(&auth("local-login", "local-seat")).unwrap(),
+    )
+    .unwrap();
+    let meta: &[u8] = if active {
+        br#"{"alias":"local","saved_at":"2026-10-03T00:00:00Z"}"#
+    } else {
+        b"{"
+    };
+    store::atomic_write(&profile.join("meta.json"), meta).unwrap();
+    let result = server.cli(
+        home.path(),
+        &["exec", "--account", "local", "--", "echo", "CHILD_STARTED"],
+    );
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    if active {
+        assert!(error.contains("remote provider is active"), "{error}");
+    } else {
+        assert!(
+            error.contains("failed to parse") && error.contains("meta.json"),
+            "{error}"
+        );
+    }
+    assert!(
+        !error.contains("pinned execution of server accounts is not supported"),
+        "{error}"
+    );
+    assert!(!error.contains("codexctl use <alias>"), "{error}");
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("CHILD_STARTED"));
+    assert!(!home.path().join(".codexctl/exec-homes/local").exists());
 }
 
 #[test]
