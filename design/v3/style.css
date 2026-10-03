@@ -630,6 +630,13 @@ details > summary:hover {
 .figure-label span {
   color: var(--ink-3);
 }
+.figure-value.none {
+  color: var(--ink-3);
+  font-size: var(--t-xl);
+  font-stretch: 100%;
+  letter-spacing: -0.01em;
+  line-height: 1.6;
+}
 .stale .figure-value {
   color: var(--ink-2);
 }
@@ -828,6 +835,7 @@ details > summary:hover {
 .usage.bad .usage-value {
   color: var(--bad);
 }
+.usage.none .usage-value,
 .usage.unknown .usage-value {
   color: var(--ink-3);
   font-size: var(--t-base);

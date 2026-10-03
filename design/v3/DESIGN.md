@@ -313,7 +313,7 @@ A 7 px dot and one word, weight 500. Available: green dot, ink word. In use: ink
 
 ### Meter
 
-A 4 px bar whose fill is what is left, the same quantity as the figure beside it. Meter ink by default, amber fill below 20% left, gray at 55% opacity inside a stale row. Unknown is a 2 px dotted rule with the word "Unknown". Always `aria-hidden`; the number carries the value.
+A 4 px bar whose fill is what is left, the same quantity as the figure beside it. Meter ink by default, amber fill below 20% left, gray at 55% opacity inside a stale row. Unknown (no telemetry) is a 2 px dotted rule with the word "Unknown". An absent window (the account has no such limit) shows "No limit" in ink-3 with no meter. Always `aria-hidden`; the number carries the value.
 
 ### Command Block
 
@@ -350,7 +350,7 @@ A native `details` summary in ink-2 weight 500 with a 6 px border-drawn chevron 
 - **Do** open every page on the answer to its visitor's question, with the action beside it.
 - **Do** fill meters with what is left, matching the figure next to them.
 - **Do** put a word beside every amber, red, or green mark.
-- **Do** show "Unknown" with a dotted rule, and keep stale figures in ink-2 with "Last observed" and an age.
+- **Do** show "Unknown" with a dotted rule for missing telemetry and "No limit" without a meter for an absent window, and keep stale figures in ink-2 with "Last observed" and an age.
 - **Do** set commands exactly as typed in a sunken block with a Copy button; scroll long lines inside the block.
 - **Do** keep standalone text controls at least 24 px tall, and 44 px on coarse pointers.
 - **Do** swap tokens for dark mode; never add dark-specific component rules.

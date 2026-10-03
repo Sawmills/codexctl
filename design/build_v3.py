@@ -19,6 +19,8 @@ OUT = Path(__file__).parent / "v3"
 NOW_TITLE = "Oct 3, 9:39:52 AM EDT"
 SWITCH_THRESHOLD_LEFT = 5  # 95% used or more
 LOW_LEFT = 20
+RATE_LIMITED_PLANS = {"free", "go", "plus", "pro", "prolite", "promax", "team",
+                      "business", "enterprise", "edu"}
 
 
 def e(text: str) -> str:
@@ -51,11 +53,14 @@ class Account:
     seven: Window | None
     banked: Banked | None
     state: str = "available"  # available | renewal_pending | unavailable
-    billing: str = "rate_limited"  # rate_limited | usage_based
+    billing: str = "rate_limited"  # rate_limited | usage_based | unknown
     stale: bool = False
     age: str = "8 s ago"
     in_use_on: str | None = None
     pending_note: str = ""
+    # True when the server has usage telemetry. A window that is None on an
+    # account with telemetry is an absent period (no such limit), not unknown.
+    usage_known: bool = True
 
     @property
     def windows(self):
@@ -95,21 +100,38 @@ class Scene:
 # ---------- Rules ----------
 
 
+def used(a: Account) -> list[int]:
+    return [100 - w.left for _, w in a.windows if w]
+
+
+def availability_score(a: Account) -> int:
+    """api::RateLimitResponse::availability_score for unexhausted accounts."""
+    short = 100 - a.five.left if a.five else 0
+    long = 100 - a.seven.left if a.seven else 0
+    return short * 2 + long
+
+
 def recommend(accounts: list[Account], ignore_stale: bool = False):
-    """Same rule as automatic selection in `codexctl use` (v0.1.37)."""
+    """Mirror automatic selection in `codexctl use` for server accounts (#76).
+
+    select_for_activation keeps accounts whose reported windows are all below
+    100%, then remote::select admits fresh, available, rate-limited accounts
+    with at least one reported window. If any of them has a window below 95%,
+    accounts with any window at 95% or more drop out. Rank by the 7-day reset,
+    then by availability score. An absent window does not disqualify.
+    """
     pool = [
         a
         for a in accounts
         if a.state == "available"
         and a.billing == "rate_limited"
         and (ignore_stale or not a.stale)
-        and a.five
-        and a.seven
+        and used(a)
         and not a.exhausted
     ]
-    if any(a.min_left > SWITCH_THRESHOLD_LEFT for a in pool):
-        pool = [a for a in pool if a.min_left > SWITCH_THRESHOLD_LEFT]
-    pool.sort(key=lambda a: (a.seven.iso, -a.min_left))
+    if any(u < 100 - SWITCH_THRESHOLD_LEFT for a in pool for u in used(a)):
+        pool = [a for a in pool if all(u < 100 - SWITCH_THRESHOLD_LEFT for u in used(a))]
+    pool.sort(key=lambda a: (a.seven.iso if a.seven else "9999", availability_score(a)))
     return pool[0] if pool else None
 
 
@@ -119,7 +141,9 @@ def reset_target(accounts: list[Account]):
         a
         for a in accounts
         if a.state == "available"
-        and a.billing == "rate_limited"
+        and not a.stale
+        and a.billing != "usage_based"
+        and a.plan.lower() in RATE_LIMITED_PLANS
         and a.exhausted
         and a.banked
         and a.banked.redeemable > 0
@@ -186,6 +210,11 @@ def issues(scene: Scene, pick: Account | None):
             out.append((2, a, "warn", f"{w.left}% left",
                         f'The {name} window resets in <time datetime="{w.iso}" title="{e(w.title)}">{e(w.reset_in)}</time>.',
                         None))
+        if a.billing == "unknown" and a.state == "available":
+            out.append((2, a, "warn", "Billing unknown",
+                        "codexctl cannot confirm this account uses included usage, so it never chooses it automatically. "
+                        f'Selecting it with <code translate="no">codexctl use {e(a.alias)}</code> asks before it can bill.',
+                        None))
         if (a.banked and a.banked.expires_in_days <= 3 and not a.exhausted
                 and a.state == "available"):
             n = a.banked.count
@@ -219,7 +248,10 @@ def command(cid: str, lines: list[str], primary=False, prompt=False) -> str:
     )
 
 
-def figure(name: str, w: Window) -> str:
+def figure(name: str, w: Window | None) -> str:
+    if w is None:
+        return (f'<div class="figure">\n  <span class="figure-value none">No limit</span>\n'
+                f'  <span class="figure-label">No {name} window on this account</span>\n</div>')
     return (
         f'<div class="figure">\n'
         f'  <span class="figure-value">{w.left}<small>%</small></span>\n'
@@ -333,6 +365,9 @@ def answer(scene: Scene) -> str:
             if a.billing == "usage_based" and a.state == "available":
                 alt.append(f"<li>{e(a.label)} {alias(a.alias)} has room but bills credits. "
                            f'<code translate="no">codexctl use {e(a.alias)}</code> asks before it bills.</li>')
+            elif a.billing == "unknown" and a.state == "available" and not a.exhausted:
+                alt.append(f"<li>{e(a.label)} {alias(a.alias)} has room but its billing is unknown. "
+                           f'<code translate="no">codexctl use {e(a.alias)}</code> asks before it can bill.</li>')
         if alt:
             parts.append('<ul class="alternatives">' + "".join(alt) + "</ul>")
         parts.append(f'<p class="rule">{updated}</p>')
@@ -366,8 +401,11 @@ def attention(scene: Scene, pick) -> str:
     )
 
 
-def usage_cell(name: str, w: Window | None) -> str:
+def usage_cell(name: str, w: Window | None, known: bool = True) -> str:
     label = f'<span class="cell-label" aria-hidden="true">{name}</span>'
+    if w is None and known:
+        return (f'<td role="cell" class="cell-usage">{label}<div class="usage none">'
+                f'<div class="usage-top"><span class="usage-value">No limit</span></div></div></td>')
     if w is None:
         return (f'<td role="cell" class="cell-usage">{label}<div class="usage unknown">'
                 f'<div class="usage-top"><span class="usage-value">Unknown</span></div>'
@@ -416,7 +454,7 @@ def state_cell(a: Account, scene: Scene) -> str:
         s, d = '<span class="state warn">Nearly exhausted</span>', ""
     else:
         s = '<span class="state ok">Available</span>'
-        d = "Never chosen automatically" if a.billing == "usage_based" else ""
+        d = "Never chosen automatically" if a.billing != "rate_limited" else ""
     detail = f'<span class="status-detail">{e(d)}</span>' if d else ""
     return f'<td role="cell" class="cell-state"><div class="status">{s}{detail}</div></td>'
 
@@ -439,6 +477,8 @@ def ledger(scene: Scene, pick) -> str:
             notes.append(f'<span class="note pick">{word}</span>')
         if a.billing == "usage_based":
             notes.append('<span class="note billing">Usage-based · bills credits</span>')
+        elif a.billing == "unknown":
+            notes.append('<span class="note billing">Billing unknown</span>')
         cls = []
         if a is pick:
             cls.append("recommended")
@@ -449,7 +489,7 @@ def ledger(scene: Scene, pick) -> str:
             f'<tr role="row"{cls_attr}>\n'
             f'<td role="cell" class="cell-account"><div class="account-name"><strong>{e(a.label)}</strong>'
             f'<span class="line">{alias(a.alias)}<span class="tag">{e(a.plan)}</span></span>{"".join(notes)}</div></td>\n'
-            f"{usage_cell('5-hour', a.five)}\n{usage_cell('7-day', a.seven)}\n{banked_cell(a.banked)}\n{state_cell(a, scene)}\n"
+            f"{usage_cell('5-hour', a.five, a.usage_known)}\n{usage_cell('7-day', a.seven, a.usage_known)}\n{banked_cell(a.banked)}\n{state_cell(a, scene)}\n"
             f"</tr>"
         )
     sub = ("Last observation, in use first" if scene.refresh_failed
@@ -621,9 +661,17 @@ BASE = [
             w(61, "2h 50m", "2026-10-03T16:30:00Z", "12:30 PM", "Oct 3, 12:30 PM EDT"),
             w(70, "3d 23h", "2026-10-07T13:00:00Z", "Oct 7, 9:00 AM", "Oct 7, 9:00 AM EDT"),
             Banked(1, expires="Oct 21", expires_in_days=18), stale=True, age="7 min ago"),
+    Account("Long runs", "weekly", "PLUS", None,
+            w(70, "6d 1h", "2026-10-09T15:00:00Z", "Oct 9, 11:00 AM", "Oct 9, 11:00 AM EDT"),
+            Banked(0)),
+    Account("Contract seat", "contract", "ENTERPRISE",
+            w(80, "4h 10m", "2026-10-03T17:50:00Z", "1:50 PM", "Oct 3, 1:50 PM EDT"),
+            w(90, "5d 2h", "2026-10-08T15:40:00Z", "Oct 8, 11:40 AM", "Oct 8, 11:40 AM EDT"),
+            Banked(0), billing="unknown"),
     Account("Weekend", "weekend", "PLUS", None, None, None, state="renewal_pending",
-            pending_note="An OpenAI sign-in started 4 min ago."),
-    Account("Night shift", "night", "PRO", None, None, None, state="unavailable", age="2 h ago"),
+            pending_note="An OpenAI sign-in started 4 min ago.", usage_known=False),
+    Account("Night shift", "night", "PRO", None, None, None, state="unavailable", age="2 h ago",
+            usage_known=False),
 ]
 
 MACHINES = [
@@ -645,6 +693,8 @@ blocked = by_alias(blocked, "studio",
                    five=w(0, "2h 5m", "2026-10-03T15:45:00Z", "11:45 AM", "Oct 3, 11:45 AM EDT"),
                    seven=w(31, "3d 5h", "2026-10-06T18:40:00Z", "Oct 6, 2:40 PM", "Oct 6, 2:40 PM EDT"),
                    banked=Banked(2, redeemable=2, expires="Oct 5", expires_in_days=2))
+blocked = by_alias(blocked, "weekly",
+                   seven=w(0, "6d 1h", "2026-10-09T15:00:00Z", "Oct 9, 11:00 AM", "Oct 9, 11:00 AM EDT"))
 blocked = by_alias(blocked, "nightly",
                    five=w(0, "38m", "2026-10-03T14:18:00Z", "10:18 AM", "Oct 3, 10:18 AM EDT"))
 
@@ -664,7 +714,29 @@ SCENES = [
           refresh_failed=True, failed_age="4 min"),
 ]
 
+def self_check():
+    """Selection cases from the PR #82 architect review, against #76 (268fcfe)."""
+    def acct(alias_, five, seven, reset="2026-10-06", **kw):
+        win = lambda left: None if left is None else Window(left, "", f"{reset}T00:00:00Z", "", "")
+        return Account(alias_, alias_, "PRO", win(five), win(seven), Banked(0), **kw)
+
+    # A weekly-only account with room is eligible; an absent window is not unknown.
+    weekly = acct("weekly", None, 70, reset="2026-10-04")
+    assert recommend([weekly, acct("both", 80, 60)]) is weekly
+    # 95% cutoff: a nearer reset at 96% used drops out while another is below 95%.
+    assert recommend([acct("hot", 4, 50, reset="2026-10-04"), acct("ok", 60, 60)]).alias == "ok"
+    # With nothing below 95%, the cutoff does not apply.
+    assert recommend([acct("hot", 4, 4, reset="2026-10-04")]).alias == "hot"
+    # Same 7-day reset: lower availability score (5-hour used counts double) wins.
+    assert recommend([acct("a", 50, 90), acct("b", 70, 50)]).alias == "a"
+    # Unknown and usage-based billing are never chosen; stale is never chosen.
+    assert recommend([acct("u", 90, 90, billing="unknown"),
+                      acct("c", 90, 90, billing="usage_based"),
+                      acct("s", 90, 90, stale=True)]) is None
+
+
 if __name__ == "__main__":
+    self_check()
     for scene in SCENES:
         (OUT / scene.file).write_text(page(scene))
         pick = None if scene.refresh_failed else recommend(scene.accounts)

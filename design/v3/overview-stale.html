@@ -121,7 +121,7 @@
         <section class="attention" aria-labelledby="attention-title">
           <div class="section-head">
             <h2 id="attention-title">
-              Needs attention <span class="count">4</span>
+              Needs attention <span class="count">5</span>
             </h2>
           </div>
           <ul>
@@ -211,6 +211,20 @@
                 spent only after a window is exhausted.
               </p>
             </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Contract seat</b
+                  ><span class="alias" translate="no">contract</span></span
+                ><span class="state warn">Billing unknown</span>
+              </div>
+              <p>
+                codexctl cannot confirm this account uses included usage, so it
+                never chooses it automatically. Selecting it with
+                <code translate="no">codexctl use contract</code> asks before it
+                can bill.
+              </p>
+            </li>
           </ul>
           <p
             id="copy-status"
@@ -222,7 +236,7 @@
       </div>
       <section class="section" aria-labelledby="accounts-title">
         <div class="section-head">
-          <h2 id="accounts-title">Accounts <span class="count">8</span></h2>
+          <h2 id="accounts-title">Accounts <span class="count">10</span></h2>
           <p>Last observation, in use first</p>
         </div>
         <table class="ledger" role="table" aria-labelledby="accounts-title">
@@ -406,6 +420,111 @@
                   </div>
                   <div class="meter" aria-hidden="true">
                     <i style="--left: 95%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state ok">Available</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row" class="stale">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Contract seat</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">contract</span
+                    ><span class="tag">ENTERPRISE</span></span
+                  ><span class="note billing">Billing unknown</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">80%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T17:50:00Z"
+                        title="Oct 3, 1:50 PM EDT"
+                        >4h 10m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 80%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">90%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-08T15:40:00Z"
+                        title="Oct 8, 11:40 AM EDT"
+                        >5d 2h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 90%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state ok">Available</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row" class="stale">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Long runs</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">weekly</span
+                    ><span class="tag">PLUS</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage none">
+                  <div class="usage-top">
+                    <span class="usage-value">No limit</span>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">70%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-09T15:00:00Z"
+                        title="Oct 9, 11:00 AM EDT"
+                        >6d 1h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 70%"></i>
                   </div>
                 </div>
               </td>
