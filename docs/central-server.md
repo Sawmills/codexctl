@@ -178,8 +178,9 @@ reported usage window has headroom, even when credits are available and the cap 
 Both bare `codexctl use` and `codexctl use <alias>` allow this selection without `--allow-billing`.
 Selection prefers the soonest long-window reset.
 `CODEXCTL_SELECT=most-available` selects by headroom instead.
-Within a billing class, automatic selection skips any candidate with a reported usage window at
-or above 95% whenever another candidate in that class is below 95%.
+Within each billing class, automatic selection skips any candidate with a reported usage window at
+or above 95% whenever another candidate in that class is below 95%; this applies to both local and
+server-account selection.
 An exhausted window (100% or more), invalid usage, or unknown entitlement requires billing consent.
 Overage-limit evidence still requires a closed cap or consent, even with subscription headroom.
 Usage-based accounts never qualify for automatic selection.
@@ -266,6 +267,10 @@ not write a static `ChatGPT-Account-ID` header: a static value would become stal
 pointer moves running sessions between seats held by one login.
 Regional routes, routing overrides, and missing routing evidence refuse import verification or activation.
 Read-only brokers cannot verify native routing and cannot supply the native provider.
+Live validation covered one login with personal and team seats: a request without the static header
+returned `ok` for the personal workspace and that workspace's out-of-credits response for the team
+workspace, matching requests with the corresponding header. The token claim therefore scopes Codex
+inference to the selected workspace.
 Running server sessions use the active account pointer when they refresh their helper token.
 After `codexctl use <alias>`, every running session on this machine moves to the selected
 account within 60 seconds. If that account can bill credits, all of those sessions can bill
