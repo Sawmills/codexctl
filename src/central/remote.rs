@@ -413,7 +413,7 @@ pub(crate) fn install(server: &str, token: &str) -> Result<()> {
     store::sync_directory(&directory)?;
     Ok(())
 }
-// This cache only routes login. Selection and credential delivery still require
+// This cache routes login and refuses unsupported exec. Selection and credential delivery require
 // a current catalog from the account server.
 #[derive(Serialize, Deserialize)]
 struct KnownAliases {
@@ -565,7 +565,41 @@ pub fn redeem_reset(alias: &str) -> Result<api::ConsumeResetResponse> {
 pub fn accounts() -> Result<Option<Vec<Account>>> {
     Ok(catalog()?.map(|c| c.accounts))
 }
+
+/// Explain unsupported pinning only for a known server alias. Local profile
+/// failures retain their own diagnostics and do not require account discovery.
+pub fn require_local_exec(alias: &str) -> Result<()> {
+    let alias = store::validate_alias(alias)?;
+    if native::known_local_alias(alias)? {
+        return Ok(());
+    }
+    let Some(connection) = connection()? else {
+        return Ok(());
+    };
+    let known = known_server_alias(&connection, alias)?;
+    let discovered = !known
+        && catalog_with_timeout(Some(Duration::from_secs(3)))
+            .ok()
+            .flatten()
+            .is_some_and(|catalog| {
+                catalog
+                    .accounts
+                    .iter()
+                    .any(|a| a.alias.eq_ignore_ascii_case(alias))
+            });
+    if known || discovered {
+        bail!(
+            "cannot pin server account '{alias}': pinned execution of server accounts is not supported. To launch Codex with a server account, run `codexctl use <alias>` then `codexctl codex`; this changes the active account"
+        );
+    }
+    Ok(())
+}
+
 pub(super) fn catalog() -> Result<Option<Catalog>> {
+    catalog_with_timeout(None)
+}
+
+fn catalog_with_timeout(timeout: Option<Duration>) -> Result<Option<Catalog>> {
     let Some(connection) = connection()? else {
         return Ok(None);
     };
@@ -574,9 +608,11 @@ pub(super) fn catalog() -> Result<Option<Catalog>> {
     // erase a server alias that another discovery already recorded.
     let _discovery = vault::registry_lock(&directory, "catalog.lock")?;
     require_current_connection(&connection)?;
-    let response = request(&connection, "/v1/accounts")?
-        .send()
-        .context("cannot reach the account server")?;
+    let mut request = request(&connection, "/v1/accounts")?;
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request.send().context("cannot reach the account server")?;
     let accounts: Vec<Account> = check(response)?.json()?;
     let _lock = native::native_lock(&directory)?;
     require_current_connection(&connection)?;

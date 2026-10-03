@@ -274,6 +274,11 @@ Switching an already active server provider shares the session leases and serial
 If disconnect or local selection restores the provider during that switch, selection refuses and asks for a retry.
 It refuses inherited or pinned Codex homes.
 Server-account launches use the provider token helper without local account failover or banked resets.
+`codexctl exec --account <alias> -- <command>` supports saved local profiles only.
+Pinned execution of server accounts is not supported: the server provider and its
+token helper refuse pinned homes. To launch Codex with a server account, run
+`codexctl use <alias>` followed by `codexctl codex`. This changes the active account
+for new sessions; it is not an isolated pinned launch.
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 

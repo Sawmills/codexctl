@@ -190,8 +190,8 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run a command with its Codex credentials pinned to one account,
-    /// without switching the active profile
+    /// Run a command with its Codex credentials pinned to one saved local profile,
+    /// without switching the active profile. Server accounts are not supported.
     Exec {
         /// Profile alias the command runs as
         #[arg(long)]
