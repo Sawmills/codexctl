@@ -1,0 +1,962 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="theme-color"
+      content="#f7f7f4"
+      media="(prefers-color-scheme: light)"
+    />
+    <meta
+      name="theme-color"
+      content="#121314"
+      media="(prefers-color-scheme: dark)"
+    />
+    <title>Accounts · codexctl</title>
+    <link
+      rel="preload"
+      href="fonts/instrument-sans.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <div class="wrap topbar-inner">
+        <a
+          class="wordmark"
+          href="overview.html"
+          translate="no"
+          aria-label="codexctl accounts"
+          >codexctl<span class="caret" aria-hidden="true"></span
+        ></a>
+        <div class="identity">
+          <span class="email" translate="no" title="amir@example.com"
+            >amir@example.com</span
+          >
+          <form action="index.html" method="get">
+            <button class="link-button" type="submit">Sign out</button>
+          </form>
+        </div>
+      </div>
+    </header>
+    <main id="main" class="wrap">
+      <div class="lead">
+        <section class="answer" aria-labelledby="answer-title">
+          <h1 id="answer-title">No included account has confirmed room</h1>
+          <p class="context">
+            Studio MacBook is on Feature sprint:
+            <b>5-hour window exhausted</b> until
+            <time datetime="2026-10-03T14:52:00Z" title="Oct 3, 10:52 AM EDT"
+              >10:52 AM</time
+            >.
+          </p>
+          <p class="next-step">
+            Spend a banked reset on <b>Everyday building</b>
+            <span class="alias" translate="no">studio</span>. Its next reset
+            expires Oct 5, sooner than any other.
+          </p>
+          <div class="command">
+            <pre><code id="cmd-use" translate="no"><span class="prompt">$ </span>codexctl reset studio
+<span class="prompt">$ </span>codexctl use studio</code></pre>
+            <button
+              class="button primary copy"
+              type="button"
+              data-copy="cmd-use"
+              aria-label="Copy codexctl reset studio and codexctl use studio"
+            >
+              Copy
+            </button>
+          </div>
+          <p class="effect">
+            The reset clears the exhausted 5-hour window. Run it on Studio
+            MacBook; its running Codex sessions move to Everyday building within
+            60 seconds.
+          </p>
+          <ul class="alternatives">
+            <li>
+              Code review
+              <span class="alias" translate="no">review</span> showed at least
+              61% left in both windows 7 min ago, too old to confirm. Bare
+              <code translate="no">codexctl use</code> checks live usage and
+              picks it if the room is still there.
+            </li>
+            <li>
+              Or wait: the 5-hour window on Nightly agents resets at
+              <time datetime="2026-10-03T14:18:00Z" title="Oct 3, 10:18 AM EDT"
+                >10:18 AM</time
+              >
+              (in 38m).
+            </li>
+            <li>
+              Team credits <span class="alias" translate="no">credits</span> has
+              room but bills credits.
+              <code translate="no">codexctl use credits</code> asks before it
+              bills.
+            </li>
+            <li>
+              Contract seat
+              <span class="alias" translate="no">contract</span> has room but
+              its billing is unknown.
+              <code translate="no">codexctl use contract</code> asks before it
+              can bill.
+            </li>
+          </ul>
+          <p class="rule">
+            Updated
+            <time datetime="2026-10-03T13:39:52Z" title="Oct 3, 9:39:52 AM EDT"
+              >8 s ago</time
+            >.
+          </p>
+        </section>
+        <section class="attention" aria-labelledby="attention-title">
+          <div class="section-head">
+            <h2 id="attention-title">
+              Needs attention <span class="count">9</span>
+            </h2>
+          </div>
+          <ul>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Feature sprint</b
+                  ><span class="alias" translate="no">sprint</span></span
+                ><span class="state bad">Exhausted</span>
+              </div>
+              <p>
+                1 banked reset ready, expiring Oct 19. The next step spends
+                Everyday building’s first because it expires sooner.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Extra capacity</b
+                  ><span class="alias" translate="no">reserve</span></span
+                ><span class="state bad">Exhausted</span>
+              </div>
+              <p>
+                The 5-hour window resets at
+                <time
+                  datetime="2026-10-03T15:20:00Z"
+                  title="Oct 3, 11:20 AM EDT"
+                  >11:20 AM</time
+                >.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Everyday building</b
+                  ><span class="alias" translate="no">studio</span></span
+                ><span class="state bad">Exhausted</span>
+              </div>
+              <p>
+                2 banked resets ready. The next step on this page spends the one
+                closest to expiry.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Nightly agents</b
+                  ><span class="alias" translate="no">nightly</span></span
+                ><span class="state bad">Exhausted</span>
+              </div>
+              <p>
+                The 5-hour window resets at
+                <time
+                  datetime="2026-10-03T14:18:00Z"
+                  title="Oct 3, 10:18 AM EDT"
+                  >10:18 AM</time
+                >.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Long runs</b
+                  ><span class="alias" translate="no">weekly</span></span
+                ><span class="state bad">Exhausted</span>
+              </div>
+              <p>
+                The 7-day window resets at
+                <time
+                  datetime="2026-10-09T15:00:00Z"
+                  title="Oct 9, 11:00 AM EDT"
+                  >Oct 9, 11:00 AM</time
+                >.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Night shift</b
+                  ><span class="alias" translate="no">night</span></span
+                ><span class="state bad">Login needs attention</span>
+              </div>
+              <p>
+                The account server cannot refresh this login. Renew it from any
+                connected machine.
+              </p>
+              <div class="command">
+                <pre><code id="fix-night-5" translate="no">codexctl login night</code></pre>
+                <button
+                  class="button small copy"
+                  type="button"
+                  data-copy="fix-night-5"
+                  aria-label="Copy codexctl login night"
+                >
+                  Copy
+                </button>
+              </div>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Weekend</b
+                  ><span class="alias" translate="no">weekend</span></span
+                ><span class="state pending">Renewal pending</span>
+              </div>
+              <p>
+                An OpenAI sign-in started 4 min ago. Only the machine that
+                started it can finish it; this command resumes it there.
+              </p>
+              <div class="command">
+                <pre><code id="fix-weekend-6" translate="no">codexctl login weekend</code></pre>
+                <button
+                  class="button small copy"
+                  type="button"
+                  data-copy="fix-weekend-6"
+                  aria-label="Copy codexctl login weekend"
+                >
+                  Copy
+                </button>
+              </div>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Code review</b
+                  ><span class="alias" translate="no">review</span></span
+                ><span class="state warn">Stale usage</span>
+              </div>
+              <p>
+                Last observed 7 min ago. The server retries every 60 seconds.
+              </p>
+            </li>
+            <li class="issue">
+              <div class="issue-head">
+                <span class="issue-account"
+                  ><b>Contract seat</b
+                  ><span class="alias" translate="no">contract</span></span
+                ><span class="state warn">Billing unknown</span>
+              </div>
+              <p>
+                codexctl cannot confirm this account uses included usage, so it
+                never chooses it automatically. Selecting it with
+                <code translate="no">codexctl use contract</code> asks before it
+                can bill.
+              </p>
+            </li>
+          </ul>
+          <p
+            id="copy-status"
+            class="copy-status"
+            role="status"
+            aria-live="polite"
+          ></p>
+        </section>
+      </div>
+      <section class="section" aria-labelledby="accounts-title">
+        <div class="section-head">
+          <h2 id="accounts-title">Accounts <span class="count">10</span></h2>
+          <p>
+            In use first, then the next step, then most room; stale and unknown
+            last
+          </p>
+        </div>
+        <table class="ledger" role="table" aria-labelledby="accounts-title">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader" scope="col">Account</th>
+              <th role="columnheader" scope="col" class="col-usage">
+                5-hour window
+              </th>
+              <th role="columnheader" scope="col" class="col-usage">
+                7-day window
+              </th>
+              <th role="columnheader" scope="col" class="col-banked">
+                Banked resets
+              </th>
+              <th role="columnheader" scope="col" class="col-state">State</th>
+            </tr>
+          </thead>
+          <tbody role="rowgroup">
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Extra capacity</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">reserve</span
+                    ><span class="tag">PRO</span></span
+                  ><span class="note live">In use on Linux build machine</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage bad">
+                  <div class="usage-top">
+                    <span class="usage-value">0%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T15:20:00Z"
+                        title="Oct 3, 11:20 AM EDT"
+                        >1h 40m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 0%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">84%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-08T12:40:00Z"
+                        title="Oct 8, 8:40 AM EDT"
+                        >4d 23h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 84%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Exhausted</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Feature sprint</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">sprint</span
+                    ><span class="tag">PRO</span></span
+                  ><span class="note live">In use on Studio MacBook</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage bad">
+                  <div class="usage-top">
+                    <span class="usage-value">0%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T14:52:00Z"
+                        title="Oct 3, 10:52 AM EDT"
+                        >1h 12m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 0%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">22%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-05T09:40:00Z"
+                        title="Oct 5, 5:40 AM EDT"
+                        >1d 20h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 22%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked">
+                  <b>1</b><span class="redeemable">Redeemable now</span
+                  ><span>expires Oct 19</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Exhausted</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row" class="recommended">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Everyday building</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">studio</span
+                    ><span class="tag">PRO</span></span
+                  ><span class="note pick">Spend a reset here</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage bad">
+                  <div class="usage-top">
+                    <span class="usage-value">0%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T15:45:00Z"
+                        title="Oct 3, 11:45 AM EDT"
+                        >2h 5m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 0%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">31%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-06T18:40:00Z"
+                        title="Oct 6, 2:40 PM EDT"
+                        >3d 5h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 31%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked">
+                  <b>2</b><span class="redeemable">Redeemable now</span
+                  ><span class="expiring">next expires Oct 5</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Exhausted</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Team credits</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">credits</span
+                    ><span class="tag">TEAM</span></span
+                  ><span class="note billing">Usage-based · bills credits</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">92%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T16:02:00Z"
+                        title="Oct 3, 12:02 PM EDT"
+                        >2h 22m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 92%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">95%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-09T15:00:00Z"
+                        title="Oct 9, 11:00 AM EDT"
+                        >6d 1h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 95%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state ok">Available</span
+                  ><span class="status-detail">Never chosen automatically</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Contract seat</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">contract</span
+                    ><span class="tag">ENTERPRISE</span></span
+                  ><span class="note billing">Billing unknown</span>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">80%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T17:50:00Z"
+                        title="Oct 3, 1:50 PM EDT"
+                        >4h 10m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 80%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">90%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-08T15:40:00Z"
+                        title="Oct 8, 11:40 AM EDT"
+                        >5d 2h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 90%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state ok">Available</span
+                  ><span class="status-detail">Never chosen automatically</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Nightly agents</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">nightly</span
+                    ><span class="tag">PLUS</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage bad">
+                  <div class="usage-top">
+                    <span class="usage-value">0%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T14:18:00Z"
+                        title="Oct 3, 10:18 AM EDT"
+                        >38m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 0%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">40%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-05T20:50:00Z"
+                        title="Oct 5, 4:50 PM EDT"
+                        >2d 7h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 40%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Exhausted</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Long runs</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">weekly</span
+                    ><span class="tag">PLUS</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage none">
+                  <div class="usage-top">
+                    <span class="usage-value">No limit</span>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage bad">
+                  <div class="usage-top">
+                    <span class="usage-value">0%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-09T15:00:00Z"
+                        title="Oct 9, 11:00 AM EDT"
+                        >6d 1h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 0%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>None</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Exhausted</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row" class="stale">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Code review</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">review</span
+                    ><span class="tag">TEAM</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">61%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-03T16:30:00Z"
+                        title="Oct 3, 12:30 PM EDT"
+                        >2h 50m</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 61%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage">
+                  <div class="usage-top">
+                    <span class="usage-value">70%<small>left</small></span
+                    ><span class="usage-reset"
+                      >resets in
+                      <time
+                        datetime="2026-10-07T13:00:00Z"
+                        title="Oct 7, 9:00 AM EDT"
+                        >3d 23h</time
+                      ></span
+                    >
+                  </div>
+                  <div class="meter" aria-hidden="true">
+                    <i style="--left: 70%"></i>
+                  </div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><b>1</b><span>expires Oct 21</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state warn">Stale usage</span
+                  ><span class="status-detail">Last observed 7 min ago</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Weekend</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">weekend</span
+                    ><span class="tag">PLUS</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage unknown">
+                  <div class="usage-top">
+                    <span class="usage-value">Unknown</span>
+                  </div>
+                  <div class="meter unknown" aria-hidden="true"></div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage unknown">
+                  <div class="usage-top">
+                    <span class="usage-value">Unknown</span>
+                  </div>
+                  <div class="meter unknown" aria-hidden="true"></div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>Unknown</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state pending">Renewal pending</span
+                  ><span class="status-detail">Waiting for OpenAI sign-in</span>
+                </div>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell" class="cell-account">
+                <div class="account-name">
+                  <strong>Night shift</strong
+                  ><span class="line"
+                    ><span class="alias" translate="no">night</span
+                    ><span class="tag">PRO</span></span
+                  >
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">5-hour</span>
+                <div class="usage unknown">
+                  <div class="usage-top">
+                    <span class="usage-value">Unknown</span>
+                  </div>
+                  <div class="meter unknown" aria-hidden="true"></div>
+                </div>
+              </td>
+              <td role="cell" class="cell-usage">
+                <span class="cell-label" aria-hidden="true">7-day</span>
+                <div class="usage unknown">
+                  <div class="usage-top">
+                    <span class="usage-value">Unknown</span>
+                  </div>
+                  <div class="meter unknown" aria-hidden="true"></div>
+                </div>
+              </td>
+              <td role="cell" class="cell-banked">
+                <span class="cell-label" aria-hidden="true">Banked resets</span>
+                <div class="banked"><span>Unknown</span></div>
+              </td>
+              <td role="cell" class="cell-state">
+                <div class="status">
+                  <span class="state bad">Login needs attention</span
+                  ><span class="status-detail">Last observed 2 h ago</span>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+      <section class="section" aria-labelledby="machines-title">
+        <div class="section-head">
+          <h2 id="machines-title">Machines <span class="count">3</span></h2>
+          <p>The account each machine last received a token for</p>
+        </div>
+        <table class="machines" role="table" aria-labelledby="machines-title">
+          <thead role="rowgroup">
+            <tr role="row">
+              <th role="columnheader" scope="col">Machine</th>
+              <th role="columnheader" scope="col">Account</th>
+              <th role="columnheader" scope="col" class="col-seen">
+                Last token delivery
+              </th>
+              <th role="columnheader" scope="col" class="col-state">State</th>
+            </tr>
+          </thead>
+          <tbody role="rowgroup">
+            <tr role="row">
+              <td role="cell">Studio MacBook</td>
+              <td role="cell" class="cell-account">
+                Feature sprint<span class="alias" translate="no">sprint</span>
+              </td>
+              <td role="cell" class="cell-seen">
+                <span class="seen"
+                  ><time
+                    datetime="2026-10-03T13:39:40Z"
+                    title="Oct 3, 9:39 AM EDT"
+                    >Just now</time
+                  ></span
+                >
+              </td>
+              <td role="cell" class="cell-state">
+                <span class="state live">In use</span>
+              </td>
+            </tr>
+            <tr role="row">
+              <td role="cell">Linux build machine</td>
+              <td role="cell" class="cell-account">
+                Extra capacity<span class="alias" translate="no">reserve</span>
+              </td>
+              <td role="cell" class="cell-seen">
+                <span class="seen"
+                  ><time
+                    datetime="2026-10-03T13:37:40Z"
+                    title="Oct 3, 9:37 AM EDT"
+                    >2 min ago</time
+                  ></span
+                >
+              </td>
+              <td role="cell" class="cell-state">
+                <span class="state live">In use</span>
+              </td>
+            </tr>
+            <tr role="row" class="idle">
+              <td role="cell">Travel Air</td>
+              <td role="cell" class="cell-account">
+                Everyday building<span class="alias" translate="no"
+                  >studio</span
+                >
+              </td>
+              <td role="cell" class="cell-seen">
+                <span class="seen"
+                  ><time
+                    datetime="2026-09-30T22:12:00Z"
+                    title="Sep 30, 6:12 PM EDT"
+                    >Sep 30, 6:12 PM</time
+                  ></span
+                >
+              </td>
+              <td role="cell" class="cell-state">
+                <span class="state idle">Idle</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="machines-note">
+          “In use” means a token delivery in the last 5 minutes. The server
+          cannot see whether a session is still running.
+        </p>
+        <details class="revoked" data-param="revoked" data-value="show">
+          <summary>1 revoked machine</summary>
+          <ul>
+            <li>
+              <b>Old iMac</b><span>Revoked</span
+              ><span
+                >Last token delivery
+                <time
+                  datetime="2026-08-12T15:02:00Z"
+                  title="Aug 12, 11:02 AM EDT"
+                  >Aug 12</time
+                ></span
+              >
+            </li>
+          </ul>
+        </details>
+      </section>
+    </main>
+    <footer class="wrap footer">
+      <span translate="no">codexctl v0.1.37</span>
+      <a
+        href="https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md"
+        >Documentation</a
+      >
+      <nav class="proto-nav" aria-label="Prototype pages">
+        <span>Prototype:</span>
+        <a href="index.html">Signed out</a>
+        <a href="overview.html">Accounts</a>
+        <a href="overview-healthy.html">Accounts, all healthy</a>
+        <a href="overview-blocked.html" aria-current="page"
+          >Accounts, nothing left</a
+        >
+        <a href="overview-stale.html">Accounts, refresh failed</a>
+        <a href="approve.html">Approve machine</a>
+        <a href="connected.html">Connected</a>
+      </nav>
+    </footer>
+    <script src="script.js"></script>
+  </body>
+</html>
