@@ -611,6 +611,8 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_real_store_scenarios() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
         let Ok(url) = std::env::var("DATABASE_URL") else {
             return;
         };
@@ -633,6 +635,14 @@ mod tests {
             second.acquire_lease(&id, "b", Duration::from_secs(60))
         );
         assert!(a.is_ok() ^ b.is_ok());
+        let upstream_refreshes = AtomicUsize::new(0);
+        if a.is_ok() {
+            upstream_refreshes.fetch_add(1, Ordering::Relaxed);
+        }
+        if b.is_ok() {
+            upstream_refreshes.fetch_add(1, Ordering::Relaxed);
+        }
+        assert_eq!(upstream_refreshes.load(Ordering::Relaxed), 1);
         let lease = a.or(b).unwrap();
         assert!(first.fenced_write(&lease, &record(&id, 2)).await.unwrap());
         let stale = Lease {
