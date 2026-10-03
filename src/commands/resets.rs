@@ -98,7 +98,7 @@ pub fn run_list() -> Result<()> {
     }
     println!("{total} banked, {redeemable} redeemable now.");
     if server_mode {
-        println!("Server-account reset redemption is not supported.");
+        println!("Redeem with `codexctl resets --redeem <alias>`.");
     } else if redeemable > 0 {
         println!("Redeem with `codexctl reset <alias>`.");
     } else if total > 0 {
@@ -192,9 +192,37 @@ pub fn run_claim(within_days: i64, assume_yes: bool) -> Result<()> {
 pub fn run_redeem(alias: Option<&str>, assume_yes: bool, credit_id: Option<&str>) -> Result<()> {
     let alias = match alias {
         Some(alias) => alias.to_string(),
-        None => profile::get_active()?
-            .context("no active profile; pass an alias: codexctl reset <alias>")?,
+        None => {
+            #[cfg(feature = "central-prototype")]
+            let active = codexctl::central::native::active_alias()?.or(profile::get_active()?);
+            #[cfg(not(feature = "central-prototype"))]
+            let active = profile::get_active()?;
+            active.context("no active account; pass an alias: codexctl resets --redeem <alias>")?
+        }
     };
+    #[cfg(feature = "central-prototype")]
+    if let Some(inventory) = codexctl::central::remote::resets()?
+        && inventory
+            .accounts
+            .iter()
+            .any(|account| account.alias == alias)
+    {
+        if credit_id.is_some() {
+            bail!(
+                "the account server selects the qualifying reset closest to expiry; omit --credit"
+            );
+        }
+        if !assume_yes
+            && !confirm(&format!(
+                "Redeem a banked reset for {alias}? This is not refundable."
+            ))?
+        {
+            bail!("redemption cancelled");
+        }
+        let response = codexctl::central::remote::redeem_reset(&alias)?;
+        report_outcome(&alias, &response);
+        return Ok(());
+    }
     // Fail early on an unknown alias rather than after a round trip.
     profile::get_profile(&alias)?;
 

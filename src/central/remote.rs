@@ -480,6 +480,70 @@ pub fn resets() -> Result<Option<ResetInventory>> {
     Ok(Some(result))
 }
 
+/// Retain the operation ID until its result is known, including across CLI restarts.
+pub fn redeem_reset(alias: &str) -> Result<api::ConsumeResetResponse> {
+    let alias = super::managed::normalize_alias(alias)?;
+    let connection = connection()?.context("run codexctl connect first")?;
+    let identity = vault::digest(&serde_json::to_vec(&(
+        &connection.server,
+        &connection.user_id,
+        alias,
+    ))?);
+    let directory = root()?.join("reset-requests");
+    let _lock = vault::lock(&directory, &format!("{identity}.lock"))?;
+    require_current_connection(&connection)?;
+    let pending = directory.join(format!("{identity}.json"));
+    let request_id: String = if pending.try_exists()? {
+        serde_json::from_slice(&vault::private_read(&pending)?)?
+    } else {
+        let id = api::new_redeem_request_id("server");
+        store::atomic_write(&pending, &serde_json::to_vec(&id)?)?;
+        id
+    };
+    let response = transport::blocking()?
+        .post(format!(
+            "{}/v1/resets/redeem",
+            connection.server.trim_end_matches('/')
+        ))
+        .bearer_auth(secret(&connection)?)
+        .json(&super::resets::Redemption {
+            alias: alias.into(),
+            redeem_request_id: request_id,
+        })
+        .send()
+        .context("reset outcome unknown; rerun the same command on this machine to retry safely")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let error: Value = response.json().unwrap_or(Value::Null);
+        let reason = match error["error"].as_str() {
+            Some("nothing_to_reset") => "no exhausted window; no reset was spent",
+            Some("no_reset_credit") => "no qualifying banked reset is available",
+            Some("reset_pending") => {
+                "an earlier reset is unresolved; retry from the machine that started it"
+            }
+            _ => "reset outcome unknown; rerun the same command on this machine to retry safely",
+        };
+        if matches!(
+            error["error"].as_str(),
+            Some("nothing_to_reset" | "no_reset_credit")
+        ) {
+            std::fs::remove_file(&pending)?;
+            store::sync_directory(&directory)?;
+        }
+        bail!("{alias}: {reason} (HTTP {status})");
+    }
+    let result: api::ConsumeResetResponse = response
+        .json()
+        .context("reset outcome unknown; rerun the same command on this machine to retry safely")?;
+    if result.code == api::ConsumeResetCode::Unknown {
+        bail!("reset outcome unknown; rerun the same command on this machine to retry safely");
+    }
+    require_current_connection(&connection)?;
+    std::fs::remove_file(&pending)?;
+    store::sync_directory(&directory)?;
+    Ok(result)
+}
+
 pub fn accounts() -> Result<Option<Vec<Account>>> {
     Ok(catalog()?.map(|c| c.accounts))
 }
@@ -1007,6 +1071,75 @@ pub fn select(accounts: &[Account]) -> Result<String> {
         let exhausted_a=score(a)>=500.0;let exhausted_b=score(b)>=500.0;
         exhausted_a.cmp(&exhausted_b).then_with(||if most||exhausted_a{by_score}else{a.resets_at.unwrap_or(i64::MAX).cmp(&b.resets_at.unwrap_or(i64::MAX)).then(by_score)})
     }).map(|a|a.alias.clone()).context("no available account with verified included usage; select an alias explicitly to approve credit billing")
+}
+
+/// Plan a reset only after included headroom is unavailable. Spending is deferred
+/// until native activation has checked the home and account migration fences.
+pub(super) fn select_for_activation(
+    accounts: &[Account],
+    allow_resets: bool,
+) -> Result<(String, bool)> {
+    let ready: Vec<_> = accounts
+        .iter()
+        .filter(|a| {
+            [a.primary_used, a.secondary_used]
+                .into_iter()
+                .flatten()
+                .all(|used| used.is_finite() && (0.0..100.0).contains(&used))
+        })
+        .cloned()
+        .collect();
+    if let Ok(alias) = select(&ready) {
+        return Ok((alias, false));
+    }
+    if !allow_resets {
+        return select(accounts).map(|alias| (alias, false));
+    }
+    let inventory = resets()?.context("account server disconnected")?;
+    let mut candidates = Vec::new();
+    for account in accounts {
+        if !account.available
+            || account.usage_stale
+            || account.billing_class == api::BillingClass::UsageBased
+            || !account
+                .plan
+                .as_deref()
+                .is_some_and(api::is_known_rate_limited_plan)
+            || ![account.primary_used, account.secondary_used]
+                .into_iter()
+                .flatten()
+                .any(|used| used.is_finite() && used >= 100.0)
+        {
+            continue;
+        }
+        let Some(reset) = inventory.accounts.iter().find(|r| r.alias == account.alias) else {
+            continue;
+        };
+        if let ResetOutcome::Read {
+            applicable,
+            credits,
+            ..
+        } = &reset.outcome
+            && *applicable > 0
+            && let Some(expiry) = credits
+                .iter()
+                .filter(|c| c.is_available())
+                .filter(|c| {
+                    c.expires_at_timestamp()
+                        .is_none_or(|t| t > chrono::Utc::now().timestamp())
+                })
+                .map(|c| c.expires_at_timestamp().unwrap_or(i64::MAX))
+                .min()
+        {
+            candidates.push((expiry, account.alias.clone()));
+        }
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|(_, alias)| (alias, true))
+        .context("no included headroom or qualifying banked reset is available")
 }
 
 fn same_seat(left: &Value, right: &Value) -> Result<bool> {

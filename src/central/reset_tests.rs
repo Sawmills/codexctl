@@ -317,3 +317,161 @@ async fn reset_inventory_stops_after_one_rejected_token_retry() {
     fixture.stop().await;
     upstream.abort();
 }
+
+impl Fixture {
+    async fn redeem(&self, id: &str) -> (StatusCode, Value) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/resets/redeem", listener.local_addr().unwrap());
+        let app = crate::central::resets::routes().with_state(self.broker.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::Client::new()
+            .post(url)
+            .headers(self.headers.clone())
+            .json(&json!({"alias":"personal","redeem_request_id":id}))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        server.abort();
+        (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+    }
+}
+
+#[tokio::test]
+async fn reset_redemption_refuses_an_account_without_an_exhausted_window() {
+    let (base, upstream) = upstream(
+        json!({"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}}),
+        json!({}),
+        StatusCode::OK,
+    )
+    .await;
+    let fixture = Fixture::start(&base).await;
+    let (status, body) = fixture.redeem("not-exhausted").await;
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body, json!({"error":"nothing_to_reset"}));
+}
+
+async fn redemption_upstream(
+    ambiguous: bool,
+) -> (
+    String,
+    Arc<StdMutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let received = Arc::new(StdMutex::new(Vec::new()));
+    let requests = received.clone();
+    let app = Router::new()
+        .route("/usage", get(|| async { Json(json!({"rate_limit_reset_credits":{"available_count":3,"applicable_available_count":1}})) }))
+        .route("/credits", get(|| async { Json(json!({"credits":[
+            {"id":"late","status":"available","expires_at":"2036-08-12T00:00:00Z"},
+            {"id":"spent","status":"redeemed","expires_at":"2036-06-01T00:00:00Z"},
+            {"id":"expired","status":"available","expires_at":"2000-01-01T00:00:00Z"},
+            {"id":"soon","status":"available","expires_at":"2036-07-26T00:00:00Z"}
+        ]})) }))
+        .route("/credits/consume", post(move |headers: HeaderMap, Json(body): Json<Value>| async move {
+            assert_eq!(headers["chatgpt-account-id"], "synthetic-seat");
+            assert!(headers.contains_key("authorization"));
+            let mut requests = requests.lock().unwrap();
+            requests.push(body);
+            if ambiguous && requests.len() == 1 {
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
+            Json(json!({"code":if ambiguous { "already_redeemed" } else { "reset" },"windows_reset":1})).into_response()
+        }));
+    (
+        base,
+        received,
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }),
+    )
+}
+
+#[tokio::test]
+async fn reset_redemption_spends_the_closest_expiry_on_an_exhausted_account() {
+    let (base, received, upstream) = redemption_upstream(false).await;
+    let fixture = Fixture::start(&base).await;
+    let (status, body) = fixture.redeem("closest-expiry").await;
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"code":"reset","windows_reset":1}));
+    let calls = received.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["credit_id"], "soon");
+}
+
+#[tokio::test]
+async fn reset_redemption_retry_returns_already_redeemed_without_a_second_spend() {
+    let (base, received, upstream) = redemption_upstream(false).await;
+    let fixture = Fixture::start(&base).await;
+    assert_eq!(fixture.redeem("durable-retry").await.0, StatusCode::OK);
+    // A new reader has no in-memory request cache; the receipt must be durable.
+    let mut broker = fixture.broker.clone();
+    broker.reset_reader = crate::central::resets::Reader::with_base(&base);
+    let retry = Fixture {
+        _root: tempfile::tempdir().unwrap(),
+        broker,
+        headers: fixture.headers.clone(),
+    };
+    let (status, body) = retry.redeem("durable-retry").await;
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], "already_redeemed");
+    assert_eq!(received.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reset_redemption_ambiguous_retry_keeps_the_credit_and_key_and_blocks_new_spends() {
+    let (base, received, upstream) = redemption_upstream(true).await;
+    let fixture = Fixture::start(&base).await;
+    assert_eq!(fixture.redeem("uncertain").await.0, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        fixture.redeem("new-operation").await,
+        (StatusCode::CONFLICT, json!({"error":"reset_pending"}))
+    );
+    let mut broker = fixture.broker.clone();
+    broker.reset_reader = crate::central::resets::Reader::with_base(&base);
+    let retry = Fixture {
+        _root: tempfile::tempdir().unwrap(),
+        broker,
+        headers: fixture.headers.clone(),
+    };
+    let (status, body) = retry.redeem("uncertain").await;
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["code"], "already_redeemed");
+    let calls = received.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], calls[1]);
+    assert_eq!(calls[0]["credit_id"], "soon");
+    assert_eq!(
+        fixture.broker.failures.lock().unwrap()["reset_redeem_failed"].count,
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_reset_retries_spend_only_once() {
+    let (base, received, upstream) = redemption_upstream(false).await;
+    let fixture = Fixture::start(&base).await;
+    let (first, second) = tokio::join!(fixture.redeem("concurrent"), fixture.redeem("concurrent"));
+    fixture.stop().await;
+    upstream.abort();
+    assert_eq!(first.0, StatusCode::OK);
+    assert_eq!(second.0, StatusCode::OK);
+    let mut codes = [
+        first.1["code"].as_str().unwrap(),
+        second.1["code"].as_str().unwrap(),
+    ];
+    codes.sort();
+    assert_eq!(codes, ["already_redeemed", "reset"]);
+    assert_eq!(received.lock().unwrap().len(), 1);
+}

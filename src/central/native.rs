@@ -393,7 +393,7 @@ pub(super) fn known_local_alias(alias: &str) -> Result<bool> {
     Ok(false)
 }
 
-pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
+pub fn activate(alias: Option<&str>, allow_billing: bool, allow_resets: bool) -> Result<bool> {
     let explicit = alias.is_some();
     if let Some(alias) = alias
         && known_local_alias(alias)?
@@ -401,6 +401,7 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
         return Ok(false);
     }
     let catalog = super::remote::catalog()?;
+    let mut redeem_reset = false;
     let selected_remote = catalog
         .as_ref()
         .map(|catalog| {
@@ -412,7 +413,9 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
                     .map(|a| a.alias.clone())
                     .context("server account alias not found")
             } else {
-                super::remote::select(accounts)
+                let (alias, redeem) = super::remote::select_for_activation(accounts, allow_resets)?;
+                redeem_reset = redeem;
+                Ok(alias)
             }
         })
         .transpose()?;
@@ -497,6 +500,16 @@ pub fn activate(alias: Option<&str>, allow_billing: bool) -> Result<bool> {
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
     drop(_lock);
+    if redeem_reset {
+        let response = super::remote::redeem_reset(alias)?;
+        if !matches!(
+            response.code,
+            api::ConsumeResetCode::Reset | api::ConsumeResetCode::AlreadyRedeemed
+        ) {
+            bail!("banked reset did not clear the account's exhausted window");
+        }
+        eprintln!("codexctl: redeemed a banked reset for {alias}");
+    }
     let token = fetch(&connection, false)?;
     let usage_based = token.billing_class != Some(api::BillingClass::RateLimited);
     if usage_based && !explicit {

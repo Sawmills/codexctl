@@ -5649,3 +5649,193 @@ fn statusline_status_json_populates_only_the_active_server_account() {
     assert!(String::from_utf8_lossy(&line.stdout).starts_with("Personal 63% wk · "));
     assert!(line.stderr.is_empty());
 }
+
+#[test]
+fn reset_redemption_rejects_another_company_users_account() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    let response = server
+        .http
+        .post(format!("{}/v1/resets/redeem", server.url))
+        .bearer_auth(&server.alex)
+        .json(&json!({"alias":"personal","redeem_request_id":"wrong-company-user"}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+    assert_eq!(
+        response.json::<Value>().unwrap(),
+        json!({"error":"account_not_found"})
+    );
+}
+
+#[test]
+fn resets_redeem_command_accepts_an_alias_and_explicit_consent() {
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .args(["resets", "--redeem", "missing", "--yes"])
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("profile 'missing' not found"), "{error}");
+}
+
+#[test]
+fn server_reset_cli_retries_an_ambiguous_response_with_the_same_request_id() {
+    use std::io::{Read, Write};
+    let server = Server::start();
+    let home = server.connected_home();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let registration = home.path().join(".codexctl/central/.server.json");
+    let mut connection: Value =
+        serde_json::from_slice(&std::fs::read(&registration).unwrap()).unwrap();
+    connection["server"] = json!(format!("http://{}", listener.local_addr().unwrap()));
+    store::atomic_write(&registration, &serde_json::to_vec(&connection).unwrap()).unwrap();
+    let requests = std::thread::spawn(move || {
+        let mut redemptions = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        while std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut headers = String::new();
+            while !headers.ends_with("\r\n\r\n") {
+                if reader.read_line(&mut headers).unwrap() == 0 {
+                    break;
+                }
+            }
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|v| v.parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            drop(reader);
+            let (status, response) = if headers.starts_with("GET /v1/resets ") {
+                (
+                    "200 OK",
+                    json!({"userId":"amir","accounts":[{"alias":"personal","available":2,"applicable":1,"credits":[]}]}),
+                )
+            } else {
+                assert!(headers.starts_with("POST /v1/resets/redeem "));
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["alias"], "personal");
+                assert_eq!(body.as_object().unwrap().len(), 2);
+                redemptions.push(body);
+                if redemptions.len() == 1 {
+                    ("502 Bad Gateway", json!({"error":"reset_redeem_failed"}))
+                } else {
+                    (
+                        "200 OK",
+                        json!({"code":"already_redeemed","windows_reset":1}),
+                    )
+                }
+            };
+            let body = response.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            if redemptions.len() == 2 {
+                break;
+            }
+        }
+        redemptions
+    });
+    let first = server.cli(home.path(), &["resets", "--redeem", "personal", "--yes"]);
+    assert!(!first.status.success());
+    let retry = server.cli(home.path(), &["resets", "--redeem", "personal", "--yes"]);
+    let requests = requests.join().unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0], requests[1]);
+}
+
+#[test]
+fn server_automatic_reset_requires_reset_approval_and_never_runs_for_explicit_aliases() {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use std::sync::{Arc, Mutex};
+    for (args, plan, used, expected) in [
+        (vec!["use", "--allow-resets"], "pro", 100.0, 1),
+        (vec!["use"], "pro", 100.0, 0),
+        (vec!["use", "--allow-billing"], "pro", 100.0, 0),
+        (
+            vec!["use", "personal", "--allow-resets", "--allow-billing"],
+            "pro",
+            100.0,
+            0,
+        ),
+        (vec!["use", "--allow-resets"], "team_usage_based", 100.0, 0),
+        (vec!["use", "--allow-resets"], "pro", 20.0, 0),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".codexctl/central");
+        let credential = directory.join("device.token");
+        store::atomic_write(&credential, b"synthetic-device").unwrap();
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let requests = received.clone();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let server = format!("http://{}", listener.local_addr().unwrap());
+        store::atomic_write(
+            &directory.join(".server.json"),
+            &serde_json::to_vec(
+                &json!({"server":server,"token_file":credential,"user_id":"synthetic-user"}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":false});
+        let app = Router::new()
+            .route("/v1/accounts", get(move || async move { Json(json!([account])) }))
+            .route("/v1/resets", get(|| async { Json(json!({"userId":"synthetic-user","accounts":[{"alias":"personal","available":1,"applicable":1,"credits":[{"id":"soon","status":"available","expires_at":"2036-07-26T00:00:00Z"}]}]})) }))
+            .route("/v1/resets/redeem", post(move |Json(body): Json<Value>| async move {
+                requests.lock().unwrap().push(body);
+                axum::http::StatusCode::BAD_GATEWAY
+            }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn(move || {
+            runtime.block_on(async {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            })
+        });
+        let _output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .env("HOME", home.path())
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .args(&args)
+            .output()
+            .unwrap();
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+        assert_eq!(
+            received.lock().unwrap().len(),
+            expected,
+            "{args:?}, {plan}, {used}"
+        );
+    }
+}

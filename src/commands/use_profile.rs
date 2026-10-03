@@ -24,7 +24,7 @@ pub fn run(
     restart_daemon: bool,
 ) -> Result<()> {
     #[cfg(feature = "central-prototype")]
-    if codexctl::central::native::activate(alias, _allow_billing)? {
+    if codexctl::central::native::activate(alias, _allow_billing, allow_resets)? {
         return Ok(());
     }
     run_to_auth_json(

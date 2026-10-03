@@ -133,15 +133,18 @@ enum Commands {
     Switch,
     /// List banked rate-limit resets across all accounts
     Resets {
+        /// Redeem one banked reset for an exhausted account
+        #[arg(long, conflicts_with = "claim", group = "redemption")]
+        redeem: Option<String>,
         /// Redeem every banked reset that is about to lapse on an account
         /// that is already rate-limited, instead of just listing them
-        #[arg(long)]
+        #[arg(long, group = "redemption")]
         claim: bool,
         /// How soon a credit must lapse to be claimed, in days
         #[arg(long, default_value_t = 3, requires = "claim")]
         within_days: i64,
-        /// Claim without confirming (for unattended runs)
-        #[arg(long, short = 'y', requires = "claim")]
+        /// Redeem without confirming (for unattended runs)
+        #[arg(long, short = 'y', requires = "redemption")]
         yes: bool,
     },
     /// Redeem a banked rate-limit reset to clear an exhausted window
@@ -310,11 +313,14 @@ fn main() {
         ),
         Commands::Switch => commands::switch::run(),
         Commands::Resets {
+            ref redeem,
             claim,
             within_days,
             yes,
         } => {
-            if claim {
+            if let Some(alias) = redeem {
+                commands::resets::run_redeem(Some(alias), yes, None)
+            } else if claim {
                 commands::resets::run_claim(within_days, yes)
             } else {
                 commands::resets::run_list()
