@@ -82,6 +82,13 @@ enum Commands {
         #[arg(long)]
         key_file: PathBuf,
     },
+    /// Copy local file state into the configured PostgreSQL store once.
+    Backfill {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
     /// Serve the account API behind a private HTTPS ingress.
     Serve {
         #[arg(long)]
@@ -195,6 +202,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         Commands::Revoke { state, device } => central::revoke(&state, &device)?,
         Commands::Migrate { state, key_file } => {
             central::storage::migrate(&state, &key_file).await?
+        }
+        Commands::Backfill { state, key_file } => {
+            let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
+            let counts = store.backfill(&state, &key_file).await?;
+            println!("{}", serde_json::to_string(&counts)?);
         }
         Commands::Serve {
             state,

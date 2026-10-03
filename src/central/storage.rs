@@ -2,8 +2,8 @@
 //!
 //! File storage remains the default.  PostgreSQL schema provisioning is
 //! available with `codexctl-central migrate`; server startup rejects
-//! `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until runtime reads and writes
-//! are wired to the shared store.  The database never receives the vault key:
+//! `CODEXCTL_CENTRAL_STORE=postgres`; dual mode is opt-in until rollout. The
+//! database never receives the vault key:
 //! credential and enrollment payloads are nonce-prefixed AES-GCM ciphertext.
 
 use super::vault;
@@ -50,6 +50,16 @@ impl StoreMode {
         std::env::var("CODEXCTL_CENTRAL_DUAL_WRITE")
             .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false)
+    }
+}
+
+impl std::fmt::Display for StoreMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Postgres => "postgres",
+            Self::Dual => "dual",
+        })
     }
 }
 
@@ -115,6 +125,14 @@ pub enum CentralStore {
     },
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct BackfillCounts {
+    pub accounts: usize,
+    pub users: usize,
+    pub devices: usize,
+    pub relogins: usize,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS central_schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -143,6 +161,11 @@ CREATE TABLE IF NOT EXISTS enrollment_challenges (
     consumed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challenges (expires_at);
+CREATE TABLE IF NOT EXISTS central_registry (
+    name TEXT PRIMARY KEY,
+    encrypted_payload BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 "#;
 
 impl CentralStore {
@@ -179,13 +202,130 @@ impl CentralStore {
         }
     }
 
+    pub fn mode(&self) -> StoreMode {
+        match self {
+            Self::File(_) => StoreMode::File,
+            Self::Postgres(_) => StoreMode::Postgres,
+            Self::Dual { .. } => StoreMode::Dual,
+        }
+    }
+
+    pub async fn reachable(&self) -> bool {
+        match self {
+            Self::File(file) => file.path().exists() || file.state.exists(),
+            Self::Postgres(db) => db.client.simple_query("SELECT 1").await.is_ok(),
+            Self::Dual { postgres, .. } => postgres.client.simple_query("SELECT 1").await.is_ok(),
+        }
+    }
+
+    pub async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        match self {
+            Self::File(file) => file.save_registry(name, payload),
+            Self::Postgres(db) => db.save_registry(name, payload).await,
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
+                postgres.save_registry(name, payload).await?;
+                if let Err(error) = file.save_registry(name, payload) {
+                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"operation":"central_store_mirror","backend":"file","stage":"registry","reason":error.to_string()})
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn backfill(&self, state: &Path, key: &Path) -> Result<BackfillCounts> {
+        let target = match self {
+            Self::Postgres(db) => db,
+            Self::Dual { postgres, .. } => postgres,
+            Self::File(_) => bail!("backfill requires PostgreSQL or dual central storage"),
+        };
+        target.migrate().await?;
+        let mut counts = BackfillCounts {
+            accounts: 0,
+            users: 0,
+            devices: 0,
+            relogins: 0,
+        };
+        let accounts = state.join("accounts");
+        if accounts.exists() {
+            for entry in std::fs::read_dir(accounts)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let account_state = entry.path();
+                if !account_state.join("vault.enc").exists() {
+                    continue;
+                }
+                let value = crate::central::vault::load(&account_state, key)?;
+                let record = CredentialRecord {
+                    account_id: crate::central::vault::account(&value.auth)?,
+                    user_id: Some(value.user.clone()),
+                    alias: value.alias.clone(),
+                    workspace: None,
+                    login: None,
+                    vault: serde_json::to_value(value)?,
+                    revision: 1,
+                };
+                target.save_account(&record).await?;
+                counts.accounts += 1;
+            }
+        }
+        for (name, path) in [
+            ("users", state.join("users.json")),
+            ("devices", state.join("devices.json")),
+        ] {
+            if path.exists() {
+                let bytes = crate::central::vault::private_read(&path)?;
+                target.save_registry(name, &bytes).await?;
+                if name == "users" {
+                    counts.users =
+                        serde_json::from_slice::<Vec<crate::central::managed::User>>(&bytes)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                } else {
+                    counts.devices =
+                        serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)
+                            .map(|v| v.len())
+                            .unwrap_or(0);
+                }
+            }
+        }
+        let relogin = state.join("relogin");
+        if relogin.exists() {
+            counts.relogins = std::fs::read_dir(relogin)?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().join("record.json").exists())
+                .count();
+        }
+        Ok(counts)
+    }
+
     pub async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
         match self {
             Self::File(file) => file.save_account(record),
             Self::Postgres(db) => db.save_account(record).await,
-            Self::Dual { file, postgres, .. } => {
-                file.save_account(record)?;
-                postgres.save_account(record).await
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
+                postgres.save_account(record).await?;
+                if let Err(error) = file.save_account(record) {
+                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"operation":"central_store_mirror","backend":"file","stage":"save_account","reason":error.to_string()})
+                    );
+                }
+                Ok(())
             }
         }
     }
@@ -453,6 +593,16 @@ impl FileStore {
             .transpose()
     }
 
+    fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        self.with_lock(|state| {
+            state.accounts.insert(
+                format!("registry:{name}"),
+                vault::encrypt_bytes(&self.key, payload)?,
+            );
+            Ok(())
+        })
+    }
+
     fn acquire_lease(&self, account_id: &str, holder_id: &str, ttl: Duration) -> Result<Lease> {
         let now = now_secs();
         self.with_lock(|state| {
@@ -650,6 +800,12 @@ impl PostgresStore {
         Ok(())
     }
 
+    async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        let encrypted = vault::encrypt_bytes(&self.key, payload)?;
+        self.client.execute("INSERT INTO central_registry(name,encrypted_payload) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,updated_at=now()", &[&name, &encrypted]).await?;
+        Ok(())
+    }
+
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         let row = self.client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1", &[&account_id]).await?;
         row.map(|row| {
@@ -751,20 +907,29 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Refuse PostgreSQL modes during server startup until the runtime is wired to
-/// the shared store. File mode remains the default and needs no migration.
-pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
+/// Open the configured runtime store. PostgreSQL remains deliberately refused;
+/// dual mode needs an explicit acknowledgement because it changes the source
+/// of truth for shared state.
+pub async fn runtime_store(state: &Path, key: &Path) -> Result<CentralStore> {
     match StoreMode::from_env()? {
-        StoreMode::File => Ok(()),
-        mode => {
-            eprintln!(
-                "central storage: refusing startup with {mode:?}; phase 1 provisions the PostgreSQL schema only, while runtime storage still uses the file vault; run codexctl-central migrate separately"
-            );
-            bail!(
-                "central storage mode {mode:?} is not wired into runtime yet; startup supports only file mode"
-            )
+        StoreMode::File => CentralStore::from_mode(StoreMode::File, state, key).await,
+        StoreMode::Postgres => {
+            bail!("central storage mode postgres remains disabled until a later phase")
+        }
+        StoreMode::Dual => {
+            if std::env::var("CODEXCTL_CENTRAL_DUAL_ACK").ok().as_deref() != Some("1") {
+                bail!("dual central storage requires CODEXCTL_CENTRAL_DUAL_ACK=1")
+            }
+            let store = CentralStore::from_mode(StoreMode::Dual, state, key).await?;
+            store.migrate().await?;
+            Ok(store)
         }
     }
+}
+
+pub async fn maybe_migrate(state: &Path, key: &Path) -> Result<()> {
+    let _ = runtime_store(state, key).await?;
+    Ok(())
 }
 
 /// Apply the configured schema migration. This is intentionally separate from

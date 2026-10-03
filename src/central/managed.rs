@@ -3,6 +3,7 @@ use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest},
+    storage::{CentralStore, CredentialRecord},
     transport,
     vault::{self, Vault},
 };
@@ -107,6 +108,8 @@ pub(super) struct Broker {
     pub(super) work: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    pub(super) central: Option<CentralStore>,
+    pub(super) holder_id: String,
 }
 pub(super) struct HttpError {
     status: StatusCode,
@@ -245,6 +248,22 @@ fn account_summary(owner: &Owner) -> Account {
 }
 
 impl Broker {
+    async fn persist_owner(&self, owner: &Owner) -> Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        let record = CredentialRecord {
+            account_id: vault::account(&owner.vault.auth)?,
+            user_id: Some(owner.vault.user.clone()),
+            alias: owner.vault.alias.clone(),
+            workspace: None,
+            login: None,
+            vault: serde_json::to_value(&owner.vault)?,
+            revision: chrono::Utc::now().timestamp_micros(),
+        };
+        central.save_account(&record).await
+    }
+
     pub(super) fn record_failure(
         &self,
         reason: &'static str,
@@ -364,10 +383,59 @@ async fn token(
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
         let mut owner = owner.lock().await;
+        let account_id = vault::account(&owner.vault.auth)
+            .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        let lease = if request.previous_revision.is_some() {
+            if let Some(central) = worker.central.as_ref() {
+                Some(
+                    central
+                        .acquire_lease(
+                            &account_id,
+                            &worker.holder_id,
+                            std::time::Duration::from_secs(120),
+                        )
+                        .await
+                        .map_err(|_| {
+                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                        })?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let token = owner
             .tokens(request)
             .await
             .map_err(|e| worker.owner_failure(e))?;
+        let record = CredentialRecord {
+            account_id: account_id.clone(),
+            user_id: Some(owner.vault.user.clone()),
+            alias: owner.vault.alias.clone(),
+            workspace: None,
+            login: None,
+            vault: serde_json::to_value(&owner.vault)
+                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?,
+            revision: chrono::Utc::now().timestamp_micros(),
+        };
+        let written = if let Some(central) = worker.central.as_ref() {
+            if let Some(lease) = lease {
+                central.fenced_write(&lease, &record).await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?
+            } else {
+                central.save_account(&record).await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                true
+            }
+        } else {
+            true
+        };
+        if !written {
+            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+        }
         Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
     })
     .await
@@ -707,6 +775,23 @@ impl Broker {
                 vault::save(&state, &self.key, &saved).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
+                let owner_record = CredentialRecord {
+                    account_id: vault::account(&saved.auth)
+                        .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                    user_id: Some(saved.user.clone()),
+                    alias: saved.alias.clone(),
+                    workspace: None,
+                    login: None,
+                    vault: serde_json::to_value(&saved).map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?,
+                    revision: chrono::Utc::now().timestamp_micros(),
+                };
+                if let Some(central) = self.central.as_ref() {
+                    central.save_account(&owner_record).await.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+                }
             }
         } else {
             store::ensure_private_dir(&state)
@@ -722,6 +807,23 @@ impl Broker {
             };
             vault::save(&state, &self.key, &vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            let owner_record = CredentialRecord {
+                account_id: vault::account(&vault.auth)
+                    .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                user_id: Some(vault.user.clone()),
+                alias: vault.alias.clone(),
+                workspace: None,
+                login: None,
+                vault: serde_json::to_value(&vault).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?,
+                revision: chrono::Utc::now().timestamp_micros(),
+            };
+            if let Some(central) = self.central.as_ref() {
+                central.save_account(&owner_record).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+            }
         }
         let owner = Arc::new(Mutex::new(
             prepare_owner(&state, &self.key, self.read_only)
@@ -762,6 +864,9 @@ impl Broker {
             }
             owner.vault.verified = true;
             vault::save(&state, &self.key, &owner.vault)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            self.persist_owner(&owner)
+                .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             // Verification and the durable vault precede retirement. A crash or
             // retirement failure leaves reservations for an explicit migration retry.
@@ -859,12 +964,26 @@ async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> 
     }
     response
 }
-async fn ready(State(broker): State<Broker>) -> StatusCode {
-    if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+async fn ready(State(broker): State<Broker>) -> Response {
+    let local = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
+    let reachable = match broker.central.as_ref() {
+        Some(store) => store.reachable().await,
+        None => true,
+    };
+    let status = if local && reachable {
         StatusCode::OK
-    }
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let mode = broker
+        .central
+        .as_ref()
+        .map_or_else(|| "file".to_owned(), |store| store.mode().to_string());
+    (
+        status,
+        Json(json!({"mode": mode, "databaseReachable": reachable})),
+    )
+        .into_response()
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
@@ -1013,7 +1132,16 @@ pub async fn serve(
         bail!("network listener requires an HTTPS ingress origin");
     }
     let _lock = vault::lock(state, "owner.lock")?;
-    super::storage::maybe_migrate(state, key).await?;
+    let central = super::storage::runtime_store(state, key).await?;
+    central
+        .save_registry("users", &vault::private_read(&state.join("users.json"))?)
+        .await?;
+    central
+        .save_registry(
+            "devices",
+            &vault::private_read(&state.join("devices.json"))?,
+        )
+        .await?;
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -1205,6 +1333,8 @@ pub async fn serve(
         work: Arc::new(Semaphore::new(128)),
         stopping: Arc::new(AtomicBool::new(false)),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+        holder_id: vault::digest(format!("{}:{}", std::process::id(), state.display()).as_bytes()),
+        central: Some(central),
         metrics_hash: metrics_token_file
             .map(|p| {
                 let bytes = vault::private_read(p)?;
@@ -1351,6 +1481,8 @@ mod tests {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            central: None,
+            holder_id: "test-holder".into(),
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
