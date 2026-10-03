@@ -7343,3 +7343,79 @@ db.close()
             .exists()
     );
 }
+
+#[test]
+fn b21_lane_account_refuses_billing_without_consent_and_exhaustion_even_with_consent() {
+    use std::os::unix::fs::PermissionsExt;
+    for (mode, plan, allow_billing, message) in [
+        ("open-spend-cap", "business", false, "--allow-billing"),
+        ("exhausted-weekly", "pro", false, "exhausted"),
+        ("exhausted-weekly", "pro", true, "exhausted"),
+    ] {
+        let server = Server::start();
+        server.import(&server.amir, "host", "host-login", "host-seat");
+        let home = server.connected_home();
+        assert!(server.cli(home.path(), &["use", "host"]).status.success());
+        let mut selected_auth = auth("lane-login", "lane-seat");
+        let access = selected_auth["tokens"]["access_token"].as_str().unwrap();
+        let mut claims: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(access.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        claims["https://api.openai.com/auth"]["chatgpt_plan_type"] = json!(plan);
+        selected_auth["tokens"]["access_token"] = json!(format!(
+            "header.{}.",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+        let imported = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"lane", "auth":selected_auth}))
+            .send()
+            .unwrap();
+        assert_eq!(imported.status(), 200);
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let config = home.path().join(".codex/config.toml");
+        let before = std::fs::read(&config).unwrap();
+        let bin = home.path().join("bin");
+        let capture = home.path().join("child-launched");
+        store::atomic_write(
+            &bin.join("codex"),
+            b"#!/bin/sh\ntouch \"$B21_CAPTURE\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let search_path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        command.args(["codex", "--account", "lane"]);
+        if allow_billing {
+            command.arg("--allow-billing");
+        }
+        let output = command
+            .arg("a prompt")
+            .env("HOME", home.path())
+            .env("PATH", search_path)
+            .env("B21_CAPTURE", &capture)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert!(!capture.exists());
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+    }
+}
