@@ -7185,3 +7185,161 @@ fn dashboard_identity_and_sign_out_are_scoped_to_the_browser_session() {
         200
     );
 }
+
+// B21's public CLI seams; these regressions are prepared before B17 merges.
+#[test]
+fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let config = home.path().join(".codex/config.toml");
+    let marker = home.path().join(".codexctl/central/.native-active.json");
+    let pointer = home.path().join(".codexctl/central/.active-account");
+    let before_config = std::fs::read(&config).unwrap();
+    let before_marker = std::fs::read(&marker).unwrap();
+    let before_pointer = std::fs::read(&pointer).ok();
+    let auth_file = home.path().join(".codex/auth.json");
+    let before_auth = std::fs::read(&auth_file).ok();
+    let bin = home.path().join("bin");
+    let cwd = home.path().join("project");
+    std::fs::create_dir(&cwd).unwrap();
+    let capture = home.path().join("child.json");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+connection = None
+for arg in args:
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+        if '--connection' in helper:
+            saved = json.loads(pathlib.Path(helper[helper.index('--connection') + 1]).read_text())
+            connection = {'alias': saved.get('alias'), 'account_id': saved['account_id']}
+pathlib.Path(os.environ['B21_CAPTURE']).write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'connection': connection}))
+sys.exit(23)
+"##).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let search_path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for args in [
+        vec!["resume", "old-session", "--", "keep this prompt"],
+        vec!["new prompt"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["codex", "--account", "lane"])
+            .args(&args)
+            .env("HOME", home.path())
+            .env("PATH", &search_path)
+            .env("B21_CAPTURE", &capture)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let child: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(
+            child["connection"],
+            json!({"alias":"lane", "account_id":"lane-seat"})
+        );
+        let argv: Vec<&str> = child["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(argv.ends_with(&args));
+        assert!(!argv.contains(&"--account"));
+        assert!(
+            argv.iter()
+                .any(|a| *a == "model_provider=\"codexctl-central\"")
+        );
+        assert!(!argv.iter().any(|a| a.contains("ChatGPT-Account-ID")));
+        assert_eq!(child["cwd"], cwd.canonicalize().unwrap().to_str().unwrap());
+        assert_eq!(std::fs::read(&config).unwrap(), before_config);
+        assert_eq!(std::fs::read(&marker).unwrap(), before_marker);
+        assert_eq!(std::fs::read(&pointer).ok(), before_pointer);
+        assert_eq!(std::fs::read(&auth_file).ok(), before_auth);
+    }
+}
+
+#[test]
+fn b21_rate_reads_a_fixture_database_without_writing_it_or_inventing_token_rates() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "personal-login", "personal-seat");
+    let home = server.connected_home();
+    let database = home.path().join(".codex/logs_2.sqlite");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let fixture = Command::new("python3").args(["-c", r#"
+import sqlite3, sys, time
+now = int(time.time())
+db = sqlite3.connect(sys.argv[1])
+db.execute('CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)')
+db.executemany('INSERT INTO logs VALUES (?, ?, ?)', [
+    (now-2000, 'old:300', '/codex/responses status=429'),
+    (now-15, 'one:301', '/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}'),
+    (now-10, 'one:301', '/codex/responses status=429'),
+    (now-8, 'two:302', '/codex/responses status=429'),
+    (now-7, 'one:301', '/codex/responses status=500'),
+    (now-5, 'one:301', '/other/endpoint status=200'),
+])
+db.commit()
+db.close()
+"#]).arg(&database).output().unwrap();
+    assert!(fixture.status.success());
+    let before = std::fs::read(&database).unwrap();
+    let output = server.cli(home.path(), &["rate", "--json", "--minutes", "10"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report.as_object().unwrap().len(), 4);
+    assert_eq!(report["window_minutes"], 10);
+    assert!(!report["host"].as_str().unwrap().is_empty());
+    assert!(chrono::DateTime::parse_from_rfc3339(report["generated_at"].as_str().unwrap()).is_ok());
+    let rows = report["accounts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().find(|r| r["account"] == "personal").unwrap(),
+        &json!({
+            "account":"personal", "weekly_used_percent":37.0, "responses_ok":1,
+            "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]
+        })
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["account"] == "unattributed")
+            .unwrap(),
+        &json!({
+            "account":"unattributed", "weekly_used_percent":null, "responses_ok":0,
+            "responses_429":1, "rate_429":1.0, "processes":1, "pids":[302]
+        })
+    );
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.active-account")
+            .exists()
+    );
+}
