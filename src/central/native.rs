@@ -109,10 +109,13 @@ fn write_config_with(
     Ok(())
 }
 fn config_not_installed(destination: &Path, bytes: &[u8]) -> Result<bool> {
-    Ok(match std::fs::read(destination) {
-        Ok(installed) => installed != bytes,
-        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
-    })
+    match std::fs::read(destination) {
+        Ok(installed) => Ok(installed != bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).context("cannot verify whether the new Codex configuration was installed")
+        }
+    }
 }
 fn rollback_pointer_if_config_not_installed(
     destination: &Path,
@@ -120,7 +123,18 @@ fn rollback_pointer_if_config_not_installed(
     pointer: &Path,
     previous_pointer: Option<&[u8]>,
 ) -> Result<bool> {
-    let not_installed = config_not_installed(destination, bytes)?;
+    let not_installed = match config_not_installed(destination, bytes) {
+        Ok(not_installed) => not_installed,
+        Err(error) => {
+            // An unreadable destination leaves installation indeterminate. Restore the
+            // prior pointer (or remove the new one) so token delivery fails closed.
+            match previous_pointer {
+                Some(bytes) => store::atomic_write(pointer, bytes)?,
+                None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
+            }
+            return Err(error);
+        }
+    };
     if not_installed {
         match previous_pointer {
             Some(bytes) => store::atomic_write(pointer, bytes)?,
@@ -1137,6 +1151,26 @@ mod tests {
             rollback_pointer_if_config_not_installed(&destination, bytes, &pointer, None).unwrap();
         assert!(!not_installed);
         assert_eq!(fs::read(pointer).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn indeterminate_config_read_restores_the_previous_pointer_and_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("config.toml");
+        let pointer = root.path().join(".active-account");
+        fs::create_dir(&destination).unwrap();
+        fs::write(&pointer, b"new\n").unwrap();
+
+        let error = rollback_pointer_if_config_not_installed(
+            &destination,
+            b"model_provider = 'codexctl-central'\n",
+            &pointer,
+            Some(b"old\n"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot verify"));
+        assert_eq!(fs::read(pointer).unwrap(), b"old\n");
     }
 
     #[test]
