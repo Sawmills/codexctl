@@ -28,6 +28,11 @@ name = "codexctl-central"
 path = "src/bin/codexctl-central.rs"
 required-features = ["central-prototype"]
 
+[[bin]]
+name = "account-server"
+path = "src/bin/account-server.rs"
+required-features = ["central-prototype"]
+
 [dependencies]
 openidconnect = { version = "4", optional = true, default-features = false, features = [
   "reqwest",

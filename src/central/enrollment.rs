@@ -47,6 +47,7 @@ struct Configuration {
 }
 struct Pending {
     name: String,
+    providers: Vec<super::providers::Provider>,
     user_code: String,
     created: Instant,
     last_poll: Option<Instant>,
@@ -176,6 +177,11 @@ fn escape(s: &str) -> String {
 #[serde(deny_unknown_fields)]
 pub struct Start {
     pub name: String,
+    #[serde(
+        default = "super::providers::legacy",
+        skip_serializing_if = "super::providers::is_legacy"
+    )]
+    pub providers: Vec<super::providers::Provider>,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,6 +210,14 @@ async fn start(
     if input.name.is_empty() || input.name.len() > 80 || input.name.chars().any(char::is_control) {
         return Err(broker.error(StatusCode::BAD_REQUEST, "invalid_device_name"));
     }
+    if input.providers.is_empty()
+        || input
+            .providers
+            .iter()
+            .any(|p| !broker.providers.contains(p))
+    {
+        return Err(broker.error(StatusCode::BAD_REQUEST, "provider_not_enabled"));
+    }
     let mut flows = sso.flows.lock().expect("enrollment lock");
     Sso::cleanup(&mut flows);
     if flows.devices.len() >= 1024 {
@@ -216,6 +230,7 @@ async fn start(
         vault::digest(device_code.as_bytes()),
         Pending {
             name: input.name,
+            providers: input.providers,
             user_code: user_code.clone(),
             created: Instant::now(),
             last_poll: None,
@@ -429,6 +444,15 @@ async fn callback(
         name = name,
         code = code,
         approval = approval,
+        providers = device
+            .providers
+            .iter()
+            .map(|p| match p {
+                super::providers::Provider::Openai => "OpenAI",
+                super::providers::Provider::Anthropic => "Claude",
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
     );
     if flows.approvals.len() >= 1024 {
         return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
@@ -483,6 +507,7 @@ async fn approve(
         user: approval.user,
         token_hash: vault::digest(token.as_bytes()),
         revoked: false,
+        providers: device.providers.clone(),
     });
     vault::save_devices(&broker.state, &devices)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;

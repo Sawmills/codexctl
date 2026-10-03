@@ -1,10 +1,13 @@
 //! Experimental single-account credential broker and local App Server client.
+pub mod anthropic;
+mod anthropic_http;
 mod catalog;
 mod client;
 pub mod enrollment;
 pub mod managed;
 pub mod native;
 mod process;
+pub mod providers;
 mod relogin;
 pub mod remote;
 pub(crate) mod resets;
@@ -78,6 +81,7 @@ pub fn register(state: &Path, id: &str, tenant: &str, user: &str, token_file: &P
         user: user.into(),
         token_hash: vault::digest(token.as_bytes()),
         revoked: false,
+        providers: providers::legacy(),
     });
     vault::save_devices(state, &devices)
 }

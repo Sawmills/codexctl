@@ -36,6 +36,8 @@ impl Fixture {
         store::atomic_write(&binary,format!("#!/bin/sh\nexport CENTRAL_TEST_MODE_FILE={}\nexport CENTRAL_TEST_REFRESH_COUNTER={}\nexec {} \"$@\"\n",quoted(&mode),quoted(&counter),quoted(&fixture)).as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let broker = Broker {
+            providers: crate::central::providers::legacy(),
+            anthropic: None,
             state,
             key,
             binary,
