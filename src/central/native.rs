@@ -124,12 +124,25 @@ fn rollback_pointer_if_config_not_installed(
     if not_installed {
         match previous_pointer {
             Some(bytes) => store::atomic_write(pointer, bytes)?,
-            None => {
-                let _ = std::fs::remove_file(pointer);
-            }
+            None => remove_active_pointer_with(pointer, |path| std::fs::remove_file(path))?,
         }
     }
     Ok(not_installed)
+}
+fn remove_active_pointer_with(
+    pointer: &Path,
+    remove: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    match remove(pointer) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed to remove active account pointer {}",
+                pointer.display()
+            )
+        }),
+    }
 }
 pub fn require_local_mode() -> Result<()> {
     require_local_mode_from(&config::default_paths()?)
@@ -879,7 +892,8 @@ pub(super) fn deactivate_locked() -> Result<()> {
     }
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
     std::fs::remove_file(marker)?;
-    let _ = std::fs::remove_file(active_pointer_path()?);
+    let pointer = active_pointer_path()?;
+    remove_active_pointer_with(&pointer, |path| std::fs::remove_file(path))?;
     Ok(())
 }
 
@@ -1058,8 +1072,8 @@ pub(crate) fn statusline_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        BILLING_SWITCH_NOTICE, billing_switch_prompt, rollback_pointer_if_config_not_installed,
-        validate_token_account, write_config_with,
+        BILLING_SWITCH_NOTICE, billing_switch_prompt, remove_active_pointer_with,
+        rollback_pointer_if_config_not_installed, validate_token_account, write_config_with,
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
@@ -1104,5 +1118,23 @@ mod tests {
             rollback_pointer_if_config_not_installed(&destination, bytes, &pointer, None).unwrap();
         assert!(!not_installed);
         assert_eq!(fs::read(pointer).unwrap(), b"new\n");
+    }
+
+    #[test]
+    fn active_pointer_unlink_failure_is_reported() {
+        let pointer = std::path::Path::new("/tmp/.active-account");
+        let error = remove_active_pointer_with(pointer, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic unlink failure",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to remove active account pointer")
+        );
+        assert!(format!("{error:#}").contains("synthetic unlink failure"));
     }
 }

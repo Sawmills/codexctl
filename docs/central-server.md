@@ -206,8 +206,8 @@ The interval does not stop an in-flight response, revoke an issued token, or rem
 Such work can continue beyond one minute; the interval is a bound on normal cached-token reuse, not total credit spend.
 Run `codexctl use` after upgrading the client, then start new sessions so they load the new interval.
 Server reset redemption requires an explicit redemption command or automatic selection with `--allow-resets`.
-Switching between server accounts updates the provider for new sessions.
-Existing sessions keep their startup account until restarted.
+Switching between server accounts updates the provider and the active pointer.
+Existing sessions refresh their helper token from that pointer within 60 seconds.
 If the daemon is running, use `codexctl use <alias> --restart-daemon` to apply the switch.
 After the provider rewrite and session repair, this restarts the daemon and resumes
 the running and usage-limited sessions with the same continuation prompt and permissions as local switching:
