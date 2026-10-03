@@ -144,6 +144,16 @@ fn remove_active_pointer_with(
         }),
     }
 }
+fn remove_pointer_then_marker_with(
+    pointer: &Path,
+    marker: &Path,
+    remove_pointer: impl FnOnce(&Path) -> std::io::Result<()>,
+    remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
+    remove_active_pointer_with(pointer, remove_pointer)?;
+    remove_marker(marker).context("failed to remove prepared remote activation")?;
+    Ok(())
+}
 pub fn require_local_mode() -> Result<()> {
     require_local_mode_from(&config::default_paths()?)
 }
@@ -866,6 +876,10 @@ pub fn deactivate() -> Result<()> {
 pub(super) fn deactivate_locked() -> Result<()> {
     let marker = root()?.join(".native-active.json");
     if !marker.try_exists()? {
+        let pointer = active_pointer_path()?;
+        if pointer.try_exists()? {
+            remove_active_pointer_with(&pointer, |path| std::fs::remove_file(path))?;
+        }
         return Ok(());
     }
     let active: Activation = serde_json::from_slice(&vault::private_read(&marker)?)?;
@@ -891,9 +905,13 @@ pub(super) fn deactivate_locked() -> Result<()> {
         }
     }
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
-    std::fs::remove_file(marker)?;
     let pointer = active_pointer_path()?;
-    remove_active_pointer_with(&pointer, |path| std::fs::remove_file(path))?;
+    remove_pointer_then_marker_with(
+        &pointer,
+        &marker,
+        |path| std::fs::remove_file(path),
+        |path| std::fs::remove_file(path),
+    )?;
     Ok(())
 }
 
@@ -1073,7 +1091,8 @@ pub(crate) fn statusline_selection(
 mod tests {
     use super::{
         BILLING_SWITCH_NOTICE, billing_switch_prompt, remove_active_pointer_with,
-        rollback_pointer_if_config_not_installed, validate_token_account, write_config_with,
+        remove_pointer_then_marker_with, rollback_pointer_if_config_not_installed,
+        validate_token_account, write_config_with,
     };
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
@@ -1136,5 +1155,44 @@ mod tests {
                 .contains("failed to remove active account pointer")
         );
         assert!(format!("{error:#}").contains("synthetic unlink failure"));
+    }
+
+    #[test]
+    fn active_pointer_unlink_failure_leaves_marker_for_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join(".native-active.json");
+        let pointer = root.path().join(".active-account");
+        fs::write(&marker, b"marker").unwrap();
+        fs::write(&pointer, b"account\n").unwrap();
+
+        let error = remove_pointer_then_marker_with(
+            &pointer,
+            &marker,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic unlink failure",
+                ))
+            },
+            |path| fs::remove_file(path),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to remove active account pointer")
+        );
+        assert!(marker.exists());
+        assert!(pointer.exists());
+
+        remove_pointer_then_marker_with(
+            &pointer,
+            &marker,
+            |path| fs::remove_file(path),
+            |path| fs::remove_file(path),
+        )
+        .unwrap();
+        assert!(!marker.exists());
+        assert!(!pointer.exists());
     }
 }
