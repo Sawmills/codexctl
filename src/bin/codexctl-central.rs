@@ -194,7 +194,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         } => central::register(&state, &device, &tenant, &user, &token_file)?,
         Commands::Revoke { state, device } => central::revoke(&state, &device)?,
         Commands::Migrate { state, key_file } => {
-            central::storage::maybe_migrate(&state, &key_file).await?
+            central::storage::migrate(&state, &key_file).await?
         }
         Commands::Serve {
             state,

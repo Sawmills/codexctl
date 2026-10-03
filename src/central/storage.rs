@@ -1,8 +1,9 @@
 //! Durable storage for the central account broker.
 //!
-//! File storage remains the default.  A PostgreSQL store can be selected with
-//! `CODEXCTL_CENTRAL_STORE=postgres`, and `dual` writes both stores while
-//! preferring PostgreSQL reads.  The database never receives the vault key:
+//! File storage remains the default.  PostgreSQL schema provisioning is
+//! available with `codexctl-central migrate`; server startup rejects
+//! `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until runtime reads and writes
+//! are wired to the shared store.  The database never receives the vault key:
 //! credential and enrollment payloads are nonce-prefixed AES-GCM ciphertext.
 
 use super::vault;
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
+    io::BufReader,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -109,6 +111,7 @@ pub enum CentralStore {
     Dual {
         file: FileStore,
         postgres: PostgresStore,
+        mirror_failures: Arc<std::sync::atomic::AtomicU64>,
     },
 }
 
@@ -146,16 +149,21 @@ impl CentralStore {
     /// Open the configured backend.  `file` does not require a database URL;
     /// PostgreSQL and dual mode fail early when one is not configured.
     pub async fn from_env(state: &Path, key: &Path) -> Result<Self> {
+        Self::from_mode(StoreMode::from_env()?, state, key).await
+    }
+
+    pub async fn from_mode(mode: StoreMode, state: &Path, key: &Path) -> Result<Self> {
         let file = FileStore {
             state: state.into(),
             key: key.into(),
         };
-        match StoreMode::from_env()? {
+        match mode {
             StoreMode::File => Ok(Self::File(file)),
             StoreMode::Postgres => Ok(Self::Postgres(PostgresStore::connect(key).await?)),
             StoreMode::Dual => Ok(Self::Dual {
                 file,
                 postgres: PostgresStore::connect(key).await?,
+                mirror_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }),
         }
     }
@@ -164,7 +172,7 @@ impl CentralStore {
         match self {
             Self::File(file) => file.migrate(),
             Self::Postgres(db) => db.migrate().await,
-            Self::Dual { file, postgres } => {
+            Self::Dual { file, postgres, .. } => {
                 file.migrate()?;
                 postgres.migrate().await
             }
@@ -175,7 +183,7 @@ impl CentralStore {
         match self {
             Self::File(file) => file.save_account(record),
             Self::Postgres(db) => db.save_account(record).await,
-            Self::Dual { file, postgres } => {
+            Self::Dual { file, postgres, .. } => {
                 file.save_account(record)?;
                 postgres.save_account(record).await
             }
@@ -186,7 +194,7 @@ impl CentralStore {
         match self {
             Self::File(file) => file.load_account(account_id),
             Self::Postgres(db) => db.load_account(account_id).await,
-            Self::Dual { file, postgres } => Ok(postgres
+            Self::Dual { file, postgres, .. } => Ok(postgres
                 .load_account(account_id)
                 .await?
                 .or(file.load_account(account_id)?)),
@@ -202,11 +210,26 @@ impl CentralStore {
         match self {
             Self::File(file) => file.acquire_lease(account_id, holder_id, ttl),
             Self::Postgres(db) => db.acquire_lease(account_id, holder_id, ttl).await,
-            Self::Dual { file, postgres } => {
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
                 // PostgreSQL is the fencing authority in dual mode.  Mirroring
                 // to disk is useful during migration, but never grants a lease.
                 let lease = postgres.acquire_lease(account_id, holder_id, ttl).await?;
-                let _ = file.acquire_lease(account_id, holder_id, ttl);
+                if let Err(error) = file.acquire_lease(account_id, holder_id, ttl) {
+                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "operation": "central_store_mirror",
+                            "backend": "file",
+                            "stage": "acquire_lease",
+                            "reason": error.to_string(),
+                        })
+                    );
+                }
                 Ok(lease)
             }
         }
@@ -216,10 +239,40 @@ impl CentralStore {
         match self {
             Self::File(file) => file.fenced_write(lease, record),
             Self::Postgres(db) => db.fenced_write(lease, record).await,
-            Self::Dual { file, postgres } => {
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
                 let written = postgres.fenced_write(lease, record).await?;
                 if written {
-                    file.fenced_write(lease, record)?;
+                    match file.fenced_write(lease, record) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "operation": "central_store_mirror",
+                                    "backend": "file",
+                                    "stage": "fenced_write",
+                                    "reason": "fence rejected",
+                                })
+                            );
+                        }
+                        Err(error) => {
+                            mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "operation": "central_store_mirror",
+                                    "backend": "file",
+                                    "stage": "fenced_write",
+                                    "reason": error.to_string(),
+                                })
+                            );
+                        }
+                    }
                 }
                 Ok(written)
             }
@@ -235,7 +288,7 @@ impl CentralStore {
         match self {
             Self::File(file) => file.create_enrollment(challenge, payload, ttl),
             Self::Postgres(db) => db.create_enrollment(challenge, payload, ttl).await,
-            Self::Dual { file, postgres } => {
+            Self::Dual { file, postgres, .. } => {
                 file.create_enrollment(challenge, payload, ttl)?;
                 postgres.create_enrollment(challenge, payload, ttl).await
             }
@@ -248,13 +301,54 @@ impl CentralStore {
         match self {
             Self::File(file) => file.consume_enrollment(challenge),
             Self::Postgres(db) => db.consume_enrollment(challenge).await,
-            Self::Dual { file, postgres } => {
+            Self::Dual { file, postgres, .. } => {
                 let value = postgres.consume_enrollment(challenge).await?;
                 if value.is_some() {
                     let _ = file.consume_enrollment(challenge)?;
                 }
                 Ok(value)
             }
+        }
+    }
+
+    pub async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
+        match self {
+            Self::File(file) => file.renew(lease, ttl),
+            Self::Postgres(db) => db.renew(lease, ttl).await,
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
+                let renewed = postgres.renew(lease, ttl).await?;
+                if renewed {
+                    match file.renew(lease, ttl) {
+                        Ok(true) => {}
+                        Ok(false) | Err(_) => {
+                            mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            eprintln!(
+                                "{}",
+                                serde_json::json!({
+                                    "operation": "central_store_mirror",
+                                    "backend": "file",
+                                    "stage": "renew",
+                                    "reason": "file lease renewal rejected",
+                                })
+                            );
+                        }
+                    }
+                }
+                Ok(renewed)
+            }
+        }
+    }
+
+    pub fn mirror_failures(&self) -> u64 {
+        match self {
+            Self::Dual {
+                mirror_failures, ..
+            } => mirror_failures.load(std::sync::atomic::Ordering::Relaxed),
+            _ => 0,
         }
     }
 }
@@ -354,6 +448,23 @@ impl FileStore {
         })
     }
 
+    fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
+        let now = now_secs();
+        self.with_lock(|state| {
+            let Some(current) = state.leases.get_mut(&lease.account_id) else {
+                return Ok(false);
+            };
+            if current.holder_id != lease.holder_id
+                || current.epoch != lease.epoch
+                || current.expires_at <= now
+            {
+                return Ok(false);
+            }
+            current.expires_at = now + ttl.as_secs();
+            Ok(true)
+        })
+    }
+
     fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         let now = now_secs();
         self.with_lock(|state| {
@@ -422,9 +533,18 @@ impl PostgresStore {
         let tls_enabled = std::env::var("CODEXCTL_CENTRAL_DB_TLS")
             .map(|value| value != "0" && value != "false" && value != "disable")
             .unwrap_or(true);
+        let mut config: tokio_postgres::Config = url
+            .parse()
+            .context("invalid DATABASE_URL for PostgreSQL central storage")?;
         let client = if tls_enabled {
-            let connector = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
-            let (client, connection) = tokio_postgres::connect(&url, connector)
+            if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
+                bail!(
+                    "TLS is enabled for central PostgreSQL; DATABASE_URL must set sslmode=require"
+                );
+            }
+            let connector = tls_connector()?;
+            let (client, connection) = config
+                .connect(connector)
                 .await
                 .context("connect to central PostgreSQL over TLS")?;
             tokio::spawn(async move {
@@ -434,7 +554,9 @@ impl PostgresStore {
             });
             client
         } else {
-            let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            config.ssl_mode(tokio_postgres::config::SslMode::Disable);
+            let (client, connection) = config
+                .connect(tokio_postgres::NoTls)
                 .await
                 .context("connect to central PostgreSQL")?;
             tokio::spawn(async move {
@@ -448,6 +570,17 @@ impl PostgresStore {
             client: Arc::new(client),
             key: key.into(),
         })
+    }
+
+    async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
+        let changed = self
+            .client
+            .execute(
+                "UPDATE account_refresh_leases SET expires_at=now()+($3::bigint * interval '1 second') WHERE account_id=$1 AND holder_id=$2 AND epoch=$4 AND expires_at > now()",
+                &[&lease.account_id, &lease.holder_id, &(ttl.as_secs() as i64), &lease.epoch],
+            )
+            .await?;
+        Ok(changed == 1)
     }
 
     async fn migrate(&self) -> Result<()> {
@@ -497,7 +630,7 @@ impl PostgresStore {
         ttl: Duration,
     ) -> Result<Lease> {
         let row = self.client.query_opt(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,$2,1,now()+($3 * interval '1 second')) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at WHERE account_refresh_leases.expires_at <= now() OR account_refresh_leases.holder_id=EXCLUDED.holder_id RETURNING epoch",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,$2,1,now()+($3::bigint * interval '1 second')) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at WHERE account_refresh_leases.expires_at <= now() OR account_refresh_leases.holder_id=EXCLUDED.holder_id RETURNING epoch",
             &[&account_id, &holder_id, &(ttl.as_secs() as i64)],
         ).await?;
         let epoch: i64 = row
@@ -530,7 +663,7 @@ impl PostgresStore {
     ) -> Result<()> {
         let hash = vault::digest(challenge.as_bytes());
         let encrypted = vault::encrypt_bytes(&self.key, payload)?;
-        self.client.execute("INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) VALUES($1,$2,now()+($3 * interval '1 second')) ON CONFLICT(challenge_hash) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,expires_at=EXCLUDED.expires_at,consumed_at=NULL", &[&hash, &encrypted, &(ttl.as_secs() as i64)]).await?;
+        self.client.execute("INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) VALUES($1,$2,now()+($3::bigint * interval '1 second')) ON CONFLICT(challenge_hash) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,expires_at=EXCLUDED.expires_at,consumed_at=NULL", &[&hash, &encrypted, &(ttl.as_secs() as i64)]).await?;
         Ok(())
     }
 
@@ -545,6 +678,28 @@ impl PostgresStore {
     }
 }
 
+fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    if let Ok(path) = std::env::var("CODEXCTL_CENTRAL_DB_CA_FILE") {
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("read CODEXCTL_CENTRAL_DB_CA_FILE {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        for certificate in
+            rustls_pemfile::certs(&mut reader).context("parse central PostgreSQL CA bundle")?
+        {
+            roots
+                .add(rustls::pki_types::CertificateDer::from(certificate))
+                .context("add central PostgreSQL CA certificate")?;
+        }
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(tokio_postgres_rustls::MakeRustlsConnect::new(config))
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -552,12 +707,25 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Run the configured migration during server startup. File mode is a no-op
-/// beyond creating its encrypted state file.
-pub async fn maybe_migrate(state: &Path, key: &Path) -> Result<()> {
-    if StoreMode::from_env()? == StoreMode::File {
-        return Ok(());
+/// Refuse PostgreSQL modes during server startup until the runtime is wired to
+/// the shared store. File mode remains the default and needs no migration.
+pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
+    match StoreMode::from_env()? {
+        StoreMode::File => Ok(()),
+        mode => {
+            eprintln!(
+                "central storage: refusing startup with {mode:?}; phase 1 provisions the PostgreSQL schema only, while runtime storage still uses the file vault; run codexctl-central migrate separately"
+            );
+            bail!(
+                "central storage mode {mode:?} is not wired into runtime yet; startup supports only file mode"
+            )
+        }
     }
+}
+
+/// Apply the configured schema migration. This is intentionally separate from
+/// server startup while the phase 1 runtime still uses file storage.
+pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
     let store = CentralStore::from_env(state, key).await?;
     store.migrate().await
 }
@@ -593,11 +761,17 @@ mod tests {
             .acquire_lease("a", "one", Duration::from_secs(60))
             .await
             .unwrap();
+        assert!(store.renew(&first, Duration::from_secs(120)).await.unwrap());
+        assert!(store.fenced_write(&first, &record("a", 2)).await.unwrap());
+        let bumped = store
+            .acquire_lease("a", "one", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(bumped.epoch, first.epoch + 1);
         let second = store
             .acquire_lease("a", "two", Duration::from_secs(60))
             .await;
         assert!(second.is_err());
-        assert!(store.fenced_write(&first, &record("a", 2)).await.unwrap());
         store
             .create_enrollment("challenge", b"payload", Duration::from_secs(60))
             .await
@@ -613,18 +787,22 @@ mod tests {
     async fn postgres_real_store_scenarios() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let Ok(url) = std::env::var("DATABASE_URL") else {
+        if std::env::var("DATABASE_URL").is_err() {
+            if std::env::var("CI").ok().as_deref() == Some("true") {
+                panic!("DATABASE_URL must be set for PostgreSQL scenarios in CI");
+            }
             return;
-        };
+        }
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
         vault::create_secret(&key, &[9; 32]).unwrap();
-        let _ = url;
-        // Tests are single-purpose and this process does not run other tasks.
-        unsafe { std::env::set_var("CODEXCTL_CENTRAL_STORE", "postgres") };
-        let first = CentralStore::from_env(root.path(), &key).await.unwrap();
+        let first = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
         first.migrate().await.unwrap();
-        let second = CentralStore::from_env(root.path(), &key).await.unwrap();
+        let second = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
         let id = format!(
             "test-{}",
             vault::digest(&crate::central::enrollment::random_bytes())
@@ -636,20 +814,29 @@ mod tests {
         );
         assert!(a.is_ok() ^ b.is_ok());
         let upstream_refreshes = AtomicUsize::new(0);
-        if a.is_ok() {
-            upstream_refreshes.fetch_add(1, Ordering::Relaxed);
-        }
-        if b.is_ok() {
-            upstream_refreshes.fetch_add(1, Ordering::Relaxed);
-        }
+        let refreshed = |counter: &AtomicUsize| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            record(&id, 2)
+        };
+        let (lease, refreshed_record) = match (a, b) {
+            (Ok(lease), Err(_)) => (lease, refreshed(&upstream_refreshes)),
+            (Err(_), Ok(lease)) => (lease, refreshed(&upstream_refreshes)),
+            _ => unreachable!("lease race must have exactly one winner"),
+        };
         assert_eq!(upstream_refreshes.load(Ordering::Relaxed), 1);
-        let lease = a.or(b).unwrap();
-        assert!(first.fenced_write(&lease, &record(&id, 2)).await.unwrap());
+        assert!(first.fenced_write(&lease, &refreshed_record).await.unwrap());
+        assert!(first.renew(&lease, Duration::from_secs(120)).await.unwrap());
+        assert!(first.fenced_write(&lease, &record(&id, 3)).await.unwrap());
+        let renewed = first
+            .acquire_lease(&id, &lease.holder_id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(renewed.epoch, lease.epoch + 1);
         let stale = Lease {
             epoch: lease.epoch - 1,
             ..lease.clone()
         };
-        assert!(!second.fenced_write(&stale, &record(&id, 3)).await.unwrap());
+        assert!(!second.fenced_write(&stale, &record(&id, 4)).await.unwrap());
         first
             .create_enrollment(&id, b"once", Duration::from_secs(60))
             .await
@@ -662,5 +849,25 @@ mod tests {
             left.unwrap().is_some() as u8 + right.unwrap().is_some() as u8,
             1
         );
+        if let CentralStore::Postgres(db) = &first {
+            db.client
+                .execute(
+                    "DELETE FROM enrollment_challenges WHERE challenge_hash=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            db.client
+                .execute(
+                    "DELETE FROM account_refresh_leases WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            db.client
+                .execute("DELETE FROM central_accounts WHERE account_id=$1", &[&id])
+                .await
+                .unwrap();
+        }
     }
 }

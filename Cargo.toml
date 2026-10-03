@@ -17,6 +17,9 @@ central-prototype = [
   "dep:toml_edit",
   "dep:tokio-postgres",
   "dep:tokio-postgres-rustls",
+  "dep:rustls",
+  "dep:rustls-pemfile",
+  "dep:webpki-roots",
   "tokio/process",
   "tokio/io-util",
   "tokio/net",
@@ -45,6 +48,9 @@ tokio-postgres-rustls = { version = "0.14", optional = true, features = [
   "ring",
   "webpki-roots",
 ] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
+rustls-pemfile = { version = "1", optional = true }
+webpki-roots = { version = "1", optional = true }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
