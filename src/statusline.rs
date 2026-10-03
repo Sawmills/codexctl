@@ -147,6 +147,11 @@ pub(crate) fn record(
             state: crate::status_json::State::Active,
             primary_used_percent: usage.five_hour_used_percent,
             secondary_used_percent: usage.weekly_used_percent,
+            // Usage carries only windows whose exact durations were confirmed upstream.
+            primary_window_seconds: usage.five_hour_used_percent.map(|_| 18_000),
+            secondary_window_seconds: usage.weekly_used_percent.map(|_| 604_800),
+            primary_resets_at: crate::status_json::timestamp(usage.five_hour_resets_at),
+            secondary_resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
             resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
             billing_class: api::BillingClass::Unknown,
             error: None,

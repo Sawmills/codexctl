@@ -5572,12 +5572,32 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
         "version":1,"accounts":[
             {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
              "primary_used_percent":0.0,"secondary_used_percent":37.0,
+             "primary_window_seconds":18000,"secondary_window_seconds":604800,
+             "primary_resets_at":"2100-01-01T00:00:00Z","secondary_resets_at":"2100-01-01T00:00:00Z",
              "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null,"usage_age_seconds":age,"usage_stale":false},
             {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
              "primary_used_percent":null,"secondary_used_percent":null,
+             "primary_window_seconds":null,"secondary_window_seconds":null,
+             "primary_resets_at":null,"secondary_resets_at":null,
              "resets_at":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
         ]})
     );
+}
+
+#[test]
+fn status_json_from_an_old_server_keeps_window_durations_unknown() {
+    // This protocol fixture omits duration fields, like an older account server.
+    let (_, output) = automatic_reset_attempt(&["status", "--json"], "pro", 25.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &document["accounts"][0];
+    assert_eq!(row.get("primary_window_seconds"), Some(&Value::Null));
+    assert_eq!(row.get("secondary_window_seconds"), Some(&Value::Null));
+    assert_eq!(row.get("primary_resets_at"), Some(&Value::Null));
+    assert_eq!(row["secondary_resets_at"], "2033-05-18T03:33:20Z");
+    assert_eq!(row["resets_at"], row["secondary_resets_at"]);
+    assert_eq!(row["primary_used_percent"], 25.0);
+    assert_eq!(row["secondary_used_percent"], 10.0);
 }
 
 #[test]

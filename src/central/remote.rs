@@ -804,6 +804,10 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     },
                     primary_used_percent: account.primary_used,
                     secondary_used_percent: account.secondary_used,
+                    primary_window_seconds: account.primary_window_seconds,
+                    secondary_window_seconds: account.secondary_window_seconds,
+                    primary_resets_at: status_json::timestamp(account.primary_resets_at),
+                    secondary_resets_at: status_json::timestamp(account.resets_at),
                     resets_at: status_json::timestamp(account.resets_at),
                     billing_class: account.billing_class,
                     error: if !account.available {
