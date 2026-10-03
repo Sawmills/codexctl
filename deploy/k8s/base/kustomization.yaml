@@ -6,3 +6,4 @@ resources:
   - service.yaml
   - networkpolicy.yaml
   - statefulset.yaml
+  - poddisruptionbudget.yaml
