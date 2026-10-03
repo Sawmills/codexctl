@@ -725,6 +725,22 @@ impl NativeClient {
         let broker = BrokerTest::start_with_plan(&[], plan);
         let home = broker.root.path().join("client");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
+        // The host's container overlay mount emits an lsof diagnostic that
+        // production must treat as an uncertain inventory. Keep these tests
+        // focused on session behavior by wrapping the real lsof with -w.
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let lsof = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("lsof"))
+            .find(|path| path.is_file())
+            .expect("lsof must be installed for central session tests");
+        std::fs::write(
+            bin.join("lsof"),
+            format!("#!/bin/sh\nexec {} -w \"$@\"\n", lsof.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("lsof"), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(
             home.join(".codex/config.toml"),
             "# Personal preference\nmodel = 'gpt-6.1-sol'\nmodel_provider = 'openai'\n",
@@ -738,6 +754,14 @@ impl NativeClient {
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(args)
             .env("HOME", &self.home)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.home.join("bin").display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .output()
@@ -1472,7 +1496,7 @@ fn server_restart_command(client: &NativeClient) -> Command {
     )
     .unwrap();
     let bin = client.home.join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
     std::fs::write(
         bin.join("codex"),
         "#!/bin/sh\n[ \"$*\" = 'app-server daemon restart' ] || exit 2\n/bin/cat \"$CODEX_HOME/config.toml\" > \"$CODEX_HOME/restart-config.toml\"\necho '{\"status\":\"restarted\"}'\n",

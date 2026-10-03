@@ -2,7 +2,9 @@ mod commands;
 
 use codexctl::{api, config, daemon, profile, store};
 
-use clap::{ArgGroup, Parser, Subcommand};
+#[cfg(feature = "central-prototype")]
+use clap::ArgGroup;
+use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
 #[derive(Parser)]
