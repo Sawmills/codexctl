@@ -66,11 +66,13 @@ impl Server {
                     id: "amir".into(),
                     email: "amir@sawmills.ai".into(),
                     enabled: true,
+                    oidc_identity: None,
                 },
                 central::managed::User {
                     id: "alex".into(),
                     email: "alex@sawmills.ai".into(),
                     enabled: true,
+                    oidc_identity: None,
                 },
             ])
             .unwrap(),
@@ -1433,8 +1435,15 @@ struct EnrollmentServer {
 }
 impl EnrollmentServer {
     fn start(identity: Value) -> Self {
+        Self::with_sso(identity, json!({}))
+    }
+    fn with_sso(identity: Value, extra: Value) -> Self {
+        Self::with_setup(identity, extra, |_| {})
+    }
+    fn with_setup(identity: Value, extra: Value, setup: impl FnOnce(&Server)) -> Self {
         let mut server = Server::start();
         server.stop();
+        setup(&server);
         store::atomic_write(
             &server.root.path().join("identity.json"),
             &serde_json::to_vec(&identity).unwrap(),
@@ -1454,9 +1463,19 @@ impl EnrollmentServer {
         let ready: Value = serde_json::from_str(&line).unwrap();
         let secret = server.root.path().join("oidc.secret");
         store::atomic_write(&secret, b"synthetic-company-client-secret").unwrap();
-        let configuration = json!({"issuer":ready["issuer"],"client_id":"codexctl-test","client_secret_file":secret,"allowed_domains":["sawmills.ai"]});
+        let mut configuration = json!({"issuer":ready["issuer"],"client_id":"codexctl-test","client_secret_file":secret,"allowed_domains":["sawmills.ai"]});
+        configuration
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         let sso = server.root.path().join("sso.json");
         store::atomic_write(&sso, &serde_json::to_vec(&configuration).unwrap()).unwrap();
+        Self::spawn_broker(&mut server);
+        Self { server, issuer }
+    }
+    fn spawn_broker(server: &mut Server) {
+        let sso = server.root.path().join("sso.json");
+        let mut line = String::new();
         let address = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -1489,7 +1508,13 @@ impl EnrollmentServer {
                 server.root.path().join("count"),
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(server.root.path().join("sso-audit.log"))
+                    .unwrap(),
+            )
             .spawn()
             .unwrap();
         line.clear();
@@ -1499,7 +1524,6 @@ impl EnrollmentServer {
         let _: Value = serde_json::from_str(&line).expect("SSO server must start");
         server.child = child;
         server.url = url;
-        Self { server, issuer }
     }
     fn challenge(&self) -> Value {
         self.server
@@ -1635,6 +1659,296 @@ fn when_the_company_callback_has_not_been_confirmed_then_no_device_credential_is
         response.json::<Value>().unwrap(),
         json!({"status":"pending"})
     );
+}
+// The loopback issuer signs Google-style claims; no real Google credentials are used.
+#[test]
+fn google_workspace_refuses_a_consumer_with_a_verified_company_email() {
+    let identity = json!({"sub": "consumer", "email": "consumer@sawmills.ai"});
+    let issuer = EnrollmentServer::with_sso(
+        identity,
+        json!({
+            "allowed_hosted_domains": ["sawmills.ai"]
+        }),
+    );
+    let challenge = issuer.challenge();
+    let response = issuer.browser(challenge["verificationUrl"].as_str().unwrap());
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "company_identity_required"
+    );
+}
+#[test]
+fn google_workspace_checks_the_signed_domain_and_verified_email() {
+    for (hd, verified, status) in [
+        ("other.example", true, 403),
+        ("sawmills.ai", false, 403),
+        ("sawmills.ai", true, 200),
+    ] {
+        let mut identity = company_identity();
+        identity["email"] = json!("workspace-member@sawmills.ai");
+        identity["hd"] = json!(hd);
+        identity["verified"] = json!(verified);
+        let issuer = EnrollmentServer::with_sso(
+            identity,
+            json!({
+                "allowed_hosted_domains": ["sawmills.ai"]
+            }),
+        );
+        let challenge = issuer.challenge();
+        let start = issuer
+            .server
+            .http
+            .get(challenge["verificationUrl"].as_str().unwrap())
+            .build()
+            .unwrap();
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let redirect = client.execute(start).unwrap();
+        let location =
+            reqwest::Url::parse(redirect.headers()["location"].to_str().unwrap()).unwrap();
+        assert!(
+            location
+                .query_pairs()
+                .any(|(key, value)| key == "hd" && value == "sawmills.ai")
+        );
+        let response = issuer.browser(location.as_str());
+        assert_eq!(response.status(), status);
+        if status == 403 {
+            assert_eq!(
+                response.json::<Value>().unwrap()["error"],
+                "company_identity_required"
+            );
+        }
+    }
+}
+fn clerk_user_id() -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(b"https://clerk.sawmills.ai\0company-amir")
+    )
+}
+fn google_migration_server(identity: Value) -> EnrollmentServer {
+    EnrollmentServer::with_setup(
+        identity,
+        json!({
+            "allowed_hosted_domains": ["sawmills.ai"],
+            "clerk_migration": {
+                "issuer": "https://clerk.sawmills.ai",
+                "users": [{"subject": "company-amir", "email": "amir@sawmills.ai"}]
+            }
+        }),
+        |server| {
+            // Synthetic legacy registry, including a machine credential issued before cutover.
+            let state = server.root.path().join("state");
+            let mut users: Value =
+                serde_json::from_slice(&std::fs::read(state.join("users.json")).unwrap()).unwrap();
+            users[0]["id"] = json!(clerk_user_id());
+            store::atomic_write(
+                &state.join("users.json"),
+                &serde_json::to_vec(&users).unwrap(),
+            )
+            .unwrap();
+            let mut devices: Value =
+                serde_json::from_slice(&std::fs::read(state.join("devices.json")).unwrap())
+                    .unwrap();
+            for device in devices.as_array_mut().unwrap() {
+                if device["user"] == "amir" {
+                    device["user"] = json!(clerk_user_id());
+                }
+            }
+            store::atomic_write(
+                &state.join("devices.json"),
+                &serde_json::to_vec(&devices).unwrap(),
+            )
+            .unwrap();
+        },
+    )
+}
+fn google_identity() -> Value {
+    json!({"sub": "google-amir", "email": "amir@sawmills.ai", "hd": "sawmills.ai"})
+}
+fn enroll(issuer: &EnrollmentServer) -> String {
+    let challenge = issuer.challenge();
+    let page = issuer.browser(challenge["verificationUrl"].as_str().unwrap());
+    assert_eq!(page.status(), 200);
+    assert_eq!(issuer.approve(&page.text().unwrap()).status(), 200);
+    issuer.poll(&challenge).json::<Value>().unwrap()["deviceToken"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+#[test]
+fn google_migration_links_once_and_preserves_accounts_and_machine_credentials() {
+    let issuer = google_migration_server(google_identity());
+    assert_eq!(
+        issuer
+            .server
+            .import(&issuer.server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let cookie = issuer.dashboard_cookie();
+    let dashboard = issuer
+        .server
+        .http
+        .get(format!("{}/accounts/data", issuer.server.url))
+        .header("cookie", cookie)
+        .send()
+        .unwrap();
+    assert_eq!(dashboard.status(), 200);
+    assert!(dashboard.text().unwrap().contains("personal"));
+    let token = enroll(&issuer);
+    assert_eq!(issuer.server.accounts(&token)[0]["alias"], "personal");
+    assert_eq!(
+        issuer.server.accounts(&issuer.server.amir)[0]["alias"],
+        "personal"
+    );
+    assert_eq!(
+        issuer
+            .server
+            .token(&issuer.server.amir, "personal", None)
+            .status(),
+        200
+    );
+    let me: Value = issuer
+        .server
+        .http
+        .get(format!("{}/v1/me", issuer.server.url))
+        .bearer_auth(&token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(me["id"], clerk_user_id());
+    let second = enroll(&issuer);
+    assert_eq!(issuer.server.accounts(&second)[0]["alias"], "personal");
+    let mut other = google_identity();
+    other["sub"] = json!("another-google-subject");
+    store::atomic_write(
+        &issuer.server.root.path().join("identity.json"),
+        &serde_json::to_vec(&other).unwrap(),
+    )
+    .unwrap();
+    let challenge = issuer.challenge();
+    assert_eq!(
+        issuer
+            .browser(challenge["verificationUrl"].as_str().unwrap())
+            .status(),
+        403
+    );
+    let audit = std::fs::read_to_string(issuer.server.root.path().join("sso-audit.log")).unwrap();
+    assert_eq!(audit.matches("SSO_IDENTITY_LINKED").count(), 1);
+    assert!(!audit.contains("amir@sawmills.ai"));
+}
+#[test]
+fn concurrent_google_sign_ins_consume_only_one_migration_authorization() {
+    let issuer = google_migration_server(google_identity());
+    let first = issuer.challenge();
+    let second = issuer.challenge();
+    let barrier = std::sync::Barrier::new(2);
+    std::thread::scope(|scope| {
+        let callbacks: Vec<_> = [&first, &second]
+            .into_iter()
+            .map(|challenge| {
+                let issuer = &issuer;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    issuer
+                        .browser(challenge["verificationUrl"].as_str().unwrap())
+                        .status()
+                })
+            })
+            .collect();
+        for callback in callbacks {
+            assert_eq!(callback.join().unwrap(), 200);
+        }
+    });
+    let audit = std::fs::read_to_string(issuer.server.root.path().join("sso-audit.log")).unwrap();
+    assert_eq!(audit.matches("SSO_IDENTITY_LINKED").count(), 1);
+}
+#[test]
+fn google_migration_survives_restart_with_the_cutover_config_removed() {
+    let mut issuer = google_migration_server(google_identity());
+    issuer
+        .server
+        .import(&issuer.server.amir, "personal", "amir-login", "amir-seat");
+    let token = enroll(&issuer);
+    issuer.server.child.kill().unwrap();
+    issuer.server.child.wait().unwrap();
+    let path = issuer.server.root.path().join("sso.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("clerk_migration");
+    store::atomic_write(&path, &serde_json::to_vec(&config).unwrap()).unwrap();
+    EnrollmentServer::spawn_broker(&mut issuer.server);
+    let new_token = enroll(&issuer);
+    for machine in [&token, &new_token, &issuer.server.amir] {
+        assert_eq!(issuer.server.accounts(machine)[0]["alias"], "personal");
+    }
+    let audit = std::fs::read_to_string(issuer.server.root.path().join("sso-audit.log")).unwrap();
+    assert_eq!(audit.matches("SSO_IDENTITY_LINKED").count(), 1);
+}
+#[test]
+fn google_migration_refuses_unverified_or_mismatched_company_email() {
+    for (email, verified) in [("amir@sawmills.ai", false), ("alex@sawmills.ai", true)] {
+        let mut identity = google_identity();
+        identity["email"] = json!(email);
+        identity["verified"] = json!(verified);
+        let issuer = google_migration_server(identity);
+        let challenge = issuer.challenge();
+        assert_eq!(
+            issuer
+                .browser(challenge["verificationUrl"].as_str().unwrap())
+                .status(),
+            403
+        );
+    }
+}
+#[test]
+fn google_migration_refuses_ambiguous_disabled_or_unapproved_legacy_users() {
+    for mode in [
+        "duplicate",
+        "disabled",
+        "unapproved",
+        "mismatched-legacy-email",
+    ] {
+        let mut issuer = google_migration_server(google_identity());
+        issuer.server.stop();
+        let state = issuer.server.root.path().join("state");
+        let mut users: Value =
+            serde_json::from_slice(&std::fs::read(state.join("users.json")).unwrap()).unwrap();
+        match mode {
+            "duplicate" => users[1]["email"] = json!("amir@sawmills.ai"),
+            "disabled" => users[0]["enabled"] = json!(false),
+            "mismatched-legacy-email" => users[0]["email"] = json!("someone-else@sawmills.ai"),
+            _ => {
+                let path = issuer.server.root.path().join("sso.json");
+                let mut config: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                config.as_object_mut().unwrap().remove("clerk_migration");
+                store::atomic_write(&path, &serde_json::to_vec(&config).unwrap()).unwrap();
+            }
+        }
+        store::atomic_write(
+            &state.join("users.json"),
+            &serde_json::to_vec(&users).unwrap(),
+        )
+        .unwrap();
+        EnrollmentServer::spawn_broker(&mut issuer.server);
+        let challenge = issuer.challenge();
+        assert_eq!(
+            issuer
+                .browser(challenge["verificationUrl"].as_str().unwrap())
+                .status(),
+            403,
+            "{mode}"
+        );
+    }
 }
 #[test]
 fn when_the_oidc_nonce_is_wrong_then_sign_in_is_rejected() {
