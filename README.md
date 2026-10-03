@@ -258,6 +258,7 @@ ones (reset is only a tiebreak within a bill class).
 Within each billing class, automatic selection skips any candidate with a reported usage window at
 or above 95% whenever another candidate in that class is below 95%; this applies to both local and
 server-account selection.
+Thus a server seat at 97% is skipped in favor of a 10% seat even when the 97% seat resets sooner.
 
 This is the default. To opt out and restore the legacy most-headroom-first pick:
 
