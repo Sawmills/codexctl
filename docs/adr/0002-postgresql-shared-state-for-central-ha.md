@@ -1,6 +1,6 @@
 # ADR 0002: PostgreSQL shared state for account-server HA
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-10-03
 - **Decision:** Move durable account-server state to encrypted PostgreSQL rows and use a fenced per-account lease for refresh ownership.
 
@@ -61,4 +61,3 @@ readiness/alerts are part of the implementation. In return, replicas can run
 on independent nodes and zones, refresh ownership survives pod failure without
 Multi-Attach, and every write that can spend or rotate credentials has a
 transactional fence.
-
