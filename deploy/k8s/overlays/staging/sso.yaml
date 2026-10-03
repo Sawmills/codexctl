@@ -6,9 +6,8 @@ metadata:
 data:
   sso.json: |
     {
-      "issuer": "https://accounts.google.com",
-      "client_id": "REPLACE_WITH_GOOGLE_WEB_CLIENT_ID.apps.googleusercontent.com",
+      "issuer": "https://clerk.sawmills.ai",
+      "client_id": "StnV91x99CEYVmSy",
       "client_secret_file": "/keys/oidc-client-secret",
-      "allowed_domains": ["sawmills.ai"],
-      "allowed_hosted_domains": ["sawmills.ai"]
+      "allowed_domains": ["sawmills.ai"]
     }

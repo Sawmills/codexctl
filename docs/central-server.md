@@ -339,7 +339,8 @@ It saves the device registry before the user registry, which marks completed set
 An interrupted setup can reuse the key and complete both registries.
 Keep the key separate from encrypted storage and backup both.
 
-Create an OIDC configuration file:
+The active staging overlay remains on Clerk. For the planned Google Workspace
+cutover, prepare an OIDC configuration file:
 
 ```json
 {
@@ -351,8 +352,8 @@ Create an OIDC configuration file:
 }
 ```
 
-Company SSO uses Google Workspace directly. In the Google Cloud project owned by
-`sawmills.ai`:
+The planned company SSO setup uses Google Workspace directly. In the Google Cloud
+project owned by `sawmills.ai`:
 
 1. Open **Google Auth platform** (or **APIs & Services → OAuth consent screen**),
    configure the application name, support email and developer contact, and set
@@ -365,20 +366,26 @@ Company SSO uses Google Workspace directly. In the Google Cloud project owned by
    as an **Authorized redirect URI**. No JavaScript origin is required for this
    server-side authorization-code flow. It requests only `openid email` and uses
    PKCE. Do not request offline access or an OpenAI scope.
-4. Copy the client ID into `deploy/k8s/overlays/staging/sso.yaml`. Store the client
+4. Copy the client ID into `deploy/k8s/cutovers/google-workspace/sso.yaml`. Store the client
    secret as a **plaintext secret value** in AWS Secrets Manager under
    `/app/codexctl/oidc-client-secret`; do not store a JSON object around the value.
-   Never commit the secret. The ExternalSecret entry reads this name through
+   Never commit the secret. The planned cutover ExternalSecret entry reads this name through
    `ClusterSecretStore/aws-secrets-manager` into `codexctl-secrets`, and the init
    container copies it to `/keys/oidc-client-secret` as a private real file.
    The platform administrator must provision/verify that ClusterSecretStore with
    provider service `SecretsManager` and permission to read this secret before
    cutover. The existing `aws-parameter-store` store continues serving the vault
    key and metrics token; it cannot read the new Secrets Manager value.
-5. Schedule the switch, prepare any explicit Clerk links below, and restart the
-   account server with the Google configuration, matching secret and reviewed
-   image. The committed client ID is a placeholder: do not merge into the
-   automatically reconciled staging deployment until these prerequisites are met.
+5. Schedule the switch and prepare the explicit Clerk links below. Confirm the
+   Google client, matching secret, secret store and reviewed image are ready
+   before manually registering or syncing the Application for cutover. Restart
+   the account server after that planned sync.
+   The files under `deploy/k8s/cutovers/google-workspace/` are unreferenced
+   preparation templates, with a placeholder client ID and Amir's company-user ID/email
+   allowlist. Fill the client ID and verify that allowlist, then promote the manifests into
+   `deploy/k8s/overlays/staging/` in a separate reviewed cutover change. Until then,
+   staging keeps its Clerk client and SSM secret source. See the
+   [cutover checklist](../deploy/k8s/cutovers/google-workspace/README.md).
 
 OIDC verification covers the signature, issuer, audience, expiry, nonce and
 `email_verified == true`. The email must have an allowed company domain. For
@@ -402,18 +409,22 @@ server configuration access may explicitly authorize **individual existing Clerk
 company users** for one link on their first verified Google sign-in. There is no
 browser or machine API for authorizing links. Back up the state and key first,
 list company users with `codexctl-central users --state /data/state`, and confirm
-both the original Clerk subject and verified primary company email in the Clerk
-administration console. The stored company-user ID is the lowercase SHA-256 of
-`issuer + NUL + subject`; verify it agrees with the chosen Clerk identity.
+the stored company-user ID and verified primary company email. The server stores
+only the derived company-user ID, not the raw Clerk subject. Copy that ID from
+`codexctl-central users`; no raw subject lookup is required. An administrator must
+confirm that the selected record is the intended existing company user.
 
 Temporarily add this object to the Google SSO configuration, using the exact
-original issuer and actual verified subject/email values:
+stored company-user ID and verified email values. The prepared staging allowlist
+authorizes only Amir; it excludes the assistbot and CLI integration company users:
 
 ```json
 "clerk_migration": {
-  "issuer": "https://clerk.sawmills.ai",
   "users": [
-    {"subject": "REPLACE_WITH_CLERK_SUBJECT", "email": "person@sawmills.ai"}
+    {
+      "user_id": "6334462fa3dac53bdd9836507666cdde920a73768c3b52b632297d08130e1fd4",
+      "email": "amir@sawmills.ai"
+    }
   ]
 }
 ```
@@ -421,9 +432,10 @@ original issuer and actual verified subject/email values:
 Configuration write access is administrative authority: restrict it with the same
 filesystem permissions and deployment RBAC as the server configuration. Do not
 populate the allowlist from an untrusted email list. The account server requires
-agreement between the approved email, the existing company user's email, and the
-verified arriving Google email. It refuses ambiguous emails, disabled company
-users, a missing source, and any second Google identity for a consumed source.
+the exact approved company-user ID and agreement between the approved email,
+the existing company user's email, and the verified arriving Google email. It
+refuses ambiguous emails, disabled company users, a missing source, and any second
+Google identity for a consumed source.
 An existing company email without explicit authorization is refused rather than
 creating a competing company user. New Workspace members with unused emails can
 still enroll normally.
@@ -469,8 +481,12 @@ Before registration, pin both workload images to that digest in the staging over
 
 The staging application lives in `Sawmills/argocd-deploy` at
 `plat/ue1-staging/argocd/codexctl-application.yaml`.
-Its parent application registers it from Git. Automatic sync, prune, and self-heal
-then reconcile `deploy/k8s/overlays/staging` from this repository.
+The checked-in [Application](../deploy/k8s/staging-application.yaml) tracks `main`
+and `deploy/k8s/overlays/staging`; its sync policy sets `CreateNamespace=true` but
+has no automated sync, prune, or self-heal. Review and manually register the
+Application if it is not installed; sync is also an explicit operator action.
+Verify the installed Application's policy and the Google client/secret readiness
+before the planned cutover sync.
 The internal ALB terminates HTTPS. The broker uses a ClusterIP service.
 
 One StatefulSet replica owns an encrypted `ReadWriteOncePod` volume.
@@ -482,19 +498,21 @@ Confirm CSI support for `ReadWriteOncePod` before deployment.
 Create these SSM SecureString values through the operator secret workflow:
 
 - `/app/codexctl/vault-key`: base64 of the 32-byte encryption key.
+- `/app/codexctl/oidc-client-secret`: the current Clerk client secret.
 - `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 visible ASCII characters. The server trims surrounding whitespace.
 
-The Google OAuth client secret is a separate AWS Secrets Manager value at
-`/app/codexctl/oidc-client-secret`, as described above.
+For the later Google cutover, prepare a separate AWS Secrets Manager value at
+`/app/codexctl/oidc-client-secret`, as described above. The active ExternalSecret
+continues reading the Clerk secret from SSM until that reviewed cutover.
 External Secrets supplies the pod secret.
 An init container copies the projected files into private real files for the broker.
 Key rotation needs a separate re-encryption procedure. Do not rotate the key independently of the stored vaults.
 
-The SSO overlay targets `https://accounts.google.com` and the `sawmills.ai`
-Workspace. It requires the administrator-created Internal web client and planned
-identity cutover above. The previous
-[Clerk OIDC research](research/central-staging-oidc.md) is historical context,
-not the Google setup runbook. Google documents
+The active SSO overlay uses `https://clerk.sawmills.ai`. The unreferenced Google
+cutover files target `https://accounts.google.com` and the `sawmills.ai` Workspace;
+they require the administrator-created Internal web client and verified migration
+allowlist described above. The [Clerk OIDC research](research/central-staging-oidc.md)
+describes the current provider, not the planned Google setup. Google documents
 [Workspace `hd` verification](https://developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo)
 and [web client creation](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred).
 

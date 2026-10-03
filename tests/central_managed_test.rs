@@ -1738,8 +1738,7 @@ fn google_migration_server(identity: Value) -> EnrollmentServer {
         json!({
             "allowed_hosted_domains": ["sawmills.ai"],
             "clerk_migration": {
-                "issuer": "https://clerk.sawmills.ai",
-                "users": [{"subject": "company-amir", "email": "amir@sawmills.ai"}]
+                "users": [{"user_id": clerk_user_id(), "email": "amir@sawmills.ai"}]
             }
         }),
         |server| {
@@ -1894,6 +1893,68 @@ fn google_migration_survives_restart_with_the_cutover_config_removed() {
     assert_eq!(audit.matches("SSO_IDENTITY_LINKED").count(), 1);
 }
 #[test]
+fn google_migration_refuses_the_original_subject_after_issuer_rollback() {
+    let mut old_identity = company_identity();
+    old_identity["email"] = json!("rollback@sawmills.ai");
+    let mut original = EnrollmentServer::start(old_identity);
+    let old_token = enroll(&original);
+    let me: Value = original
+        .server
+        .http
+        .get(format!("{}/v1/me", original.server.url))
+        .bearer_auth(&old_token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    let path = original.server.root.path().join("sso.json");
+    let old_config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut new_identity = google_identity();
+    new_identity["email"] = json!("rollback@sawmills.ai");
+    let google = EnrollmentServer::with_sso(
+        new_identity,
+        json!({
+            "allowed_hosted_domains": ["sawmills.ai"]
+        }),
+    );
+    let google_config: Value =
+        serde_json::from_slice(&std::fs::read(google.server.root.path().join("sso.json")).unwrap())
+            .unwrap();
+    original.server.stop();
+    let mut cutover = old_config.clone();
+    cutover["issuer"] = google_config["issuer"].clone();
+    cutover["allowed_hosted_domains"] = json!(["sawmills.ai"]);
+    cutover["clerk_migration"] = json!({
+        "users": [{"user_id": me["id"], "email": "rollback@sawmills.ai"}]
+    });
+    store::atomic_write(&path, &serde_json::to_vec(&cutover).unwrap()).unwrap();
+    EnrollmentServer::spawn_broker(&mut original.server);
+    let linked_token = enroll(&original);
+    let linked: Value = original
+        .server
+        .http
+        .get(format!("{}/v1/me", original.server.url))
+        .bearer_auth(&linked_token)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(linked["id"], me["id"]);
+
+    original.server.stop();
+    // Restore the actual original issuer and subject, without hosted-domain policy
+    // or migration authorization: refusal must come from the consumed-source guard.
+    store::atomic_write(&path, &serde_json::to_vec(&old_config).unwrap()).unwrap();
+    EnrollmentServer::spawn_broker(&mut original.server);
+    let challenge = original.challenge();
+    let response = original.browser(challenge["verificationUrl"].as_str().unwrap());
+    assert_eq!(response.status(), 403);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "identity_link_refused"
+    );
+}
+#[test]
 fn google_migration_refuses_unverified_or_mismatched_company_email() {
     for (email, verified) in [("amir@sawmills.ai", false), ("alex@sawmills.ai", true)] {
         let mut identity = google_identity();
@@ -1915,6 +1976,7 @@ fn google_migration_refuses_ambiguous_disabled_or_unapproved_legacy_users() {
         "duplicate",
         "disabled",
         "unapproved",
+        "wrong-user-id",
         "mismatched-legacy-email",
     ] {
         let mut issuer = google_migration_server(google_identity());
@@ -1930,7 +1992,11 @@ fn google_migration_refuses_ambiguous_disabled_or_unapproved_legacy_users() {
                 let path = issuer.server.root.path().join("sso.json");
                 let mut config: Value =
                     serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-                config.as_object_mut().unwrap().remove("clerk_migration");
+                if mode == "wrong-user-id" {
+                    config["clerk_migration"]["users"][0]["user_id"] = json!("f".repeat(64));
+                } else {
+                    config.as_object_mut().unwrap().remove("clerk_migration");
+                }
                 store::atomic_write(&path, &serde_json::to_vec(&config).unwrap()).unwrap();
             }
         }

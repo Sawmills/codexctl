@@ -92,13 +92,12 @@ struct Configuration {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClerkMigration {
-    issuer: String,
     users: Vec<ClerkLink>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ClerkLink {
-    subject: String,
+    user_id: String,
     email: String,
 }
 impl Configuration {
@@ -167,18 +166,18 @@ impl Sso {
             bail!("SSO requires nonempty allowed hosted domains");
         }
         if let Some(migration) = &config.clerk_migration {
-            if config.hosted_domains().is_none()
-                || reqwest::Url::parse(&migration.issuer)?.scheme() != "https"
-                || migration.issuer == config.issuer
-                || migration.users.is_empty()
-            {
-                bail!("Clerk migration requires a distinct HTTPS source issuer and hosted domains");
+            if config.hosted_domains().is_none() || migration.users.is_empty() {
+                bail!("Clerk migration requires company users and hosted domains");
             }
-            let mut subjects = std::collections::BTreeSet::new();
+            let mut user_ids = std::collections::BTreeSet::new();
             let mut emails = std::collections::BTreeSet::new();
             for user in &migration.users {
-                if user.subject.is_empty()
-                    || !subjects.insert(&user.subject)
+                if user.user_id.len() != 64
+                    || !user
+                        .user_id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    || !user_ids.insert(&user.user_id)
                     || !emails.insert(user.email.to_ascii_lowercase())
                     || !user.email.rsplit_once('@').is_some_and(|(local, domain)| {
                         !local.is_empty()
@@ -188,7 +187,7 @@ impl Sso {
                                 .any(|d| d.eq_ignore_ascii_case(domain))
                     })
                 {
-                    bail!("Clerk migration requires unique subjects and company emails");
+                    bail!("Clerk migration requires unique company-user IDs and company emails");
                 }
             }
         }

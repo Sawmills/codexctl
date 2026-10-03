@@ -1,12 +1,16 @@
 # Keep company-user ownership stable across an explicitly approved SSO cutover
 
 Switching from Clerk to Google Workspace changes the issuer/subject identity. An
-administrator may allowlist a particular Clerk subject and verified company email
-for one link at the first verified, hosted-domain-checked Google sign-in. Store the
+administrator may allowlist a particular existing company-user ID and verified
+company email for one link at the first verified, hosted-domain-checked Google sign-in. Store the
 replacement identity on the existing company-user record in one locked atomic
 write, retaining its ID, server accounts and machine credentials. This preserves
 [ADR 0001](0001-server-account-has-one-company-user.md): each server account still
 belongs to exactly one company user.
+
+The account server retains the derived company-user ID, not the raw Clerk subject,
+so the administrator copies the ID from the existing registry. The allowlist does
+not require recovering a subject the server no longer has.
 
 We rejected automatic email-based merging because email is mutable and can be
 ambiguous, and rejected rewriting account/device ownership because that spans

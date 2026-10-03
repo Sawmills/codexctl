@@ -60,7 +60,7 @@ pub(super) fn resolve(
             .users
             .iter()
             .find(|link| link.email.eq_ignore_ascii_case(email))
-            .map(|link| identity(&migration.issuer, &link.subject))
+            .map(|link| link.user_id.as_str())
     });
     match (matches.as_slice(), authorized_source) {
         ([index], Some(source)) => {
