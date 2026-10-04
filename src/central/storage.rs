@@ -157,8 +157,10 @@ CREATE TABLE IF NOT EXISTS central_accounts (
     login TEXT,
     encrypted_vault BYTEA NOT NULL,
     revision BIGINT NOT NULL,
+    deleted_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE central_accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS account_refresh_leases (
     account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id) ON DELETE CASCADE,
     holder_id TEXT NOT NULL,
@@ -377,9 +379,8 @@ impl CentralStore {
     pub async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         match self {
             Self::File(file) => file.load_account(account_id),
-            Self::Postgres(db) => db.load_account(account_id).await,
-            Self::Dual { file, postgres, .. } => Ok(postgres
-                .load_account(account_id)
+            Self::Postgres(db) => bounded_db(db.load_account(account_id)).await,
+            Self::Dual { file, postgres, .. } => Ok(bounded_db(postgres.load_account(account_id))
                 .await?
                 .or(file.load_account(account_id)?)),
         }
@@ -752,7 +753,11 @@ impl FileStore {
             current.holder_id == lease.holder_id && current.epoch == lease.epoch
         });
         if released {
-            state.leases.remove(&lease.account_id);
+            state
+                .leases
+                .get_mut(&lease.account_id)
+                .expect("lease checked above")
+                .expires_at = 0;
             self.write_state(&state)?;
         }
         Ok(released)
@@ -786,7 +791,7 @@ impl FileStore {
                 .get(&record.account_id)
                 .and_then(|bytes| vault::decrypt_bytes(&self.key, bytes).ok())
                 .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok())
-                .is_some_and(|old| old.revision == record.revision));
+                .is_some_and(|old| old.revision == record.revision && old.vault == record.vault));
         }
         state.accounts.insert(
             record.account_id.clone(),
@@ -917,7 +922,7 @@ impl PostgresStore {
     async fn release_lease(&self, lease: &Lease) -> Result<bool> {
         let client = self.client().await?;
         let changed = client.execute(
-            "DELETE FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
+            "UPDATE account_refresh_leases SET expires_at=now() WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
             &[&lease.account_id, &lease.holder_id, &lease.epoch],
         ).await?;
         Ok(changed == 1)
@@ -972,7 +977,7 @@ impl PostgresStore {
 
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         let client = self.client().await?;
-        let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1", &[&account_id]).await?;
+        let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&account_id]).await?;
         row.map(|row| {
             let vault_bytes: Vec<u8> = row.get(4);
             Ok(CredentialRecord {
@@ -990,7 +995,10 @@ impl PostgresStore {
 
     async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
         let client = self.client().await?;
-        let rows = client.query("SELECT account_id,user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts", &[]).await?;
+        let rows = client.query("SELECT account_id,user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE deleted_at IS NULL ORDER BY account_id LIMIT 10001", &[]).await?;
+        if rows.len() > 10_000 {
+            bail!("central account hydration exceeds the 10000-account startup bound");
+        }
         rows.into_iter()
             .map(|row| {
                 let encrypted: Vec<u8> = row.get(5);
@@ -1041,8 +1049,11 @@ impl PostgresStore {
         if changed == 1 {
             return Ok(true);
         }
-        let row = client.query_opt("SELECT 1 FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
-        Ok(row.is_some())
+        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
+        Ok(row.is_some_and(|row| {
+            let stored: Vec<u8> = row.get(0);
+            stored == encrypted
+        }))
     }
 
     async fn create_enrollment(

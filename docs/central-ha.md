@@ -27,6 +27,11 @@ registry when central storage is enabled. A pod seeds each row from its local
 registry only when the central row does not exist; enrollment and revocation
 write the central row and refresh the process-local cache.
 
+Replacement-pod hydration is a bounded startup scan: it reads at most 10,000
+active account rows ordered by `account_id` and fails closed when that bound is
+exceeded. `deleted_at IS NULL` is the active-row predicate; the staging plan
+must keep the account fleet below this bound before enabling dual mode.
+
 Backfill reports relogin journals as `observed_relogins`; these operation
 records are not copied into a central table yet and do not count as migrated
 state.
