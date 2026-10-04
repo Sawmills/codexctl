@@ -345,10 +345,9 @@ impl Owner {
             current.chatgpt_plan_type = token.chatgpt_plan_type;
             current.native_routing_supported = true;
             if let Some((limits, observed_at)) = observed_limits {
-                current.statusline_usage = usage(&limits)
-                    .ok()
-                    .as_ref()
-                    .map(crate::statusline::Usage::from_usage);
+                let parsed = usage(&limits).ok();
+                current.statusline_usage =
+                    parsed.as_ref().map(crate::statusline::Usage::from_usage);
                 if let Some(usage) = current.statusline_usage.as_mut() {
                     usage.age_seconds = observed_at.elapsed().as_secs();
                 }
