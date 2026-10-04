@@ -571,6 +571,7 @@ fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a M
 fn unescape_mountinfo(path: &str) -> String {
     path.replace("\\040", " ")
         .replace("\\011", "\t")
+        .replace("\\012", "\n")
         .replace("\\134", "\\")
 }
 #[cfg(target_os = "linux")]
@@ -761,5 +762,13 @@ mod tests {
                 .id,
             6
         );
+    }
+
+    #[test]
+    fn mountinfo_decodes_newline_path_escapes() {
+        let mount =
+            parse_mountinfo("1 0 8:1 / /var/lib/docker/new\\012line rw - overlay overlay rw")
+                .unwrap();
+        assert_eq!(mount.mountpoint, Path::new("/var/lib/docker/new\nline"));
     }
 }
