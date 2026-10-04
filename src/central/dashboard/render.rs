@@ -285,10 +285,11 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
             )
         );
     }
-    if accounts
-        .iter()
-        .any(|a| a.state == "available" && a.included() && a.stale())
-    {
+    if accounts.iter().any(|a| {
+        a.state == "available"
+            && a.billing_class != crate::api::BillingClass::UsageBased
+            && a.stale()
+    }) {
         return fallback("cmd-live-current");
     }
     let mut html = String::from(r#"<h1 id="answer-title">No included usage available</h1>"#);

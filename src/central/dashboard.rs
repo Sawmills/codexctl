@@ -263,11 +263,12 @@ fn document(content: &str) -> Response {
     let policy = format!(
         "default-src 'none'; style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
-    let refresh = if content.contains("data-has-accounts") {
-        r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#
-    } else {
-        ""
-    };
+    let refresh =
+        if content.contains("data-has-accounts") || content.contains("data-load-error=\"true\"") {
+            r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#
+        } else {
+            ""
+        };
     let html = include_str!("dashboard/page.html")
         .replace("<!-- ACCOUNT_REFRESH -->", refresh)
         .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))

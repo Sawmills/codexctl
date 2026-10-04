@@ -100,6 +100,17 @@ fn reset_fallback_requires_fresh_exhaustion_and_inventory() {
 }
 
 #[test]
+fn stale_unknown_billing_still_withdraws_the_recommendation() {
+    let mut data = fixture();
+    data.accounts.truncate(1);
+    data.accounts[0].billing_class = crate::api::BillingClass::Unknown;
+    data.accounts[0].usage_stale = true;
+    let html = overview(&data);
+    assert!(html.contains("Cannot confirm headroom"));
+    assert!(!html.contains("No included usage available"));
+}
+
+#[test]
 fn earliest_recovery_requires_both_exhausted_windows_and_never_promises_unknown_reset() {
     let mut data = fixture();
     data.accounts.truncate(1);
@@ -181,6 +192,16 @@ async fn render_fixture_pages() {
         std::fs::write(directory.join(format!("{name}.html")), body).unwrap();
         std::fs::write(directory.join(format!("{name}.html.csp")), csp).unwrap();
     }
+}
+
+#[tokio::test]
+async fn snapshot_error_page_retries_without_javascript() {
+    let response = super::super::document(include_str!("../error.html"));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains(r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#));
 }
 
 #[test]
