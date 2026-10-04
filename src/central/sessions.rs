@@ -493,7 +493,8 @@ fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
         return false;
     };
     warned_mount.id != home_mount.id
-        && (warned_mount.device != home_mount.device || warned_mount.root != home_mount.root)
+        && (warned_mount.device != home_mount.device
+            || roots_are_disjoint(&warned_mount.root, &home_mount.root))
         && !home.starts_with(&warned_mount.mountpoint)
 }
 #[cfg(not(target_os = "linux"))]
@@ -525,6 +526,12 @@ fn unescape_mountinfo(path: &str) -> String {
     path.replace("\\040", " ")
         .replace("\\011", "\t")
         .replace("\\134", "\\")
+}
+#[cfg(target_os = "linux")]
+fn roots_are_disjoint(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    !left.starts_with(right) && !right.starts_with(left)
 }
 fn is_open(path: &Path, home: &Path) -> Result<bool> {
     let output = lsof(
@@ -636,7 +643,10 @@ fn restore_backup(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{MountInfo, harmless_lsof_warning, overlay_warning_is_unrelated, parse_mountinfo};
+    use super::{
+        MountInfo, harmless_lsof_warning, overlay_warning_is_unrelated, parse_mountinfo,
+        roots_are_disjoint,
+    };
     use std::fs;
     use std::path::Path;
 
@@ -680,5 +690,12 @@ mod tests {
             line,
             Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
         ));
+    }
+
+    #[test]
+    fn same_device_bind_alias_roots_are_not_assumed_disjoint() {
+        assert!(!roots_are_disjoint("/", "/workspace"));
+        assert!(!roots_are_disjoint("/workspace", "/workspace/codex"));
+        assert!(roots_are_disjoint("/workspace", "/other"));
     }
 }
