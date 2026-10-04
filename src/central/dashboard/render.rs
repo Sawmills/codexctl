@@ -346,7 +346,8 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
     html
 }
 fn attention(accounts: &[Account], all_stale: bool, now: i64) -> String {
-    let has_stale_included = accounts.iter().any(stale_included);
+    let can_advise_reset =
+        recommendation(accounts).is_none() && !accounts.iter().any(stale_included);
     let mut items = Vec::new();
     for (i, a) in accounts.iter().enumerate() {
         let (class, state) = a.state();
@@ -359,7 +360,7 @@ fn attention(accounts: &[Account], all_stale: bool, now: i64) -> String {
             "Stale usage" if !all_stale => note = format!("Last observed {}. The server refreshes every 60 seconds.", age(a)),
             "Exhausted" | "Nearly exhausted" => {
                 note = [&a.primary, &a.secondary].into_iter().filter(|w| w.used_percent.is_some_and(|n| n > 80.0)).map(|w| reset(w.resets_at, now)).collect::<Vec<_>>().join(" · ");
-                if a.redeemable(now) && !has_stale_included {
+                if a.redeemable(now) && can_advise_reset {
                     fix = Some(format!("codexctl reset {}", shell(&a.alias)));
                 }
             }

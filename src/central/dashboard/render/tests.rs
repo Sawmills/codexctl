@@ -6,16 +6,13 @@ fn fixture() -> Snapshot {
 
 #[test]
 fn renders_every_account_and_machine_state_with_the_right_action() {
-    let mut data = fixture();
-    data.accounts[3].billing_class = crate::api::BillingClass::UsageBased;
-    let html = overview(&data);
+    let html = overview(&fixture());
     for text in [
         "Use Everyday building",
         "codexctl use studio",
         "Nearly exhausted",
         "Exhausted",
         "Redeemable now",
-        "codexctl reset sprint",
         "Stale usage",
         "Last observed 7 min ago",
         "Renewal pending",
@@ -31,6 +28,7 @@ fn renders_every_account_and_machine_state_with_the_right_action() {
         assert!(html.contains(text), "missing {text}");
     }
     assert!(!html.contains("codexctl login routing"));
+    assert!(!html.contains("codexctl reset sprint"));
     assert!(!html.contains("data-value=\"show\" open"));
     assert!(html.contains("Banked reset expires"));
     assert!(html.contains("value=\"76\""), "meters show left, not used");
@@ -124,6 +122,15 @@ fn stale_included_account_blocks_reset_advice_for_another_account() {
     assert!(!html.contains("codexctl reset sprint"));
     assert!(!html.contains("id=\"cmd-live-current\""));
     assert!(!html.contains("id=\"cmd-live\""));
+}
+
+#[test]
+fn existing_headroom_blocks_reset_advice_for_another_account() {
+    let mut data = fixture();
+    data.accounts.truncate(2);
+    let html = overview(&data);
+    assert!(html.contains("codexctl use studio"));
+    assert!(!html.contains("codexctl reset sprint"));
 }
 
 #[test]
