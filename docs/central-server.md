@@ -340,9 +340,17 @@ It never switches accounts or redeems resets. The default window is 10 minutes;
 Only successful HTTP responses and 429s from `/codex/responses` count; other statuses
 and endpoints are excluded. Accounts without matching traffic have no row.
 
-The `x-codex-primary-reset-at` response header is matched to the account's weekly
-reset, allowing 120 seconds of drift. Multiple candidates, unknown reset times, and
-missing evidence stay `.unattributed` (a reserved label that cannot be an account alias). Headerless replies inherit the last observed
+The `x-codex-primary-reset-at` response header is matched to the account's declared
+short window (including 5-hour windows) or weekly reset, allowing 120 seconds of drift.
+When present, `x-codex-primary-window-minutes` must also match the status window's
+declared duration; malformed or mismatched durations remain unattributed. The legacy
+secondary weekly slot may omit its duration and still match a 10080-minute header,
+but never a short-window header. Without that header, a reset can match either known
+window. A short window without a declared duration is never inferred. Matching windows
+from different status rows (including local/server rows sharing an alias), unknown
+reset times, and missing evidence stay `.unattributed` (a reserved label that cannot
+be an account alias). Two matching windows from the same row are not ambiguous.
+Headerless replies inherit the last observed
 assignment for the same process within the requested window; an unrecognized header
 clears that assignment. An account switch without a logged header cannot be detected.
 `processes` counts distinct process identifiers observed in the logs, not live OS
