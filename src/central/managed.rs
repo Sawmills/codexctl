@@ -407,7 +407,7 @@ async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
 
 async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers)?;
-    let result = account_catalog(&broker, &device.user).await?;
+    let result = account_catalog(&broker, &device.user, catalog::Freshness::Cached).await?;
     broker.authorize(&headers)?;
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
@@ -415,6 +415,7 @@ async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Re
 pub(super) async fn account_catalog(
     broker: &Broker,
     user: &str,
+    freshness: catalog::Freshness,
 ) -> Result<Vec<Account>, HttpError> {
     let owners: Vec<_> = broker
         .owners
@@ -451,7 +452,14 @@ pub(super) async fn account_catalog(
             };
             let failure = broker
                 .catalog
-                .read(&key, &revision, access.as_deref(), seed, &mut summary)
+                .read(
+                    &key,
+                    &revision,
+                    access.as_deref(),
+                    seed,
+                    &mut summary,
+                    freshness,
+                )
                 .await;
             if let Some(reason) = failure {
                 broker.record_failure(reason, "catalog_usage", StatusCode::SERVICE_UNAVAILABLE);
@@ -887,17 +895,24 @@ async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> 
     response
 }
 async fn ready(State(broker): State<Broker>) -> Response {
-    let healthy = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
-    let status = if !healthy {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else {
+    let healthy = readiness(&broker).is_success();
+    let status = if healthy {
         StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     };
     (
         status,
         Json(json!({"ready": healthy, "storeMode": "file", "databaseReachable": null})),
     )
         .into_response()
+}
+pub(super) fn readiness(broker: &Broker) -> StatusCode {
+    if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    }
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {

@@ -1,0 +1,260 @@
+{
+  "version": 1,
+  "identity": {
+    "email": "engineer@example.com"
+  },
+  "server_time": 1791034800,
+  "accounts": [
+    {
+      "alias": "studio",
+      "label": "Everyday building",
+      "plan": "pro",
+      "state": "available",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": 24,
+        "left_percent": 76,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 42,
+        "left_percent": 58,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 8,
+      "usage_stale": false,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "sprint",
+      "label": "Feature sprint",
+      "plan": "pro",
+      "state": "available",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": 100,
+        "left_percent": 0,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 82,
+        "left_percent": 18,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 8,
+      "usage_stale": false,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 2,
+        "redeemable_now": 1,
+        "nearest_expiry": 1791207600,
+        "stale": false
+      }
+    },
+    {
+      "alias": "build",
+      "label": "Build and test",
+      "plan": "pro",
+      "state": "available",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": 96,
+        "left_percent": 4,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 60,
+        "left_percent": 40,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 8,
+      "usage_stale": false,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "review",
+      "label": "Code review",
+      "plan": "pro",
+      "state": "available",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": 39,
+        "left_percent": 61,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 30,
+        "left_percent": 70,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 420,
+      "usage_stale": true,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "weekend",
+      "label": "Weekend",
+      "plan": "pro",
+      "state": "renewal_pending",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": null,
+        "left_percent": null,
+        "window_seconds": null,
+        "resets_at": null
+      },
+      "secondary": {
+        "used_percent": null,
+        "left_percent": null,
+        "window_seconds": null,
+        "resets_at": null
+      },
+      "usage_age_seconds": null,
+      "usage_stale": true,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "night",
+      "label": "Night shift",
+      "plan": "pro",
+      "state": "unavailable",
+      "routing_refused": false,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": null,
+        "left_percent": null,
+        "window_seconds": null,
+        "resets_at": null
+      },
+      "secondary": {
+        "used_percent": null,
+        "left_percent": null,
+        "window_seconds": null,
+        "resets_at": null
+      },
+      "usage_age_seconds": 7200,
+      "usage_stale": true,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "routing",
+      "label": "Restricted routing",
+      "plan": "pro",
+      "state": "unavailable",
+      "routing_refused": true,
+      "billing_class": "rate_limited",
+      "primary": {
+        "used_percent": 24,
+        "left_percent": 76,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 42,
+        "left_percent": 58,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 8,
+      "usage_stale": false,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    },
+    {
+      "alias": "flex",
+      "label": "Extra capacity",
+      "plan": "pro",
+      "state": "available",
+      "routing_refused": false,
+      "billing_class": "usage_based",
+      "primary": {
+        "used_percent": 24,
+        "left_percent": 76,
+        "window_seconds": 18000,
+        "resets_at": 1791046800
+      },
+      "secondary": {
+        "used_percent": 42,
+        "left_percent": 58,
+        "window_seconds": 604800,
+        "resets_at": 1791314800
+      },
+      "usage_age_seconds": 8,
+      "usage_stale": false,
+      "usage_error": null,
+      "banked_resets": {
+        "count": 0,
+        "redeemable_now": 0,
+        "nearest_expiry": null,
+        "stale": false
+      }
+    }
+  ],
+  "machines": [
+    {
+      "name": "Studio MacBook",
+      "status": "registered",
+      "last_seen_at": 1791034770,
+      "last_used_alias": "sprint"
+    },
+    {
+      "name": "Travel Air",
+      "status": "registered",
+      "last_seen_at": 1790948400,
+      "last_used_alias": "studio"
+    },
+    {
+      "name": "Old workstation",
+      "status": "revoked",
+      "last_seen_at": null
+    }
+  ]
+}

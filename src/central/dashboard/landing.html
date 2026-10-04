@@ -1,83 +1,68 @@
-<section class="hero landing-hero" aria-labelledby="title">
-  <div>
-    <p class="eyebrow">Codex account management</p>
-    <h1 id="title">Your accounts.<br />One place.</h1>
-    <p>Manage your Codex accounts across all your machines.</p>
-    <a class="button primary" href="/accounts"
-      >Sign in with company SSO <span aria-hidden="true">↗</span></a
-    >
-    <p class="hero-caption">
-      View your accounts, usage, resets &amp; machines.
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="wordmark" href="/" translate="no" aria-label="codexctl home"
+      >codexctl<span class="caret" aria-hidden="true"></span
+    ></a>
+    <a class="identity" href="/accounts/sign-in">Sign in</a>
+  </div>
+</header>
+
+<main id="main" class="wrap landing">
+  <!-- Returning engineers: sign in first -->
+  <section class="signin" aria-labelledby="title">
+    <h1 id="title">Sign in to see which account to use</h1>
+    <p class="lede">
+      See how much each of your Codex accounts has left, which machine uses
+      which, and what needs a fix.
     </p>
-  </div>
-  <div class="terminal" aria-label="Example of using codexctl">
-    <div class="terminal-top">
-      <span aria-hidden="true">● ● ●</span><span>Your terminal</span>
+    <a class="button primary" href="/accounts/sign-in"
+      >Sign in with company SSO</a
+    >
+    <p class="server-status" role="status" aria-live="polite">
+      <span class="state <!-- READY_STATE -->"><!-- READY_LABEL --></span>
+    </p>
+  </section>
+
+  <!-- New machine: three steps -->
+  <section aria-labelledby="connect-title">
+    <div class="steps-head">
+      <h2 id="connect-title">Connect a new machine</h2>
+      <p>Two commands, then one approval</p>
     </div>
-    <p><span class="prompt">$</span> codexctl status</p>
-    <div class="terminal-line">
-      <span>Connect a machine</span>
-    </div>
-    <div class="terminal-line">
-      <span>Check account capacity</span>
-    </div>
-    <div class="terminal-line">
-      <span>Choose an account</span>
-    </div>
-    <p class="terminal-bottom">Run codexctl on your machine.</p>
-  </div>
-</section>
-<div class="section-heading">
-  <div>
-    <p class="eyebrow">From here to your terminal</p>
-    <h2>Connect a machine</h2>
-  </div>
-  <span id="server-status" class="pill" role="status" aria-live="polite"
-    >Checking server…</span
-  >
-</div>
-<div class="setup-grid">
-  <section class="setup card">
-    <div class="step-heading">
-      <span class="step-number">01</span>
-      <h3>Install codexctl</h3>
-    </div>
-    <p class="muted">Pick your platform. Run it in your terminal.</p>
-    <div class="command-heading">
-      <h4>macOS <span class="muted">/ Homebrew</span></h4>
-      <button
-        class="copy"
-        data-copy="mac-install"
-        aria-label="Copy macOS install command"
-      >
-        Copy
-      </button>
-    </div>
-    <pre><code translate="no" id="mac-install">brew install sawmills/tap/codexctl</code></pre>
-    <details>
-      <summary>Linux <span class="muted">/ arm64 &amp; x86_64</span></summary>
-      <p class="muted">
-        Pinned to v0.1.34. Downloads the matching release and verifies its
-        SHA-256 checksum before installation.
-      </p>
-      <div class="command-heading">
-        <span class="muted">Requires curl, tar and sha256sum</span
-        ><button
-          class="copy"
-          data-copy="linux-install"
-          aria-label="Copy Linux install commands"
-        >
-          Copy
-        </button>
-      </div>
-      <pre><code translate="no" id="linux-install">(
+    <ol class="steps">
+      <li class="step">
+        <div class="step-body">
+          <h3>Install codexctl</h3>
+          <p class="platform">macOS<span>Homebrew</span></p>
+          <div class="command">
+            <pre
+              tabindex="0"
+            ><code id="mac-install" translate="no">brew install sawmills/tap/codexctl</code></pre>
+            <button
+              class="button small copy"
+              type="button"
+              data-copy="mac-install"
+              aria-label="Copy macOS install command"
+            >
+              Copy
+            </button>
+          </div>
+          <p class="command-note">POSIX shell syntax.</p>
+          <details data-param="platform" data-value="linux">
+            <summary>Linux<span class="faint">arm64 and x86_64</span></summary>
+            <p class="muted">
+              Pinned to v<!-- VERSION -->. The script checks the SHA-256
+              checksum before it installs. Requires curl, tar, and sha256sum.
+            </p>
+            <div class="command">
+              <pre tabindex="0"><code id="linux-install" translate="no">(
   set -eu
   case "$(uname -m)" in
     aarch64|arm64) arch=arm64 ;;
     x86_64) arch=x86_64 ;;
     *) echo "Unsupported architecture" &gt;&amp;2; exit 1 ;;
   esac
-  version=v0.1.34
+  version=v<!-- VERSION -->
   archive="codexctl_${version}_Linux_${arch}.tar.gz"
   base="https://github.com/Sawmills/codexctl/releases/download/${version}"
   work=$(mktemp -d)
@@ -92,47 +77,68 @@
 )
 export PATH="$HOME/.local/bin:$PATH"
 codexctl --version</code></pre>
-      <p class="muted">
-        Add <code translate="no">$HOME/.local/bin</code> to your shell’s PATH to
-        keep the command available in new terminals.
-      </p>
-    </details>
+              <button
+                class="button small copy"
+                type="button"
+                data-copy="linux-install"
+                aria-label="Copy Linux install commands"
+              >
+                Copy
+              </button>
+            </div>
+            <p class="command-note">POSIX shell syntax.</p>
+            <p class="hint">
+              Add <code translate="no">$HOME/.local/bin</code> to your shell’s
+              PATH so new terminals find the command.
+            </p>
+          </details>
+        </div>
+      </li>
+      <li class="step">
+        <div class="step-body">
+          <h3>Connect it to this account server</h3>
+          <div class="command">
+            <pre
+              tabindex="0"
+            ><code translate="no" id="connect-command">codexctl connect \
+  <span class="flag">--server</span> <!-- SERVER --> \
+  <span class="flag">--name</span> "<span class="placeholder">&lt;machine&gt;</span>"</code></pre>
+            <button
+              class="button small copy"
+              type="button"
+              data-copy="connect-command"
+              aria-label="Copy machine connection command"
+            >
+              Copy
+            </button>
+          </div>
+          <p class="command-note">POSIX shell syntax.</p>
+          <p>
+            Replace <code translate="no">&lt;machine&gt;</code> with a name you
+            will recognize, such as “Studio MacBook”.
+          </p>
+        </div>
+      </li>
+      <li class="step">
+        <div class="step-body">
+          <h3>Approve it in your browser</h3>
+          <p>
+            The connect command opens a page. Sign in with company SSO, check
+            that the code matches your terminal, then approve.
+          </p>
+          <p class="hint">
+            No browser on that machine? Add
+            <code translate="no">--no-browser</code> and open the printed link
+            on another computer.
+          </p>
+        </div>
+      </li>
+    </ol>
+    <p
+      id="copy-status"
+      class="copy-status"
+      role="status"
+      aria-live="polite"
+    ></p>
   </section>
-  <section class="setup card">
-    <div class="step-heading">
-      <span class="step-number">02</span>
-      <h3>Connect to your account server</h3>
-    </div>
-    <p class="muted">
-      Replace <code translate="no">&lt;machine&gt;</code> with a name you
-      recognize.
-    </p>
-    <div class="command-heading">
-      <h4>Run in your terminal</h4>
-      <button
-        class="copy"
-        data-copy="connect-command"
-        aria-label="Copy machine connection command"
-      >
-        Copy
-      </button>
-    </div>
-    <pre><code translate="no" id="connect-command">codexctl connect <span class="command-token">--server</span> <!-- SERVER --> <span class="command-token">--name</span> "&lt;machine&gt;"</code></pre>
-    <div class="next">
-      <span aria-hidden="true">↗</span>
-      <div>
-        <h4>Finish in your browser</h4>
-        <p class="muted">
-          Sign in with company SSO, compare the code with your terminal, then
-          approve your machine.
-        </p>
-      </div>
-    </div>
-    <p class="small muted">
-      Use a terminal without a browser? Add
-      <code translate="no">--no-browser</code> and open the printed link on
-      another machine.
-    </p>
-  </section>
-</div>
-<p id="copy-status" class="small muted" role="status" aria-live="polite"></p>
+</main>

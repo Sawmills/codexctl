@@ -1,29 +1,28 @@
-<p class="eyebrow step">
-  MACHINE SETUP <span aria-hidden="true">/</span> CONFIRM ACCESS
-</p>
-<h1 id="page-title">Connect this<br />machine.</h1>
-<p class="intro">
-  Use your company sign-in to connect this machine to your accounts.
-</p>
-<dl class="details">
-  <div>
-    <dt>Signed in as</dt>
-    <dd>{email}</dd>
+<section class="panel" aria-labelledby="page-title">
+  <h1 id="page-title">Connect {name}?</h1>
+  <p class="lede">
+    It will get tokens for your server accounts until you revoke it.
+  </p>
+  <div class="code-check">
+    <p class="label">Code shown in your terminal</p>
+    <code translate="no">{code}</code>
+    <p class="label">Connect only if it matches your terminal exactly.</p>
   </div>
-  <div>
-    <dt>Machine</dt>
-    <dd>{name}</dd>
-  </div>
-</dl>
-<div class="verification">
-  <p class="eyebrow">CHECK YOUR TERMINAL</p>
-  <code class="verification-code">{code}</code>
-  <p>Only connect if this code matches the one in your terminal.</p>
-</div>
-<form method="post" action="/auth/approve">
-  <input type="hidden" name="approval" value="{approval}" />
-  <button type="submit">
-    Connect machine <span aria-hidden="true">&rarr;</span>
-  </button>
-</form>
-<p class="footnote">Not your account or machine? Close this page to cancel.</p>
+  <dl class="facts-list">
+    <div>
+      <dt>Signed in as</dt>
+      <dd translate="no">{email}</dd>
+    </div>
+    <div>
+      <dt>Machine name</dt>
+      <dd>{name}</dd>
+    </div>
+  </dl>
+  <form method="post" action="/auth/approve">
+    <input type="hidden" name="approval" value="{approval}" />
+    <button class="button primary" type="submit">Connect machine</button>
+  </form>
+  <p class="footnote">
+    Not your machine? Close this page. Nothing connects until you approve.
+  </p>
+</section>

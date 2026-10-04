@@ -9,6 +9,14 @@ use std::{
 };
 
 pub(super) const TTL: Duration = Duration::from_secs(60);
+// Leave time for the sequential usage and reset reads (15 seconds each),
+// plus transport/rendering, before the observation expires.
+pub(super) const REFRESH_MARGIN: Duration = Duration::from_secs(35);
+#[derive(Clone, Copy)]
+pub(super) enum Freshness {
+    Cached,
+    RefreshAhead,
+}
 
 #[derive(Default)]
 struct Entry {
@@ -54,14 +62,19 @@ impl Reader {
 
     #[cfg(test)]
     pub(super) async fn expire(&self) {
+        self.age(TTL).await;
+    }
+
+    #[cfg(test)]
+    pub(super) async fn age(&self, elapsed: Duration) {
         let entries: Vec<_> = self.entries.lock().unwrap().values().cloned().collect();
         for entry in entries {
             let mut entry = entry.lock().await;
             if let Some((_, at)) = &mut entry.sample {
-                *at -= TTL;
+                *at -= elapsed;
             }
             if let Some(at) = &mut entry.attempted {
-                *at -= TTL;
+                *at -= elapsed;
             }
         }
     }
@@ -118,6 +131,7 @@ impl Reader {
         access: Option<&str>,
         seed: Option<(api::RateLimitResponse, Instant)>,
         summary: &mut Account,
+        freshness: Freshness,
     ) -> Option<&'static str> {
         let entry = self
             .entries
@@ -141,11 +155,22 @@ impl Reader {
             entry.error = None;
             entry.attempted = None;
         }
+        let refresh_after = match freshness {
+            Freshness::Cached => self.ttl,
+            Freshness::RefreshAhead => self.ttl.saturating_sub(REFRESH_MARGIN),
+        };
         let fresh = entry
             .sample
             .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < self.ttl);
-        let cooling_down = entry.attempted.is_some_and(|at| at.elapsed() < self.ttl);
+            .is_some_and(|(_, at)| at.elapsed() < refresh_after);
+        // Successful observations may refresh early; failures retain the full
+        // cooldown so more frequent browser polling cannot hammer the upstream.
+        let cooldown = if entry.error.is_some() {
+            self.ttl
+        } else {
+            refresh_after
+        };
+        let cooling_down = entry.attempted.is_some_and(|at| at.elapsed() < cooldown);
         let mut failure = None;
         if access.is_some_and(api::is_token_expired) {
             // An idle account can outlive its access token. Only token delivery

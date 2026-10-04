@@ -1,0 +1,21 @@
+<div id="overview" data-load-error="true">
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="wordmark" href="/" translate="no"
+        >codexctl<span class="caret" aria-hidden="true"></span
+      ></a>
+    </div>
+  </header>
+  <main id="main" class="wrap">
+    <h1>Your accounts could not be loaded</h1>
+    <div class="notice" id="connection" role="status">
+      <p id="connection-text">
+        Retry now, or sign in again. Retrying automatically within 60 seconds.
+      </p>
+      <form action="/accounts" method="get">
+        <button class="button small" id="retry" type="submit">Retry now</button>
+      </form>
+    </div>
+    <a href="/accounts/sign-in">Sign in with company SSO</a>
+  </main>
+</div>
