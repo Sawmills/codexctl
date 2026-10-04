@@ -8,6 +8,13 @@ use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+mod ownership;
+
+#[derive(Serialize)]
+struct OwnedPid {
+    pid: u32,
+    source: ownership::Source,
+}
 
 #[derive(Default, Serialize)]
 struct AccountRate {
@@ -18,6 +25,7 @@ struct AccountRate {
     rate_429: f64,
     processes: usize,
     pids: BTreeSet<u32>,
+    owned_pids: Vec<OwnedPid>,
     #[serde(skip)]
     process_ids: BTreeSet<String>,
 }
@@ -52,12 +60,25 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
         .context("cannot locate home directory")?
         .join(".codex/logs_2.sqlite");
     // Do not use immutable=1: a running Codex process may have replies in the WAL.
-    // READ_ONLY also refuses a missing database instead of creating an empty one.
-    let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("cannot read Codex logs at {}", path.display()))?;
-    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    // A machine without logs still has an account catalog. Never create a DB.
+    let db = if path.try_exists()? {
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("cannot read Codex logs at {}", path.display()))?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        Some(db)
+    } else {
+        None
+    };
     let accounts = accounts()?;
-    let report = collect_report(&db, &accounts, minutes)?;
+    let host_account = accounts
+        .iter()
+        .find(|account| {
+            matches!(account.source, codexctl::status_json::Source::Server)
+                && matches!(account.state, codexctl::status_json::State::Active)
+        })
+        .map(|account| account.alias.as_str());
+    let live = ownership::snapshot(host_account)?;
+    let report = collect_report(db.as_ref(), &accounts, minutes, &live)?;
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -93,9 +114,21 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
     Ok(())
 }
 
-fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> Result<Report> {
+fn collect_report(
+    db: Option<&Connection>,
+    accounts: &[AccountStatus],
+    minutes: u32,
+    live: &[ownership::LiveProcess],
+) -> Result<Report> {
     let now = Utc::now();
     let since = now.timestamp() - i64::from(minutes) * 60;
+    let live_by_pid: HashMap<_, _> = live.iter().map(|process| (process.pid, process)).collect();
+    let scan_since = live
+        .iter()
+        .filter(|process| process.account.is_none())
+        .map(|process| process.started_at)
+        .fold(since, i64::min);
+    let mut log_owners = HashMap::new();
     let resets: Vec<_> = accounts
         .iter()
         .flat_map(|a| {
@@ -129,18 +162,43 @@ fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> 
     // None is a separate key: an account literally called "unattributed" cannot
     // absorb traffic for which we have no evidence.
     let mut totals: BTreeMap<Option<String>, AccountRate> = BTreeMap::new();
+    for account in accounts
+        .iter()
+        .filter(|account| matches!(account.source, codexctl::status_json::Source::Server))
+    {
+        totals.insert(
+            Some(account.alias.clone()),
+            AccountRate {
+                account: account.alias.clone(),
+                weekly_used_percent: account.secondary_used_percent,
+                ..Default::default()
+            },
+        );
+    }
     let mut query = db
-        .prepare(
-            "SELECT process_uuid, feedback_log_body FROM logs
+        .map(|db| {
+            db.prepare(
+                "SELECT process_uuid, feedback_log_body, ts FROM logs
          WHERE ts >= ?1 AND ts <= ?2 AND feedback_log_body LIKE '%/codex/responses status=%'
          ORDER BY ts, rowid",
-        )
+            )
+        })
+        .transpose()
         .context("unsupported Codex log database schema")?;
-    let rows = query.query_map([since, now.timestamp()], |row| {
-        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (process, body) = row?;
+    let rows = query
+        .as_mut()
+        .map(|query| {
+            query.query_map([scan_since, now.timestamp()], |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+        })
+        .transpose()?;
+    for row in rows.into_iter().flatten() {
+        let (process, body, timestamp) = row?;
         let Some(status) = status_pattern
             .captures(&body)
             .and_then(|c| c[1].parse::<u16>().ok())
@@ -172,6 +230,19 @@ fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> 
                     .all(|(_, _, account)| std::ptr::eq(*account, first.2))
                     .then_some(first.2)
             });
+        if has_header
+            && let Some(pid) = process.as_deref().and_then(process_pid)
+            && live_by_pid
+                .get(&pid)
+                .is_some_and(|process| timestamp >= process.started_at)
+        {
+            log_owners.insert(pid, observed);
+        }
+        // Ownership may use older evidence; response counts retain their
+        // original window-scoped header inheritance.
+        if timestamp < since {
+            continue;
+        }
         if has_header && let Some(process) = process.as_ref().filter(|p| !p.is_empty()) {
             // Unknown/malformed/ambiguous evidence clears a previous assignment.
             current.insert(process.clone(), observed);
@@ -199,20 +270,51 @@ fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> 
             row.responses_ok += 1;
         }
         if let Some(process) = process.filter(|p| !p.is_empty()) {
-            if let Some(pid) = process
-                .strip_prefix("pid:")
-                .and_then(|rest| rest.split(':').next())
-                .and_then(|pid| pid.parse::<u32>().ok())
-                .filter(|pid| *pid > 0)
-            {
+            if let Some(pid) = process_pid(&process) {
                 row.pids.insert(pid);
             }
             row.process_ids.insert(process);
         }
     }
+    for process in live {
+        let owner = process
+            .account
+            .as_ref()
+            .map(|(alias, source)| (alias.as_str(), *source))
+            .or_else(|| {
+                log_owners
+                    .get(&process.pid)
+                    .copied()
+                    .flatten()
+                    .map(|account| (account.alias.as_str(), ownership::Source::Log))
+            });
+        let Some((alias, source)) = owner else {
+            continue;
+        };
+        let Some(account) = accounts.iter().find(|account| account.alias == alias) else {
+            continue;
+        };
+        totals
+            .entry(Some(alias.to_owned()))
+            .or_insert_with(|| AccountRate {
+                account: alias.to_owned(),
+                weekly_used_percent: account.secondary_used_percent,
+                ..Default::default()
+            })
+            .owned_pids
+            .push(OwnedPid {
+                pid: process.pid,
+                source,
+            });
+    }
     let mut rows: Vec<_> = totals.into_values().collect();
     for row in &mut rows {
-        row.rate_429 = row.responses_429 as f64 / (row.responses_ok + row.responses_429) as f64;
+        let responses = row.responses_ok + row.responses_429;
+        row.rate_429 = if responses == 0 {
+            0.0
+        } else {
+            row.responses_429 as f64 / responses as f64
+        };
         row.processes = row.process_ids.len();
     }
     rows.sort_by(|a, b| a.account.cmp(&b.account));
@@ -222,6 +324,16 @@ fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> 
         generated_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
         accounts: rows,
     })
+}
+
+fn process_pid(process: &str) -> Option<u32> {
+    process
+        .strip_prefix("pid:")?
+        .split(':')
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|pid| *pid > 0)
 }
 
 #[cfg(test)]
@@ -274,12 +386,12 @@ mod tests {
             "/codex/responses status=429",
             r#"/codex/responses status=429 headers={"x-codex-primary-reset-at": "4102444800", "x-codex-primary-window-minutes": "300"}"#,
         ]);
-        let report = collect_report(&db, &[account], 10).unwrap();
+        let report = collect_report(Some(&db), &[account], 10, &[]).unwrap();
         assert_eq!(
             serde_json::to_value(report.accounts).unwrap(),
             json!([
-                {"account":".unattributed", "weekly_used_percent":null, "responses_ok":0, "responses_429":1, "rate_429":1.0, "processes":1, "pids":[301]},
-                {"account":"shared", "weekly_used_percent":10.0, "responses_ok":1, "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]}
+                {"account":".unattributed", "weekly_used_percent":null, "responses_ok":0, "responses_429":1, "rate_429":1.0, "processes":1, "pids":[301], "owned_pids":[]},
+                {"account":"shared", "weekly_used_percent":10.0, "responses_ok":1, "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301], "owned_pids":[]}
             ])
         );
     }
@@ -300,15 +412,19 @@ mod tests {
         let mut rows = [local, remote];
         // Two windows from the same status row do not create ambiguity.
         assert_eq!(
-            collect_report(&db, &rows[..1], 10).unwrap().accounts[0].account,
+            collect_report(Some(&db), &rows[..1], 10, &[])
+                .unwrap()
+                .accounts[0]
+                .account,
             "shared"
         );
         for _ in 0..2 {
-            let report = collect_report(&db, &rows, 10).unwrap();
+            let report = collect_report(Some(&db), &rows, 10, &[]).unwrap();
             assert_eq!(
                 serde_json::to_value(report.accounts).unwrap(),
                 json!([
-                    {"account":".unattributed", "weekly_used_percent":null, "responses_ok":1, "responses_429":0, "rate_429":0.0, "processes":1, "pids":[301]}
+                    {"account":".unattributed", "weekly_used_percent":null, "responses_ok":1, "responses_429":0, "rate_429":0.0, "processes":1, "pids":[301], "owned_pids":[]},
+                    {"account":"shared", "weekly_used_percent":70.0, "responses_ok":0, "responses_429":0, "rate_429":0.0, "processes":0, "pids":[], "owned_pids":[]}
                 ])
             );
             rows.reverse();

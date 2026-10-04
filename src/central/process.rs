@@ -1,4 +1,4 @@
-//! Identity of the exact process that writes the persistent credential journal.
+//! Identity of the exact process that owns durable local state.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -69,6 +69,9 @@ fn incarnation(pid: u32) -> Result<Option<String>> {
     }
 }
 impl Process {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
     pub fn capture(pid: u32) -> Result<Self> {
         Ok(Self {
             pid,

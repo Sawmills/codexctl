@@ -266,6 +266,10 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             .prefix("launch-")
             .tempdir_in(launches)?;
         let owner = vault::lock(prepared.path(), "owner.lock")?;
+        store::atomic_write(
+            &prepared.path().join("owner.json"),
+            &serde_json::to_vec(&super::super::process::Process::capture(std::process::id())?)?,
+        )?;
         save_connection(&prepared.path().join("connection.json"), &connection)?;
         (prepared, owner)
     };
@@ -387,4 +391,48 @@ mod tests {
         assert!(require_headroom("premium", &token(None, None)).is_err());
         assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
     }
+}
+
+/// Live launcher PIDs and aliases, for read-only process ownership reporting.
+/// The lock and process incarnation jointly reject stale directories and PID reuse.
+pub fn launch_owners() -> Result<std::collections::BTreeMap<u32, String>> {
+    let mut owners = std::collections::BTreeMap::new();
+    let lanes = root()?.join("lanes");
+    if !lanes.try_exists()? {
+        return Ok(owners);
+    }
+    for entry in std::fs::read_dir(lanes)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with("launch-")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        let connection_path = entry.path().join("connection.json");
+        if require_live_launch(&connection_path).is_err() {
+            continue;
+        }
+        // Older launches have no owner metadata. A sweep can also remove a
+        // directory between these reads; neither proves ownership.
+        let owner = std::fs::read(entry.path().join("owner.json"))
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<super::super::process::Process>(&bytes).ok()
+            });
+        let Some(owner) = owner else {
+            continue;
+        };
+        if !owner.alive()? {
+            continue;
+        }
+        let Ok(connection) = read_connection(&connection_path) else {
+            continue;
+        };
+        if connection.launch_pinned
+            && let Some(alias) = connection.alias
+        {
+            owners.insert(owner.pid(), alias);
+        }
+    }
+    Ok(owners)
 }

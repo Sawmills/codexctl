@@ -336,9 +336,12 @@ codexctl rate --json --minutes 10
 `rate` opens `~/.codex/logs_2.sqlite` read-only, including committed WAL entries, and
 uses the same account usage lookup as `status --json` (which may update status caches).
 It never switches accounts or redeems resets. The default window is 10 minutes;
-`--minutes` accepts 1 through 525600. Missing/unreadable databases fail with exit 1.
-Only successful HTTP responses and 429s from `/codex/responses` count; other statuses
-and endpoints are excluded. Accounts without matching traffic have no row.
+`--minutes` accepts 1 through 525600. Every server account has a row, including
+unavailable accounts and accounts with no matching traffic. Their response counts,
+429 ratio, and log process count are zero. A missing log database produces these
+zero-traffic rows without creating a database; unreadable or malformed databases
+still fail with exit 1. Only successful HTTP responses and 429s from
+`/codex/responses` count; other statuses and endpoints are excluded.
 
 The `x-codex-primary-reset-at` response header is matched to the account's declared
 short window (including 5-hour windows) or weekly reset, allowing 120 seconds of drift.
@@ -359,9 +362,30 @@ reused PIDs can correspond to multiple process identifiers.
 
 JSON contains `host`, `window_minutes`, `generated_at`, and `accounts`, whose rows
 contain `account`, `weekly_used_percent`, `responses_ok`, `responses_429`, `rate_429`,
-`processes`, and `pids`. `rate_429` is 429s divided by successes plus 429s; unknown weekly
-usage is null. The backend exposes no token-per-minute counts or limit, so neither
-field is estimated or included. This readout is log evidence, not a throughput quota.
+`processes`, `pids`, and `owned_pids`. `rate_429` is 429s divided by successes plus
+429s (zero without responses); unknown weekly usage is null.
+
+`owned_pids` is an array such as `[{"pid":123,"source":"launch"}]`, sorted by PID.
+On Linux and macOS it reports live processes independently of the response window:
+
+- `launch`: a live `codexctl codex --account` launcher owns the direct child and
+  native Codex descendants. Its private `lanes/launch-*/owner.json` records the
+  launcher PID and process incarnation; both that identity and the held owner lock
+  must still be valid. Older launches without this metadata can use log evidence.
+- `host-default`: an unpinned Codex process in this home uses the host's active
+  server-account pointer. Isolated homes and inherited pinned aliases are excluded.
+- `log`: when neither source identifies the account, the latest reset-header
+  evidence from the live process's lifetime can identify it, even outside the
+  requested response window. Ambiguous or invalid newer headers clear this evidence.
+
+Sources have the precedence shown above. Ownership is a process snapshot and can
+change after the command returns. Exited processes disappear from `owned_pids`;
+the historical `pids` and response counts stay unchanged. A host-default assignment
+states the configured default, not proof that a request used it. Local-only Windows
+builds retain log counts and return empty `owned_pids`.
+
+The backend exposes no token-per-minute counts or limit, so neither field is
+estimated or included. Response counts are log evidence, not a throughput quota.
 
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.

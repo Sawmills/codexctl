@@ -13,8 +13,8 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
-pub use launch::run_pinned_codex;
 pub(super) use launch::sweep_stale_launches;
+pub use launch::{launch_owners, run_pinned_codex};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";

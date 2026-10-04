@@ -7455,7 +7455,7 @@ db.close()
             .unwrap(),
         &json!({
             "account":"unattributed", "weekly_used_percent":37.0, "responses_ok":1,
-            "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]
+            "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301], "owned_pids":[]
         })
     );
     assert_eq!(
@@ -7464,7 +7464,7 @@ db.close()
             .unwrap(),
         &json!({
             "account":".unattributed", "weekly_used_percent":null, "responses_ok":0,
-            "responses_429":1, "rate_429":1.0, "processes":1, "pids":[302]
+            "responses_429":1, "rate_429":1.0, "processes":1, "pids":[302], "owned_pids":[]
         })
     );
     assert_eq!(std::fs::read(&database).unwrap(), before);
@@ -7615,8 +7615,11 @@ fn b21_rate_reads_wal_and_keeps_ambiguous_or_missing_process_evidence_unattribut
         json!([{
             "account":".unattributed", "weekly_used_percent":null,
             "responses_ok":2, "responses_429":3, "rate_429":0.6,
-            "processes":3, "pids":[301]
-        }])
+            "processes":3, "pids":[301], "owned_pids":[]
+        },
+        {"account":"first", "weekly_used_percent":37.0, "responses_ok":0, "responses_429":0, "rate_429":0.0, "processes":0, "pids":[], "owned_pids":[]},
+        {"account":"second", "weekly_used_percent":37.0, "responses_ok":0, "responses_429":0, "rate_429":0.0, "processes":0, "pids":[], "owned_pids":[]}
+        ])
     );
     // Keep the writer open until after the command so the response rows are in WAL.
     drop(db);
@@ -7860,9 +7863,197 @@ fn b21b_rate_attributes_declared_five_hour_and_weekly_windows() {
         report["accounts"],
         json!([
             {"account":".unattributed", "weekly_used_percent":null, "responses_ok":0,
-             "responses_429":2, "rate_429":1.0, "processes":1, "pids":[303]},
+             "responses_429":2, "rate_429":1.0, "processes":1, "pids":[303], "owned_pids":[]},
             {"account":"standard", "weekly_used_percent":37.0, "responses_ok":3,
-             "responses_429":1, "rate_429":0.25, "processes":2, "pids":[301,302]}
+             "responses_429":1, "rate_429":0.25, "processes":2, "pids":[301,302], "owned_pids":[]}
         ])
     );
+}
+
+#[test]
+fn b21d_rate_lists_every_server_account_without_traffic_or_a_log_database() {
+    let server = Server::start();
+    server.import(&server.amir, "idle-a", "login-a", "seat-a");
+    server.import(&server.amir, "idle-b", "login-b", "seat-b");
+    let home = server.connected_home();
+    let database = home.path().join(".codex/logs_2.sqlite");
+    for with_database in [false, true] {
+        if with_database {
+            std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)",
+                )
+                .unwrap();
+        }
+        let output = server.cli(home.path(), &["rate", "--json"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows = report["accounts"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, alias) in rows.iter().zip(["idle-a", "idle-b"]) {
+            assert_eq!(row["account"], alias);
+            assert_eq!(row["responses_ok"], 0);
+            assert_eq!(row["responses_429"], 0);
+            assert_eq!(row["rate_429"], 0.0);
+            assert_eq!(row["processes"], 0);
+            assert_eq!(row["pids"], json!([]));
+        }
+        assert_eq!(database.exists(), with_database);
+    }
+}
+
+#[test]
+fn b21d_rate_keeps_live_launch_and_host_ownership_without_responses() {
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let mut lane = B21Lane::start(home.path(), "ownership-ready");
+    // A real, idle process named codex, with the same host environment.
+    let plain_bin = home.path().join("plain");
+    std::fs::create_dir(&plain_bin).unwrap();
+    std::fs::copy("/bin/sleep", plain_bin.join("codex")).unwrap();
+    let plain = Command::new(plain_bin.join("codex"))
+        .arg("120")
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .spawn()
+        .unwrap();
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let plain = ChildGuard(plain);
+    let output = server.cli(home.path(), &["rate", "--json", "--minutes", "1"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let rows = report["accounts"].as_array().unwrap();
+    let host = rows.iter().find(|r| r["account"] == "host").unwrap();
+    let pinned = rows.iter().find(|r| r["account"] == "lane").unwrap();
+    assert_eq!(
+        host["owned_pids"],
+        json!([{"pid":plain.0.id(),"source":"host-default"}])
+    );
+    assert_eq!(
+        pinned["owned_pids"],
+        json!([{"pid":lane.child_pid,"source":"launch"}])
+    );
+    for row in rows {
+        assert_eq!(row["responses_ok"], 0);
+        assert_eq!(row["processes"], 0);
+    }
+    // Even a held lock must not make a reused launcher PID authoritative.
+    let owner_file = lane.connection.with_file_name("owner.json");
+    let original = std::fs::read(&owner_file).unwrap();
+    let mut owner: Value = serde_json::from_slice(&original).unwrap();
+    owner["incarnation"] = json!("previous-incarnation");
+    store::atomic_write(&owner_file, &serde_json::to_vec(&owner).unwrap()).unwrap();
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["accounts"][1]["owned_pids"], json!([]));
+    store::atomic_write(&owner_file, &original).unwrap();
+
+    // The host pointer moves the default process, while the launch stays pinned.
+    assert!(server.cli(home.path(), &["use", "lane"]).status.success());
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["accounts"][0]["owned_pids"], json!([]));
+    let owned = report["accounts"][1]["owned_pids"].as_array().unwrap();
+    assert_eq!(owned.len(), 2);
+    assert!(owned.contains(&json!({"pid":lane.child_pid,"source":"launch"})));
+    assert!(owned.contains(&json!({"pid":plain.0.id(),"source":"host-default"})));
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+
+    // A crash leaves the child and directory alive, but the ownership is stale.
+    lane.signal_and_wait(libc::SIGKILL);
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pinned = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["account"] == "lane")
+        .unwrap();
+    assert_eq!(pinned["owned_pids"], json!([]));
+}
+
+#[test]
+fn b21d_log_ownership_requires_a_live_process_and_evidence_from_its_lifetime() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "legacy", "legacy-login", "legacy-seat");
+    let home = server.connected_home();
+    let binary = home.path().join("codex");
+    std::fs::copy("/bin/sleep", &binary).unwrap();
+    let child = Command::new(binary)
+        .arg("120")
+        .env("HOME", home.path())
+        .env("CODEXCTL_PINNED_ALIAS", "legacy")
+        .env_remove("CODEX_HOME")
+        .spawn()
+        .unwrap();
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = ChildGuard(child);
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    let db = rusqlite::Connection::open(home.path().join(".codex/logs_2.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)")
+        .unwrap();
+    let process = format!("pid:{}:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", child.0.id());
+    let header = r#"/codex/responses status=200 headers={"x-codex-primary-reset-at":"4102444800"}"#;
+    db.execute(
+        "INSERT INTO logs VALUES (?1, ?2, ?3)",
+        rusqlite::params![chrono::Utc::now().timestamp() - 3600, process, header],
+    )
+    .unwrap();
+    let read = || {
+        let output = server.cli(home.path(), &["rate", "--json", "--minutes", "120"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    // Reused PID in historical traffic is not current ownership.
+    assert_eq!(read()["accounts"][0]["owned_pids"], json!([]));
+    db.execute(
+        "INSERT INTO logs VALUES (?1, ?2, ?3)",
+        rusqlite::params![chrono::Utc::now().timestamp(), process, header],
+    )
+    .unwrap();
+    let report = read();
+    assert_eq!(
+        report["accounts"][0]["owned_pids"],
+        json!([{"pid":child.0.id(),"source":"log"}])
+    );
+    assert_eq!(report["accounts"][0]["responses_ok"], 2);
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let report = read();
+    assert_eq!(report["accounts"][0]["owned_pids"], json!([]));
+    assert_eq!(report["accounts"][0]["pids"], json!([child.0.id()]));
 }
