@@ -13,7 +13,8 @@ ExternalSecret supplies the vault key, SSO secret, and metrics token; the
 `codexctl-postgres` ExternalSecret mirrors the five SSM keys provisioned by
 infra#1513. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
 uses the image system CA bundle through
-`CODEXCTL_CENTRAL_DB_CA_FILE`.
+`CODEXCTL_CENTRAL_DB_CA_FILE`. Kustomize rewrites the workload image to the
+reviewed immutable ECR manifest digest; it does not use the mutable staging tag.
 
 Build it with:
 

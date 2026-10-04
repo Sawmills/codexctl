@@ -10,3 +10,7 @@ resources:
   - deployment.yaml
   - pdb.yaml
   - postgres-externalsecret.yaml
+images:
+  - name: codexctl-central
+    newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
+    digest: sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68

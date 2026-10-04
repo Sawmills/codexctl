@@ -176,7 +176,7 @@ or row counts do not match the reviewed plan.
          restartPolicy: Never
          containers:
            - name: migrate
-             image: codexctl-central:staging # replace with the reviewed image digest
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
              command:
                [
                  codexctl-central,
@@ -258,7 +258,7 @@ or row counts do not match the reviewed plan.
          restartPolicy: Never
          containers:
            - name: backfill
-             image: codexctl-central:staging # replace with the reviewed image digest
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
              env:
                - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
