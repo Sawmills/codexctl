@@ -1994,7 +1994,12 @@ fn spend_cap_seen(output: &str) -> bool {
 }
 
 fn rate_limit_seen(output: &str) -> bool {
-    normalize_spend_cap_text(output).contains(&normalize_spend_cap_text(RATE_LIMIT_MESSAGE))
+    let normalized = strip_ansi_escapes(output)
+        .split(['\n', '\r'])
+        .filter(|line| line.chars().any(is_box_drawing))
+        .map(normalize_spend_cap_text)
+        .collect::<String>();
+    normalized.contains(&normalize_spend_cap_text(RATE_LIMIT_MESSAGE))
 }
 
 /// Flatten Codex's bordered error box for matching: drop ANSI escapes,
@@ -2356,10 +2361,19 @@ mod tests {
 
     #[test]
     fn rate_limit_seen_detects_retry_limit_message() {
-        assert!(rate_limit_seen("exceeded retry limit, last status: 429"));
-        assert!(rate_limit_seen("exceeded\nretry limit, last status: 429"));
+        assert!(!rate_limit_seen("exceeded retry limit, last status: 429"));
+        assert!(!rate_limit_seen("exceeded\nretry limit, last status: 429"));
         assert!(rate_limit_seen(
-            "\u{1b}[31mexceeded retry limit, last status: 429\u{1b}[0m"
+            "\u{1b}[31m│ exceeded retry limit, last status: 429 │\u{1b}[0m"
+        ));
+        assert!(rate_limit_seen(
+            "│ exceeded\n│ retry limit, last status: 429 │"
+        ));
+        assert!(rate_limit_seen(
+            "\u{1b}[31mexceeded retry limit, last status: 429\u{2595}\u{1b}[0m"
+        ));
+        assert!(!rate_limit_seen(
+            "assistant quoted: exceeded retry limit, last status: 429"
         ));
         assert!(!rate_limit_seen("last status: 500"));
     }

@@ -1383,10 +1383,7 @@ pub(super) async fn account_catalog(
                 .live_sessions(&user, &summary.alias, 10 * 60);
             if let Some(central) = broker.central.as_ref()
                 && let Ok(count) = central
-                    .live_session_count(
-                        &summary.account_id,
-                        std::time::Duration::from_secs(10 * 60),
-                    )
+                    .live_session_count(&key, std::time::Duration::from_secs(10 * 60))
                     .await
             {
                 summary.live_sessions = summary.live_sessions.max(count);
