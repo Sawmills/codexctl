@@ -167,6 +167,20 @@ impl Owner {
         validate_owned_identity(&self.vault.auth, auth)
     }
 
+    pub(super) fn validate_account_id(
+        &mut self,
+        requested: Option<&str>,
+    ) -> Result<(), TokenFailure> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let current = self.snapshot().map_err(TokenFailure::Unavailable)?;
+        if requested != current.chatgpt_account_id {
+            return Err(TokenFailure::AccountMismatch);
+        }
+        Ok(())
+    }
+
     pub(super) fn reconcile_journal(&mut self) -> Result<()> {
         let journal: Value =
             serde_json::from_slice(&vault::private_read(&self.home.join("auth.json"))?)?;
@@ -248,13 +262,6 @@ impl Owner {
                 return Err(error.into());
             }
         };
-        if request
-            .account_id
-            .as_ref()
-            .is_some_and(|id| *id != current.chatgpt_account_id)
-        {
-            return Err(TokenFailure::AccountMismatch);
-        }
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
                 return self.with_billing(current, request.billing).await;
@@ -577,7 +584,11 @@ async fn tokens(
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     // A disconnected HTTP client must not cancel a refresh after OpenAI rotates its token.
     let owner = broker.owner.clone();
-    let task = tokio::spawn(async move { owner.lock().await.tokens(request).await });
+    let task = tokio::spawn(async move {
+        let mut owner = owner.lock().await;
+        owner.validate_account_id(request.account_id.as_deref())?;
+        owner.tokens(request).await
+    });
     let result = task
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?

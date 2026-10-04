@@ -73,6 +73,16 @@ impl Rpc {
         self.outstanding.is_some()
     }
 
+    pub(super) fn process_exited(&mut self) -> bool {
+        self._child.try_wait().ok().flatten().is_some()
+    }
+
+    pub(super) async fn terminate(mut self) {
+        let _ = self.input.take();
+        let _ = self._child.start_kill();
+        let _ = timeout(Duration::from_secs(5), self._child.wait()).await;
+    }
+
     pub(super) fn retryable_failure(&self) -> bool {
         self.retryable_failure
     }

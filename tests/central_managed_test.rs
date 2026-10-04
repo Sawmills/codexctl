@@ -2259,7 +2259,7 @@ fn repeated_account_id_mismatches_do_not_spend_recovery_budget() {
             server
                 .token_with_account(&server.amir, "personal", "wrong-seat")
                 .status(),
-            400
+            409
         );
     }
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
