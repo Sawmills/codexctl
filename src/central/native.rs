@@ -204,15 +204,24 @@ fn write_pointer_with_rollback(
     expected_connection: &Connection,
     pointer: &Path,
     pointer_bytes: &[u8],
+    previous_pointer: Option<&[u8]>,
     write_pointer: impl FnOnce(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
-    write_pointer_after_connection(
+    if let Err(error) = write_pointer_after_connection(
         connection_path,
         expected_connection,
         pointer,
         pointer_bytes,
         write_pointer,
-    )
+    ) {
+        return match restore_active_pointer(pointer, previous_pointer) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "active account pointer rollback failed: {rollback_error:#}"
+            ))),
+        };
+    }
+    Ok(())
 }
 fn rollback_or_context(error: anyhow::Error, state: ActivationRollback<'_>) -> anyhow::Error {
     match rollback_activation(state) {
@@ -1011,6 +1020,7 @@ pub fn activate(
         &connection,
         &pointer,
         format!("{alias}\n").as_bytes(),
+        previous_pointer.as_deref(),
         store::atomic_write,
     ) {
         return Err(rollback_or_context(
@@ -1270,9 +1280,9 @@ pub(crate) fn statusline_selection(
 mod tests {
     use super::{
         ActivationRollback, BILLING_SWITCH_NOTICE, Connection, billing_switch_prompt,
-        remove_active_pointer_with, remove_pointer_then_marker_with, restore_active_pointer,
-        rollback_or_context, save_connection, validate_token_account,
-        write_pointer_after_connection, write_pointer_with_rollback,
+        remove_active_pointer_with, remove_pointer_then_marker_with, rollback_or_context,
+        save_connection, validate_token_account, write_pointer_after_connection,
+        write_pointer_with_rollback,
     };
     use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1314,6 +1324,7 @@ mod tests {
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
+            launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
         };
@@ -1325,6 +1336,7 @@ mod tests {
             &connection,
             &pointer,
             b"new\n",
+            Some(b"old\n"),
             |path, bytes| {
                 fs::write(path, bytes)?;
                 anyhow::bail!("synthetic late pointer fsync failure")
@@ -1333,7 +1345,6 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("late pointer fsync"));
-        restore_active_pointer(&pointer, Some(b"old\n")).unwrap();
         assert_eq!(fs::read(pointer).unwrap(), b"old\n");
     }
 
@@ -1421,6 +1432,7 @@ mod tests {
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
+            launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
         };
