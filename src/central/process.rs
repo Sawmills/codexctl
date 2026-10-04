@@ -68,7 +68,11 @@ fn incarnation(pid: u32) -> Result<Option<String>> {
         Ok(Some(start))
     }
 }
+
 impl Process {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
     pub fn capture(pid: u32) -> Result<Self> {
         Ok(Self {
             pid,
@@ -146,10 +150,40 @@ mod tests {
         let alive = process.alive().unwrap();
         assert!(!alive);
     }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn an_incarnation_persisted_by_the_previous_format_stays_live() {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &std::process::id().to_string(), "-o", "lstart="])
+            .output()
+            .unwrap();
+        let process = Process {
+            pid: std::process::id(),
+            incarnation: String::from_utf8(output.stdout).unwrap().trim().to_owned(),
+        };
+        assert!(process.alive().unwrap());
+    }
+
     #[test]
     fn when_the_actual_owner_still_exists_then_restart_refuses_it() {
         let process = Process::capture(std::process::id()).unwrap();
         let alive = process.alive().unwrap();
         assert!(alive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_pid_stays_not_alive_when_ps_reports_no_output() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let process = Process {
+            pid,
+            incarnation: String::from("old-process-incarnation"),
+        };
+        assert!(!process.alive().unwrap());
     }
 }
