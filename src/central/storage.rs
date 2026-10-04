@@ -181,6 +181,16 @@ CREATE TABLE IF NOT EXISTS central_registry (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE central_registry ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS central_registry_entries (
+    kind TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    encrypted_payload BYTEA NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, entity_id)
+);
+CREATE INDEX IF NOT EXISTS central_registry_entries_kind_idx
+    ON central_registry_entries (kind);
 "#;
 
 impl CentralStore {
@@ -263,6 +273,36 @@ impl CentralStore {
             Self::File(_) => Ok(None),
             Self::Postgres(db) => bounded_db(db.load_registry(name)).await,
             Self::Dual { postgres, .. } => bounded_db(postgres.load_registry(name)).await,
+        }
+    }
+
+    /// Read normalized registry entities. PostgreSQL is authoritative in the
+    /// shared modes; the legacy blob remains only as a migration fallback.
+    pub async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.load_registry_entities(name)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.load_registry_entities(name)).await,
+        }
+    }
+
+    /// Atomically upsert each registry entity in one SQL statement. This keeps
+    /// a stale pod from replacing the shared users/devices set with its local
+    /// snapshot and gives every entity its own revision.
+    pub async fn save_registry_entities(
+        &self,
+        name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) => bounded_db(db.save_registry_entities(name, entries)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.save_registry_entities(name, entries)).await
+            }
         }
     }
 
@@ -981,6 +1021,53 @@ impl PostgresStore {
         Ok(Some(vault::decrypt_bytes(&self.key, &encrypted)?))
     }
 
+    async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT encrypted_payload FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
+                &[&name],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let encrypted: Vec<u8> = row.get(0);
+                vault::decrypt_bytes(&self.key, &encrypted)
+            })
+            .collect()
+    }
+
+    async fn save_registry_entities(
+        &self,
+        name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        let client = self.client().await?;
+        let mut sql = String::from(
+            "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload) VALUES ",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        for (index, (entity_id, payload)) in entries.iter().enumerate() {
+            if index != 0 {
+                sql.push(',');
+            }
+            let base = params.len() + 1;
+            sql.push_str(&format!("(${base},${},${})", base + 1, base + 2));
+            params.push(Box::new(name.to_owned()));
+            params.push(Box::new(entity_id.clone()));
+            params.push(Box::new(vault::encrypt_bytes(&self.key, payload)?));
+        }
+        sql.push_str(
+            " ON CONFLICT(kind,entity_id) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload, revision=central_registry_entries.revision+1, updated_at=now()",
+        );
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        client.execute(&sql, &refs).await?;
+        Ok(())
+    }
+
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         let client = self.client().await?;
         let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&account_id]).await?;
@@ -1358,6 +1445,21 @@ mod tests {
             ..lease.clone()
         };
         assert!(!second.fenced_write(&stale, &record(&id, 4)).await.unwrap());
+        // A second broker must observe the committed credential revision before
+        // it attempts another refresh, rather than using its startup snapshot.
+        assert_eq!(second.load_account(&id).await.unwrap().unwrap().revision, 3);
+        let registry_id = format!("registry-{}", vault::digest(id.as_bytes()));
+        first
+            .save_registry_entities(
+                "devices",
+                &[(registry_id.clone(), br#"{"revoked":true}"#.to_vec())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.load_registry_entities("devices").await.unwrap(),
+            vec![br#"{"revoked":true}"#.to_vec()]
+        );
         first
             .create_enrollment(&id, b"once", Duration::from_secs(60))
             .await
@@ -1388,6 +1490,13 @@ mod tests {
                 .unwrap();
             client
                 .execute("DELETE FROM central_accounts WHERE account_id=$1", &[&id])
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "DELETE FROM central_registry_entries WHERE kind=$1 AND entity_id=$2",
+                    &[&"devices", &registry_id],
+                )
                 .await
                 .unwrap();
         }
