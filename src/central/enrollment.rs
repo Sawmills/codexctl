@@ -252,13 +252,17 @@ fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
 }
 fn page(html: String) -> Response {
-    let styles = include_str!("enrollment/style.css");
+    let styles = include_str!("dashboard/style.css");
+    let script = include_str!("dashboard/copy.js");
+    let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
     let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
     let policy = format!(
-        "default-src 'none'; style-src 'sha256-{style_hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     let document = include_str!("enrollment/page.html")
         .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))
+        .replace("<!-- SCRIPT -->", &format!("<script>{script}</script>"))
+        .replace("<!-- VERSION -->", env!("CARGO_PKG_VERSION"))
         .replace("<!-- CONTENT -->", &html);
     (
         [
@@ -673,7 +677,10 @@ async fn approve(
     vault::save_devices(&broker.state, &devices)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     device.grant = Some(token);
-    Ok(page(include_str!("enrollment/connected.html").into()))
+    Ok(page(format!(
+        include_str!("enrollment/connected.html"),
+        name = escape(&device.name)
+    )))
 }
 pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
     router

@@ -1,14 +1,56 @@
-<p class="eyebrow step">
-  MACHINE SETUP <span aria-hidden="true">/</span> COMPLETE
-</p>
-<div class="success-mark" aria-hidden="true">&check;</div>
-<h1 id="page-title">You're<br />connected.</h1>
-<p class="intro">
-  Your machine is ready. Return to your terminal to choose an account and start
-  working.
-</p>
-<div class="next-step">
-  <p class="eyebrow">NEXT, IN YOUR TERMINAL</p>
-  <code>codexctl use</code>
-</div>
-<p class="footnote">You can close this page.</p>
+<section class="panel" aria-labelledby="page-title">
+  <span class="done-mark" aria-hidden="true"
+    ><svg width="20" height="20" viewBox="0 0 20 20" fill="none">
+      <path
+        d="M4.5 10.5l3.5 3.5 7.5-8"
+        stroke="currentColor"
+        stroke-width="2"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+      /></svg
+  ></span>
+  <h1 id="page-title">{name} is connected</h1>
+  <p class="lede">Go back to your terminal. You can close this page.</p>
+  <div class="next">
+    <h2>Pick an account</h2>
+    <div class="command">
+      <pre
+        tabindex="0"
+      ><code id="next-use" translate="no"><span class="prompt">$ </span>codexctl use</code></pre>
+      <button
+        class="button primary copy"
+        type="button"
+        data-copy="next-use"
+        aria-label="Copy codexctl use"
+      >
+        Copy
+      </button>
+    </div>
+    <p>
+      Chooses the account with included usage left and switches this machine to
+      it.
+    </p>
+  </div>
+  <div class="next">
+    <h2>First machine with local Codex profiles?</h2>
+    <div class="command">
+      <pre
+        tabindex="0"
+      ><code id="next-migrate" translate="no"><span class="prompt">$ </span>codexctl migrate</code></pre>
+      <button
+        class="button small copy"
+        type="button"
+        data-copy="next-migrate"
+        aria-label="Copy codexctl migrate"
+      >
+        Copy
+      </button>
+    </div>
+    <p>Moves them to the account server so every machine can use them.</p>
+  </div>
+  <p id="copy-status" class="copy-status" role="status" aria-live="polite"></p>
+  <p class="footnote">
+    See all your accounts and machines on the
+    <a href="/accounts">Accounts</a> page.
+  </p>
+</section>

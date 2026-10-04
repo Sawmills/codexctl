@@ -1655,10 +1655,18 @@ fn enrollment_pages_allow_only_their_bundled_styles_and_escape_device_names() {
             .next()
             .unwrap();
         let hash = STANDARD.encode(Sha256::digest(style.as_bytes()));
+        let script = html
+            .split("<script>")
+            .nth(1)
+            .unwrap()
+            .split("</script>")
+            .next()
+            .unwrap();
+        let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
         assert_eq!(
             policy,
             format!(
-                "default-src 'none'; style-src 'sha256-{hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+                "default-src 'none'; style-src 'sha256-{hash}'; script-src 'sha256-{script_hash}'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
             )
         );
         html
@@ -7033,6 +7041,147 @@ fn dashboard_pages_pin_bundled_assets_and_contain_no_credentials() {
             std::fs::write(std::path::Path::new(&directory).join(filename), html).unwrap();
             std::fs::write(
                 std::path::Path::new(&directory).join(format!("{filename}.csp")),
+                csp,
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[test]
+fn dashboard_v3_serves_rendered_accounts_and_same_origin_fonts() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let token = issuer.enrolled_token();
+    assert_eq!(
+        issuer
+            .server
+            .import(&token, "studio", "login", "seat")
+            .status(),
+        200
+    );
+    let cookie = issuer.dashboard_cookie();
+    for path in ["/accounts", "/accounts/data"] {
+        let response = issuer
+            .server
+            .http
+            .get(format!("{}{path}", issuer.server.url))
+            .header("cookie", &cookie)
+            .header("accept", "text/html")
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let html = response.text().unwrap();
+        assert!(
+            html.contains("codexctl use studio"),
+            "recommendation must be server rendered"
+        );
+        assert!(html.contains("All accounts"));
+        assert!(html.contains("Needs attention"));
+        assert!(!html.contains("synthetic-refresh"));
+    }
+    let json: Value = issuer
+        .server
+        .http
+        .get(format!("{}/accounts/data", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(json["accounts"][0]["routing_refused"], false);
+    store::atomic_write(
+        &issuer.server.root.path().join("mode"),
+        b"routing-policy-missing",
+    )
+    .unwrap();
+    assert_eq!(issuer.server.token(&token, "studio", None).status(), 409);
+    let refused: Value = issuer
+        .server
+        .http
+        .get(format!("{}/accounts/data", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(refused["accounts"][0]["routing_refused"], true);
+    let refused = issuer
+        .server
+        .http
+        .get(format!("{}/accounts", issuer.server.url))
+        .header("cookie", &cookie)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(refused.contains("Routing refused"));
+    assert!(!refused.contains("codexctl login studio"));
+    for name in ["instrument-sans", "jetbrains-mono"] {
+        let response = issuer
+            .server
+            .http
+            .get(format!("{}/assets/fonts/{name}.woff2", issuer.server.url))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-type"], "font/woff2");
+        assert!(response.bytes().unwrap().starts_with(b"wOF2"));
+    }
+}
+
+#[test]
+fn dashboard_v3_enrollment_and_landing_render_for_browser_checks() {
+    let issuer =
+        EnrollmentServer::start(json!({"sub":"fixture-engineer","email":"engineer@sawmills.ai"}));
+    let challenge = issuer.challenge();
+    let approval = issuer.browser(challenge["verificationUrl"].as_str().unwrap());
+    let approval_csp = approval.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let approval = approval.text().unwrap();
+    assert!(approval.contains("Code shown in your terminal"));
+    assert!(approval.contains("method=\"post\" action=\"/auth/approve\""));
+    let connected = issuer.approve(&approval);
+    let connected_csp = connected.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let connected = connected.text().unwrap();
+    assert!(connected.contains("is connected"));
+    assert!(connected.contains("codexctl migrate"));
+    let landing = issuer
+        .server
+        .http
+        .get(format!("{}/", issuer.server.url))
+        .send()
+        .unwrap();
+    let landing_csp = landing.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let landing = landing.text().unwrap();
+    if let Ok(directory) = std::env::var("B22_RENDER_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, html, csp) in [
+            ("approval", approval, approval_csp),
+            ("connected", connected, connected_csp),
+            ("landing", landing, landing_csp),
+        ] {
+            // The one-time synthetic approval is already consumed above.
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("{name}.html")),
+                html,
+            )
+            .unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(format!("{name}.html.csp")),
                 csp,
             )
             .unwrap();
