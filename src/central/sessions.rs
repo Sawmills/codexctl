@@ -477,9 +477,8 @@ fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
         .lines()
         .filter_map(parse_mountinfo)
         .collect::<Vec<_>>();
-    let Some(warned_mount) = mounts
-        .iter()
-        .find(|mount| mount.filesystem == "overlay" && mount.mountpoint == warning_path)
+    let Some(warned_mount) =
+        visible_mount(&mounts, warning_path).filter(|mount| mount.filesystem == "overlay")
     else {
         // A warning without a matching mount entry is ambiguous. Keep the
         // inventory fail-closed rather than trusting a pathname alone.
@@ -489,6 +488,7 @@ fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
         .iter()
         .filter(|mount| home.starts_with(&mount.mountpoint))
         .max_by_key(|mount| mount.mountpoint.components().count())
+        .and_then(|mount| visible_mount(&mounts, &mount.mountpoint))
     else {
         return false;
     };
@@ -504,6 +504,7 @@ fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
 #[cfg(target_os = "linux")]
 struct MountInfo {
     id: u64,
+    parent: u64,
     device: String,
     root: String,
     mountpoint: PathBuf,
@@ -515,11 +516,39 @@ fn parse_mountinfo(line: &str) -> Option<MountInfo> {
     let fields = mount.split_whitespace().collect::<Vec<_>>();
     Some(MountInfo {
         id: fields.first()?.parse().ok()?,
+        parent: fields.get(1)?.parse().ok()?,
         device: fields.get(2)?.to_owned().to_string(),
         root: unescape_mountinfo(fields.get(3)?),
         mountpoint: PathBuf::from(unescape_mountinfo(fields.get(4)?)),
         filesystem: filesystem.split_whitespace().next()?.to_owned(),
     })
+}
+#[cfg(target_os = "linux")]
+fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a MountInfo> {
+    let candidates = mounts
+        .iter()
+        .filter(|mount| mount.mountpoint == mountpoint)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let parent = mountpoint
+        .parent()
+        .and_then(|parent| {
+            mounts
+                .iter()
+                .filter(|mount| {
+                    mount.mountpoint != *mountpoint && parent.starts_with(&mount.mountpoint)
+                })
+                .max_by_key(|mount| (mount.mountpoint.components().count(), mount.id))
+        })
+        .map(|mount| mount.id);
+    candidates
+        .iter()
+        .copied()
+        .filter(|mount| parent.is_none_or(|parent| mount.parent == parent))
+        .max_by_key(|mount| mount.id)
+        .or_else(|| candidates.into_iter().max_by_key(|mount| mount.id))
 }
 #[cfg(target_os = "linux")]
 fn unescape_mountinfo(path: &str) -> String {
@@ -645,7 +674,7 @@ fn restore_backup(
 mod tests {
     use super::{
         MountInfo, harmless_lsof_warning, overlay_warning_is_unrelated, parse_mountinfo,
-        roots_are_disjoint,
+        roots_are_disjoint, visible_mount,
     };
     use std::fs;
     use std::path::Path;
@@ -697,5 +726,21 @@ mod tests {
         assert!(!roots_are_disjoint("/", "/workspace"));
         assert!(!roots_are_disjoint("/workspace", "/workspace/codex"));
         assert!(roots_are_disjoint("/workspace", "/other"));
+    }
+
+    #[test]
+    fn stacked_mounts_choose_the_visible_entry() {
+        let mounts = [
+            parse_mountinfo("1 0 8:1 / / rw - ext4 /dev/root rw").unwrap(),
+            parse_mountinfo("2 1 8:1 / /var rw - ext4 /dev/root rw").unwrap(),
+            parse_mountinfo("3 2 0:1 / /var/lib/docker/rootfs rw - overlay overlay rw").unwrap(),
+            parse_mountinfo("4 2 0:2 / /var/lib/docker/rootfs rw - tmpfs tmpfs rw").unwrap(),
+        ];
+        assert_eq!(
+            visible_mount(&mounts, Path::new("/var/lib/docker/rootfs"))
+                .unwrap()
+                .id,
+            4
+        );
     }
 }
