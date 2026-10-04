@@ -401,6 +401,7 @@ struct RateLimitColumns {
     labeled: bool,
     billing: bool,
     plan: bool,
+    resets: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -493,6 +494,7 @@ impl RateLimitColumns {
         }
         Self {
             billing: accounts.iter().any(|account| account.billing_unknown),
+            resets: accounts.iter().any(|account| account.reset_credits > 0),
             plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
             // An error row still carries its label, so consider every account
@@ -517,7 +519,10 @@ impl RateLimitColumns {
             headers.push(window.label.clone());
             headers.push(format!("{} Reset", window.label));
         }
-        headers.extend(["Resets".to_string(), "Token".to_string()]);
+        if self.resets {
+            headers.push("Resets".to_string());
+        }
+        headers.push("Token".to_string());
         if self.billing {
             headers.push("Billing".to_string());
         }
@@ -610,14 +615,18 @@ async fn fetch_and_split(
 
     let results = futures::future::join_all(futures).await;
 
-    let accounts = results
+    let mut accounts: Vec<codexctl::status_json::AccountStatus> = results
         .iter()
         .zip(profiles)
         .map(|(result, profile)| {
             let (_, _, _, is_active, auth, usage) = result;
             let mut row = codexctl::status_json::AccountStatus::local(&profile.meta, *is_active);
             match (auth, usage) {
-                (Ok(_), Some(Ok(usage))) => row.set_usage(usage),
+                (Ok(_), Some(Ok(usage))) => {
+                    row.set_usage(usage);
+                    row.resets_banked = Some(usage.reset_credits_available());
+                    row.resets_redeemable = Some(usage.reset_credits_applicable());
+                }
                 (Ok(auth), Some(Err(error))) => {
                     row.error = Some(
                         if error.to_string().contains("expired") {
@@ -848,6 +857,13 @@ async fn fetch_and_split(
         }
     }
 
+    for account in &mut accounts {
+        if let Some(rate_limited) = rate_limited.iter().find(|row| row.alias == account.alias) {
+            account.resets_next_expiry =
+                codexctl::status_json::timestamp(rate_limited.reset_credit_expiry);
+        }
+    }
+
     Ok(StatusSnapshot {
         rate_limited,
         usage_based,
@@ -908,7 +924,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         for _ in &columns.windows {
             row.extend([Cell::new("-"), Cell::new("-")]);
         }
-        row.push(Cell::new("-"));
+        if columns.resets {
+            row.push(Cell::new("-"));
+        }
         row.push(token_cell(account.token_expiry, true, &account.error_msg));
         if columns.billing {
             row.push(Cell::new("-"));
@@ -962,7 +980,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
                 .join("\n"),
         ));
     }
-    row.push(resets_cell(account));
+    if columns.resets {
+        row.push(resets_cell(account));
+    }
     row.push(token_cell(account.token_expiry, false, &account.error_msg));
     if columns.billing {
         row.push(if account.billing_unknown {
@@ -1338,7 +1358,7 @@ mod tests {
         let row = render_rate_limited_row(&failed, &columns);
 
         assert_eq!(row.len(), columns.headers().len());
-        assert_eq!(row[6].content(), failed.error_msg);
+        assert_eq!(row[5].content(), failed.error_msg);
         assert_eq!(row.last().unwrap().content(), "-");
     }
 
@@ -1347,8 +1367,32 @@ mod tests {
         let account = rate_limited_account();
         let columns = RateLimitColumns::for_accounts(&[&account]);
         let row = render_rate_limited_row(&account, &columns);
-        assert_eq!(columns.headers().len(), 7);
-        assert_eq!(row.len(), 7);
+        assert_eq!(columns.headers().len(), 6);
+        assert_eq!(row.len(), 6);
+    }
+
+    #[test]
+    fn reset_column_is_present_for_banked_credits_and_error_rows_match() {
+        let account = RateLimitedAccount {
+            reset_credits: 2,
+            ..rate_limited_account()
+        };
+        let error = RateLimitedAccount {
+            reset_credits: 2,
+            is_error: true,
+            ..rate_limited_account()
+        };
+        let columns = RateLimitColumns::for_accounts(&[&account, &error]);
+        assert!(columns.resets);
+        assert_eq!(columns.headers().last().unwrap(), "Token");
+        assert_eq!(
+            render_rate_limited_row(&account, &columns).len(),
+            columns.headers().len()
+        );
+        assert_eq!(
+            render_rate_limited_row(&error, &columns).len(),
+            columns.headers().len()
+        );
     }
 
     /// A store with no labels must render exactly the table it rendered before
@@ -1431,9 +1475,9 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec!["Account", "7d", "7d Reset", "Resets", "Token"]
+            vec!["Account", "7d", "7d Reset", "Token"]
         );
-        assert_eq!(render_rate_limited_row(&account, &columns).len(), 5);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 4);
     }
 
     #[test]
@@ -1511,17 +1555,9 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account",
-                "15m",
-                "15m Reset",
-                "1h",
-                "1h Reset",
-                "Resets",
-                "Token",
-            ]
+            vec!["Account", "15m", "15m Reset", "1h", "1h Reset", "Token",]
         );
-        assert_eq!(render_rate_limited_row(&account, &columns).len(), 7);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 6);
     }
 
     #[test]
@@ -1544,15 +1580,7 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account",
-                "1h",
-                "1h Reset",
-                "1h #2",
-                "1h #2 Reset",
-                "Resets",
-                "Token",
-            ]
+            vec!["Account", "1h", "1h Reset", "1h #2", "1h #2 Reset", "Token",]
         );
         assert_eq!(row[1].content(), "25%");
         assert_eq!(row[3].content(), "42%");
@@ -1586,9 +1614,7 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account", "5h", "5h Reset", "7d", "7d Reset", "Resets", "Token"
-            ]
+            vec!["Account", "5h", "5h Reset", "7d", "7d Reset", "Token"]
         );
         assert_eq!(legacy_row[1].content(), "30%");
         assert_eq!(legacy_row[3].content(), "40%");
@@ -1645,7 +1671,6 @@ mod tests {
                 "5h Reset",
                 "7d",
                 "7d Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1685,7 +1710,6 @@ mod tests {
                 "7d Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1730,7 +1754,6 @@ mod tests {
                 "1h Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1788,7 +1811,6 @@ mod tests {
                 "7d Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1807,8 +1829,8 @@ mod tests {
         let columns = RateLimitColumns::for_accounts(&[&account]);
 
         assert_eq!(
-            columns.headers(),
-            vec!["Account", "Secondary", "Secondary Reset", "Resets", "Token"]
+            render_rate_limited_row(&account, &columns).len(),
+            columns.headers().len()
         );
     }
 

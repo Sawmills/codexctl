@@ -38,6 +38,9 @@ pub struct AccountStatus {
     pub error: Option<String>,
     pub usage_age_seconds: Option<u64>,
     pub usage_stale: Option<bool>,
+    pub resets_banked: Option<i64>,
+    pub resets_redeemable: Option<i64>,
+    pub resets_next_expiry: Option<String>,
 }
 
 impl AccountStatus {
@@ -59,6 +62,9 @@ impl AccountStatus {
             error: None,
             usage_age_seconds: None,
             usage_stale: None,
+            resets_banked: None,
+            resets_redeemable: None,
+            resets_next_expiry: None,
         }
     }
 
@@ -196,5 +202,21 @@ mod tests {
         );
         assert_eq!(row["primary_resets_at"], serde_json::Value::Null);
         assert_eq!(row["secondary_resets_at"], "2100-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn reset_fields_round_trip_and_default_to_null() {
+        let mut row = AccountStatus::local(&profile::Meta::default(), false);
+        let empty = serde_json::to_value(&row).unwrap();
+        assert!(empty["resets_banked"].is_null());
+        assert!(empty["resets_redeemable"].is_null());
+        assert!(empty["resets_next_expiry"].is_null());
+        row.resets_banked = Some(3);
+        row.resets_redeemable = Some(1);
+        row.resets_next_expiry = Some("2100-01-01T00:00:00Z".into());
+        let value = serde_json::to_value(row).unwrap();
+        assert_eq!(value["resets_banked"], 3);
+        assert_eq!(value["resets_redeemable"], 1);
+        assert_eq!(value["resets_next_expiry"], "2100-01-01T00:00:00Z");
     }
 }

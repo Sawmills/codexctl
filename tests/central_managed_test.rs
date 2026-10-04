@@ -6230,12 +6230,12 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
              "primary_used_percent":0.0,"secondary_used_percent":37.0,
              "primary_window_seconds":18000,"secondary_window_seconds":604800,
              "primary_resets_at":"2100-01-01T00:00:00Z","secondary_resets_at":"2100-01-01T00:00:00Z",
-             "resets_at":"2100-01-01T00:00:00Z","billing_class":"rate_limited","error":null,"usage_age_seconds":age,"usage_stale":false},
+             "resets_at":"2100-01-01T00:00:00Z","resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"rate_limited","error":null,"usage_age_seconds":age,"usage_stale":false},
             {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
              "primary_used_percent":null,"secondary_used_percent":null,
              "primary_window_seconds":null,"secondary_window_seconds":null,
              "primary_resets_at":null,"secondary_resets_at":null,
-             "resets_at":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
+             "resets_at":null,"resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
         ]})
     );
 }
