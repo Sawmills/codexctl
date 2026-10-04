@@ -516,7 +516,10 @@ async fn token(
             None
         };
         if lease.is_some()
-            && let Some(central) = worker.central.as_ref()
+            && let Some(central) = worker
+                .central
+                .as_ref()
+                .filter(|central| central.mode() != super::storage::StoreMode::File)
             && let Some(record) = central
                 .load_account(&account_id)
                 .await
@@ -563,9 +566,13 @@ async fn token(
         };
         let result = async {
             let token_result = owner.tokens(request).await;
-            if !matches!(token_result, Err(TokenFailure::UnsupportedRouting))
-                && let Some(rpc) = owner.rpc.as_mut()
-            {
+            let settle_required = matches!(
+                &token_result,
+                Err(TokenFailure::Unavailable(error))
+                    if error.to_string().contains("timed out")
+                        || error.to_string().contains("completion unknown")
+            );
+            if settle_required && let Some(rpc) = owner.rpc.as_mut() {
                 let _ = rpc.settle_and_stop().await;
             }
             let record = CredentialRecord {

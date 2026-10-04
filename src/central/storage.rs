@@ -949,7 +949,8 @@ impl PostgresStore {
     }
 
     async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
-        let encrypted = vault::encrypt_bytes(&self.key, &serde_json::to_vec(&record.vault)?)?;
+        let serialized = serde_json::to_vec(&record.vault)?;
+        let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
         let client = self.client().await?;
         client.execute(
             "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision",
@@ -1045,7 +1046,8 @@ impl PostgresStore {
         if lease.account_id != record.account_id {
             bail!("lease account does not match credential account")
         }
-        let encrypted = vault::encrypt_bytes(&self.key, &serde_json::to_vec(&record.vault)?)?;
+        let serialized = serde_json::to_vec(&record.vault)?;
+        let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
         let client = self.client().await?;
         let changed = client.execute(
             "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision < $7",
@@ -1057,7 +1059,9 @@ impl PostgresStore {
         let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
         Ok(row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
-            stored == encrypted
+            vault::decrypt_bytes(&self.key, &stored)
+                .ok()
+                .is_some_and(|plain| plain == serialized)
         }))
     }
 
