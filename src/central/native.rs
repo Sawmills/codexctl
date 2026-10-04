@@ -693,6 +693,48 @@ fn spawn_child_with_lease(
 
 /// Launch the active server account without restoring a resumed thread's old provider.
 /// Local account launches remain the caller's responsibility.
+pub fn central_active() -> Result<bool> {
+    let paths = config::default_paths()?;
+    let marker = paths.codexctl_dir().join("central/.native-active.json");
+    if !marker.try_exists()? {
+        return Ok(false);
+    }
+    Ok(document(&paths.codex_home())?
+        .get("model_provider")
+        .and_then(Item::as_str)
+        == Some(PROVIDER))
+}
+
+/// Move only the central provider's account pointer for a launch. A fresh
+/// `codexctl codex` launch must not run session repair or restart an unrelated
+/// daemon while spreading work across accounts.
+pub fn set_active_for_codex(alias: &str) -> Result<()> {
+    let catalog =
+        super::remote::catalog()?.context("codex launch requires a connected account server")?;
+    let account = catalog
+        .accounts
+        .iter()
+        .find(|account| account.alias.eq_ignore_ascii_case(alias))
+        .context("server account alias not found")?;
+    let path = connection_path(alias)?;
+    let directory = root()?;
+    let _lock = native_lock(&directory)?;
+    sync_account(&catalog.connection, account)?;
+    let connection =
+        read_connection(&path).with_context(|| format!("server account {alias} is unavailable"))?;
+    let pointer = active_pointer_path()?;
+    let previous = read_optional_file(&pointer)?;
+    write_pointer_with_rollback(
+        &path,
+        &connection,
+        &pointer,
+        format!("{}\n", connection_alias(&path, &connection)).as_bytes(),
+        previous.as_deref(),
+        PointerCause::UseAuto,
+        store::atomic_write,
+    )
+}
+
 pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
     use std::os::unix::process::ExitStatusExt;
     let paths = config::default_paths()?;

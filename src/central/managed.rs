@@ -66,6 +66,12 @@ pub struct Account {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline_usage: Option<crate::statusline::Usage>,
+    /// Number of machines that received this account's token recently.
+    #[serde(default)]
+    pub live_sessions: usize,
+    /// Recent 429 ratio reported by a client, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_429_rate: Option<f64>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -289,6 +295,8 @@ fn account_summary(owner: &Owner) -> Account {
             .as_ref()
             .and_then(|v| super::server::usage(v).ok())
             .and_then(|u| u.rate_limit.map(|r| r.availability_score())),
+        live_sessions: 0,
+        recent_429_rate: None,
     }
 }
 
@@ -1234,7 +1242,24 @@ async fn token(
     refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
-    broker.activity.delivered(&device, alias);
+    broker.activity.delivered(&device, alias.clone());
+    if let Some(central) = broker.central.as_ref()
+        && let Err(error) = central
+            .record_live_session(
+                &account_key(&device.user, &alias),
+                &device.user,
+                &alias,
+                &device.id,
+            )
+            .await
+    {
+        broker.record_failure(
+            "live_session_failed",
+            "live_session",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        eprintln!("central live-session observation failed: {error:#}");
+    }
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
@@ -1301,8 +1326,10 @@ pub(super) async fn account_catalog(
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
+    let user = user.to_owned();
     let tasks = owners.into_iter().map(|(key, owner)| {
         let broker = broker.clone();
+        let user = user.clone();
         tokio::spawn(async move {
             // Copy only the access credential. Listing never snapshots, refreshes,
             // persists, or changes the credential owner's availability.
@@ -1350,6 +1377,19 @@ pub(super) async fn account_catalog(
                 summary.billing_class = api::BillingClass::Unknown;
                 summary.credits = None;
                 summary.usage_score = None;
+            }
+            summary.live_sessions = broker
+                .activity
+                .live_sessions(&user, &summary.alias, 10 * 60);
+            if let Some(central) = broker.central.as_ref()
+                && let Ok(count) = central
+                    .live_session_count(
+                        &summary.account_id,
+                        std::time::Duration::from_secs(10 * 60),
+                    )
+                    .await
+            {
+                summary.live_sessions = summary.live_sessions.max(count);
             }
             summary
         })
@@ -2725,6 +2765,7 @@ pub async fn serve(
                 "reset_auth_rejected",
                 "catalog_usage_failed",
                 "catalog_usage_timeout",
+                "live_session_failed",
                 "catalog_task_failed",
                 "persistence_failed",
                 "registry_unavailable",

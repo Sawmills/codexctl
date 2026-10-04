@@ -5,9 +5,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 #[cfg(not(unix))]
@@ -24,6 +23,7 @@ use crate::profile;
 const SPEND_CAP_MESSAGE: &str = "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.";
 const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
     "You hit your spend cap set in your workspace. Increase your spend cap to continue.";
+const RATE_LIMIT_MESSAGE: &str = "exceeded retry limit, last status: 429";
 pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
 pub fn run(
@@ -45,17 +45,43 @@ pub fn run(
         bail!("server account launch for {alias} requires central support");
     }
     #[cfg(feature = "central-prototype")]
-    if let Some(code) = codexctl::central::native::run_codex(&invocation_args_for_cwd(args, &cwd))?
+    let selected_central_alias = if codexctl::central::native::central_active()? {
+        match codexctl::central::remote::select_codex_account() {
+            Ok(alias) => {
+                eprintln!("codexctl: selected included account {alias} (least loaded)");
+                codexctl::central::native::set_active_for_codex(&alias)?;
+                Some(alias)
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "central-prototype")]
+    // Existing noninteractive callers rely on native exit-status and signal
+    // forwarding. Interactive launches use the PTY wrapper so 429 output can
+    // stop and resume the session safely.
+    let central_mode = selected_central_alias.is_some() && std::io::stdin().is_terminal();
+    #[cfg(not(feature = "central-prototype"))]
+    let central_mode = false;
+    #[cfg(not(feature = "central-prototype"))]
+    let selected_central_alias: Option<String> = None;
+    #[cfg(feature = "central-prototype")]
+    if !central_mode
+        && let Some(code) =
+            codexctl::central::native::run_codex(&invocation_args_for_cwd(args, &cwd))?
     {
         return Ok(code);
     }
     #[cfg(feature = "central-prototype")]
-    let _operation = codexctl::central::native::local_operation(&config::default_paths()?)?;
+    let _operation = (!central_mode)
+        .then(|| codexctl::central::native::local_operation(&config::default_paths()?))
+        .transpose()?;
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
     let mut runner = PtyCodexRunner::new(reporter.clone());
-    let failed_alias = failed_alias_for_child_auth(&paths);
-    let mut switcher = CodexctlProfileSwitcher::new(&paths);
+    let failed_alias = selected_central_alias.or_else(|| failed_alias_for_child_auth(&paths));
+    let mut switcher = CodexctlProfileSwitcher::new(&paths, central_mode);
     let mut sessions = FilesystemSessionStore::new(&paths)?;
     let mut consent = InteractiveConsent {
         allow_billing,
@@ -79,6 +105,7 @@ pub fn run(
 enum CodexRunOutcome {
     Exited(i32),
     SpendCap { session_id: Option<String> },
+    RateLimited429 { session_id: Option<String> },
 }
 
 trait CodexRunner {
@@ -218,14 +245,32 @@ fn run_with_reporter_inner(
     mut tried: Vec<String>,
 ) -> Result<i32> {
     let mut invocation = CodexInvocation::from_forwarded_args(&options.args, &options.cwd);
-    // The resume invocation is built once on the first spend cap and reused for
+    // The resume invocation is built once on the first stop and reused for
     // every subsequent switch, since each switch resumes the same session.
     let mut recovery: Option<CodexInvocation> = None;
+    let mut rate_limit_recoveries = Vec::new();
 
     loop {
         match runner.run_codex(&invocation)? {
             CodexRunOutcome::Exited(code) => return Ok(code),
-            CodexRunOutcome::SpendCap { session_id } => {
+            outcome @ (CodexRunOutcome::SpendCap { .. }
+            | CodexRunOutcome::RateLimited429 { .. }) => {
+                let (session_id, rate_limited) = match outcome {
+                    CodexRunOutcome::SpendCap { session_id } => (session_id, false),
+                    CodexRunOutcome::RateLimited429 { session_id } => (session_id, true),
+                    CodexRunOutcome::Exited(_) => unreachable!(),
+                };
+                if rate_limited {
+                    let now = Instant::now();
+                    rate_limit_recoveries
+                        .retain(|at| now.duration_since(*at) < Duration::from_secs(3600));
+                    if rate_limit_recoveries.len() >= 3 {
+                        bail!(
+                            "Codex stopped after repeated 429 responses; recovery is limited to 3 attempts per hour"
+                        );
+                    }
+                    rate_limit_recoveries.push(now);
+                }
                 if recovery.is_none() {
                     let plan = recovery_plan(options, session_id, sessions)?;
                     let mut rec = CodexInvocation::from_forwarded_args(&plan.args, &options.cwd);
@@ -240,14 +285,38 @@ fn run_with_reporter_inner(
                     recovery = Some(rec);
                 }
 
-                let Some(candidate) = switcher.find_recovery_candidate(&tried)? else {
-                    bail!(
-                        "spend cap reached and no alternate rate-limited account is available to switch to"
-                    );
+                let candidate = if rate_limited {
+                    loop {
+                        let Some(candidate) = switcher.find_recovery_candidate(&tried)? else {
+                            bail!(
+                                "429 rate limit reached and no alternate included account is available"
+                            );
+                        };
+                        if candidate.reset_plan().is_some() {
+                            tried.push(candidate.alias);
+                            continue;
+                        }
+                        break candidate;
+                    }
+                } else {
+                    let Some(candidate) = switcher.find_recovery_candidate(&tried)? else {
+                        bail!(
+                            "spend cap reached and no alternate rate-limited account is available to switch to"
+                        );
+                    };
+                    candidate
                 };
 
-                eprintln!();
-                if candidate.bills_credits {
+                if rate_limited
+                    && candidate.bills_credits
+                    && !consent.allow_billing_account(&candidate.alias)
+                {
+                    bail!(
+                        "429 rate limit reached; switching to credit-billing account {} was not approved",
+                        candidate.alias
+                    );
+                }
+                if !rate_limited && candidate.bills_credits {
                     eprintln!("codexctl: spend cap reached; only credit-billing accounts remain.");
                     if !consent.allow_billing_account(&candidate.alias) {
                         bail!(
@@ -255,13 +324,20 @@ fn run_with_reporter_inner(
                             candidate.alias
                         );
                     }
-                } else if candidate.reset_plan().is_none() {
+                } else if !rate_limited && candidate.reset_plan().is_none() {
                     eprintln!("codexctl: spend cap detected; switching to a no-overage account");
                 }
 
-                // Every account with headroom is spoken for, so the cheapest way
-                // forward is to spend a banked reset on an exhausted one.
-                if let Some(plan) = candidate.reset_plan() {
+                if rate_limited {
+                    eprintln!(
+                        "codexctl: 429 rate limit detected; switching to least-loaded included account {}",
+                        candidate.alias
+                    );
+                }
+
+                if rate_limited {
+                    // 429 recovery never spends a banked reset.
+                } else if let Some(plan) = candidate.reset_plan() {
                     eprintln!(
                         "codexctl: no account has rate-limit headroom left; {} can redeem a banked reset.",
                         candidate.alias
@@ -825,12 +901,15 @@ fn is_session_id(candidate: &str) -> bool {
 
 struct CodexctlProfileSwitcher {
     auth_json: PathBuf,
+    #[cfg_attr(not(feature = "central-prototype"), allow(dead_code))]
+    central: bool,
 }
 
 impl CodexctlProfileSwitcher {
-    fn new(paths: &Paths) -> Self {
+    fn new(paths: &Paths, central: bool) -> Self {
         Self {
             auth_json: codex_auth_json_for_child(paths),
+            central,
         }
     }
 }
@@ -840,10 +919,27 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
         &mut self,
         tried: &[String],
     ) -> Result<Option<use_profile::RecoveryCandidate>> {
+        #[cfg(feature = "central-prototype")]
+        if self.central {
+            return Ok(
+                codexctl::central::remote::find_rate_limit_recovery_candidate(tried)?.map(
+                    |alias| use_profile::RecoveryCandidate {
+                        alias,
+                        bills_credits: false,
+                        cost: use_profile::RecoveryCost::Headroom,
+                    },
+                ),
+            );
+        }
         use_profile::find_recovery_candidate(tried)
     }
 
     fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()> {
+        #[cfg(feature = "central-prototype")]
+        if self.central {
+            codexctl::central::native::activate(Some(alias), true, false, true)?;
+            return Ok(());
+        }
         // Inside a pinned lane the outgoing token is this lane's own account,
         // and the switch is about to overwrite it. Fold it back under the alias
         // the launch named first: subject alone cannot name it when one seat is
@@ -1383,6 +1479,7 @@ fn run_codex_in_pty(
 
     let stop_input = Arc::new(AtomicBool::new(false));
     let spend_cap = Arc::new(AtomicBool::new(false));
+    let rate_limited = Arc::new(AtomicBool::new(false));
     let session_id = Arc::new(Mutex::new(None));
 
     let mut master = Some(pair.master);
@@ -1393,10 +1490,12 @@ fn run_codex_in_pty(
     let reader_thread = spawn_output_thread(
         reader,
         Arc::clone(&spend_cap),
+        Arc::clone(&rate_limited),
         Arc::clone(&session_id),
         Arc::clone(&stop_input),
         Arc::clone(&writer),
         invocation.continue_goal_on_start,
+        !interactive,
         state_reporter,
         move || {
             let _ = killer.kill();
@@ -1426,6 +1525,9 @@ fn run_codex_in_pty(
     if spend_cap.load(Ordering::SeqCst) {
         let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
         Ok(CodexRunOutcome::SpendCap { session_id })
+    } else if rate_limited.load(Ordering::SeqCst) {
+        let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
+        Ok(CodexRunOutcome::RateLimited429 { session_id })
     } else {
         Ok(CodexRunOutcome::Exited(status.exit_code() as i32))
     }
@@ -1473,10 +1575,12 @@ impl Drop for RawModeGuard {
 fn spawn_output_thread(
     mut reader: Box<dyn Read + Send>,
     spend_cap: Arc<AtomicBool>,
+    rate_limited: Arc<AtomicBool>,
     session_id: Arc<Mutex<Option<String>>>,
     stop_input: Arc<AtomicBool>,
     continue_goal_writer: SharedPtyWriter,
     continue_goal_on_start: bool,
+    normalize_newlines: bool,
     state_reporter: Option<HerdrAgentReporter>,
     mut kill_child: impl FnMut() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
@@ -1494,7 +1598,13 @@ fn spawn_output_thread(
                 Err(_) => break,
             };
             let chunk = &buffer[..bytes_read];
-            let _ = stdout.write_all(chunk);
+            if normalize_newlines {
+                let text = String::from_utf8_lossy(chunk);
+                let normalized = text.replace("\r\n", "\n");
+                let _ = stdout.write_all(normalized.as_bytes());
+            } else {
+                let _ = stdout.write_all(chunk);
+            }
             let _ = stdout.flush();
 
             let chunk_text = String::from_utf8_lossy(chunk);
@@ -1502,6 +1612,18 @@ fn spawn_output_thread(
 
             if spend_cap_seen(&recent) {
                 spend_cap.store(true, Ordering::SeqCst);
+                if let Some(id) = find_resume_hint_session_id(&recent)
+                    && let Ok(mut guard) = session_id.lock()
+                {
+                    *guard = Some(id);
+                }
+                stop_input.store(true, Ordering::SeqCst);
+                kill_child();
+                break;
+            }
+
+            if rate_limit_seen(&recent) {
+                rate_limited.store(true, Ordering::SeqCst);
                 if let Some(id) = find_resume_hint_session_id(&recent)
                     && let Ok(mut guard) = session_id.lock()
                 {
@@ -1871,6 +1993,10 @@ fn spend_cap_seen(output: &str) -> bool {
         })
 }
 
+fn rate_limit_seen(output: &str) -> bool {
+    normalize_spend_cap_text(output).contains(&normalize_spend_cap_text(RATE_LIMIT_MESSAGE))
+}
+
 /// Flatten Codex's bordered error box for matching: drop ANSI escapes,
 /// box-drawing/block glyphs, and all whitespace, while keeping the `■` error
 /// marker (U+25A0, just past the block-element range).
@@ -2226,6 +2352,16 @@ mod tests {
         assert!(spend_cap_seen(&format!(
             "\u{25a0} {SELF_MANAGED_SPEND_CAP_MESSAGE}"
         )));
+    }
+
+    #[test]
+    fn rate_limit_seen_detects_retry_limit_message() {
+        assert!(rate_limit_seen("exceeded retry limit, last status: 429"));
+        assert!(rate_limit_seen("exceeded\nretry limit, last status: 429"));
+        assert!(rate_limit_seen(
+            "\u{1b}[31mexceeded retry limit, last status: 429\u{1b}[0m"
+        ));
+        assert!(!rate_limit_seen("last status: 500"));
     }
 
     #[test]
@@ -3184,6 +3320,52 @@ mod tests {
             switcher.switched,
             vec!["amir+2".to_string(), "amir+3".to_string()]
         );
+    }
+
+    #[test]
+    fn rate_limit_recovery_is_bounded_to_three_attempts() {
+        let mut runner = FakeCodexRunner::new(vec![
+            CodexRunOutcome::RateLimited429 {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::RateLimited429 {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::RateLimited429 {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+            CodexRunOutcome::RateLimited429 {
+                session_id: Some(SESSION_ID.to_string()),
+            },
+        ]);
+        let mut switcher = FakeProfileSwitcher::new(vec![
+            no_bill("first"),
+            no_bill("second"),
+            no_bill("third"),
+            no_bill("fourth"),
+        ]);
+        let mut sessions = FakeSessionStore::default();
+        let error = run_with(&resume_options(), &mut runner, &mut switcher, &mut sessions)
+            .expect_err("fourth 429 recovery must be refused");
+
+        assert!(error.to_string().contains("3 attempts per hour"));
+        assert_eq!(switcher.switched, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn rate_limit_recovery_never_switches_to_credit_account_without_consent() {
+        let mut runner = FakeCodexRunner::new(vec![CodexRunOutcome::RateLimited429 {
+            session_id: Some(SESSION_ID.to_string()),
+        }]);
+        let mut switcher = FakeProfileSwitcher::new(vec![billing("credit")]);
+        let mut sessions = FakeSessionStore::default();
+
+        let error = run_with(&resume_options(), &mut runner, &mut switcher, &mut sessions)
+            .expect_err("credit recovery must require approval");
+
+        assert!(error.to_string().contains("credit-billing account"));
+        assert!(switcher.switched.is_empty());
+        assert!(switcher.redeemed.is_empty());
     }
 
     #[test]

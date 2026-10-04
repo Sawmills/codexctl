@@ -1,4 +1,4 @@
-//! Last successful token response per registered machine, never a session inventory.
+//! Recent token delivery per registered machine, used as a bounded session signal.
 use super::vault::Device;
 use std::{collections::BTreeMap, sync::Mutex};
 
@@ -28,5 +28,17 @@ impl Activity {
             .expect("machine activity lock")
             .get(&(device.user.clone(), device.id.clone()))
             .cloned()
+    }
+
+    pub(super) fn live_sessions(&self, user: &str, alias: &str, window: i64) -> usize {
+        let cutoff = chrono::Utc::now().timestamp().saturating_sub(window);
+        self.entries
+            .lock()
+            .expect("machine activity lock")
+            .iter()
+            .filter(|((entry_user, _), entry)| {
+                entry_user == user && entry.alias == alias && entry.seen_at >= cutoff
+            })
+            .count()
     }
 }

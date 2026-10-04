@@ -1222,6 +1222,132 @@ pub fn select(accounts: &[Account]) -> Result<String> {
     }).map(|a|a.alias.clone()).context("no available account with verified included usage; select an alias explicitly to approve credit billing")
 }
 
+/// Select an included account for a fresh `codexctl codex` launch.
+///
+/// Launches spread across the accounts that the server says are currently in
+/// use. Usage-based accounts and exhausted windows never enter this list.
+pub fn select_for_codex(accounts: &[Account]) -> Result<String> {
+    accounts
+        .iter()
+        .filter(|account| {
+            account.available
+                && !account.usage_stale
+                && account.billing_class == api::BillingClass::RateLimited
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_some()
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .all(|used| used.is_finite() && used < 100.0)
+        })
+        .min_by(|left, right| {
+            left.live_sessions
+                .cmp(&right.live_sessions)
+                .then_with(|| {
+                    left.recent_429_rate
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&right.recent_429_rate.unwrap_or(f64::MAX))
+                })
+                .then_with(|| {
+                    left.usage_score
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&right.usage_score.unwrap_or(f64::MAX))
+                })
+                .then_with(|| left.alias.cmp(&right.alias))
+        })
+        .map(|account| account.alias.clone())
+        .context("no available included account with rate-limit headroom")
+}
+
+pub fn select_codex_account() -> Result<String> {
+    let catalog = catalog()?.context("codex launch requires a connected account server")?;
+    let mut accounts = catalog.accounts;
+    let rates = recent_429_rates(accounts.iter().map(|account| account.alias.as_str()));
+    for account in &mut accounts {
+        account.recent_429_rate = rates.get(&account.alias).copied();
+    }
+    select_for_codex(&accounts)
+}
+
+fn recent_429_rates<'a>(
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeMap<String, f64> {
+    let wanted: std::collections::BTreeSet<_> = aliases.into_iter().collect();
+    let Ok(executable) = std::env::current_exe() else {
+        return std::collections::BTreeMap::new();
+    };
+    let Ok(output) = std::process::Command::new(executable)
+        .args(["rate", "--json", "--minutes", "10"])
+        .output()
+    else {
+        return std::collections::BTreeMap::new();
+    };
+    if !output.status.success() {
+        return std::collections::BTreeMap::new();
+    }
+    let Ok(report) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return std::collections::BTreeMap::new();
+    };
+    report
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let alias = row.get("account")?.as_str()?;
+            wanted
+                .contains(alias)
+                .then_some((alias.to_owned(), row.get("rate_429")?.as_f64()?))
+        })
+        .collect()
+}
+
+/// Find the next server account for a 429 recovery. This deliberately shares
+/// the fresh-launch ordering and never offers a reset as a recovery action.
+pub fn find_rate_limit_recovery_candidate(tried: &[String]) -> Result<Option<String>> {
+    let Some(catalog) = catalog()? else {
+        return Ok(None);
+    };
+    let mut accounts = catalog.accounts;
+    let rates = recent_429_rates(accounts.iter().map(|account| account.alias.as_str()));
+    for account in &mut accounts {
+        account.recent_429_rate = rates.get(&account.alias).copied();
+    }
+    Ok(accounts
+        .iter()
+        .filter(|account| {
+            !tried
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&account.alias))
+                && account.available
+                && !account.usage_stale
+                && account.billing_class == api::BillingClass::RateLimited
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_some()
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .all(|used| used.is_finite() && used < 100.0)
+        })
+        .min_by(|left, right| {
+            left.live_sessions
+                .cmp(&right.live_sessions)
+                .then_with(|| {
+                    left.recent_429_rate
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&right.recent_429_rate.unwrap_or(f64::MAX))
+                })
+                .then_with(|| left.alias.cmp(&right.alias))
+        })
+        .map(|account| account.alias.clone()))
+}
+
 /// Plan a reset only after included headroom is unavailable. Spending is deferred
 /// until native activation has checked the home and account migration fences.
 pub(super) fn select_for_activation(

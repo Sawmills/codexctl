@@ -6592,6 +6592,8 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
             usage_stale: false,
             usage_error: None,
             statusline_usage: None,
+            live_sessions: 0,
+            recent_429_rate: None,
         }
     };
     let selected = central::remote::select(&[
@@ -6605,6 +6607,51 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
     assert_eq!(
         central::remote::select(&[account("mixed-windows", 97.0, 100, 3.0)]).unwrap(),
         "mixed-windows"
+    );
+}
+
+#[test]
+fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
+    let account = |alias: &str, live_sessions: usize, recent_429_rate: Option<f64>| {
+        central::managed::Account {
+            user_id: "synthetic-user".into(),
+            alias: alias.into(),
+            label: None,
+            account_id: format!("{alias}-seat"),
+            plan: Some("pro".into()),
+            billing_class: codexctl::api::BillingClass::RateLimited,
+            primary_used: Some(10.0),
+            secondary_used: Some(10.0),
+            primary_window_seconds: Some(5 * 60 * 60),
+            secondary_window_seconds: Some(7 * 24 * 60 * 60),
+            primary_resets_at: None,
+            resets_at: None,
+            available: true,
+            usage_score: Some(10.0),
+            usage_age_seconds: Some(1),
+            usage_stale: false,
+            usage_error: None,
+            statusline_usage: None,
+            live_sessions,
+            recent_429_rate,
+        }
+    };
+
+    assert_eq!(
+        central::remote::select_for_codex(&[
+            account("busy", 3, Some(0.0)),
+            account("idle", 0, Some(0.8)),
+        ])
+        .unwrap(),
+        "idle"
+    );
+    assert_eq!(
+        central::remote::select_for_codex(&[
+            account("higher-429", 0, Some(0.8)),
+            account("lower-429", 0, Some(0.1)),
+        ])
+        .unwrap(),
+        "lower-429"
     );
 }
 
