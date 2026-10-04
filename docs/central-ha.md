@@ -365,22 +365,26 @@ instance, then repeat the destructive cases in staging.
    response but before the commit, and again after the commit but before the HTTP
    response. Assert the successor either commits the single rotation or reads
    the committed revision; a stale holder cannot write after epoch change.
-3. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
+3. **Unresolved provider call.** Force lease renewal loss while the old
+   provider call is still unresolved. Keep the old owner fenced and assert that
+   no successor calls the provider until the old child is settled or confirmed
+   stopped and its rotated credential is reconciled.
+4. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
    keeps one ready pod, topology rules place replacements on another node and
    zone, and token requests recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
-4. **Enrollment and renewal.** In phase three, assert that enrollment and
+5. **Enrollment and renewal.** In phase three, assert that enrollment and
    relogin return `503` on every pod because their workflow state remains
    local. Move the cross-pod success and one-operation assertions to phase four.
-5. **Reset idempotency.** In phase three, assert that reset redemption returns
+6. **Reset idempotency.** In phase three, assert that reset redemption returns
    `503` on every pod. Move the one-spend and terminal-receipt assertions to
    phase four, after the shared journal is delivered
    (`src/central/resets.rs:325-441`).
-6. **Readiness and fencing.** Remove the lease or database access from one pod;
+7. **Readiness and fencing.** Remove the lease or database access from one pod;
    `/ready` must fail for unsafe write service, reads must either use committed
    state or return a bounded unavailable response, and metrics must identify the
    pod and lease epoch without secrets.
-7. **Load and recovery.** Run account listing at the 60-second cache interval,
+8. **Load and recovery.** Run account listing at the 60-second cache interval,
    mixed token requests, and a rolling restart. Verify no refresh race, no lost
    pending operation, and no account identity or revision regression. Record
    p50/p95/p99 token latency and the maximum observed outage; acceptance is
