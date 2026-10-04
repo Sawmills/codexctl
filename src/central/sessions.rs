@@ -492,7 +492,9 @@ fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
     else {
         return false;
     };
-    warned_mount.id != home_mount.id && !home.starts_with(&warned_mount.mountpoint)
+    warned_mount.id != home_mount.id
+        && (warned_mount.device != home_mount.device || warned_mount.root != home_mount.root)
+        && !home.starts_with(&warned_mount.mountpoint)
 }
 #[cfg(not(target_os = "linux"))]
 fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
@@ -501,6 +503,8 @@ fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
 #[cfg(target_os = "linux")]
 struct MountInfo {
     id: u64,
+    device: String,
+    root: String,
     mountpoint: PathBuf,
     filesystem: String,
 }
@@ -510,6 +514,8 @@ fn parse_mountinfo(line: &str) -> Option<MountInfo> {
     let fields = mount.split_whitespace().collect::<Vec<_>>();
     Some(MountInfo {
         id: fields.first()?.parse().ok()?,
+        device: fields.get(2)?.to_owned().to_string(),
+        root: unescape_mountinfo(fields.get(3)?),
         mountpoint: PathBuf::from(unescape_mountinfo(fields.get(4)?)),
         filesystem: filesystem.split_whitespace().next()?.to_owned(),
     })
