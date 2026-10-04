@@ -1377,3 +1377,5 @@ progress.meter.warn::-moz-progress-bar {
 .overview-expired .fresh-action {
   display: none;
 }
+
+.command-note { margin: -8px 0 0; color: var(--ink-3); font-size: var(--t-xs); }

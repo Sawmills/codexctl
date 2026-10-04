@@ -155,7 +155,7 @@ fn command(id: &str, text: &str, primary: bool) -> String {
     let class = if primary { "primary" } else { "small" };
     let text = escape(text);
     format!(
-        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button {class} copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div>"#
+        r#"<div class="command"><pre tabindex="0"><code id="{id}" translate="no">{text}</code></pre><button class="button {class} copy" type="button" data-copy="{id}" aria-label="Copy {text}">Copy</button></div><p class="command-note">POSIX shell syntax.</p>"#
     )
 }
 fn date(at: i64) -> String {
@@ -546,12 +546,15 @@ fn machines(snapshot: &Snapshot) -> String {
 pub(super) fn overview(snapshot: &Snapshot) -> String {
     let best = recommendation(&snapshot.accounts);
     let all_stale = !snapshot.accounts.is_empty() && snapshot.accounts.iter().all(Account::stale);
+    // Only observations we can refresh can set the browser's next refresh.
+    // Unavailable/routing-refused accounts do not affect the answer and may
+    // retain old telemetry indefinitely.
     let valid_for = snapshot
         .accounts
         .iter()
-        .filter(|a| !a.stale())
+        .filter(|a| a.ready())
         .filter_map(|a| a.usage_age_seconds)
-        .map(|age| 60 - age)
+        .map(|age| 60u64.saturating_sub(age))
         .min()
         .unwrap_or(60);
     let notice = if all_stale {
@@ -564,6 +567,11 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
         include_str!("accounts.html"),
         email = email,
         server_time = snapshot.server_time,
+        has_accounts = if snapshot.accounts.is_empty() {
+            "false"
+        } else {
+            "true"
+        },
         valid_for = valid_for,
         refresh_margin = super::super::catalog::REFRESH_MARGIN.as_secs(),
         notice = notice,

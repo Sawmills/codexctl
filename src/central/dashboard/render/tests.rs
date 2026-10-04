@@ -207,3 +207,56 @@ fn option_like_aliases_are_passed_as_positional_arguments() {
     data.accounts[0].state = "renewal_pending".into();
     assert!(overview(&data).contains("codexctl login --cancel -- --help"));
 }
+
+#[test]
+fn page_validity_ignores_accounts_that_cannot_refresh_the_answer() {
+    for (state, refused) in [
+        ("available", true),
+        ("unavailable", true),
+        ("unavailable", false),
+        ("renewal_pending", false),
+    ] {
+        for age in [30, 59, 60] {
+            let mut data = fixture();
+            data.accounts.truncate(1);
+            data.accounts[0].usage_age_seconds = Some(5);
+            let mut unavailable = data.accounts[0].clone();
+            unavailable.alias = "cannot-refresh".into();
+            unavailable.state = state.into();
+            unavailable.routing_refused = refused;
+            unavailable.usage_age_seconds = Some(age);
+            data.accounts.push(unavailable);
+            let html = overview(&data);
+            assert!(html.contains("codexctl use studio"));
+            assert!(
+                html.contains("data-valid-for=\"55\""),
+                "{state}, routing refused {refused}, age {age} must not shorten the ready account's validity"
+            );
+        }
+    }
+}
+
+#[test]
+fn validity_uses_only_refreshable_accounts_and_empty_pages_do_not_expire() {
+    let mut data = fixture();
+    data.accounts.truncate(1);
+    data.accounts[0].usage_age_seconds = Some(5);
+    let mut routing = data.accounts[0].clone();
+    routing.alias = "routing".into();
+    routing.state = "available".into();
+    routing.routing_refused = true;
+    routing.usage_age_seconds = Some(59);
+    data.accounts.push(routing);
+    assert!(overview(&data).contains("data-valid-for=\"55\""));
+    let mut empty = data;
+    empty.accounts.clear();
+    let html = overview(&empty);
+    assert!(html.contains("data-has-accounts=\"false\""));
+    assert!(!html.contains("data-valid-for=\"0\""));
+}
+
+#[test]
+fn account_commands_identify_posix_shell_syntax() {
+    let html = overview(&fixture());
+    assert!(html.matches("POSIX shell syntax.").count() >= 4);
+}

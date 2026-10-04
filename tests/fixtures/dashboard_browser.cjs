@@ -87,7 +87,6 @@ const server = http.createServer((req, res) => {
         "blocked",
         "stale",
         "empty",
-        "error",
         "approval",
         "connected",
       ]) {
@@ -126,7 +125,7 @@ const server = http.createServer((req, res) => {
           .evaluate((el) => getComputedStyle(el).outlineStyle);
         assert.notEqual(outline, "none", "keyboard focus visible");
         await page.keyboard.press("Escape");
-        await page.locator("h1").first().click();
+        await page.locator("h1:visible").first().click();
         await page.screenshot({
           path: `${out}/${name}-${scheme}-${width}.png`,
           fullPage: true,
@@ -240,6 +239,10 @@ const server = http.createServer((req, res) => {
     "codexctl use studio",
   );
   assert.equal(await page.locator(".ledger tbody tr").count(), 8);
+  assert.equal(
+    await page.locator("noscript meta[http-equiv=refresh]").count(),
+    1,
+  );
   await noScript.close();
   assert.deepEqual(errors, []);
   await browser.close();

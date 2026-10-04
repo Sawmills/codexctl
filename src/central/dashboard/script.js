@@ -5,9 +5,7 @@
   if (!byId("overview")) return;
   // Snapshot ages already include server-side work. Only age them from the
   // response's arrival, otherwise slow upstream reads get counted twice.
-  let received =
-      performance.getEntriesByType("navigation")[0]?.responseStart ??
-      performance.now(),
+  let received = performance.now(),
     inFlight = false,
     ended = false,
     pollTimer,
@@ -140,7 +138,7 @@
   function tick() {
     if (ended) return;
     const root = byId("overview");
-    if (root.dataset.loadError) return;
+    if (root.dataset.loadError || root.dataset.hasAccounts === "false") return;
     const elapsed = (performance.now() - received) / 1000;
     if (
       elapsed >= Number(root.dataset.validFor) &&
