@@ -8365,3 +8365,98 @@ exit 127
     }
     lane.signal_and_wait(libc::SIGTERM);
 }
+
+#[test]
+fn dashboard_review_snapshot_failure_has_html_recovery() {
+    let issuer = EnrollmentServer::start(company_identity());
+    let cookie = issuer.dashboard_cookie();
+    for registry in ["devices.json", "users.json"] {
+        let path = issuer.server.root.path().join("state").join(registry);
+        let original = std::fs::read(&path).unwrap_or_else(|_| b"[]".to_vec());
+        store::atomic_write(&path, b"invalid registry").unwrap();
+        let response = issuer
+            .server
+            .http
+            .get(format!("{}/accounts", issuer.server.url))
+            .header("cookie", &cookie)
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html"),
+            "snapshot failures must render HTML"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let csp = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let html = response.text().unwrap();
+        if let Ok(directory) = std::env::var("B22_RENDER_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(std::path::Path::new(&directory).join("error.html"), &html).unwrap();
+            std::fs::write(std::path::Path::new(&directory).join("error.html.csp"), csp).unwrap();
+        }
+        assert!(html.contains("Your accounts could not be loaded"));
+        assert!(html.contains("Retry now"));
+        assert!(html.contains("/accounts/sign-in"));
+        store::atomic_write(&path, &original).unwrap();
+        assert_eq!(
+            issuer
+                .server
+                .http
+                .get(format!("{}/accounts", issuer.server.url))
+                .header("cookie", &cookie)
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[test]
+fn dashboard_review_landing_readiness_matches_ready_endpoint() {
+    let issuer = EnrollmentServer::start(company_identity());
+    for registry in ["users.json", "devices.json"] {
+        let path = issuer.server.root.path().join("state").join(registry);
+        let original = std::fs::read(&path).unwrap_or_else(|_| b"[]".to_vec());
+        for healthy in [true, false, true] {
+            store::atomic_write(
+                &path,
+                if healthy {
+                    &original
+                } else {
+                    b"invalid registry"
+                },
+            )
+            .unwrap();
+            let ready = issuer
+                .server
+                .http
+                .get(format!("{}/ready", issuer.server.url))
+                .send()
+                .unwrap();
+            assert_eq!(ready.status(), if healthy { 200 } else { 503 });
+            let landing = issuer
+                .server
+                .http
+                .get(format!("{}/", issuer.server.url))
+                .send()
+                .unwrap()
+                .text()
+                .unwrap();
+            assert!(landing.contains(if healthy {
+                "Account server ready"
+            } else {
+                "Account server not ready"
+            }));
+            if !healthy {
+                assert!(!landing.contains("Account server ready"));
+            }
+        }
+    }
+}

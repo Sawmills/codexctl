@@ -3,9 +3,15 @@
   "use strict";
   const byId = (id) => document.getElementById(id);
   if (!byId("overview")) return;
-  let received = 0,
+  // Snapshot ages already include server-side work. Only age them from the
+  // response's arrival, otherwise slow upstream reads get counted twice.
+  let received =
+      performance.getEntriesByType("navigation")[0]?.responseStart ??
+      performance.now(),
     inFlight = false,
-    ended = false;
+    ended = false,
+    pollTimer,
+    hasPolled = false;
   function expire(message) {
     const root = byId("overview");
     if (!root) return;
@@ -36,9 +42,11 @@
   }
   async function poll() {
     if (inFlight || ended) return;
+    clearTimeout(pollTimer);
     inFlight = true;
-    const started = performance.now();
+    hasPolled = true;
     byId("retry").disabled = true;
+    let failed = false;
     try {
       const response = await fetch("/accounts/data", {
         headers: { Accept: "text/html" },
@@ -46,6 +54,7 @@
         cache: "no-store",
         signal: AbortSignal.timeout(45000),
       });
+      const arrived = performance.now();
       if (response.status === 401 || response.status === 403) {
         ended = true;
         byId("overview").replaceChildren();
@@ -73,7 +82,7 @@
       const focusId = focused?.id;
       const focusCopy = focused?.dataset.copy;
       byId("overview").replaceWith(next);
-      received = started; // Include request time in the age, conservatively.
+      received = arrived;
       bindControls();
       bindRetry();
       if (focusId) byId(focusId)?.focus({ preventScroll: true });
@@ -84,27 +93,61 @@
       }
       tick();
     } catch {
-      expire(
-        "Refresh failed. Last observed figures are not proof of headroom.",
-      );
+      failed = true;
+      if (byId("overview").dataset.loadError) {
+        byId("connection-text").textContent =
+          "Your accounts could not be loaded. Retrying within 60 seconds.";
+      } else {
+        expire(
+          "Refresh failed. Last observed figures are not proof of headroom.",
+        );
+      }
     } finally {
       inFlight = false;
       if (byId("retry")) byId("retry").disabled = false;
+      schedule(failed);
     }
   }
+  function schedule(failed = false) {
+    clearTimeout(pollTimer);
+    if (ended) return;
+    const root = byId("overview");
+    const elapsed = (performance.now() - received) / 1000;
+    const delay =
+      failed ||
+      root.dataset.loadError ||
+      root.classList.contains("overview-expired")
+        ? 60
+        : Math.max(
+            0,
+            Math.min(
+              60,
+              Number(root.dataset.validFor) -
+                Number(root.dataset.refreshMargin) -
+                elapsed,
+            ),
+          );
+    // A response with little validity left may be a cached observation. Bound
+    // repeat requests to one per second while starting an aged initial page now.
+    pollTimer = setTimeout(poll, Math.max(hasPolled ? 1000 : 0, delay * 1000));
+  }
   function bindRetry() {
-    byId("retry").addEventListener("click", poll);
+    byId("retry").addEventListener("click", (event) => {
+      event.preventDefault();
+      poll();
+    });
   }
   function tick() {
     if (ended) return;
     const root = byId("overview");
+    if (root.dataset.loadError) return;
     const elapsed = (performance.now() - received) / 1000;
     if (
       elapsed >= Number(root.dataset.validFor) &&
       !root.classList.contains("overview-expired")
     ) {
       expire(
-        "Observations have aged. Cannot confirm headroom; refreshes every 60 seconds.",
+        "Observations have aged. Cannot confirm headroom; refreshes within 60 seconds.",
       );
     }
     for (const observed of root.querySelectorAll("[data-age]")) {
@@ -121,7 +164,7 @@
     }
   }
   bindRetry();
-  setInterval(poll, 60000);
+  schedule();
   setInterval(tick, 1000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {

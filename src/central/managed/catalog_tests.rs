@@ -485,6 +485,95 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
     }
     assert_eq!(f.requests.load(Ordering::SeqCst), 1);
     assert_eq!(credits_requests.load(Ordering::SeqCst), 1);
+    // A CLI catalog read retains its 60-second cache, while the browser must
+    // refresh the same observation with enough validity left for the response.
+    f.broker.catalog.age(Duration::from_secs(45)).await;
+    f.list().await;
+    assert_eq!(f.requests.load(Ordering::SeqCst), 1);
+    let read = || {
+        client
+            .get(&url)
+            .header("cookie", "codexctl-session=synthetic-session")
+            .send()
+    };
+    let (first, second) = tokio::join!(read(), read());
+    for response in [first.unwrap(), second.unwrap()] {
+        let data: Value = response.json().await.unwrap();
+        assert_eq!(data["accounts"][0]["usage_stale"], false);
+        assert!(data["accounts"][0]["usage_age_seconds"].as_u64().unwrap() < 5);
+    }
+    assert_eq!(
+        f.requests.load(Ordering::SeqCst),
+        2,
+        "early refresh is deduplicated"
+    );
+    f.broker.catalog.age(Duration::from_secs(45)).await;
+    f.fail.store(true, Ordering::SeqCst);
+    for _ in 0..3 {
+        let data: Value = read().await.unwrap().json().await.unwrap();
+        assert_eq!(data["accounts"][0]["usage_stale"], true);
+    }
+    assert_eq!(
+        f.requests.load(Ordering::SeqCst),
+        3,
+        "failure cooldown survives early browser requests"
+    );
     credits_task.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn dashboard_redirects_if_session_ends_during_snapshot() {
+    let mut f = Fixture::new(Duration::from_secs(5)).await;
+    f.broker.sso = Some(Arc::new(enrollment::Sso::testing_session("test")));
+    f.hold.store(true, Ordering::SeqCst);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    f.broker.reset_reader = super::super::resets::Reader::with_base(&base);
+    let app = super::super::dashboard::routes(&base)
+        .route(
+            "/credits",
+            get(|| async { Json(json!({"available_count":0,"credits":[]})) }),
+        )
+        .with_state(f.broker.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = tokio::spawn(async move {
+        client
+            .get(format!("{base}/accounts"))
+            .header("cookie", "codexctl-session=synthetic-session")
+            .send()
+            .await
+            .unwrap()
+    });
+    f.started.acquire().await.unwrap().forget();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "cookie",
+        "codexctl-session=synthetic-session".parse().unwrap(),
+    );
+    headers.insert("origin", "http://127.0.0.1".parse().unwrap());
+    let signed_out = enrollment::accounts_sign_out(State(f.broker.clone()), headers)
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(signed_out.status(), StatusCode::SEE_OTHER);
+    f.release.add_permits(1);
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(response.headers()["location"], "/accounts/sign-in");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(
+        !response
+            .text()
+            .await
+            .unwrap()
+            .contains("browser_sign_in_required")
+    );
     server.abort();
 }

@@ -16,16 +16,27 @@ mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
 use sha2::{Digest, Sha256};
 
-async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
-    if enrollment::browser_user(&broker, &headers)?.is_none() {
-        return Ok((
-            [("cache-control", "no-store")],
-            Redirect::to("/accounts/sign-in"),
-        )
-            .into_response());
+async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
+    match snapshot(&broker, &headers).await {
+        Ok(snapshot) => document(&render::overview(&snapshot)),
+        Err(error) => {
+            let error = error.into_response();
+            if error.status() == StatusCode::UNAUTHORIZED {
+                return (
+                    [("cache-control", "no-store")],
+                    Redirect::to("/accounts/sign-in"),
+                )
+                    .into_response();
+            }
+            let mut response = document(include_str!("dashboard/error.html"));
+            *response.status_mut() = error.status();
+            // Keep the already-recorded failure marker for the HTTP observer.
+            response
+                .extensions_mut()
+                .extend(error.into_parts().0.extensions);
+            response
+        }
     }
-    let snapshot = snapshot(&broker, &headers).await?;
-    Ok(document(&render::overview(&snapshot)))
 }
 async fn data(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     let snapshot = snapshot(&broker, &headers).await?;
@@ -45,7 +56,8 @@ async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, Http
     let identity = enrollment::browser_user(broker, headers)?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     let user = identity.id;
-    let catalog = managed::account_catalog(broker, &user).await?;
+    let catalog =
+        managed::account_catalog(broker, &user, super::catalog::Freshness::RefreshAhead).await?;
     let sampled_at = std::time::Instant::now();
     let tasks = catalog
         .into_iter()
@@ -226,6 +238,17 @@ async fn landing(
     if matches!(enrollment::browser_user(&broker, &headers), Ok(Some(_))) {
         return Ok(([("cache-control", "no-store")], Redirect::to("/accounts")).into_response());
     }
+    let ready = managed::readiness(&broker).is_success();
+    let content = content
+        .replace("<!-- READY_STATE -->", if ready { "ok" } else { "bad" })
+        .replace(
+            "<!-- READY_LABEL -->",
+            if ready {
+                "Account server ready"
+            } else {
+                "Account server not ready"
+            },
+        );
     Ok(document(&content))
 }
 fn document(content: &str) -> Response {

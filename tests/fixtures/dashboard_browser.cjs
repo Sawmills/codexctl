@@ -87,6 +87,7 @@ const server = http.createServer((req, res) => {
         "blocked",
         "stale",
         "empty",
+        "error",
         "approval",
         "connected",
       ]) {
@@ -172,22 +173,21 @@ const server = http.createServer((req, res) => {
     );
     await page.clock.install();
     await page.goto(`${origin}/accounts`);
-    await page.clock.fastForward(53000);
-    assert.equal(
-      await page.locator("#answer-current").isVisible(),
-      false,
-      "aged recommendation expires before polling",
-    );
-    assert.equal(await page.locator("#answer-fallback").isVisible(), true);
-    responseMode = "503";
     const before = polls;
-    await page.clock.fastForward(8000);
+    await page.clock.fastForward(40000);
+    await page.waitForFunction(
+      () => document.getElementById("overview").dataset.validFor === "52",
+    );
+    assert.equal(await page.locator("#answer-current").isVisible(), true);
+    assert.equal(await page.locator("#answer-fallback").isVisible(), false);
+    responseMode = "503";
+    await page.clock.fastForward(60000);
     await page
       .getByText(
         "Refresh failed. Last observed figures are not proof of headroom.",
       )
       .waitFor();
-    assert.equal(polls, before + 1);
+    assert(polls > before);
     assert.equal(
       await page.locator(".fresh-action:visible").count(),
       0,
@@ -213,6 +213,21 @@ const server = http.createServer((req, res) => {
         0,
       );
     }
+    responseMode = "healthy";
+    await page.goto(`${origin}/error`);
+    await page
+      .getByRole("heading", { name: "Your accounts could not be loaded" })
+      .waitFor();
+    await page.getByRole("button", { name: "Retry now" }).click();
+    await page.locator("#cmd-use").waitFor();
+    assert.equal(
+      await page.locator("#cmd-use").textContent(),
+      "codexctl use studio",
+    );
+    // The error page also recovers automatically without a manual reload.
+    await page.goto(`${origin}/error`);
+    await page.clock.fastForward(61000);
+    await page.locator("#cmd-use").waitFor();
     responseMode = "accounts";
     await context.close();
   }
@@ -230,7 +245,7 @@ const server = http.createServer((req, res) => {
   await browser.close();
   server.close();
   console.log(
-    "32 screenshots; desktop/390px light/dark; WCAG A/AA; focus; copy; disclosures; SSR without JS; polling; stale expiry; session loss passed.",
+    "36 screenshots; desktop/390px light/dark; WCAG A/AA; focus; copy; disclosures; SSR without JS; polling; stale expiry; session loss passed.",
   );
 })().catch((e) => {
   console.error(e);

@@ -565,6 +565,7 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
         email = email,
         server_time = snapshot.server_time,
         valid_for = valid_for,
+        refresh_margin = super::super::catalog::REFRESH_MARGIN.as_secs(),
         notice = notice,
         notice_hidden = if all_stale { "" } else { "hidden" },
         answer = answer(&snapshot.accounts, best, snapshot.server_time),
