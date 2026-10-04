@@ -52,9 +52,6 @@ impl Fixture {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
-            central: None,
-            holder_id: "test-holder".into(),
-            registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});

@@ -111,7 +111,7 @@ pub(super) async fn run(
             }
             if flag.load(Ordering::Acquire)
                 || broker.stopping.load(Ordering::Acquire)
-                || broker.authorize(headers).await.is_err()
+                || broker.authorize(headers).is_err()
                 || started.elapsed() >= DEADLINE
             {
                 child.start_kill()?;
@@ -191,7 +191,6 @@ pub(super) async fn run(
         .context("native login did not save credentials")?;
     broker
         .authorize(headers)
-        .await
         .map_err(|_| anyhow::anyhow!("device revoked"))?;
     check_claim(
         state.parent().context("missing registry")?,

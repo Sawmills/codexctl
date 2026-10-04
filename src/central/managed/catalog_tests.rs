@@ -96,9 +96,6 @@ impl Fixture {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
-            central: None,
-            holder_id: "test-holder".into(),
-            registry: None,
         };
         Self {
             _root: root,

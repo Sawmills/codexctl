@@ -1,7 +1,8 @@
 # Account server high availability design
 
-**Status:** Phase 2 runtime implementation. PostgreSQL remains refused as an
-authoritative mode; dual mode is opt-in and still requires operator approval.
+**Status:** target design. Phase 1 schema provisioning is implemented; phase 2
+retains the single-instance file runtime. Shared runtime integration is deferred
+to phase 3 and must pass the acceptance gates below before it is enabled.
 
 The current staging shape is one StatefulSet replica with one encrypted
 `ReadWriteOncePod` claim (`deploy/k8s/base/statefulset.yaml:9-13,134-142`). The
@@ -12,34 +13,56 @@ protects the current single-writer design but turns node eviction into a
 storage-attach outage. The target is several pods on separate nodes and zones,
 with durable state in PostgreSQL and an explicit refresh fence.
 
-Phase 2 wires managed account revisions, leases, and registry snapshots through
-the central store. File mode remains the default. Server startup refuses
-`CODEXCTL_CENTRAL_STORE=postgres`; dual mode requires
-`CODEXCTL_CENTRAL_DUAL_ACK=1`. Provision and backfill explicitly with
+Phase 1 provisions the PostgreSQL schema and validates its fencing primitives;
+the running broker still reads and writes the encrypted file vault. Server
+startup therefore refuses `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until
+runtime integration is complete. Provision the schema explicitly with
 `CODEXCTL_CENTRAL_STORE=postgres DATABASE_URL='postgres://USER@HOST/DB?sslmode=require' codexctl-central migrate --state /path/to/state --key-file /path/to/key`
-(then run `codexctl-central backfill --state ... --key-file ...`; use `dual`
-for the runtime after setting the acknowledgement). TLS is required by default, and `DATABASE_URL` must set
+(or use `dual` mode). TLS is required by default, and `DATABASE_URL` must set
 `sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
 the server certificate is signed by a private Amazon RDS authority.
 
-Phase 2 `central_registry` rows are encrypted and are the shared authorization
-registry when central storage is enabled. A pod seeds each row from its local
-registry only when the central row does not exist; enrollment and revocation
-write the central row and refresh the process-local cache.
+Phase 2 is intentionally inert with respect to shared storage. Both server
+implementations reject `dual` and `postgres`, including the legacy dual-write
+alias and `CODEXCTL_CENTRAL_DUAL_ACK=1`. Local CLI administration (`setup`, `init`,
+`users`, `register`, `revoke`) also refuses these modes before touching files.
+The explicit `migrate` command remains available for schema provisioning.
+The managed broker's `/ready` body reports `storeMode: "file"`, local registry
+health as `ready`, and `databaseReachable: null` because it does not use a DB.
+No database client, lease task, mirror write, or central registry read is added
+to the token path. Keep one replica and the existing local native-owner rules.
 
-The phase-two registry uses a versioned encrypted payload as a bounded migration
-exception: users and devices are each limited to a 1 MiB row and every update
-increments that row's revision. Phase three will normalize these entities into
-transactional rows before the fleet grows beyond the documented bound.
+### Phase 3 ownership and acceptance gates
 
-Replacement-pod hydration is a bounded startup scan: it reads at most 10,000
-active account rows ordered by `account_id` and fails closed when that bound is
-exceeded. `deleted_at IS NULL` is the active-row predicate; the staging plan
-must keep the account fleet below this bound before enabling dual mode.
+The managed central-runtime and storage-DAL owner is this B19 implementation
+lane; acceptance owner is HQ. The unfinished implementation is preserved on
+`archive/b19-dual-runtime-wip` for redesign, not deployment. Backfill, PostgreSQL
+authorization, and dual runtime are not delivered by phase 2.
 
-Backfill reports relogin journals as `observed_relogins`; these operation
-records are not copied into a central table yet and do not count as migrated
-state.
+Before HQ accepts a phase-3 PR, CI must exercise actual broker instances against
+the PostgreSQL service and prove all of the following:
+
+- Each token request reads the committed account generation. A stale follower
+  reloads credentials before use, then can perform a forced refresh after
+  acquiring ownership. Persisted generations use compare-and-swap; JWT issued-at
+  or expiry remain freshness evidence, not unique credential generations.
+- CLI and HTTP enable/disable, enroll/register, and revoke mutate central
+  entities transactionally. Concurrent changes retain every enrollment and
+  revocation, explicit re-enable works, and another instance observes the result.
+- Every credential-mutating native call owns the lease. Renewal failure stops
+  work before lease expiry, uncertain completion retains ownership until the
+  child is confirmed stopped, and a replacement holder refreshes immediately
+  after a safe release. Tests count actual provider calls and cover child-stop
+  failure, same-second credentials, and forced-refresh failover.
+- Cached clients recover from dropped and hanging DB connections within bounded
+  deadlines. Readiness and token behavior follow the agreed authority model;
+  transient authorization-store outages are not treated as device revocation.
+- Backfill parses the full input and durably copies every reported record using
+  owner keys (two logins in one workspace both survive). Enrollment handoff,
+  reset idempotency, and relogin recovery work across instances.
+
+Green CI and an exact-head Architect approval are required before enablement.
+The staging and rollback procedure below remains a future acceptance plan.
 
 ## 1. State inventory
 

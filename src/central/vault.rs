@@ -27,7 +27,7 @@ pub struct Vault {
     pub import_rejected: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub tenant: String,

@@ -163,7 +163,7 @@ pub(super) async fn list(
     State(broker): State<Broker>,
     headers: HeaderMap,
 ) -> Result<Response, super::managed::HttpError> {
-    let device = broker.authorize(&headers).await?;
+    let device = broker.authorize(&headers)?;
     let owners: Vec<_> = broker
         .owners
         .read()
@@ -246,7 +246,7 @@ pub(super) async fn list(
         );
     }
     accounts.sort_by(|a, b| a.alias.cmp(&b.alias));
-    broker.authorize(&headers).await?;
+    broker.authorize(&headers)?;
     Ok((
         [("cache-control", "no-store")],
         Json(Inventory {
@@ -275,7 +275,7 @@ async fn redeem(
     headers: HeaderMap,
     body: Result<Json<Redemption>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, super::managed::HttpError> {
-    let device = broker.authorize(&headers).await?;
+    let device = broker.authorize(&headers)?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     if request.redeem_request_id.is_empty() || request.redeem_request_id.len() > 128 {
@@ -296,7 +296,7 @@ async fn redeem(
     let response = tokio::spawn(async move {
         let _permit = permit;
         let mut owner = owner.lock().await;
-        worker.authorize(&headers).await?;
+        worker.authorize(&headers)?;
         if owner.vault.user != device.user {
             return Err(worker.error(StatusCode::NOT_FOUND, "account_not_found"));
         }
