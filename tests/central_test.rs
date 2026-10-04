@@ -1741,6 +1741,60 @@ fn when_a_new_configuration_write_fails_then_its_marker_and_billing_approval_are
 }
 
 #[test]
+fn server_switch_config_write_failure_keeps_the_previous_pointer() {
+    // Root can write through mode 0500, so this permission-based failure is not
+    // meaningful in the root-owned development container.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let client = NativeClient::with_plan(Some("self_serve_business_usage_based"));
+    client.connect();
+    let first = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let connection_path = client.home.join(".codexctl/central/remote.json");
+    let mut connection: Value =
+        serde_json::from_slice(&std::fs::read(&connection_path).unwrap()).unwrap();
+    connection["allow_billing"] = Value::Bool(false);
+    store::atomic_write(&connection_path, &serde_json::to_vec(&connection).unwrap()).unwrap();
+
+    let config = client.home.join(".codex/config.toml");
+    let readonly = client.home.join("readonly-config");
+    std::fs::create_dir(&readonly).unwrap();
+    let target = readonly.join("config.toml");
+    std::fs::rename(&config, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &config).unwrap();
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let failed = client.run(
+        env!("CARGO_BIN_EXE_codexctl"),
+        &["use", "remote", "--allow-billing"],
+    );
+
+    std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(!failed.status.success());
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(stderr.contains("Permission denied"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(client.home.join(".codexctl/central/.active-account"))
+            .unwrap()
+            .trim(),
+        "remote"
+    );
+    let connection: Value =
+        serde_json::from_slice(&std::fs::read(connection_path).unwrap()).unwrap();
+    assert_eq!(connection["allow_billing"], false);
+}
+
+#[test]
 fn when_the_default_codex_profile_overrides_the_provider_then_remote_activation_refuses() {
     let client = NativeClient::start();
     client.connect();
