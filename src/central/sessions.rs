@@ -603,6 +603,7 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn docker_overlay_warning_is_ignored_outside_the_selected_mount() {
         let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
         assert!(overlay_warning_is_unrelated(

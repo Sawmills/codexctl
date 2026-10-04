@@ -418,6 +418,7 @@ fn lsof_warnings_are_suppressed_with_w_flag() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn docker_lsof_filesystem_warnings_are_ignored() {
     let f = Fixture::new();
     let result = f.run_with_lsof(
