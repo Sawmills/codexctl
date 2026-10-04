@@ -108,7 +108,7 @@ fn alias_from_pointer_bytes(bytes: Option<&[u8]>) -> Option<String> {
 fn render_parent_cmd(args: &[String]) -> String {
     let mut rendered = Vec::new();
     let mut redact = false;
-    for arg in args {
+    for arg in args.iter().flat_map(|arg| arg.split_whitespace()) {
         let lower = arg.to_ascii_lowercase();
         if redact {
             rendered.push("<redacted>".to_owned());
@@ -116,39 +116,34 @@ fn render_parent_cmd(args: &[String]) -> String {
         } else if lower == "bearer" {
             rendered.push("<redacted>".to_owned());
             redact = true;
-        } else if lower.starts_with("bearer ")
-            || lower.contains("token=")
-            || lower.contains("password=")
-            || lower.contains("secret=")
-            || lower.contains("key=")
-            || lower.contains("credential=")
-            || lower.contains("authorization=")
-            || (lower.split('.').count() == 3 && arg.len() > 30)
-        {
-            rendered.push("<redacted>".to_owned());
         } else {
-            redact = matches!(
-                lower.as_str(),
+            let (name, value) = lower.split_once('=').unwrap_or((lower.as_str(), ""));
+            let sensitive_name = name
+                .trim_start_matches('-')
+                .trim_end_matches(':')
+                .replace('-', "");
+            let sensitive = matches!(
+                sensitive_name.as_str(),
                 "token"
-                    | "--token"
                     | "password"
-                    | "--password"
                     | "secret"
-                    | "--secret"
                     | "key"
-                    | "--key"
-                    | "api-key"
-                    | "--api-key"
-                    | "access-token"
-                    | "--access-token"
-                    | "refresh-token"
-                    | "--refresh-token"
+                    | "apikey"
+                    | "accesstoken"
+                    | "refreshtoken"
                     | "authorization"
-                    | "--authorization"
                     | "credential"
-                    | "--credential"
             );
-            rendered.push(arg.clone());
+            if !value.is_empty() && sensitive {
+                rendered.push(format!("{name}=<redacted>"));
+            } else {
+                redact = sensitive && value.is_empty();
+                if lower.split('.').count() == 3 && arg.len() > 30 {
+                    rendered.push("<redacted>".to_owned());
+                } else {
+                    rendered.push(arg.to_owned());
+                }
+            }
         }
     }
     rendered.join(" ").chars().take(200).collect()
@@ -254,6 +249,15 @@ fn append_active_history(
     file.write_all(&bytes)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
+    sync_history_directory(history_root)?;
+    Ok(())
+}
+
+fn sync_history_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -261,18 +265,31 @@ fn remove_active_pointer_audited(pointer: &Path, cause: PointerCause) -> Result<
     let previous = read_optional_file(pointer)?;
     remove_active_pointer_with(pointer, |path| fs::remove_file(path))?;
     if previous.is_some() {
-        append_active_history(
+        let append = append_active_history(
             pointer.parent().context("active pointer has no parent")?,
             alias_from_pointer_bytes(previous.as_deref()),
             None,
             cause,
-        )?;
+        );
+        if let Err(error) = append {
+            let rollback = previous
+                .as_deref()
+                .map(|bytes| store::atomic_write(pointer, bytes))
+                .transpose();
+            return match rollback {
+                Ok(_) => Err(error),
+                Err(rollback_error) => Err(error.context(format!(
+                    "active account pointer rollback failed: {rollback_error:#}"
+                ))),
+            };
+        }
     }
     Ok(())
 }
 
 pub fn print_history(limit: usize, json: bool) -> Result<()> {
     let history_root = root()?;
+    let _lock = native_lock(&history_root)?;
     let mut entries = Vec::new();
     for path in [
         history_root.join(ACTIVE_HISTORY_ROTATED),
@@ -1399,9 +1416,22 @@ pub(super) fn deactivate_locked() -> Result<()> {
             doc.remove("model_providers");
         }
     }
-    write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
+    let destination = config_path(&active.home)?;
+    let previous_config = read_optional_file(&destination)?;
+    let desired_config = doc.to_string().into_bytes();
+    write_config(&destination, &desired_config)?;
     let pointer = active_pointer_path()?;
-    remove_pointer_then_marker_audited(&pointer, &marker, PointerCause::Deactivate)?;
+    if let Err(error) =
+        remove_pointer_then_marker_audited(&pointer, &marker, PointerCause::Deactivate)
+    {
+        let rollback = restore_config(&destination, previous_config.as_deref(), &desired_config);
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "deactivation configuration rollback failed: {rollback_error:#}"
+            ))),
+        };
+    }
     Ok(())
 }
 
@@ -1784,6 +1814,21 @@ mod tests {
     }
 
     #[test]
+    fn deactivation_restores_pointer_when_history_append_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let pointer = root.path().join(".active-account");
+        fs::write(&pointer, b"remote\n").unwrap();
+        fs::create_dir(root.path().join(ACTIVE_HISTORY)).unwrap();
+
+        let error = remove_active_pointer_audited(&pointer, PointerCause::Deactivate).unwrap_err();
+
+        assert!(
+            error.to_string().contains("Is a directory") || error.to_string().contains("directory")
+        );
+        assert_eq!(fs::read(pointer).unwrap(), b"remote\n");
+    }
+
+    #[test]
     fn parent_command_redacts_secrets_and_caps_length() {
         let args = vec![
             "codexctl".to_owned(),
@@ -1794,6 +1839,7 @@ mod tests {
             "Bearer".to_owned(),
             "authorization-secret".to_owned(),
             "--api-key=another-secret".to_owned(),
+            "--token=attached-secret".to_owned(),
             "x".repeat(300),
         ];
         let rendered = render_parent_cmd(&args);
@@ -1801,7 +1847,21 @@ mod tests {
         assert!(!rendered.contains("access-secret"));
         assert!(!rendered.contains("authorization-secret"));
         assert!(!rendered.contains("another-secret"));
+        assert!(!rendered.contains("attached-secret"));
         assert!(rendered.chars().count() <= 200);
+    }
+
+    #[test]
+    fn parent_command_splits_shell_scripts_before_redacting() {
+        let args = vec![
+            "bash".to_owned(),
+            "-lc".to_owned(),
+            "curl -H 'Authorization: Bearer script-secret' --token script-token && codexctl use"
+                .to_owned(),
+        ];
+        let rendered = render_parent_cmd(&args);
+        assert!(!rendered.contains("script-secret"));
+        assert!(!rendered.contains("script-token"));
     }
 
     fn test_connection(root: &std::path::Path) -> Connection {
