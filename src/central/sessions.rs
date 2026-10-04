@@ -450,6 +450,7 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
 fn harmless_lsof_warning(line: &[u8]) -> bool {
     let line = String::from_utf8_lossy(line);
     line.contains("WARNING: can't stat() nsfs file system /run/docker/netns/")
+        || line.contains("WARNING: can't stat() overlay file system /var/lib/docker/")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/tracing")
 }
