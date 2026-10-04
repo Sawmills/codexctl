@@ -1314,6 +1314,7 @@ mod tests {
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
+            launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
         };
@@ -1421,6 +1422,7 @@ mod tests {
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
+            launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
         };
