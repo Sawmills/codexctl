@@ -7,7 +7,9 @@ use std::collections::BTreeSet;
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum Source {
+    #[cfg(unix)]
     Launch,
+    #[cfg(unix)]
     HostDefault,
     Log,
 }
@@ -23,7 +25,7 @@ pub(super) struct Snapshot {
     pub warnings: Vec<String>,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn launch_only(launchers: &BTreeMap<u32, String>) -> Vec<LiveProcess> {
     launchers
         .iter()
@@ -281,7 +283,7 @@ fn proc_start_epoch(start_ticks: u64) -> Option<i64> {
     (hz > 0).then(|| btime.checked_add(i64::try_from(start_ticks / hz as u64).ok()?))?
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn fallback_processes(
     _host_account: Option<&str>,
     _home: &std::path::Path,
