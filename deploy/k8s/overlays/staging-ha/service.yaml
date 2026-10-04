@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: codexctl
+  name: codexctl-ha
+  labels:
+    app.kubernetes.io/name: codexctl
+spec:
+  selector:
+    app.kubernetes.io/name: codexctl
+    app.kubernetes.io/component: broker-ha
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
