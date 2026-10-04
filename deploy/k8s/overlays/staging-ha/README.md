@@ -10,8 +10,8 @@ and hostnames, require hostname anti-affinity, use only `emptyDir` volumes, and
 keep `PodDisruptionBudget.minAvailable: 1`. The overlay has no
 `karpenter.sh/do-not-disrupt` annotation. The `codexctl-secrets`
 ExternalSecret supplies the vault key, SSO secret, and metrics token; the
-`codexctl-postgres` ExternalSecret mirrors the five SSM keys provisioned by
-infra#1513. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
+The infra#1513 manifest owns the `codexctl-postgres` ExternalSecret and its five
+SSM references. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
 uses the image system CA bundle through
 `CODEXCTL_CENTRAL_DB_CA_FILE`. Kustomize rewrites the workload image to the
 reviewed immutable ECR manifest digest; it does not use the mutable staging tag.
