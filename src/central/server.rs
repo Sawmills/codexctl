@@ -681,6 +681,21 @@ mod billing_tests {
     }
 
     #[test]
+    fn app_server_usage_based_billing_still_requires_approval() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "usage_based",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": 100, "windowDurationMins": 10080},
+                "credits": {"hasCredits": true, "unlimited": false}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::UsageBased);
+        assert_ne!(billing_class(&limits), api::BillingClass::RateLimited);
+    }
+
+    #[test]
     fn organizational_limits_need_a_closed_spend_cap_to_prove_included_usage() {
         for plan in ["team", "business", "enterprise", "edu"] {
             let mut limits = json!({"rateLimits":{"planType":plan,"primary":{"usedPercent":0,"windowDurationMins":300},"credits":{"hasCredits":false,"unlimited":false}}});
