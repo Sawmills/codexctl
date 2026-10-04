@@ -7241,9 +7241,58 @@ sys.exit(23)
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
+    // Match Codex's real global Append option. Clap propagates the deepest
+    // subcommand's values upwards; config flags at different levels do not merge.
+    let config_arg = clap::Arg::new("config")
+        .short('c')
+        .long("config")
+        .action(clap::ArgAction::Append)
+        .global(true);
+    let session_command = |name| {
+        clap::Command::new(name)
+            .arg(clap::Arg::new("session"))
+            .arg(clap::Arg::new("prompt"))
+    };
+    let parser = clap::Command::new("codex")
+        .arg(config_arg)
+        .arg(clap::Arg::new("cd").long("cd").global(true))
+        .arg(clap::Arg::new("model").short('m').global(true))
+        .arg(clap::Arg::new("prompt"))
+        .subcommand(session_command("resume"))
+        .subcommand(clap::Command::new("exec").subcommand(session_command("resume")));
     for args in [
         vec!["resume", "old-session", "--", "keep this prompt"],
         vec!["new prompt"],
+        vec![
+            "resume",
+            "old-session",
+            "-m",
+            "gpt-6-astra",
+            "-c",
+            "model_reasoning_effort=high",
+        ],
+        vec![
+            "exec",
+            "resume",
+            "old-session",
+            "--config=model_reasoning_effort=high",
+        ],
+        vec!["resume", "old-session", "-c=model_reasoning_effort=high"],
+        vec![
+            "resume",
+            "old-session",
+            "--config",
+            "model_reasoning_effort=high",
+        ],
+        vec![
+            "-cmodel_reasoning_effort=low",
+            "resume",
+            "old-session",
+            "-c",
+            "model_reasoning_effort=high",
+            "--",
+            "-c literal prompt",
+        ],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
             .args(["codex", "--account", "lane"])
@@ -7275,7 +7324,42 @@ sys.exit(23)
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert!(argv.ends_with(&args));
+        let parsed = parser
+            .clone()
+            .try_get_matches_from(std::iter::once("codex").chain(argv.iter().copied()))
+            .unwrap();
+        let effective: Vec<&str> = parsed
+            .get_many::<String>("config")
+            .unwrap()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            effective
+                .iter()
+                .any(|value| value.starts_with("model_providers.codexctl-central.auth.args=")),
+            "Codex lost the private helper overrides: {effective:?}"
+        );
+        if args
+            .iter()
+            .any(|arg| arg.contains("model_reasoning_effort=high"))
+        {
+            assert_eq!(
+                effective
+                    .iter()
+                    .rfind(|value| value.starts_with("model_reasoning_effort=")),
+                Some(&"model_reasoning_effort=high")
+            );
+        }
+        let mut leaf = &parsed;
+        while let Some((_, subcommand)) = leaf.subcommand() {
+            leaf = subcommand;
+        }
+        if args.contains(&"--") {
+            assert_eq!(
+                leaf.get_one::<String>("prompt").map(String::as_str),
+                args.last().copied()
+            );
+        }
         assert!(!argv.contains(&"--account"));
         assert!(argv.contains(&"model_provider=\"codexctl-central\""));
         assert!(!argv.iter().any(|a| a.contains("ChatGPT-Account-ID")));

@@ -115,10 +115,14 @@ pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()>
     Ok(())
 }
 
-fn require_pinned_arguments(args: &[String]) -> Result<()> {
+fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
+    let mut config_args = Vec::new();
+    let mut remaining = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--" {
+            remaining.push(arg.clone());
+            remaining.extend(args.cloned());
             break;
         }
         if arg == "--profile"
@@ -129,10 +133,17 @@ fn require_pinned_arguments(args: &[String]) -> Result<()> {
             bail!("--account cannot be combined with a Codex profile override");
         }
         let config = if arg == "-c" || arg == "--config" {
-            args.next().map(String::as_str)
+            Some(
+                args.next()
+                    .context("Codex config override requires a value")?
+                    .as_str(),
+            )
         } else {
-            arg.strip_prefix("--config=")
-                .or_else(|| arg.strip_prefix("-c").filter(|s| !s.is_empty()))
+            arg.strip_prefix("--config=").or_else(|| {
+                arg.strip_prefix("-c")
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.strip_prefix('=').unwrap_or(s))
+            })
         };
         if let Some(config) = config {
             let key = config.split('=').next().unwrap_or_default().trim();
@@ -146,16 +157,23 @@ fn require_pinned_arguments(args: &[String]) -> Result<()> {
                     "--account cannot be combined with a provider or profile configuration override"
                 );
             }
+            config_args.extend(["-c".to_owned(), config.to_owned()]);
+        } else {
+            remaining.push(arg.clone());
         }
     }
-    Ok(())
+    // Codex's global Clap Append option keeps only the deepest subcommand's
+    // values when -c occurs at multiple levels. Keep user and launch overrides
+    // together at the root so resume/exec cannot discard the private helper.
+    config_args.extend(remaining);
+    Ok(config_args)
 }
 
 /// Prepare consent and a private helper connection, then preserve the child exit status.
 /// Does not activate a provider, change the host pointer, or redeem resets.
 pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
     store::validate_alias(alias)?;
-    require_pinned_arguments(args)?;
+    let args = pinned_arguments(args)?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
