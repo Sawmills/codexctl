@@ -407,8 +407,16 @@ pub(super) fn billing_class(response: &Value) -> api::BillingClass {
                     .as_f64()
                     .is_some_and(|used| (0.0..100.0).contains(&used))
         }) || u.rate_limit.as_ref().is_some_and(|r| {
+            let raw_windows_valid = ["primary", "secondary"].into_iter().all(|name| {
+                let window = &response["rateLimits"][name];
+                window.is_null()
+                    || window["usedPercent"]
+                        .as_f64()
+                        .is_some_and(|used| used.is_finite() && (0.0..=100.0).contains(&used))
+            });
             r.allowed == Some(true)
                 && r.limit_reached == Some(false)
+                && raw_windows_valid
                 && r.windows().all(|(_, w)| {
                     w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent)
                 })
@@ -708,6 +716,20 @@ mod billing_tests {
                 "allowed": true,
                 "limitReached": false,
                 "primary": {"usedPercent": -1, "windowDurationMins": 10080}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
+    #[test]
+    fn missing_window_data_never_gains_no_bill_status_from_admission_flags() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "promax",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": 100, "windowDurationMins": 10080},
+                "secondary": {"windowDurationMins": 300}
             }
         });
         assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
