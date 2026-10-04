@@ -127,6 +127,7 @@ pub(super) struct Owner {
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
+    pub(super) verification_blocked: bool,
     #[cfg(test)]
     pub(super) retry_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -231,7 +232,10 @@ impl Owner {
             &self.home.as_path().join("auth.json"),
         )?)?;
         self.validate_owned_auth(&auth)?;
-        if self.rpc.as_ref().is_some_and(Rpc::verified_login) {
+        if self.rpc.as_ref().is_some_and(Rpc::verified_login)
+            && !self.vault.import_rejected
+            && !self.verification_blocked
+        {
             self.vault.verified = true;
             self.vault.import_rejected = false;
         } else if !self.vault.verified {
@@ -708,6 +712,7 @@ pub async fn serve(
         limits: None,
         limits_observed: None,
         verification_input: None,
+        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };

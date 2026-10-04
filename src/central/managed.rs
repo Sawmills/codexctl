@@ -748,9 +748,6 @@ async fn token(
         let _permit = permit;
         let retry_requested = {
             let mut guard = owner_ref.lock().await;
-            guard
-                .validate_account_id(request.account_id.as_deref())
-                .map_err(|failure| worker.owner_failure(failure))?;
             if !guard.vault.verified {
                 // An interrupted import owns a reservation, but it has not
                 // completed verification. Never let a retryable billing or
@@ -761,6 +758,9 @@ async fn token(
                 guard.retry_failures = 0;
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
+            guard
+                .validate_account_id(request.account_id.as_deref())
+                .map_err(|failure| worker.owner_failure(failure))?;
             guard.retryable_unavailable && !guard.retry_cooldown_active() && !guard.routing_refused
         };
         // Shared-store paths take imports before Owner. File mode keeps this
@@ -1389,6 +1389,9 @@ impl Broker {
                     rpc.shutdown().await.map_err(|_| {
                         self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
                     })?;
+                    // The response is settled before this snapshot, so a
+                    // completed verification may now be trusted.
+                    owner.verification_blocked = false;
                 } else {
                     previous_owner_exited(&owner.home).map_err(|_| {
                         self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
@@ -1640,6 +1643,7 @@ impl Broker {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
             owner.vault.verified = true;
+            owner.verification_blocked = false;
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
@@ -1671,6 +1675,7 @@ impl Broker {
             // retirement failure leaves reservations for an explicit migration retry.
             relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            owner.verification_input = None;
             Ok(account_summary(&owner))
         }
         .await;
@@ -1684,6 +1689,7 @@ impl Broker {
                 // must complete verification through import retry before token
                 // recovery can become eligible.
                 owner.vault.verified = false;
+                owner.verification_blocked = verification_required;
                 vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
@@ -1949,6 +1955,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         limits: None,
         limits_observed: None,
         verification_input: None,
+        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };
@@ -2135,6 +2142,7 @@ pub async fn serve(
                     limits: None,
                     limits_observed: None,
                     verification_input: None,
+                    verification_blocked: false,
                     #[cfg(test)]
                     retry_clock: None,
                 }
@@ -2351,6 +2359,7 @@ pub async fn serve(
         if let Some(rpc) = owner.rpc.as_mut() {
             rpc.shutdown().await?;
         }
+        owner.verification_blocked = false;
         owner.snapshot()?;
         // Retain the process incarnation as evidence. A dead incarnation cannot block restart.
         Ok::<(), anyhow::Error>(())

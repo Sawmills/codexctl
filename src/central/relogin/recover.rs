@@ -25,6 +25,7 @@ pub(in crate::central) fn promote(
         limits: None,
         limits_observed: None,
         verification_input: None,
+        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };
@@ -309,6 +310,7 @@ fn finish_verified(state: &Path, key: &Path, record: &mut Record) -> Result<bool
         limits: None,
         limits_observed: None,
         verification_input: None,
+        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };
