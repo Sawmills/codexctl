@@ -544,18 +544,25 @@ fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a M
         })
         .and_then(|mount| visible_mount(mounts, &mount.mountpoint))
         .map(|mount| mount.id);
-    let mut visible = candidates
+    let mut roots = candidates
         .iter()
         .copied()
-        .filter(|mount| enclosing_parent.is_none_or(|parent| mount.parent == parent))
-        .max_by_key(|mount| mount.id)
-        .or_else(|| candidates.iter().copied().max_by_key(|mount| mount.id))?;
-    while let Some(next) = candidates
-        .iter()
-        .copied()
-        .filter(|mount| mount.parent == visible.id)
-        .max_by_key(|mount| mount.id)
-    {
+        .filter(|mount| enclosing_parent.is_none_or(|parent| mount.parent == parent));
+    let mut visible = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    loop {
+        let mut children = candidates
+            .iter()
+            .copied()
+            .filter(|mount| mount.parent == visible.id);
+        let Some(next) = children.next() else {
+            break;
+        };
+        if children.next().is_some() {
+            return None;
+        }
         visible = next;
     }
     Some(visible)
