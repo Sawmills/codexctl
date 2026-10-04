@@ -905,9 +905,6 @@ fn finish_token(
         .launch_pinned
         .then(|| launch::lock_live_launch(path))
         .transpose()?;
-    if connection.launch_pinned {
-        launch::require_headroom(&alias, &token)?;
-    }
     let mut latest = read_connection(path)?;
     if let Some(expected) = expected_active
         && read_active_alias()?.as_str() != expected
@@ -920,11 +917,13 @@ fn finish_token(
     {
         bail!("remote connection changed during token retrieval");
     }
-    if token.billing_class != Some(api::BillingClass::RateLimited)
-        && (!latest.allow_billing
-            || latest.approved_billing_plan != token.chatgpt_plan_type
-            || latest.approved_billing_class != token.billing_class)
-    {
+    let billing_approved = latest.allow_billing
+        && latest.approved_billing_plan == token.chatgpt_plan_type
+        && latest.approved_billing_class == token.billing_class;
+    if connection.launch_pinned && !billing_approved {
+        launch::require_headroom(&alias, &token)?;
+    }
+    if token.billing_class != Some(api::BillingClass::RateLimited) && !billing_approved {
         return Err(billing_error(&alias, &token));
     }
     if latest.revision == connection.revision {

@@ -201,7 +201,7 @@ Account selection during recovery:
 For one server-account lane, use `codexctl codex --account <alias> [codex args...]`,
 including `resume <session-id>`. It preserves the host account and keeps this session
 pinned when other lanes switch. Billing accounts require terminal approval or
-`--allow-billing`; exhausted accounts refuse and no reset is redeemed.
+`--allow-billing`. An exhausted account requires `--allow-billing` to run on ChatGPT credits; no reset is redeemed.
 See [server-account launches](docs/central-server.md) for policy and exit codes.
 
 `codexctl rate [--json] [--minutes 10]` reports successful responses, 429s, their ratio,
