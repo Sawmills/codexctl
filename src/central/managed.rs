@@ -490,23 +490,23 @@ async fn reconcile_owner_from_central(
     broker: &Broker,
     owner: &mut Owner,
     account_id: &str,
-) -> Result<(), HttpError> {
+) -> Result<bool, HttpError> {
     let Some(central) = broker
         .central
         .as_ref()
         .filter(|central| central.mode() != super::storage::StoreMode::File)
     else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(record) = central
         .load_account(account_id)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
     else {
-        return Ok(());
+        return Ok(false);
     };
     if record.revision <= credential_revision(&owner.vault.auth) {
-        return Ok(());
+        return Ok(false);
     }
     let committed: vault::Vault = serde_json::from_value(record.vault)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
@@ -519,7 +519,7 @@ async fn reconcile_owner_from_central(
     // committed access token while the lease holder performs the next refresh.
     owner.rpc = None;
     owner.refresh_enabled = false;
-    Ok(())
+    Ok(true)
 }
 
 async fn token(
@@ -584,8 +584,9 @@ async fn token(
                 .as_ref()
                 .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
         {
-            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
-            request.previous_revision = None;
+            if reconcile_owner_from_central(&worker, &mut owner, &account_id).await? {
+                request.previous_revision = None;
+            }
         }
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
@@ -1130,8 +1131,18 @@ async fn devices(
     headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
     let current = broker.authorize(&headers).await?;
-    let devices = vault::devices(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+    let devices = if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    {
+        central_registry_devices(central)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    } else {
+        vault::devices(&broker.state)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    };
     Ok(Json(json!(
         devices
             .into_iter()
@@ -1150,7 +1161,29 @@ async fn revoke_device(
     Json(input): Json<RevokeDevice>,
 ) -> Result<StatusCode, HttpError> {
     let current = broker.authorize(&headers).await?;
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
     {
+        let mut devices = central_registry_devices(central)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let device = devices
+            .iter_mut()
+            .find(|d| d.id == input.id && d.user == current.user)
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
+        device.revoked = true;
+        let entries = devices
+            .iter()
+            .map(|device| Ok((device.id.clone(), serde_json::to_vec(device)?)))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        central
+            .save_registry_entities("devices", &entries)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    } else {
         let _lock = vault::registry_lock(&broker.state, "devices.lock")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
         let mut devices = vault::devices(&broker.state)

@@ -684,11 +684,11 @@ async fn approve(
         vault::save_devices(&broker.state, &devices)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     }
-    grant_device(&broker, &approval.device_hash, &token)?;
     broker
         .sync_registry()
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    grant_device(&broker, &approval.device_hash, &token)?;
     Ok(page(include_str!("enrollment/connected.html").into()))
 }
 fn grant_device(broker: &Broker, device_hash: &str, token: &str) -> Result<(), HttpError> {

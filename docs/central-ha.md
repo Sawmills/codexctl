@@ -22,15 +22,14 @@ for the runtime after setting the acknowledgement). TLS is required by default, 
 `sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
 the server certificate is signed by a private Amazon RDS authority.
 
-Phase 2 `central_registry` rows are encrypted and are the shared authorization
-registry when central storage is enabled. A pod seeds each row from its local
-registry only when the central row does not exist; enrollment and revocation
-write the central row and refresh the process-local cache.
-
-The phase-two registry uses a versioned encrypted payload as a bounded migration
-exception: users and devices are each limited to a 1 MiB row and every update
-increments that row's revision. Phase three will normalize these entities into
-transactional rows before the fleet grows beyond the documented bound.
+Phase 2 `central_registry_entries` rows are encrypted and are the shared
+authorization registry when central storage is enabled. Each user and device
+has its own `(kind, entity_id)` row; enrollment and revocation upsert only the
+changed entity set and authorization reads the committed rows on every request.
+The legacy `central_registry` blob is read only while migrating an existing
+database. Entity revisions increment independently, and startup seeds a kind
+only when that kind has no central entries. The staging plan must keep each
+entity payload bounded and reject oversized registry updates.
 
 Replacement-pod hydration is a bounded startup scan: it reads at most 10,000
 active account rows ordered by `account_id` and fails closed when that bound is

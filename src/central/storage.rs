@@ -297,6 +297,12 @@ impl CentralStore {
         if entries.is_empty() {
             return Ok(());
         }
+        if entries
+            .iter()
+            .any(|(_, payload)| payload.len() > 1024 * 1024)
+        {
+            bail!("central registry entity exceeds the 1 MiB bound");
+        }
         match self {
             Self::File(_) => Ok(()),
             Self::Postgres(db) => bounded_db(db.save_registry_entities(name, entries)).await,
@@ -939,12 +945,23 @@ impl PostgresStore {
 
     async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
         let current = self.client.lock().await.clone();
-        if let Some(client) = current
-            && tokio::time::timeout(DB_TIMEOUT, client.simple_query("SELECT 1"))
+        if let Some(client) = current {
+            if tokio::time::timeout(DB_TIMEOUT, client.simple_query("SELECT 1"))
                 .await
                 .is_ok_and(|result| result.is_ok())
-        {
-            return Ok(client);
+            {
+                return Ok(client);
+            }
+            // Drop a half-open client before reconnecting. Otherwise a failed
+            // reconnect can leave the dead Arc installed and make every later
+            // request probe the same broken connection forever.
+            let mut slot = self.client.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|stored| Arc::ptr_eq(stored, &client))
+            {
+                *slot = None;
+            }
         }
         let client = tokio::time::timeout(DB_TIMEOUT, self.establish())
             .await
