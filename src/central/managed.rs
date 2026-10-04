@@ -295,14 +295,6 @@ async fn central_registry_users(central: &CentralStore) -> Result<Vec<User>> {
         .collect()
 }
 
-async fn central_registry_devices(central: &CentralStore) -> Result<Vec<vault::Device>> {
-    let entities = central.load_registry_entities("devices").await?;
-    entities
-        .into_iter()
-        .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
-        .collect()
-}
-
 async fn central_registry_devices_for_tenant(
     central: &CentralStore,
     tenant: &str,
@@ -399,7 +391,12 @@ impl Broker {
             .as_ref()
             .context("central store is not configured")?;
         if !central
-            .save_registry_entity_cas("devices", &device.id, &serde_json::to_vec(device)?, None)
+            .save_device_entity_cas(
+                &device.tenant,
+                &device.id,
+                &serde_json::to_vec(device)?,
+                None,
+            )
             .await?
         {
             bail!("device was enrolled concurrently; retry");
@@ -411,18 +408,19 @@ impl Broker {
         let local_users = users(&self.state)?;
         let local_devices = vault::devices(&self.state)?;
         let (users, devices) = if let Some(central) = self.central.as_ref() {
-            (
-                central_registry_users(central).await?,
-                central_registry_devices(central).await?,
-            )
+            (central_registry_users(central).await?, Vec::new())
         } else {
             (local_users, local_devices)
         };
         if let Some(registry) = self.registry.as_ref() {
             *registry
                 .write()
-                .map_err(|_| anyhow::anyhow!("registry lock poisoned"))? =
-                RegistryState { users, devices };
+                .map_err(|_| anyhow::anyhow!("registry lock poisoned"))? = RegistryState {
+                users,
+                // PostgreSQL device authorization is queried per request.
+                // Keep no cross-tenant device snapshot in the in-memory registry.
+                devices,
+            };
         }
         Ok(())
     }
@@ -1601,8 +1599,8 @@ async fn revoke_device(
         }
         device.revoked = true;
         let updated = central
-            .save_registry_entity_cas(
-                "devices",
+            .save_device_entity_cas(
+                &current.tenant,
                 &input.id,
                 &serde_json::to_vec(&device).map_err(|_| {
                     broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
@@ -2058,29 +2056,23 @@ pub async fn serve(
                     .await?;
             }
         }
-        let existing_devices = central
-            .load_registry_entity_revisions("devices")
-            .await?
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect::<std::collections::BTreeSet<_>>();
         for device in vault::devices(state).unwrap_or_default() {
-            if !existing_devices.contains(&device.id) {
-                central
-                    .save_registry_entity_cas(
-                        "devices",
-                        &device.id,
-                        &serde_json::to_vec(&device)?,
-                        None,
-                    )
-                    .await?;
-            }
+            // Insert-only CAS preserves an existing central row without
+            // reading a cross-tenant device snapshot during startup.
+            let _ = central
+                .save_device_entity_cas(
+                    &device.tenant,
+                    &device.id,
+                    &serde_json::to_vec(&device)?,
+                    None,
+                )
+                .await?;
         }
         let users = central_registry_users(central).await?;
-        let devices = central_registry_devices(central).await?;
         Some(Arc::new(std::sync::RwLock::new(RegistryState {
             users,
-            devices,
+            // PostgreSQL device authorization is queried per request.
+            devices: Vec::new(),
         })))
     } else {
         None

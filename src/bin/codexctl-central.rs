@@ -79,6 +79,8 @@ enum Commands {
         #[arg(long)]
         key_file: Option<PathBuf>,
         #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
         device: String,
     },
     /// Apply central PostgreSQL schema migrations when PostgreSQL storage is enabled.
@@ -252,6 +254,7 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         Commands::Revoke {
             state,
             key_file,
+            tenant,
             device,
         } => {
             if matches!(
@@ -261,7 +264,15 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                 let key_file = key_file.ok_or_else(|| {
                     anyhow::anyhow!("--key-file is required for revoke in postgres mode")
                 })?;
-                central::revoke_central(&state, &key_file, &device).await?
+                central::revoke_central(
+                    &state,
+                    &key_file,
+                    tenant.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("--tenant is required for revoke in postgres mode")
+                    })?,
+                    &device,
+                )
+                .await?
             } else {
                 central::revoke(&state, &device)?
             }

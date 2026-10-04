@@ -317,6 +317,7 @@ impl CentralStore {
         &self,
         tenant: &str,
     ) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        crate::store::validate_alias(tenant)?;
         match self {
             Self::File(_) => Ok(Vec::new()),
             Self::Postgres(db) => bounded_db(db.load_device_entity_revisions(tenant)).await,
@@ -331,6 +332,8 @@ impl CentralStore {
         tenant: &str,
         entity_id: &str,
     ) -> Result<Option<(String, Vec<u8>, i64)>> {
+        crate::store::validate_alias(tenant)?;
+        crate::store::validate_alias(entity_id)?;
         match self {
             Self::File(_) => Ok(None),
             Self::Postgres(db) => {
@@ -390,6 +393,36 @@ impl CentralStore {
             Self::Dual { postgres, .. } => {
                 bounded_db(postgres.save_registry_entity_cas(
                     name,
+                    entity_id,
+                    payload,
+                    expected_revision,
+                ))
+                .await
+            }
+        }
+    }
+
+    pub async fn save_device_entity_cas(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+        payload: &[u8],
+        expected_revision: Option<i64>,
+    ) -> Result<bool> {
+        crate::store::validate_alias(tenant)?;
+        crate::store::validate_alias(entity_id)?;
+        if payload.len() > 1024 * 1024 {
+            bail!("central registry entity exceeds the 1 MiB bound");
+        }
+        match self {
+            Self::File(_) => Ok(true),
+            Self::Postgres(db) => {
+                bounded_db(db.save_device_entity_cas(tenant, entity_id, payload, expected_revision))
+                    .await
+            }
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.save_device_entity_cas(
+                    tenant,
                     entity_id,
                     payload,
                     expected_revision,
@@ -475,8 +508,8 @@ impl CentralStore {
                         serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?;
                     for device in &devices {
                         target
-                            .save_registry_entity_cas(
-                                "devices",
+                            .save_device_entity_cas(
+                                &device.tenant,
                                 &device.id,
                                 &serde_json::to_vec(device)?,
                                 None,
@@ -1220,23 +1253,6 @@ impl PostgresStore {
                 })
                 .collect();
         }
-        if name == "devices" {
-            let rows = client
-                .query("SELECT id,tenant,user_id,token_hash,revoked FROM central_devices WHERE deleted_at IS NULL ORDER BY id", &[])
-                .await?;
-            return rows
-                .into_iter()
-                .map(|row| {
-                    Ok(serde_json::to_vec(&vault::Device {
-                        id: row.get(0),
-                        tenant: row.get(1),
-                        user: row.get(2),
-                        token_hash: row.get(3),
-                        revoked: row.get(4),
-                    })?)
-                })
-                .collect();
-        }
         bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
@@ -1261,27 +1277,6 @@ impl PostgresStore {
                             oidc_identity: row.get(3),
                         })?,
                         row.get(4),
-                    ))
-                })
-                .collect();
-        }
-        if name == "devices" {
-            let rows = client
-                .query("SELECT id,tenant,user_id,token_hash,revoked,revision FROM central_devices WHERE deleted_at IS NULL ORDER BY id", &[])
-                .await?;
-            return rows
-                .into_iter()
-                .map(|row| {
-                    Ok((
-                        row.get(0),
-                        serde_json::to_vec(&vault::Device {
-                            id: row.get(0),
-                            tenant: row.get(1),
-                            user: row.get(2),
-                            token_hash: row.get(3),
-                            revoked: row.get(4),
-                        })?,
-                        row.get(5),
                     ))
                 })
                 .collect();
@@ -1350,7 +1345,7 @@ impl PostgresStore {
         name: &str,
         entries: &[(String, Vec<u8>)],
     ) -> Result<()> {
-        if name == "users" || name == "devices" {
+        if name == "users" {
             for (id, payload) in entries {
                 let inserted = self
                     .save_registry_entity_cas(name, id, payload, None)
@@ -1387,23 +1382,37 @@ impl PostgresStore {
             };
             return Ok(changed == 1);
         }
-        if name == "devices" {
-            let device: vault::Device = serde_json::from_slice(payload)?;
-            let client = self.client().await?;
-            let changed = match expected_revision {
-                None => client.execute(
-                    "INSERT INTO central_devices(id,tenant,user_id,token_hash,revoked,revision) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT(id) DO NOTHING",
-                    &[&device.id, &device.tenant, &device.user, &device.token_hash, &device.revoked],
-                ).await?,
-                Some(revision) => client.execute(
-                    "UPDATE central_devices SET tenant=$2,user_id=$3,token_hash=$4,revoked=$5,revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$6 AND deleted_at IS NULL",
-                    &[&device.id, &device.tenant, &device.user, &device.token_hash, &device.revoked, &revision],
-                ).await?,
-            };
-            return Ok(changed == 1);
-        }
         let _ = (entity_id, payload, expected_revision);
         bail!("unsupported registry entity kind: {name}; use typed entities")
+    }
+
+    async fn save_device_entity_cas(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+        payload: &[u8],
+        expected_revision: Option<i64>,
+    ) -> Result<bool> {
+        let device: vault::Device = serde_json::from_slice(payload)?;
+        if device.id != entity_id || device.tenant != tenant {
+            bail!("device entity tenant or id does not match the scoped operation");
+        }
+        let client = self.client().await?;
+        let changed = match expected_revision {
+            None => client
+                .execute(
+                    "INSERT INTO central_devices(id,tenant,user_id,token_hash,revoked,revision) VALUES($2,$1,$3,$4,$5,0) ON CONFLICT(id) DO NOTHING",
+                    &[&tenant, &device.id, &device.user, &device.token_hash, &device.revoked],
+                )
+                .await?,
+            Some(revision) => client
+                .execute(
+                    "UPDATE central_devices SET user_id=$3,token_hash=$4,revoked=$5,revision=revision+1,updated_at=now() WHERE tenant=$1 AND id=$2 AND revision=$6 AND deleted_at IS NULL",
+                    &[&tenant, &device.id, &device.user, &device.token_hash, &device.revoked, &revision],
+                )
+                .await?,
+        };
+        Ok(changed == 1)
     }
 
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
@@ -1847,14 +1856,47 @@ mod tests {
         };
         let device_bytes = serde_json::to_vec(&device).unwrap();
         first
-            .save_registry_entities("devices", &[(registry_id.clone(), device_bytes.clone())])
+            .save_device_entity_cas("sawmills", &registry_id, &device_bytes, None)
             .await
             .unwrap();
         let seen = second
-            .load_registry_entity_revisions("devices")
+            .load_device_entity_revisions("sawmills")
             .await
             .unwrap();
         assert!(seen.iter().any(|(id, _, _)| id == &registry_id));
+        let other_registry_id = format!("other-{}", vault::digest(id.as_bytes()));
+        let other_device = vault::Device {
+            id: other_registry_id.clone(),
+            tenant: "other-tenant".into(),
+            user: "other-user".into(),
+            token_hash: vault::digest(b"other-device-token"),
+            revoked: false,
+        };
+        first
+            .save_device_entity_cas(
+                "other-tenant",
+                &other_registry_id,
+                &serde_json::to_vec(&other_device).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            second
+                .load_device_entity_revisions("sawmills")
+                .await
+                .unwrap()
+                .iter()
+                .all(|(device_id, _, _)| device_id != &other_registry_id)
+        );
+        assert!(
+            second
+                .load_device_entity_revisions("other-tenant")
+                .await
+                .unwrap()
+                .iter()
+                .any(|(device_id, _, _)| device_id == &other_registry_id)
+        );
         first
             .create_enrollment(&id, b"once", Duration::from_secs(60))
             .await
@@ -1889,6 +1931,13 @@ mod tests {
                 .unwrap();
             client
                 .execute("DELETE FROM central_devices WHERE id=$1", &[&registry_id])
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "DELETE FROM central_devices WHERE id=$1",
+                    &[&other_registry_id],
+                )
                 .await
                 .unwrap();
             client

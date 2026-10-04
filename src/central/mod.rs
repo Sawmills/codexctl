@@ -21,21 +21,18 @@ pub use client::run_client;
 pub use server::serve;
 
 /// Revoke a device in the shared registry with a per-entity CAS revision.
-pub async fn revoke_central(state: &Path, key: &Path, id: &str) -> Result<()> {
+pub async fn revoke_central(state: &Path, key: &Path, tenant: &str, id: &str) -> Result<()> {
+    store::validate_alias(tenant)?;
+    store::validate_alias(id)?;
     let central = storage::runtime_store(state, key).await?;
-    let rows = central.load_registry_entity_revisions("devices").await?;
-    let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id) else {
+    let Some((_, payload, revision)) = central.load_device_entity_revision(tenant, id).await?
+    else {
         bail!("device not found");
     };
-    let mut device: vault::Device = serde_json::from_slice(payload)?;
+    let mut device: vault::Device = serde_json::from_slice(&payload)?;
     device.revoked = true;
     if !central
-        .save_registry_entity_cas(
-            "devices",
-            id,
-            &serde_json::to_vec(&device)?,
-            Some(*revision),
-        )
+        .save_device_entity_cas(tenant, id, &serde_json::to_vec(&device)?, Some(revision))
         .await?
     {
         bail!("device changed concurrently; retry");
@@ -55,7 +52,7 @@ pub async fn register_central(
     store::validate_alias(tenant)?;
     store::validate_alias(user)?;
     let central = storage::runtime_store(state, key).await?;
-    let devices = central.load_registry_entity_revisions("devices").await?;
+    let devices = central.load_device_entity_revisions(tenant).await?;
     if devices.iter().any(|(device_id, _, _)| device_id == id) {
         bail!("device already registered");
     }
@@ -69,7 +66,7 @@ pub async fn register_central(
         revoked: false,
     };
     let saved = central
-        .save_registry_entity_cas("devices", id, &serde_json::to_vec(&device)?, None)
+        .save_device_entity_cas(tenant, id, &serde_json::to_vec(&device)?, None)
         .await;
     match saved {
         Ok(true) => Ok(()),
