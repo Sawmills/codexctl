@@ -2,7 +2,7 @@
 use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
-    server::{Owner, TokenFailure, TokenRequest, TokenResponse},
+    server::{Owner, TokenFailure, TokenRequest, TokenResponse, retry_clock_now},
     storage::{CentralStore, CredentialRecord},
     transport,
     vault::{self, Vault},
@@ -269,7 +269,7 @@ fn account_summary(owner: &Owner) -> Account {
         resets_at: windows
             .and_then(|r| r.long_window())
             .and_then(|w| w.reset_timestamp()),
-        available: owner.available && !owner.routing_refused,
+        available: owner.selectable(),
         usage_age_seconds: owner
             .limits_observed
             .as_ref()
@@ -741,18 +741,83 @@ async fn token(
     let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
+        let retry_requested = {
+            let guard = owner_ref.lock().await;
+            guard.retryable_unavailable && !guard.retry_cooldown_active()
+        };
         // Shared-store paths take imports before Owner. File mode keeps this
         // lock off the token path and remains a local, zero-central-cost path.
         let import_guard = if worker
             .central
             .as_ref()
             .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+            || retry_requested
         {
             Some(worker.imports.lock().await)
         } else {
             None
         };
         let mut owner = owner_ref.lock().await;
+        let retry = retry_requested && owner.retryable_unavailable;
+        if retry {
+            let imports = import_guard.as_ref().ok_or_else(|| {
+                worker.error(StatusCode::INTERNAL_SERVER_ERROR, "owner_recovery")
+            })?;
+            if owner.retry_cooldown_active() {
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            }
+            owner.retry_started = Some(retry_clock_now());
+            let recovered = async {
+                if let Some(rpc) = owner.rpc.as_mut() {
+                    if let Err(error) = rpc.settle_and_stop().await {
+                        owner.rpc = None;
+                        if let Err(exit) = previous_owner_exited(&owner.home) {
+                            return Err(RespawnFailure::Retryable(anyhow::anyhow!(
+                                "could not settle owner: {error}; {exit}"
+                            )));
+                        }
+                    } else {
+                        owner.rpc = None;
+                    }
+                } else {
+                    previous_owner_exited(&owner.home).map_err(RespawnFailure::Retryable)?;
+                }
+                owner.snapshot().map_err(RespawnFailure::Permanent)?;
+                let proof = relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
+                    .clear_for_launch(&owner, relogin::AdmissionKind::Restore, imports)
+                    .map_err(RespawnFailure::Permanent)?;
+                proof
+                    .validate(&owner)
+                    .map_err(RespawnFailure::Permanent)?;
+                proof
+                    .validate_home(&owner.home)
+                    .map_err(RespawnFailure::Permanent)?;
+                launch_owner(&mut owner, &worker.binary, proof)
+                    .await
+                    .map_err(RespawnFailure::Retryable)?;
+                Ok::<(), RespawnFailure>(())
+            }
+            .await;
+            if let Err(error) = recovered {
+                match error {
+                    RespawnFailure::Permanent(error) => {
+                        owner.fence(false);
+                        eprintln!("central owner respawn fenced reason=owner_identity_or_persistence detail={error}");
+                    }
+                    RespawnFailure::Retryable(error) => {
+                        owner.retry_failures = owner.retry_failures.saturating_add(1);
+                        if owner.retry_failures >= 3 {
+                            owner.fence(false);
+                        } else {
+                            owner.retryable_unavailable = true;
+                        }
+                        eprintln!("central owner respawn failed reason=owner_refresh_failed detail={error}");
+                    }
+                }
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            }
+            owner.available = true;
+        }
         // A retry cannot take over recovery, even after the child stops: the
         // final credentials may still be waiting for a durable shared write.
         if worker.central.is_some() && !owner.available && owner.routing_refused {
@@ -933,7 +998,28 @@ async fn token(
                 })?;
             }
             retain_lease = false;
-            let token = token_result.map_err(|error| worker.owner_failure(error))?;
+            let token = match token_result {
+                Ok(token) => {
+                    if retry {
+                        owner.retry_failures = 0;
+                        owner.retry_started = None;
+                        owner.retryable_unavailable = false;
+                        owner.available = true;
+                    }
+                    token
+                }
+                Err(error) => {
+                    if retry && owner.retryable_unavailable {
+                        owner.retry_failures = owner.retry_failures.saturating_add(1);
+                        if owner.retry_failures >= 3 {
+                            owner.fence(false);
+                        } else {
+                            owner.retry_started = Some(retry_clock_now());
+                        }
+                    }
+                    return Err(worker.owner_failure(error));
+                }
+            };
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
         }
         .await;
@@ -1004,6 +1090,12 @@ async fn token(
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
+
+enum RespawnFailure {
+    Permanent(anyhow::Error),
+    Retryable(anyhow::Error),
+}
+
 async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
     let Some(usage) = token.statusline_usage.as_ref() else {
         return;
@@ -1105,7 +1197,7 @@ pub(super) async fn account_catalog(
             // Renewal or a token request may have changed the credential while
             // the independent usage request was in flight. Do not publish its evidence.
             let current = owner.lock().await;
-            summary.available = current.available && !current.routing_refused;
+            summary.available = current.selectable();
             if vault::digest(current.vault.auth.to_string().as_bytes()) != revision {
                 summary.usage_stale = true;
                 summary.usage_error = Some("credentials_changed".into());
@@ -1305,6 +1397,12 @@ impl Broker {
                     != api::token_subject(vault::token(&input.auth).unwrap_or(""))
                 || matches!((&original_uid, &incoming_uid), (Some(a), Some(b)) if a != b)
             {
+                return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
+            }
+            if owner.retryable_unavailable {
+                owner.available = false;
+                owner.retry_started = Some(u64::MAX);
+                owner.routing_refused = true;
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
             if owner.vault.verified && owner.available && !admission.quarantine_repair {
@@ -1788,6 +1886,9 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         state: state.into(),
         key: key.into(),
         available: true,
+        retryable_unavailable: false,
+        retry_started: None,
+        retry_failures: 0,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
@@ -1968,6 +2069,9 @@ pub async fn serve(
                     state: entry.path(),
                     key: key.into(),
                     available: false,
+                    retryable_unavailable: false,
+                    retry_started: None,
+                    retry_failures: 0,
                     routing_refused: false,
                     refresh_enabled: false,
                     limits: None,

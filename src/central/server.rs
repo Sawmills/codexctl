@@ -17,7 +17,8 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::Instant,
 };
 use tokio::sync::Mutex;
 
@@ -86,6 +87,17 @@ pub(super) enum TokenFailure {
     Unavailable(anyhow::Error),
 }
 
+pub(super) fn retry_clock_now() -> u64 {
+    if let Ok(path) = std::env::var("CENTRAL_TEST_RETRY_CLOCK")
+        && let Ok(value) = std::fs::read_to_string(path)
+        && let Ok(milliseconds) = value.trim().parse()
+    {
+        return milliseconds;
+    }
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 impl From<anyhow::Error> for TokenFailure {
     fn from(error: anyhow::Error) -> Self {
         if error.is::<RoutingPolicyError>() {
@@ -103,11 +115,33 @@ pub(super) struct Owner {
     pub(super) state: PathBuf,
     pub(super) key: PathBuf,
     pub(super) available: bool,
+    pub(super) retryable_unavailable: bool,
+    pub(super) retry_started: Option<u64>,
+    pub(super) retry_failures: u8,
     pub(super) routing_refused: bool,
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
+}
+
+impl Owner {
+    pub(super) fn retry_cooldown_active(&self) -> bool {
+        self.retry_started
+            .is_some_and(|started| retry_clock_now().saturating_sub(started) < 60_000)
+    }
+    pub(super) fn selectable(&self) -> bool {
+        (self.available || (self.retryable_unavailable && !self.retry_cooldown_active()))
+            && !self.routing_refused
+    }
+    pub(super) fn fence(&mut self, retryable: bool) {
+        self.available = false;
+        self.retryable_unavailable = retryable;
+        if !retryable {
+            self.retry_started = None;
+            self.retry_failures = 0;
+        }
+    }
 }
 
 pub(super) fn validate_owned_identity(original_auth: &Value, auth: &Value) -> Result<()> {
@@ -203,10 +237,16 @@ impl Owner {
     ) -> Result<TokenResponse, TokenFailure> {
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
-                "credential owner unavailable; restart after diagnosis"
+                "credential owner unavailable"
             )));
         }
-        let current = self.snapshot()?;
+        let current = match self.snapshot() {
+            Ok(current) => current,
+            Err(error) => {
+                self.fence(false);
+                return Err(error.into());
+            }
+        };
         if request
             .account_id
             .as_ref()
@@ -245,7 +285,7 @@ impl Owner {
             .as_ref()
             .is_err_and(|error| !error.is::<RoutingPolicyError>())
         {
-            self.available = false;
+            self.fence(false);
         }
         if force
             && !self.vault.verified
@@ -256,7 +296,7 @@ impl Owner {
         }
         let snapshot = self.snapshot();
         if snapshot.is_err() {
-            self.available = false;
+            self.fence(false);
         }
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
@@ -288,11 +328,23 @@ impl Owner {
                     .await;
                 let observed_at = std::time::Instant::now();
                 let snapshot = self.snapshot();
-                if result.is_err() || snapshot.is_err() {
-                    self.available = false;
+                if snapshot.is_err() {
+                    self.fence(false);
                 }
-                let limits = result?;
+                if result.is_err() {
+                    if snapshot.is_ok() {
+                        self.fence(
+                            self.vault.verified
+                                && self.refresh_enabled
+                                && result.as_ref().is_err_and(|error| {
+                                    error.is::<super::rpc::RetryableUsageRead>()
+                                }),
+                        );
+                    }
+                    eprintln!("central owner refresh failed reason=owner_refresh_failed");
+                }
                 token = snapshot?;
+                let limits = result?;
                 token.billing_class = Some(billing_class(&limits));
                 token.chatgpt_plan_type = limits
                     .pointer("/rateLimits/planType")
@@ -314,7 +366,7 @@ impl Owner {
                 .is_err_and(|error| !error.is::<RoutingPolicyError>())
                 || snapshot.is_err()
             {
-                self.available = false;
+                self.fence(false);
             }
             let mut current = snapshot?;
             if result
@@ -603,6 +655,9 @@ pub async fn serve(
         state: state.into(),
         key: key.into(),
         available: true,
+        retryable_unavailable: false,
+        retry_started: None,
+        retry_failures: 0,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,

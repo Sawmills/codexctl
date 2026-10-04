@@ -49,6 +49,15 @@ pub struct Rpc {
     pending: VecDeque<Value>,
 }
 
+#[derive(Debug)]
+pub(super) struct RetryableUsageRead;
+impl std::fmt::Display for RetryableUsageRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("app-server usage read rejected")
+    }
+}
+impl std::error::Error for RetryableUsageRead {}
+
 impl Rpc {
     pub(super) fn completion_pending(&self) -> bool {
         self.outstanding.is_some()
@@ -333,6 +342,13 @@ impl Rpc {
                             )
                         {
                             return Err(RoutingPolicyError.into());
+                        }
+                        if method == "account/rateLimits/read"
+                            && response.pointer("/error/code").and_then(Value::as_i64)
+                                == Some(-32000)
+                            && response.pointer("/error/data/retryable") == Some(&json!(true))
+                        {
+                            return Err(RetryableUsageRead.into());
                         }
                         bail!("app-server rejected {method}");
                     }

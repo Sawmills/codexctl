@@ -144,7 +144,7 @@ async fn account_snapshot(
     let pending = relogin::renewal_pending(&current.state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "account_unavailable"))?;
     let routing_refused = current.routing_refused;
-    let available = current.available && !routing_refused;
+    let available = current.selectable();
     drop(current);
     let expiry = if changed {
         None

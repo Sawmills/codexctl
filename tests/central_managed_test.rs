@@ -129,6 +129,8 @@ impl Server {
         .unwrap();
         store::atomic_write(&root.path().join("mode"), b"").unwrap();
         store::atomic_write(&root.path().join("count"), b"0").unwrap();
+        store::atomic_write(&root.path().join("retry-clock"), b"0").unwrap();
+        store::atomic_write(&root.path().join("launch-count"), b"0").unwrap();
         let (child, url) = Self::spawn(&root);
         let amir = std::fs::read_to_string(root.path().join("amir.token")).unwrap();
         let alex = std::fs::read_to_string(root.path().join("alex.token")).unwrap();
@@ -183,6 +185,11 @@ impl Server {
             .env("no_proxy", "127.0.0.1,localhost")
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
+            .env("CENTRAL_TEST_RETRY_CLOCK", root.path().join("retry-clock"))
+            .env(
+                "CENTRAL_TEST_LAUNCH_COUNTER",
+                root.path().join("launch-count"),
+            )
             .env("CENTRAL_TEST_KEY_FILE", root.path().join("key"))
             .env("CENTRAL_TEST_OWNER_CWD_FILE", root.path().join("owner-cwd"))
             .stdout(Stdio::piped())
@@ -2192,6 +2199,191 @@ fn when_a_saved_import_failed_to_start_then_retry_reconciles_it() {
     assert_eq!(response.status(), 200);
     assert_eq!(server.accounts(&server.amir)[0]["accountId"], "amir-seat");
 }
+
+#[test]
+fn retryable_billing_failure_replaces_rpc_and_keeps_catalog_selectable() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    let response = server.token(&server.amir, "personal", None);
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-once").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2
+    );
+}
+
+#[test]
+fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"0").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    let launches = || {
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    assert_eq!(launches(), 2);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 2);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 3);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 4);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn an_unmarked_billing_rejection_is_permanent_without_respawn() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-permanent-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
+        "1"
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn retryable_owner_cannot_lift_a_relogin_fence() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let id = "d".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn retry_snapshot_identity_failure_stays_fenced_after_journal_repair() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let journal = account.join("runtime/auth.json");
+    let saved = std::fs::read(&journal).unwrap();
+    store::atomic_write(
+        &journal,
+        &serde_json::to_vec(&auth("different-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&journal, &saved).unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn failed_respawn_is_retried_with_a_real_launch_attempt() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"respawn-launch-fail-once",
+    )
+    .unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let recovered = server.token(&server.amir, "personal", None);
+    assert_eq!(recovered.status(), 200);
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 3
+    );
+}
+
 fn retry_import(server: &Server) -> reqwest::blocking::Response {
     retry_import_for(server, &server.amir, "personal", "amir-login", "amir-seat")
 }
@@ -6275,7 +6467,11 @@ fn connected_status_json_keeps_unavailable_accounts() {
     let server = Server::start();
     server.import(&server.amir, "personal", "server-login", "server-seat");
     let home = server.connected_home();
-    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"routing-policy-wrong-code",
+    )
+    .unwrap();
 
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let output = server.cli(home.path(), &["status", "--json"]);

@@ -16,6 +16,9 @@ pub(in crate::central) fn promote(
         state: state.into(),
         key: key.into(),
         available: false,
+        retryable_unavailable: false,
+        retry_started: None,
+        retry_failures: 0,
         routing_refused: false,
         refresh_enabled: true,
         limits: None,
@@ -58,7 +61,7 @@ pub(in crate::central) async fn verify_replacement(
     }
     let result = verify_inner(owner, binary, lock).await;
     if let Err(error) = result {
-        owner.available = false;
+        owner.fence(false);
         let reconciled = finish_rejection(owner).await;
         let mut record = current(&owner.state)?.context("missing login operation")?;
         record.error.get_or_insert_with(|| "relogin_failed".into());
@@ -294,6 +297,9 @@ fn finish_verified(state: &Path, key: &Path, record: &mut Record) -> Result<bool
         state: state.into(),
         key: key.into(),
         available: false,
+        retryable_unavailable: false,
+        retry_started: None,
+        retry_failures: 0,
         routing_refused: false,
         refresh_enabled: false,
         limits: None,

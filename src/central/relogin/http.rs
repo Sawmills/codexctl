@@ -193,7 +193,7 @@ async fn start_owned(
             .await
             .is_err()
         {
-            original.available = false;
+            original.fence(false);
             finish_rejection(&mut original)
                 .await
                 .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
@@ -273,7 +273,7 @@ async fn start_owned(
     };
     publish(&state, &record)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-    original.available = false;
+    original.fence(false);
     drop(original);
     let flag = Arc::new(AtomicBool::new(false));
     broker
@@ -293,7 +293,7 @@ async fn start_owned(
         if let Err(error) = result {
             let _import = worker.imports.lock().await;
             let _ = error; // Never log native output or credential data.
-            owner.lock().await.available = false;
+            owner.lock().await.fence(false);
             match load(&state, &record.id) {
                 Ok(durable) => {
                     record = durable;
