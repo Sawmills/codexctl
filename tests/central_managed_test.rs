@@ -1156,7 +1156,7 @@ fn connected_status_formats_server_reset() {
 
     assert!(output.status.success());
     assert!(
-        stdout.contains("Resets") && stdout.contains("in ") && stdout.contains(&date),
+        stdout.contains("Window resets") && stdout.contains("in ") && stdout.contains(&date),
         "{stdout}"
     );
 }
