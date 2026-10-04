@@ -366,13 +366,15 @@ contain `account`, `weekly_used_percent`, `responses_ok`, `responses_429`, `rate
 429s (zero without responses); unknown weekly usage is null.
 
 When live process inspection is unavailable, JSON also contains a `warnings` array;
-launch ownership and log counts remain available. An empty warnings array is omitted.
+launch ownership and log counts remain available. In text mode, warnings go to stderr
+and the table includes an `Owned PIDs` column. An empty warnings array is omitted.
 
 `owned_pids` is an array such as `[{"pid":123,"source":"launch"}]`, sorted by PID.
 On Linux and macOS it reports live processes independently of the response window:
 
 - `launch`: a live `codexctl codex --account` launcher owns the direct child and
-  native Codex descendants. Its private `lanes/launch-*/owner.json` records the
+  native Codex descendants. If `ps` is unavailable, Linux procfs supplies the same
+  Codex child rows. Its private `lanes/launch-*/owner.json` records the
   launcher PID and process incarnation; both that identity and the held owner lock
   must still be valid. Older launches without this metadata can use log evidence.
 - `host-default`: an unpinned Codex process in this home uses the host's active

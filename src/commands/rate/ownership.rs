@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum Source {
     Launch,
@@ -23,6 +23,7 @@ pub(super) struct Snapshot {
     pub warnings: Vec<String>,
 }
 
+#[cfg(not(target_os = "linux"))]
 fn launch_only(launchers: &BTreeMap<u32, String>) -> Vec<LiveProcess> {
     launchers
         .iter()
@@ -208,19 +209,32 @@ fn fallback_processes(
         let Some(parent) = fields.get(1).and_then(|value| value.parse::<u32>().ok()) else {
             continue;
         };
-        let Some(started_at) = fields.get(19).and_then(|value| value.parse::<i64>().ok()) else {
+        let Some(start_ticks) = fields.get(19).and_then(|value| value.parse::<u64>().ok()) else {
             continue;
         };
-        let codex = std::fs::read_link(format!("/proc/{pid}/exe"))
+        let Some(started_at) = proc_start_epoch(start_ticks) else {
+            continue;
+        };
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .and_then(|path| {
                 path.file_name()
                     .map(|name| name == "codex" || name == "codex-app-server")
             })
             .unwrap_or(false);
+        let argv_codex = std::fs::read(format!("/proc/{pid}/cmdline"))
+            .ok()
+            .is_some_and(|bytes| {
+                bytes.split(|byte| *byte == 0).any(|arg| {
+                    std::path::Path::new(String::from_utf8_lossy(arg).as_ref())
+                        .file_name()
+                        .is_some_and(|name| name == "codex" || name == "codex-app-server")
+                })
+            });
+        let codex = executable || argv_codex;
         processes.insert(pid, (parent, started_at, codex));
     }
-    let mut result = launch_only(launchers);
+    let mut result = Vec::new();
     for (&pid, &(parent, started_at, codex)) in &processes {
         let mut ancestor = parent;
         let mut visited = BTreeSet::new();
@@ -235,7 +249,15 @@ fn fallback_processes(
             };
             ancestor = next;
         }
-        if alias.is_none() && codex && process_home(pid, home).is_some_and(|default| default) {
+        if let Some(alias) = alias {
+            if codex {
+                result.push(LiveProcess {
+                    pid,
+                    started_at,
+                    account: Some((alias, Source::Launch)),
+                });
+            }
+        } else if codex && process_home(pid, home).is_some_and(|default| default) {
             result.push(LiveProcess {
                 pid,
                 started_at,
@@ -244,6 +266,19 @@ fn fallback_processes(
         }
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn proc_start_epoch(start_ticks: u64) -> Option<i64> {
+    let btime = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse::<i64>()
+        .ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    (hz > 0).then(|| btime.checked_add(i64::try_from(start_ticks / hz as u64).ok()?))?
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -331,5 +366,23 @@ pub(super) fn snapshot(_host_account: Option<&str>) -> Snapshot {
     Snapshot {
         processes: Vec::new(),
         warnings: Vec::new(),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    #[test]
+    fn proc_starttime_is_converted_from_boot_ticks_to_unix_seconds() {
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks: u64 = fields[19].parse().unwrap();
+        let epoch = super::proc_start_epoch(ticks).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(epoch > now - 86_400 && epoch <= now);
     }
 }

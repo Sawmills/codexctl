@@ -85,6 +85,9 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+        }
         println!("window {} min, host {}", report.window_minutes, report.host);
         let mut table = Table::new();
         table.load_preset(UTF8_FULL_CONDENSED).set_header([
@@ -95,6 +98,7 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
             "429 rate",
             "Processes",
             "PIDs",
+            "Owned PIDs",
         ]);
         for row in report.accounts {
             table.add_row([
@@ -108,6 +112,11 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
                 row.pids
                     .iter()
                     .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                row.owned_pids
+                    .iter()
+                    .map(|owned| format!("{} ({:?})", owned.pid, owned.source))
                     .collect::<Vec<_>>()
                     .join(", "),
             ]);
@@ -319,6 +328,7 @@ fn collect_report(
             row.responses_429 as f64 / responses as f64
         };
         row.processes = row.process_ids.len();
+        row.owned_pids.sort_by_key(|owned| owned.pid);
     }
     rows.sort_by(|a, b| a.account.cmp(&b.account));
     Ok(Report {

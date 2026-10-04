@@ -7979,6 +7979,11 @@ fn b21d_rate_keeps_live_launch_and_host_ownership_without_responses() {
     assert_eq!(owned.len(), 2);
     assert!(owned.contains(&json!({"pid":lane.child_pid,"source":"launch"})));
     assert!(owned.contains(&json!({"pid":plain.0.id(),"source":"host-default"})));
+    let pids: Vec<_> = owned
+        .iter()
+        .map(|row| row["pid"].as_u64().unwrap())
+        .collect();
+    assert!(pids.windows(2).all(|pair| pair[0] <= pair[1]));
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
 
     // A crash leaves the child and directory alive, but the ownership is stale.
@@ -8109,12 +8114,6 @@ fn b21d_rate_warns_and_keeps_launch_ownership_when_ps_is_unavailable() {
     server.import(&server.amir, "lane", "lane-login", "lane-seat");
     let home = server.connected_home();
     let mut lane = B21Lane::start(home.path(), "ps-missing-ready");
-    let owner_pid = serde_json::from_slice::<Value>(
-        &std::fs::read(lane.connection.with_file_name("owner.json")).unwrap(),
-    )
-    .unwrap()["pid"]
-        .as_u64()
-        .unwrap();
     let bin = home.path().join("broken-bin");
     std::fs::create_dir(&bin).unwrap();
     store::atomic_write(
@@ -8153,7 +8152,20 @@ exit 127
         .unwrap();
     assert_eq!(
         lane_row["owned_pids"],
-        json!([{"pid":owner_pid,"source":"launch"}])
+        json!([{"pid":lane.child_pid,"source":"launch"}])
     );
+    let text = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["rate"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    assert!(String::from_utf8_lossy(&text.stderr).contains("warning:"));
+    assert!(String::from_utf8_lossy(&text.stdout).contains("Owned PIDs"));
+    assert!(String::from_utf8_lossy(&text.stdout).contains(&lane.child_pid.to_string()));
     lane.signal_and_wait(libc::SIGTERM);
 }

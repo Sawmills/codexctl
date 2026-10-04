@@ -1,4 +1,4 @@
-//! Identity of the exact process that owns durable local state.
+//! Identity of the exact process that writes the persistent credential journal.
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -57,15 +57,13 @@ fn incarnation(pid: u32) -> Result<Option<String>> {
     {
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "lstart="])
-            .env("LC_ALL", "C")
-            .env("TZ", "UTC")
             .output()?;
-        if !output.status.success() {
-            bail!("cannot identify process incarnation");
-        }
         let start = String::from_utf8(output.stdout)?.trim().to_owned();
         if start.is_empty() {
             return Ok(None);
+        }
+        if !output.status.success() {
+            bail!("cannot identify credential owner");
         }
         Ok(Some(start))
     }
@@ -151,6 +149,20 @@ mod tests {
         let alive = process.alive().unwrap();
         assert!(!alive);
     }
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn an_incarnation_persisted_by_the_previous_format_stays_live() {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &std::process::id().to_string(), "-o", "lstart="])
+            .output()
+            .unwrap();
+        let process = Process {
+            pid: std::process::id(),
+            incarnation: String::from_utf8(output.stdout).unwrap().trim().to_owned(),
+        };
+        assert!(process.alive().unwrap());
+    }
+
     #[test]
     fn when_the_actual_owner_still_exists_then_restart_refuses_it() {
         let process = Process::capture(std::process::id()).unwrap();
