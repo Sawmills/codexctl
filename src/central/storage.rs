@@ -326,6 +326,22 @@ impl CentralStore {
         }
     }
 
+    pub async fn load_device_entity_revision(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+    ) -> Result<Option<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => {
+                bounded_db(db.load_device_entity_revision(tenant, entity_id)).await
+            }
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.load_device_entity_revision(tenant, entity_id)).await
+            }
+        }
+    }
+
     /// Atomically upsert each registry entity in one SQL statement. This keeps
     /// a stale pod from replacing the shared users/devices set with its local
     /// snapshot and gives every entity its own revision.
@@ -1299,6 +1315,34 @@ impl PostgresStore {
                 ))
             })
             .collect()
+    }
+
+    async fn load_device_entity_revision(
+        &self,
+        tenant: &str,
+        entity_id: &str,
+    ) -> Result<Option<(String, Vec<u8>, i64)>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT id,tenant,user_id,token_hash,revoked,revision FROM central_devices WHERE tenant=$1 AND id=$2 AND deleted_at IS NULL",
+                &[&tenant, &entity_id],
+            )
+            .await?;
+        row.map(|row| {
+            Ok((
+                row.get(0),
+                serde_json::to_vec(&vault::Device {
+                    id: row.get(0),
+                    tenant: row.get(1),
+                    user: row.get(2),
+                    token_hash: row.get(3),
+                    revoked: row.get(4),
+                })?,
+                row.get(5),
+            ))
+        })
+        .transpose()
     }
 
     async fn save_registry_entities(

@@ -840,6 +840,7 @@ async fn token(
             _ => None,
         };
         let mut retain_lease = false;
+        let mut reconcile_record = None;
         let result = async {
             let prior_auth = owner.vault.auth.clone();
             let token_result = owner.tokens(request).await;
@@ -892,7 +893,13 @@ async fn token(
                                 eprintln!("central fenced write retry: {error:#}");
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
-                            Err(_error) => {
+                            Err(error) => {
+                                retain_lease = true;
+                                reconcile_record = Some(record.clone());
+                                owner.available = false;
+                                owner.routing_refused = true;
+                                owner.refresh_enabled = false;
+                                eprintln!("central fenced write deferred: {error:#}");
                                 return Err(worker
                                     .error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
                             }
@@ -937,6 +944,7 @@ async fn token(
                 let renew_done = settled.clone();
                 let renew_central = central.clone();
                 let renew_lease = lease.clone();
+                let pending_record = reconcile_record;
                 tokio::spawn(async move {
                     while !renew_done.load(Ordering::Acquire) {
                         if !renew_central
@@ -969,6 +977,20 @@ async fn token(
                             }
                         };
                         if stopped {
+                            if let Some(record) = pending_record.as_ref() {
+                                match central.fenced_write(&lease, record).await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        continue;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("central fenced write reconciliation: {error:#}");
+                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                        continue;
+                                    }
+                                }
+                            }
                             settled.store(true, Ordering::Release);
                             let _ = central.release_lease(&lease).await;
                             break;
@@ -1576,15 +1598,12 @@ async fn revoke_device(
         .as_ref()
         .filter(|central| central.mode() != super::storage::StoreMode::File)
     {
-        let mut rows = central
-            .load_device_entity_revisions(&current.tenant)
+        let (_, payload, revision) = central
+            .load_device_entity_revision(&current.tenant, &input.id)
             .await
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-        let (_, payload, revision) = rows
-            .iter_mut()
-            .find(|(id, _, _)| id == &input.id)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
             .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
-        let mut device: vault::Device = serde_json::from_slice(payload)
+        let mut device: vault::Device = serde_json::from_slice(&payload)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
         if device.user != current.user {
             return Err(broker.error(StatusCode::NOT_FOUND, "device_not_found"));
@@ -1597,7 +1616,7 @@ async fn revoke_device(
                 &serde_json::to_vec(&device).map_err(|_| {
                     broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?,
-                Some(*revision),
+                Some(revision),
             )
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
