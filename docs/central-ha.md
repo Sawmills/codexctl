@@ -173,22 +173,62 @@ or row counts do not match the reviewed plan.
          containers:
            - name: migrate
              image: codexctl-central:staging # replace with the reviewed image digest
-             command: [codexctl-central, migrate, --state, /data/state, --key-file, /keys/vault-key]
+             command:
+               [
+                 codexctl-central,
+                 migrate,
+                 --state,
+                 /data/state,
+                 --key-file,
+                 /keys/vault-key,
+               ]
              env:
-               - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
-               - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
-               - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
-               - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
-               - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
-               - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
+               - { name: CODEXCTL_CENTRAL_STORE, value: postgres }
+               - {
+                   name: DB_HOST,
+                   valueFrom:
+                     {
+                       secretKeyRef:
+                         { name: codexctl-postgres, key: db-hostname },
+                     },
+                 }
+               - {
+                   name: DB_PORT,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-port },
+                     },
+                 }
+               - {
+                   name: DB_NAME,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-name },
+                     },
+                 }
+               - {
+                   name: DB_USER,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-user },
+                     },
+                 }
+               - {
+                   name: DB_PASSWORD,
+                   valueFrom:
+                     {
+                       secretKeyRef:
+                         { name: codexctl-postgres, key: db-password },
+                     },
+                 }
              volumeMounts:
-               - {name: state, mountPath: /data}
-               - {name: keys, mountPath: /keys, readOnly: true}
+               - { name: state, mountPath: /data }
+               - { name: keys, mountPath: /keys, readOnly: true }
          volumes:
            - name: state
-             persistentVolumeClaim: {claimName: state-codexctl-0}
+             persistentVolumeClaim: { claimName: state-codexctl-0 }
            - name: keys
-             secret: {secretName: codexctl-secrets}
+             secret: { secretName: codexctl-secrets }
    ```
 
    Apply the reviewed Job, wait for completion, and repeat the manifest with
