@@ -6,6 +6,12 @@ rust-version = "1.89"
 description = "Manage multiple OpenAI Codex CLI accounts"
 license = "Apache-2.0"
 
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
+
 [features]
 default = ["central-prototype"]
 central-prototype = [
