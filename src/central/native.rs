@@ -146,7 +146,15 @@ fn render_parent_cmd(args: &[String]) -> String {
             }
         }
     }
-    rendered.join(" ").chars().take(200).collect()
+    // Keep only the executable token. The remaining parent argv is open-ended
+    // shell input and cannot be made secret-safe with a finite denylist.
+    rendered
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect()
 }
 
 fn parent_cmd() -> String {
@@ -571,8 +579,19 @@ fn remove_pointer_then_marker_audited(
     marker: &Path,
     cause: PointerCause,
 ) -> Result<()> {
+    let previous = read_optional_file(pointer)?;
     remove_active_pointer_audited(pointer, cause)?;
-    std::fs::remove_file(marker).context("failed to remove prepared remote activation")?;
+    if let Err(error) =
+        std::fs::remove_file(marker).context("failed to remove prepared remote activation")
+    {
+        let rollback = restore_active_pointer(pointer, previous.as_deref());
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error.context(format!(
+                "deactivation pointer rollback failed: {rollback_error:#}"
+            ))),
+        };
+    }
     Ok(())
 }
 pub fn require_local_mode() -> Result<()> {
@@ -1614,8 +1633,8 @@ mod tests {
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
         billing_switch_prompt, remove_active_pointer_audited, remove_active_pointer_with,
-        remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
-        rollback_or_context, save_connection, validate_token_account,
+        remove_pointer_then_marker_audited, remove_pointer_then_marker_with, render_parent_cmd,
+        restore_active_pointer, rollback_or_context, save_connection, validate_token_account,
         write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
@@ -1843,7 +1862,7 @@ mod tests {
             "x".repeat(300),
         ];
         let rendered = render_parent_cmd(&args);
-        assert!(rendered.contains("<redacted>"));
+        assert_eq!(rendered, "codexctl");
         assert!(!rendered.contains("access-secret"));
         assert!(!rendered.contains("authorization-secret"));
         assert!(!rendered.contains("another-secret"));
@@ -1860,8 +1879,25 @@ mod tests {
                 .to_owned(),
         ];
         let rendered = render_parent_cmd(&args);
+        assert_eq!(rendered, "bash");
         assert!(!rendered.contains("script-secret"));
         assert!(!rendered.contains("script-token"));
+    }
+
+    #[test]
+    fn deactivation_restores_pointer_when_marker_removal_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let pointer = root.path().join(".active-account");
+        let marker = root.path().join(".native-active.json");
+        fs::write(&pointer, b"remote\n").unwrap();
+        fs::create_dir(&marker).unwrap();
+
+        let error = remove_pointer_then_marker_audited(&pointer, &marker, PointerCause::Deactivate)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("prepared remote activation"));
+        assert_eq!(fs::read(pointer).unwrap(), b"remote\n");
+        assert!(marker.is_dir());
     }
 
     fn test_connection(root: &std::path::Path) -> Connection {
