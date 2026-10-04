@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: codexctl
+  namespace: codexctl
+spec:
+  template:
+    metadata:
+      annotations:
+        codexctl.sawmills.ai/restarted-at: "2026-10-04T14:00Z"

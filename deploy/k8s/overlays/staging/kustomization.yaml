@@ -11,3 +11,5 @@ images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
     digest: sha256:78774ed363301d264fe8770016707c97b1c0d0f2e7585016fbbb2e80cee064e2
+patches:
+  - path: codexctl-restart-patch.yaml
