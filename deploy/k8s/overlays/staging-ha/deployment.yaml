@@ -141,7 +141,13 @@ spec:
             { httpGet: { path: /health, port: http }, periodSeconds: 10 }
           lifecycle:
             preStop:
-              exec: { command: [sh, -ec, "kill -TERM 1; sleep 5"] }
+              exec:
+                command:
+                  - sh
+                  - -ec
+                  - |
+                    kill -TERM 1
+                    sleep 5
           securityContext:
             {
               allowPrivilegeEscalation: false,
