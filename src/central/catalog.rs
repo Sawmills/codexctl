@@ -101,11 +101,9 @@ impl Reader {
                         .is_some_and(reqwest::Error::is_timeout)
                 }) {
                     "timeout"
-                } else if error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<reqwest::Error>()
-                        .is_some_and(|request| request.status().is_some())
-                }) {
+                } else if error.is::<crate::api::AuthExpired>()
+                    || error.to_string().contains("API returned")
+                {
                     "http_status"
                 } else {
                     "client"

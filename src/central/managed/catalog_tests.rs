@@ -54,14 +54,15 @@ impl Fixture {
         let release = Arc::new(Semaphore::new(0));
         let app = Router::new().route("/usage", get({
             let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
-            move || {
+            move |headers: HeaderMap| {
                 let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
                     started.add_permits(1);
                     if hold.load(Ordering::SeqCst) { release.acquire().await.unwrap().forget(); }
                     if fail.load(Ordering::SeqCst) { return StatusCode::BAD_GATEWAY.into_response(); }
-                    Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                    if headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()) != Some("account") { return StatusCode::BAD_REQUEST.into_response(); }
+                    Json(json!({"plan_type":"promax","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":100,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}})).into_response()
                 }
             }
         }));
@@ -147,6 +148,32 @@ async fn list(broker: Broker, headers: HeaderMap) -> Value {
         .await
         .unwrap();
     serde_json::from_slice::<Value>(&body).unwrap()[0].clone()
+}
+
+#[tokio::test]
+async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    let usage = fixture
+        .broker
+        .catalog
+        .fetch_direct("token", "account")
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            usage.rate_limit.as_ref().unwrap().allowed,
+            usage.billing_class()
+        ),
+        (Some(true), api::BillingClass::RateLimited)
+    );
+    fixture.fail.store(true, Ordering::SeqCst);
+    let failure = fixture
+        .broker
+        .catalog
+        .fetch_direct("token", "account")
+        .await;
+    assert!(matches!(failure, Err("http_status")));
+    assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
 #[tokio::test]
