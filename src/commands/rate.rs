@@ -61,19 +61,31 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
     let since = now.timestamp() - i64::from(minutes) * 60;
     let resets: Vec<_> = accounts
         .iter()
-        .filter_map(|a| {
-            // A declared non-weekly long window must not masquerade as a weekly reset.
-            if a.secondary_window_seconds
-                .is_some_and(|seconds| seconds != 604800)
-            {
-                return None;
-            }
-            let reset = DateTime::parse_from_rfc3339(a.secondary_resets_at.as_deref()?).ok()?;
-            Some((reset.timestamp(), a))
+        .flat_map(|a| {
+            let primary = a
+                .primary_window_seconds
+                .filter(|seconds| *seconds > 0)
+                .and(a.primary_resets_at.as_deref());
+            // Preserve the legacy weekly fallback, but never guess a short
+            // window when status does not declare its duration.
+            let weekly = a.secondary_resets_at.as_deref().filter(|_| {
+                a.secondary_window_seconds
+                    .is_none_or(|seconds| seconds == 604800)
+            });
+            [
+                (primary, a.primary_window_seconds),
+                (weekly, a.secondary_window_seconds),
+            ]
+            .into_iter()
+            .filter_map(move |(reset, seconds)| {
+                let reset = DateTime::parse_from_rfc3339(reset?).ok()?;
+                Some((reset.timestamp(), seconds, a))
+            })
         })
         .collect();
     let status_pattern = Regex::new(r"/codex/responses status=(\d{3})\b")?;
     let reset_pattern = Regex::new(r#""x-codex-primary-reset-at"\s*:\s*"(\d+)""#)?;
+    let window_pattern = Regex::new(r#""x-codex-primary-window-minutes"\s*:\s*"(\d+)""#)?;
     let mut current: HashMap<String, Option<&AccountStatus>> = HashMap::new();
     // None is a separate key: an account literally called "unattributed" cannot
     // absorb traffic for which we have no evidence.
@@ -97,15 +109,29 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
             continue;
         };
         let has_header = body.contains("\"x-codex-primary-reset-at\"");
+        let has_window = body.contains("\"x-codex-primary-window-minutes\"");
+        let window = window_pattern
+            .captures(&body)
+            .and_then(|c| c[1].parse::<u64>().ok())
+            .and_then(|minutes| minutes.checked_mul(60))
+            .filter(|seconds| *seconds > 0);
         let observed = reset_pattern
             .captures(&body)
             .and_then(|c| c[1].parse::<i64>().ok())
             .and_then(|reset| {
-                let mut matches = resets
-                    .iter()
-                    .filter(|(candidate, _)| candidate.abs_diff(reset) <= 120);
+                if has_window && window.is_none() {
+                    return None;
+                }
+                let mut matches = resets.iter().filter(|(candidate, seconds, _)| {
+                    candidate.abs_diff(reset) <= 120
+                        && window.is_none_or(|window| *seconds == Some(window))
+                });
                 let first = matches.next()?;
-                matches.next().is_none().then_some(first.1)
+                // Both windows of one account can reset together. Ambiguity is
+                // between accounts, not between that account's own windows.
+                matches
+                    .all(|(_, _, account)| account.alias == first.2.alias)
+                    .then_some(first.2)
             });
         if has_header && let Some(process) = process.as_ref().filter(|p| !p.is_empty()) {
             // Unknown/malformed/ambiguous evidence clears a previous assignment.

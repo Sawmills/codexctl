@@ -7686,3 +7686,71 @@ fn b21_signal_reaps_child_even_when_cleanup_fails() {
         "failed cleanup left a usable approval"
     );
 }
+
+#[test]
+fn b21b_rate_attributes_declared_five_hour_and_weekly_windows() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"rate-distinct-reset").unwrap();
+    server.import(&server.amir, "standard", "standard-login", "standard-seat");
+    let home = server.connected_home();
+    let status = server.cli(home.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["accounts"][0]["primary_window_seconds"], 18000);
+    assert_eq!(status["accounts"][0]["secondary_window_seconds"], 604800);
+    let database = home.path().join(".codex/logs_2.sqlite");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(database).unwrap();
+    db.execute_batch("CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)")
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for (process, body) in [
+        (
+            "pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102440000", "x-codex-primary-window-minutes": "300"}"#,
+        ),
+        (
+            "pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "/codex/responses status=429",
+        ),
+        (
+            "pid:302:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800", "x-codex-primary-window-minutes": "10080"}"#,
+        ),
+        // The reset matches the short window but the declared duration does not.
+        (
+            "pid:303:cccccccc-cccc-cccc-cccc-cccccccccccc",
+            r#"/codex/responses status=429 headers={"x-codex-primary-reset-at": "4102440000", "x-codex-primary-window-minutes": "10080"}"#,
+        ),
+        // Missing duration can use a known reset; a malformed duration cannot.
+        (
+            "pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102440000"}"#,
+        ),
+        (
+            "pid:303:cccccccc-cccc-cccc-cccc-cccccccccccc",
+            r#"/codex/responses status=429 headers={"x-codex-primary-reset-at": "4102440000", "x-codex-primary-window-minutes": "invalid"}"#,
+        ),
+    ] {
+        db.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3)",
+            rusqlite::params![now, process, body],
+        )
+        .unwrap();
+    }
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["accounts"],
+        json!([
+            {"account":".unattributed", "weekly_used_percent":null, "responses_ok":0,
+             "responses_429":2, "rate_429":1.0, "processes":1, "pids":[303]},
+            {"account":"standard", "weekly_used_percent":37.0, "responses_ok":3,
+             "responses_429":1, "rate_429":0.25, "processes":2, "pids":[301,302]}
+        ])
+    );
+}
