@@ -768,12 +768,15 @@ impl NativeClient {
             .unwrap()
     }
     fn connect(&self) {
+        self.connect_alias("remote");
+    }
+    fn connect_alias(&self, alias: &str) {
         let output = self.run(
             env!("CARGO_BIN_EXE_codexctl-central"),
             &[
                 "connect",
                 "--alias",
-                "remote",
+                alias,
                 "--server",
                 &self.broker.url,
                 "--token-file",
@@ -1750,6 +1753,7 @@ fn server_switch_config_write_failure_keeps_the_previous_pointer() {
     use std::os::unix::fs::PermissionsExt;
     let client = NativeClient::with_plan(Some("self_serve_business_usage_based"));
     client.connect();
+    client.connect_alias("other");
     let first = client.run(
         env!("CARGO_BIN_EXE_codexctl"),
         &["use", "remote", "--allow-billing"],
@@ -1760,7 +1764,7 @@ fn server_switch_config_write_failure_keeps_the_previous_pointer() {
         String::from_utf8_lossy(&first.stderr)
     );
 
-    let connection_path = client.home.join(".codexctl/central/remote.json");
+    let connection_path = client.home.join(".codexctl/central/other.json");
     let mut connection: Value =
         serde_json::from_slice(&std::fs::read(&connection_path).unwrap()).unwrap();
     connection["allow_billing"] = Value::Bool(false);
@@ -1776,7 +1780,7 @@ fn server_switch_config_write_failure_keeps_the_previous_pointer() {
 
     let failed = client.run(
         env!("CARGO_BIN_EXE_codexctl"),
-        &["use", "remote", "--allow-billing"],
+        &["use", "other", "--allow-billing"],
     );
 
     std::fs::set_permissions(&readonly, std::fs::Permissions::from_mode(0o700)).unwrap();

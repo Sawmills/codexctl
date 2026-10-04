@@ -73,7 +73,7 @@ pub(super) fn run(home: &Path, action: SessionProviderAction) -> Result<()> {
         let open = if home.join("sessions").try_exists()?
             || home.join("archived_sessions").try_exists()?
         {
-            open_files()?
+            open_files(&home)?
         } else {
             HashSet::new()
         };
@@ -355,7 +355,7 @@ fn repair(
     temp.as_file().sync_all()?;
     // Include every process, including this CLI's parent. Close our own input
     // before asking the OS, then recheck the inode and timestamps before rename.
-    if is_open(path)? {
+    if is_open(path, home)? {
         summary.open += 1;
         println!("skipped-open {}", path.display());
         return Ok(());
@@ -402,7 +402,7 @@ fn save_backup(path: &Path, line: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
+fn lsof(args: &[&std::ffi::OsStr], home: &Path) -> Result<std::process::Output> {
     let mut command = Command::new("lsof");
     command.arg("-nP");
     #[cfg(target_os = "linux")]
@@ -433,7 +433,7 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
         if line.is_empty() {
             return false;
         }
-        if harmless_lsof_warning(line) {
+        if harmless_lsof_warning(line, home) {
             after_warning = true;
             return false;
         }
@@ -447,22 +447,152 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
     }
     Ok(output)
 }
-fn harmless_lsof_warning(line: &[u8]) -> bool {
+fn harmless_lsof_warning(line: &[u8], home: &Path) -> bool {
     let line = String::from_utf8_lossy(line);
     line.contains("WARNING: can't stat() nsfs file system /run/docker/netns/")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/tracing")
+        || (line.contains("WARNING: can't stat() overlay file system /var/lib/docker/")
+            && overlay_warning_is_unrelated(&line, home))
 }
-fn is_open(path: &Path) -> Result<bool> {
-    let output = lsof(&["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()])?;
+#[cfg(target_os = "linux")]
+fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
+    // Docker's nested overlay mounts are safe to ignore only when mountinfo
+    // proves the selected Codex home is outside the affected mount. If mount
+    // information is unavailable or the home is inside it, fail closed.
+    let Some(warning_path) = line
+        .split_once("overlay file system ")
+        .and_then(|(_, path)| path.split_whitespace().next())
+        .map(Path::new)
+    else {
+        return false;
+    };
+    if home.starts_with(warning_path) {
+        return false;
+    }
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let mounts = mountinfo
+        .lines()
+        .filter_map(parse_mountinfo)
+        .collect::<Vec<_>>();
+    let Some(warned_mount) =
+        visible_mount(&mounts, warning_path).filter(|mount| mount.filesystem == "overlay")
+    else {
+        // A warning without a matching mount entry is ambiguous. Keep the
+        // inventory fail-closed rather than trusting a pathname alone.
+        return false;
+    };
+    let Some(home_mount) = mounts
+        .iter()
+        .filter(|mount| home.starts_with(&mount.mountpoint))
+        .max_by_key(|mount| mount.mountpoint.components().count())
+        .and_then(|mount| visible_mount(&mounts, &mount.mountpoint))
+    else {
+        return false;
+    };
+    warned_mount.id != home_mount.id
+        && (warned_mount.device != home_mount.device
+            || roots_are_disjoint(&warned_mount.root, &home_mount.root))
+        && !home.starts_with(&warned_mount.mountpoint)
+}
+#[cfg(not(target_os = "linux"))]
+fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
+    false
+}
+#[cfg(target_os = "linux")]
+struct MountInfo {
+    id: u64,
+    parent: u64,
+    device: String,
+    root: String,
+    mountpoint: PathBuf,
+    filesystem: String,
+}
+#[cfg(target_os = "linux")]
+fn parse_mountinfo(line: &str) -> Option<MountInfo> {
+    let (mount, filesystem) = line.split_once(" - ")?;
+    let fields = mount.split_whitespace().collect::<Vec<_>>();
+    Some(MountInfo {
+        id: fields.first()?.parse().ok()?,
+        parent: fields.get(1)?.parse().ok()?,
+        device: fields.get(2)?.to_owned().to_string(),
+        root: unescape_mountinfo(fields.get(3)?),
+        mountpoint: PathBuf::from(unescape_mountinfo(fields.get(4)?)),
+        filesystem: filesystem.split_whitespace().next()?.to_owned(),
+    })
+}
+#[cfg(target_os = "linux")]
+fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a MountInfo> {
+    let candidates = mounts
+        .iter()
+        .filter(|mount| mount.mountpoint == mountpoint)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    let enclosing_parent = mountpoint
+        .parent()
+        .and_then(|parent| {
+            mounts
+                .iter()
+                .filter(|mount| {
+                    mount.mountpoint != *mountpoint && parent.starts_with(&mount.mountpoint)
+                })
+                .max_by_key(|mount| mount.mountpoint.components().count())
+        })
+        .and_then(|mount| visible_mount(mounts, &mount.mountpoint))
+        .map(|mount| mount.id);
+    let mut roots = candidates
+        .iter()
+        .copied()
+        .filter(|mount| enclosing_parent.is_none_or(|parent| mount.parent == parent));
+    let mut visible = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    loop {
+        let mut children = candidates
+            .iter()
+            .copied()
+            .filter(|mount| mount.parent == visible.id);
+        let Some(next) = children.next() else {
+            break;
+        };
+        if children.next().is_some() {
+            return None;
+        }
+        visible = next;
+    }
+    Some(visible)
+}
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+#[cfg(target_os = "linux")]
+fn roots_are_disjoint(left: &str, right: &str) -> bool {
+    let left = Path::new(left);
+    let right = Path::new(right);
+    !left.starts_with(right) && !right.starts_with(left)
+}
+fn is_open(path: &Path, home: &Path) -> Result<bool> {
+    let output = lsof(
+        &["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()],
+        home,
+    )?;
     match (output.status.code(), output.stdout.is_empty()) {
         (Some(0), false) => Ok(true),
         (Some(1), true) => Ok(false),
         _ => bail!("ambiguous OS open-file result; file unchanged"),
     }
 }
-fn open_files() -> Result<HashSet<(u64, u64)>> {
-    let output = lsof(&["-F".as_ref(), "pDi".as_ref()])?;
+fn open_files(home: &Path) -> Result<HashSet<(u64, u64)>> {
+    let output = lsof(&["-F".as_ref(), "pDi".as_ref()], home)?;
     let mut files = HashSet::new();
     let mut device = None;
     for line in output.stdout.split(|&b| b == b'\n') {
@@ -556,4 +686,89 @@ fn restore_backup(
         }
     }
     Ok(found)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::{
+        MountInfo, harmless_lsof_warning, overlay_warning_is_unrelated, parse_mountinfo,
+        roots_are_disjoint, visible_mount,
+    };
+    use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn docker_overlay_warning_is_ignored_outside_the_selected_mount() {
+        let Some(mount) = fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .filter_map(parse_mountinfo)
+                    .find(|mount: &MountInfo| {
+                        mount.filesystem == "overlay"
+                            && mount.mountpoint.starts_with("/var/lib/docker/")
+                    })
+            })
+        else {
+            return;
+        };
+        let line = format!(
+            "lsof: WARNING: can't stat() overlay file system {}",
+            mount.mountpoint.display()
+        );
+        assert!(overlay_warning_is_unrelated(
+            &line,
+            Path::new("/tmp/codexctl-home")
+        ));
+        assert!(harmless_lsof_warning(
+            line.as_bytes(),
+            Path::new("/tmp/codexctl-home")
+        ));
+    }
+
+    #[test]
+    fn docker_overlay_warning_covering_the_home_is_not_ignored() {
+        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
+        assert!(!overlay_warning_is_unrelated(
+            std::str::from_utf8(line).unwrap(),
+            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
+        ));
+        assert!(!harmless_lsof_warning(
+            line,
+            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
+        ));
+    }
+
+    #[test]
+    fn same_device_bind_alias_roots_are_not_assumed_disjoint() {
+        assert!(!roots_are_disjoint("/", "/workspace"));
+        assert!(!roots_are_disjoint("/workspace", "/workspace/codex"));
+        assert!(roots_are_disjoint("/workspace", "/other"));
+    }
+
+    #[test]
+    fn stacked_mounts_choose_the_visible_entry() {
+        let mounts = [
+            parse_mountinfo("1 0 8:1 / / rw - ext4 /dev/root rw").unwrap(),
+            parse_mountinfo("2 1 8:1 / /var rw - ext4 /dev/root rw").unwrap(),
+            parse_mountinfo("3 2 8:1 / /var/lib/docker rw - ext4 /dev/root rw").unwrap(),
+            parse_mountinfo("4 3 0:2 / /var/lib/docker rw - tmpfs tmpfs rw").unwrap(),
+            parse_mountinfo("5 4 0:1 / /var/lib/docker/rootfs rw - overlay overlay rw").unwrap(),
+            parse_mountinfo("6 5 0:2 / /var/lib/docker/rootfs rw - tmpfs tmpfs rw").unwrap(),
+        ];
+        assert_eq!(
+            visible_mount(&mounts, Path::new("/var/lib/docker/rootfs"))
+                .unwrap()
+                .id,
+            6
+        );
+    }
+
+    #[test]
+    fn mountinfo_decodes_newline_path_escapes() {
+        let mount =
+            parse_mountinfo("1 0 8:1 / /var/lib/docker/new\\012line rw - overlay overlay rw")
+                .unwrap();
+        assert_eq!(mount.mountpoint, Path::new("/var/lib/docker/new\nline"));
+    }
 }

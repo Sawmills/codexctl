@@ -418,10 +418,45 @@ fn lsof_warnings_are_suppressed_with_w_flag() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
+fn docker_lsof_filesystem_warnings_are_ignored() {
+    let f = Fixture::new();
+    let Some(overlay) = std::fs::read_to_string("/proc/self/mountinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let (mount, filesystem) = line.split_once(" - ")?;
+                if filesystem.split_whitespace().next()? != "overlay" {
+                    return None;
+                }
+                let path = mount.split_whitespace().nth(4)?;
+                path.starts_with("/var/lib/docker/")
+                    .then(|| path.to_owned())
+            })
+        })
+    else {
+        return;
+    };
+    let script = format!(
+        "echo \"lsof: WARNING: can't stat() overlay file system {overlay}\" >&2\necho \"      Output information may be incomplete.\" >&2\necho \"lsof: WARNING: can't stat() nsfs file system /run/docker/netns/test\" >&2\necho \"      Output information may be incomplete.\" >&2\nexit 1"
+    );
+    let result = f.run_with_lsof(&script);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(&f.rollout).unwrap(),
+        [migrated().as_bytes(), TAIL].concat()
+    );
+}
+
+#[test]
 fn unknown_lsof_filesystem_warning_refuses_to_modify_rollouts() {
     let f = Fixture::new();
     let result = f.run_with_lsof(
-        "echo \"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test\" >&2\necho \"      Output information may be incomplete.\" >&2\nexit 1",
+        "echo \"lsof: WARNING: can't stat() overlay file system /var/lib/other/test\" >&2\necho \"      Output information may be incomplete.\" >&2\nexit 1",
     );
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("OS open-file check failed"));
