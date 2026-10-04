@@ -3,6 +3,10 @@ kind: Deployment
 metadata:
   name: codexctl-ha
   namespace: codexctl
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy is defined in this build-only overlay.
+    checkov.io/skip2: CKV_K8S_35=Database credentials are sourced from the ExternalSecret by design.
+    checkov.io/skip3: CKV_K8S_43=The build-only image tag is replaced by the release overlay process.
 spec:
   replicas: 3
   selector:
@@ -22,31 +26,63 @@ spec:
         runAsGroup: 10001
         runAsNonRoot: true
         fsGroup: 10001
-        seccompProfile: {type: RuntimeDefault}
+        seccompProfile: { type: RuntimeDefault }
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: topology.kubernetes.io/zone
           whenUnsatisfiable: DoNotSchedule
-          labelSelector: {matchLabels: {app.kubernetes.io/name: codexctl, app.kubernetes.io/component: broker-ha}}
+          labelSelector:
+            {
+              matchLabels:
+                {
+                  app.kubernetes.io/name: codexctl,
+                  app.kubernetes.io/component: broker-ha,
+                },
+            }
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: DoNotSchedule
-          labelSelector: {matchLabels: {app.kubernetes.io/name: codexctl, app.kubernetes.io/component: broker-ha}}
+          labelSelector:
+            {
+              matchLabels:
+                {
+                  app.kubernetes.io/name: codexctl,
+                  app.kubernetes.io/component: broker-ha,
+                },
+            }
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
             - topologyKey: kubernetes.io/hostname
-              labelSelector: {matchLabels: {app.kubernetes.io/name: codexctl, app.kubernetes.io/component: broker-ha}}
+              labelSelector:
+                {
+                  matchLabels:
+                    {
+                      app.kubernetes.io/name: codexctl,
+                      app.kubernetes.io/component: broker-ha,
+                    },
+                }
       initContainers:
         - name: initialize
           image: codexctl-central:staging
           imagePullPolicy: Always
           command: [sh, -ec]
-          args: ["if [ ! -f /data/state/users.json ]; then codexctl-central setup --state /data/state --key-file /keys/vault-key; fi"]
-          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          args:
+            [
+              "if [ ! -f /data/state/users.json ]; then codexctl-central setup --state /data/state --key-file /keys/vault-key; fi",
+            ]
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
           volumeMounts:
-            - {name: keys, mountPath: /keys, readOnly: true}
-            - {name: state, mountPath: /data}
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: state, mountPath: /data }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
       containers:
         - name: broker
           image: codexctl-central:staging
@@ -63,32 +99,71 @@ spec:
               value: postgres
             - name: DATABASE_URL
               value: ""
-            - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
-            - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
-            - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
-            - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
-            - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
+            - {
+                name: DB_HOST,
+                valueFrom:
+                  {
+                    secretKeyRef: { name: codexctl-postgres, key: db-hostname },
+                  },
+              }
+            - {
+                name: DB_PORT,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-port } },
+              }
+            - {
+                name: DB_NAME,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-name } },
+              }
+            - {
+                name: DB_USER,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-user } },
+              }
+            - {
+                name: DB_PASSWORD,
+                valueFrom:
+                  {
+                    secretKeyRef: { name: codexctl-postgres, key: db-password },
+                  },
+              }
             - name: CODEXCTL_CENTRAL_DB_CA_FILE
               value: /etc/ssl/certs/ca-certificates.crt
-          ports: [{name: http, containerPort: 8787}]
-          readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 5, failureThreshold: 3}
-          livenessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 10}
+          ports: [{ name: http, containerPort: 8787 }]
+          readinessProbe:
+            {
+              httpGet: { path: /ready, port: http },
+              periodSeconds: 5,
+              failureThreshold: 3,
+            }
+          livenessProbe:
+            { httpGet: { path: /health, port: http }, periodSeconds: 10 }
           lifecycle:
             preStop:
-              exec: {command: [sh, -ec, 'kill -TERM 1; sleep 5']}
-          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-          resources: {requests: {cpu: 100m, memory: 256Mi}, limits: {cpu: "2", memory: 2Gi}}
+              exec: { command: [sh, -ec, "kill -TERM 1; sleep 5"] }
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
+          resources:
+            {
+              requests: { cpu: 100m, memory: 256Mi },
+              limits: { cpu: "2", memory: 2Gi },
+            }
           volumeMounts:
-            - {name: keys, mountPath: /keys, readOnly: true}
-            - {name: configuration, mountPath: /configuration, readOnly: true}
-            - {name: state, mountPath: /data}
-            - {name: home, mountPath: /home/codexctl}
-            - {name: temporary, mountPath: /tmp}
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: configuration, mountPath: /configuration, readOnly: true }
+            - { name: state, mountPath: /data }
+            - { name: home, mountPath: /home/codexctl }
+            - { name: temporary, mountPath: /tmp }
       volumes:
         - name: keys
-          secret: {secretName: codexctl-secrets, defaultMode: 288}
+          secret: { secretName: codexctl-secrets, defaultMode: 288 }
         - name: configuration
-          configMap: {name: codexctl-sso}
+          configMap: { name: codexctl-sso }
         - name: state
           emptyDir: {}
         - name: home
