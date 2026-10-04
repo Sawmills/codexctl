@@ -77,6 +77,13 @@ enum Commands {
         #[arg(long, conflicts_with = "rate_limited")]
         usage_based: bool,
     },
+    /// Read per-account response and 429 counts from this host's Codex logs
+    Rate {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u32).range(1..=525600))]
+        minutes: u32,
+    },
     /// Print cached active-account usage for prompts. Silent on unavailable data.
     Statusline,
     /// Log into a local Codex account or renew an existing server account
@@ -176,12 +183,15 @@ enum Commands {
     },
     /// Show current active account
     Whoami,
-    /// Run Codex with automatic spend-cap account recovery
+    /// Run Codex with recovery, or pin one session to a server account
     Codex {
+        /// Pin this launch to one server account without switching other sessions.
+        #[arg(long, conflicts_with = "allow_resets")]
+        account: Option<String>,
         /// Prompt sent when the wrapper resumes after switching profiles
         #[arg(long, default_value = commands::codex::DEFAULT_RECOVERY_PROMPT)]
         recovery_prompt: String,
-        /// Allow recovery to switch to a credit-billing account without
+        /// Allow a pinned launch or recovery to use a credit-billing account without
         /// prompting (use for unattended runs; it may spend credits)
         #[arg(long)]
         allow_billing: bool,
@@ -237,6 +247,7 @@ fn main() {
     }
     let result = match cli.command {
         Commands::Statusline => Ok(()),
+        Commands::Rate { json, minutes } => commands::rate::run(json, minutes),
         #[cfg(feature = "central-prototype")]
         Commands::Connect {
             server,
@@ -347,11 +358,13 @@ fn main() {
         Commands::Remove { ref alias } => commands::remove::run(alias),
         Commands::Whoami => commands::whoami::run(),
         Commands::Codex {
+            ref account,
             ref args,
             ref recovery_prompt,
             allow_billing,
             allow_resets,
         } => codex_command_outcome(commands::codex::run(
+            account.as_deref(),
             args,
             recovery_prompt,
             allow_billing,

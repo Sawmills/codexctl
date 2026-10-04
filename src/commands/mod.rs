@@ -7,6 +7,7 @@ pub mod exec;
 pub mod label;
 pub mod list;
 pub mod login;
+pub mod rate;
 pub mod remove;
 pub mod resets;
 pub mod save;

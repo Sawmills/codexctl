@@ -12,6 +12,10 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
+mod launch;
+pub use launch::run_pinned_codex;
+pub(super) use launch::sweep_stale_launches;
+
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
 const BILLING_SWITCH_NOTICE: &str = "ALL running Codex sessions on this machine will also move to this account within 60 seconds and may bill credits.";
@@ -33,6 +37,8 @@ struct Connection {
     revision: String,
     #[serde(default)]
     allow_billing: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    launch_pinned: bool,
     #[serde(default)]
     approved_billing_plan: Option<String>,
     #[serde(default)]
@@ -241,6 +247,15 @@ fn run_child_with_lease(
     guard: &std::fs::File,
     command: &mut std::process::Command,
 ) -> Result<std::process::ExitStatus> {
+    spawn_child_with_lease(guard, command)?
+        .wait()
+        .context("Codex process failed to wait")
+}
+
+fn spawn_child_with_lease(
+    guard: &std::fs::File,
+    command: &mut std::process::Command,
+) -> Result<std::process::Child> {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
     let fd = guard.as_raw_fd();
     // The child retains the mode lease if its launcher dies.
@@ -253,7 +268,7 @@ fn run_child_with_lease(
             Ok(())
         });
     }
-    command.status().context("Codex process failed to run")
+    command.spawn().context("Codex process failed to run")
 }
 
 /// Launch the active server account without restoring a resumed thread's old provider.
@@ -383,6 +398,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         account_id: String::new(),
         revision: String::new(),
         allow_billing: false,
+        launch_pinned: false,
         approved_billing_plan: None,
         approved_billing_class: None,
     };
@@ -465,6 +481,13 @@ fn finish_token(
 ) -> Result<()> {
     let alias = connection_alias(path, connection);
     validate_token_account(&token.access_token, &connection.account_id)?;
+    let _launch = connection
+        .launch_pinned
+        .then(|| launch::lock_live_launch(path))
+        .transpose()?;
+    if connection.launch_pinned {
+        launch::require_headroom(&alias, &token)?;
+    }
     let mut latest = read_connection(path)?;
     if let Some(expected) = expected_active
         && read_active_alias()?.as_str() != expected
@@ -499,14 +522,21 @@ fn finish_token(
     Ok(())
 }
 pub fn print_token(path: &Path) -> Result<()> {
-    if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
-        bail!("remote credentials cannot be supplied to a pinned local launch");
-    }
     let directory = path.parent().context("missing connection directory")?;
     let connection = {
         let _lock = native_lock(directory)?;
         read_connection(path)?
     };
+    if let Some(alias) = std::env::var_os("CODEXCTL_PINNED_ALIAS")
+        && (!connection.launch_pinned
+            || connection.alias.as_deref() != alias.to_str()
+            || std::env::var_os("CODEX_HOME").is_some())
+    {
+        bail!("remote credentials cannot be supplied to this pinned launch");
+    }
+    if connection.launch_pinned {
+        launch::require_live_launch(path)?;
+    }
     let token = fetch(&connection, true)?;
     let _lock = native_lock(directory)?;
     finish_token(path, &connection, token, None)
@@ -966,6 +996,7 @@ pub(super) fn sync_account(
             account_id: account.account_id.clone(),
             revision: String::new(),
             allow_billing: false,
+            launch_pinned: false,
             approved_billing_plan: None,
             approved_billing_class: None,
         },

@@ -7185,3 +7185,504 @@ fn dashboard_identity_and_sign_out_are_scoped_to_the_browser_session() {
         200
     );
 }
+
+// B21's public CLI seams; these regressions are prepared before B17 merges.
+#[test]
+fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let config = home.path().join(".codex/config.toml");
+    let marker = home.path().join(".codexctl/central/.native-active.json");
+    let pointer = home.path().join(".codexctl/central/.active-account");
+    let before_config = std::fs::read(&config).unwrap();
+    let before_marker = std::fs::read(&marker).unwrap();
+    let before_pointer = std::fs::read(&pointer).ok();
+    let auth_file = home.path().join(".codex/auth.json");
+    let before_auth = std::fs::read(&auth_file).ok();
+    let bin = home.path().join("bin");
+    let cwd = home.path().join("project");
+    std::fs::create_dir(&cwd).unwrap();
+    let capture = home.path().join("child.json");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import base64, json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+connection = None
+helper_command = None
+for arg in args:
+    command_prefix = 'model_providers.codexctl-central.auth.command='
+    if arg.startswith(command_prefix):
+        helper_command = json.loads(arg[len(command_prefix):])
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+        if '--connection' in helper:
+            saved = json.loads(pathlib.Path(helper[helper.index('--connection') + 1]).read_text())
+            connection = {'alias': saved.get('alias'), 'account_id': saved['account_id']}
+token = subprocess.run([helper_command] + helper, capture_output=True, text=True)
+assert token.returncode == 0, token.stderr
+payload = token.stdout.strip().split('.')[1]
+claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat'
+active = subprocess.run([helper_command, 'central-token', '--active'], capture_output=True)
+assert active.returncode == 1
+pathlib.Path(os.environ['B21_MODE']).write_text('exhausted-weekly')
+exhausted = subprocess.run([helper_command] + helper, capture_output=True, text=True)
+assert exhausted.returncode == 1 and 'exhausted' in exhausted.stderr, exhausted.stderr
+pathlib.Path(os.environ['B21_MODE']).write_text('normal')
+pathlib.Path(os.environ['B21_CAPTURE']).write_text(json.dumps({'args': args, 'cwd': os.getcwd(), 'connection': connection}))
+sys.exit(23)
+"##).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let search_path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for args in [
+        vec!["resume", "old-session", "--", "keep this prompt"],
+        vec!["new prompt"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["codex", "--account", "lane"])
+            .args(&args)
+            .env("HOME", home.path())
+            .env("PATH", &search_path)
+            .env("B21_CAPTURE", &capture)
+            .env("B21_MODE", server.root.path().join("mode"))
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(23),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let child: Value = serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(
+            child["connection"],
+            json!({"alias":"lane", "account_id":"lane-seat"})
+        );
+        let argv: Vec<&str> = child["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(argv.ends_with(&args));
+        assert!(!argv.contains(&"--account"));
+        assert!(argv.contains(&"model_provider=\"codexctl-central\""));
+        assert!(!argv.iter().any(|a| a.contains("ChatGPT-Account-ID")));
+        assert_eq!(child["cwd"], cwd.canonicalize().unwrap().to_str().unwrap());
+        assert_eq!(std::fs::read(&config).unwrap(), before_config);
+        assert_eq!(std::fs::read(&marker).unwrap(), before_marker);
+        assert_eq!(std::fs::read(&pointer).ok(), before_pointer);
+        assert_eq!(std::fs::read(&auth_file).ok(), before_auth);
+    }
+}
+
+#[test]
+fn b21_rate_reads_a_fixture_database_without_writing_it_or_inventing_token_rates() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"rate-distinct-reset").unwrap();
+    server.import(
+        &server.amir,
+        "unattributed",
+        "personal-login",
+        "personal-seat",
+    );
+    let home = server.connected_home();
+    let status = server.cli(home.path(), &["status", "--json"]);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_ne!(
+        status["accounts"][0]["primary_resets_at"],
+        status["accounts"][0]["secondary_resets_at"]
+    );
+    let database = home.path().join(".codex/logs_2.sqlite");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let fixture = Command::new("python3").args(["-c", r#"
+import sqlite3, sys, time
+now = int(time.time())
+db = sqlite3.connect(sys.argv[1])
+db.execute('CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)')
+db.executemany('INSERT INTO logs VALUES (?, ?, ?)', [
+    (now-2000, 'pid:300:00000000-0000-0000-0000-000000000000', '/codex/responses status=429'),
+    (now-15, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}'),
+    (now-10, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=429'),
+    (now-8, 'pid:302:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', '/codex/responses status=429'),
+    (now-7, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/codex/responses status=500'),
+    (now-5, 'pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '/other/endpoint status=200'),
+])
+db.commit()
+db.close()
+"#]).arg(&database).output().unwrap();
+    assert!(fixture.status.success());
+    let before = std::fs::read(&database).unwrap();
+    let output = server.cli(home.path(), &["rate", "--json", "--minutes", "10"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report.as_object().unwrap().len(), 4);
+    assert_eq!(report["window_minutes"], 10);
+    assert!(!report["host"].as_str().unwrap().is_empty());
+    assert!(chrono::DateTime::parse_from_rfc3339(report["generated_at"].as_str().unwrap()).is_ok());
+    let rows = report["accounts"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["account"] == "unattributed")
+            .unwrap(),
+        &json!({
+            "account":"unattributed", "weekly_used_percent":37.0, "responses_ok":1,
+            "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]
+        })
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["account"] == ".unattributed")
+            .unwrap(),
+        &json!({
+            "account":".unattributed", "weekly_used_percent":null, "responses_ok":0,
+            "responses_429":1, "rate_429":1.0, "processes":1, "pids":[302]
+        })
+    );
+    assert_eq!(std::fs::read(&database).unwrap(), before);
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.active-account")
+            .exists()
+    );
+}
+
+#[test]
+fn b21_lane_account_scopes_billing_consent_and_refuses_exhaustion() {
+    use std::os::unix::fs::PermissionsExt;
+    for (mode, plan, allow_billing, message) in [
+        ("open-spend-cap", "business", false, "--allow-billing"),
+        ("open-spend-cap", "business", true, ""),
+        ("exhausted-weekly", "pro", false, "exhausted"),
+        ("exhausted-weekly", "pro", true, "exhausted"),
+    ] {
+        let server = Server::start();
+        server.import(&server.amir, "host", "host-login", "host-seat");
+        let home = server.connected_home();
+        assert!(server.cli(home.path(), &["use", "host"]).status.success());
+        let mut selected_auth = auth("lane-login", "lane-seat");
+        let access = selected_auth["tokens"]["access_token"].as_str().unwrap();
+        let mut claims: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(access.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        claims["https://api.openai.com/auth"]["chatgpt_plan_type"] = json!(plan);
+        selected_auth["tokens"]["access_token"] = json!(format!(
+            "header.{}.",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+        let imported = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"lane", "auth":selected_auth}))
+            .send()
+            .unwrap();
+        assert_eq!(imported.status(), 200);
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let config = home.path().join(".codex/config.toml");
+        let before = std::fs::read(&config).unwrap();
+        let bin = home.path().join("bin");
+        let capture = home.path().join("child-launched");
+        store::atomic_write(
+            &bin.join("codex"),
+            b"#!/bin/sh\ntouch \"$B21_CAPTURE\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let search_path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        command.args(["codex", "--account", "lane"]);
+        if allow_billing {
+            command.arg("--allow-billing");
+        }
+        let output = command
+            .arg("a prompt")
+            .env("HOME", home.path())
+            .env("PATH", search_path)
+            .env("B21_CAPTURE", &capture)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if message.is_empty() { 0 } else { 1 }),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains(message));
+        assert_eq!(capture.exists(), message.is_empty());
+        assert!(!home.path().join(".codexctl/central/lane.json").exists());
+        if message.is_empty() {
+            let unapproved = server.cli(home.path(), &["codex", "--account", "lane", "a prompt"]);
+            assert_eq!(unapproved.status.code(), Some(1));
+            assert!(String::from_utf8_lossy(&unapproved.stderr).contains("--allow-billing"));
+        }
+        assert_eq!(std::fs::read(&config).unwrap(), before);
+    }
+}
+
+#[test]
+fn b21_rate_reads_wal_and_keeps_ambiguous_or_missing_process_evidence_unattributed() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "first", "first-login", "first-seat");
+    server.import(&server.amir, "second", "second-login", "second-seat");
+    let home = server.connected_home();
+    let database = home.path().join(".codex/logs_2.sqlite");
+    std::fs::create_dir_all(database.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT);",
+    )
+    .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    for (process, body) in [
+        (
+            Some("pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "/codex/responses status=200 headers={\"x-codex-primary-reset-at\": \"4102444800\"}",
+        ),
+        (
+            Some("pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            "/codex/responses status=429",
+        ),
+        (
+            Some("pid:301:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            "/codex/responses status=429",
+        ),
+        (None, "/codex/responses status=429"),
+        (Some("unknown-format"), "/codex/responses status=201"),
+    ] {
+        db.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3)",
+            rusqlite::params![now, process, body],
+        )
+        .unwrap();
+    }
+    let output = server.cli(home.path(), &["rate", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["accounts"],
+        json!([{
+            "account":".unattributed", "weekly_used_percent":null,
+            "responses_ok":2, "responses_429":3, "rate_429":0.6,
+            "processes":3, "pids":[301]
+        }])
+    );
+    // Keep the writer open until after the command so the response rows are in WAL.
+    drop(db);
+}
+
+struct B21Lane {
+    launcher: std::process::Child,
+    child_pid: i32,
+    connection: std::path::PathBuf,
+}
+
+impl B21Lane {
+    fn start(home: &std::path::Path, name: &str) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        store::atomic_write(&bin.join("codex"), br#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+for arg in sys.argv:
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+        path = helper[helper.index('--connection') + 1]
+pathlib.Path(os.environ['B21_READY']).write_text(json.dumps({'pid': os.getpid(), 'connection': path}))
+while True: time.sleep(0.1)
+"#).unwrap();
+        std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let ready = home.join(name);
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["codex", "--account", "lane", "--allow-billing", "a prompt"])
+            .env("HOME", home)
+            .env("PATH", path)
+            .env("B21_READY", &ready)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let data: Value = loop {
+            if let Ok(bytes) = std::fs::read(&ready)
+                && let Ok(data) = serde_json::from_slice(&bytes)
+            {
+                break data;
+            }
+            assert!(
+                launcher.try_wait().unwrap().is_none(),
+                "launcher exited before child ready"
+            );
+            assert!(std::time::Instant::now() < deadline, "child did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        Self {
+            launcher,
+            child_pid: data["pid"].as_i64().unwrap() as i32,
+            connection: data["connection"].as_str().unwrap().into(),
+        }
+    }
+
+    fn signal_and_wait(&mut self, signal: i32) -> std::process::ExitStatus {
+        assert_eq!(unsafe { libc::kill(self.launcher.id() as i32, signal) }, 0);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.launcher.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "launcher ignored signal"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for B21Lane {
+    fn drop(&mut self) {
+        let _ = self.launcher.kill();
+        let _ = self.launcher.wait();
+        unsafe {
+            libc::kill(self.child_pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[test]
+fn b21_signals_remove_launch_approval_and_reap_the_child() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        let mut lane = B21Lane::start(home.path(), &format!("ready-{signal}"));
+        let status = lane.signal_and_wait(signal);
+        assert!(
+            !lane.connection.parent().unwrap().exists(),
+            "signal left launch approval behind"
+        );
+        assert_eq!(status.code(), Some(128 + signal));
+        assert_ne!(
+            unsafe { libc::kill(lane.child_pid, 0) },
+            0,
+            "child was not reaped"
+        );
+    }
+}
+
+#[test]
+fn b21_launch_and_disconnect_sweep_orphans_but_keep_live_lanes() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let mut orphan = B21Lane::start(home.path(), "orphan");
+    orphan.signal_and_wait(libc::SIGKILL);
+    assert!(orphan.connection.exists());
+    let output = server.cli(
+        home.path(),
+        &[
+            "central-token",
+            "--connection",
+            orphan.connection.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !output.status.success(),
+        "orphaned approval remained usable"
+    );
+    let mut live = B21Lane::start(home.path(), "live");
+    assert!(!orphan.connection.parent().unwrap().exists());
+    let mut second = B21Lane::start(home.path(), "second");
+    assert!(live.connection.exists(), "sweep removed a live lane");
+    second.signal_and_wait(libc::SIGKILL);
+    let disconnected = server.cli(home.path(), &["disconnect"]);
+    assert!(
+        disconnected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disconnected.stderr)
+    );
+    assert!(!second.connection.parent().unwrap().exists());
+    assert!(
+        live.connection.exists(),
+        "disconnect sweep removed a live lane"
+    );
+    live.signal_and_wait(libc::SIGTERM);
+}
+
+#[test]
+fn b21_signal_reaps_child_even_when_cleanup_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let mut lane = B21Lane::start(home.path(), "cleanup-failure");
+    let directory = lane.connection.parent().unwrap().to_owned();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let status = lane.signal_and_wait(libc::SIGTERM);
+    // Restore permissions even when the regression fails, so test cleanup works.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(status.code(), Some(1), "cleanup error must be reported");
+    assert_ne!(
+        unsafe { libc::kill(lane.child_pid, 0) },
+        0,
+        "cleanup error stranded the child"
+    );
+    let helper = server.cli(
+        home.path(),
+        &[
+            "central-token",
+            "--connection",
+            lane.connection.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !helper.status.success(),
+        "failed cleanup left a usable approval"
+    );
+}

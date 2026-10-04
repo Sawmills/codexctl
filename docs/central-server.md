@@ -280,8 +280,8 @@ Live validation covered one login with personal and team seats: a request withou
 returned `ok` for the personal workspace and that workspace's out-of-credits response for the team
 workspace, matching requests with the corresponding header. The token claim therefore scopes Codex
 inference to the selected workspace.
-Running server sessions use the active account pointer when they refresh their helper token.
-After `codexctl use <alias>`, every running session on this machine moves to the selected
+Unpinned server sessions use the active account pointer when they refresh their helper token.
+After `codexctl use <alias>`, every unpinned running session on this machine moves to the selected
 account within 60 seconds. If that account can bill credits, all of those sessions can bill
 credits after their included usage ends; the switch still requires billing approval.
 Use `codexctl codex resume <session-id>` to resume a session from before migration.
@@ -298,11 +298,63 @@ If disconnect or local selection restores the provider during that switch, selec
 It refuses inherited or pinned Codex homes.
 Server-account launches use the provider token helper without local account failover or banked resets.
 `codexctl exec --account <alias> -- <command>` supports saved local profiles only.
-Pinned execution of server accounts is not supported: the server provider and its
-token helper refuse pinned homes. To launch Codex with a server account, run
-`codexctl use <alias>` followed by `codexctl codex`. This changes the active account for
-new and running sessions; running sessions follow it within 60 seconds. It is not an
-isolated pinned launch.
+To pin one Codex session to a server account without switching the host account:
+
+```sh
+codexctl codex --account personal "a new prompt"
+codexctl codex --account personal resume <session-id>
+codexctl codex --account team --allow-billing resume <session-id>
+```
+
+The launcher gives the child a private connection and explicit provider/token-helper
+arguments. It preserves the working directory and resumed session; the host's
+configuration, active pointer, and auth file stay unchanged. Later `codexctl use`
+switches do not move this session. No static `ChatGPT-Account-ID` header is sent:
+the token workspace claim must match the selected account on every helper refresh.
+Billing approval applies only to this launch. SIGHUP and SIGTERM remove its private
+connection before forwarding the signal to Codex; an unresponsive child is killed
+and reaped after one second. Helpers refuse connections whose launcher no longer
+holds its owner lock, including after SIGKILL. The next launch and `disconnect`
+sweep orphaned `lanes/launch-*` directories under an exclusive lane-directory lock,
+while preserving directories owned by live launchers. Accounts that may bill credits require
+confirmation on a terminal or `--allow-billing` for unattended use. Exhausted accounts
+refuse even with billing approval; an exhausted account also refuses subsequent
+helper refreshes. This launch never redeems a reset and rejects `--allow-resets`.
+Inherited `CODEX_HOME`/pinned launches and provider/profile argument overrides refuse;
+a selected config profile that overrides `model_provider` must be removed first.
+Exit status is the child's status (including `128 + signal` on Unix), 1 for launch
+or policy failures, and 2 for invalid CLI options. Herdr pane management stays outside
+codexctl: stop the intended lane, then run the pinned launch in that lane.
+
+### Read per-account response rates
+
+```sh
+codexctl rate
+codexctl rate --json --minutes 10
+```
+
+`rate` opens `~/.codex/logs_2.sqlite` read-only, including committed WAL entries, and
+uses the same account usage lookup as `status --json` (which may update status caches).
+It never switches accounts or redeems resets. The default window is 10 minutes;
+`--minutes` accepts 1 through 525600. Missing/unreadable databases fail with exit 1.
+Only successful HTTP responses and 429s from `/codex/responses` count; other statuses
+and endpoints are excluded. Accounts without matching traffic have no row.
+
+The `x-codex-primary-reset-at` response header is matched to the account's weekly
+reset, allowing 120 seconds of drift. Multiple candidates, unknown reset times, and
+missing evidence stay `.unattributed` (a reserved label that cannot be an account alias). Headerless replies inherit the last observed
+assignment for the same process within the requested window; an unrecognized header
+clears that assignment. An account switch without a logged header cannot be detected.
+`processes` counts distinct process identifiers observed in the logs, not live OS
+processes. `pids` contains the parseable PID segment in `pid:<pid>:<uuid>` identifiers, deduplicated and sorted;
+reused PIDs can correspond to multiple process identifiers.
+
+JSON contains `host`, `window_minutes`, `generated_at`, and `accounts`, whose rows
+contain `account`, `weekly_used_percent`, `responses_ok`, `responses_429`, `rate_429`,
+`processes`, and `pids`. `rate_429` is 429s divided by successes plus 429s; unknown weekly
+usage is null. The backend exposes no token-per-minute counts or limit, so neither
+field is estimated or included. This readout is log evidence, not a throughput quota.
+
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 

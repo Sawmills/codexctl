@@ -972,6 +972,7 @@ pub fn disconnect(forget: bool) -> Result<()> {
     // The native lock serializes provider restoration with activation.
     let _lock = native::native_lock(&root()?)?;
     native::deactivate_locked()?;
+    native::sweep_stale_launches()?;
     if forget {
         let registrations: Vec<_> = [connection()?, registration(&pending_path()?)?]
             .into_iter()
