@@ -1,4 +1,5 @@
 use super::*;
+use crate::central::server::TokenResponse;
 use std::{sync::atomic::AtomicUsize, time::Duration};
 
 struct Fixture {
@@ -45,6 +46,7 @@ impl Fixture {
                 auth,
                 verified: true,
                 import_rejected: false,
+                revision: 0,
             },
         )
         .unwrap_or_else(|_| panic!("token response failed"));

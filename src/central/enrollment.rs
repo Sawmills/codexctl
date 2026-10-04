@@ -246,19 +246,26 @@ impl Sso {
     }
 }
 fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
     broker
         .sso
         .as_deref()
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
 }
 fn page(html: String) -> Response {
-    let styles = include_str!("enrollment/style.css");
+    let styles = include_str!("dashboard/style.css");
+    let script = include_str!("dashboard/copy.js");
+    let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
     let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
     let policy = format!(
-        "default-src 'none'; style-src 'sha256-{style_hash}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+        "default-src 'none'; style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; font-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
     let document = include_str!("enrollment/page.html")
         .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))
+        .replace("<!-- SCRIPT -->", &format!("<script>{script}</script>"))
+        .replace("<!-- VERSION -->", env!("CARGO_PKG_VERSION"))
         .replace("<!-- CONTENT -->", &html);
     (
         [
@@ -646,6 +653,9 @@ async fn approve(
     State(broker): State<Broker>,
     Form(input): Form<Approve>,
 ) -> Result<Response, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
     let (approval, device_name) = {
         let sso = broker
             .sso
@@ -765,6 +775,9 @@ pub(super) fn browser_user(
     broker: &Broker,
     headers: &HeaderMap,
 ) -> Result<Option<managed::User>, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
     let Some(sso) = broker.sso.as_deref() else {
         return Ok(None);
     };

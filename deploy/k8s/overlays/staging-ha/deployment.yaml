@@ -90,15 +90,12 @@ spec:
           command: [sh, -ec]
           args:
             - >-
-              export DATABASE_URL="postgres://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}?sslmode=require";
               exec codexctl-central serve --state /data/state --key-file /keys/vault-key
               --listen 0.0.0.0:8787 --public-url https://codexctl.ue1.staging.plat.sm-svc.com
               --metrics-token-file /keys/metrics-token --sso-config /configuration/sso.json
           env:
             - name: CODEXCTL_CENTRAL_STORE
               value: postgres
-            - name: DATABASE_URL
-              value: ""
             - {
                 name: DB_HOST,
                 valueFrom:

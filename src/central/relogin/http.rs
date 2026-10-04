@@ -4,6 +4,9 @@ pub(in crate::central) async fn status(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
+        return Err(error);
+    }
     let _import = broker.imports.lock().await;
     let device = broker.authorize(&headers).await?;
     let Json(request) =
@@ -35,6 +38,9 @@ pub(in crate::central) async fn cancel(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
+        return Err(error);
+    }
     let _import = broker.imports.lock().await;
     let device = broker.authorize(&headers).await?;
     let Json(request) =
@@ -70,6 +76,9 @@ pub(in crate::central) async fn start(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
+        return Err(error);
+    }
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     broker.authorize(&headers).await?;

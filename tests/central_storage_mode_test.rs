@@ -130,3 +130,40 @@ fn file_admin_remains_available_without_database_configuration() {
     );
     assert!(command(&["users", "--state", "state"]).status.success());
 }
+
+#[test]
+fn postgres_admin_requires_the_central_key_file_before_touching_local_state() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["users"],
+        vec!["users", "--user", "u", "--enable"],
+        vec![
+            "register",
+            "--device",
+            "d",
+            "--tenant",
+            "sawmills",
+            "--user",
+            "u",
+            "--token-file",
+            "token",
+        ],
+        vec!["revoke", "--device", "d"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .current_dir(root.path())
+            .env("CODEXCTL_CENTRAL_STORE", "postgres")
+            .env_remove("DATABASE_URL")
+            .args(&args)
+            .args(["--state", "state"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--key-file is required"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}

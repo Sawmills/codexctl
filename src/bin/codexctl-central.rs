@@ -62,6 +62,8 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
         device: String,
         #[arg(long)]
         tenant: String,
@@ -180,6 +182,13 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             enable,
             disable,
         } => {
+            let postgres_mode = matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            );
+            if postgres_mode && key_file.is_none() {
+                anyhow::bail!("--key-file is required for users in postgres mode");
+            }
             if enable || disable {
                 let id = user
                     .as_deref()
@@ -190,7 +199,12 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                     central::managed::set_user(&state, id, enable)?;
                 }
             } else {
-                for user in central::managed::users(&state)? {
+                let users = if let Some(key_file) = key_file {
+                    central::managed::list_users_central(&state, &key_file).await?
+                } else {
+                    central::managed::users(&state)?
+                };
+                for user in users {
                     println!(
                         "{} {} {}",
                         user.id,
@@ -212,11 +226,25 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         } => central::init(&state, &key_file, &auth, &alias, &tenant, &user)?,
         Commands::Register {
             state,
+            key_file,
             device,
             tenant,
             user,
             token_file,
-        } => central::register(&state, &device, &tenant, &user, &token_file)?,
+        } => {
+            if matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            ) {
+                let key_file = key_file.ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for register in postgres mode")
+                })?;
+                central::register_central(&state, &key_file, &device, &tenant, &user, &token_file)
+                    .await?
+            } else {
+                central::register(&state, &device, &tenant, &user, &token_file)?
+            }
+        }
         Commands::Revoke {
             state,
             key_file,
@@ -224,6 +252,11 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         } => {
             if let Some(key_file) = key_file {
                 central::revoke_central(&state, &key_file, &device).await?
+            } else if matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            ) {
+                anyhow::bail!("--key-file is required for revoke in postgres mode")
             } else {
                 central::revoke(&state, &device)?
             }

@@ -21,6 +21,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
             label: None,
             verified: true,
             import_rejected: false,
+            revision: 0,
         },
     )
     .unwrap();

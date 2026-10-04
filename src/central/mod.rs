@@ -43,6 +43,40 @@ pub async fn revoke_central(state: &Path, key: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn register_central(
+    state: &Path,
+    key: &Path,
+    id: &str,
+    tenant: &str,
+    user: &str,
+    token_file: &Path,
+) -> Result<()> {
+    store::validate_alias(id)?;
+    store::validate_alias(tenant)?;
+    store::validate_alias(user)?;
+    let central = storage::runtime_store(state, key).await?;
+    let devices = central.load_registry_entity_revisions("devices").await?;
+    if devices.iter().any(|(device_id, _, _)| device_id == id) {
+        bail!("device already registered");
+    }
+    let token = vault::digest(&enrollment::random_bytes());
+    vault::create_secret(token_file, token.as_bytes())?;
+    let device = vault::Device {
+        id: id.into(),
+        tenant: tenant.into(),
+        user: user.into(),
+        token_hash: vault::digest(token.as_bytes()),
+        revoked: false,
+    };
+    if !central
+        .save_registry_entity_cas("devices", id, &serde_json::to_vec(&device)?, None)
+        .await?
+    {
+        bail!("device was registered concurrently; retry");
+    }
+    Ok(())
+}
+
 use crate::store;
 use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use anyhow::{Result, bail};
@@ -79,6 +113,7 @@ pub fn init(
             label: None,
             verified: true,
             import_rejected: false,
+            revision: 0,
         },
     )?;
     vault::save_devices(state, &[])?;

@@ -163,6 +163,9 @@ pub(super) async fn list(
     State(broker): State<Broker>,
     headers: HeaderMap,
 ) -> Result<Response, super::managed::HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("reset_unavailable") {
+        return Err(error);
+    }
     let device = broker.authorize(&headers).await?;
     let owners: Vec<_> = broker
         .owners
@@ -275,6 +278,9 @@ async fn redeem(
     headers: HeaderMap,
     body: Result<Json<Redemption>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, super::managed::HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("reset_unavailable") {
+        return Err(error);
+    }
     let device = broker.authorize(&headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;

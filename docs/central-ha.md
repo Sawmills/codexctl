@@ -19,7 +19,14 @@ or persist a rotated credential. Holder IDs contain the pod hostname and a
 random boot nonce. Registry authorization reads PostgreSQL on every request and
 mutations use one entity per compare-and-swap revision, so a stale pod cannot
 replace a concurrent revoke, enrollment, or re-enable. Dual mode is retained
-only for the migration soak and still requires `CODEXCTL_CENTRAL_DUAL_ACK=1`.
+only for explicit migration commands and still requires
+`CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
+
+The phase-3 PostgreSQL server fails closed for enrollment, reset redemption,
+and relogin endpoints. Their browser sessions, reset journals, and operation
+records remain file-backed, so they are not safe behind a multi-replica
+service. Keep those workflows on the single file-mode writer until phase 4
+adds shared TTL/one-time-consume and operation-record tables.
 
 TLS is required by default. `DATABASE_URL` must include `sslmode=require`; set
 `CODEXCTL_CENTRAL_DB_CA_FILE` to the mounted RDS CA bundle or system CA bundle.
@@ -150,22 +157,64 @@ or row counts do not match the reviewed plan.
      kubectl --context plat-staging -n codexctl get secret codexctl-postgres \
        -o "jsonpath={.data.$1}" | base64 --decode
    }
-   DATABASE_URL="postgres://$(secret_value db-user):$(secret_value db-password)@$(secret_value db-hostname):$(secret_value db-port)/$(secret_value db-name)?sslmode=require"
    kubectl --context plat-staging -n codexctl exec statefulset/codexctl -- \
-     env CODEXCTL_CENTRAL_STORE=postgres DATABASE_URL="$DATABASE_URL" \
+     env CODEXCTL_CENTRAL_STORE=postgres \
+       DB_HOST="$(secret_value db-hostname)" DB_PORT="$(secret_value db-port)" \
+       DB_NAME="$(secret_value db-name)" DB_USER="$(secret_value db-user)" \
+       DB_PASSWORD="$(secret_value db-password)" \
      codexctl-central migrate --state /data/state --key-file /keys/vault-key
    kubectl --context plat-staging -n codexctl exec statefulset/codexctl -- \
-     env CODEXCTL_CENTRAL_STORE=dual CODEXCTL_CENTRAL_DUAL_ACK=1 \
+     env CODEXCTL_CENTRAL_STORE=postgres \
+       DB_HOST="$(secret_value db-hostname)" DB_PORT="$(secret_value db-port)" \
+       DB_NAME="$(secret_value db-name)" DB_USER="$(secret_value db-user)" \
+       DB_PASSWORD="$(secret_value db-password)" \
      codexctl-central backfill --state /data/state --key-file /keys/vault-key
    ```
 
-3. **Soak dual mode on one pod.** Use a reviewed compatibility image and keep
-   exactly one refresh writer. Set `CODEXCTL_CENTRAL_STORE=dual` and
-   `CODEXCTL_CENTRAL_DUAL_ACK=1`, verify `/ready` reports the database reachable,
-   and exercise account listing, enrollment handoff, reset idempotency, and a
-   forced-refresh canary. Do not scale the live StatefulSet during this soak.
+3. **Quiesce the file writer and re-backfill.** PostgreSQL mode is the only
+   serving mode; `dual` is migration-only and the server refuses to start in it.
+   Stop the old writer before the final backfill, then run the backfill from a
+   reviewed one-shot migration Job that mounts the retained PVC. Keep the
+   StatefulSet scaled to zero after this point. Do not run two refresh writers:
 
-4. **Cut over to the build-only HA overlay.** After HQ approves the canary,
+   ```sh
+   kubectl --context plat-staging -n codexctl scale statefulset/codexctl --replicas=0
+   kubectl --context plat-staging -n codexctl wait --for=delete pod/codexctl-0 --timeout=120s
+   kubectl --context plat-staging -n codexctl apply -f - <<'YAML'
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     name: codexctl-backfill
+   spec:
+     ttlSecondsAfterFinished: 86400
+     template:
+       spec:
+         restartPolicy: Never
+         containers:
+           - name: backfill
+             image: codexctl-central:staging # replace with the reviewed image digest
+             command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
+             env:
+               - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
+               - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
+               - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
+               - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
+               - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
+               - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
+             volumeMounts:
+               - {name: state, mountPath: /data/state}
+               - {name: keys, mountPath: /keys, readOnly: true}
+         volumes:
+           - name: state
+             persistentVolumeClaim: {claimName: state-codexctl-0}
+           - name: keys
+             secret: {secretName: codexctl-secrets}
+   YAML
+   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=10m
+   kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
+   ```
+
+4. **Cut over to the build-only HA overlay.** After the final backfill,
    build and apply the separately reviewed overlay (the overlay is deliberately
    not referenced by `deploy/k8s/staging-application.yaml`):
 
@@ -174,6 +223,10 @@ or row counts do not match the reviewed plan.
    kubectl --context plat-staging apply -k deploy/k8s/overlays/staging-ha
    kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
    ```
+
+   The HA service accepts token and registry operations only. Enrollment,
+   reset redemption, and relogin return `503` until their shared workflow
+   state is delivered in phase 4.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
    `/ready` database health, one upstream refresh for a simultaneous forced

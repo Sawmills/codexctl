@@ -191,6 +191,29 @@ CREATE TABLE IF NOT EXISTS central_registry_entries (
 );
 CREATE INDEX IF NOT EXISTS central_registry_entries_kind_idx
     ON central_registry_entries (kind);
+CREATE TABLE IF NOT EXISTS central_users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL,
+    oidc_identity TEXT,
+    revision BIGINT NOT NULL DEFAULT 0,
+    deleted_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS central_devices (
+    id TEXT PRIMARY KEY,
+    tenant TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    revoked BOOLEAN NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
+    deleted_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
+    ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
+CREATE INDEX IF NOT EXISTS central_users_enabled_idx
+    ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
 "#;
 
 impl CentralStore {
@@ -283,6 +306,24 @@ impl CentralStore {
             Self::File(_) => Ok(Vec::new()),
             Self::Postgres(db) => bounded_db(db.load_registry_entities(name)).await,
             Self::Dual { postgres, .. } => bounded_db(postgres.load_registry_entities(name)).await,
+        }
+    }
+
+    /// Authorize against typed, indexed PostgreSQL rows. The encrypted legacy
+    /// registry blob is never used as an authorization source in shared mode.
+    pub async fn authorized_device(&self, token_hash: &str) -> Result<Option<vault::Device>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => bounded_db(db.authorized_device(token_hash)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.authorized_device(token_hash)).await,
+        }
+    }
+
+    pub async fn enabled_user(&self, id: &str) -> Result<bool> {
+        match self {
+            Self::File(_) => Ok(false),
+            Self::Postgres(db) => bounded_db(db.enabled_user(id)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.enabled_user(id)).await,
         }
     }
 
@@ -387,13 +428,7 @@ impl CentralStore {
                 let login = crate::central::vault::token(&value.auth)
                     .ok()
                     .and_then(crate::api::token_subject);
-                let revision = crate::central::vault::token(&value.auth)
-                    .ok()
-                    .and_then(|token| {
-                        crate::api::token_issued_at(token)
-                            .or_else(|| crate::api::token_expiry(token))
-                    })
-                    .unwrap_or(0);
+                let revision = value.revision.max(1);
                 let record = CredentialRecord {
                     account_id: crate::central::managed::account_key(&value.user, &value.alias),
                     user_id: Some(value.user.clone()),
@@ -939,8 +974,7 @@ impl FileStore {
 
 impl PostgresStore {
     async fn connect(key: &Path) -> Result<Self> {
-        let url = std::env::var("DATABASE_URL")
-            .context("DATABASE_URL is required for PostgreSQL central storage")?;
+        let url = std::env::var("DATABASE_URL").unwrap_or_default();
         let tls_enabled = std::env::var("CODEXCTL_CENTRAL_DB_TLS")
             .map(|value| value != "0" && value != "false" && value != "disable")
             .unwrap_or(true);
@@ -955,17 +989,46 @@ impl PostgresStore {
     }
 
     async fn establish(&self) -> Result<Arc<tokio_postgres::Client>> {
-        let mut config: tokio_postgres::Config = self
-            .url
-            .parse()
-            .context("invalid DATABASE_URL for PostgreSQL central storage")?;
+        let mut config =
+            if self.url.is_empty() {
+                let mut config = tokio_postgres::Config::new();
+                config.host(&std::env::var("DB_HOST").context(
+                    "DATABASE_URL or DB_HOST is required for PostgreSQL central storage",
+                )?);
+                config.port(
+                    std::env::var("DB_PORT")
+                        .context("DB_PORT is required when DATABASE_URL is unset")?
+                        .parse()
+                        .context("invalid DB_PORT for PostgreSQL central storage")?,
+                );
+                config.dbname(
+                    &std::env::var("DB_NAME")
+                        .context("DB_NAME is required when DATABASE_URL is unset")?,
+                );
+                config.user(
+                    &std::env::var("DB_USER")
+                        .context("DB_USER is required when DATABASE_URL is unset")?,
+                );
+                config.password(
+                    std::env::var("DB_PASSWORD")
+                        .context("DB_PASSWORD is required when DATABASE_URL is unset")?,
+                );
+                config
+            } else {
+                self.url
+                    .parse()
+                    .context("invalid DATABASE_URL for PostgreSQL central storage")?
+            };
         config.connect_timeout(DB_TIMEOUT);
         let client = if self.tls_enabled {
-            if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
+            if !self.url.is_empty()
+                && config.get_ssl_mode() != tokio_postgres::config::SslMode::Require
+            {
                 bail!(
                     "TLS is enabled for central PostgreSQL; DATABASE_URL must set sslmode=require"
                 );
             }
+            config.ssl_mode(tokio_postgres::config::SslMode::Require);
             let (client, connection) = config
                 .connect(tls_connector()?)
                 .await
@@ -1093,8 +1156,69 @@ impl PostgresStore {
         Ok(Some(vault::decrypt_bytes(&self.key, &encrypted)?))
     }
 
+    async fn authorized_device(&self, token_hash: &str) -> Result<Option<vault::Device>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT id,tenant,user_id,token_hash,revoked FROM central_devices WHERE tenant=$1 AND token_hash=$2 AND revoked=false AND deleted_at IS NULL",
+                &[&"sawmills", &token_hash],
+            )
+            .await?;
+        Ok(row.map(|row| vault::Device {
+            id: row.get(0),
+            tenant: row.get(1),
+            user: row.get(2),
+            token_hash: row.get(3),
+            revoked: row.get(4),
+        }))
+    }
+
+    async fn enabled_user(&self, id: &str) -> Result<bool> {
+        let client = self.client().await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM central_users WHERE id=$1 AND enabled=true AND deleted_at IS NULL",
+                &[&id],
+            )
+            .await?
+            .is_some())
+    }
+
     async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
         let client = self.client().await?;
+        if name == "users" {
+            let rows = client
+                .query("SELECT id,email,enabled,oidc_identity FROM central_users WHERE deleted_at IS NULL ORDER BY id", &[])
+                .await?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    Ok(serde_json::to_vec(&crate::central::managed::User {
+                        id: row.get(0),
+                        email: row.get(1),
+                        enabled: row.get(2),
+                        oidc_identity: row.get(3),
+                    })?)
+                })
+                .collect();
+        }
+        if name == "devices" {
+            let rows = client
+                .query("SELECT id,tenant,user_id,token_hash,revoked FROM central_devices WHERE deleted_at IS NULL ORDER BY id", &[])
+                .await?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    Ok(serde_json::to_vec(&vault::Device {
+                        id: row.get(0),
+                        tenant: row.get(1),
+                        user: row.get(2),
+                        token_hash: row.get(3),
+                        revoked: row.get(4),
+                    })?)
+                })
+                .collect();
+        }
         let rows = client
             .query(
                 "SELECT encrypted_payload FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
@@ -1114,6 +1238,47 @@ impl PostgresStore {
         name: &str,
     ) -> Result<Vec<(String, Vec<u8>, i64)>> {
         let client = self.client().await?;
+        if name == "users" {
+            let rows = client
+                .query("SELECT id,email,enabled,oidc_identity,revision FROM central_users WHERE deleted_at IS NULL ORDER BY id", &[])
+                .await?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.get(0),
+                        serde_json::to_vec(&crate::central::managed::User {
+                            id: row.get(0),
+                            email: row.get(1),
+                            enabled: row.get(2),
+                            oidc_identity: row.get(3),
+                        })?,
+                        row.get(4),
+                    ))
+                })
+                .collect();
+        }
+        if name == "devices" {
+            let rows = client
+                .query("SELECT id,tenant,user_id,token_hash,revoked,revision FROM central_devices WHERE deleted_at IS NULL ORDER BY id", &[])
+                .await?;
+            return rows
+                .into_iter()
+                .map(|row| {
+                    Ok((
+                        row.get(0),
+                        serde_json::to_vec(&vault::Device {
+                            id: row.get(0),
+                            tenant: row.get(1),
+                            user: row.get(2),
+                            token_hash: row.get(3),
+                            revoked: row.get(4),
+                        })?,
+                        row.get(5),
+                    ))
+                })
+                .collect();
+        }
         let rows = client
             .query(
                 "SELECT entity_id,encrypted_payload,revision FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
@@ -1139,6 +1304,17 @@ impl PostgresStore {
         name: &str,
         entries: &[(String, Vec<u8>)],
     ) -> Result<()> {
+        if name == "users" || name == "devices" {
+            for (id, payload) in entries {
+                let inserted = self
+                    .save_registry_entity_cas(name, id, payload, None)
+                    .await?;
+                if !inserted {
+                    bail!("registry entity already exists: {name}/{id}");
+                }
+            }
+            return Ok(());
+        }
         let client = self.client().await?;
         let mut sql = String::from(
             "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload) VALUES ",
@@ -1172,6 +1348,36 @@ impl PostgresStore {
         payload: &[u8],
         expected_revision: Option<i64>,
     ) -> Result<bool> {
+        if name == "users" {
+            let user: crate::central::managed::User = serde_json::from_slice(payload)?;
+            let client = self.client().await?;
+            let changed = match expected_revision {
+                None => client.execute(
+                    "INSERT INTO central_users(id,email,enabled,oidc_identity,revision) VALUES($1,$2,$3,$4,0) ON CONFLICT(id) DO NOTHING",
+                    &[&user.id, &user.email, &user.enabled, &user.oidc_identity],
+                ).await?,
+                Some(revision) => client.execute(
+                    "UPDATE central_users SET email=$2,enabled=$3,oidc_identity=$4,revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$5 AND deleted_at IS NULL",
+                    &[&user.id, &user.email, &user.enabled, &user.oidc_identity, &revision],
+                ).await?,
+            };
+            return Ok(changed == 1);
+        }
+        if name == "devices" {
+            let device: vault::Device = serde_json::from_slice(payload)?;
+            let client = self.client().await?;
+            let changed = match expected_revision {
+                None => client.execute(
+                    "INSERT INTO central_devices(id,tenant,user_id,token_hash,revoked,revision) VALUES($1,$2,$3,$4,$5,0) ON CONFLICT(id) DO NOTHING",
+                    &[&device.id, &device.tenant, &device.user, &device.token_hash, &device.revoked],
+                ).await?,
+                Some(revision) => client.execute(
+                    "UPDATE central_devices SET tenant=$2,user_id=$3,token_hash=$4,revoked=$5,revision=revision+1,updated_at=now() WHERE id=$1 AND revision=$6 AND deleted_at IS NULL",
+                    &[&device.id, &device.tenant, &device.user, &device.token_hash, &device.revoked, &revision],
+                ).await?,
+            };
+            return Ok(changed == 1);
+        }
         let encrypted = vault::encrypt_bytes(&self.key, payload)?;
         let client = self.client().await?;
         let changed = match expected_revision {
