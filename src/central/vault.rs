@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub alias: String,
     pub tenant: String,

@@ -650,3 +650,114 @@ async fn dashboard_redirects_if_session_ends_during_snapshot() {
     );
     server.abort();
 }
+
+impl Fixture {
+    async fn attach_refresh_store(&mut self, mode: &str) -> CentralStore {
+        use std::os::unix::fs::PermissionsExt;
+        let central = CentralStore::from_mode(
+            super::super::storage::StoreMode::File,
+            &self.broker.state,
+            &self.broker.key,
+        )
+        .await
+        .unwrap();
+        central.migrate().await.unwrap();
+        self.broker.central = Some(central.clone());
+        self.broker.read_only = false;
+        let owner_ref = self.broker.owners.read().await["fixture"].1.clone();
+        let mut owner = owner_ref.lock().await;
+        owner.vault.revision = 1;
+        vault::save(&owner.state, &owner.key, &owner.vault).unwrap();
+        central
+            .save_account(&Broker::owner_record(&owner).unwrap())
+            .await
+            .unwrap();
+        let root = self._root.path();
+        store::atomic_write(&root.join("mode"), mode.as_bytes()).unwrap();
+        store::atomic_write(&root.join("count"), b"0").unwrap();
+        let binary = root.join("codex");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        let script = format!(
+            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nos.environ['CENTRAL_TEST_REFRESH_COUNTER'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
+            serde_json::to_string(&root.join("mode")).unwrap(),
+            serde_json::to_string(&root.join("count")).unwrap(),
+            serde_json::to_string(&fixture).unwrap(),
+        );
+        store::atomic_write(&binary, script.as_bytes()).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        owner.rpc = Some(Rpc::start(&binary, &owner.home).await.unwrap());
+        owner.refresh_enabled = true;
+        central
+    }
+}
+
+#[tokio::test]
+async fn late_native_completion_is_published_before_another_holder_gets_the_lease() {
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let central = fixture.attach_refresh_store("late-error").await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let revision = owner_ref.lock().await.snapshot().unwrap().revision;
+    let response = token(
+        State(fixture.broker.clone()),
+        fixture.headers.clone(),
+        Ok(Json(TokenRequest {
+            alias: Some("fixture".into()),
+            previous_revision: Some(revision),
+            ..Default::default()
+        })),
+    )
+    .await
+    .unwrap_or_else(IntoResponse::into_response);
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let id = account_key("test", "fixture");
+    let peer_lease = central
+        .acquire_lease(&id, "peer", Duration::from_secs(60))
+        .await
+        .unwrap();
+    let committed = central.load_account(&id).await.unwrap().unwrap();
+    assert_eq!(committed.revision, 2);
+    assert_eq!(committed.vault["revision"], 2);
+    assert_eq!(
+        committed.vault["auth"]["tokens"]["refresh_token"],
+        "synthetic-rotated-refresh"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "1"
+    );
+    assert!(owner_ref.lock().await.rpc.is_none());
+    central.release_lease(&peer_lease).await.unwrap();
+}
+
+#[tokio::test]
+async fn retry_keeps_recovery_epoch_after_the_native_process_stops() {
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let central = fixture.attach_refresh_store("").await;
+    let id = account_key("test", "fixture");
+    let lease = central
+        .acquire_lease(&id, &fixture.broker.holder_id, Duration::from_secs(60))
+        .await
+        .unwrap();
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+        owner.rpc = None;
+        owner.available = false;
+        owner.routing_refused = true;
+    }
+    assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        central
+            .renew(&lease, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+    assert!(
+        central
+            .acquire_lease(&id, "peer", Duration::from_secs(60))
+            .await
+            .is_err()
+    );
+    central.release_lease(&lease).await.unwrap();
+}

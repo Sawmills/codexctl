@@ -50,6 +50,10 @@ pub struct Rpc {
 }
 
 impl Rpc {
+    pub(super) fn completion_pending(&self) -> bool {
+        self.outstanding.is_some()
+    }
+
     pub async fn start(binary: &Path, home: &Path) -> Result<Self> {
         let mut rpc = Self::spawn(binary, home, false)?;
         rpc.initialize().await?;

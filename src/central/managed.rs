@@ -702,6 +702,24 @@ async fn reconcile_owner_from_central(
     Ok(true)
 }
 
+// Settlement may finish a refresh after the request deadline. Keep the stopped
+// RPC attached through snapshot so its final journal is read as this owner's
+// output (including refresh-only rotations with unchanged access claims).
+async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
+    if let Some(rpc) = owner.rpc.as_mut() {
+        rpc.settle_and_stop().await?;
+    }
+    owner.snapshot()?;
+    if owner.vault.auth != before.auth {
+        owner.vault.revision = before.revision.saturating_add(1).max(1);
+    }
+    vault::save(&owner.state, &owner.key, &owner.vault)?;
+    let record = Broker::owner_record(owner)?;
+    owner.rpc = None;
+    owner.refresh_enabled = false;
+    Ok(record)
+}
+
 async fn token(
     State(broker): State<Broker>,
     headers: HeaderMap,
@@ -737,6 +755,11 @@ async fn token(
             None
         };
         let mut owner = owner_ref.lock().await;
+        // A retry cannot take over recovery, even after the child stops: the
+        // final credentials may still be waiting for a durable shared write.
+        if worker.central.is_some() && !owner.available && owner.routing_refused {
+            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        }
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         if worker
             .central
@@ -749,16 +772,6 @@ async fn token(
         // PostgreSQL token path therefore takes the account lease before
         // invoking the native owner or persisting its result.
         let lease = if let Some(central) = worker.central.as_ref() {
-            // A retained lease fences an owner whose refresh result is
-            // unresolved. Do not bump its epoch or release the fence from a
-            // retry while the native process may still hold the token.
-            if central.mode() != super::storage::StoreMode::File
-                && owner.routing_refused
-                && !owner.available
-                && owner.rpc.is_some()
-            {
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            }
             // Ensure the FK target exists before the first request after cutover
             // or a locally imported account.
             worker
@@ -839,31 +852,23 @@ async fn token(
             }
             _ => None,
         };
-        let mut retain_lease = false;
-        let mut reconcile_record = None;
+        let mut retain_lease = lease.is_some();
+        let before = owner.vault.clone();
         let result = async {
-            let prior_auth = owner.vault.auth.clone();
             let token_result = owner.tokens(request).await;
-            let settle_required = matches!(
-                &token_result,
-                Err(TokenFailure::Unavailable(error))
-                    if error.to_string().contains("timed out")
-                        || error.to_string().contains("completion unknown")
-            );
-            if settle_required
-                && let Some(rpc) = owner.rpc.as_mut()
-                && let Err(error) = rpc.settle_and_stop().await
-            {
+            let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
+            if settle_required && owner.rpc.is_some() {
                 retain_lease = true;
-                owner.available = false;
-                owner.routing_refused = true;
-                owner.refresh_enabled = false;
-                eprintln!("central owner settlement is unknown: {error:#}");
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+                settled_owner_record(&mut owner, &before)
+                    .await
+                    .map_err(|error| {
+                        eprintln!("central owner settlement: {error:#}");
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
             }
-            let auth_changed = owner.vault.auth != prior_auth;
+            let auth_changed = owner.vault.auth != before.auth;
             if auth_changed {
-                owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
+                owner.vault.revision = before.revision.saturating_add(1).max(1);
             }
             let record = CredentialRecord {
                 account_id: account_id.clone(),
@@ -895,7 +900,6 @@ async fn token(
                             }
                             Err(error) => {
                                 retain_lease = true;
-                                reconcile_record = Some(record.clone());
                                 owner.available = false;
                                 owner.routing_refused = true;
                                 owner.refresh_enabled = false;
@@ -930,6 +934,7 @@ async fn token(
                     worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
+            retain_lease = false;
             let token = token_result.map_err(|error| worker.owner_failure(error))?;
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
         }
@@ -938,13 +943,15 @@ async fn token(
             task.abort();
         }
         if retain_lease {
+            owner.available = false;
+            owner.routing_refused = true;
+            owner.refresh_enabled = false;
             if let (Some(central), Some(lease)) = (worker.central.clone(), lease.clone()) {
                 let owner_ref = owner_ref.clone();
                 let settled = Arc::new(AtomicBool::new(false));
                 let renew_done = settled.clone();
                 let renew_central = central.clone();
                 let renew_lease = lease.clone();
-                let pending_record = reconcile_record;
                 tokio::spawn(async move {
                     while !renew_done.load(Ordering::Acquire) {
                         if !renew_central
@@ -959,41 +966,25 @@ async fn token(
                 });
                 tokio::spawn(async move {
                     loop {
-                        let stopped = {
+                        let record = {
                             let mut owner = owner_ref.lock().await;
-                            match owner.rpc.as_mut() {
-                                Some(rpc) => match rpc.settle_and_stop().await {
-                                    Ok(_) => {
-                                        owner.rpc = None;
-                                        owner.refresh_enabled = false;
-                                        true
-                                    }
-                                    Err(error) => {
-                                        eprintln!("central owner settlement retry: {error:#}");
-                                        false
-                                    }
-                                },
-                                None => true,
-                            }
+                            settled_owner_record(&mut owner, &before).await
                         };
-                        if stopped {
-                            if let Some(record) = pending_record.as_ref() {
-                                match central.fenced_write(&lease, record).await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                        continue;
-                                    }
-                                    Err(error) => {
-                                        eprintln!("central fenced write reconciliation: {error:#}");
-                                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                                        continue;
-                                    }
+                        match record {
+                            Ok(record) => match central.fenced_write(&lease, &record).await {
+                                Ok(true) => {
+                                    settled.store(true, Ordering::Release);
+                                    let _ = central.release_lease(&lease).await;
+                                    break;
                                 }
-                            }
-                            settled.store(true, Ordering::Release);
-                            let _ = central.release_lease(&lease).await;
-                            break;
+                                Ok(false) => {
+                                    eprintln!("central recovery lost its credential fence")
+                                }
+                                Err(error) => {
+                                    eprintln!("central fenced write reconciliation: {error:#}")
+                                }
+                            },
+                            Err(error) => eprintln!("central owner settlement retry: {error:#}"),
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
