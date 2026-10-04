@@ -650,6 +650,7 @@ struct DisplayRow {
     cells: Vec<String>,
     billing: api::BillingClass,
     account: AccountStatus,
+    resets_redeemable: bool,
 }
 
 fn usage_cells(usage: &api::RateLimitResponse) -> Vec<String> {
@@ -686,6 +687,38 @@ fn percentage(value: Option<f64>) -> String {
     value.map_or("-".into(), |n| format!("{n:.0}%"))
 }
 
+fn reset_fields(
+    inventory: Option<&super::resets::Inventory>,
+    alias: &str,
+) -> (Option<i64>, Option<i64>, Option<i64>) {
+    let Some(super::resets::Account {
+        outcome:
+            super::resets::Outcome::Read {
+                available,
+                applicable,
+                credits,
+            },
+        ..
+    }) = inventory.and_then(|inventory| {
+        inventory
+            .accounts
+            .iter()
+            .find(|entry| entry.alias.eq_ignore_ascii_case(alias))
+    })
+    else {
+        return (None, None, None);
+    };
+    (
+        Some(*available),
+        Some(*applicable),
+        credits
+            .iter()
+            .filter(|credit| credit.is_available())
+            .filter_map(api::ResetCredit::expires_at_timestamp)
+            .min(),
+    )
+}
+
 async fn local_display_rows(
     profiles: &[profile::Profile],
     paths: &config::Paths,
@@ -708,6 +741,7 @@ async fn local_display_rows(
                 ],
                 billing: api::BillingClass::Unknown,
                 account: AccountStatus::local(&p.meta, false),
+                resets_redeemable: false,
             };
             let auth_path = profile::auth_json_path_for_profile_from(paths, p, active);
             let usage = match api::read_auth_json(&auth_path) {
@@ -731,7 +765,9 @@ async fn local_display_rows(
                     if let Some(plan) = &usage.plan_type {
                         row.cells[2] = plan.clone();
                     }
-                    row.cells.extend(usage_cells(&usage));
+                    let mut cells = usage_cells(&usage);
+                    cells.insert(3, "-".into());
+                    row.cells.extend(cells);
                     row.cells.extend(["local".into(), "-".into()]);
                 }
                 Err(reason) => {
@@ -749,6 +785,7 @@ async fn local_display_rows(
                         api::BillingClass::RateLimited
                     };
                     row.cells.extend([
+                        "-".into(),
                         "-".into(),
                         "-".into(),
                         "-".into(),
@@ -778,6 +815,9 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
         &paths,
         local_active.as_deref(),
     ))?;
+    // One inventory response covers every server account. Reuse it for status
+    // instead of issuing a reset-credit request per row.
+    let reset_inventory = status.then(|| resets().ok().flatten()).flatten();
     let show_usage = status || !rows.is_empty();
     let active = native::active_alias()?;
     for account in &accounts {
@@ -802,6 +842,12 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
     let mut server_rows: Vec<_> = accounts
         .iter()
         .map(|account| {
+            let (resets_banked, resets_redeemable, resets_next_expiry) =
+                reset_fields(reset_inventory.as_ref(), &account.alias);
+            let reset_cell = match (resets_banked, resets_redeemable) {
+                (Some(banked), Some(redeemable)) if banked > 0 => format!("{banked}/{redeemable}"),
+                _ => "-".into(),
+            };
             let is_active = active.as_deref() == Some(&account.alias);
             let state = if !account.available {
                 "unavailable"
@@ -818,6 +864,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     percentage(account.primary_used),
                     percentage(account.secondary_used),
                     reset_time(account.resets_at),
+                    reset_cell,
                     "-".into(),
                     state.into(),
                     if account.usage_stale {
@@ -870,10 +917,11 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     },
                     usage_age_seconds: account.usage_age_seconds,
                     usage_stale: Some(account.usage_stale),
-                    resets_banked: None,
-                    resets_redeemable: None,
-                    resets_next_expiry: None,
+                    resets_banked,
+                    resets_redeemable,
+                    resets_next_expiry: status_json::timestamp(resets_next_expiry),
                 },
+                resets_redeemable: resets_redeemable.is_some_and(|count| count > 0),
             }
         })
         .collect();
@@ -891,6 +939,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
             "Plan",
             "Short used",
             "Long used",
+            "Window resets",
             "Resets",
             "Balance",
             "State",
@@ -898,9 +947,9 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
         ];
         let columns: Vec<_> = (0..headers.len())
             .filter(|&i| {
-                (show_usage || !(3..=6).contains(&i))
+                (show_usage || !(3..=7).contains(&i))
                     && (i == 0
-                        || i == 7
+                        || i == 8
                         || server_rows
                             .iter()
                             .any(|row| !row.cells[i].trim().is_empty() && row.cells[i] != "-"))
@@ -911,11 +960,17 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
         table.set_header(columns.iter().map(|&i| headers[i]));
         for row in server_rows {
             table.add_row(columns.iter().map(|&i| {
-                row.cells[i]
+                let value = row.cells[i]
                     .chars()
                     .filter(|c| !c.is_control())
                     .take(160)
-                    .collect::<String>()
+                    .collect::<String>();
+                let cell = comfy_table::Cell::new(value);
+                if i == 6 && row.resets_redeemable {
+                    cell.fg(comfy_table::Color::Green)
+                } else {
+                    cell
+                }
             }));
         }
         println!("{table}");
@@ -1491,6 +1546,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(usage_cells(&usage)[3], "55835.54");
+    }
+
+    #[test]
+    fn server_status_uses_one_reset_inventory_for_counts_and_expiry() {
+        let inventory = crate::central::resets::Inventory {
+            user_id: "amir".into(),
+            accounts: vec![crate::central::resets::Account {
+                alias: "P5".into(),
+                outcome: crate::central::resets::Outcome::Read {
+                    available: 1,
+                    applicable: 1,
+                    credits: vec![api::ResetCredit {
+                        id: "soon".into(),
+                        status: "available".into(),
+                        reset_type: None,
+                        granted_at: None,
+                        expires_at: Some("2036-10-29T00:00:00Z".into()),
+                        title: None,
+                        description: None,
+                    }],
+                },
+            }],
+        };
+
+        assert_eq!(
+            reset_fields(Some(&inventory), "p5"),
+            (Some(1), Some(1), Some(2108851200))
+        );
+        assert_eq!(
+            reset_fields(Some(&inventory), "missing"),
+            (None, None, None)
+        );
     }
 
     #[test]
