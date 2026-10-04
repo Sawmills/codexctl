@@ -9,7 +9,14 @@ fn explicit_migration_bounds_a_stalled_postgres_handshake() {
         time::{Duration, Instant},
     };
     let root = tempfile::tempdir().unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping TCP black-hole probe: local sandbox denies loopback bind");
+            return;
+        }
+        Err(error) => panic!("bind TCP black-hole probe: {error}"),
+    };
     let endpoint = listener.local_addr().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
         .current_dir(root.path())
@@ -50,7 +57,9 @@ fn explicit_migration_bounds_a_stalled_postgres_handshake() {
 #[test]
 fn shared_modes_refuse_startup_and_admin_before_touching_files() {
     let root = tempfile::tempdir().unwrap();
-    for (mode, dual_write) in [("dual", "0"), ("postgres", "0"), ("file", "1")] {
+    // PostgreSQL is the phase-three runtime; the old phase-two refusal test
+    // covers only dual mode and the legacy dual-write alias now.
+    for (mode, dual_write) in [("dual", "0"), ("file", "1")] {
         for args in [
             vec!["setup", "--key-file", "key"],
             vec!["serve", "--key-file", "key"],
@@ -95,7 +104,7 @@ fn shared_modes_refuse_startup_and_admin_before_touching_files() {
                 .unwrap();
             assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
             let error = String::from_utf8_lossy(&output.stderr);
-            assert!(error.contains("only file mode"), "{args:?}: {error}");
+            assert!(error.contains("file or postgres mode"), "{args:?}: {error}");
             assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         }
     }
@@ -120,4 +129,41 @@ fn file_admin_remains_available_without_database_configuration() {
             .success()
     );
     assert!(command(&["users", "--state", "state"]).status.success());
+}
+
+#[test]
+fn postgres_admin_requires_the_central_key_file_before_touching_local_state() {
+    let root = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["users"],
+        vec!["users", "--user", "u", "--enable"],
+        vec![
+            "register",
+            "--device",
+            "d",
+            "--tenant",
+            "sawmills",
+            "--user",
+            "u",
+            "--token-file",
+            "token",
+        ],
+        vec!["revoke", "--device", "d"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .current_dir(root.path())
+            .env("CODEXCTL_CENTRAL_STORE", "postgres")
+            .env_remove("DATABASE_URL")
+            .args(&args)
+            .args(["--state", "state"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--key-file is required"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
 }

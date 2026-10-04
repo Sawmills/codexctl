@@ -3,6 +3,7 @@ use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest, TokenResponse},
+    storage::{CentralStore, CredentialRecord},
     transport,
     vault::{self, Vault},
 };
@@ -107,6 +108,14 @@ pub(super) struct Broker {
     pub(super) work: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    pub(super) central: Option<CentralStore>,
+    pub(super) holder_id: String,
+    pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
+}
+#[derive(Clone)]
+pub(super) struct RegistryState {
+    pub users: Vec<User>,
+    pub devices: Vec<vault::Device>,
 }
 pub(super) struct HttpError {
     status: StatusCode,
@@ -154,6 +163,31 @@ pub fn set_user(state: &Path, id: &str, enabled: bool) -> Result<()> {
     user.enabled = enabled;
     store::atomic_write(&state.join("users.json"), &serde_json::to_vec(&users)?)
 }
+
+/// Mutate one user in PostgreSQL using its entity revision.  The local file is
+/// not consulted in PostgreSQL mode, so a stale pod cannot replace another
+/// instance's concurrent enrollment or revocation changes.
+pub async fn set_user_central(state: &Path, key: &Path, id: &str, enabled: bool) -> Result<()> {
+    let central = super::storage::runtime_store(state, key).await?;
+    let rows = central.load_registry_entity_revisions("users").await?;
+    let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id) else {
+        bail!("user not found");
+    };
+    let mut user: User = serde_json::from_slice(payload)?;
+    user.enabled = enabled;
+    let updated = central
+        .save_registry_entity_cas("users", id, &serde_json::to_vec(&user)?, Some(*revision))
+        .await?;
+    if !updated {
+        bail!("user changed concurrently; retry");
+    }
+    Ok(())
+}
+
+pub async fn list_users_central(state: &Path, key: &Path) -> Result<Vec<User>> {
+    let central = super::storage::runtime_store(state, key).await?;
+    central_registry_users(&central).await
+}
 pub(super) enum UserEnrollment {
     Recorded,
     Disabled,
@@ -183,6 +217,15 @@ pub(super) fn normalize_alias(alias: &str) -> Result<&str> {
 pub(super) fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
+
+fn instance_holder_id() -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|v| v.trim().to_owned()))
+        .unwrap_or_else(|_| "unknown-host".into());
+    let boot_nonce = vault::digest(&enrollment::random_bytes());
+    vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
+}
+
 fn account_summary(owner: &Owner) -> Account {
     let limits = owner.limits.as_ref().map(|v| &v["rateLimits"]);
     let usage = owner
@@ -244,7 +287,173 @@ fn account_summary(owner: &Owner) -> Account {
     }
 }
 
+async fn central_registry_users(central: &CentralStore) -> Result<Vec<User>> {
+    let entities = central.load_registry_entities("users").await?;
+    if !entities.is_empty() {
+        return entities
+            .into_iter()
+            .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
+            .collect();
+    }
+    Ok(central
+        .load_registry("users")
+        .await?
+        .map(|bytes| serde_json::from_slice::<Vec<User>>(&bytes))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+async fn central_registry_devices(central: &CentralStore) -> Result<Vec<vault::Device>> {
+    let entities = central.load_registry_entities("devices").await?;
+    if !entities.is_empty() {
+        return entities
+            .into_iter()
+            .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
+            .collect();
+    }
+    Ok(central
+        .load_registry("devices")
+        .await?
+        .map(|bytes| serde_json::from_slice::<Vec<vault::Device>>(&bytes))
+        .transpose()?
+        .unwrap_or_default())
+}
+
 impl Broker {
+    pub(super) fn reject_unshared_workflow(&self, reason: &'static str) -> Option<HttpError> {
+        self.central
+            .as_ref()
+            .filter(|store| store.mode() == super::storage::StoreMode::Postgres)
+            .map(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, reason))
+    }
+
+    async fn ensure_refresh_owner(&self, owner: &mut Owner) -> Result<(), HttpError> {
+        if owner.refresh_enabled && owner.rpc.is_some() {
+            return Ok(());
+        }
+        let import_guard = self.imports.lock().await;
+        let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
+            .clear_for_launch(owner, relogin::AdmissionKind::Restore, &import_guard)
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        launch_owner(owner, &self.binary, proof)
+            .await
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        owner.refresh_enabled = true;
+        owner.available = true;
+        Ok(())
+    }
+
+    pub(super) async fn record_user_central(
+        &self,
+        id: &str,
+        email: &str,
+    ) -> Result<UserEnrollment> {
+        let central = self
+            .central
+            .as_ref()
+            .context("central store is not configured")?;
+        let rows = central.load_registry_entity_revisions("users").await?;
+        if let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id)
+        {
+            let mut user: User = serde_json::from_slice(payload)?;
+            if !user.enabled {
+                return Ok(UserEnrollment::Disabled);
+            }
+            user.email = email.to_owned();
+            if !central
+                .save_registry_entity_cas("users", id, &serde_json::to_vec(&user)?, Some(*revision))
+                .await?
+            {
+                bail!("user changed concurrently; retry");
+            }
+            return Ok(UserEnrollment::Recorded);
+        }
+        let user = User {
+            id: id.to_owned(),
+            email: email.to_owned(),
+            enabled: true,
+            oidc_identity: None,
+        };
+        if !central
+            .save_registry_entity_cas("users", id, &serde_json::to_vec(&user)?, None)
+            .await?
+        {
+            bail!("user was enrolled concurrently; retry");
+        }
+        Ok(UserEnrollment::Recorded)
+    }
+
+    pub(super) async fn record_device_central(&self, device: &vault::Device) -> Result<()> {
+        let central = self
+            .central
+            .as_ref()
+            .context("central store is not configured")?;
+        if !central
+            .save_registry_entity_cas("devices", &device.id, &serde_json::to_vec(device)?, None)
+            .await?
+        {
+            bail!("device was enrolled concurrently; retry");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn sync_registry(&self) -> Result<()> {
+        let local_users = users(&self.state)?;
+        let local_devices = vault::devices(&self.state)?;
+        let (users, devices) = if let Some(central) = self.central.as_ref() {
+            (
+                central_registry_users(central).await?,
+                central_registry_devices(central).await?,
+            )
+        } else {
+            (local_users, local_devices)
+        };
+        if let Some(registry) = self.registry.as_ref() {
+            *registry
+                .write()
+                .map_err(|_| anyhow::anyhow!("registry lock poisoned"))? =
+                RegistryState { users, devices };
+        }
+        Ok(())
+    }
+
+    async fn save_owner_record(&self, owner: &Owner) -> Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        central.save_account(&Self::owner_record(owner)?).await
+    }
+
+    fn owner_record(owner: &Owner) -> Result<CredentialRecord> {
+        Ok(CredentialRecord {
+            account_id: account_key(&owner.vault.user, &owner.vault.alias),
+            user_id: Some(owner.vault.user.clone()),
+            alias: owner.vault.alias.clone(),
+            workspace: Some(vault::account(&owner.vault.auth)?),
+            login: vault::token(&owner.vault.auth)
+                .ok()
+                .and_then(api::token_subject),
+            vault: serde_json::to_value(&owner.vault)?,
+            revision: owner.vault.revision.max(1),
+        })
+    }
+
+    async fn ensure_owner_record(&self, owner: &mut Owner) -> Result<()> {
+        let Some(central) = self.central.as_ref() else {
+            return Ok(());
+        };
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
+        if let Some(record) = central.load_account(&account_id).await? {
+            if record.revision > owner.vault.revision {
+                let committed: Vault = serde_json::from_value(record.vault)?;
+                owner.vault = committed;
+            }
+            return Ok(());
+        }
+        owner.vault.revision = owner.vault.revision.max(1);
+        self.save_owner_record(owner).await
+    }
+
     pub(super) fn record_failure(
         &self,
         reason: &'static str,
@@ -265,24 +474,66 @@ impl Broker {
         self.record_failure(reason, "broker", status);
         HttpError { status, reason }
     }
-    pub fn authorize(&self, headers: &HeaderMap) -> Result<vault::Device, HttpError> {
+    pub async fn authorize(&self, headers: &HeaderMap) -> Result<vault::Device, HttpError> {
         let bearer = headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
             .and_then(|h| h.strip_prefix("Bearer "))
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-        let devices = vault::devices(&self.state)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let (devices, users) =
+            if let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|central| central.mode() != super::storage::StoreMode::File)
+            {
+                let hash = vault::digest(bearer.as_bytes());
+                let Some(device) = central.authorized_device(&hash).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                })?
+                else {
+                    return Err(self.error(StatusCode::UNAUTHORIZED, "unauthorized"));
+                };
+                let enabled = central.enabled_user(&device.user).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                })?;
+                if !enabled {
+                    return Err(self.error(StatusCode::FORBIDDEN, "user_disabled"));
+                }
+                return Ok(device);
+            } else {
+                (
+                    match self.registry.as_ref() {
+                        Some(registry) => registry
+                            .read()
+                            .map_err(|_| {
+                                self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                            })?
+                            .devices
+                            .clone(),
+                        None => vault::devices(&self.state).map_err(|_| {
+                            self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                        })?,
+                    },
+                    match self.registry.as_ref() {
+                        Some(registry) => registry
+                            .read()
+                            .map_err(|_| {
+                                self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                            })?
+                            .users
+                            .clone(),
+                        None => users(&self.state).map_err(|_| {
+                            self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+                        })?,
+                    },
+                )
+            };
         let hash = vault::digest(bearer.as_bytes());
         let device = devices
             .into_iter()
             .find(|d| d.token_hash == hash && !d.revoked && d.tenant == "sawmills")
             .ok_or_else(|| self.error(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-        if !users(&self.state)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
-            .iter()
-            .any(|u| u.id == device.user && u.enabled)
-        {
+        if !users.iter().any(|u| u.id == device.user && u.enabled) {
             return Err(self.error(StatusCode::FORBIDDEN, "user_disabled"));
         }
         Ok(device)
@@ -325,6 +576,58 @@ impl Broker {
                 selected = Some((key.clone(), refresh.clone()));
             }
         }
+        drop(entries);
+        if selected.is_none()
+            && let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|central| central.mode() != super::storage::StoreMode::File)
+        {
+            let record = central
+                .load_account_by_alias(user, alias)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            if let Some(record) = record {
+                let account_state = self
+                    .state
+                    .join("accounts")
+                    .join(account_key(user, &record.alias));
+                let account_vault: Vault = serde_json::from_value(record.vault).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                vault::validate_auth(&account_vault.auth).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                store::ensure_private_dir(&account_state).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                vault::save(&account_state, &self.key, &account_vault).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                let owner = Arc::new(Mutex::new(
+                    prepare_owner(&account_state, &self.key, self.read_only).map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?,
+                ));
+                let key = account_key(user, &record.alias);
+                let mut owners = self.owners.write().await;
+                if let Some((_, existing)) = owners.get(&key) {
+                    selected = Some((key, existing.clone()));
+                } else {
+                    owners.insert(
+                        key.clone(),
+                        (
+                            AccountIndex {
+                                user: user.to_owned(),
+                                alias: record.alias.trim().to_owned(),
+                            },
+                            owner.clone(),
+                        ),
+                    );
+                    selected = Some((key, owner));
+                }
+            }
+        }
         Ok(selected)
     }
     fn owner_failure(&self, error: TokenFailure) -> HttpError {
@@ -341,13 +644,61 @@ impl Broker {
     }
 }
 
+async fn reconcile_owner_from_central(
+    broker: &Broker,
+    owner: &mut Owner,
+    account_id: &str,
+) -> Result<bool, HttpError> {
+    let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    else {
+        return Ok(false);
+    };
+    let Some(record) = central
+        .load_account(account_id)
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+    else {
+        return Ok(false);
+    };
+    if record.revision <= owner.vault.revision {
+        return Ok(false);
+    }
+    let committed: vault::Vault = serde_json::from_value(record.vault)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    vault::validate_auth(&committed.auth)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    vault::save(&owner.state, &owner.key, &committed)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    store::atomic_write(
+        &owner.home.join("auth.json"),
+        &serde_json::to_vec(&committed.auth)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?,
+    )
+    .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    owner.vault = committed;
+    owner.vault.revision = record.revision;
+    // The old child may have cached the spent refresh token. Stop it and let the
+    // next lease holder relaunch from the committed vault.
+    if let Some(rpc) = owner.rpc.as_mut() {
+        rpc.shutdown()
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+    }
+    owner.rpc = None;
+    owner.refresh_enabled = false;
+    Ok(true)
+}
+
 async fn token(
     State(broker): State<Broker>,
     headers: HeaderMap,
     body: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
-    let device = broker.authorize(&headers)?;
-    let Json(request) =
+    let device = broker.authorize(&headers).await?;
+    let Json(mut request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let alias = request
         .alias
@@ -361,20 +712,250 @@ async fn token(
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
+    let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
-        let mut owner = owner.lock().await;
-        let token = owner
-            .tokens(request)
-            .await
-            .map_err(|e| worker.owner_failure(e))?;
-        Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
+        let mut owner = owner_ref.lock().await;
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
+        if worker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+        {
+            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
+        }
+        // `account/read` may refresh even without a forced request. Every
+        // PostgreSQL token path therefore takes the account lease before
+        // invoking the native owner or persisting its result.
+        let lease = if let Some(central) = worker.central.as_ref() {
+            // Ensure the FK target exists before the first request after cutover
+            // or a locally imported account.
+            worker
+                .ensure_owner_record(&mut owner)
+                .await
+                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            Some(
+                central
+                    .acquire_lease(
+                        &account_id,
+                        &worker.holder_id,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+                    .map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                    })?,
+            )
+        } else {
+            None
+        };
+        if lease.is_some()
+            && worker
+                .central
+                .as_ref()
+                .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+            && let Err(error) = worker.ensure_refresh_owner(&mut owner).await
+        {
+            if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
+                let _ = central.release_lease(lease).await;
+            }
+            return Err(error);
+        }
+        if lease.is_some()
+            && worker
+                .central
+                .as_ref()
+                .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+            && match reconcile_owner_from_central(&worker, &mut owner, &account_id).await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
+                    {
+                        let _ = central.release_lease(lease).await;
+                    }
+                    return Err(error);
+                }
+            }
+        {
+            request.previous_revision = None;
+        }
+        let renew_lost = Arc::new(AtomicBool::new(false));
+        let renew_task = match (worker.central.clone(), lease.clone()) {
+            (Some(central), Some(lease)) => {
+                let lost = renew_lost.clone();
+                Some(tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        match central
+                            .renew(&lease, std::time::Duration::from_secs(120))
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                lost.store(true, Ordering::Release);
+                                break;
+                            }
+                            Err(error) => {
+                                eprintln!("central lease renewal: {error:#}");
+                                lost.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
+        let mut retain_lease = false;
+        let result = async {
+            let prior_auth = owner.vault.auth.clone();
+            let token_result = owner.tokens(request).await;
+            let settle_required = matches!(
+                &token_result,
+                Err(TokenFailure::Unavailable(error))
+                    if error.to_string().contains("timed out")
+                        || error.to_string().contains("completion unknown")
+            );
+            if settle_required
+                && let Some(rpc) = owner.rpc.as_mut()
+                && let Err(error) = rpc.settle_and_stop().await
+            {
+                retain_lease = true;
+                owner.available = false;
+                owner.routing_refused = true;
+                owner.refresh_enabled = false;
+                eprintln!("central owner settlement is unknown: {error:#}");
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            }
+            let auth_changed = owner.vault.auth != prior_auth;
+            if auth_changed {
+                owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
+            }
+            let record = CredentialRecord {
+                account_id: account_id.clone(),
+                user_id: Some(owner.vault.user.clone()),
+                alias: owner.vault.alias.clone(),
+                workspace: Some(vault::account(&owner.vault.auth).map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })?),
+                login: vault::token(&owner.vault.auth)
+                    .ok()
+                    .and_then(api::token_subject),
+                vault: serde_json::to_value(&owner.vault).map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?,
+                revision: owner.vault.revision.max(1),
+            };
+            let written = if let Some(central) = worker.central.as_ref() {
+                if let Some(lease) = lease.as_ref() {
+                    let mut result = None;
+                    for attempt in 0..3 {
+                        match central.fenced_write(lease, &record).await {
+                            Ok(written) => {
+                                result = Some(written);
+                                break;
+                            }
+                            Err(error) if attempt < 2 => {
+                                eprintln!("central fenced write retry: {error:#}");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(_error) => {
+                                return Err(worker
+                                    .error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
+                            }
+                        }
+                    }
+                    result.expect("fenced write result")
+                } else {
+                    if let Err(error) = central.save_account(&record).await {
+                        // The local vault remains authoritative in dual mode for
+                        // cached-token delivery. Readiness exposes the DB outage;
+                        // token delivery stays available while the mirror recovers.
+                        eprintln!("central store cached-token mirror: {error:#}");
+                    }
+                    true
+                }
+            } else {
+                true
+            };
+            if !written || renew_lost.load(Ordering::Acquire) {
+                retain_lease = true;
+                owner.available = false;
+                owner.routing_refused = true;
+                owner.refresh_enabled = false;
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            }
+            if auth_changed {
+                vault::save(&owner.state, &owner.key, &owner.vault).map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+            }
+            let token = token_result.map_err(|error| worker.owner_failure(error))?;
+            Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
+        }
+        .await;
+        if let Some(task) = renew_task {
+            task.abort();
+        }
+        if retain_lease {
+            if let (Some(central), Some(lease)) = (worker.central.clone(), lease.clone()) {
+                let owner_ref = owner_ref.clone();
+                let settled = Arc::new(AtomicBool::new(false));
+                let renew_done = settled.clone();
+                let renew_central = central.clone();
+                let renew_lease = lease.clone();
+                tokio::spawn(async move {
+                    while !renew_done.load(Ordering::Acquire) {
+                        if !renew_central
+                            .renew(&renew_lease, std::time::Duration::from_secs(120))
+                            .await
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
+                tokio::spawn(async move {
+                    loop {
+                        let stopped = {
+                            let mut owner = owner_ref.lock().await;
+                            match owner.rpc.as_mut() {
+                                Some(rpc) => match rpc.settle_and_stop().await {
+                                    Ok(_) => {
+                                        owner.rpc = None;
+                                        owner.refresh_enabled = false;
+                                        true
+                                    }
+                                    Err(error) => {
+                                        eprintln!("central owner settlement retry: {error:#}");
+                                        false
+                                    }
+                                },
+                                None => true,
+                            }
+                        };
+                        if stopped {
+                            settled.store(true, Ordering::Release);
+                            let _ = central.release_lease(&lease).await;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                });
+            }
+        } else if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
+            && let Err(error) = central.release_lease(lease).await
+        {
+            eprintln!("central lease release: {error:#}");
+        }
+        result
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
     refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     broker.activity.delivered(&device, alias);
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
@@ -406,9 +987,9 @@ async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
 }
 
 async fn accounts(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     let result = account_catalog(&broker, &device.user, catalog::Freshness::Cached).await?;
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 
@@ -417,6 +998,19 @@ pub(super) async fn account_catalog(
     user: &str,
     freshness: catalog::Freshness,
 ) -> Result<Vec<Account>, HttpError> {
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|store| store.mode() != super::storage::StoreMode::File)
+    {
+        let aliases = central
+            .list_account_aliases(user)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        for alias in aliases {
+            let _ = broker.resolve_alias(user, &alias).await?;
+        }
+    }
     let owners: Vec<_> = broker
         .owners
         .read()
@@ -495,7 +1089,7 @@ async fn import(
     headers: HeaderMap,
     body: Result<Json<Import>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     let Json(input) = body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     normalize_alias(&input.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
@@ -739,9 +1333,29 @@ impl Broker {
                 saved.auth = input.auth;
                 saved.import_rejected = false;
                 saved.label = input.label;
+                saved.revision = saved.revision.saturating_add(1).max(1);
                 vault::save(&state, &self.key, &saved).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
+                let owner_record = CredentialRecord {
+                    account_id: account_key(&saved.user, &saved.alias),
+                    user_id: Some(saved.user.clone()),
+                    alias: saved.alias.clone(),
+                    workspace: Some(
+                        vault::account(&saved.auth)
+                            .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                    ),
+                    login: vault::token(&saved.auth).ok().and_then(api::token_subject),
+                    vault: serde_json::to_value(&saved).map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?,
+                    revision: saved.revision.max(1),
+                };
+                if let Some(central) = self.central.as_ref() {
+                    central.save_account(&owner_record).await.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+                }
             }
         } else {
             store::ensure_private_dir(&state)
@@ -754,9 +1368,29 @@ impl Broker {
                 label: input.label,
                 verified: false,
                 import_rejected: false,
+                revision: 1,
             };
             vault::save(&state, &self.key, &vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            let owner_record = CredentialRecord {
+                account_id: account_key(&vault.user, &vault.alias),
+                user_id: Some(vault.user.clone()),
+                alias: vault.alias.clone(),
+                workspace: Some(
+                    vault::account(&vault.auth)
+                        .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_auth"))?,
+                ),
+                login: vault::token(&vault.auth).ok().and_then(api::token_subject),
+                vault: serde_json::to_value(&vault).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?,
+                revision: vault.revision.max(1),
+            };
+            if let Some(central) = self.central.as_ref() {
+                central.save_account(&owner_record).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+            }
         }
         let owner = Arc::new(Mutex::new(
             prepare_owner(&state, &self.key, self.read_only)
@@ -770,6 +1404,29 @@ impl Broker {
         };
         self.owners.write().await.insert(id, (identity, owner));
         let mut owner = guard;
+        let verification_lease = if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|store| store.mode() != super::storage::StoreMode::File)
+        {
+            self.ensure_owner_record(&mut owner)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            Some(
+                central
+                    .acquire_lease(
+                        &account_key(&owner.vault.user, &owner.vault.alias),
+                        &self.holder_id,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                    })?,
+            )
+        } else {
+            None
+        };
         let verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -798,6 +1455,31 @@ impl Broker {
             owner.vault.verified = true;
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
+            vault::save(&owner.state, &self.key, &owner.vault)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            if let (Some(central), Some(lease)) =
+                (self.central.as_ref(), verification_lease.as_ref())
+            {
+                let written = central
+                    .fenced_write(
+                        lease,
+                        &Self::owner_record(&owner).map_err(|_| {
+                            self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                        })?,
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+                if !written {
+                    return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+                }
+            } else {
+                self.save_owner_record(&owner).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+            }
             // Verification and the durable vault precede retirement. A crash or
             // retirement failure leaves reservations for an explicit migration retry.
             relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
@@ -805,6 +1487,9 @@ impl Broker {
             Ok(account_summary(&owner))
         }
         .await;
+        if let (Some(central), Some(lease)) = (self.central.as_ref(), verification_lease.as_ref()) {
+            let _ = central.release_lease(lease).await;
+        }
         if verification.is_err() {
             owner.available = false;
         }
@@ -812,16 +1497,26 @@ impl Broker {
     }
 }
 async fn me(State(broker): State<Broker>, headers: HeaderMap) -> Result<Json<Value>, HttpError> {
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     Ok(Json(json!({"id":device.user})))
 }
 async fn devices(
     State(broker): State<Broker>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, HttpError> {
-    let current = broker.authorize(&headers)?;
-    let devices = vault::devices(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+    let current = broker.authorize(&headers).await?;
+    let devices = if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    {
+        central_registry_devices(central)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    } else {
+        vault::devices(&broker.state)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    };
     Ok(Json(json!(
         devices
             .into_iter()
@@ -839,17 +1534,56 @@ async fn revoke_device(
     headers: HeaderMap,
     Json(input): Json<RevokeDevice>,
 ) -> Result<StatusCode, HttpError> {
-    let current = broker.authorize(&headers)?;
-    let _lock = vault::registry_lock(&broker.state, "devices.lock")
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
-    let mut devices = vault::devices(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-    let device = devices
-        .iter_mut()
-        .find(|d| d.id == input.id && d.user == current.user)
-        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
-    device.revoked = true;
-    vault::save_devices(&broker.state, &devices)
+    let current = broker.authorize(&headers).await?;
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    {
+        let mut rows = central
+            .load_registry_entity_revisions("devices")
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let (_, payload, revision) = rows
+            .iter_mut()
+            .find(|(id, _, _)| id == &input.id)
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
+        let mut device: vault::Device = serde_json::from_slice(payload)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        if device.user != current.user {
+            return Err(broker.error(StatusCode::NOT_FOUND, "device_not_found"));
+        }
+        device.revoked = true;
+        let updated = central
+            .save_registry_entity_cas(
+                "devices",
+                &input.id,
+                &serde_json::to_vec(&device).map_err(|_| {
+                    broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?,
+                Some(*revision),
+            )
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        if !updated {
+            return Err(broker.error(StatusCode::CONFLICT, "registry_changed"));
+        }
+    } else {
+        let _lock = vault::registry_lock(&broker.state, "devices.lock")
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
+        let mut devices = vault::devices(&broker.state)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        let device = devices
+            .iter_mut()
+            .find(|d| d.id == input.id && d.user == current.user)
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
+        device.revoked = true;
+        vault::save_devices(&broker.state, &devices)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    }
+    broker
+        .sync_registry()
+        .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -864,7 +1598,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
             return Err(broker.error(StatusCode::UNAUTHORIZED, "metrics_unauthorized"));
         }
     } else {
-        broker.authorize(&headers)?;
+        broker.authorize(&headers).await?;
     }
     let mut output: String = broker
         .failures
@@ -895,24 +1629,59 @@ async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> 
     response
 }
 async fn ready(State(broker): State<Broker>) -> Response {
-    let healthy = readiness(&broker).is_success();
+    let local = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
+    let reachable = match broker.central.as_ref() {
+        Some(store) => Some(store.reachable().await),
+        None => None,
+    };
+    let healthy = local && reachable.is_none_or(|value| value);
     let status = if healthy {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+    let mode = broker
+        .central
+        .as_ref()
+        .map_or_else(|| "file".to_owned(), |store| store.mode().to_string());
     (
         status,
-        Json(json!({"ready": healthy, "storeMode": "file", "databaseReachable": null})),
+        Json(json!({
+            "ready": healthy,
+            "storeMode": mode,
+            "databaseReachable": reachable,
+        })),
     )
         .into_response()
 }
+
 pub(super) fn readiness(broker: &Broker) -> StatusCode {
     if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
     }
+}
+
+async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> Result<()> {
+    for record in central.list_accounts().await? {
+        let account_vault: Vault = serde_json::from_value(record.vault.clone())?;
+        vault::validate_auth(&account_vault.auth)?;
+        let account_state = state
+            .join("accounts")
+            .join(account_key(&account_vault.user, &account_vault.alias));
+        let replace = if account_state.join("vault.enc").exists() {
+            let local = vault::load(&account_state, key)?;
+            local.revision < record.revision
+        } else {
+            true
+        };
+        if replace {
+            store::ensure_private_dir(&account_state)?;
+            vault::save(&account_state, key, &account_vault)?;
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
@@ -1061,7 +1830,16 @@ pub async fn serve(
         bail!("network listener requires an HTTPS ingress origin");
     }
     let _lock = vault::lock(state, "owner.lock")?;
-    super::storage::maybe_migrate(state, key).await?;
+    let configured = super::storage::runtime_store(state, key).await?;
+    // File mode deliberately keeps the central store detached: the existing
+    // vault remains the authoritative local path with no token-request cost.
+    let central = match configured {
+        CentralStore::File(_) => None,
+        store => Some(store),
+    };
+    if let Some(central) = central.as_ref() {
+        hydrate_accounts(state, key, central).await?;
+    }
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -1217,6 +1995,50 @@ pub async fn serve(
         }
     }
     drop(startup_import);
+    let registry = if let Some(central) = central.as_ref() {
+        // Convert the phase-two array snapshot to entity rows once.  After
+        // this point authorization and mutations use only per-entity rows;
+        // no pod can replace the shared registry with its local array.
+        let existing_users = central
+            .load_registry_entity_revisions("users")
+            .await?
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for user in self::users(state).unwrap_or_default() {
+            if !existing_users.contains(&user.id) {
+                central
+                    .save_registry_entity_cas("users", &user.id, &serde_json::to_vec(&user)?, None)
+                    .await?;
+            }
+        }
+        let existing_devices = central
+            .load_registry_entity_revisions("devices")
+            .await?
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for device in vault::devices(state).unwrap_or_default() {
+            if !existing_devices.contains(&device.id) {
+                central
+                    .save_registry_entity_cas(
+                        "devices",
+                        &device.id,
+                        &serde_json::to_vec(&device)?,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        let users = central_registry_users(central).await?;
+        let devices = central_registry_devices(central).await?;
+        Some(Arc::new(std::sync::RwLock::new(RegistryState {
+            users,
+            devices,
+        })))
+    } else {
+        None
+    };
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -1253,6 +2075,9 @@ pub async fn serve(
         work: Arc::new(Semaphore::new(128)),
         stopping: Arc::new(AtomicBool::new(false)),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+        holder_id: instance_holder_id(),
+        registry,
+        central,
         metrics_hash: metrics_token_file
             .map(|p| {
                 let bytes = vault::private_read(p)?;
@@ -1337,6 +2162,11 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn holder_id_changes_for_each_boot() {
+        assert_ne!(super::instance_holder_id(), super::instance_holder_id());
+    }
+
+    #[test]
     fn interrupted_registry_setup_keeps_the_completion_marker_absent_and_can_retry() {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
@@ -1382,6 +2212,11 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
         store::atomic_write(&binary,format!("#!/bin/sh\nexport CENTRAL_TEST_MODE_FILE={}\nexport CENTRAL_TEST_REFRESH_COUNTER={}\nexec {} \"$@\"\n",quoted(&mode),quoted(&counter),quoted(&fixture)).as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let central =
+            CentralStore::from_mode(crate::central::storage::StoreMode::File, &state, &key)
+                .await
+                .unwrap();
+        central.migrate().await.unwrap();
         let broker = Broker {
             state,
             key,
@@ -1399,6 +2234,9 @@ mod tests {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            central: Some(central),
+            holder_id: "test-holder".into(),
+            registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
@@ -1456,6 +2294,7 @@ mod tests {
                 label: None,
                 verified: true,
                 import_rejected: false,
+                revision: 0,
             },
         )
         .unwrap();
