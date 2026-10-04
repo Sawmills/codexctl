@@ -473,21 +473,52 @@ fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
     let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
         return false;
     };
-    let Some(home_mount) = mountinfo
+    let mounts = mountinfo
         .lines()
-        .filter_map(|line| line.split_once(" - "))
-        .filter_map(|(mount, _)| mount.split_whitespace().nth(4))
-        .map(|mount| PathBuf::from(mount.replace("\\040", " ")))
-        .filter(|mount| home.starts_with(mount))
-        .max_by_key(|mount| mount.components().count())
+        .filter_map(parse_mountinfo)
+        .collect::<Vec<_>>();
+    let Some(warned_mount) = mounts
+        .iter()
+        .find(|mount| mount.filesystem == "overlay" && mount.mountpoint == warning_path)
+    else {
+        // A warning without a matching mount entry is ambiguous. Keep the
+        // inventory fail-closed rather than trusting a pathname alone.
+        return false;
+    };
+    let Some(home_mount) = mounts
+        .iter()
+        .filter(|mount| home.starts_with(&mount.mountpoint))
+        .max_by_key(|mount| mount.mountpoint.components().count())
     else {
         return false;
     };
-    !home_mount.starts_with(warning_path)
+    warned_mount.id != home_mount.id && !home.starts_with(&warned_mount.mountpoint)
 }
 #[cfg(not(target_os = "linux"))]
 fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
     false
+}
+#[cfg(target_os = "linux")]
+struct MountInfo {
+    id: u64,
+    mountpoint: PathBuf,
+    filesystem: String,
+}
+#[cfg(target_os = "linux")]
+fn parse_mountinfo(line: &str) -> Option<MountInfo> {
+    let (mount, filesystem) = line.split_once(" - ")?;
+    let fields = mount.split_whitespace().collect::<Vec<_>>();
+    Some(MountInfo {
+        id: fields.first()?.parse().ok()?,
+        mountpoint: PathBuf::from(unescape_mountinfo(fields.get(4)?)),
+        filesystem: filesystem.split_whitespace().next()?.to_owned(),
+    })
+}
+#[cfg(target_os = "linux")]
+fn unescape_mountinfo(path: &str) -> String {
+    path.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\134", "\\")
 }
 fn is_open(path: &Path, home: &Path) -> Result<bool> {
     let output = lsof(
@@ -597,20 +628,39 @@ fn restore_backup(
     Ok(found)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use super::{harmless_lsof_warning, overlay_warning_is_unrelated};
+    use super::{MountInfo, harmless_lsof_warning, overlay_warning_is_unrelated, parse_mountinfo};
+    use std::fs;
     use std::path::Path;
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn docker_overlay_warning_is_ignored_outside_the_selected_mount() {
-        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
+        let Some(mount) = fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .filter_map(parse_mountinfo)
+                    .find(|mount: &MountInfo| {
+                        mount.filesystem == "overlay"
+                            && mount.mountpoint.starts_with("/var/lib/docker/")
+                    })
+            })
+        else {
+            return;
+        };
+        let line = format!(
+            "lsof: WARNING: can't stat() overlay file system {}",
+            mount.mountpoint.display()
+        );
         assert!(overlay_warning_is_unrelated(
-            std::str::from_utf8(line).unwrap(),
+            &line,
             Path::new("/tmp/codexctl-home")
         ));
-        assert!(harmless_lsof_warning(line, Path::new("/tmp/codexctl-home")));
+        assert!(harmless_lsof_warning(
+            line.as_bytes(),
+            Path::new("/tmp/codexctl-home")
+        ));
     }
 
     #[test]
