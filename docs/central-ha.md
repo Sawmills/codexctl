@@ -161,6 +161,14 @@ or row counts do not match the reviewed plan.
    migration Job mounts the retained PVC at `/data` and runs `migrate`; submit
    a second copy with `backfill` as its command after migration completes:
 
+   Apply the migration-only egress policy before creating either Job. It
+   matches the `app.kubernetes.io/name: codexctl-migration` label below and
+   permits only cluster DNS and the private PostgreSQL network:
+
+   ```sh
+   kubectl --context plat-staging apply -f deploy/k8s/overlays/staging-ha/migration-networkpolicy.yaml
+   ```
+
    The scale-down starts a maintenance window: the existing Ingress has no
    token-serving backend until the HA Deployment is ready. Announce the
    expected token outage, reject or drain token traffic during migration, and
@@ -182,6 +190,9 @@ or row counts do not match the reviewed plan.
    spec:
      ttlSecondsAfterFinished: 86400
      template:
+       metadata:
+         labels:
+           app.kubernetes.io/name: codexctl-migration
        spec:
          securityContext:
            runAsUser: 10001
@@ -293,6 +304,9 @@ or row counts do not match the reviewed plan.
    spec:
      ttlSecondsAfterFinished: 86400
      template:
+       metadata:
+         labels:
+           app.kubernetes.io/name: codexctl-migration
        spec:
          securityContext:
            runAsUser: 10001

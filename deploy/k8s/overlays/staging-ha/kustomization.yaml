@@ -5,6 +5,7 @@ resources:
   - namespace.yaml
   - service.yaml
   - networkpolicy.yaml
+  - migration-networkpolicy.yaml
   - sso.yaml
   - codexctl-externalsecret.yaml
   - deployment.yaml
