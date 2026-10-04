@@ -399,7 +399,10 @@ async fn refresh_legacy_usage(token: &mut TokenResponse) {
         return;
     };
     token.billing_class = Some(super::server::usage_billing_class(&authoritative));
-    token.chatgpt_plan_type = authoritative.plan_type.clone();
+    token.chatgpt_plan_type = authoritative
+        .plan_type
+        .clone()
+        .or(token.chatgpt_plan_type.take());
     token.statusline_usage = Some(crate::statusline::Usage::from_usage(&authoritative));
 }
 
