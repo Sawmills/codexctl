@@ -319,6 +319,7 @@ impl Broker {
         &self,
         owner: &mut Owner,
         imports: &tokio::sync::MutexGuard<'_, ()>,
+        allow_retry: bool,
     ) -> Result<(), HttpError> {
         if owner.refresh_enabled && owner.rpc.is_some() {
             return Ok(());
@@ -329,7 +330,7 @@ impl Broker {
         if self.read_only
             || self.stopping.load(Ordering::Acquire)
             || self.ownership_unresolved.load(Ordering::Acquire)
-            || !owner.available
+            || (!owner.available && !allow_retry)
             || owner.routing_refused
         {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
@@ -649,7 +650,7 @@ impl Broker {
             TokenFailure::UnsupportedRouting => {
                 self.error(StatusCode::CONFLICT, "unsupported_workspace_routing")
             }
-            TokenFailure::Unavailable(_) => {
+            TokenFailure::Unavailable(_) | TokenFailure::Retryable(_, _) => {
                 self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
         }
@@ -788,7 +789,6 @@ async fn token(
             if let Some(rpc) = owner.rpc.take() {
                 rpc.terminate().await;
             }
-            owner.available = true;
         }
         // A retry cannot take over recovery, even after the child stops: the
         // final credentials may still be waiting for a durable shared write.
@@ -834,7 +834,18 @@ async fn token(
             let Some(imports) = import_guard.as_ref() else {
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             };
-            if let Err(error) = worker.ensure_refresh_owner(&mut owner, imports).await {
+            if let Err(error) = worker
+                .ensure_refresh_owner(&mut owner, imports, retry)
+                .await
+            {
+                if retry && owner.retryable_unavailable {
+                    owner.retry_failures = owner.retry_failures.saturating_add(1);
+                    if owner.retry_failures >= 3 {
+                        owner.fence(false);
+                    } else {
+                        owner.retry_started = Some(retry_clock_now());
+                    }
+                }
                 if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
                     let _ = central.release_lease(lease).await;
                 }
@@ -892,8 +903,14 @@ async fn token(
         let before = owner.vault.clone();
         let result = async {
             let owner_was_available = owner.available;
+            if retry && owner.retry_requires_billing {
+                request.billing = true;
+            }
             let token_result = owner.tokens(request).await;
-            if owner_was_available && owner.rpc.as_ref().is_some_and(Rpc::retryable_failure) {
+            if owner_was_available && matches!(&token_result, Err(TokenFailure::Retryable(_, _))) {
+                if matches!(&token_result, Err(TokenFailure::Retryable(_, true))) {
+                    owner.retry_requires_billing = true;
+                }
                 owner.fence(true);
                 if retry {
                     owner.retry_failures = owner.retry_failures.saturating_add(1);
@@ -988,18 +1005,21 @@ async fn token(
                 })?;
             }
             retain_lease = false;
+            let retryable_token_failure =
+                matches!(&token_result, Err(TokenFailure::Retryable(_, _)));
             let token = match token_result {
                 Ok(token) => {
                     owner.retry_failures = 0;
                     owner.retry_started = None;
                     owner.retryable_unavailable = false;
+                    owner.retry_requires_billing = false;
                     if retry {
                         owner.available = true;
                     }
                     token
                 }
                 Err(error) => {
-                    if retry && owner.retryable_unavailable && !retry_failure_recorded {
+                    if retry && retryable_token_failure && !retry_failure_recorded {
                         owner.retry_failures = owner.retry_failures.saturating_add(1);
                         if owner.retry_failures >= 3 {
                             owner.fence(false);
@@ -1869,6 +1889,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         key: key.into(),
         available: true,
         retryable_unavailable: false,
+        retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
         routing_refused: false,
@@ -2052,6 +2073,7 @@ pub async fn serve(
                     key: key.into(),
                     available: false,
                     retryable_unavailable: false,
+                    retry_requires_billing: false,
                     retry_started: None,
                     retry_failures: 0,
                     routing_refused: false,

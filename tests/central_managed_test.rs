@@ -242,6 +242,14 @@ impl Server {
             .send()
             .unwrap()
     }
+    fn token_without_billing(&self, token: &str, alias: &str) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/token", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .unwrap()
+    }
     fn token_with_account(
         &self,
         token: &str,
@@ -2235,6 +2243,34 @@ fn retryable_billing_failure_replaces_rpc_and_keeps_catalog_selectable() {
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
 }
 
 #[test]

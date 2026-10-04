@@ -653,14 +653,19 @@ async fn dashboard_redirects_if_session_ends_during_snapshot() {
 
 impl Fixture {
     async fn attach_refresh_store(&mut self, mode: &str) -> CentralStore {
+        self.attach_refresh_store_with_mode(super::super::storage::StoreMode::File, mode)
+            .await
+    }
+
+    async fn attach_refresh_store_with_mode(
+        &mut self,
+        store_mode: super::super::storage::StoreMode,
+        mode: &str,
+    ) -> CentralStore {
         use std::os::unix::fs::PermissionsExt;
-        let central = CentralStore::from_mode(
-            super::super::storage::StoreMode::File,
-            &self.broker.state,
-            &self.broker.key,
-        )
-        .await
-        .unwrap();
+        let central = CentralStore::from_mode(store_mode, &self.broker.state, &self.broker.key)
+            .await
+            .unwrap();
         central.migrate().await.unwrap();
         self.broker.central = Some(central.clone());
         self.broker.read_only = false;
@@ -689,6 +694,29 @@ impl Fixture {
         owner.refresh_enabled = true;
         central
     }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn postgres_retry_recovers_after_marked_billing_failure() {
+    if std::env::var("DATABASE_URL").is_err() {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("DATABASE_URL must be set for PostgreSQL managed retry scenarios in CI");
+        }
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(2)).await;
+    let _central = fixture
+        .attach_refresh_store_with_mode(
+            super::super::storage::StoreMode::Postgres,
+            "billing-error-marked",
+        )
+        .await;
+
+    assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+    store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&fixture._root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
 #[tokio::test]

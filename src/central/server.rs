@@ -85,6 +85,7 @@ pub(super) enum TokenFailure {
     RefreshDisabled,
     UnsupportedRouting,
     Unavailable(anyhow::Error),
+    Retryable(anyhow::Error, bool),
 }
 
 pub(super) fn retry_clock_now() -> u64 {
@@ -118,6 +119,7 @@ pub(super) struct Owner {
     pub(super) key: PathBuf,
     pub(super) available: bool,
     pub(super) retryable_unavailable: bool,
+    pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
     pub(super) routing_refused: bool,
@@ -308,7 +310,14 @@ impl Owner {
         }
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
-        result?;
+        if let Err(error) = result {
+            if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+                && !error.is::<RoutingPolicyError>()
+            {
+                return Err(TokenFailure::Retryable(error, false));
+            }
+            return Err(error.into());
+        }
         self.with_billing(current, request.billing).await
     }
 
@@ -339,18 +348,23 @@ impl Owner {
                 if snapshot.is_err() {
                     self.fence(false);
                 }
-                if result.is_err() {
-                    if snapshot.is_ok() {
-                        self.fence(
-                            result
-                                .as_ref()
-                                .is_err_and(|error| error.is::<super::rpc::RetryableUsageRead>()),
-                        );
-                    }
-                    eprintln!("central owner refresh failed reason=owner_refresh_failed");
-                }
                 token = snapshot?;
-                let limits = result?;
+                let limits = match result {
+                    Ok(limits) => limits,
+                    Err(error)
+                        if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+                            && !error.is::<RoutingPolicyError>() =>
+                    {
+                        self.fence(true);
+                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
+                        return Err(TokenFailure::Retryable(error, true));
+                    }
+                    Err(error) => {
+                        self.fence(false);
+                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
+                        return Err(error.into());
+                    }
+                };
                 token.billing_class = Some(billing_class(&limits));
                 token.chatgpt_plan_type = limits
                     .pointer("/rateLimits/planType")
@@ -381,7 +395,16 @@ impl Owner {
             {
                 self.routing_refused = true;
             }
-            let account = result?;
+            let account = match result {
+                Ok(account) => account,
+                Err(error)
+                    if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+                        && !error.is::<RoutingPolicyError>() =>
+                {
+                    return Err(TokenFailure::Retryable(error, false));
+                }
+                Err(error) => return Err(error.into()),
+            };
             if supported_native_routing(&account) != Some(current.chatgpt_account_id.as_str()) {
                 self.routing_refused = true;
                 return Err(TokenFailure::UnsupportedRouting);
@@ -596,7 +619,7 @@ async fn tokens(
             TokenFailure::AccountMismatch => broker.error(StatusCode::BAD_REQUEST, "account_mismatch"),
             TokenFailure::RefreshDisabled => broker.error(StatusCode::CONFLICT, "refresh_disabled"),
             TokenFailure::UnsupportedRouting => broker.error(StatusCode::CONFLICT, "unsupported_workspace_routing"),
-            TokenFailure::Unavailable(error) => {
+            TokenFailure::Unavailable(error) | TokenFailure::Retryable(error, _) => {
                 eprintln!("{}", json!({"operation":"token_request","stage":"owner","reason":"owner_unavailable","detail":error.to_string()}));
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
@@ -666,6 +689,7 @@ pub async fn serve(
         key: key.into(),
         available: true,
         retryable_unavailable: false,
+        retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
         routing_refused: false,
