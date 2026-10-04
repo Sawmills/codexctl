@@ -30,6 +30,9 @@ codexctl list --json
       "primary_resets_at": "2099-12-25T05:00:00Z",
       "secondary_resets_at": "2100-01-01T00:00:00Z",
       "resets_at": "2100-01-01T00:00:00Z",
+      "resets_banked": 2,
+      "resets_redeemable": 1,
+      "resets_next_expiry": "2099-12-31T00:00:00Z",
       "billing_class": "rate_limited",
       "error": null,
       "usage_age_seconds": 12,
@@ -61,6 +64,9 @@ An empty result is `{"version":1,"accounts":[]}`.
 - `primary_resets_at`, `secondary_resets_at`: Each window's reset time in RFC 3339 UTC format, or `null` when unknown.
 - `resets_at`: The long window's reset time in RFC 3339 UTC format, or `null`.
   This existing field remains an alias of `secondary_resets_at`.
+- `resets_banked`: Number of banked resets held by the account, or `null` when usage is unavailable.
+- `resets_redeemable`: Number of banked resets that may be redeemed now, or `null` when usage is unavailable.
+- `resets_next_expiry`: RFC 3339 UTC expiry of the soonest redeemable banked reset, or `null` when no credit listing is available or no credit can be redeemed.
 - `billing_class`: `rate_limited`, `usage_based`, or `unknown`.
   Failed requests keep unknown billing, regardless of the table's display group.
 - `error`: A brief account error, or `null`.
