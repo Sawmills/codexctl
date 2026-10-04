@@ -401,6 +401,10 @@ pub fn launch_owners() -> Result<std::collections::BTreeMap<u32, String>> {
     if !lanes.try_exists()? {
         return Ok(owners);
     }
+    // Serialize this read-only scan with launch directory creation. In
+    // particular, never probe a freshly-created owner.lock before its launcher
+    // has acquired it.
+    let _sweep = vault::registry_lock(&lanes, "sweep.lock")?;
     for entry in std::fs::read_dir(lanes)? {
         let entry = entry?;
         if !entry.file_name().to_string_lossy().starts_with("launch-")
@@ -422,7 +426,10 @@ pub fn launch_owners() -> Result<std::collections::BTreeMap<u32, String>> {
         let Some(owner) = owner else {
             continue;
         };
-        if !owner.alive()? {
+        // A held owner lock proves the launcher has not been swept. On hosts
+        // where the process-time probe is unavailable, retain that durable
+        // launch record and let rate report its inventory warning.
+        if matches!(owner.alive(), Ok(false)) {
             continue;
         }
         let Ok(connection) = read_connection(&connection_path) else {

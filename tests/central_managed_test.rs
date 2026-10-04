@@ -8057,3 +8057,103 @@ fn b21d_log_ownership_requires_a_live_process_and_evidence_from_its_lifetime() {
     assert_eq!(report["accounts"][0]["owned_pids"], json!([]));
     assert_eq!(report["accounts"][0]["pids"], json!([child.0.id()]));
 }
+
+#[test]
+fn b21d_rate_waits_for_a_launch_to_finish_creating_its_owner_lock() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let lanes = home.path().join(".codexctl/central/lanes");
+    std::fs::create_dir_all(&lanes).unwrap();
+    let sweep = std::fs::File::create(lanes.join("sweep.lock")).unwrap();
+    sweep.lock().unwrap();
+    // Reproduce the launcher's create-file -> acquire-lock interval, with the
+    // same sweep lease held by run_pinned_codex throughout directory creation.
+    let launch = lanes.join("launch-in-progress");
+    std::fs::create_dir(&launch).unwrap();
+    let owner = std::fs::File::create(launch.join("owner.lock")).unwrap();
+    let mut report = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["rate", "--json"])
+        .env("HOME", home.path())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        assert!(
+            report.try_wait().unwrap().is_none(),
+            "rate read a half-created launch without the sweep lease"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    owner
+        .try_lock()
+        .expect("rate must not take a new launch's owner lock");
+    sweep.unlock().unwrap();
+    let output = report.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn b21d_rate_warns_and_keeps_launch_ownership_when_ps_is_unavailable() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let mut lane = B21Lane::start(home.path(), "ps-missing-ready");
+    let owner_pid = serde_json::from_slice::<Value>(
+        &std::fs::read(lane.connection.with_file_name("owner.json")).unwrap(),
+    )
+    .unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    let bin = home.path().join("broken-bin");
+    std::fs::create_dir(&bin).unwrap();
+    store::atomic_write(
+        &bin.join("ps"),
+        b"#!/bin/sh
+exit 127
+",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("ps"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["rate", "--json"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        report["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty())
+    );
+    let lane_row = report["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["account"] == "lane")
+        .unwrap();
+    assert_eq!(
+        lane_row["owned_pids"],
+        json!([{"pid":owner_pid,"source":"launch"}])
+    );
+    lane.signal_and_wait(libc::SIGTERM);
+}

@@ -1,17 +1,13 @@
 //! Current process ownership, independent of response-log activity.
-use anyhow::Result;
-#[cfg(unix)]
-use anyhow::{Context, bail};
 use serde::Serialize;
+use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(super) enum Source {
-    #[cfg(unix)]
     Launch,
-    #[cfg(unix)]
     HostDefault,
     Log,
 }
@@ -22,16 +18,49 @@ pub(super) struct LiveProcess {
     pub account: Option<(String, Source)>,
 }
 
+pub(super) struct Snapshot {
+    pub processes: Vec<LiveProcess>,
+    pub warnings: Vec<String>,
+}
+
+fn launch_only(launchers: &BTreeMap<u32, String>) -> Vec<LiveProcess> {
+    launchers
+        .iter()
+        .map(|(&pid, alias)| LiveProcess {
+            pid,
+            started_at: chrono::Utc::now().timestamp(),
+            account: Some((alias.clone(), Source::Launch)),
+        })
+        .collect()
+}
+
 #[cfg(unix)]
-pub(super) fn snapshot(host_account: Option<&str>) -> Result<Vec<LiveProcess>> {
+pub(super) fn snapshot(host_account: Option<&str>) -> Snapshot {
     use std::path::Path;
     use std::process::Command;
-    let home = dirs::home_dir().context("cannot locate home directory")?;
+    let mut warnings = Vec::new();
+    let home = match dirs::home_dir() {
+        Some(home) => home,
+        None => {
+            warnings
+                .push("live process inventory unavailable: cannot locate home directory".into());
+            return Snapshot {
+                processes: Vec::new(),
+                warnings,
+            };
+        }
+    };
     #[cfg(feature = "central-prototype")]
-    let launchers = codexctl::central::native::launch_owners()?;
+    let launchers = match codexctl::central::native::launch_owners() {
+        Ok(launchers) => launchers,
+        Err(error) => {
+            warnings.push(format!("live launch inventory unavailable: {error:#}"));
+            BTreeMap::new()
+        }
+    };
     #[cfg(not(feature = "central-prototype"))]
     let launchers: BTreeMap<u32, String> = BTreeMap::new();
-    let output = Command::new("ps")
+    let output = match Command::new("ps")
         .args([
             "-u",
             &unsafe { libc::geteuid() }.to_string(),
@@ -41,22 +70,48 @@ pub(super) fn snapshot(host_account: Option<&str>) -> Result<Vec<LiveProcess>> {
         .env("LC_ALL", "C")
         .env("TZ", "UTC")
         .output()
-        .context("cannot inspect live Codex processes")?;
+    {
+        Ok(output) => output,
+        Err(error) => {
+            warnings.push(format!("live process inventory unavailable: {error}"));
+            return Snapshot {
+                processes: fallback_processes(host_account, &home, &launchers),
+                warnings,
+            };
+        }
+    };
     if !output.status.success() {
-        bail!("cannot inspect live Codex processes");
+        warnings.push("live process inventory unavailable: ps returned a failure".into());
+        return Snapshot {
+            processes: fallback_processes(host_account, &home, &launchers),
+            warnings,
+        };
     }
     let mut processes = BTreeMap::new();
-    for line in std::str::from_utf8(&output.stdout)?.lines() {
+    let output_text = match std::str::from_utf8(&output.stdout) {
+        Ok(text) => text,
+        Err(_) => {
+            warnings.push("live process inventory unavailable: ps output was not UTF-8".into());
+            return Snapshot {
+                processes: fallback_processes(host_account, &home, &launchers),
+                warnings,
+            };
+        }
+    };
+    let mut malformed = 0usize;
+    for line in output_text.lines() {
         let mut fields = line.split_whitespace();
         let Some((pid, parent)) = fields
             .next()
             .and_then(|p| p.parse::<u32>().ok())
             .zip(fields.next().and_then(|p| p.parse::<u32>().ok()))
         else {
+            malformed += 1;
             continue;
         };
         let start = fields.by_ref().take(5).collect::<Vec<_>>().join(" ");
         let Ok(start) = chrono::NaiveDateTime::parse_from_str(&start, "%a %b %e %T %Y") else {
+            malformed += 1;
             continue;
         };
         let started_at = start.and_utc().timestamp();
@@ -78,6 +133,10 @@ pub(super) fn snapshot(host_account: Option<&str>) -> Result<Vec<LiveProcess>> {
             .file_name()
             .is_some_and(|name| name == "codex" || name == "codex-app-server");
         processes.insert(pid, (parent, started_at, codex));
+    }
+    if malformed > 0 {
+        warnings
+            .push("live process inventory partially unavailable: incompatible ps output".into());
     }
     let mut result = Vec::new();
     for (&pid, &(parent, started_at, codex)) in &processes {
@@ -115,7 +174,85 @@ pub(super) fn snapshot(host_account: Option<&str>) -> Result<Vec<LiveProcess>> {
             });
         }
     }
-    Ok(result)
+    Snapshot {
+        processes: result,
+        warnings,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn fallback_processes(
+    host_account: Option<&str>,
+    home: &std::path::Path,
+    launchers: &BTreeMap<u32, String>,
+) -> Vec<LiveProcess> {
+    let mut processes = BTreeMap::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<_> = rest.split_whitespace().collect();
+        if fields.first() == Some(&"Z") {
+            continue;
+        }
+        let Some(parent) = fields.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(started_at) = fields.get(19).and_then(|value| value.parse::<i64>().ok()) else {
+            continue;
+        };
+        let codex = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name == "codex" || name == "codex-app-server")
+            })
+            .unwrap_or(false);
+        processes.insert(pid, (parent, started_at, codex));
+    }
+    let mut result = launch_only(launchers);
+    for (&pid, &(parent, started_at, codex)) in &processes {
+        let mut ancestor = parent;
+        let mut visited = BTreeSet::new();
+        let mut alias = None;
+        while visited.insert(ancestor) {
+            if let Some(value) = launchers.get(&ancestor) {
+                alias = Some(value.clone());
+                break;
+            }
+            let Some(&(next, _, _)) = processes.get(&ancestor) else {
+                break;
+            };
+            ancestor = next;
+        }
+        if alias.is_none() && codex && process_home(pid, home).is_some_and(|default| default) {
+            result.push(LiveProcess {
+                pid,
+                started_at,
+                account: host_account.map(|alias| (alias.to_owned(), Source::HostDefault)),
+            });
+        }
+    }
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fallback_processes(
+    _host_account: Option<&str>,
+    _home: &std::path::Path,
+    launchers: &BTreeMap<u32, String>,
+) -> Vec<LiveProcess> {
+    launch_only(launchers)
 }
 
 /// None means another home or unreadable evidence. False means an isolated or
@@ -190,6 +327,9 @@ fn process_environment(_pid: u32) -> Option<Vec<u8>> {
 }
 
 #[cfg(not(unix))]
-pub(super) fn snapshot(_host_account: Option<&str>) -> Result<Vec<LiveProcess>> {
-    Ok(Vec::new())
+pub(super) fn snapshot(_host_account: Option<&str>) -> Snapshot {
+    Snapshot {
+        processes: Vec::new(),
+        warnings: Vec::new(),
+    }
 }

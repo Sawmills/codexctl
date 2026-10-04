@@ -35,6 +35,8 @@ struct Report {
     host: String,
     window_minutes: u32,
     generated_at: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     accounts: Vec<AccountRate>,
 }
 
@@ -77,8 +79,9 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
                 && matches!(account.state, codexctl::status_json::State::Active)
         })
         .map(|account| account.alias.as_str());
-    let live = ownership::snapshot(host_account)?;
-    let report = collect_report(db.as_ref(), &accounts, minutes, &live)?;
+    let snapshot = ownership::snapshot(host_account);
+    let mut report = collect_report(db.as_ref(), &accounts, minutes, &snapshot.processes)?;
+    report.warnings = snapshot.warnings;
     if json {
         println!("{}", serde_json::to_string(&report)?);
     } else {
@@ -322,6 +325,7 @@ fn collect_report(
         host: hostname::get()?.to_string_lossy().into_owned(),
         window_minutes: minutes,
         generated_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        warnings: Vec::new(),
         accounts: rows,
     })
 }

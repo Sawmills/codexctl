@@ -365,6 +365,9 @@ contain `account`, `weekly_used_percent`, `responses_ok`, `responses_429`, `rate
 `processes`, `pids`, and `owned_pids`. `rate_429` is 429s divided by successes plus
 429s (zero without responses); unknown weekly usage is null.
 
+When live process inspection is unavailable, JSON also contains a `warnings` array;
+launch ownership and log counts remain available. An empty warnings array is omitted.
+
 `owned_pids` is an array such as `[{"pid":123,"source":"launch"}]`, sorted by PID.
 On Linux and macOS it reports live processes independently of the response window:
 

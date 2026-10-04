@@ -57,13 +57,15 @@ fn incarnation(pid: u32) -> Result<Option<String>> {
     {
         let output = std::process::Command::new("ps")
             .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
             .output()?;
+        if !output.status.success() {
+            bail!("cannot identify process incarnation");
+        }
         let start = String::from_utf8(output.stdout)?.trim().to_owned();
         if start.is_empty() {
             return Ok(None);
-        }
-        if !output.status.success() {
-            bail!("cannot identify credential owner");
         }
         Ok(Some(start))
     }
