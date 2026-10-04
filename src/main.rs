@@ -126,7 +126,14 @@ enum Commands {
     /// Switch to a profile by alias (or most available if omitted)
     Use {
         /// Profile alias to switch to (auto-selects most available if omitted)
+        #[arg(conflicts_with = "history")]
         alias: Option<String>,
+        /// Print recent active-account pointer changes without changing accounts
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "20", conflicts_with_all = ["allow_billing", "allow_resets", "restart_daemon"])]
+        history: Option<usize>,
+        /// Print history as a JSON array
+        #[arg(long, requires = "history")]
+        json: bool,
         /// Deprecated compatibility flag. Automatic selection now warns and
         /// continues without prompting.
         #[arg(long, hide = true)]
@@ -325,15 +332,33 @@ fn main() {
         },
         Commands::Use {
             ref alias,
+            history,
+            json,
             allow_billing,
             allow_resets,
             restart_daemon,
-        } => commands::use_profile::run(
-            alias.as_deref(),
-            allow_billing,
-            allow_resets,
-            restart_daemon,
-        ),
+        } => {
+            if let Some(limit) = history {
+                #[cfg(feature = "central-prototype")]
+                {
+                    codexctl::central::native::print_history(limit, json)
+                }
+                #[cfg(not(feature = "central-prototype"))]
+                {
+                    let _ = (limit, json);
+                    Err(anyhow::anyhow!(
+                        "--history requires the central provider feature"
+                    ))
+                }
+            } else {
+                commands::use_profile::run(
+                    alias.as_deref(),
+                    allow_billing,
+                    allow_resets,
+                    restart_daemon,
+                )
+            }
+        }
         Commands::Switch => commands::switch::run(),
         Commands::Resets {
             ref redeem,
@@ -463,6 +488,29 @@ mod tests {
         match codex_command_outcome(Ok(130)) {
             CommandOutcome::Exit(code) => assert_eq!(code, 130),
             CommandOutcome::Continue(_) => panic!("expected process exit"),
+        }
+    }
+
+    #[test]
+    fn use_history_is_optional_and_read_only() {
+        let cli = Cli::parse_from(["codexctl", "use", "--history", "--json"]);
+        match cli.command {
+            Commands::Use {
+                alias,
+                history,
+                json,
+                allow_billing,
+                allow_resets,
+                restart_daemon,
+            } => {
+                assert_eq!(alias, None);
+                assert_eq!(history, Some(20));
+                assert!(json);
+                assert!(!allow_billing);
+                assert!(!allow_resets);
+                assert!(!restart_daemon);
+            }
+            _ => panic!("expected use command"),
         }
     }
 }

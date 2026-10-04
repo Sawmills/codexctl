@@ -6,14 +6,14 @@ use super::{
 use crate::{api, config, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     time::Duration,
 };
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
@@ -27,6 +27,7 @@ const ACTIVE_HISTORY_ROTATED: &str = "active-history.jsonl.1";
 const ACTIVE_HISTORY_LIMIT: u64 = 1024 * 1024;
 const BILLING_SWITCH_NOTICE: &str = "ALL running Codex sessions on this machine will also move to this account within 60 seconds and may bill credits.";
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PointerCause {
     Use,
@@ -96,10 +97,61 @@ fn root() -> Result<PathBuf> {
 fn alias_from_pointer_bytes(bytes: Option<&[u8]>) -> Option<String> {
     let raw = std::str::from_utf8(bytes?).ok()?;
     let alias = raw.trim();
-    if alias.is_empty() || (raw != alias && raw != format!("{alias}\n") && raw != format!("{alias}\r\n")) {
+    if alias.is_empty()
+        || (raw != alias && raw != format!("{alias}\n") && raw != format!("{alias}\r\n"))
+    {
         return None;
     }
     store::validate_alias(alias).ok().map(str::to_owned)
+}
+
+fn render_parent_cmd(args: &[String]) -> String {
+    let mut rendered = Vec::new();
+    let mut redact = false;
+    for arg in args {
+        let lower = arg.to_ascii_lowercase();
+        if redact {
+            rendered.push("<redacted>".to_owned());
+            redact = lower == "bearer";
+        } else if lower == "bearer" {
+            rendered.push("<redacted>".to_owned());
+            redact = true;
+        } else if lower.starts_with("bearer ")
+            || lower.contains("token=")
+            || lower.contains("password=")
+            || lower.contains("secret=")
+            || lower.contains("key=")
+            || lower.contains("credential=")
+            || lower.contains("authorization=")
+            || (lower.split('.').count() == 3 && arg.len() > 30)
+        {
+            rendered.push("<redacted>".to_owned());
+        } else {
+            redact = matches!(
+                lower.as_str(),
+                "token"
+                    | "--token"
+                    | "password"
+                    | "--password"
+                    | "secret"
+                    | "--secret"
+                    | "key"
+                    | "--key"
+                    | "api-key"
+                    | "--api-key"
+                    | "access-token"
+                    | "--access-token"
+                    | "refresh-token"
+                    | "--refresh-token"
+                    | "authorization"
+                    | "--authorization"
+                    | "credential"
+                    | "--credential"
+            );
+            rendered.push(arg.clone());
+        }
+    }
+    rendered.join(" ").chars().take(200).collect()
 }
 
 fn parent_cmd() -> String {
@@ -124,34 +176,17 @@ fn parent_cmd() -> String {
                 .output()
                 .ok()
                 .filter(|output| output.status.success())
-                .map(|output| vec![String::from_utf8_lossy(&output.stdout).trim().to_owned()])
+                .map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect()
+                })
         })
         .unwrap_or_default();
     #[cfg(not(unix))]
     let args: Vec<String> = Vec::new();
-    let mut rendered = Vec::new();
-    let mut redact = false;
-    for arg in args {
-        let lower = arg.to_ascii_lowercase();
-        if redact {
-            rendered.push("<redacted>".to_owned());
-            redact = false;
-        } else if lower.starts_with("bearer ")
-            || lower.contains("password")
-            || lower.contains("secret")
-            || lower.contains("token=")
-            || (lower.split('.').count() == 3 && arg.len() > 30)
-        {
-            rendered.push("<redacted>".to_owned());
-        } else {
-            redact = lower.ends_with("token")
-                || lower.ends_with("password")
-                || lower.ends_with("secret")
-                || lower.ends_with("key");
-            rendered.push(arg);
-        }
-    }
-    rendered.join(" ").chars().take(200).collect()
+    render_parent_cmd(&args)
 }
 
 fn tty_path() -> Option<String> {
@@ -160,7 +195,10 @@ fn tty_path() -> Option<String> {
         let mut bytes = [0u8; 256];
         let result = unsafe { libc::ttyname_r(0, bytes.as_mut_ptr().cast(), bytes.len()) };
         if result == 0 {
-            let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+            let end = bytes
+                .iter()
+                .position(|byte| *byte == 0)
+                .unwrap_or(bytes.len());
             return std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned);
         }
     }
@@ -175,7 +213,10 @@ fn append_active_history(
 ) -> Result<()> {
     store::ensure_private_dir(history_root)?;
     let path = history_root.join(ACTIVE_HISTORY);
-    if path.metadata().is_ok_and(|metadata| metadata.len() >= ACTIVE_HISTORY_LIMIT) {
+    if path
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() >= ACTIVE_HISTORY_LIMIT)
+    {
         let rotated = history_root.join(ACTIVE_HISTORY_ROTATED);
         match fs::remove_file(&rotated) {
             Ok(()) => {}
@@ -194,9 +235,13 @@ fn append_active_history(
         pid: std::process::id(),
         ppid: {
             #[cfg(unix)]
-            { unsafe { libc::getppid() as u32 } }
+            {
+                unsafe { libc::getppid() as u32 }
+            }
             #[cfg(not(unix))]
-            { 0 }
+            {
+                0
+            }
         },
         parent_cmd: parent_cmd(),
         tty: tty_path(),
@@ -210,21 +255,6 @@ fn append_active_history(
     file.write_all(b"\n")?;
     file.sync_all()?;
     Ok(())
-}
-
-fn write_active_pointer(pointer: &Path, bytes: &[u8], cause: PointerCause) -> Result<()> {
-    let previous = read_optional_file(pointer)?;
-    if previous.as_deref() == Some(bytes) {
-        return Ok(());
-    }
-    store::atomic_write(pointer, bytes)?;
-    let history_root = pointer.parent().context("active pointer has no parent")?;
-    append_active_history(
-        history_root,
-        alias_from_pointer_bytes(previous.as_deref()),
-        alias_from_pointer_bytes(Some(bytes)),
-        cause,
-    )
 }
 
 fn remove_active_pointer_audited(pointer: &Path, cause: PointerCause) -> Result<()> {
@@ -248,11 +278,16 @@ pub fn print_history(limit: usize, json: bool) -> Result<()> {
         history_root.join(ACTIVE_HISTORY_ROTATED),
         history_root.join(ACTIVE_HISTORY),
     ] {
-        if let Ok(text) = fs::read_to_string(path) {
-            for line in text.lines() {
-                if let Ok(entry) = serde_json::from_str::<ActiveHistoryEntry>(line) {
-                    entries.push(entry);
-                }
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        for line in text.lines() {
+            if let Ok(entry) = serde_json::from_str::<ActiveHistoryEntry>(line) {
+                entries.push(entry);
             }
         }
     }
@@ -443,6 +478,13 @@ fn write_pointer_with_rollback(
     cause: PointerCause,
     write_pointer: impl FnOnce(&Path, &[u8]) -> Result<()>,
 ) -> Result<()> {
+    if previous_pointer == Some(pointer_bytes) {
+        let saved = read_connection(connection_path)?;
+        if saved != *expected_connection {
+            bail!("activation approval was not saved before moving the active account pointer");
+        }
+        return Ok(());
+    }
     if let Err(error) = write_pointer_after_connection(
         connection_path,
         expected_connection,
@@ -496,6 +538,7 @@ fn remove_active_pointer_with(
         }),
     }
 }
+#[cfg(test)]
 fn remove_pointer_then_marker_with(
     pointer: &Path,
     marker: &Path,
@@ -504,6 +547,15 @@ fn remove_pointer_then_marker_with(
 ) -> Result<()> {
     remove_active_pointer_with(pointer, remove_pointer)?;
     remove_marker(marker).context("failed to remove prepared remote activation")?;
+    Ok(())
+}
+fn remove_pointer_then_marker_audited(
+    pointer: &Path,
+    marker: &Path,
+    cause: PointerCause,
+) -> Result<()> {
+    remove_active_pointer_audited(pointer, cause)?;
+    std::fs::remove_file(marker).context("failed to remove prepared remote activation")?;
     Ok(())
 }
 pub fn require_local_mode() -> Result<()> {
@@ -1321,7 +1373,7 @@ pub(super) fn deactivate_locked() -> Result<()> {
     if !marker.try_exists()? {
         let pointer = active_pointer_path()?;
         if pointer.try_exists()? {
-            remove_active_pointer_with(&pointer, |path| std::fs::remove_file(path))?;
+            remove_active_pointer_audited(&pointer, PointerCause::Deactivate)?;
         }
         return Ok(());
     }
@@ -1349,12 +1401,7 @@ pub(super) fn deactivate_locked() -> Result<()> {
     }
     write_config(&config_path(&active.home)?, doc.to_string().as_bytes())?;
     let pointer = active_pointer_path()?;
-    remove_pointer_then_marker_with(
-        &pointer,
-        &marker,
-        |path| std::fs::remove_file(path),
-        |path| std::fs::remove_file(path),
-    )?;
+    remove_pointer_then_marker_audited(&pointer, &marker, PointerCause::Deactivate)?;
     Ok(())
 }
 
@@ -1534,14 +1581,17 @@ pub(crate) fn statusline_selection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivationRollback, BILLING_SWITCH_NOTICE, Connection, billing_switch_prompt,
-        remove_active_pointer_with, remove_pointer_then_marker_with, rollback_or_context,
-        save_connection, validate_token_account, write_pointer_after_connection,
-        write_pointer_with_rollback,
+        ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
+        ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
+        billing_switch_prompt, remove_active_pointer_audited, remove_active_pointer_with,
+        remove_pointer_then_marker_with, render_parent_cmd, rollback_or_context, save_connection,
+        validate_token_account, write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn billing_confirmation_warns_about_all_running_sessions() {
@@ -1592,6 +1642,7 @@ mod tests {
             &pointer,
             b"new\n",
             Some(b"old\n"),
+            PointerCause::Use,
             |path, bytes| {
                 fs::write(path, bytes)?;
                 anyhow::bail!("synthetic late pointer fsync failure")
@@ -1601,6 +1652,134 @@ mod tests {
 
         assert!(error.to_string().contains("late pointer fsync"));
         assert_eq!(fs::read(pointer).unwrap(), b"old\n");
+    }
+
+    #[test]
+    fn unchanged_pointer_does_not_append_history() {
+        let root = tempfile::tempdir().unwrap();
+        let connection_path = root.path().join("remote.json");
+        let pointer = root.path().join(".active-account");
+        let connection = test_connection(root.path());
+        save_connection(&connection_path, &connection).unwrap();
+        fs::write(&pointer, b"remote\n").unwrap();
+
+        write_pointer_with_rollback(
+            &connection_path,
+            &connection,
+            &pointer,
+            b"remote\n",
+            Some(b"remote\n"),
+            PointerCause::Use,
+            |path, bytes| {
+                fs::write(path, bytes)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!root.path().join(ACTIVE_HISTORY).exists());
+    }
+
+    #[test]
+    fn history_records_all_pointer_causes_and_private_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let causes = [
+            PointerCause::Use,
+            PointerCause::UseAuto,
+            PointerCause::Recovery,
+            PointerCause::Rollback,
+            PointerCause::Deactivate,
+        ];
+        for cause in causes {
+            append_active_history(root.path(), Some("from".into()), None, cause).unwrap();
+        }
+        let path = root.path().join(ACTIVE_HISTORY);
+        let entries = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<ActiveHistoryEntry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), causes.len());
+        assert_eq!(entries[0].cause, "use");
+        assert_eq!(entries[1].cause, "use-auto");
+        assert_eq!(entries[2].cause, "recovery");
+        assert_eq!(entries[3].cause, "rollback");
+        assert_eq!(entries[4].cause, "deactivate");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn history_rotates_at_one_mib_and_keeps_one_backup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(ACTIVE_HISTORY);
+        fs::write(&path, vec![b'x'; ACTIVE_HISTORY_LIMIT as usize]).unwrap();
+        append_active_history(root.path(), None, Some("new".into()), PointerCause::Use).unwrap();
+        assert!(root.path().join(ACTIVE_HISTORY_ROTATED).exists());
+        assert!(fs::metadata(&path).unwrap().len() < ACTIVE_HISTORY_LIMIT);
+        append_active_history(root.path(), None, Some("newer".into()), PointerCause::Use).unwrap();
+        assert!(root.path().join(ACTIVE_HISTORY_ROTATED).exists());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(root.path().join(ACTIVE_HISTORY_ROTATED))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn deactivation_audit_records_pointer_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let pointer = root.path().join(".active-account");
+        fs::write(&pointer, b"remote\n").unwrap();
+        remove_active_pointer_audited(&pointer, PointerCause::Deactivate).unwrap();
+        let line = fs::read_to_string(root.path().join(ACTIVE_HISTORY)).unwrap();
+        let entry: ActiveHistoryEntry = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(entry.from_alias.as_deref(), Some("remote"));
+        assert_eq!(entry.to_alias, None);
+        assert_eq!(entry.cause, "deactivate");
+    }
+
+    #[test]
+    fn parent_command_redacts_secrets_and_caps_length() {
+        let args = vec![
+            "codexctl".to_owned(),
+            "use".to_owned(),
+            "--token".to_owned(),
+            "access-secret".to_owned(),
+            "--authorization".to_owned(),
+            "Bearer".to_owned(),
+            "authorization-secret".to_owned(),
+            "--api-key=another-secret".to_owned(),
+            "x".repeat(300),
+        ];
+        let rendered = render_parent_cmd(&args);
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("access-secret"));
+        assert!(!rendered.contains("authorization-secret"));
+        assert!(!rendered.contains("another-secret"));
+        assert!(rendered.chars().count() <= 200);
+    }
+
+    fn test_connection(root: &std::path::Path) -> Connection {
+        Connection {
+            user_id: Some("user".into()),
+            alias: Some("remote".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: root.join("device.token"),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: true,
+            launch_pinned: false,
+            approved_billing_plan: Some("usage_based".into()),
+            approved_billing_class: Some(api::BillingClass::Unknown),
+        }
     }
 
     #[test]
