@@ -2,6 +2,7 @@ FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88
 WORKDIR /source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY design/v3/fonts ./design/v3/fonts
 RUN cargo build --release --locked --features central-prototype --bin codexctl-central
 
 FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4
