@@ -57,6 +57,43 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
         .with_context(|| format!("cannot read Codex logs at {}", path.display()))?;
     db.busy_timeout(std::time::Duration::from_secs(5))?;
     let accounts = accounts()?;
+    let report = collect_report(&db, &accounts, minutes)?;
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        println!("window {} min, host {}", report.window_minutes, report.host);
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL_CONDENSED).set_header([
+            "Account",
+            "Weekly",
+            "OK",
+            "429",
+            "429 rate",
+            "Processes",
+            "PIDs",
+        ]);
+        for row in report.accounts {
+            table.add_row([
+                row.account,
+                row.weekly_used_percent
+                    .map_or_else(|| "-".into(), |v| format!("{v:.1}%")),
+                row.responses_ok.to_string(),
+                row.responses_429.to_string(),
+                format!("{:.1}%", row.rate_429 * 100.0),
+                row.processes.to_string(),
+                row.pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ]);
+        }
+        println!("{table}");
+    }
+    Ok(())
+}
+
+fn collect_report(db: &Connection, accounts: &[AccountStatus], minutes: u32) -> Result<Report> {
     let now = Utc::now();
     let since = now.timestamp() - i64::from(minutes) * 60;
     let resets: Vec<_> = accounts
@@ -74,7 +111,9 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
             });
             [
                 (primary, a.primary_window_seconds),
-                (weekly, a.secondary_window_seconds),
+                // An undeclared duration is compatible only with a weekly header
+                // for this legacy secondary slot; status metadata stays unknown.
+                (weekly, Some(a.secondary_window_seconds.unwrap_or(604800))),
             ]
             .into_iter()
             .filter_map(move |(reset, seconds)| {
@@ -127,10 +166,10 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
                         && window.is_none_or(|window| *seconds == Some(window))
                 });
                 let first = matches.next()?;
-                // Both windows of one account can reset together. Ambiguity is
-                // between accounts, not between that account's own windows.
+                // Both windows of one status row can reset together. Distinct
+                // rows stay ambiguous, including local/server alias collisions.
                 matches
-                    .all(|(_, _, account)| account.alias == first.2.alias)
+                    .all(|(_, _, account)| std::ptr::eq(*account, first.2))
                     .then_some(first.2)
             });
         if has_header && let Some(process) = process.as_ref().filter(|p| !p.is_empty()) {
@@ -177,43 +216,102 @@ pub fn run(json: bool, minutes: u32) -> Result<()> {
         row.processes = row.process_ids.len();
     }
     rows.sort_by(|a, b| a.account.cmp(&b.account));
-    let report = Report {
+    Ok(Report {
         host: hostname::get()?.to_string_lossy().into_owned(),
         window_minutes: minutes,
         generated_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
         accounts: rows,
-    };
-    if json {
-        println!("{}", serde_json::to_string(&report)?);
-    } else {
-        println!("window {} min, host {}", report.window_minutes, report.host);
-        let mut table = Table::new();
-        table.load_preset(UTF8_FULL_CONDENSED).set_header([
-            "Account",
-            "Weekly",
-            "OK",
-            "429",
-            "429 rate",
-            "Processes",
-            "PIDs",
-        ]);
-        for row in report.accounts {
-            table.add_row([
-                row.account,
-                row.weekly_used_percent
-                    .map_or_else(|| "-".into(), |v| format!("{v:.1}%")),
-                row.responses_ok.to_string(),
-                row.responses_429.to_string(),
-                format!("{:.1}%", row.rate_429 * 100.0),
-                row.processes.to_string(),
-                row.pids
-                    .iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            ]);
-        }
-        println!("{table}");
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codexctl::{profile::Meta, status_json::Source};
+    use serde_json::json;
+
+    fn weekly_account() -> AccountStatus {
+        let mut account = AccountStatus::local(
+            &Meta {
+                alias: "shared".into(),
+                ..Meta::default()
+            },
+            false,
+        );
+        account.secondary_resets_at = Some("2100-01-01T00:00:00Z".into());
+        account.secondary_used_percent = Some(10.0);
+        account
     }
-    Ok(())
+
+    fn fixture(bodies: &[&str]) -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)",
+        )
+        .unwrap();
+        for body in bodies {
+            db.execute(
+                "INSERT INTO logs VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    Utc::now().timestamp(),
+                    "pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    body
+                ],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn b21b_legacy_weekly_duration_accepts_only_a_weekly_header() {
+        let mut account = weekly_account();
+        account.primary_resets_at = account.secondary_resets_at.clone();
+        assert!(account.primary_window_seconds.is_none());
+        assert!(account.secondary_window_seconds.is_none());
+        let db = fixture(&[
+            r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800", "x-codex-primary-window-minutes": "10080"}"#,
+            "/codex/responses status=429",
+            r#"/codex/responses status=429 headers={"x-codex-primary-reset-at": "4102444800", "x-codex-primary-window-minutes": "300"}"#,
+        ]);
+        let report = collect_report(&db, &[account], 10).unwrap();
+        assert_eq!(
+            serde_json::to_value(report.accounts).unwrap(),
+            json!([
+                {"account":".unattributed", "weekly_used_percent":null, "responses_ok":0, "responses_429":1, "rate_429":1.0, "processes":1, "pids":[301]},
+                {"account":"shared", "weekly_used_percent":10.0, "responses_ok":1, "responses_429":1, "rate_429":0.5, "processes":1, "pids":[301]}
+            ])
+        );
+    }
+
+    #[test]
+    fn b21b_matching_windows_in_distinct_same_alias_status_rows_stay_ambiguous() {
+        let mut local = weekly_account();
+        local.secondary_window_seconds = Some(604800);
+        local.primary_resets_at = local.secondary_resets_at.clone();
+        local.primary_window_seconds = Some(18000);
+        let mut remote = weekly_account();
+        remote.source = Source::Server;
+        remote.secondary_window_seconds = Some(604800);
+        remote.secondary_used_percent = Some(70.0);
+        let db = fixture(&[
+            r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}"#,
+        ]);
+        let mut rows = [local, remote];
+        // Two windows from the same status row do not create ambiguity.
+        assert_eq!(
+            collect_report(&db, &rows[..1], 10).unwrap().accounts[0].account,
+            "shared"
+        );
+        for _ in 0..2 {
+            let report = collect_report(&db, &rows, 10).unwrap();
+            assert_eq!(
+                serde_json::to_value(report.accounts).unwrap(),
+                json!([
+                    {"account":".unattributed", "weekly_used_percent":null, "responses_ok":1, "responses_429":0, "rate_429":0.0, "processes":1, "pids":[301]}
+                ])
+            );
+            rows.reverse();
+        }
+    }
 }
