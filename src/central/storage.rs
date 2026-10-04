@@ -177,8 +177,10 @@ CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challe
 CREATE TABLE IF NOT EXISTS central_registry (
     name TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE central_registry ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 "#;
 
 impl CentralStore {
@@ -232,6 +234,9 @@ impl CentralStore {
     }
 
     pub async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        if payload.len() > 1024 * 1024 {
+            bail!("central registry payload exceeds the 1 MiB bound");
+        }
         match self {
             Self::File(file) => file.save_registry(name, payload),
             Self::Postgres(db) => db.save_registry(name, payload).await,
@@ -956,7 +961,7 @@ impl PostgresStore {
     async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
         let encrypted = vault::encrypt_bytes(&self.key, payload)?;
         let client = self.client().await?;
-        client.execute("INSERT INTO central_registry(name,encrypted_payload) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,updated_at=now()", &[&name, &encrypted]).await?;
+        client.execute("INSERT INTO central_registry(name,encrypted_payload) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,revision=central_registry.revision+1,updated_at=now()", &[&name, &encrypted]).await?;
         Ok(())
     }
 

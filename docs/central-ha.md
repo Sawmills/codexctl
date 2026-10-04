@@ -27,6 +27,11 @@ registry when central storage is enabled. A pod seeds each row from its local
 registry only when the central row does not exist; enrollment and revocation
 write the central row and refresh the process-local cache.
 
+The phase-two registry uses a versioned encrypted payload as a bounded migration
+exception: users and devices are each limited to a 1 MiB row and every update
+increments that row's revision. Phase three will normalize these entities into
+transactional rows before the fleet grows beyond the documented bound.
+
 Replacement-pod hydration is a bounded startup scan: it reads at most 10,000
 active account rows ordered by `account_id` and fails closed when that bound is
 exceeded. `deleted_at IS NULL` is the active-row predicate; the staging plan

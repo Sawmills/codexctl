@@ -1157,11 +1157,7 @@ async fn ready(State(broker): State<Broker>) -> Response {
         Some(store) => store.reachable().await,
         None => true,
     };
-    let mirror_outage_is_degraded = broker
-        .central
-        .as_ref()
-        .is_some_and(|store| store.mode() == super::storage::StoreMode::Dual);
-    let status = if local && (reachable || mirror_outage_is_degraded) {
+    let status = if local && reachable {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
