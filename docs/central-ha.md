@@ -194,6 +194,10 @@ or row counts do not match the reviewed plan.
            - name: prepare-secrets
              image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
              command: [sh, -ec]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
              args:
                - >-
                  cp /projected/vault-key /keys/vault-key;
@@ -215,6 +219,10 @@ or row counts do not match the reviewed plan.
                  --key-file,
                  /keys/vault-key,
                ]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
              env:
                - { name: CODEXCTL_CENTRAL_STORE, value: postgres }
                - {
@@ -297,6 +305,10 @@ or row counts do not match the reviewed plan.
            - name: prepare-secrets
              image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
              command: [sh, -ec]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
              args:
                - >-
                  cp /projected/vault-key /keys/vault-key;
@@ -310,6 +322,10 @@ or row counts do not match the reviewed plan.
            - name: backfill
              image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
              env:
                - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
                - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
