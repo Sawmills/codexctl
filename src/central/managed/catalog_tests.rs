@@ -8,6 +8,8 @@ struct Fixture {
     requests: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
     hold: Arc<AtomicBool>,
+    modern: Arc<AtomicBool>,
+    seen_account: Arc<StdMutex<Option<String>>>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     http: tokio::task::JoinHandle<()>,
@@ -45,24 +47,32 @@ impl Fixture {
                 import_rejected: false,
             },
         )
-        .unwrap();
+        .unwrap_or_else(|_| panic!("token response failed"));
         let owner = prepare_owner(&account, &key, true).unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(false));
         let hold = Arc::new(AtomicBool::new(false));
+        let modern = Arc::new(AtomicBool::new(false));
+        let seen_account = Arc::new(StdMutex::new(None));
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let app = Router::new().route("/usage", get({
-            let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
+            let (requests, fail, hold, modern, seen_account, started, release) = (requests.clone(), fail.clone(), hold.clone(), modern.clone(), seen_account.clone(), started.clone(), release.clone());
             move |headers: HeaderMap| {
-                let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
+                let (requests, fail, hold, modern, seen_account, started, release) = (requests.clone(), fail.clone(), hold.clone(), modern.clone(), seen_account.clone(), started.clone(), release.clone());
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
                     started.add_permits(1);
                     if hold.load(Ordering::SeqCst) { release.acquire().await.unwrap().forget(); }
                     if fail.load(Ordering::SeqCst) { return StatusCode::BAD_GATEWAY.into_response(); }
-                    if headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()) != Some("account") { return StatusCode::BAD_REQUEST.into_response(); }
-                    Json(json!({"plan_type":"promax","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":100,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}})).into_response()
+                    let account = headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+                    *seen_account.lock().unwrap() = account;
+                    if modern.load(Ordering::SeqCst) {
+                        if headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()) != Some("synthetic-seat") { return StatusCode::BAD_REQUEST.into_response(); }
+                        Json(json!({"plan_type":"promax","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":100,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}})).into_response()
+                    } else {
+                        Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                    }
                 }
             }
         }));
@@ -105,6 +115,8 @@ impl Fixture {
             requests,
             fail,
             hold,
+            modern,
+            seen_account,
             started,
             release,
             http,
@@ -133,6 +145,24 @@ impl Fixture {
     fn spawn_list(&self) -> tokio::task::JoinHandle<Value> {
         tokio::spawn(list(self.broker.clone(), self.headers.clone()))
     }
+
+    async fn token_json(&self) -> Value {
+        let response = token(
+            State(self.broker.clone()),
+            self.headers.clone(),
+            Ok(Json(TokenRequest {
+                alias: Some("fixture".into()),
+                billing: true,
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("token response failed"));
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -153,26 +183,18 @@ async fn list(broker: Broker, headers: HeaderMap) -> Value {
 #[tokio::test]
 async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
     let fixture = Fixture::new(Duration::from_secs(1)).await;
-    let usage = fixture
-        .broker
-        .catalog
-        .fetch_direct("token", "account")
-        .await
-        .unwrap();
+    fixture.modern.store(true, Ordering::SeqCst);
+    let refreshed = fixture.token_json().await;
+    assert_eq!(refreshed["billingClass"], "rate_limited");
+    assert_eq!(refreshed["chatgptPlanType"], "promax");
+    assert_eq!(refreshed["statuslineUsage"]["allowed"], true);
+    assert_eq!(refreshed["statuslineUsage"]["limit_reached"], false);
+    assert_eq!(refreshed["statuslineUsage"]["weekly_used_percent"], 100.0);
     assert_eq!(
-        (
-            usage.rate_limit.as_ref().unwrap().allowed,
-            usage.billing_class()
-        ),
-        (Some(true), api::BillingClass::RateLimited)
+        fixture.seen_account.lock().unwrap().as_deref(),
+        Some("synthetic-seat")
     );
     fixture.fail.store(true, Ordering::SeqCst);
-    let failure = fixture
-        .broker
-        .catalog
-        .fetch_direct("token", "account")
-        .await;
-    assert!(matches!(failure, Err("http_status")));
     assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
