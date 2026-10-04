@@ -103,7 +103,10 @@ impl Drop for LaunchSignals {
 
 pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()> {
     if token.statusline_usage.as_ref().is_some_and(|usage| {
-        [usage.five_hour_used_percent, usage.weekly_used_percent]
+        !matches!(
+            (usage.allowed, usage.limit_reached),
+            (Some(true), Some(false))
+        ) && [usage.five_hour_used_percent, usage.weekly_used_percent]
             .into_iter()
             .flatten()
             .any(|used| used >= 100.0)
@@ -349,5 +352,39 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(allowed: Option<bool>, limit_reached: Option<bool>) -> TokenResponse {
+        TokenResponse {
+            user_id: None,
+            access_token: "token".into(),
+            chatgpt_account_id: "account".into(),
+            chatgpt_plan_type: Some("promax".into()),
+            revision: "revision".into(),
+            billing_class: Some(api::BillingClass::RateLimited),
+            native_routing_supported: true,
+            statusline_usage: Some(crate::statusline::Usage {
+                age_seconds: 0,
+                weekly_used_percent: Some(100.0),
+                weekly_resets_at: None,
+                five_hour_used_percent: None,
+                five_hour_resets_at: None,
+                allowed,
+                limit_reached,
+            }),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn headroom_requires_positive_admission_flags_at_one_hundred_percent() {
+        assert!(require_headroom("premium", &token(Some(true), Some(false))).is_ok());
+        assert!(require_headroom("premium", &token(None, None)).is_err());
+        assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
     }
 }

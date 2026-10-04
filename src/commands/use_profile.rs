@@ -730,6 +730,8 @@ mod tests {
         api::RateLimitResponse {
             plan_type: Some("team".to_string()),
             rate_limit: Some(api::RateLimit {
+                allowed: None,
+                limit_reached: None,
                 primary: Some(window(h5)),
                 secondary: Some(window(d7)),
                 primary_window: None,
@@ -809,6 +811,8 @@ mod tests {
 
         let empty_rate_limit = api::RateLimitResponse {
             rate_limit: Some(api::RateLimit {
+                allowed: None,
+                limit_reached: None,
                 primary: None,
                 secondary: None,
                 primary_window: None,
@@ -1316,6 +1320,8 @@ mod tests {
         // Only exhausted windows gate the account; the 7d one clears last.
         let usage = api::RateLimitResponse {
             rate_limit: Some(api::RateLimit {
+                allowed: None,
+                limit_reached: None,
                 primary: Some(window_resetting_at(100.0, 1_000)),
                 secondary: Some(window_resetting_at(100.0, 9_000)),
                 primary_window: None,
@@ -1330,6 +1336,8 @@ mod tests {
     fn natural_reset_ts_ignores_windows_with_headroom() {
         let usage = api::RateLimitResponse {
             rate_limit: Some(api::RateLimit {
+                allowed: None,
+                limit_reached: None,
                 primary: Some(window_resetting_at(100.0, 1_000)),
                 secondary: Some(window_resetting_at(40.0, 9_000)),
                 primary_window: None,

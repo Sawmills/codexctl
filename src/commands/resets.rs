@@ -102,9 +102,7 @@ pub fn run_list() -> Result<()> {
     } else if redeemable > 0 {
         println!("Redeem with `codexctl reset <alias>`.");
     } else if total > 0 {
-        println!(
-            "A reset only applies to an exhausted window, so none can be redeemed until an\naccount hits 100%."
-        );
+        println!("OpenAI reports no reset applies yet (account not blocked).");
     }
 
     Ok(())

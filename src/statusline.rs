@@ -21,6 +21,10 @@ pub struct Usage {
     pub five_hour_used_percent: Option<f64>,
     #[serde(default)]
     pub five_hour_resets_at: Option<i64>,
+    #[serde(default)]
+    pub allowed: Option<bool>,
+    #[serde(default)]
+    pub limit_reached: Option<bool>,
 }
 impl Usage {
     pub(crate) fn from_usage(usage: &api::RateLimitResponse) -> Self {
@@ -40,6 +44,8 @@ impl Usage {
             weekly_resets_at: weekly.and_then(api::RateLimitWindow::reset_timestamp),
             five_hour_used_percent: short.map(|w| w.used_percent),
             five_hour_resets_at: short.and_then(api::RateLimitWindow::reset_timestamp),
+            allowed: usage.rate_limit.as_ref().and_then(|r| r.allowed),
+            limit_reached: usage.rate_limit.as_ref().and_then(|r| r.limit_reached),
         }
     }
 }

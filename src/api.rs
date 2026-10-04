@@ -132,6 +132,8 @@ pub struct AdditionalRateLimit {
 
 #[derive(Deserialize)]
 pub struct RateLimit {
+    pub allowed: Option<bool>,
+    pub limit_reached: Option<bool>,
     // API returns both naming conventions depending on plan
     pub primary: Option<RateLimitWindow>,
     pub secondary: Option<RateLimitWindow>,

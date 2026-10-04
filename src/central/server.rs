@@ -383,7 +383,17 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
             .or_else(|| limits.get("spend_control"))
             .map(|s| json!({"reached":s.get("reached")})),
     };
-    let usage = json!({"spend_control":spend,"plan_type":limits.get("planType"), "rate_limit":{"primary":window("primary"), "secondary":window("secondary")}, "credits":credits});
+    let usage = json!({
+        "spend_control":spend,
+        "plan_type":limits.get("planType"),
+        "rate_limit":{
+            "primary":window("primary"),
+            "secondary":window("secondary"),
+            "allowed":limits.get("allowed").and_then(Value::as_bool),
+            "limit_reached":limits.get("limitReached").and_then(Value::as_bool)
+        },
+        "credits":credits
+    });
     Ok(serde_json::from_value::<api::RateLimitResponse>(usage)?)
 }
 
@@ -396,6 +406,20 @@ pub(super) fn billing_class(response: &Value) -> api::BillingClass {
                 || window["usedPercent"]
                     .as_f64()
                     .is_some_and(|used| (0.0..100.0).contains(&used))
+        }) || u.rate_limit.as_ref().is_some_and(|r| {
+            let raw_windows_valid = ["primary", "secondary"].into_iter().all(|name| {
+                let window = &response["rateLimits"][name];
+                window.is_null()
+                    || window["usedPercent"]
+                        .as_f64()
+                        .is_some_and(|used| used.is_finite() && (0.0..=100.0).contains(&used))
+            });
+            r.allowed == Some(true)
+                && r.limit_reached == Some(false)
+                && raw_windows_valid
+                && r.windows().all(|(_, w)| {
+                    w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent)
+                })
         });
         if u.billing_class() == api::BillingClass::RateLimited && !headroom {
             api::BillingClass::Unknown
@@ -411,6 +435,11 @@ pub(super) fn usage_billing_class(u: &api::RateLimitResponse) -> api::BillingCla
         limits
             .windows()
             .all(|(_, w)| (0.0..100.0).contains(&w.used_percent))
+    }) || u.rate_limit.as_ref().is_some_and(|r| {
+        r.allowed == Some(true)
+            && r.limit_reached == Some(false)
+            && r.windows()
+                .all(|(_, w)| w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent))
     });
     if class == api::BillingClass::RateLimited && !headroom {
         return api::BillingClass::Unknown;
@@ -650,6 +679,62 @@ mod token_compatibility_tests {
 #[cfg(test)]
 mod billing_tests {
     use super::*;
+    #[test]
+    fn allowed_premium_window_at_100_keeps_token_billing_included() {
+        let usage = serde_json::from_value(json!({
+            "plan_type": "promax",
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 100, "limit_window_seconds": 604800}},
+            "credits": {"has_credits": true, "unlimited": false, "overage_limit_reached": false},
+            "rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 0}
+        }))
+        .unwrap();
+        assert_eq!(usage_billing_class(&usage), api::BillingClass::RateLimited);
+        assert_eq!(usage.reset_credits_applicable(), 0);
+    }
+
+    #[test]
+    fn app_server_usage_based_billing_still_requires_approval() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "usage_based",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": 100, "windowDurationMins": 10080},
+                "credits": {"hasCredits": true, "unlimited": false}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::UsageBased);
+        assert_ne!(billing_class(&limits), api::BillingClass::RateLimited);
+    }
+
+    #[test]
+    fn malformed_windows_never_gain_no_bill_status_from_admission_flags() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "promax",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": -1, "windowDurationMins": 10080}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
+    #[test]
+    fn missing_window_data_never_gains_no_bill_status_from_admission_flags() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "promax",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": 100, "windowDurationMins": 10080},
+                "secondary": {"windowDurationMins": 300}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
+    }
+
     #[test]
     fn organizational_limits_need_a_closed_spend_cap_to_prove_included_usage() {
         for plan in ["team", "business", "enterprise", "edu"] {
