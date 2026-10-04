@@ -318,8 +318,8 @@ holds its owner lock, including after SIGKILL. The next launch and `disconnect`
 sweep orphaned `lanes/launch-*` directories under an exclusive lane-directory lock,
 while preserving directories owned by live launchers. Accounts that may bill credits require
 confirmation on a terminal or `--allow-billing` for unattended use. Exhausted accounts
-refuse even with billing approval; an exhausted account also refuses subsequent
-helper refreshes. This launch never redeems a reset and rejects `--allow-resets`.
+require `--allow-billing` to launch on ChatGPT credits. Helper refreshes keep serving
+that account while its approved plan and billing class match. This launch never redeems a reset and rejects `--allow-resets`.
 Inherited `CODEX_HOME`/pinned launches and provider/profile argument overrides refuse;
 a selected config profile that overrides `model_provider` must be removed first.
 Exit status is the child's status (including `128 + signal` on Unix), 1 for launch

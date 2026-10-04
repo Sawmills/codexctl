@@ -6620,6 +6620,16 @@ fn automatic_reset_attempt(
 }
 
 #[test]
+fn b30_billing_approval_does_not_auto_select_exhausted_or_usage_based_accounts() {
+    for (plan, used) in [("pro", 100.0), ("team_usage_based", 20.0)] {
+        let (resets, output) =
+            automatic_reset_attempt(&["use", "--allow-billing"], plan, used, None);
+        assert!(!output.status.success(), "selected {plan} at {used}% usage");
+        assert_eq!(resets, 0);
+    }
+}
+
+#[test]
 fn automatic_reset_waits_for_all_local_activation_fences() {
     for fence in ["profile", "store", "handoff", "provider", "daemon"] {
         let (count, output) =
@@ -7632,13 +7642,13 @@ db.close()
 }
 
 #[test]
-fn b21_lane_account_scopes_billing_consent_and_refuses_exhaustion() {
+fn b30_lane_account_scopes_billing_consent_and_allows_approved_exhaustion() {
     use std::os::unix::fs::PermissionsExt;
     for (mode, plan, allow_billing, message) in [
         ("open-spend-cap", "business", false, "--allow-billing"),
         ("open-spend-cap", "business", true, ""),
         ("exhausted-weekly", "pro", false, "exhausted"),
-        ("exhausted-weekly", "pro", true, "exhausted"),
+        ("exhausted-weekly", "pro", true, ""),
     ] {
         let server = Server::start();
         server.import(&server.amir, "host", "host-login", "host-seat");
@@ -7672,7 +7682,21 @@ fn b21_lane_account_scopes_billing_consent_and_refuses_exhaustion() {
         let capture = home.path().join("child-launched");
         store::atomic_write(
             &bin.join("codex"),
-            b"#!/bin/sh\ntouch \"$B21_CAPTURE\"\nexit 0\n",
+            br#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+for arg in sys.argv:
+    prefix = 'model_providers.codexctl-central.auth.command='
+    if arg.startswith(prefix):
+        command = json.loads(arg[len(prefix):])
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+for _ in range(2):
+    token = subprocess.run([command] + helper, capture_output=True, text=True)
+    assert token.returncode == 0, token.stderr
+    assert token.stdout.strip()
+pathlib.Path(os.environ['B21_CAPTURE']).touch()
+"#,
         )
         .unwrap();
         std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
@@ -7708,7 +7732,17 @@ fn b21_lane_account_scopes_billing_consent_and_refuses_exhaustion() {
         if message.is_empty() {
             let unapproved = server.cli(home.path(), &["codex", "--account", "lane", "a prompt"]);
             assert_eq!(unapproved.status.code(), Some(1));
-            assert!(String::from_utf8_lossy(&unapproved.stderr).contains("--allow-billing"));
+            let refusal = if mode == "exhausted-weekly" {
+                "server account lane is exhausted; choose another account (no reset was redeemed)"
+            } else {
+                "--allow-billing"
+            };
+            assert!(String::from_utf8_lossy(&unapproved.stderr).contains(refusal));
+        }
+        if mode == "exhausted-weekly" && allow_billing {
+            assert!(String::from_utf8_lossy(&output.stderr).contains(
+                "codexctl: lane is exhausted; running on ChatGPT credits (--allow-billing)"
+            ));
         }
         assert_eq!(std::fs::read(&config).unwrap(), before);
     }

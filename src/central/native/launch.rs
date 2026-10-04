@@ -101,8 +101,8 @@ impl Drop for LaunchSignals {
     }
 }
 
-pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()> {
-    if token.statusline_usage.as_ref().is_some_and(|usage| {
+fn is_exhausted(token: &TokenResponse) -> bool {
+    token.statusline_usage.as_ref().is_some_and(|usage| {
         !matches!(
             (usage.allowed, usage.limit_reached),
             (Some(true), Some(false))
@@ -110,7 +110,11 @@ pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()>
             .into_iter()
             .flatten()
             .any(|used| used >= 100.0)
-    }) {
+    })
+}
+
+pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()> {
+    if is_exhausted(token) {
         bail!(
             "server account {alias} is exhausted; choose another account (no reset was redeemed)"
         );
@@ -226,8 +230,11 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
-    require_headroom(&account.alias, &token)?;
-    let bills = token.billing_class != Some(api::BillingClass::RateLimited);
+    let exhausted = is_exhausted(&token);
+    if !allow_billing {
+        require_headroom(&account.alias, &token)?;
+    }
+    let bills = exhausted || token.billing_class != Some(api::BillingClass::RateLimited);
     if bills && !allow_billing {
         if !std::io::stdin().is_terminal() {
             bail!(
@@ -245,6 +252,12 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         {
             bail!("server account launch billing declined");
         }
+    }
+    if exhausted {
+        eprintln!(
+            "codexctl: {} is exhausted; running on ChatGPT credits (--allow-billing)",
+            account.alias
+        );
     }
     connection.allow_billing = bills;
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
