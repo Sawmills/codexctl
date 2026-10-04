@@ -246,6 +246,9 @@ impl Sso {
     }
 }
 fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
     broker
         .sso
         .as_deref()
@@ -560,7 +563,12 @@ async fn callback(
     let device_hash = match login.destination {
         Destination::Enrollment(hash) => hash,
         Destination::Accounts(_) => {
-            match managed::record_user(&broker.state, &user, email).map_err(|_| {
+            let result = if broker.central.is_some() {
+                broker.record_user_central(&user, email).await
+            } else {
+                managed::record_user(&broker.state, &user, email)
+            };
+            match result.map_err(|_| {
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
             })? {
                 managed::UserEnrollment::Recorded => {}
@@ -568,6 +576,9 @@ async fn callback(
                     return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
                 }
             }
+            broker.sync_registry().await.map_err(|_| {
+                broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+            })?;
             let token = secret();
             let mut flows = sso.flows.lock().expect("enrollment lock");
             Sso::cleanup(&mut flows);
@@ -642,19 +653,36 @@ async fn approve(
     State(broker): State<Broker>,
     Form(input): Form<Approve>,
 ) -> Result<Response, HttpError> {
-    let sso = sso(&broker)?;
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    let approval = flows
-        .approvals
-        .remove(&vault::digest(input.approval.as_bytes()))
-        .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_approval"))?;
-    let device = flows
-        .devices
-        .get_mut(&approval.device_hash)
-        .filter(|d| d.grant.is_none())
-        .ok_or_else(|| broker.error(StatusCode::GONE, "enrollment_expired"))?;
-    match managed::record_user(&broker.state, &approval.user, &approval.email)
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
+    let (approval, device_name) = {
+        let sso = broker
+            .sso
+            .clone()
+            .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
+        let mut flows = sso.flows.lock().expect("enrollment lock");
+        Sso::cleanup(&mut flows);
+        let approval = flows
+            .approvals
+            .remove(&vault::digest(input.approval.as_bytes()))
+            .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_approval"))?;
+        let device_name = flows
+            .devices
+            .get(&approval.device_hash)
+            .filter(|d| d.grant.is_none())
+            .map(|d| d.name.clone())
+            .ok_or_else(|| broker.error(StatusCode::GONE, "enrollment_expired"))?;
+        (approval, device_name)
+    };
+    let result = if broker.central.is_some() {
+        broker
+            .record_user_central(&approval.user, &approval.email)
+            .await
+    } else {
+        managed::record_user(&broker.state, &approval.user, &approval.email)
+    };
+    match result
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
     {
         managed::UserEnrollment::Recorded => {}
@@ -663,24 +691,44 @@ async fn approve(
         }
     }
     let token = secret();
-    let _lock = vault::registry_lock(&broker.state, "devices.lock")
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
-    let mut devices = vault::devices(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-    devices.push(vault::Device {
-        id: format!("{}-{}", device.name, &secret()[..12]),
+    let new_device = vault::Device {
+        id: format!("{}-{}", device_name, &secret()[..12]),
         tenant: "sawmills".into(),
         user: approval.user,
         token_hash: vault::digest(token.as_bytes()),
         revoked: false,
-    });
-    vault::save_devices(&broker.state, &devices)
+    };
+    if broker.central.is_some() {
+        broker
+            .record_device_central(&new_device)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    } else {
+        let _lock = vault::registry_lock(&broker.state, "devices.lock")
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
+        let mut devices = vault::devices(&broker.state)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+        devices.push(new_device);
+        vault::save_devices(&broker.state, &devices)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    }
+    broker
+        .sync_registry()
+        .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-    device.grant = Some(token);
-    Ok(page(format!(
-        include_str!("enrollment/connected.html"),
-        name = escape(&device.name)
-    )))
+    grant_device(&broker, &approval.device_hash, &token)?;
+    Ok(page(include_str!("enrollment/connected.html").into()))
+}
+fn grant_device(broker: &Broker, device_hash: &str, token: &str) -> Result<(), HttpError> {
+    let sso = broker
+        .sso
+        .clone()
+        .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?;
+    let mut flows = sso.flows.lock().expect("enrollment lock");
+    if let Some(device) = flows.devices.get_mut(device_hash) {
+        device.grant = Some(token.to_owned());
+    }
+    Ok(())
 }
 pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
     router
@@ -727,6 +775,9 @@ pub(super) fn browser_user(
     broker: &Broker,
     headers: &HeaderMap,
 ) -> Result<Option<managed::User>, HttpError> {
+    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
+        return Err(error);
+    }
     let Some(sso) = broker.sso.as_deref() else {
         return Ok(None);
     };

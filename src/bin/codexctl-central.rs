@@ -23,6 +23,8 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
         user: Option<String>,
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
@@ -60,6 +62,8 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
         device: String,
         #[arg(long)]
         tenant: String,
@@ -73,10 +77,21 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
+        tenant: Option<String>,
+        #[arg(long)]
         device: String,
     },
     /// Apply central PostgreSQL schema migrations when PostgreSQL storage is enabled.
     Migrate {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// Copy local file state into the configured PostgreSQL store once.
+    Backfill {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
@@ -149,34 +164,53 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
-    if matches!(
+    if !matches!(
         &cli.command,
-        Commands::Setup { .. }
-            | Commands::Init { .. }
-            | Commands::Users { .. }
-            | Commands::Register { .. }
-            | Commands::Revoke { .. }
-            | Commands::Serve { .. }
+        Commands::Migrate { .. } | Commands::Backfill { .. }
+    ) && matches!(
+        central::storage::StoreMode::from_env()?,
+        central::storage::StoreMode::Dual
     ) {
-        central::storage::require_file_runtime()?;
+        anyhow::bail!(
+            "dual runtime is migration-only; administration and serving support file or postgres mode"
+        );
     }
     match cli.command {
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {
             state,
+            key_file,
             user,
             enable,
             disable,
         } => {
-            if enable || disable {
-                central::managed::set_user(
-                    &state,
-                    user.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("--user required"))?,
-                    enable,
-                )?;
+            let postgres_mode = matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            );
+            let central_key = if postgres_mode {
+                Some(key_file.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for users in postgres mode")
+                })?)
             } else {
-                for user in central::managed::users(&state)? {
+                None
+            };
+            if enable || disable {
+                let id = user
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--user required"))?;
+                if let Some(key_file) = central_key {
+                    central::managed::set_user_central(&state, key_file, id, enable).await?;
+                } else {
+                    central::managed::set_user(&state, id, enable)?;
+                }
+            } else {
+                let users = if let Some(key_file) = central_key {
+                    central::managed::list_users_central(&state, key_file).await?
+                } else {
+                    central::managed::users(&state)?
+                };
+                for user in users {
                     println!(
                         "{} {} {}",
                         user.id,
@@ -198,14 +232,58 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         } => central::init(&state, &key_file, &auth, &alias, &tenant, &user)?,
         Commands::Register {
             state,
+            key_file,
             device,
             tenant,
             user,
             token_file,
-        } => central::register(&state, &device, &tenant, &user, &token_file)?,
-        Commands::Revoke { state, device } => central::revoke(&state, &device)?,
+        } => {
+            if matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            ) {
+                let key_file = key_file.ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for register in postgres mode")
+                })?;
+                central::register_central(&state, &key_file, &device, &tenant, &user, &token_file)
+                    .await?
+            } else {
+                central::register(&state, &device, &tenant, &user, &token_file)?
+            }
+        }
+        Commands::Revoke {
+            state,
+            key_file,
+            tenant,
+            device,
+        } => {
+            if matches!(
+                central::storage::StoreMode::from_env()?,
+                central::storage::StoreMode::Postgres
+            ) {
+                let key_file = key_file.ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for revoke in postgres mode")
+                })?;
+                central::revoke_central(
+                    &state,
+                    &key_file,
+                    tenant.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("--tenant is required for revoke in postgres mode")
+                    })?,
+                    &device,
+                )
+                .await?
+            } else {
+                central::revoke(&state, &device)?
+            }
+        }
         Commands::Migrate { state, key_file } => {
             central::storage::migrate(&state, &key_file).await?
+        }
+        Commands::Backfill { state, key_file } => {
+            let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
+            let counts = store.backfill(&state, &key_file).await?;
+            println!("{}", serde_json::to_string(&counts)?);
         }
         Commands::Serve {
             state,

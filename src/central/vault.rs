@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Vault {
     pub alias: String,
     pub tenant: String,
@@ -25,9 +25,13 @@ pub struct Vault {
     pub verified: bool,
     #[serde(default)]
     pub import_rejected: bool,
+    /// Monotonic durable credential revision assigned by the central store.
+    /// It is independent of JWT timestamps, which can collide or be absent.
+    #[serde(default)]
+    pub revision: i64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub tenant: String,
@@ -269,6 +273,7 @@ mod tests {
                 label: None,
                 verified: true,
                 import_rejected: false,
+                revision: 0,
                 auth: json!({"refresh_token":"synthetic-rotated-refresh"}),
             },
         )

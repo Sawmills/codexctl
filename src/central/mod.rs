@@ -20,6 +20,67 @@ mod vault;
 pub use client::run_client;
 pub use server::serve;
 
+/// Revoke a device in the shared registry with a per-entity CAS revision.
+pub async fn revoke_central(state: &Path, key: &Path, tenant: &str, id: &str) -> Result<()> {
+    store::validate_alias(tenant)?;
+    store::validate_alias(id)?;
+    let central = storage::runtime_store(state, key).await?;
+    let Some((_, payload, revision)) = central.load_device_entity_revision(tenant, id).await?
+    else {
+        bail!("device not found");
+    };
+    let mut device: vault::Device = serde_json::from_slice(&payload)?;
+    device.revoked = true;
+    if !central
+        .save_device_entity_cas(tenant, id, &serde_json::to_vec(&device)?, Some(revision))
+        .await?
+    {
+        bail!("device changed concurrently; retry");
+    }
+    Ok(())
+}
+
+pub async fn register_central(
+    state: &Path,
+    key: &Path,
+    id: &str,
+    tenant: &str,
+    user: &str,
+    token_file: &Path,
+) -> Result<()> {
+    store::validate_alias(id)?;
+    store::validate_alias(tenant)?;
+    store::validate_alias(user)?;
+    let central = storage::runtime_store(state, key).await?;
+    let devices = central.load_device_entity_revisions(tenant).await?;
+    if devices.iter().any(|(device_id, _, _)| device_id == id) {
+        bail!("device already registered");
+    }
+    let token = vault::digest(&enrollment::random_bytes());
+    vault::create_secret(token_file, token.as_bytes())?;
+    let device = vault::Device {
+        id: id.into(),
+        tenant: tenant.into(),
+        user: user.into(),
+        token_hash: vault::digest(token.as_bytes()),
+        revoked: false,
+    };
+    let saved = central
+        .save_device_entity_cas(tenant, id, &serde_json::to_vec(&device)?, None)
+        .await;
+    match saved {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(token_file);
+            bail!("device was registered concurrently; retry")
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(token_file);
+            Err(error)
+        }
+    }
+}
+
 use crate::store;
 use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use anyhow::{Result, bail};
@@ -56,6 +117,7 @@ pub fn init(
             label: None,
             verified: true,
             import_rejected: false,
+            revision: 0,
         },
     )?;
     vault::save_devices(state, &[])?;
