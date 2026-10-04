@@ -406,10 +406,13 @@ pub(super) fn billing_class(response: &Value) -> api::BillingClass {
                 || window["usedPercent"]
                     .as_f64()
                     .is_some_and(|used| (0.0..100.0).contains(&used))
-        }) || u
-            .rate_limit
-            .as_ref()
-            .is_some_and(|r| r.allowed == Some(true) && r.limit_reached == Some(false));
+        }) || u.rate_limit.as_ref().is_some_and(|r| {
+            r.allowed == Some(true)
+                && r.limit_reached == Some(false)
+                && r.windows().all(|(_, w)| {
+                    w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent)
+                })
+        });
         if u.billing_class() == api::BillingClass::RateLimited && !headroom {
             api::BillingClass::Unknown
         } else {
@@ -424,10 +427,12 @@ pub(super) fn usage_billing_class(u: &api::RateLimitResponse) -> api::BillingCla
         limits
             .windows()
             .all(|(_, w)| (0.0..100.0).contains(&w.used_percent))
-    }) || u
-        .rate_limit
-        .as_ref()
-        .is_some_and(|r| r.allowed == Some(true) && r.limit_reached == Some(false));
+    }) || u.rate_limit.as_ref().is_some_and(|r| {
+        r.allowed == Some(true)
+            && r.limit_reached == Some(false)
+            && r.windows()
+                .all(|(_, w)| w.used_percent.is_finite() && (0.0..=100.0).contains(&w.used_percent))
+    });
     if class == api::BillingClass::RateLimited && !headroom {
         return api::BillingClass::Unknown;
     }
@@ -693,6 +698,19 @@ mod billing_tests {
         });
         assert_eq!(billing_class(&limits), api::BillingClass::UsageBased);
         assert_ne!(billing_class(&limits), api::BillingClass::RateLimited);
+    }
+
+    #[test]
+    fn malformed_windows_never_gain_no_bill_status_from_admission_flags() {
+        let limits = json!({
+            "rateLimits": {
+                "planType": "promax",
+                "allowed": true,
+                "limitReached": false,
+                "primary": {"usedPercent": -1, "windowDurationMins": 10080}
+            }
+        });
+        assert_eq!(billing_class(&limits), api::BillingClass::Unknown);
     }
 
     #[test]
