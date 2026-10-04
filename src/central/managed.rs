@@ -563,7 +563,7 @@ async fn token(
         };
         let result = async {
             let token_result = owner.tokens(request).await;
-            if token_result.is_err()
+            if !matches!(token_result, Err(TokenFailure::UnsupportedRouting))
                 && let Some(rpc) = owner.rpc.as_mut()
             {
                 let _ = rpc.settle_and_stop().await;
