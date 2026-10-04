@@ -372,31 +372,30 @@ async fn token(
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
-    refresh_legacy_usage(&mut token).await;
+    refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers)?;
     broker.activity.delivered(&device, alias);
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
-async fn refresh_legacy_usage(token: &mut TokenResponse) {
+async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
     let Some(usage) = token.statusline_usage.as_ref() else {
         return;
     };
     if usage.allowed.is_some() && usage.limit_reached.is_some() {
         return;
     }
-    let Ok(client) = api::http_client() else {
-        return;
-    };
-    let Ok(authoritative) = api::fetch_usage_async(
-        &client,
-        &token.access_token,
-        Some(&token.chatgpt_account_id),
-    )
-    .await
-    else {
-        return;
+    let authoritative = match broker
+        .catalog
+        .fetch_direct(&token.access_token, &token.chatgpt_account_id)
+        .await
+    {
+        Ok(usage) => usage,
+        Err(reason) => {
+            eprintln!("central token usage refresh failed reason={reason}");
+            return;
+        }
     };
     token.billing_class = Some(super::server::usage_billing_class(&authoritative));
     token.chatgpt_plan_type = authoritative

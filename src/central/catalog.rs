@@ -87,6 +87,32 @@ impl Reader {
         )
     }
 
+    pub(super) async fn fetch_direct(
+        &self,
+        access: &str,
+        account_id: &str,
+    ) -> Result<api::RateLimitResponse, &'static str> {
+        api::fetch_usage_at(&self.client, &self.endpoint, access, Some(account_id))
+            .await
+            .map_err(|error| {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout)
+                }) {
+                    "timeout"
+                } else if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(|request| request.status().is_some())
+                }) {
+                    "http_status"
+                } else {
+                    "client"
+                }
+            })
+    }
+
     pub(super) async fn read(
         &self,
         key: &str,
