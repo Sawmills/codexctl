@@ -303,11 +303,23 @@ async fn central_registry_devices(central: &CentralStore) -> Result<Vec<vault::D
         .collect()
 }
 
+async fn central_registry_devices_for_tenant(
+    central: &CentralStore,
+    tenant: &str,
+) -> Result<Vec<vault::Device>> {
+    central
+        .load_device_entity_revisions(tenant)
+        .await?
+        .into_iter()
+        .map(|(_, bytes, _)| Ok(serde_json::from_slice(&bytes)?))
+        .collect()
+}
+
 impl Broker {
     pub(super) fn reject_unshared_workflow(&self, reason: &'static str) -> Option<HttpError> {
         self.central
             .as_ref()
-            .filter(|store| store.mode() == super::storage::StoreMode::Postgres)
+            .filter(|store| store.mode() != super::storage::StoreMode::File)
             .map(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, reason))
     }
 
@@ -737,6 +749,16 @@ async fn token(
         // PostgreSQL token path therefore takes the account lease before
         // invoking the native owner or persisting its result.
         let lease = if let Some(central) = worker.central.as_ref() {
+            // A retained lease fences an owner whose refresh result is
+            // unresolved. Do not bump its epoch or release the fence from a
+            // retry while the native process may still hold the token.
+            if central.mode() != super::storage::StoreMode::File
+                && owner.routing_refused
+                && !owner.available
+                && owner.rpc.is_some()
+            {
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            }
             // Ensure the FK target exists before the first request after cutover
             // or a locally imported account.
             worker
@@ -1524,7 +1546,7 @@ async fn devices(
         .as_ref()
         .filter(|central| central.mode() != super::storage::StoreMode::File)
     {
-        central_registry_devices(central)
+        central_registry_devices_for_tenant(central, &current.tenant)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
     } else {
@@ -1555,7 +1577,7 @@ async fn revoke_device(
         .filter(|central| central.mode() != super::storage::StoreMode::File)
     {
         let mut rows = central
-            .load_registry_entity_revisions("devices")
+            .load_device_entity_revisions(&current.tenant)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
         let (_, payload, revision) = rows

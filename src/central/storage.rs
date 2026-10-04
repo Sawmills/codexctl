@@ -310,6 +310,22 @@ impl CentralStore {
         }
     }
 
+    /// Read device entities for one authenticated tenant only. Administrative
+    /// startup snapshots may enumerate all devices, but request handlers use
+    /// this scoped path before listing or mutating a device.
+    pub async fn load_device_entity_revisions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.load_device_entity_revisions(tenant)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.load_device_entity_revisions(tenant)).await
+            }
+        }
+    }
+
     /// Atomically upsert each registry entity in one SQL statement. This keeps
     /// a stale pod from replacing the shared users/devices set with its local
     /// snapshot and gives every entity its own revision.
@@ -407,6 +423,13 @@ impl CentralStore {
                     vault: serde_json::to_value(value)?,
                     revision,
                 };
+                if target
+                    .load_account(&record.account_id)
+                    .await?
+                    .is_some_and(|existing| existing.revision >= record.revision)
+                {
+                    continue;
+                }
                 target.save_account(&record).await?;
                 counts.accounts += 1;
             }
@@ -1250,6 +1273,34 @@ impl PostgresStore {
         bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
+    async fn load_device_entity_revisions(
+        &self,
+        tenant: &str,
+    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT id,tenant,user_id,token_hash,revoked,revision FROM central_devices WHERE tenant=$1 AND deleted_at IS NULL ORDER BY id",
+                &[&tenant],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.get(0),
+                    serde_json::to_vec(&vault::Device {
+                        id: row.get(0),
+                        tenant: row.get(1),
+                        user: row.get(2),
+                        token_hash: row.get(3),
+                        revoked: row.get(4),
+                    })?,
+                    row.get(5),
+                ))
+            })
+            .collect()
+    }
+
     async fn save_registry_entities(
         &self,
         name: &str,
@@ -1700,6 +1751,8 @@ mod tests {
         let imported = first.load_account(&legacy_id).await.unwrap().unwrap();
         assert_eq!(imported.revision, 1);
         assert_eq!(imported.vault["revision"], serde_json::json!(1));
+        let repeated = first.backfill(root.path(), &key).await.unwrap();
+        assert_eq!(repeated.accounts, 0);
         let second = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
             .await
             .unwrap();
