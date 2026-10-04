@@ -1137,8 +1137,14 @@ impl PostgresStore {
         ).await?;
         if changed == 0 {
             let current = client
-                .query_opt("SELECT encrypted_vault FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&record.account_id])
+                .query_opt(
+                    "SELECT encrypted_vault,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
+                    &[&record.account_id],
+                )
                 .await?;
+            if current.as_ref().is_some_and(|row| row.get::<_, bool>(1)) {
+                bail!("central account is tombstoned");
+            }
             if current.is_none_or(|row| {
                 let stored: Vec<u8> = row.get(0);
                 vault::decrypt_bytes(&self.key, &stored)
