@@ -306,7 +306,9 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         let signal = signals.received();
         if signal != 0 {
             // Revoke approval before forwarding the signal, even if Codex ignores it.
-            close_launch(prepared)?;
+            let cleanup = close_launch(prepared);
+            // A filesystem or lock error must not strand the running child.
+            // Keep that error until termination and reaping have been attempted.
             unsafe {
                 libc::kill(child.id() as i32, signal);
             }
@@ -319,6 +321,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
+            cleanup?;
             return Ok(128 + signal);
         }
         if let Some(status) = child.try_wait()? {

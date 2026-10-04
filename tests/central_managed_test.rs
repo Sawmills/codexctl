@@ -7654,3 +7654,35 @@ fn b21_launch_and_disconnect_sweep_orphans_but_keep_live_lanes() {
     );
     live.signal_and_wait(libc::SIGTERM);
 }
+
+#[test]
+fn b21_signal_reaps_child_even_when_cleanup_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let mut lane = B21Lane::start(home.path(), "cleanup-failure");
+    let directory = lane.connection.parent().unwrap().to_owned();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let status = lane.signal_and_wait(libc::SIGTERM);
+    // Restore permissions even when the regression fails, so test cleanup works.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(status.code(), Some(1), "cleanup error must be reported");
+    assert_ne!(
+        unsafe { libc::kill(lane.child_pid, 0) },
+        0,
+        "cleanup error stranded the child"
+    );
+    let helper = server.cli(
+        home.path(),
+        &[
+            "central-token",
+            "--connection",
+            lane.connection.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !helper.status.success(),
+        "failed cleanup left a usable approval"
+    );
+}
