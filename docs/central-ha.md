@@ -174,6 +174,19 @@ or row counts do not match the reviewed plan.
      template:
        spec:
          restartPolicy: Never
+         initContainers:
+           - name: prepare-secrets
+             image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+             command: [sh, -ec]
+             args:
+               - >-
+                 cp /projected/vault-key /keys/vault-key;
+                 cp /projected/oidc-client-secret /keys/oidc-client-secret;
+                 cp /projected/metrics-token /keys/metrics-token;
+                 chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+             volumeMounts:
+               - { name: projected, mountPath: /projected, readOnly: true }
+               - { name: keys, mountPath: /keys }
          containers:
            - name: migrate
              image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
@@ -231,8 +244,10 @@ or row counts do not match the reviewed plan.
          volumes:
            - name: state
              persistentVolumeClaim: { claimName: state-codexctl-0 }
+           - name: projected
+             secret: { secretName: codexctl-secrets, defaultMode: 288 }
            - name: keys
-             secret: { secretName: codexctl-secrets }
+             emptyDir: { medium: Memory }
    ```
 
    Apply the reviewed Job, wait for completion, and repeat the manifest with
@@ -256,6 +271,19 @@ or row counts do not match the reviewed plan.
      template:
        spec:
          restartPolicy: Never
+         initContainers:
+           - name: prepare-secrets
+             image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+             command: [sh, -ec]
+             args:
+               - >-
+                 cp /projected/vault-key /keys/vault-key;
+                 cp /projected/oidc-client-secret /keys/oidc-client-secret;
+                 cp /projected/metrics-token /keys/metrics-token;
+                 chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+             volumeMounts:
+               - {name: projected, mountPath: /projected, readOnly: true}
+               - {name: keys, mountPath: /keys}
          containers:
            - name: backfill
              image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
@@ -273,8 +301,10 @@ or row counts do not match the reviewed plan.
          volumes:
            - name: state
              persistentVolumeClaim: {claimName: state-codexctl-0}
+           - name: projected
+             secret: {secretName: codexctl-secrets, defaultMode: 288}
            - name: keys
-             secret: {secretName: codexctl-secrets}
+             emptyDir: {medium: Memory}
    YAML
    kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=10m
    kubectl --context plat-staging -n codexctl logs job/codexctl-backfill

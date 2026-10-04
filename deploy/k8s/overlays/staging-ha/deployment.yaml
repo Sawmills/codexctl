@@ -63,6 +63,28 @@ spec:
                     },
                 }
       initContainers:
+        - name: prepare-secrets
+          image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            - >-
+              cp /projected/vault-key /keys/vault-key;
+              cp /projected/oidc-client-secret /keys/oidc-client-secret;
+              cp /projected/metrics-token /keys/metrics-token;
+              chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 32Mi }
+          volumeMounts:
+            - { name: projected, mountPath: /projected, readOnly: true }
+            - { name: keys, mountPath: /keys }
         - name: initialize
           image: codexctl-central:staging
           imagePullPolicy: Always
@@ -163,8 +185,10 @@ spec:
             - { name: home, mountPath: /home/codexctl }
             - { name: temporary, mountPath: /tmp }
       volumes:
-        - name: keys
+        - name: projected
           secret: { secretName: codexctl-secrets, defaultMode: 288 }
+        - name: keys
+          emptyDir: { medium: Memory }
         - name: configuration
           configMap: { name: codexctl-sso }
         - name: state
