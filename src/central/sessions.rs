@@ -532,7 +532,7 @@ fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a M
     if candidates.is_empty() {
         return None;
     }
-    let parent = mountpoint
+    let enclosing_parent = mountpoint
         .parent()
         .and_then(|parent| {
             mounts
@@ -543,12 +543,21 @@ fn visible_mount<'a>(mounts: &'a [MountInfo], mountpoint: &Path) -> Option<&'a M
                 .max_by_key(|mount| (mount.mountpoint.components().count(), mount.id))
         })
         .map(|mount| mount.id);
-    candidates
+    let mut visible = candidates
         .iter()
         .copied()
-        .filter(|mount| parent.is_none_or(|parent| mount.parent == parent))
+        .filter(|mount| enclosing_parent.is_none_or(|parent| mount.parent == parent))
         .max_by_key(|mount| mount.id)
-        .or_else(|| candidates.into_iter().max_by_key(|mount| mount.id))
+        .or_else(|| candidates.iter().copied().max_by_key(|mount| mount.id))?;
+    while let Some(next) = candidates
+        .iter()
+        .copied()
+        .filter(|mount| mount.parent == visible.id)
+        .max_by_key(|mount| mount.id)
+    {
+        visible = next;
+    }
+    Some(visible)
 }
 #[cfg(target_os = "linux")]
 fn unescape_mountinfo(path: &str) -> String {
@@ -734,7 +743,7 @@ mod tests {
             parse_mountinfo("1 0 8:1 / / rw - ext4 /dev/root rw").unwrap(),
             parse_mountinfo("2 1 8:1 / /var rw - ext4 /dev/root rw").unwrap(),
             parse_mountinfo("3 2 0:1 / /var/lib/docker/rootfs rw - overlay overlay rw").unwrap(),
-            parse_mountinfo("4 2 0:2 / /var/lib/docker/rootfs rw - tmpfs tmpfs rw").unwrap(),
+            parse_mountinfo("4 3 0:2 / /var/lib/docker/rootfs rw - tmpfs tmpfs rw").unwrap(),
         ];
         assert_eq!(
             visible_mount(&mounts, Path::new("/var/lib/docker/rootfs"))
