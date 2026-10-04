@@ -1,68 +1,37 @@
 # Account server high availability design
 
-**Status:** target design. Phase 1 schema provisioning is implemented; phase 2
-retains the single-instance file runtime. Shared runtime integration is deferred
-to phase 3 and must pass the acceptance gates below before it is enabled.
+**Status:** Phase 3 build. PostgreSQL is authoritative when
+`CODEXCTL_CENTRAL_STORE=postgres`; file mode remains the default and the live
+staging overlay is unchanged. The HA overlay in
+`deploy/k8s/overlays/staging-ha` is build-only until HQ authorizes cutover after
+infra#1513 provisions the database and `codexctl-postgres` ExternalSecret.
 
-The current staging shape is one StatefulSet replica with one encrypted
-`ReadWriteOncePod` claim (`deploy/k8s/base/statefulset.yaml:9-13,134-142`). The
-broker deliberately takes a process-local file lock before serving
-(`src/central/managed.rs:1001-1004`), and the documented deployment says that a
-second broker must not mount the state (`docs/central-server.md:386-390`). That
-protects the current single-writer design but turns node eviction into a
-storage-attach outage. The target is several pods on separate nodes and zones,
-with durable state in PostgreSQL and an explicit refresh fence.
+The current live staging shape remains one StatefulSet replica with an encrypted
+`ReadWriteOncePod` claim (`deploy/k8s/base/statefulset.yaml`). The phase-3 target
+uses three independent pods, no broker PVC, per-account PostgreSQL fencing, and
+readiness that reports database health. A pod-local vault key remains a secret;
+credential payloads are encrypted before PostgreSQL insertion.
 
-Phase 1 provisions the PostgreSQL schema and validates its fencing primitives;
-the running broker still reads and writes the encrypted file vault. Server
-startup therefore refuses `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until
-runtime integration is complete. Provision the schema explicitly with
-`CODEXCTL_CENTRAL_STORE=postgres DATABASE_URL='postgres://USER@HOST/DB?sslmode=require' codexctl-central migrate --state /path/to/state --key-file /path/to/key`
-(or use `dual` mode). TLS is required by default, and `DATABASE_URL` must set
-`sslmode=require`; set `CODEXCTL_CENTRAL_DB_CA_FILE` to the RDS CA bundle when
-the server certificate is signed by a private Amazon RDS authority.
+PostgreSQL mode opens a reconnecting client with bounded connect, statement, and
+operation timeouts. Every token request reads the committed account revision;
+only a holder of the per-account lease and fencing epoch may run a refresh child
+or persist a rotated credential. Holder IDs contain the pod hostname and a
+random boot nonce. Registry authorization reads PostgreSQL on every request and
+mutations use one entity per compare-and-swap revision, so a stale pod cannot
+replace a concurrent revoke, enrollment, or re-enable. Dual mode is retained
+only for explicit migration commands and still requires
+`CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
-Phase 2 is intentionally inert with respect to shared storage. Both server
-implementations reject `dual` and `postgres`, including the legacy dual-write
-alias and `CODEXCTL_CENTRAL_DUAL_ACK=1`. Local CLI administration (`setup`, `init`,
-`users`, `register`, `revoke`) also refuses these modes before touching files.
-The explicit `migrate` command remains available for schema provisioning.
-The managed broker's `/ready` body reports `storeMode: "file"`, local registry
-health as `ready`, and `databaseReachable: null` because it does not use a DB.
-No database client, lease task, mirror write, or central registry read is added
-to the token path. Keep one replica and the existing local native-owner rules.
+The phase-3 PostgreSQL server fails closed for enrollment, reset redemption,
+and relogin endpoints. Their browser sessions, reset journals, and operation
+records remain file-backed, so they are not safe behind a multi-replica
+service. Keep those workflows on the single file-mode writer until phase 4
+adds shared TTL/one-time-consume and operation-record tables.
 
-### Phase 3 ownership and acceptance gates
-
-The managed central-runtime and storage-DAL owner is this B19 implementation
-lane; acceptance owner is HQ. The unfinished implementation is preserved on
-`archive/b19-dual-runtime-wip` for redesign, not deployment. Backfill, PostgreSQL
-authorization, and dual runtime are not delivered by phase 2.
-
-Before HQ accepts a phase-3 PR, CI must exercise actual broker instances against
-the PostgreSQL service and prove all of the following:
-
-- Each token request reads the committed account generation. A stale follower
-  reloads credentials before use, then can perform a forced refresh after
-  acquiring ownership. Persisted generations use compare-and-swap; JWT issued-at
-  or expiry remain freshness evidence, not unique credential generations.
-- CLI and HTTP enable/disable, enroll/register, and revoke mutate central
-  entities transactionally. Concurrent changes retain every enrollment and
-  revocation, explicit re-enable works, and another instance observes the result.
-- Every credential-mutating native call owns the lease. Renewal failure stops
-  work before lease expiry, uncertain completion retains ownership until the
-  child is confirmed stopped, and a replacement holder refreshes immediately
-  after a safe release. Tests count actual provider calls and cover child-stop
-  failure, same-second credentials, and forced-refresh failover.
-- Cached clients recover from dropped and hanging DB connections within bounded
-  deadlines. Readiness and token behavior follow the agreed authority model;
-  transient authorization-store outages are not treated as device revocation.
-- Backfill parses the full input and durably copies every reported record using
-  owner keys (two logins in one workspace both survive). Enrollment handoff,
-  reset idempotency, and relogin recovery work across instances.
-
-Green CI and an exact-head Architect approval are required before enablement.
-The staging and rollback procedure below remains a future acceptance plan.
+TLS is required by default. `DATABASE_URL` must include `sslmode=require`; set
+`CODEXCTL_CENTRAL_DB_CA_FILE` to the mounted RDS CA bundle or system CA bundle.
+The database role owns only `codexctl` and is non-superuser; the live
+ExternalSecret is supplied by infra#1513.
 
 ## 1. State inventory
 
@@ -80,7 +49,7 @@ database mapping is described in section 3.
 | Login-renewal (relogin) state                    | A renewal is a durable `relogin/<id>/record.json` with phase, process evidence, candidate auth, and error (`src/central/relogin/state.rs:23-50`, `67-103`). Candidate and reservation inventory intentionally retains unreadable evidence (`src/central/relogin/inventory.rs:65-134`).                                                                                                                  | Written at every phase transition and on child/process evidence; read at startup, recovery, status, cancellation, and identity-conflict checks.                                                                                                                        | Store the operation record and candidate encrypted auth in PostgreSQL. Keep the browser/device flow and native child pod-local until the operation is promoted; acquire the account lease before stopping or replacing its refresh owner.                                             |
 | Enrollment state                                 | Pending device challenges, OIDC login state, and approval tokens are in three in-memory maps (`src/central/enrollment.rs:65-78`). They expire during cleanup (`src/central/enrollment.rs:136-140`) and are consumed once (`src/central/enrollment.rs:237-266`, `451-490`).                                                                                                                              | Read/write per browser or polling request; currently lost when a pod dies.                                                                                                                                                                                             | Put short-lived challenges, PKCE state, and approvals in PostgreSQL (or a shared expiring key store) with TTL and one-time-consume transactions. This is required for a poll or callback to land on another pod.                                                                      |
 | Usage/catalog observations                       | The account catalog is a 60-second per-pod cache keyed by account and credential revision (`src/central/catalog.rs:11-25`, `69-105`). Listing copies only an access token and never refreshes or persists credentials (`src/central/managed.rs:375-442`).                                                                                                                                               | Read-mostly; cache fills on expiry and may issue one read-only upstream usage request.                                                                                                                                                                                 | Keep this cache local to each pod. It is derived state, so a pod may return stale/unknown usage and refill independently. Never use it as an ownership or refresh lock.                                                                                                               |
-| SSO configuration, vault key, metrics credential | The SSO client secret is read from a private file at startup (`src/central/enrollment.rs:80-115`); the vault key and metrics token are projected secrets in staging (`deploy/k8s/base/statefulset.yaml:33-55`, `120-133`).                                                                                                                                                                              | Read-only after startup.                                                                                                                                                                                                                                               | Continue using External Secrets/secret mounts. Rotate the vault key only with a coordinated re-encryption migration, as already documented (`docs/central-server.md:392-400`).                                                                                                        |
+| SSO configuration, vault key, metrics credential | The SSO client secret is read from a private file at startup (`src/central/enrollment.rs:80-115`); the vault key and metrics token are projected secrets in staging (`deploy/k8s/base/statefulset.yaml` and the HA overlay secret mounts).                                                                                                                                                              | Read-only after startup.                                                                                                                                                                                                                                               | Continue using External Secrets/secret mounts. Rotate the vault key only with a coordinated re-encryption migration, as already documented (`docs/central-server.md:392-400`).                                                                                                        |
 | Failure counters and shutdown flags              | Failure counters, ownership-unresolved, stopping, and the work semaphore are process memory (`src/central/managed.rs:90-105`, `243-261`).                                                                                                                                                                                                                                                               | Updated per request or lifecycle event.                                                                                                                                                                                                                                | Treat as pod-local telemetry. Export counters to Prometheus; do not use them as durable business state.                                                                                                                                                                               |
 
 ## 2. Refresh-token rotation and the single writer
@@ -152,7 +121,7 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
   refresh lease (for example, the compatibility write path), that pod must
   return 503 until it holds the lease; it must never advertise readiness while
   accepting an unsafe write. The current probes and semantics are
-  `deploy/k8s/base/statefulset.yaml:104-113` and `docs/central-server.md:467-472`.
+  `deploy/k8s/base/statefulset.yaml` and the probes in `deploy/k8s/overlays/staging-ha/deployment.yaml`.
 - Use a short `preStop` drain: stop accepting new refresh acquisitions, finish
   in-flight persistence, release the account lease, and then terminate. A pod
   that loses the lease or database connection must fail readiness immediately.
@@ -162,47 +131,267 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
-The migration is staged so no cutover step depends on a cold database import.
-The operator measures the token-request outage at every step and aborts if it
-approaches 60 seconds.
+The commands below are an operator runbook. This PR does not run them and does
+not reference the live Argo application. Stop if the database, role, secret,
+or row counts do not match the reviewed plan.
 
-1. **Prepare and back up.** Freeze administrative mutations, verify the vault key
-   and PVC snapshot, and export a checksummed copy of `users.json`,
-   `devices.json`, every account vault/runtime journal, reset journals, and
-   relogin records. Keep the existing pod serving token reads.
-2. **Install the compatibility release.** Add the PostgreSQL schema, least-
-   privilege role, connection secret, and migration job. Start the current
-   single pod with dual-read/dual-write enabled: it remains the only refresh
-   writer while it backfills rows under the existing owner lock. Reconcile row
-   counts, account identities, token revisions, device hashes, pending reset
-   IDs, and nonterminal relogin operations before proceeding.
-3. **Warm followers.** Start two new pods in read-only/follower mode on distinct
-   nodes and zones. They read the database, never attach the old PVC, and expose
-   readiness only after catalog/device rows and the lease table are readable.
-   Exercise `GET /v1/accounts`, `GET /v1/resets`, and an access-token request
-   against each pod through an internal test Service.
-4. **Enable fenced refresh.** Turn on per-account lease acquisition for the new
-   image. Run a two-pod forced-refresh canary for one staging account and verify
-   one upstream refresh, one committed revision, and identical responses from
-   both pods. Keep the old pod as a read-only emergency endpoint during the
-   canary.
-5. **Cut over.** Mark the old pod unready, wait for its in-flight operations to
-   drain, and release its leases. Point the Service at the three new pods. The
-   old process must not be allowed to refresh after handoff. Observe token
-   success, lease transitions, and database latency for at least two lease TTLs.
-6. **Finish.** After a successful observation window, disable the file-backed
-   dual-write path, retain the PVC snapshot for the agreed rollback period, and
-   remove the old single-replica workload in a later reviewed deployment.
+1. **Back up the current PVC.** Keep the single live pod serving file mode.
+   Freeze administrative mutations, take the filesystem copy at one point in
+   time, and hash the exact archive kept for recovery before changing its
+   environment:
 
-Rollback is a feature-flag reversal, not a simultaneous writer operation. If
-the database or new pods fail, stop new-pod writes, fence their leases, mark the
-new Service endpoints unready, and route to the still-running old pod. If the
-old pod was stopped, restore its PVC snapshot and start exactly one old image;
-the compatibility image reads the exported rows or file snapshot and refuses
-to refresh until it has a current fencing epoch. This keeps one refresh writer
-and bounds the outage to pod readiness plus one lease interval. Never force-
-delete the old pod while its native owner may still be alive, matching the
-existing recovery warning (`docs/central-server.md:454-456`).
+   ```sh
+   kubectl --context plat-staging -n codexctl cp codexctl-0:/data/state ./codexctl-state-backup
+   tar -C ./codexctl-state-backup -czf ./codexctl-state-backup.tar.gz .
+   sha256sum ./codexctl-state-backup.tar.gz
+   ```
+
+   Keep `codexctl-state-backup.tar.gz` and its checksum together. Restore from
+   that archive, not from a second live copy.
+
+2. **Provision and migrate.** After infra#1513 is merged and applied, stop the
+   file-mode writer and wait for `codexctl-0` to terminate before attaching its
+   ReadWriteOncePod claim to a migration Job. Then wait for
+   `externalsecret/codexctl-postgres` to be Ready. Run the explicit schema
+   migration and backfill from the retained PVC using the projected vault key;
+   retain the JSON count output as the migration receipt:
+
+   Use one-shot migration Jobs with `secretKeyRef` inputs. Do not pass the
+   database password through `kubectl exec` arguments or shell expansion. The
+   migration Job mounts the retained PVC at `/data` and runs `migrate`; submit
+   a second copy with `backfill` as its command after migration completes:
+
+   Apply the migration-only egress policy before creating either Job. It
+   matches the `app.kubernetes.io/name: codexctl-migration` label below and
+   permits only cluster DNS and the private PostgreSQL network:
+
+   ```sh
+   kubectl --context plat-staging apply -f deploy/k8s/overlays/staging-ha/migration-networkpolicy.yaml
+   ```
+
+   The scale-down starts a maintenance window: the existing Ingress has no
+   token-serving backend until the HA Deployment is ready. Announce the
+   expected token outage, reject or drain token traffic during migration, and
+   do not scale down outside that window. Apply the HA overlay and switch the
+   Ingress only after its three pods pass the checks in step 4.
+
+   ```sh
+   kubectl --context plat-staging -n codexctl scale statefulset/codexctl --replicas=0
+   kubectl --context plat-staging -n codexctl wait --for=delete pod/codexctl-0 --timeout=120s
+   kubectl --context plat-staging -n codexctl wait --for=condition=Ready \
+     externalsecret/codexctl-postgres --timeout=120s
+   ```
+
+   ```yaml
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     name: codexctl-migrate
+   spec:
+     ttlSecondsAfterFinished: 86400
+     template:
+       metadata:
+         labels:
+           app.kubernetes.io/name: codexctl-migration
+       spec:
+         securityContext:
+           runAsUser: 10001
+           runAsGroup: 10001
+           runAsNonRoot: true
+           fsGroup: 10001
+           seccompProfile: { type: RuntimeDefault }
+         restartPolicy: Never
+         initContainers:
+           - name: prepare-secrets
+             image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+             command: [sh, -ec]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
+             args:
+               - >-
+                 cp /projected/vault-key /keys/vault-key;
+                 cp /projected/oidc-client-secret /keys/oidc-client-secret;
+                 cp /projected/metrics-token /keys/metrics-token;
+                 chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+             volumeMounts:
+               - { name: projected, mountPath: /projected, readOnly: true }
+               - { name: keys, mountPath: /keys }
+         containers:
+           - name: migrate
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
+             command:
+               [
+                 codexctl-central,
+                 migrate,
+                 --state,
+                 /data/state,
+                 --key-file,
+                 /keys/vault-key,
+               ]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
+             env:
+               - { name: CODEXCTL_CENTRAL_STORE, value: postgres }
+               - {
+                   name: DB_HOST,
+                   valueFrom:
+                     {
+                       secretKeyRef:
+                         { name: codexctl-postgres, key: db-hostname },
+                     },
+                 }
+               - {
+                   name: DB_PORT,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-port },
+                     },
+                 }
+               - {
+                   name: DB_NAME,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-name },
+                     },
+                 }
+               - {
+                   name: DB_USER,
+                   valueFrom:
+                     {
+                       secretKeyRef: { name: codexctl-postgres, key: db-user },
+                     },
+                 }
+               - {
+                   name: DB_PASSWORD,
+                   valueFrom:
+                     {
+                       secretKeyRef:
+                         { name: codexctl-postgres, key: db-password },
+                     },
+                 }
+             volumeMounts:
+               - { name: state, mountPath: /data }
+               - { name: keys, mountPath: /keys, readOnly: true }
+         volumes:
+           - name: state
+             persistentVolumeClaim: { claimName: state-codexctl-0 }
+           - name: projected
+             secret: { secretName: codexctl-secrets, defaultMode: 288 }
+           - name: keys
+             emptyDir: { medium: Memory }
+   ```
+
+   Apply the reviewed Job, wait for completion, and repeat the manifest with
+   `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]`.
+   Keep both Job logs and the backfill JSON counts as the migration receipt.
+
+3. **Re-backfill after quiescing.** PostgreSQL mode is the only serving mode;
+   `dual` is migration-only and the server refuses to start in it. Run the
+   final backfill from a reviewed one-shot migration Job that mounts the
+   retained PVC. Keep the StatefulSet scaled to zero after this point. Do not
+   run two refresh writers:
+
+   ```sh
+   kubectl --context plat-staging -n codexctl apply -f - <<'YAML'
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     name: codexctl-backfill
+   spec:
+     ttlSecondsAfterFinished: 86400
+     template:
+       metadata:
+         labels:
+           app.kubernetes.io/name: codexctl-migration
+       spec:
+         securityContext:
+           runAsUser: 10001
+           runAsGroup: 10001
+           runAsNonRoot: true
+           fsGroup: 10001
+           seccompProfile: { type: RuntimeDefault }
+         restartPolicy: Never
+         initContainers:
+           - name: prepare-secrets
+             image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+             command: [sh, -ec]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
+             args:
+               - >-
+                 cp /projected/vault-key /keys/vault-key;
+                 cp /projected/oidc-client-secret /keys/oidc-client-secret;
+                 cp /projected/metrics-token /keys/metrics-token;
+                 chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+             volumeMounts:
+               - {name: projected, mountPath: /projected, readOnly: true}
+               - {name: keys, mountPath: /keys}
+         containers:
+           - name: backfill
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
+             command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
+             securityContext:
+               allowPrivilegeEscalation: false
+               readOnlyRootFilesystem: true
+               capabilities: { drop: [ALL] }
+             env:
+               - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
+               - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
+               - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
+               - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
+               - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
+               - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
+             volumeMounts:
+               - {name: state, mountPath: /data}
+               - {name: keys, mountPath: /keys, readOnly: true}
+         volumes:
+           - name: state
+             persistentVolumeClaim: {claimName: state-codexctl-0}
+           - name: projected
+             secret: {secretName: codexctl-secrets, defaultMode: 288}
+           - name: keys
+             emptyDir: {medium: Memory}
+   YAML
+   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=10m
+   kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
+   ```
+
+4. **Cut over to the build-only HA overlay.** After the final backfill,
+   build and apply the separately reviewed overlay (the overlay is deliberately
+   not referenced by `deploy/k8s/staging-application.yaml`):
+
+   ```sh
+   kustomize build deploy/k8s/overlays/staging-ha
+   kubectl --context plat-staging apply -k deploy/k8s/overlays/staging-ha
+   kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
+   ```
+
+   The HA service accepts token and registry operations only. Enrollment,
+   reset redemption, and relogin return `503` until their shared workflow
+   state is delivered in phase 4.
+
+   Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
+   `/ready` database health, one upstream refresh for a simultaneous forced
+   request, and no lease or ExternalSecret errors before changing traffic.
+   Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
+   `Service/codexctl-ha` and apply the Ingress change only after validation.
+
+5. **Rollback.** Stop HA refreshes, mark the HA Service endpoints unready, and
+   fence their leases by allowing the TTL to expire or explicitly releasing
+   them. Restore the previous single-pod StatefulSet from the retained PVC
+   snapshot, unset PostgreSQL mode, and verify file-mode `/ready`. Because HA
+   may have rotated credentials after the snapshot, require an explicit
+   relogin for every affected account and verify a successful file-mode token
+   request before routing traffic back. Change the staging `Ingress/codexctl`
+   backend from `Service/codexctl-ha` back to `Service/codexctl` and apply the
+   Ingress change. Never run old and HA refresh writers
+   simultaneously; preserve the database and PVC receipts for reconciliation.
 
 ## 6. Test and acceptance plan
 
@@ -218,23 +407,26 @@ instance, then repeat the destructive cases in staging.
    response but before the commit, and again after the commit but before the HTTP
    response. Assert the successor either commits the single rotation or reads
    the committed revision; a stale holder cannot write after epoch change.
-3. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
+3. **Unresolved provider call.** Force lease renewal loss while the old
+   provider call is still unresolved. Keep the old owner fenced and assert that
+   no successor calls the provider until the old child is settled or confirmed
+   stopped and its rotated credential is reconciled.
+4. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
    keeps one ready pod, topology rules place replacements on another node and
    zone, and token requests recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
-4. **Enrollment and renewal.** Start enrollment on pod A, complete the browser
-   callback on pod B, and poll from pod C. Repeat a login renewal across pods;
-   assert one operation record, one candidate promotion, and no duplicate native
-   owner.
-5. **Reset idempotency.** Submit one redemption ID to two pods, kill one during
-   the provider call, and retry from the other. Assert one credit/key spend and
-   the same terminal receipt, as required by the current journal behavior
+5. **Enrollment and renewal.** In phase three, assert that enrollment and
+   relogin return `503` on every pod because their workflow state remains
+   local. Move the cross-pod success and one-operation assertions to phase four.
+6. **Reset idempotency.** In phase three, assert that reset redemption returns
+   `503` on every pod. Move the one-spend and terminal-receipt assertions to
+   phase four, after the shared journal is delivered
    (`src/central/resets.rs:325-441`).
-6. **Readiness and fencing.** Remove the lease or database access from one pod;
+7. **Readiness and fencing.** Remove the lease or database access from one pod;
    `/ready` must fail for unsafe write service, reads must either use committed
    state or return a bounded unavailable response, and metrics must identify the
    pod and lease epoch without secrets.
-7. **Load and recovery.** Run account listing at the 60-second cache interval,
+8. **Load and recovery.** Run account listing at the 60-second cache interval,
    mixed token requests, and a rolling restart. Verify no refresh race, no lost
    pending operation, and no account identity or revision regression. Record
    p50/p95/p99 token latency and the maximum observed outage; acceptance is
