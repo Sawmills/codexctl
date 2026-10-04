@@ -936,17 +936,12 @@ async fn token(
             if settle_required && owner.rpc.is_some() {
                 let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out);
                 let process_exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
-                if owner.rpc.as_ref().is_some_and(Rpc::timed_out) {
-                    // Keep the RPC attached and the lease retained if settlement
-                    // fails; the next settlement attempt must see its journal.
-                    retain_lease = true;
-                    settled_owner_record(&mut owner, &before)
-                        .await
-                        .map_err(|error| {
-                            eprintln!("central owner timeout settlement: {error:#}");
-                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                        })?;
-                } else if failed_rpc || process_exited {
+                // An outstanding request may still have rotated credentials even
+                // after a protocol/transport failure. Only an EOF from a child
+                // that is confirmed dead can skip the normal settlement path.
+                let dead_child =
+                    failed_rpc && process_exited && !owner.rpc.as_ref().is_some_and(Rpc::timed_out);
+                if dead_child {
                     if let Some(rpc) = owner.rpc.take() {
                         rpc.terminate().await;
                     }
@@ -961,6 +956,9 @@ async fn token(
                         })?;
                     }
                 } else {
+                    // Keep the RPC attached and the lease retained until the
+                    // request completion is known. This applies to timeouts and
+                    // protocol failures alike.
                     retain_lease = true;
                     settled_owner_record(&mut owner, &before)
                         .await
@@ -1636,12 +1634,10 @@ impl Broker {
             if !owner.rpc.as_ref().is_some_and(Rpc::verified_login) {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
-            relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.vault.verified = true;
+            owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-            owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
             vault::save(&owner.state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             if let (Some(central), Some(lease)) =
@@ -1666,6 +1662,8 @@ impl Broker {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
+            relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.verification_input = None;
             Ok(account_summary(&owner))
         }
