@@ -73,7 +73,7 @@ pub(super) fn run(home: &Path, action: SessionProviderAction) -> Result<()> {
         let open = if home.join("sessions").try_exists()?
             || home.join("archived_sessions").try_exists()?
         {
-            open_files()?
+            open_files(&home)?
         } else {
             HashSet::new()
         };
@@ -355,7 +355,7 @@ fn repair(
     temp.as_file().sync_all()?;
     // Include every process, including this CLI's parent. Close our own input
     // before asking the OS, then recheck the inode and timestamps before rename.
-    if is_open(path)? {
+    if is_open(path, home)? {
         summary.open += 1;
         println!("skipped-open {}", path.display());
         return Ok(());
@@ -402,7 +402,7 @@ fn save_backup(path: &Path, line: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
+fn lsof(args: &[&std::ffi::OsStr], home: &Path) -> Result<std::process::Output> {
     let mut command = Command::new("lsof");
     command.arg("-nP");
     #[cfg(target_os = "linux")]
@@ -433,7 +433,7 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
         if line.is_empty() {
             return false;
         }
-        if harmless_lsof_warning(line) {
+        if harmless_lsof_warning(line, home) {
             after_warning = true;
             return false;
         }
@@ -447,23 +447,61 @@ fn lsof(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
     }
     Ok(output)
 }
-fn harmless_lsof_warning(line: &[u8]) -> bool {
+fn harmless_lsof_warning(line: &[u8], home: &Path) -> bool {
     let line = String::from_utf8_lossy(line);
     line.contains("WARNING: can't stat() nsfs file system /run/docker/netns/")
-        || line.contains("WARNING: can't stat() overlay file system /var/lib/docker/")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/debug/tracing")
         || line.contains("WARNING: can't stat() tracefs file system /sys/kernel/tracing")
+        || (line.contains("WARNING: can't stat() overlay file system /var/lib/docker/")
+            && overlay_warning_is_unrelated(&line, home))
 }
-fn is_open(path: &Path) -> Result<bool> {
-    let output = lsof(&["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()])?;
+#[cfg(target_os = "linux")]
+fn overlay_warning_is_unrelated(line: &str, home: &Path) -> bool {
+    // Docker's nested overlay mounts are safe to ignore only when mountinfo
+    // proves the selected Codex home is outside the affected mount. If mount
+    // information is unavailable or the home is inside it, fail closed.
+    let Some(warning_path) = line
+        .split_once("overlay file system ")
+        .and_then(|(_, path)| path.split_whitespace().next())
+        .map(Path::new)
+    else {
+        return false;
+    };
+    if home.starts_with(warning_path) {
+        return false;
+    }
+    let Ok(mountinfo) = fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    let Some(home_mount) = mountinfo
+        .lines()
+        .filter_map(|line| line.split_once(" - "))
+        .filter_map(|(mount, _)| mount.split_whitespace().nth(4))
+        .map(|mount| PathBuf::from(mount.replace("\\040", " ")))
+        .filter(|mount| home.starts_with(mount))
+        .max_by_key(|mount| mount.components().count())
+    else {
+        return false;
+    };
+    !home_mount.starts_with(warning_path)
+}
+#[cfg(not(target_os = "linux"))]
+fn overlay_warning_is_unrelated(_line: &str, _home: &Path) -> bool {
+    false
+}
+fn is_open(path: &Path, home: &Path) -> Result<bool> {
+    let output = lsof(
+        &["-F".as_ref(), "p".as_ref(), "--".as_ref(), path.as_os_str()],
+        home,
+    )?;
     match (output.status.code(), output.stdout.is_empty()) {
         (Some(0), false) => Ok(true),
         (Some(1), true) => Ok(false),
         _ => bail!("ambiguous OS open-file result; file unchanged"),
     }
 }
-fn open_files() -> Result<HashSet<(u64, u64)>> {
-    let output = lsof(&["-F".as_ref(), "pDi".as_ref()])?;
+fn open_files(home: &Path) -> Result<HashSet<(u64, u64)>> {
+    let output = lsof(&["-F".as_ref(), "pDi".as_ref()], home)?;
     let mut files = HashSet::new();
     let mut device = None;
     for line in output.stdout.split(|&b| b == b'\n') {
