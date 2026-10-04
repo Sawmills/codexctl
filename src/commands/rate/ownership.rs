@@ -1,8 +1,7 @@
 //! Current process ownership, independent of response-log activity.
 use serde::Serialize;
-use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -23,18 +22,6 @@ pub(super) struct LiveProcess {
 pub(super) struct Snapshot {
     pub processes: Vec<LiveProcess>,
     pub warnings: Vec<String>,
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn launch_only(launchers: &BTreeMap<u32, String>) -> Vec<LiveProcess> {
-    launchers
-        .iter()
-        .map(|(&pid, alias)| LiveProcess {
-            pid,
-            started_at: chrono::Utc::now().timestamp(),
-            account: Some((alias.clone(), Source::Launch)),
-        })
-        .collect()
 }
 
 #[cfg(unix)]
@@ -259,11 +246,14 @@ fn fallback_processes(
                     account: Some((alias, Source::Launch)),
                 });
             }
-        } else if codex && process_home(pid, home).is_some_and(|default| default) {
+        } else if codex && let Some(default_home) = process_home(pid, home) {
             result.push(LiveProcess {
                 pid,
                 started_at,
-                account: host_account.map(|alias| (alias.to_owned(), Source::HostDefault)),
+                account: default_home
+                    .then_some(host_account)
+                    .flatten()
+                    .map(|alias| (alias.to_owned(), Source::HostDefault)),
             });
         }
     }
@@ -287,9 +277,12 @@ fn proc_start_epoch(start_ticks: u64) -> Option<i64> {
 fn fallback_processes(
     _host_account: Option<&str>,
     _home: &std::path::Path,
-    launchers: &BTreeMap<u32, String>,
+    _launchers: &BTreeMap<u32, String>,
 ) -> Vec<LiveProcess> {
-    launch_only(launchers)
+    // Without a process inventory, a non-Linux fallback cannot identify the
+    // Codex child below a launcher. Keep the report successful and let the
+    // snapshot warning explain why ownership is unavailable.
+    Vec::new()
 }
 
 /// None means another home or unreadable evidence. False means an isolated or

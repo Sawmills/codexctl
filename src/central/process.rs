@@ -68,6 +68,7 @@ fn incarnation(pid: u32) -> Result<Option<String>> {
         Ok(Some(start))
     }
 }
+
 impl Process {
     pub fn pid(&self) -> u32 {
         self.pid
@@ -168,5 +169,21 @@ mod tests {
         let process = Process::capture(std::process::id()).unwrap();
         let alive = process.alive().unwrap();
         assert!(alive);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exited_pid_stays_not_alive_when_ps_reports_no_output() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let process = Process {
+            pid,
+            incarnation: String::from("old-process-incarnation"),
+        };
+        assert!(!process.alive().unwrap());
     }
 }

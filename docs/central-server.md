@@ -366,7 +366,8 @@ contain `account`, `weekly_used_percent`, `responses_ok`, `responses_429`, `rate
 429s (zero without responses); unknown weekly usage is null.
 
 When live process inspection is unavailable, JSON also contains a `warnings` array;
-launch ownership and log counts remain available. In text mode, warnings go to stderr
+log counts remain available. Linux uses procfs for live ownership; other Unix systems
+report no ownership when `ps` fails. In text mode, warnings go to stderr
 and the table includes an `Owned PIDs` column. An empty warnings array is omitted.
 
 `owned_pids` is an array such as `[{"pid":123,"source":"launch"}]`, sorted by PID.

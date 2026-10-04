@@ -8059,6 +8059,33 @@ fn b21d_log_ownership_requires_a_live_process_and_evidence_from_its_lifetime() {
         json!([{"pid":child.0.id(),"source":"log"}])
     );
     assert_eq!(report["accounts"][0]["responses_ok"], 2);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.path().join("broken-bin");
+        std::fs::create_dir(&bin).unwrap();
+        store::atomic_write(&bin.join("ps"), b"#!/bin/sh\nexit 127\n").unwrap();
+        std::fs::set_permissions(bin.join("ps"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fallback = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(["rate", "--json", "--minutes", "120"])
+            .env("HOME", home.path())
+            .env("PATH", &bin)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            fallback.status.success(),
+            "{}",
+            String::from_utf8_lossy(&fallback.stderr)
+        );
+        let fallback_report: Value = serde_json::from_slice(&fallback.stdout).unwrap();
+        assert_eq!(
+            fallback_report["accounts"][0]["owned_pids"],
+            json!([{"pid":child.0.id(),"source":"log"}])
+        );
+    }
     child.0.kill().unwrap();
     child.0.wait().unwrap();
     let report = read();
@@ -8111,7 +8138,18 @@ fn b21d_rate_waits_for_a_launch_to_finish_creating_its_owner_lock() {
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn b21d_rate_warns_and_keeps_launch_ownership_when_ps_is_unavailable() {
+    check_rate_with_unavailable_ps(true);
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn b21d_rate_warns_without_claiming_the_launcher_when_ps_is_unavailable() {
+    check_rate_with_unavailable_ps(false);
+}
+
+fn check_rate_with_unavailable_ps(expect_child: bool) {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();
     server.import(&server.amir, "lane", "lane-login", "lane-seat");
@@ -8155,7 +8193,11 @@ exit 127
         .unwrap();
     assert_eq!(
         lane_row["owned_pids"],
-        json!([{"pid":lane.child_pid,"source":"launch"}])
+        if expect_child {
+            json!([{"pid":lane.child_pid,"source":"launch"}])
+        } else {
+            json!([])
+        }
     );
     let text = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .args(["rate"])
@@ -8169,6 +8211,8 @@ exit 127
     assert!(text.status.success());
     assert!(String::from_utf8_lossy(&text.stderr).contains("warning:"));
     assert!(String::from_utf8_lossy(&text.stdout).contains("Owned PIDs"));
-    assert!(String::from_utf8_lossy(&text.stdout).contains(&lane.child_pid.to_string()));
+    if expect_child {
+        assert!(String::from_utf8_lossy(&text.stdout).contains(&lane.child_pid.to_string()));
+    }
     lane.signal_and_wait(libc::SIGTERM);
 }
