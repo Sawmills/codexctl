@@ -20,6 +20,24 @@ mod vault;
 pub use client::run_client;
 pub use server::serve;
 
+/// Revoke a device in the shared registry with a per-entity CAS revision.
+pub async fn revoke_central(state: &Path, key: &Path, id: &str) -> Result<()> {
+    let central = storage::runtime_store(state, key).await?;
+    let rows = central.load_registry_entity_revisions("devices").await?;
+    let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id) else {
+        bail!("device not found");
+    };
+    let mut device: vault::Device = serde_json::from_slice(payload)?;
+    device.revoked = true;
+    if !central
+        .save_registry_entity_cas("devices", id, &serde_json::to_vec(&device)?, Some(*revision))
+        .await?
+    {
+        bail!("device changed concurrently; retry");
+    }
+    Ok(())
+}
+
 use crate::store;
 use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use anyhow::{Result, bail};

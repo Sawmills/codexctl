@@ -23,6 +23,8 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
         user: Option<String>,
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
@@ -73,10 +75,19 @@ enum Commands {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
+        key_file: Option<PathBuf>,
+        #[arg(long)]
         device: String,
     },
     /// Apply central PostgreSQL schema migrations when PostgreSQL storage is enabled.
     Migrate {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+    /// Copy local file state into the configured PostgreSQL store once.
+    Backfill {
         #[arg(long)]
         state: PathBuf,
         #[arg(long)]
@@ -149,32 +160,24 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
-    if matches!(
-        &cli.command,
-        Commands::Setup { .. }
-            | Commands::Init { .. }
-            | Commands::Users { .. }
-            | Commands::Register { .. }
-            | Commands::Revoke { .. }
-            | Commands::Serve { .. }
-    ) {
-        central::storage::require_file_runtime()?;
-    }
     match cli.command {
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {
             state,
+            key_file,
             user,
             enable,
             disable,
         } => {
             if enable || disable {
-                central::managed::set_user(
-                    &state,
-                    user.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("--user required"))?,
-                    enable,
-                )?;
+                let id = user
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--user required"))?;
+                if let Some(key_file) = key_file {
+                    central::managed::set_user_central(&state, &key_file, id, enable).await?;
+                } else {
+                    central::managed::set_user(&state, id, enable)?;
+                }
             } else {
                 for user in central::managed::users(&state)? {
                     println!(
@@ -203,9 +206,24 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             user,
             token_file,
         } => central::register(&state, &device, &tenant, &user, &token_file)?,
-        Commands::Revoke { state, device } => central::revoke(&state, &device)?,
+        Commands::Revoke {
+            state,
+            key_file,
+            device,
+        } => {
+            if let Some(key_file) = key_file {
+                central::revoke_central(&state, &key_file, &device).await?
+            } else {
+                central::revoke(&state, &device)?
+            }
+        }
         Commands::Migrate { state, key_file } => {
             central::storage::migrate(&state, &key_file).await?
+        }
+        Commands::Backfill { state, key_file } => {
+            let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
+            let counts = store.backfill(&state, &key_file).await?;
+            println!("{}", serde_json::to_string(&counts)?);
         }
         Commands::Serve {
             state,

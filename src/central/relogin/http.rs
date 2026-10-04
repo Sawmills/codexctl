@@ -5,7 +5,7 @@ pub(in crate::central) async fn status(
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
     let _import = broker.imports.lock().await;
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let refresh = broker.owner(&device, &request.alias).await?;
@@ -27,7 +27,7 @@ pub(in crate::central) async fn status(
     if record.device != device.id {
         return Err(broker.error(StatusCode::CONFLICT, "login_belongs_to_another_device"));
     }
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     Ok(response(&record))
 }
 pub(in crate::central) async fn cancel(
@@ -36,7 +36,7 @@ pub(in crate::central) async fn cancel(
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
     let _import = broker.imports.lock().await;
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let refresh = broker.owner(&device, &request.alias).await?;
@@ -72,7 +72,7 @@ pub(in crate::central) async fn start(
 ) -> Result<Response, HttpError> {
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     let permit = broker
         .work
         .clone()
@@ -86,7 +86,7 @@ pub(in crate::central) async fn start(
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "relogin_failed"))??;
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     Ok(response)
 }
 async fn start_owned(
@@ -97,7 +97,7 @@ async fn start_owned(
     validate_id(&request.id)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let _import = broker.imports.lock().await;
-    let device = broker.authorize(&headers)?;
+    let device = broker.authorize(&headers).await?;
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
     let owner = broker.owner(&device, alias).await?;
@@ -320,6 +320,6 @@ async fn start_owned(
         Err(_) => load(&initial_state, &initial_id)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?,
     };
-    broker.authorize(&headers)?;
+    broker.authorize(&headers).await?;
     Ok(response(&record))
 }

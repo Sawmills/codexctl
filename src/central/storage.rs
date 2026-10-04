@@ -2,8 +2,8 @@
 //!
 //! File storage remains the default.  PostgreSQL schema provisioning is
 //! available with `codexctl-central migrate`; server startup rejects
-//! `CODEXCTL_CENTRAL_STORE=postgres` and `dual` until runtime reads and writes
-//! are wired to the shared store.  The database never receives the vault key:
+//! `CODEXCTL_CENTRAL_STORE=postgres`; dual mode is opt-in until rollout. The
+//! database never receives the vault key:
 //! credential and enrollment payloads are nonce-prefixed AES-GCM ciphertext.
 
 use super::vault;
@@ -17,6 +17,14 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+const DB_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+    tokio::time::timeout(DB_TIMEOUT, future)
+        .await
+        .context("central PostgreSQL operation timed out")?
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StoreMode {
@@ -53,8 +61,19 @@ impl StoreMode {
     }
 }
 
+impl std::fmt::Display for StoreMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::File => "file",
+            Self::Postgres => "postgres",
+            Self::Dual => "dual",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CredentialRecord {
+    /// Stable broker owner key (`account_key(user, alias)`), not the workspace.
     pub account_id: String,
     pub user_id: Option<String>,
     pub alias: String,
@@ -100,7 +119,9 @@ pub struct FileStore {
 
 #[derive(Clone)]
 pub struct PostgresStore {
-    client: Arc<tokio_postgres::Client>,
+    url: String,
+    tls_enabled: bool,
+    client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     key: PathBuf,
 }
 
@@ -113,6 +134,14 @@ pub enum CentralStore {
         postgres: PostgresStore,
         mirror_failures: Arc<std::sync::atomic::AtomicU64>,
     },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BackfillCounts {
+    pub accounts: usize,
+    pub users: usize,
+    pub devices: usize,
+    pub observed_relogins: usize,
 }
 
 const SCHEMA: &str = r#"
@@ -128,8 +157,10 @@ CREATE TABLE IF NOT EXISTS central_accounts (
     login TEXT,
     encrypted_vault BYTEA NOT NULL,
     revision BIGINT NOT NULL,
+    deleted_at TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE central_accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE TABLE IF NOT EXISTS account_refresh_leases (
     account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id) ON DELETE CASCADE,
     holder_id TEXT NOT NULL,
@@ -143,6 +174,23 @@ CREATE TABLE IF NOT EXISTS enrollment_challenges (
     consumed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challenges (expires_at);
+CREATE TABLE IF NOT EXISTS central_registry (
+    name TEXT PRIMARY KEY,
+    encrypted_payload BYTEA NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE central_registry ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS central_registry_entries (
+    kind TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    encrypted_payload BYTEA NOT NULL,
+    revision BIGINT NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, entity_id)
+);
+CREATE INDEX IF NOT EXISTS central_registry_entries_kind_idx
+    ON central_registry_entries (kind);
 "#;
 
 impl CentralStore {
@@ -179,13 +227,241 @@ impl CentralStore {
         }
     }
 
+    pub fn mode(&self) -> StoreMode {
+        match self {
+            Self::File(_) => StoreMode::File,
+            Self::Postgres(_) => StoreMode::Postgres,
+            Self::Dual { .. } => StoreMode::Dual,
+        }
+    }
+
+    pub async fn reachable(&self) -> bool {
+        match self {
+            Self::File(file) => file.path().exists() || file.state.exists(),
+            Self::Postgres(db) => bounded_db(db.client()).await.is_ok(),
+            Self::Dual { postgres, .. } => bounded_db(postgres.client()).await.is_ok(),
+        }
+    }
+
+    pub async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        if payload.len() > 1024 * 1024 {
+            bail!("central registry payload exceeds the 1 MiB bound");
+        }
+        match self {
+            Self::File(file) => file.save_registry(name, payload),
+            Self::Postgres(db) => db.save_registry(name, payload).await,
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
+                postgres.save_registry(name, payload).await?;
+                if let Err(error) = file.save_registry(name, payload) {
+                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"operation":"central_store_mirror","backend":"file","stage":"registry","reason":error.to_string()})
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => bounded_db(db.load_registry(name)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.load_registry(name)).await,
+        }
+    }
+
+    /// Read normalized registry entities. PostgreSQL is authoritative in the
+    /// shared modes; the legacy blob remains only as a migration fallback.
+    pub async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.load_registry_entities(name)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.load_registry_entities(name)).await,
+        }
+    }
+
+    /// Read registry entities together with their per-entity revision.  The
+    /// revision is a compare-and-swap token for administrative mutations.
+    pub async fn load_registry_entity_revisions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.load_registry_entity_revisions(name)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.load_registry_entity_revisions(name)).await
+            }
+        }
+    }
+
+    /// Atomically upsert each registry entity in one SQL statement. This keeps
+    /// a stale pod from replacing the shared users/devices set with its local
+    /// snapshot and gives every entity its own revision.
+    pub async fn save_registry_entities(
+        &self,
+        name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if entries
+            .iter()
+            .any(|(_, payload)| payload.len() > 1024 * 1024)
+        {
+            bail!("central registry entity exceeds the 1 MiB bound");
+        }
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) => bounded_db(db.save_registry_entities(name, entries)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.save_registry_entities(name, entries)).await
+            }
+        }
+    }
+
+    /// Update one entity without replacing a stale registry snapshot.  A
+    /// missing entity is inserted; an existing entity is replaced only when
+    /// `expected_revision` still matches.
+    pub async fn save_registry_entity_cas(
+        &self,
+        name: &str,
+        entity_id: &str,
+        payload: &[u8],
+        expected_revision: Option<i64>,
+    ) -> Result<bool> {
+        if payload.len() > 1024 * 1024 {
+            bail!("central registry entity exceeds the 1 MiB bound");
+        }
+        match self {
+            Self::File(_) => Ok(true),
+            Self::Postgres(db) => {
+                bounded_db(db.save_registry_entity_cas(name, entity_id, payload, expected_revision)).await
+            }
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.save_registry_entity_cas(name, entity_id, payload, expected_revision)).await
+            }
+        }
+    }
+
+    pub async fn backfill(&self, state: &Path, key: &Path) -> Result<BackfillCounts> {
+        let target = match self {
+            Self::Postgres(db) => db,
+            Self::Dual { postgres, .. } => postgres,
+            Self::File(_) => bail!("backfill requires PostgreSQL or dual central storage"),
+        };
+        target.migrate().await?;
+        let mut counts = BackfillCounts {
+            accounts: 0,
+            users: 0,
+            devices: 0,
+            observed_relogins: 0,
+        };
+        let accounts = state.join("accounts");
+        if accounts.exists() {
+            for entry in std::fs::read_dir(accounts)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let account_state = entry.path();
+                if !account_state.join("vault.enc").exists() {
+                    continue;
+                }
+                let value = crate::central::vault::load(&account_state, key)?;
+                let workspace = crate::central::vault::account(&value.auth)?;
+                let login = crate::central::vault::token(&value.auth)
+                    .ok()
+                    .and_then(crate::api::token_subject);
+                let revision = crate::central::vault::token(&value.auth)
+                    .ok()
+                    .and_then(|token| {
+                        crate::api::token_issued_at(token)
+                            .or_else(|| crate::api::token_expiry(token))
+                    })
+                    .unwrap_or(0);
+                let record = CredentialRecord {
+                    account_id: crate::central::managed::account_key(&value.user, &value.alias),
+                    user_id: Some(value.user.clone()),
+                    alias: value.alias.clone(),
+                    workspace: Some(workspace),
+                    login,
+                    vault: serde_json::to_value(value)?,
+                    revision,
+                };
+                target.save_account(&record).await?;
+                counts.accounts += 1;
+            }
+        }
+        for (name, path) in [
+            ("users", state.join("users.json")),
+            ("devices", state.join("devices.json")),
+        ] {
+            if path.exists() {
+                let bytes = crate::central::vault::private_read(&path)?;
+                let user_count = if name == "users" {
+                    Some(
+                        serde_json::from_slice::<Vec<crate::central::managed::User>>(&bytes)?.len(),
+                    )
+                } else {
+                    None
+                };
+                let device_count = if name == "devices" {
+                    Some(
+                        serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?.len(),
+                    )
+                } else {
+                    None
+                };
+                target.save_registry(name, &bytes).await?;
+                if name == "users" {
+                    counts.users = user_count.unwrap_or_default();
+                } else {
+                    counts.devices = device_count.unwrap_or_default();
+                }
+            }
+        }
+        let relogin = state.join("relogin");
+        if relogin.exists() {
+            counts.observed_relogins = std::fs::read_dir(relogin)?
+                .filter_map(Result::ok)
+                .filter(|e| e.path().join("record.json").exists())
+                .count();
+        }
+        Ok(counts)
+    }
+
     pub async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
         match self {
             Self::File(file) => file.save_account(record),
-            Self::Postgres(db) => db.save_account(record).await,
-            Self::Dual { file, postgres, .. } => {
-                file.save_account(record)?;
-                postgres.save_account(record).await
+            Self::Postgres(db) => bounded_db(db.save_account(record)).await,
+            Self::Dual {
+                file,
+                postgres,
+                mirror_failures,
+            } => {
+                bounded_db(postgres.save_account(record)).await?;
+                let mirror = file.clone();
+                let record = record.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || mirror.save_account_if_newer(&record))
+                        .await
+                        .context("central file mirror task failed")?;
+                if let Err(error) = result {
+                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"operation":"central_store_mirror","backend":"file","stage":"save_account","reason":error.to_string()})
+                    );
+                }
+                Ok(())
             }
         }
     }
@@ -193,11 +469,18 @@ impl CentralStore {
     pub async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
         match self {
             Self::File(file) => file.load_account(account_id),
-            Self::Postgres(db) => db.load_account(account_id).await,
-            Self::Dual { file, postgres, .. } => Ok(postgres
-                .load_account(account_id)
+            Self::Postgres(db) => bounded_db(db.load_account(account_id)).await,
+            Self::Dual { file, postgres, .. } => Ok(bounded_db(postgres.load_account(account_id))
                 .await?
                 .or(file.load_account(account_id)?)),
+        }
+    }
+
+    pub async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.list_accounts()).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.list_accounts()).await,
         }
     }
 
@@ -209,7 +492,7 @@ impl CentralStore {
     ) -> Result<Lease> {
         match self {
             Self::File(file) => file.acquire_lease(account_id, holder_id, ttl),
-            Self::Postgres(db) => db.acquire_lease(account_id, holder_id, ttl).await,
+            Self::Postgres(db) => bounded_db(db.acquire_lease(account_id, holder_id, ttl)).await,
             Self::Dual {
                 file,
                 postgres,
@@ -217,8 +500,14 @@ impl CentralStore {
             } => {
                 // PostgreSQL is the fencing authority in dual mode.  Mirroring
                 // to disk is useful during migration, but never grants a lease.
-                let lease = postgres.acquire_lease(account_id, holder_id, ttl).await?;
-                if let Err(error) = file.mirror_lease(&lease, ttl) {
+                let lease = bounded_db(postgres.acquire_lease(account_id, holder_id, ttl)).await?;
+                let mirror = file.clone();
+                let lease_copy = lease.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || mirror.mirror_lease(&lease_copy, ttl))
+                        .await
+                        .context("central file lease mirror task failed")?;
+                if let Err(error) = result {
                     mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
                         "{}",
@@ -238,15 +527,23 @@ impl CentralStore {
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         match self {
             Self::File(file) => file.fenced_write(lease, record),
-            Self::Postgres(db) => db.fenced_write(lease, record).await,
+            Self::Postgres(db) => bounded_db(db.fenced_write(lease, record)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                let written = postgres.fenced_write(lease, record).await?;
+                let written = bounded_db(postgres.fenced_write(lease, record)).await?;
                 if written {
-                    match file.fenced_write(lease, record) {
+                    let mirror = file.clone();
+                    let lease_copy = lease.clone();
+                    let record_copy = record.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        mirror.fenced_write(&lease_copy, &record_copy)
+                    })
+                    .await
+                    .context("central file fenced mirror task failed")?;
+                    match result {
                         Ok(true) => {}
                         Ok(false) => {
                             mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -275,6 +572,20 @@ impl CentralStore {
                     }
                 }
                 Ok(written)
+            }
+        }
+    }
+
+    pub async fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        match self {
+            Self::File(file) => file.release_lease(lease),
+            Self::Postgres(db) => bounded_db(db.release_lease(lease)).await,
+            Self::Dual { file, postgres, .. } => {
+                let released = bounded_db(postgres.release_lease(lease)).await?;
+                let mirror = file.clone();
+                let lease = lease.clone();
+                let _ = tokio::task::spawn_blocking(move || mirror.release_lease(&lease)).await;
+                Ok(released)
             }
         }
     }
@@ -344,13 +655,13 @@ impl CentralStore {
     pub async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
         match self {
             Self::File(file) => file.renew(lease, ttl),
-            Self::Postgres(db) => db.renew(lease, ttl).await,
+            Self::Postgres(db) => bounded_db(db.renew(lease, ttl)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                let renewed = postgres.renew(lease, ttl).await?;
+                let renewed = bounded_db(postgres.renew(lease, ttl)).await?;
                 if renewed {
                     match file.renew(lease, ttl) {
                         Ok(true) => {}
@@ -423,21 +734,27 @@ impl FileStore {
     }
 
     fn save_account(&self, record: &CredentialRecord) -> Result<()> {
-        self.with_lock(|state| {
-            let replace = state.accounts.get(&record.account_id).is_none_or(|bytes| {
-                let old = vault::decrypt_bytes(&self.key, bytes)
-                    .ok()
-                    .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok());
-                old.is_none_or(|old| record.revision >= old.revision)
-            });
-            if replace {
-                state.accounts.insert(
-                    record.account_id.clone(),
-                    vault::encrypt_bytes(&self.key, &serde_json::to_vec(record)?)?,
-                );
-            }
-            Ok(())
-        })
+        self.save_account_if_newer(record).map(|_| ())
+    }
+
+    fn save_account_if_newer(&self, record: &CredentialRecord) -> Result<bool> {
+        let _lock = vault::registry_lock(&self.state, "central-storage.lock")?;
+        let mut state = self.read_state()?;
+        let replace = state.accounts.get(&record.account_id).is_none_or(|bytes| {
+            let old = vault::decrypt_bytes(&self.key, bytes)
+                .ok()
+                .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok());
+            old.is_none_or(|old| record.revision > old.revision)
+        });
+        if !replace {
+            return Ok(false);
+        }
+        state.accounts.insert(
+            record.account_id.clone(),
+            vault::encrypt_bytes(&self.key, &serde_json::to_vec(record)?)?,
+        );
+        self.write_state(&state)?;
+        Ok(true)
     }
 
     fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
@@ -451,6 +768,16 @@ impl FileStore {
                 )?)?)
             })
             .transpose()
+    }
+
+    fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        self.with_lock(|state| {
+            state.accounts.insert(
+                format!("registry:{name}"),
+                vault::encrypt_bytes(&self.key, payload)?,
+            );
+            Ok(())
+        })
     }
 
     fn acquire_lease(&self, account_id: &str, holder_id: &str, ttl: Duration) -> Result<Lease> {
@@ -509,35 +836,59 @@ impl FileStore {
         })
     }
 
+    fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        let _lock = vault::registry_lock(&self.state, "central-storage.lock")?;
+        let mut state = self.read_state()?;
+        let released = state.leases.get(&lease.account_id).is_some_and(|current| {
+            current.holder_id == lease.holder_id && current.epoch == lease.epoch
+        });
+        if released {
+            state
+                .leases
+                .get_mut(&lease.account_id)
+                .expect("lease checked above")
+                .expires_at = 0;
+            self.write_state(&state)?;
+        }
+        Ok(released)
+    }
+
     fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         let now = now_secs();
-        self.with_lock(|state| {
-            let Some(current) = state.leases.get(&lease.account_id) else {
-                return Ok(false);
-            };
-            if current.holder_id != lease.holder_id
-                || current.epoch != lease.epoch
-                || current.expires_at <= now
-            {
-                return Ok(false);
-            }
-            if lease.account_id != record.account_id {
-                bail!("lease account does not match credential account")
-            }
-            let replace = state.accounts.get(&record.account_id).is_none_or(|bytes| {
-                let old = vault::decrypt_bytes(&self.key, bytes)
-                    .ok()
-                    .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok());
-                old.is_none_or(|old| record.revision >= old.revision)
-            });
-            if replace {
-                state.accounts.insert(
-                    record.account_id.clone(),
-                    vault::encrypt_bytes(&self.key, &serde_json::to_vec(record)?)?,
-                );
-            }
-            Ok(replace)
-        })
+        let _lock = vault::registry_lock(&self.state, "central-storage.lock")?;
+        let mut state = self.read_state()?;
+        let Some(current) = state.leases.get(&lease.account_id) else {
+            return Ok(false);
+        };
+        if current.holder_id != lease.holder_id
+            || current.epoch != lease.epoch
+            || current.expires_at <= now
+        {
+            return Ok(false);
+        }
+        if lease.account_id != record.account_id {
+            bail!("lease account does not match credential account")
+        }
+        let replace = state.accounts.get(&record.account_id).is_none_or(|bytes| {
+            let old = vault::decrypt_bytes(&self.key, bytes)
+                .ok()
+                .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok());
+            old.is_none_or(|old| record.revision > old.revision)
+        });
+        if !replace {
+            return Ok(state
+                .accounts
+                .get(&record.account_id)
+                .and_then(|bytes| vault::decrypt_bytes(&self.key, bytes).ok())
+                .and_then(|plain| serde_json::from_slice::<CredentialRecord>(&plain).ok())
+                .is_some_and(|old| old.revision == record.revision && old.vault == record.vault));
+        }
+        state.accounts.insert(
+            record.account_id.clone(),
+            vault::encrypt_bytes(&self.key, &serde_json::to_vec(record)?)?,
+        );
+        self.write_state(&state)?;
+        Ok(true)
     }
 
     fn create_enrollment(&self, challenge: &str, payload: &[u8], ttl: Duration) -> Result<()> {
@@ -577,23 +928,30 @@ impl PostgresStore {
         let tls_enabled = std::env::var("CODEXCTL_CENTRAL_DB_TLS")
             .map(|value| value != "0" && value != "false" && value != "disable")
             .unwrap_or(true);
-        let mut config: tokio_postgres::Config = url
+        let store = Self {
+            url,
+            tls_enabled,
+            client: Arc::new(tokio::sync::Mutex::new(None)),
+            key: key.into(),
+        };
+        let _ = store.client().await?;
+        Ok(store)
+    }
+
+    async fn establish(&self) -> Result<Arc<tokio_postgres::Client>> {
+        let mut config: tokio_postgres::Config = self
+            .url
             .parse()
             .context("invalid DATABASE_URL for PostgreSQL central storage")?;
-        config.connect_timeout(Duration::from_secs(2));
-        config.options(format!(
-            "{} -c statement_timeout=2000",
-            config.get_options().unwrap_or_default()
-        ));
-        let client = if tls_enabled {
+        config.connect_timeout(DB_TIMEOUT);
+        let client = if self.tls_enabled {
             if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
                 bail!(
                     "TLS is enabled for central PostgreSQL; DATABASE_URL must set sslmode=require"
                 );
             }
-            let connector = tls_connector()?;
             let (client, connection) = config
-                .connect(connector)
+                .connect(tls_connector()?)
                 .await
                 .context("connect to central PostgreSQL over TLS")?;
             tokio::spawn(async move {
@@ -615,15 +973,45 @@ impl PostgresStore {
             });
             client
         };
-        Ok(Self {
-            client: Arc::new(client),
-            key: key.into(),
-        })
+        tokio::time::timeout(
+            DB_TIMEOUT,
+            client.batch_execute("SET statement_timeout = '2s'"),
+        )
+        .await
+        .context("central PostgreSQL statement timeout setup timed out")??;
+        Ok(Arc::new(client))
+    }
+
+    async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
+        let current = self.client.lock().await.clone();
+        if let Some(client) = current {
+            if tokio::time::timeout(DB_TIMEOUT, client.simple_query("SELECT 1"))
+                .await
+                .is_ok_and(|result| result.is_ok())
+            {
+                return Ok(client);
+            }
+            // Drop a half-open client before reconnecting. Otherwise a failed
+            // reconnect can leave the dead Arc installed and make every later
+            // request probe the same broken connection forever.
+            let mut slot = self.client.lock().await;
+            if slot
+                .as_ref()
+                .is_some_and(|stored| Arc::ptr_eq(stored, &client))
+            {
+                *slot = None;
+            }
+        }
+        let client = tokio::time::timeout(DB_TIMEOUT, self.establish())
+            .await
+            .context("central PostgreSQL connect timed out")??;
+        *self.client.lock().await = Some(client.clone());
+        Ok(client)
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
-        let changed = self
-            .client
+        let client = self.client().await?;
+        let changed = client
             .execute(
                 "UPDATE account_refresh_leases SET expires_at=now()+($3::bigint * interval '1 second') WHERE account_id=$1 AND holder_id=$2 AND epoch=$4 AND expires_at > now()",
                 &[&lease.account_id, &lease.holder_id, &(ttl.as_secs() as i64), &lease.epoch],
@@ -632,12 +1020,22 @@ impl PostgresStore {
         Ok(changed == 1)
     }
 
+    async fn release_lease(&self, lease: &Lease) -> Result<bool> {
+        let client = self.client().await?;
+        let changed = client.execute(
+            "UPDATE account_refresh_leases SET expires_at=now() WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
+            &[&lease.account_id, &lease.holder_id, &lease.epoch],
+        ).await?;
+        Ok(changed == 1)
+    }
+
     async fn migrate(&self) -> Result<()> {
-        self.client
+        let client = self.client().await?;
+        client
             .batch_execute(SCHEMA)
             .await
             .context("migrate central PostgreSQL schema")?;
-        self.client
+        client
             .execute(
                 "INSERT INTO central_schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING",
                 &[],
@@ -647,16 +1045,135 @@ impl PostgresStore {
     }
 
     async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
-        let encrypted = vault::encrypt_bytes(&self.key, &serde_json::to_vec(&record.vault)?)?;
-        self.client.execute(
-            "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision <= EXCLUDED.revision",
+        let serialized = serde_json::to_vec(&record.vault)?;
+        let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
+        let client = self.client().await?;
+        client.execute(
+            "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision],
         ).await?;
         Ok(())
     }
 
+    async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
+        let encrypted = vault::encrypt_bytes(&self.key, payload)?;
+        let client = self.client().await?;
+        client.execute("INSERT INTO central_registry(name,encrypted_payload) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,revision=central_registry.revision+1,updated_at=now()", &[&name, &encrypted]).await?;
+        Ok(())
+    }
+
+    async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let client = self.client().await?;
+        let Some(row) = client
+            .query_opt(
+                "SELECT encrypted_payload FROM central_registry WHERE name=$1",
+                &[&name],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let encrypted: Vec<u8> = row.get(0);
+        Ok(Some(vault::decrypt_bytes(&self.key, &encrypted)?))
+    }
+
+    async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT encrypted_payload FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
+                &[&name],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let encrypted: Vec<u8> = row.get(0);
+                vault::decrypt_bytes(&self.key, &encrypted)
+            })
+            .collect()
+    }
+
+    async fn load_registry_entity_revisions(
+        &self,
+        name: &str,
+    ) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT entity_id,encrypted_payload,revision FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
+                &[&name],
+            )
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let entity_id: String = row.get(0);
+                let encrypted: Vec<u8> = row.get(1);
+                let revision: i64 = row.get(2);
+                Ok((entity_id, vault::decrypt_bytes(&self.key, &encrypted)?, revision))
+            })
+            .collect()
+    }
+
+    async fn save_registry_entities(
+        &self,
+        name: &str,
+        entries: &[(String, Vec<u8>)],
+    ) -> Result<()> {
+        let client = self.client().await?;
+        let mut sql = String::from(
+            "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload) VALUES ",
+        );
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        for (index, (entity_id, payload)) in entries.iter().enumerate() {
+            if index != 0 {
+                sql.push(',');
+            }
+            let base = params.len() + 1;
+            sql.push_str(&format!("(${base},${},${})", base + 1, base + 2));
+            params.push(Box::new(name.to_owned()));
+            params.push(Box::new(entity_id.clone()));
+            params.push(Box::new(vault::encrypt_bytes(&self.key, payload)?));
+        }
+        sql.push_str(
+            " ON CONFLICT(kind,entity_id) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload, revision=central_registry_entries.revision+1, updated_at=now()",
+        );
+        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+        client.execute(&sql, &refs).await?;
+        Ok(())
+    }
+
+    async fn save_registry_entity_cas(
+        &self,
+        name: &str,
+        entity_id: &str,
+        payload: &[u8],
+        expected_revision: Option<i64>,
+    ) -> Result<bool> {
+        let encrypted = vault::encrypt_bytes(&self.key, payload)?;
+        let client = self.client().await?;
+        let changed = match expected_revision {
+            None => client
+                .execute(
+                    "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload,revision) VALUES($1,$2,$3,0) ON CONFLICT(kind,entity_id) DO NOTHING",
+                    &[&name, &entity_id, &encrypted],
+                )
+                .await?,
+            Some(revision) => client
+                .execute(
+                    "UPDATE central_registry_entries SET encrypted_payload=$3,revision=revision+1,updated_at=now() WHERE kind=$1 AND entity_id=$2 AND revision=$4",
+                    &[&name, &entity_id, &encrypted, &revision],
+                )
+                .await?,
+        };
+        Ok(changed == 1)
+    }
+
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
-        let row = self.client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1", &[&account_id]).await?;
+        let client = self.client().await?;
+        let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&account_id]).await?;
         row.map(|row| {
             let vault_bytes: Vec<u8> = row.get(4);
             Ok(CredentialRecord {
@@ -672,13 +1189,36 @@ impl PostgresStore {
         .transpose()
     }
 
+    async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
+        let client = self.client().await?;
+        let rows = client.query("SELECT account_id,user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE deleted_at IS NULL ORDER BY account_id LIMIT 10001", &[]).await?;
+        if rows.len() > 10_000 {
+            bail!("central account hydration exceeds the 10000-account startup bound");
+        }
+        rows.into_iter()
+            .map(|row| {
+                let encrypted: Vec<u8> = row.get(5);
+                Ok(CredentialRecord {
+                    account_id: row.get(0),
+                    user_id: row.get(1),
+                    alias: row.get(2),
+                    workspace: row.get(3),
+                    login: row.get(4),
+                    vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
+                    revision: row.get(6),
+                })
+            })
+            .collect()
+    }
+
     async fn acquire_lease(
         &self,
         account_id: &str,
         holder_id: &str,
         ttl: Duration,
     ) -> Result<Lease> {
-        let row = self.client.query_opt(
+        let client = self.client().await?;
+        let row = client.query_opt(
             "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,$2,1,now()+($3::bigint * interval '1 second')) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at WHERE account_refresh_leases.expires_at <= now() OR account_refresh_leases.holder_id=EXCLUDED.holder_id RETURNING epoch",
             &[&account_id, &holder_id, &(ttl.as_secs() as i64)],
         ).await?;
@@ -696,12 +1236,23 @@ impl PostgresStore {
         if lease.account_id != record.account_id {
             bail!("lease account does not match credential account")
         }
-        let encrypted = vault::encrypt_bytes(&self.key, &serde_json::to_vec(&record.vault)?)?;
-        let changed = self.client.execute(
-            "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision <= $7",
+        let serialized = serde_json::to_vec(&record.vault)?;
+        let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
+        let client = self.client().await?;
+        let changed = client.execute(
+            "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision < $7",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
-        Ok(changed == 1)
+        if changed == 1 {
+            return Ok(true);
+        }
+        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
+        Ok(row.is_some_and(|row| {
+            let stored: Vec<u8> = row.get(0);
+            vault::decrypt_bytes(&self.key, &stored)
+                .ok()
+                .is_some_and(|plain| plain == serialized)
+        }))
     }
 
     async fn create_enrollment(
@@ -712,13 +1263,15 @@ impl PostgresStore {
     ) -> Result<()> {
         let hash = vault::digest(challenge.as_bytes());
         let encrypted = vault::encrypt_bytes(&self.key, payload)?;
-        self.client.execute("INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) VALUES($1,$2,now()+($3::bigint * interval '1 second')) ON CONFLICT(challenge_hash) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,expires_at=EXCLUDED.expires_at,consumed_at=NULL", &[&hash, &encrypted, &(ttl.as_secs() as i64)]).await?;
+        let client = self.client().await?;
+        client.execute("INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) VALUES($1,$2,now()+($3::bigint * interval '1 second')) ON CONFLICT(challenge_hash) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,expires_at=EXCLUDED.expires_at,consumed_at=NULL", &[&hash, &encrypted, &(ttl.as_secs() as i64)]).await?;
         Ok(())
     }
 
     async fn consume_enrollment(&self, challenge: &str) -> Result<Option<Vec<u8>>> {
         let hash = vault::digest(challenge.as_bytes());
-        let row = self.client.query_opt("UPDATE enrollment_challenges SET consumed_at=now() WHERE challenge_hash=$1 AND consumed_at IS NULL AND expires_at > now() RETURNING encrypted_payload", &[&hash]).await?;
+        let client = self.client().await?;
+        let row = client.query_opt("UPDATE enrollment_challenges SET consumed_at=now() WHERE challenge_hash=$1 AND consumed_at IS NULL AND expires_at > now() RETURNING encrypted_payload", &[&hash]).await?;
         row.map(|row| {
             let encrypted: Vec<u8> = row.get(0);
             vault::decrypt_bytes(&self.key, &encrypted)
@@ -756,41 +1309,39 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
-/// Refuse PostgreSQL modes during server startup until the runtime is wired to
-/// the shared store. File mode remains the default and needs no migration.
-pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
-    require_file_runtime()?;
-    eprintln!(
-        "central storage: file runtime; PostgreSQL schema provisioning only; dual runtime deferred"
-    );
-    Ok(())
+/// Open the configured runtime store. PostgreSQL is authoritative in phase 3;
+/// dual mode remains an explicitly acknowledged migration compatibility mode.
+pub async fn runtime_store(state: &Path, key: &Path) -> Result<CentralStore> {
+    match StoreMode::from_env()? {
+        StoreMode::File => CentralStore::from_mode(StoreMode::File, state, key).await,
+        StoreMode::Postgres => {
+            let store = CentralStore::from_mode(StoreMode::Postgres, state, key).await?;
+            store.migrate().await?;
+            Ok(store)
+        }
+        StoreMode::Dual => {
+            if std::env::var("CODEXCTL_CENTRAL_DUAL_ACK").ok().as_deref() != Some("1") {
+                bail!("dual central storage requires CODEXCTL_CENTRAL_DUAL_ACK=1")
+            }
+            let store = CentralStore::from_mode(StoreMode::Dual, state, key).await?;
+            store.migrate().await?;
+            Ok(store)
+        }
+    }
 }
 
-/// Runtime and local administration must agree on the authority. Only the
-/// explicit migration command may open a shared store in this phase.
-pub fn require_file_runtime() -> Result<()> {
+pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
     match StoreMode::from_env()? {
         StoreMode::File => Ok(()),
-        mode => {
-            eprintln!(
-                "central storage: refusing startup with {mode:?}; phase 1 provisions the PostgreSQL schema only, while runtime storage still uses the file vault; run codexctl-central migrate separately"
-            );
-            bail!(
-                "central storage mode {mode:?} is not wired into runtime yet; startup and administration support only file mode; dual runtime is deferred"
-            )
-        }
+        mode => bail!("prototype central server supports file storage only (requested {mode})"),
     }
 }
 
 /// Apply the configured schema migration. This is intentionally separate from
 /// server startup while the phase 1 runtime still uses file storage.
 pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
-        let store = CentralStore::from_env(state, key).await?;
-        store.migrate().await
-    })
-    .await
-    .context("central PostgreSQL schema provisioning timed out")?
+    let store = CentralStore::from_env(state, key).await?;
+    store.migrate().await
 }
 
 #[cfg(test)]
@@ -844,6 +1395,103 @@ mod tests {
             Some(b"payload".to_vec())
         );
         assert_eq!(store.consume_enrollment("challenge").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn two_file_instances_have_one_live_lease_holder() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[4; 32]).unwrap();
+        let first = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        let second = first.clone();
+        first.migrate().await.unwrap();
+        first
+            .save_account(&record("lease-account", 1))
+            .await
+            .unwrap();
+        let (left, right) = tokio::join!(
+            first.acquire_lease("lease-account", "pod-a:boot-a", Duration::from_secs(60)),
+            second.acquire_lease("lease-account", "pod-b:boot-b", Duration::from_secs(60)),
+        );
+        assert!(
+            left.is_ok() ^ right.is_ok(),
+            "exactly one instance may hold a live lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_a_lease_allows_a_restarted_holder_to_refresh_immediately() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[7; 32]).unwrap();
+        let first = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        let restarted = first.clone();
+        first.migrate().await.unwrap();
+        first
+            .save_account(&record("restart-account", 1))
+            .await
+            .unwrap();
+        let lease = first
+            .acquire_lease("restart-account", "pod-a:boot-a", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert!(first.release_lease(&lease).await.unwrap());
+        let replacement = restarted
+            .acquire_lease("restart-account", "pod-b:boot-b", Duration::from_secs(120))
+            .await
+            .unwrap();
+        assert_eq!(replacement.holder_id, "pod-b:boot-b");
+    }
+
+    #[tokio::test]
+    async fn distinct_owner_keys_preserve_two_users_in_one_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[5; 32]).unwrap();
+        let store = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        store.migrate().await.unwrap();
+        let mut first = record("user-a/seat", 10);
+        first.user_id = Some("user-a".into());
+        first.workspace = Some("shared-workspace".into());
+        let mut second = record("user-b/seat", 10);
+        second.user_id = Some("user-b".into());
+        second.workspace = Some("shared-workspace".into());
+        store.save_account(&first).await.unwrap();
+        store.save_account(&second).await.unwrap();
+        assert!(store.load_account("user-a/seat").await.unwrap().is_some());
+        assert!(store.load_account("user-b/seat").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn credential_revision_rejects_a_skewed_unleased_write() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[6; 32]).unwrap();
+        let store = CentralStore::File(FileStore {
+            state: root.path().into(),
+            key: key.clone(),
+        });
+        store.migrate().await.unwrap();
+        store.save_account(&record("skewed", 200)).await.unwrap();
+        store.save_account(&record("skewed", 100)).await.unwrap();
+        assert_eq!(
+            store
+                .load_account("skewed")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            200
+        );
     }
 
     #[cfg(feature = "central-real-db-tests")]
@@ -901,6 +1549,21 @@ mod tests {
             ..lease.clone()
         };
         assert!(!second.fenced_write(&stale, &record(&id, 4)).await.unwrap());
+        // A second broker must observe the committed credential revision before
+        // it attempts another refresh, rather than using its startup snapshot.
+        assert_eq!(second.load_account(&id).await.unwrap().unwrap().revision, 3);
+        let registry_id = format!("registry-{}", vault::digest(id.as_bytes()));
+        first
+            .save_registry_entities(
+                "devices",
+                &[(registry_id.clone(), br#"{"revoked":true}"#.to_vec())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.load_registry_entities("devices").await.unwrap(),
+            vec![br#"{"revoked":true}"#.to_vec()]
+        );
         first
             .create_enrollment(&id, b"once", Duration::from_secs(60))
             .await
@@ -914,22 +1577,30 @@ mod tests {
             1
         );
         if let CentralStore::Postgres(db) = &first {
-            db.client
+            let client = db.client().await.unwrap();
+            client
                 .execute(
                     "DELETE FROM enrollment_challenges WHERE challenge_hash=$1",
                     &[&vault::digest(id.as_bytes())],
                 )
                 .await
                 .unwrap();
-            db.client
+            client
                 .execute(
                     "DELETE FROM account_refresh_leases WHERE account_id=$1",
                     &[&id],
                 )
                 .await
                 .unwrap();
-            db.client
+            client
                 .execute("DELETE FROM central_accounts WHERE account_id=$1", &[&id])
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "DELETE FROM central_registry_entries WHERE kind=$1 AND entity_id=$2",
+                    &[&"devices", &registry_id],
+                )
                 .await
                 .unwrap();
         }
