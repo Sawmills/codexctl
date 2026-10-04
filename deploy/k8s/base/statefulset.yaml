@@ -17,6 +17,8 @@ spec:
       app.kubernetes.io/name: codexctl
   template:
     metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
       labels:
         app.kubernetes.io/name: codexctl
     spec:
