@@ -174,23 +174,6 @@ CREATE TABLE IF NOT EXISTS enrollment_challenges (
     consumed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challenges (expires_at);
-CREATE TABLE IF NOT EXISTS central_registry (
-    name TEXT PRIMARY KEY,
-    encrypted_payload BYTEA NOT NULL,
-    revision BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-ALTER TABLE central_registry ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
-CREATE TABLE IF NOT EXISTS central_registry_entries (
-    kind TEXT NOT NULL,
-    entity_id TEXT NOT NULL,
-    encrypted_payload BYTEA NOT NULL,
-    revision BIGINT NOT NULL DEFAULT 0,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (kind, entity_id)
-);
-CREATE INDEX IF NOT EXISTS central_registry_entries_kind_idx
-    ON central_registry_entries (kind);
 CREATE TABLE IF NOT EXISTS central_users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -272,35 +255,20 @@ impl CentralStore {
         }
         match self {
             Self::File(file) => file.save_registry(name, payload),
-            Self::Postgres(db) => bounded_db(db.save_registry(name, payload)).await,
-            Self::Dual {
-                file,
-                postgres,
-                mirror_failures,
-            } => {
-                bounded_db(postgres.save_registry(name, payload)).await?;
-                if let Err(error) = file.save_registry(name, payload) {
-                    mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({"operation":"central_store_mirror","backend":"file","stage":"registry","reason":error.to_string()})
-                    );
-                }
-                Ok(())
+            Self::Postgres(_) | Self::Dual { .. } => {
+                bail!("generic registry blobs are unsupported; use typed entities")
             }
         }
     }
 
-    pub async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
+    pub async fn load_registry(&self, _name: &str) -> Result<Option<Vec<u8>>> {
         match self {
             Self::File(_) => Ok(None),
-            Self::Postgres(db) => bounded_db(db.load_registry(name)).await,
-            Self::Dual { postgres, .. } => bounded_db(postgres.load_registry(name)).await,
+            Self::Postgres(_) | Self::Dual { .. } => Ok(None),
         }
     }
 
-    /// Read normalized registry entities. PostgreSQL is authoritative in the
-    /// shared modes; the legacy blob remains only as a migration fallback.
+    /// Read typed registry entities. PostgreSQL is authoritative in shared mode.
     pub async fn load_registry_entities(&self, name: &str) -> Result<Vec<Vec<u8>>> {
         match self {
             Self::File(_) => Ok(Vec::new()),
@@ -423,12 +391,13 @@ impl CentralStore {
                 if !account_state.join("vault.enc").exists() {
                     continue;
                 }
-                let value = crate::central::vault::load(&account_state, key)?;
+                let mut value = crate::central::vault::load(&account_state, key)?;
                 let workspace = crate::central::vault::account(&value.auth)?;
                 let login = crate::central::vault::token(&value.auth)
                     .ok()
                     .and_then(crate::api::token_subject);
                 let revision = value.revision.max(1);
+                value.revision = revision;
                 let record = CredentialRecord {
                     account_id: crate::central::managed::account_key(&value.user, &value.alias),
                     user_id: Some(value.user.clone()),
@@ -1166,28 +1135,6 @@ impl PostgresStore {
         Ok(())
     }
 
-    async fn save_registry(&self, name: &str, payload: &[u8]) -> Result<()> {
-        let encrypted = vault::encrypt_bytes(&self.key, payload)?;
-        let client = self.client().await?;
-        client.execute("INSERT INTO central_registry(name,encrypted_payload) VALUES($1,$2) ON CONFLICT(name) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload,revision=central_registry.revision+1,updated_at=now()", &[&name, &encrypted]).await?;
-        Ok(())
-    }
-
-    async fn load_registry(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let client = self.client().await?;
-        let Some(row) = client
-            .query_opt(
-                "SELECT encrypted_payload FROM central_registry WHERE name=$1",
-                &[&name],
-            )
-            .await?
-        else {
-            return Ok(None);
-        };
-        let encrypted: Vec<u8> = row.get(0);
-        Ok(Some(vault::decrypt_bytes(&self.key, &encrypted)?))
-    }
-
     async fn authorized_device(&self, token_hash: &str) -> Result<Option<vault::Device>> {
         let client = self.client().await?;
         let row = client
@@ -1251,18 +1198,7 @@ impl PostgresStore {
                 })
                 .collect();
         }
-        let rows = client
-            .query(
-                "SELECT encrypted_payload FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
-                &[&name],
-            )
-            .await?;
-        rows.into_iter()
-            .map(|row| {
-                let encrypted: Vec<u8> = row.get(0);
-                vault::decrypt_bytes(&self.key, &encrypted)
-            })
-            .collect()
+        bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
     async fn load_registry_entity_revisions(
@@ -1311,24 +1247,7 @@ impl PostgresStore {
                 })
                 .collect();
         }
-        let rows = client
-            .query(
-                "SELECT entity_id,encrypted_payload,revision FROM central_registry_entries WHERE kind=$1 ORDER BY entity_id",
-                &[&name],
-            )
-            .await?;
-        rows.into_iter()
-            .map(|row| {
-                let entity_id: String = row.get(0);
-                let encrypted: Vec<u8> = row.get(1);
-                let revision: i64 = row.get(2);
-                Ok((
-                    entity_id,
-                    vault::decrypt_bytes(&self.key, &encrypted)?,
-                    revision,
-                ))
-            })
-            .collect()
+        bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
     async fn save_registry_entities(
@@ -1347,30 +1266,8 @@ impl PostgresStore {
             }
             return Ok(());
         }
-        let client = self.client().await?;
-        let mut sql = String::from(
-            "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload) VALUES ",
-        );
-        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
-        for (index, (entity_id, payload)) in entries.iter().enumerate() {
-            if index != 0 {
-                sql.push(',');
-            }
-            let base = params.len() + 1;
-            sql.push_str(&format!("(${base},${},${})", base + 1, base + 2));
-            params.push(Box::new(name.to_owned()));
-            params.push(Box::new(entity_id.clone()));
-            params.push(Box::new(vault::encrypt_bytes(&self.key, payload)?));
-        }
-        sql.push_str(
-            " ON CONFLICT(kind,entity_id) DO UPDATE SET encrypted_payload=EXCLUDED.encrypted_payload, revision=central_registry_entries.revision+1, updated_at=now()",
-        );
-        let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
-            .iter()
-            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
-            .collect();
-        client.execute(&sql, &refs).await?;
-        Ok(())
+        let _ = entries;
+        bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
     async fn save_registry_entity_cas(
@@ -1410,23 +1307,8 @@ impl PostgresStore {
             };
             return Ok(changed == 1);
         }
-        let encrypted = vault::encrypt_bytes(&self.key, payload)?;
-        let client = self.client().await?;
-        let changed = match expected_revision {
-            None => client
-                .execute(
-                    "INSERT INTO central_registry_entries(kind,entity_id,encrypted_payload,revision) VALUES($1,$2,$3,0) ON CONFLICT(kind,entity_id) DO NOTHING",
-                    &[&name, &entity_id, &encrypted],
-                )
-                .await?,
-            Some(revision) => client
-                .execute(
-                    "UPDATE central_registry_entries SET encrypted_payload=$3,revision=revision+1,updated_at=now() WHERE kind=$1 AND entity_id=$2 AND revision=$4",
-                    &[&name, &entity_id, &encrypted, &revision],
-                )
-                .await?,
-        };
-        Ok(changed == 1)
+        let _ = (entity_id, payload, expected_revision);
+        bail!("unsupported registry entity kind: {name}; use typed entities")
     }
 
     async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
@@ -1533,7 +1415,7 @@ impl PostgresStore {
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
         let client = self.client().await?;
         let changed = client.execute(
-            "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision < $7",
+            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > now() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
@@ -1607,18 +1489,12 @@ fn now_secs() -> u64 {
 pub async fn runtime_store(state: &Path, key: &Path) -> Result<CentralStore> {
     match StoreMode::from_env()? {
         StoreMode::File => CentralStore::from_mode(StoreMode::File, state, key).await,
-        StoreMode::Postgres => {
-            let store = CentralStore::from_mode(StoreMode::Postgres, state, key).await?;
-            store.migrate().await?;
-            Ok(store)
-        }
+        StoreMode::Postgres => CentralStore::from_mode(StoreMode::Postgres, state, key).await,
         StoreMode::Dual => {
             if std::env::var("CODEXCTL_CENTRAL_DUAL_ACK").ok().as_deref() != Some("1") {
                 bail!("dual central storage requires CODEXCTL_CENTRAL_DUAL_ACK=1")
             }
-            let store = CentralStore::from_mode(StoreMode::Dual, state, key).await?;
-            store.migrate().await?;
-            Ok(store)
+            CentralStore::from_mode(StoreMode::Dual, state, key).await
         }
     }
 }
@@ -1805,6 +1681,25 @@ mod tests {
             .await
             .unwrap();
         first.migrate().await.unwrap();
+        let legacy_state = root.path().join("accounts").join("legacy-seat");
+        crate::store::ensure_private_dir(&legacy_state).unwrap();
+        let legacy_vault = crate::central::vault::Vault {
+            alias: "legacy-seat".into(),
+            tenant: "sawmills".into(),
+            user: "legacy-user".into(),
+            auth: serde_json::json!({"access_token":"legacy-access","account_id":"legacy-account"}),
+            label: None,
+            verified: false,
+            import_rejected: false,
+            revision: 0,
+        };
+        crate::central::vault::save(&legacy_state, &key, &legacy_vault).unwrap();
+        let counts = first.backfill(root.path(), &key).await.unwrap();
+        assert_eq!(counts.accounts, 1);
+        let legacy_id = crate::central::managed::account_key("legacy-user", "legacy-seat");
+        let imported = first.load_account(&legacy_id).await.unwrap().unwrap();
+        assert_eq!(imported.revision, 1);
+        assert_eq!(imported.vault["revision"], serde_json::json!(1));
         let second = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
             .await
             .unwrap();
@@ -1896,14 +1791,14 @@ mod tests {
                 .await
                 .unwrap();
             client
-                .execute(
-                    "DELETE FROM central_registry_entries WHERE kind=$1 AND entity_id=$2",
-                    &[&"devices", &registry_id],
-                )
+                .execute("DELETE FROM central_devices WHERE id=$1", &[&registry_id])
                 .await
                 .unwrap();
             client
-                .execute("DELETE FROM central_devices WHERE id=$1", &[&registry_id])
+                .execute(
+                    "DELETE FROM central_accounts WHERE account_id=$1",
+                    &[&legacy_id],
+                )
                 .await
                 .unwrap();
         }

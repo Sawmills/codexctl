@@ -289,34 +289,18 @@ fn account_summary(owner: &Owner) -> Account {
 
 async fn central_registry_users(central: &CentralStore) -> Result<Vec<User>> {
     let entities = central.load_registry_entities("users").await?;
-    if !entities.is_empty() {
-        return entities
-            .into_iter()
-            .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
-            .collect();
-    }
-    Ok(central
-        .load_registry("users")
-        .await?
-        .map(|bytes| serde_json::from_slice::<Vec<User>>(&bytes))
-        .transpose()?
-        .unwrap_or_default())
+    entities
+        .into_iter()
+        .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
+        .collect()
 }
 
 async fn central_registry_devices(central: &CentralStore) -> Result<Vec<vault::Device>> {
     let entities = central.load_registry_entities("devices").await?;
-    if !entities.is_empty() {
-        return entities
-            .into_iter()
-            .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
-            .collect();
-    }
-    Ok(central
-        .load_registry("devices")
-        .await?
-        .map(|bytes| serde_json::from_slice::<Vec<vault::Device>>(&bytes))
-        .transpose()?
-        .unwrap_or_default())
+    entities
+        .into_iter()
+        .map(|bytes| Ok(serde_json::from_slice(&bytes)?))
+        .collect()
 }
 
 impl Broker {
@@ -327,13 +311,27 @@ impl Broker {
             .map(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, reason))
     }
 
-    async fn ensure_refresh_owner(&self, owner: &mut Owner) -> Result<(), HttpError> {
+    async fn ensure_refresh_owner(
+        &self,
+        owner: &mut Owner,
+        imports: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<(), HttpError> {
         if owner.refresh_enabled && owner.rpc.is_some() {
             return Ok(());
         }
-        let import_guard = self.imports.lock().await;
+        // Lock order is imports, then Owner. The token path takes imports before
+        // its Owner guard, and import workflows retain this guard while they
+        // inspect and replace owners.
+        if self.read_only
+            || self.stopping.load(Ordering::Acquire)
+            || self.ownership_unresolved.load(Ordering::Acquire)
+            || !owner.available
+            || owner.routing_refused
+        {
+            return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        }
         let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-            .clear_for_launch(owner, relogin::AdmissionKind::Restore, &import_guard)
+            .clear_for_launch(owner, relogin::AdmissionKind::Restore, imports)
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         launch_owner(owner, &self.binary, proof)
             .await
@@ -715,6 +713,17 @@ async fn token(
     let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
+        // Shared-store paths take imports before Owner. File mode keeps this
+        // lock off the token path and remains a local, zero-central-cost path.
+        let import_guard = if worker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+        {
+            Some(worker.imports.lock().await)
+        } else {
+            None
+        };
         let mut owner = owner_ref.lock().await;
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         if worker
@@ -754,7 +763,8 @@ async fn token(
                 .central
                 .as_ref()
                 .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
-            && let Err(error) = worker.ensure_refresh_owner(&mut owner).await
+            && let Some(import_guard) = import_guard.as_ref()
+            && let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await
         {
             if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
                 let _ = central.release_lease(lease).await;
@@ -779,6 +789,7 @@ async fn token(
         {
             request.previous_revision = None;
         }
+        drop(import_guard);
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -1118,7 +1129,9 @@ impl Broker {
         input.alias = normalize_alias(&input.alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
             .to_owned();
-        let _import = self.imports.lock().await;
+        // Lock order is imports, then Owner. Token requests take the same
+        // imports guard before locking their selected Owner.
+        let import_guard = self.imports.lock().await;
         let id = self
             .resolve_alias(user, &input.alias)
             .await?
@@ -1431,8 +1444,9 @@ impl Broker {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
+            // The imports guard was acquired before the new Owner guard.
             let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, &_import)
+                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, &import_guard)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut owner, &self.binary, proof)
                 .await
