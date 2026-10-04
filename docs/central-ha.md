@@ -150,26 +150,50 @@ or row counts do not match the reviewed plan.
    migration and backfill from the current PVC using the projected vault key;
    retain the JSON count output as the migration receipt:
 
+   Use one-shot migration Jobs with `secretKeyRef` inputs. Do not pass the
+   database password through `kubectl exec` arguments or shell expansion. The
+   migration Job mounts the retained PVC at `/data` and runs `migrate`; submit
+   a second copy with `backfill` as its command after migration completes:
+
    ```sh
    kubectl --context plat-staging -n codexctl wait --for=condition=Ready \
      externalsecret/codexctl-postgres --timeout=120s
-   secret_value() {
-     kubectl --context plat-staging -n codexctl get secret codexctl-postgres \
-       -o "jsonpath={.data.$1}" | base64 --decode
-   }
-   kubectl --context plat-staging -n codexctl exec statefulset/codexctl -- \
-     env CODEXCTL_CENTRAL_STORE=postgres \
-       DB_HOST="$(secret_value db-hostname)" DB_PORT="$(secret_value db-port)" \
-       DB_NAME="$(secret_value db-name)" DB_USER="$(secret_value db-user)" \
-       DB_PASSWORD="$(secret_value db-password)" \
-     codexctl-central migrate --state /data/state --key-file /keys/vault-key
-   kubectl --context plat-staging -n codexctl exec statefulset/codexctl -- \
-     env CODEXCTL_CENTRAL_STORE=postgres \
-       DB_HOST="$(secret_value db-hostname)" DB_PORT="$(secret_value db-port)" \
-       DB_NAME="$(secret_value db-name)" DB_USER="$(secret_value db-user)" \
-       DB_PASSWORD="$(secret_value db-password)" \
-     codexctl-central backfill --state /data/state --key-file /keys/vault-key
    ```
+
+   ```yaml
+   apiVersion: batch/v1
+   kind: Job
+   metadata:
+     name: codexctl-migrate
+   spec:
+     ttlSecondsAfterFinished: 86400
+     template:
+       spec:
+         restartPolicy: Never
+         containers:
+           - name: migrate
+             image: codexctl-central:staging # replace with the reviewed image digest
+             command: [codexctl-central, migrate, --state, /data/state, --key-file, /keys/vault-key]
+             env:
+               - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
+               - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
+               - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
+               - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
+               - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
+               - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
+             volumeMounts:
+               - {name: state, mountPath: /data}
+               - {name: keys, mountPath: /keys, readOnly: true}
+         volumes:
+           - name: state
+             persistentVolumeClaim: {claimName: state-codexctl-0}
+           - name: keys
+             secret: {secretName: codexctl-secrets}
+   ```
+
+   Apply the reviewed Job, wait for completion, and repeat the manifest with
+   `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]`.
+   Keep both Job logs and the backfill JSON counts as the migration receipt.
 
 3. **Quiesce the file writer and re-backfill.** PostgreSQL mode is the only
    serving mode; `dual` is migration-only and the server refuses to start in it.
@@ -259,13 +283,12 @@ instance, then repeat the destructive cases in staging.
    keeps one ready pod, topology rules place replacements on another node and
    zone, and token requests recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
-4. **Enrollment and renewal.** Start enrollment on pod A, complete the browser
-   callback on pod B, and poll from pod C. Repeat a login renewal across pods;
-   assert one operation record, one candidate promotion, and no duplicate native
-   owner.
-5. **Reset idempotency.** Submit one redemption ID to two pods, kill one during
-   the provider call, and retry from the other. Assert one credit/key spend and
-   the same terminal receipt, as required by the current journal behavior
+4. **Enrollment and renewal.** In phase three, assert that enrollment and
+   relogin return `503` on every pod because their workflow state remains
+   local. Move the cross-pod success and one-operation assertions to phase four.
+5. **Reset idempotency.** In phase three, assert that reset redemption returns
+   `503` on every pod. Move the one-spend and terminal-receipt assertions to
+   phase four, after the shared journal is delivered
    (`src/central/resets.rs:325-441`).
 6. **Readiness and fencing.** Remove the lease or database access from one pod;
    `/ready` must fail for unsafe write service, reads must either use committed
