@@ -22,6 +22,7 @@ lint:
     - trufflehog@3.97.9
     - yamllint@1.38.0
   disabled:
+    - osv-scanner # upstream release assets no longer match Trunk's downloader
     - trivy # install issues in CI
 actions:
   disabled:
