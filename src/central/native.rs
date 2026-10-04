@@ -1584,8 +1584,9 @@ mod tests {
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
         billing_switch_prompt, remove_active_pointer_audited, remove_active_pointer_with,
-        remove_pointer_then_marker_with, render_parent_cmd, rollback_or_context, save_connection,
-        validate_token_account, write_pointer_after_connection, write_pointer_with_rollback,
+        remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
+        rollback_or_context, save_connection, validate_token_account,
+        write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1678,6 +1679,42 @@ mod tests {
         .unwrap();
 
         assert!(!root.path().join(ACTIVE_HISTORY).exists());
+    }
+
+    #[test]
+    fn pointer_transitions_record_use_auto_and_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let connection_path = root.path().join("remote.json");
+        let pointer = root.path().join(".active-account");
+        let connection = test_connection(root.path());
+        save_connection(&connection_path, &connection).unwrap();
+        fs::write(&pointer, b"old\n").unwrap();
+
+        write_pointer_with_rollback(
+            &connection_path,
+            &connection,
+            &pointer,
+            b"new\n",
+            Some(b"old\n"),
+            PointerCause::UseAuto,
+            |path, bytes| {
+                fs::write(path, bytes)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        restore_active_pointer(&pointer, Some(b"old\n")).unwrap();
+
+        let causes = fs::read_to_string(root.path().join(ACTIVE_HISTORY))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<ActiveHistoryEntry>(line)
+                    .unwrap()
+                    .cause
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(causes, ["use-auto", "rollback"]);
     }
 
     #[test]
