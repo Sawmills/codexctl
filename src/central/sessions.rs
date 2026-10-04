@@ -402,35 +402,6 @@ fn save_backup(path: &Path, line: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{harmless_lsof_warning, overlay_warning_is_unrelated};
-    use std::path::Path;
-
-    #[test]
-    fn docker_overlay_warning_is_ignored_outside_the_selected_mount() {
-        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
-        assert!(overlay_warning_is_unrelated(
-            std::str::from_utf8(line).unwrap(),
-            Path::new("/tmp/codexctl-home")
-        ));
-        assert!(harmless_lsof_warning(line, Path::new("/tmp/codexctl-home")));
-    }
-
-    #[test]
-    fn docker_overlay_warning_covering_the_home_is_not_ignored() {
-        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
-        assert!(!overlay_warning_is_unrelated(
-            std::str::from_utf8(line).unwrap(),
-            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
-        ));
-        assert!(!harmless_lsof_warning(
-            line,
-            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
-        ));
-    }
-}
-
 fn lsof(args: &[&std::ffi::OsStr], home: &Path) -> Result<std::process::Output> {
     let mut command = Command::new("lsof");
     command.arg("-nP");
@@ -624,4 +595,33 @@ fn restore_backup(
         }
     }
     Ok(found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{harmless_lsof_warning, overlay_warning_is_unrelated};
+    use std::path::Path;
+
+    #[test]
+    fn docker_overlay_warning_is_ignored_outside_the_selected_mount() {
+        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
+        assert!(overlay_warning_is_unrelated(
+            std::str::from_utf8(line).unwrap(),
+            Path::new("/tmp/codexctl-home")
+        ));
+        assert!(harmless_lsof_warning(line, Path::new("/tmp/codexctl-home")));
+    }
+
+    #[test]
+    fn docker_overlay_warning_covering_the_home_is_not_ignored() {
+        let line = b"lsof: WARNING: can't stat() overlay file system /var/lib/docker/rootfs/overlayfs/test";
+        assert!(!overlay_warning_is_unrelated(
+            std::str::from_utf8(line).unwrap(),
+            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
+        ));
+        assert!(!harmless_lsof_warning(
+            line,
+            Path::new("/var/lib/docker/rootfs/overlayfs/test/codex")
+        ));
+    }
 }
