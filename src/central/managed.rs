@@ -731,6 +731,14 @@ async fn token(
         .as_deref()
         .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "alias_required"))?;
     let owner = broker.owner(&device, alias).await?;
+    if let Some(requested) = request.account_id.as_deref() {
+        let owner_guard = owner.lock().await;
+        let account = vault::account(&owner_guard.vault.auth)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        if requested != account {
+            return Err(broker.error(StatusCode::BAD_REQUEST, "account_mismatch"));
+        }
+    }
     let permit = broker
         .work
         .clone()
@@ -817,6 +825,9 @@ async fn token(
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
             owner.available = true;
+            owner.retryable_unavailable = false;
+            owner.retry_started = None;
+            owner.retry_failures = 0;
         }
         // A retry cannot take over recovery, even after the child stops: the
         // final credentials may still be waiting for a durable shared write.
@@ -916,9 +927,22 @@ async fn token(
             _ => None,
         };
         let mut retain_lease = lease.is_some();
+        let mut retry_failure_recorded = false;
         let before = owner.vault.clone();
         let result = async {
+            let owner_was_available = owner.available;
             let token_result = owner.tokens(request).await;
+            if owner_was_available && owner.rpc.as_ref().is_some_and(Rpc::retryable_failure) {
+                owner.fence(true);
+                if retry {
+                    owner.retry_failures = owner.retry_failures.saturating_add(1);
+                    owner.retry_started = Some(retry_clock_now());
+                    retry_failure_recorded = true;
+                    if owner.retry_failures >= 3 {
+                        owner.fence(false);
+                    }
+                }
+            }
             let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
             if settle_required && owner.rpc.is_some() {
                 retain_lease = true;
@@ -1009,7 +1033,7 @@ async fn token(
                     token
                 }
                 Err(error) => {
-                    if retry && owner.retryable_unavailable {
+                    if retry && owner.retryable_unavailable && !retry_failure_recorded {
                         owner.retry_failures = owner.retry_failures.saturating_add(1);
                         if owner.retry_failures >= 3 {
                             owner.fence(false);
@@ -1028,8 +1052,10 @@ async fn token(
         }
         if retain_lease {
             owner.available = false;
-            owner.routing_refused = true;
-            owner.refresh_enabled = false;
+            if lease.is_some() {
+                owner.routing_refused = true;
+                owner.refresh_enabled = false;
+            }
             if let (Some(central), Some(lease)) = (worker.central.clone(), lease.clone()) {
                 let owner_ref = owner_ref.clone();
                 let settled = Arc::new(AtomicBool::new(false));
@@ -1400,10 +1426,7 @@ impl Broker {
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
             if owner.retryable_unavailable {
-                owner.available = false;
-                owner.retry_started = Some(u64::MAX);
-                owner.routing_refused = true;
-                return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
+                return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
             if owner.vault.verified && owner.available && !admission.quarantine_repair {
                 // A retained proof owns the grant, but cannot establish current

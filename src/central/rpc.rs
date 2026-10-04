@@ -18,6 +18,15 @@ impl std::fmt::Display for RoutingPolicyError {
 }
 impl std::error::Error for RoutingPolicyError {}
 
+#[derive(Debug)]
+struct AppServerError;
+impl std::fmt::Display for AppServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("app-server rejected request")
+    }
+}
+impl std::error::Error for AppServerError {}
+
 pub(super) trait RequestHandler {
     fn keep_notifications(&self) -> bool {
         true
@@ -42,6 +51,7 @@ pub struct Rpc {
     output: BufReader<ChildStdout>,
     next_id: u64,
     healthy: bool,
+    retryable_failure: bool,
     outstanding: Option<(u64, bool)>,
     verified_login: bool,
     rejected_login: bool,
@@ -49,18 +59,13 @@ pub struct Rpc {
     pending: VecDeque<Value>,
 }
 
-#[derive(Debug)]
-pub(super) struct RetryableUsageRead;
-impl std::fmt::Display for RetryableUsageRead {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("app-server usage read rejected")
-    }
-}
-impl std::error::Error for RetryableUsageRead {}
-
 impl Rpc {
     pub(super) fn completion_pending(&self) -> bool {
         self.outstanding.is_some()
+    }
+
+    pub(super) fn retryable_failure(&self) -> bool {
+        self.retryable_failure
     }
 
     pub async fn start(binary: &Path, home: &Path) -> Result<Self> {
@@ -137,6 +142,7 @@ impl Rpc {
             output,
             next_id: 0,
             healthy: true,
+            retryable_failure: false,
             outstanding: None,
             verified_login: false,
             rejected_login: false,
@@ -343,14 +349,7 @@ impl Rpc {
                         {
                             return Err(RoutingPolicyError.into());
                         }
-                        if method == "account/rateLimits/read"
-                            && response.pointer("/error/code").and_then(Value::as_i64)
-                                == Some(-32000)
-                            && response.pointer("/error/data/retryable") == Some(&json!(true))
-                        {
-                            return Err(RetryableUsageRead.into());
-                        }
-                        bail!("app-server rejected {method}");
+                        return Err(AppServerError.into());
                     }
                     return response
                         .get("result")
@@ -376,16 +375,17 @@ impl Rpc {
         };
         match timeout(deadline, operation).await {
             Ok(result) => {
-                if result
-                    .as_ref()
-                    .is_err_and(|error| !error.is::<RoutingPolicyError>())
-                {
+                if result.as_ref().is_err_and(|error| {
+                    !error.is::<RoutingPolicyError>() && !error.is::<AppServerError>()
+                }) {
                     self.healthy = false;
+                    self.retryable_failure = true;
                 }
                 result
             }
             Err(_) => {
                 self.healthy = false;
+                self.retryable_failure = true;
                 bail!("app-server request timed out; completion is unknown");
             }
         }

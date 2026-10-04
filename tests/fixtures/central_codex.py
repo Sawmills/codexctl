@@ -159,17 +159,23 @@ for line in sys.stdin:
             send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
             continue
         if mode == "billing-error":
-            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
+        if mode == "rpc-unhealthy":
+            print("{invalid", flush=True)
+            sys.exit(1)
         if mode == "billing-permanent-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic permanent billing rejection"}})
             continue
-        if mode == "billing-error-once":
+        if mode in ["billing-error-once", "rpc-unhealthy-once"]:
             marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("billing-failed")
             if not marker.exists():
                 marker.write_text("failed")
-                send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
-                continue
+                if mode == "billing-error-once":
+                    send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
+                    continue
+                print("{invalid", flush=True)
+                sys.exit(1)
         if mode == "billing-slow":
             pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("billing-started").write_text("started")
             time.sleep(6)

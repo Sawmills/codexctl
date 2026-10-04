@@ -333,13 +333,7 @@ impl Owner {
                 }
                 if result.is_err() {
                     if snapshot.is_ok() {
-                        self.fence(
-                            self.vault.verified
-                                && self.refresh_enabled
-                                && result.as_ref().is_err_and(|error| {
-                                    error.is::<super::rpc::RetryableUsageRead>()
-                                }),
-                        );
+                        self.fence(false);
                     }
                     eprintln!("central owner refresh failed reason=owner_refresh_failed");
                 }
