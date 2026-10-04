@@ -747,11 +747,11 @@ async fn postgres_retry_recovers_after_marked_billing_failure() {
 
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
     store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
-    fixture.broker.owners.read().await["fixture"]
-        .1
-        .lock()
-        .await
-        .retry_started = Some(0);
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let mut owner = owner_ref.lock().await;
+    let now = owner.retry_clock_now();
+    owner.retry_started = Some(now.saturating_sub(60_000));
+    drop(owner);
     assert_eq!(fixture.token().await, StatusCode::OK);
 }
 

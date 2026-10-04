@@ -25,7 +25,6 @@ pub(in crate::central) fn promote(
         limits: None,
         limits_observed: None,
         verification_input: None,
-        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };
@@ -121,9 +120,11 @@ async fn verify_inner(
         })
         .await
         .map_err(|_| anyhow::anyhow!("replacement verification failed"))?;
-    if !owner.vault.verified {
+    if !owner.rpc.as_ref().is_some_and(|rpc| rpc.verified_login()) {
         bail!("replacement not verified");
     }
+    owner.vault.verified = true;
+    vault::save(&owner.state, &owner.key, &owner.vault)?;
     let mut record = current(&owner.state)?.context("missing re-login commit")?;
     record.phase = Phase::Retiring;
     record.error = None;
@@ -310,7 +311,6 @@ fn finish_verified(state: &Path, key: &Path, record: &mut Record) -> Result<bool
         limits: None,
         limits_observed: None,
         verification_input: None,
-        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };

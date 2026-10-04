@@ -785,7 +785,7 @@ async fn token(
             // An unknown request completion can still have rotated credentials.
             // Keep the owner fenced until settlement has durably completed.
             let unsettled_healthy_rpc = owner.rpc.as_mut().is_some_and(|rpc| {
-                rpc.completion_pending() && !rpc.retryable_or_timed_out() && !rpc.process_exited()
+                rpc.completion_pending() && !rpc.retryable_failure() && !rpc.process_exited()
             });
             if unsettled_healthy_rpc {
                 owner.available = false;
@@ -936,22 +936,19 @@ async fn token(
             if settle_required && owner.rpc.is_some() {
                 let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out);
                 let process_exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
-                if failed_rpc || process_exited {
-                    if let Some(mut rpc) = owner.rpc.take() {
-                        if rpc.timed_out() && !process_exited {
-                            // A timeout leaves an OpenAI refresh in flight. Let
-                            // the normal settlement deadline drain it before
-                            // closing the child, so a rotated refresh token is
-                            // captured in the journal.
-                            rpc.settle_and_stop().await.map_err(|error| {
-                                eprintln!("central owner timeout settlement: {error:#}");
-                                worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                            })?;
-                            rpc.mark_retryable();
-                        } else {
-                            // Protocol/EOF failures have no response to settle.
-                            rpc.terminate().await;
-                        }
+                if owner.rpc.as_ref().is_some_and(Rpc::timed_out) {
+                    // Keep the RPC attached and the lease retained if settlement
+                    // fails; the next settlement attempt must see its journal.
+                    retain_lease = true;
+                    settled_owner_record(&mut owner, &before)
+                        .await
+                        .map_err(|error| {
+                            eprintln!("central owner timeout settlement: {error:#}");
+                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                        })?;
+                } else if failed_rpc || process_exited {
+                    if let Some(rpc) = owner.rpc.take() {
+                        rpc.terminate().await;
                     }
                     owner.refresh_enabled = false;
                     // The failed call may have rotated auth before the protocol
@@ -1389,9 +1386,6 @@ impl Broker {
                     rpc.shutdown().await.map_err(|_| {
                         self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
                     })?;
-                    // The response is settled before this snapshot, so a
-                    // completed verification may now be trusted.
-                    owner.verification_blocked = false;
                 } else {
                     previous_owner_exited(&owner.home).map_err(|_| {
                         self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
@@ -1642,8 +1636,9 @@ impl Broker {
             if !owner.rpc.as_ref().is_some_and(Rpc::verified_login) {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
+            relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.vault.verified = true;
-            owner.verification_blocked = false;
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
@@ -1671,10 +1666,6 @@ impl Broker {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
-            // Verification and the durable vault precede retirement. A crash or
-            // retirement failure leaves reservations for an explicit migration retry.
-            relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.verification_input = None;
             Ok(account_summary(&owner))
         }
@@ -1689,7 +1680,6 @@ impl Broker {
                 // must complete verification through import retry before token
                 // recovery can become eligible.
                 owner.vault.verified = false;
-                owner.verification_blocked = verification_required;
                 vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
@@ -1955,7 +1945,6 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         limits: None,
         limits_observed: None,
         verification_input: None,
-        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };
@@ -2142,7 +2131,6 @@ pub async fn serve(
                     limits: None,
                     limits_observed: None,
                     verification_input: None,
-                    verification_blocked: false,
                     #[cfg(test)]
                     retry_clock: None,
                 }
@@ -2359,7 +2347,6 @@ pub async fn serve(
         if let Some(rpc) = owner.rpc.as_mut() {
             rpc.shutdown().await?;
         }
-        owner.verification_blocked = false;
         owner.snapshot()?;
         // Retain the process incarnation as evidence. A dead incarnation cannot block restart.
         Ok::<(), anyhow::Error>(())

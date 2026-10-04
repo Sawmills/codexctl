@@ -2302,7 +2302,7 @@ fn failed_import_billing_probe_keeps_retry_fenced_without_billing() {
 
 #[test]
 fn account_id_validation_cannot_reopen_a_failed_import() {
-    let server = Server::start();
+    let mut server = Server::start();
     store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
     assert_eq!(
         server
@@ -2333,6 +2333,27 @@ fn account_id_validation_cannot_reopen_a_failed_import() {
         503
     );
     assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    server.stop();
+    server.restart();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
 }
 
 #[test]
@@ -2764,10 +2785,11 @@ fn when_an_import_has_an_uncertain_reply_then_its_owner_finishes_before_shutdown
     );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     assert_eq!(retry_import(&server).status(), 200);
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
-        "1"
+        "2"
     );
 }
 #[test]
@@ -2866,7 +2888,7 @@ fn when_an_uncertain_import_matches_another_request_then_the_first_owner_settles
         server
             .import(&server.amir, "personal", "same-login", "same-seat")
             .status(),
-        409
+        503
     );
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),

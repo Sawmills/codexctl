@@ -127,7 +127,6 @@ pub(super) struct Owner {
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
-    pub(super) verification_blocked: bool,
     #[cfg(test)]
     pub(super) retry_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -151,7 +150,7 @@ impl Owner {
     }
     pub(super) fn fence(&mut self, retryable: bool) {
         self.available = false;
-        self.retryable_unavailable = retryable;
+        self.retryable_unavailable = retryable && self.vault.verified;
         if !retryable {
             self.retry_started = None;
         }
@@ -232,13 +231,9 @@ impl Owner {
             &self.home.as_path().join("auth.json"),
         )?)?;
         self.validate_owned_auth(&auth)?;
-        if self.rpc.as_ref().is_some_and(Rpc::verified_login)
-            && !self.vault.import_rejected
-            && !self.verification_blocked
-        {
-            self.vault.verified = true;
-            self.vault.import_rejected = false;
-        } else if !self.vault.verified {
+        // A journal snapshot preserves credentials, not import eligibility.
+        // Only a completed import or replacement verification grants eligibility.
+        if !self.vault.verified {
             if let Some(rpc) = self.rpc.as_ref() {
                 self.vault.import_rejected =
                     rpc.rejected_login() && self.verification_input.as_ref() == Some(&auth);
@@ -325,7 +320,8 @@ impl Owner {
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
         if let Err(error) = result {
-            if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+            if self.vault.verified
+                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                 && !error.is::<RoutingPolicyError>()
             {
                 return Err(TokenFailure::Retryable(error, false));
@@ -366,7 +362,8 @@ impl Owner {
                 let limits = match result {
                     Ok(limits) => limits,
                     Err(error)
-                        if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                        if self.vault.verified
+                            && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                             && !error.is::<RoutingPolicyError>() =>
                     {
                         self.retry_requires_billing = true;
@@ -413,7 +410,8 @@ impl Owner {
             let account = match result {
                 Ok(account) => account,
                 Err(error)
-                    if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                    if self.vault.verified
+                        && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                         && !error.is::<RoutingPolicyError>() =>
                 {
                     return Err(TokenFailure::Retryable(error, false));
@@ -712,7 +710,6 @@ pub async fn serve(
         limits: None,
         limits_observed: None,
         verification_input: None,
-        verification_blocked: false,
         #[cfg(test)]
         retry_clock: None,
     };

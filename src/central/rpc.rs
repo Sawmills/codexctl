@@ -101,10 +101,6 @@ impl Rpc {
         self.retryable_failure() || self.timed_out
     }
 
-    pub(super) fn mark_retryable(&mut self) {
-        self.retryable_failure = true;
-    }
-
     pub(super) fn timed_out(&self) -> bool {
         self.timed_out
     }
