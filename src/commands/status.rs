@@ -615,7 +615,7 @@ async fn fetch_and_split(
 
     let results = futures::future::join_all(futures).await;
 
-    let mut accounts = results
+    let mut accounts: Vec<codexctl::status_json::AccountStatus> = results
         .iter()
         .zip(profiles)
         .map(|(result, profile)| {
@@ -1358,7 +1358,7 @@ mod tests {
         let row = render_rate_limited_row(&failed, &columns);
 
         assert_eq!(row.len(), columns.headers().len());
-        assert_eq!(row[6].content(), failed.error_msg);
+        assert_eq!(row[5].content(), failed.error_msg);
         assert_eq!(row.last().unwrap().content(), "-");
     }
 
@@ -1367,8 +1367,32 @@ mod tests {
         let account = rate_limited_account();
         let columns = RateLimitColumns::for_accounts(&[&account]);
         let row = render_rate_limited_row(&account, &columns);
-        assert_eq!(columns.headers().len(), 7);
-        assert_eq!(row.len(), 7);
+        assert_eq!(columns.headers().len(), 6);
+        assert_eq!(row.len(), 6);
+    }
+
+    #[test]
+    fn reset_column_is_present_for_banked_credits_and_error_rows_match() {
+        let account = RateLimitedAccount {
+            reset_credits: 2,
+            ..rate_limited_account()
+        };
+        let error = RateLimitedAccount {
+            reset_credits: 2,
+            is_error: true,
+            ..rate_limited_account()
+        };
+        let columns = RateLimitColumns::for_accounts(&[&account, &error]);
+        assert!(columns.resets);
+        assert_eq!(columns.headers().last().unwrap(), "Token");
+        assert_eq!(
+            render_rate_limited_row(&account, &columns).len(),
+            columns.headers().len()
+        );
+        assert_eq!(
+            render_rate_limited_row(&error, &columns).len(),
+            columns.headers().len()
+        );
     }
 
     /// A store with no labels must render exactly the table it rendered before
@@ -1451,9 +1475,9 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec!["Account", "7d", "7d Reset", "Resets", "Token"]
+            vec!["Account", "7d", "7d Reset", "Token"]
         );
-        assert_eq!(render_rate_limited_row(&account, &columns).len(), 5);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 4);
     }
 
     #[test]
@@ -1531,17 +1555,9 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account",
-                "15m",
-                "15m Reset",
-                "1h",
-                "1h Reset",
-                "Resets",
-                "Token",
-            ]
+            vec!["Account", "15m", "15m Reset", "1h", "1h Reset", "Token",]
         );
-        assert_eq!(render_rate_limited_row(&account, &columns).len(), 7);
+        assert_eq!(render_rate_limited_row(&account, &columns).len(), 6);
     }
 
     #[test]
@@ -1564,15 +1580,7 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account",
-                "1h",
-                "1h Reset",
-                "1h #2",
-                "1h #2 Reset",
-                "Resets",
-                "Token",
-            ]
+            vec!["Account", "1h", "1h Reset", "1h #2", "1h #2 Reset", "Token",]
         );
         assert_eq!(row[1].content(), "25%");
         assert_eq!(row[3].content(), "42%");
@@ -1606,9 +1614,7 @@ mod tests {
 
         assert_eq!(
             columns.headers(),
-            vec![
-                "Account", "5h", "5h Reset", "7d", "7d Reset", "Resets", "Token"
-            ]
+            vec!["Account", "5h", "5h Reset", "7d", "7d Reset", "Token"]
         );
         assert_eq!(legacy_row[1].content(), "30%");
         assert_eq!(legacy_row[3].content(), "40%");
@@ -1665,7 +1671,6 @@ mod tests {
                 "5h Reset",
                 "7d",
                 "7d Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1705,7 +1710,6 @@ mod tests {
                 "7d Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1750,7 +1754,6 @@ mod tests {
                 "1h Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1808,7 +1811,6 @@ mod tests {
                 "7d Reset",
                 "Secondary",
                 "Secondary Reset",
-                "Resets",
                 "Token",
             ]
         );
@@ -1827,8 +1829,8 @@ mod tests {
         let columns = RateLimitColumns::for_accounts(&[&account]);
 
         assert_eq!(
-            columns.headers(),
-            vec!["Account", "Secondary", "Secondary Reset", "Resets", "Token"]
+            render_rate_limited_row(&account, &columns).len(),
+            columns.headers().len()
         );
     }
 
