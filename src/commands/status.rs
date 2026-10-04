@@ -615,7 +615,7 @@ async fn fetch_and_split(
 
     let results = futures::future::join_all(futures).await;
 
-    let accounts = results
+    let mut accounts = results
         .iter()
         .zip(profiles)
         .map(|(result, profile)| {
@@ -857,6 +857,13 @@ async fn fetch_and_split(
         }
     }
 
+    for account in &mut accounts {
+        if let Some(rate_limited) = rate_limited.iter().find(|row| row.alias == account.alias) {
+            account.resets_next_expiry =
+                codexctl::status_json::timestamp(rate_limited.reset_credit_expiry);
+        }
+    }
+
     Ok(StatusSnapshot {
         rate_limited,
         usage_based,
@@ -917,7 +924,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         for _ in &columns.windows {
             row.extend([Cell::new("-"), Cell::new("-")]);
         }
-        row.push(Cell::new("-"));
+        if columns.resets {
+            row.push(Cell::new("-"));
+        }
         row.push(token_cell(account.token_expiry, true, &account.error_msg));
         if columns.billing {
             row.push(Cell::new("-"));
@@ -971,7 +980,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
                 .join("\n"),
         ));
     }
-    row.push(resets_cell(account));
+    if columns.resets {
+        row.push(resets_cell(account));
+    }
     row.push(token_cell(account.token_expiry, false, &account.error_msg));
     if columns.billing {
         row.push(if account.billing_unknown {
