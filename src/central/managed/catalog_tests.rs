@@ -8,6 +8,8 @@ struct Fixture {
     requests: Arc<AtomicUsize>,
     fail: Arc<AtomicBool>,
     hold: Arc<AtomicBool>,
+    modern: Arc<AtomicBool>,
+    seen_account: Arc<StdMutex<Option<String>>>,
     started: Arc<Semaphore>,
     release: Arc<Semaphore>,
     http: tokio::task::JoinHandle<()>,
@@ -45,23 +47,32 @@ impl Fixture {
                 import_rejected: false,
             },
         )
-        .unwrap();
+        .unwrap_or_else(|_| panic!("token response failed"));
         let owner = prepare_owner(&account, &key, true).unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let fail = Arc::new(AtomicBool::new(false));
         let hold = Arc::new(AtomicBool::new(false));
+        let modern = Arc::new(AtomicBool::new(false));
+        let seen_account = Arc::new(StdMutex::new(None));
         let started = Arc::new(Semaphore::new(0));
         let release = Arc::new(Semaphore::new(0));
         let app = Router::new().route("/usage", get({
-            let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
-            move || {
-                let (requests, fail, hold, started, release) = (requests.clone(), fail.clone(), hold.clone(), started.clone(), release.clone());
+            let (requests, fail, hold, modern, seen_account, started, release) = (requests.clone(), fail.clone(), hold.clone(), modern.clone(), seen_account.clone(), started.clone(), release.clone());
+            move |headers: HeaderMap| {
+                let (requests, fail, hold, modern, seen_account, started, release) = (requests.clone(), fail.clone(), hold.clone(), modern.clone(), seen_account.clone(), started.clone(), release.clone());
                 async move {
                     requests.fetch_add(1, Ordering::SeqCst);
                     started.add_permits(1);
                     if hold.load(Ordering::SeqCst) { release.acquire().await.unwrap().forget(); }
                     if fail.load(Ordering::SeqCst) { return StatusCode::BAD_GATEWAY.into_response(); }
-                    Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                    let account = headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+                    *seen_account.lock().unwrap() = account;
+                    if modern.load(Ordering::SeqCst) {
+                        if headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()) != Some("synthetic-seat") { return StatusCode::BAD_REQUEST.into_response(); }
+                        Json(json!({"plan_type":"promax","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":100,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}})).into_response()
+                    } else {
+                        Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                    }
                 }
             }
         }));
@@ -104,6 +115,8 @@ impl Fixture {
             requests,
             fail,
             hold,
+            modern,
+            seen_account,
             started,
             release,
             http,
@@ -147,6 +160,61 @@ async fn list(broker: Broker, headers: HeaderMap) -> Value {
         .await
         .unwrap();
     serde_json::from_slice::<Value>(&body).unwrap()[0].clone()
+}
+
+#[tokio::test]
+async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    fixture.modern.store(true, Ordering::SeqCst);
+    let mut refreshed = TokenResponse {
+        access_token: "token".into(),
+        chatgpt_account_id: "synthetic-seat".into(),
+        chatgpt_plan_type: Some("pro".into()),
+        revision: "revision".into(),
+        billing_class: Some(api::BillingClass::Unknown),
+        native_routing_supported: false,
+        statusline_usage: Some(crate::statusline::Usage {
+            age_seconds: 0,
+            weekly_used_percent: Some(100.0),
+            weekly_resets_at: None,
+            five_hour_used_percent: None,
+            five_hour_resets_at: None,
+            allowed: None,
+            limit_reached: None,
+        }),
+        user_id: None,
+        label: None,
+    };
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    assert_eq!(
+        refreshed.billing_class,
+        Some(api::BillingClass::RateLimited)
+    );
+    assert_eq!(refreshed.chatgpt_plan_type.as_deref(), Some("promax"));
+    assert_eq!(
+        refreshed.statusline_usage.as_ref().unwrap().allowed,
+        Some(true)
+    );
+    assert_eq!(
+        refreshed.statusline_usage.as_ref().unwrap().limit_reached,
+        Some(false)
+    );
+    assert_eq!(
+        refreshed
+            .statusline_usage
+            .as_ref()
+            .unwrap()
+            .weekly_used_percent,
+        Some(100.0)
+    );
+    assert_eq!(
+        fixture.seen_account.lock().unwrap().as_deref(),
+        Some("synthetic-seat")
+    );
+    fixture.fail.store(true, Ordering::SeqCst);
+    let before = refreshed.clone();
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    assert_eq!(refreshed.billing_class, before.billing_class);
 }
 
 #[tokio::test]
