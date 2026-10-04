@@ -183,6 +183,12 @@ or row counts do not match the reviewed plan.
      ttlSecondsAfterFinished: 86400
      template:
        spec:
+         securityContext:
+           runAsUser: 10001
+           runAsGroup: 10001
+           runAsNonRoot: true
+           fsGroup: 10001
+           seccompProfile: { type: RuntimeDefault }
          restartPolicy: Never
          initContainers:
            - name: prepare-secrets
@@ -280,6 +286,12 @@ or row counts do not match the reviewed plan.
      ttlSecondsAfterFinished: 86400
      template:
        spec:
+         securityContext:
+           runAsUser: 10001
+           runAsGroup: 10001
+           runAsNonRoot: true
+           fsGroup: 10001
+           seccompProfile: { type: RuntimeDefault }
          restartPolicy: Never
          initContainers:
            - name: prepare-secrets
