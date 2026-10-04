@@ -136,14 +136,18 @@ not reference the live Argo application. Stop if the database, role, secret,
 or row counts do not match the reviewed plan.
 
 1. **Back up the current PVC.** Keep the single live pod serving file mode.
-   Freeze administrative mutations, snapshot the PVC, and export checksummed
-   copies of the current state before changing its environment:
+   Freeze administrative mutations, take the filesystem copy at one point in
+   time, and hash the exact archive kept for recovery before changing its
+   environment:
 
    ```sh
-   kubectl --context plat-staging -n codexctl exec statefulset/codexctl -- \
-     tar -C /data -czf - state | sha256sum
    kubectl --context plat-staging -n codexctl cp codexctl-0:/data/state ./codexctl-state-backup
+   tar -C ./codexctl-state-backup -czf ./codexctl-state-backup.tar.gz .
+   sha256sum ./codexctl-state-backup.tar.gz
    ```
+
+   Keep `codexctl-state-backup.tar.gz` and its checksum together. Restore from
+   that archive, not from a second live copy.
 
 2. **Provision and migrate.** After infra#1513 is merged and applied, stop the
    file-mode writer and wait for `codexctl-0` to terminate before attaching its
@@ -156,6 +160,12 @@ or row counts do not match the reviewed plan.
    database password through `kubectl exec` arguments or shell expansion. The
    migration Job mounts the retained PVC at `/data` and runs `migrate`; submit
    a second copy with `backfill` as its command after migration completes:
+
+   The scale-down starts a maintenance window: the existing Ingress has no
+   token-serving backend until the HA Deployment is ready. Announce the
+   expected token outage, reject or drain token traffic during migration, and
+   do not scale down outside that window. Apply the HA overlay and switch the
+   Ingress only after its three pods pass the checks in step 4.
 
    ```sh
    kubectl --context plat-staging -n codexctl scale statefulset/codexctl --replicas=0
