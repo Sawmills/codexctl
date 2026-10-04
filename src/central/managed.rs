@@ -167,12 +167,7 @@ pub fn set_user(state: &Path, id: &str, enabled: bool) -> Result<()> {
 /// Mutate one user in PostgreSQL using its entity revision.  The local file is
 /// not consulted in PostgreSQL mode, so a stale pod cannot replace another
 /// instance's concurrent enrollment or revocation changes.
-pub async fn set_user_central(
-    state: &Path,
-    key: &Path,
-    id: &str,
-    enabled: bool,
-) -> Result<()> {
+pub async fn set_user_central(state: &Path, key: &Path, id: &str, enabled: bool) -> Result<()> {
     let central = super::storage::runtime_store(state, key).await?;
     let rows = central.load_registry_entity_revisions("users").await?;
     let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id) else {
@@ -336,7 +331,8 @@ impl Broker {
             .as_ref()
             .context("central store is not configured")?;
         let rows = central.load_registry_entity_revisions("users").await?;
-        if let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id) {
+        if let Some((_, payload, revision)) = rows.iter().find(|(entity_id, _, _)| entity_id == id)
+        {
             let mut user: User = serde_json::from_slice(payload)?;
             if !user.enabled {
                 return Ok(UserEnrollment::Disabled);
@@ -382,9 +378,11 @@ impl Broker {
     pub(super) async fn sync_registry(&self) -> Result<()> {
         let local_users = users(&self.state)?;
         let local_devices = vault::devices(&self.state)?;
-        let (users, devices) = if self.central.is_some() {
-            let central = self.central.as_ref().expect("checked above");
-            (central_registry_users(central).await?, central_registry_devices(central).await?)
+        let (users, devices) = if let Some(central) = self.central.as_ref() {
+            (
+                central_registry_users(central).await?,
+                central_registry_devices(central).await?,
+            )
         } else {
             (local_users, local_devices)
         };
@@ -626,10 +624,9 @@ async fn token(
                 .central
                 .as_ref()
                 .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+            && reconcile_owner_from_central(&worker, &mut owner, &account_id).await?
         {
-            if reconcile_owner_from_central(&worker, &mut owner, &account_id).await? {
-                request.previous_revision = None;
-            }
+            request.previous_revision = None;
         }
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
@@ -1209,7 +1206,7 @@ async fn revoke_device(
         .as_ref()
         .filter(|central| central.mode() != super::storage::StoreMode::File)
     {
-        let rows = central
+        let mut rows = central
             .load_registry_entity_revisions("devices")
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
@@ -1224,7 +1221,14 @@ async fn revoke_device(
         }
         device.revoked = true;
         let updated = central
-            .save_registry_entity_cas("devices", &input.id, &serde_json::to_vec(&device).map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?, Some(*revision))
+            .save_registry_entity_cas(
+                "devices",
+                &input.id,
+                &serde_json::to_vec(&device).map_err(|_| {
+                    broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?,
+                Some(*revision),
+            )
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
         if !updated {
@@ -1293,10 +1297,11 @@ async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> 
 async fn ready(State(broker): State<Broker>) -> Response {
     let local = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
     let reachable = match broker.central.as_ref() {
-        Some(store) => store.reachable().await,
-        None => true,
+        Some(store) => Some(store.reachable().await),
+        None => None,
     };
-    let status = if local && reachable {
+    let healthy = local && reachable.is_none_or(|value| value);
+    let status = if healthy {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -1307,7 +1312,11 @@ async fn ready(State(broker): State<Broker>) -> Response {
         .map_or_else(|| "file".to_owned(), |store| store.mode().to_string());
     (
         status,
-        Json(json!({"mode": mode, "databaseReachable": reachable})),
+        Json(json!({
+            "ready": healthy,
+            "storeMode": mode,
+            "databaseReachable": reachable,
+        })),
     )
         .into_response()
 }
@@ -1647,21 +1656,43 @@ pub async fn serve(
     let registry = if let Some(central) = central.as_ref() {
         let mut users = central_registry_users(central).await?;
         let mut devices = central_registry_devices(central).await?;
-        if users.is_empty() {
-            users = self::users(state)?;
-            let entries = users
-                .iter()
-                .map(|user| Ok((user.id.clone(), serde_json::to_vec(user)?)))
-                .collect::<Result<Vec<_>>>()?;
-            central.save_registry_entities("users", &entries).await?;
+        // Convert the phase-two array snapshot to entity rows once.  After
+        // this point authorization and mutations use only per-entity rows;
+        // no pod can replace the shared registry with its local array.
+        if central
+            .load_registry_entity_revisions("users")
+            .await?
+            .is_empty()
+        {
+            if users.is_empty() {
+                users = self::users(state)?;
+            }
+            for user in &users {
+                central
+                    .save_registry_entity_cas("users", &user.id, &serde_json::to_vec(user)?, None)
+                    .await?;
+            }
+            users = central_registry_users(central).await?;
         }
-        if devices.is_empty() {
-            devices = vault::devices(state)?;
-            let entries = devices
-                .iter()
-                .map(|device| Ok((device.id.clone(), serde_json::to_vec(device)?)))
-                .collect::<Result<Vec<_>>>()?;
-            central.save_registry_entities("devices", &entries).await?;
+        if central
+            .load_registry_entity_revisions("devices")
+            .await?
+            .is_empty()
+        {
+            if devices.is_empty() {
+                devices = vault::devices(state)?;
+            }
+            for device in &devices {
+                central
+                    .save_registry_entity_cas(
+                        "devices",
+                        &device.id,
+                        &serde_json::to_vec(device)?,
+                        None,
+                    )
+                    .await?;
+            }
+            devices = central_registry_devices(central).await?;
         }
         Some(Arc::new(std::sync::RwLock::new(RegistryState {
             users,

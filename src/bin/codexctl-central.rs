@@ -160,6 +160,17 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
+    if !matches!(
+        &cli.command,
+        Commands::Migrate { .. } | Commands::Backfill { .. }
+    ) && matches!(
+        central::storage::StoreMode::from_env()?,
+        central::storage::StoreMode::Dual
+    ) {
+        anyhow::bail!(
+            "dual runtime is migration-only; administration and serving support file or postgres mode"
+        );
+    }
     match cli.command {
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {

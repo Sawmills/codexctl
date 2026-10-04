@@ -1,8 +1,8 @@
 //! Durable storage for the central account broker.
 //!
-//! File storage remains the default.  PostgreSQL schema provisioning is
-//! available with `codexctl-central migrate`; server startup rejects
-//! `CODEXCTL_CENTRAL_STORE=postgres`; dual mode is opt-in until rollout. The
+//! File storage remains the default. PostgreSQL is authoritative when
+//! `CODEXCTL_CENTRAL_STORE=postgres`; dual mode is an explicit migration
+//! compatibility mode. The
 //! database never receives the vault key:
 //! credential and enrollment payloads are nonce-prefixed AES-GCM ciphertext.
 
@@ -249,13 +249,13 @@ impl CentralStore {
         }
         match self {
             Self::File(file) => file.save_registry(name, payload),
-            Self::Postgres(db) => db.save_registry(name, payload).await,
+            Self::Postgres(db) => bounded_db(db.save_registry(name, payload)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                postgres.save_registry(name, payload).await?;
+                bounded_db(postgres.save_registry(name, payload)).await?;
                 if let Err(error) = file.save_registry(name, payload) {
                     mirror_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!(
@@ -343,10 +343,17 @@ impl CentralStore {
         match self {
             Self::File(_) => Ok(true),
             Self::Postgres(db) => {
-                bounded_db(db.save_registry_entity_cas(name, entity_id, payload, expected_revision)).await
+                bounded_db(db.save_registry_entity_cas(name, entity_id, payload, expected_revision))
+                    .await
             }
             Self::Dual { postgres, .. } => {
-                bounded_db(postgres.save_registry_entity_cas(name, entity_id, payload, expected_revision)).await
+                bounded_db(postgres.save_registry_entity_cas(
+                    name,
+                    entity_id,
+                    payload,
+                    expected_revision,
+                ))
+                .await
             }
         }
     }
@@ -406,25 +413,34 @@ impl CentralStore {
         ] {
             if path.exists() {
                 let bytes = crate::central::vault::private_read(&path)?;
-                let user_count = if name == "users" {
-                    Some(
-                        serde_json::from_slice::<Vec<crate::central::managed::User>>(&bytes)?.len(),
-                    )
-                } else {
-                    None
-                };
-                let device_count = if name == "devices" {
-                    Some(
-                        serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?.len(),
-                    )
-                } else {
-                    None
-                };
-                target.save_registry(name, &bytes).await?;
                 if name == "users" {
-                    counts.users = user_count.unwrap_or_default();
+                    let users =
+                        serde_json::from_slice::<Vec<crate::central::managed::User>>(&bytes)?;
+                    for user in &users {
+                        target
+                            .save_registry_entity_cas(
+                                "users",
+                                &user.id,
+                                &serde_json::to_vec(user)?,
+                                None,
+                            )
+                            .await?;
+                    }
+                    counts.users = users.len();
                 } else {
-                    counts.devices = device_count.unwrap_or_default();
+                    let devices =
+                        serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?;
+                    for device in &devices {
+                        target
+                            .save_registry_entity_cas(
+                                "devices",
+                                &device.id,
+                                &serde_json::to_vec(device)?,
+                                None,
+                            )
+                            .await?;
+                    }
+                    counts.devices = devices.len();
                 }
             }
         }
@@ -598,10 +614,10 @@ impl CentralStore {
     ) -> Result<()> {
         match self {
             Self::File(file) => file.create_enrollment(challenge, payload, ttl),
-            Self::Postgres(db) => db.create_enrollment(challenge, payload, ttl).await,
+            Self::Postgres(db) => bounded_db(db.create_enrollment(challenge, payload, ttl)).await,
             Self::Dual { file, postgres, .. } => {
                 file.create_enrollment(challenge, payload, ttl)?;
-                postgres.create_enrollment(challenge, payload, ttl).await
+                bounded_db(postgres.create_enrollment(challenge, payload, ttl)).await
             }
         }
     }
@@ -611,13 +627,13 @@ impl CentralStore {
     pub async fn consume_enrollment(&self, challenge: &str) -> Result<Option<Vec<u8>>> {
         match self {
             Self::File(file) => file.consume_enrollment(challenge),
-            Self::Postgres(db) => db.consume_enrollment(challenge).await,
+            Self::Postgres(db) => bounded_db(db.consume_enrollment(challenge)).await,
             Self::Dual {
                 file,
                 postgres,
                 mirror_failures,
             } => {
-                let value = postgres.consume_enrollment(challenge).await?;
+                let value = bounded_db(postgres.consume_enrollment(challenge)).await?;
                 if value.is_some() {
                     match file.consume_enrollment(challenge) {
                         Ok(Some(_)) => {}
@@ -1109,7 +1125,11 @@ impl PostgresStore {
                 let entity_id: String = row.get(0);
                 let encrypted: Vec<u8> = row.get(1);
                 let revision: i64 = row.get(2);
-                Ok((entity_id, vault::decrypt_bytes(&self.key, &encrypted)?, revision))
+                Ok((
+                    entity_id,
+                    vault::decrypt_bytes(&self.key, &encrypted)?,
+                    revision,
+                ))
             })
             .collect()
     }

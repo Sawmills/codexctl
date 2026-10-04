@@ -561,7 +561,9 @@ async fn callback(
             } else {
                 managed::record_user(&broker.state, &user, email)
             };
-            match result.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))? {
+            match result.map_err(|_| {
+                broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
+            })? {
                 managed::UserEnrollment::Recorded => {}
                 managed::UserEnrollment::Disabled => {
                     return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
@@ -664,11 +666,14 @@ async fn approve(
         (approval, device_name)
     };
     let result = if broker.central.is_some() {
-        broker.record_user_central(&approval.user, &approval.email).await
+        broker
+            .record_user_central(&approval.user, &approval.email)
+            .await
     } else {
         managed::record_user(&broker.state, &approval.user, &approval.email)
     };
-    match result.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    match result
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
     {
         managed::UserEnrollment::Recorded => {}
         managed::UserEnrollment::Disabled => {
@@ -677,16 +682,17 @@ async fn approve(
     }
     let token = secret();
     let new_device = vault::Device {
-            id: format!("{}-{}", device_name, &secret()[..12]),
-            tenant: "sawmills".into(),
-            user: approval.user,
-            token_hash: vault::digest(token.as_bytes()),
-            revoked: false,
-        };
+        id: format!("{}-{}", device_name, &secret()[..12]),
+        tenant: "sawmills".into(),
+        user: approval.user,
+        token_hash: vault::digest(token.as_bytes()),
+        revoked: false,
+    };
     if broker.central.is_some() {
-        broker.record_device_central(&new_device).await.map_err(|_| {
-            broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-        })?;
+        broker
+            .record_device_central(&new_device)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     } else {
         let _lock = vault::registry_lock(&broker.state, "devices.lock")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;

@@ -1,0 +1,9 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: codexctl-ha
+  namespace: codexctl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: {app.kubernetes.io/name: codexctl, app.kubernetes.io/component: broker-ha}

@@ -30,7 +30,12 @@ pub async fn revoke_central(state: &Path, key: &Path, id: &str) -> Result<()> {
     let mut device: vault::Device = serde_json::from_slice(payload)?;
     device.revoked = true;
     if !central
-        .save_registry_entity_cas("devices", id, &serde_json::to_vec(&device)?, Some(*revision))
+        .save_registry_entity_cas(
+            "devices",
+            id,
+            &serde_json::to_vec(&device)?,
+            Some(*revision),
+        )
         .await?
     {
         bail!("device changed concurrently; retry");
