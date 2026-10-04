@@ -4,6 +4,10 @@
 !Cargo.lock
 !src
 !src/**
+!design
+!design/v3
+!design/v3/fonts
+!design/v3/fonts/**
 !deploy
 !deploy/Dockerfile
 !deploy/Dockerfile.dockerignore
