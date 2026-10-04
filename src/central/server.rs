@@ -345,10 +345,36 @@ impl Owner {
             current.chatgpt_plan_type = token.chatgpt_plan_type;
             current.native_routing_supported = true;
             if let Some((limits, observed_at)) = observed_limits {
-                current.statusline_usage = usage(&limits)
+                let parsed = usage(&limits).ok();
+                // Older Codex app-server versions omit the admission flags that
+                // the usage endpoint provides. Refresh that authoritative
+                // source before classifying a 100% window as billable.
+                let direct = if parsed.as_ref().is_some_and(|value| {
+                    value
+                        .rate_limit
+                        .as_ref()
+                        .is_some_and(|rate| rate.allowed.is_none() || rate.limit_reached.is_none())
+                }) {
+                    let client = reqwest::Client::new();
+                    crate::api::fetch_usage_async(
+                        &client,
+                        &token.access_token,
+                        Some(&token.chatgpt_account_id),
+                    )
+                    .await
                     .ok()
-                    .as_ref()
-                    .map(crate::statusline::Usage::from_usage);
+                } else {
+                    None
+                };
+                if let Some(ref authoritative) = direct {
+                    current.billing_class = Some(authoritative.billing_class());
+                    current.chatgpt_plan_type = authoritative.plan_type.clone();
+                    current.statusline_usage =
+                        Some(crate::statusline::Usage::from_usage(authoritative));
+                } else {
+                    current.statusline_usage =
+                        parsed.as_ref().map(crate::statusline::Usage::from_usage);
+                }
                 if let Some(usage) = current.statusline_usage.as_mut() {
                     usage.age_seconds = observed_at.elapsed().as_secs();
                 }
