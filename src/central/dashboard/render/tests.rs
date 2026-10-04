@@ -111,6 +111,17 @@ fn stale_unknown_billing_still_withdraws_the_recommendation() {
 }
 
 #[test]
+fn stale_included_account_blocks_reset_advice_for_another_account() {
+    let mut data = fixture();
+    let mut stale = data.accounts[3].clone();
+    stale.billing_class = crate::api::BillingClass::Unknown;
+    data.accounts = vec![data.accounts[1].clone(), stale];
+    let html = overview(&data);
+    assert!(html.contains("Cannot confirm headroom"));
+    assert!(!html.contains("id=\"cmd-reset-use\""));
+}
+
+#[test]
 fn earliest_recovery_requires_both_exhausted_windows_and_never_promises_unknown_reset() {
     let mut data = fixture();
     data.accounts.truncate(1);

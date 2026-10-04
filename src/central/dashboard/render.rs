@@ -266,6 +266,13 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
             command("cmd-migrate", "codexctl migrate", true)
         );
     }
+    if accounts.iter().any(|a| {
+        a.state == "available"
+            && a.billing_class != crate::api::BillingClass::UsageBased
+            && a.stale()
+    }) {
+        return fallback("cmd-live-current");
+    }
     if let Some(a) = accounts
         .iter()
         .filter(|a| a.redeemable(now))
@@ -284,13 +291,6 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
                 true
             )
         );
-    }
-    if accounts.iter().any(|a| {
-        a.state == "available"
-            && a.billing_class != crate::api::BillingClass::UsageBased
-            && a.stale()
-    }) {
-        return fallback("cmd-live-current");
     }
     let mut html = String::from(r#"<h1 id="answer-title">No included usage available</h1>"#);
     // All exhausted windows must reset before this account has headroom again.
