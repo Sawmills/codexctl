@@ -38,6 +38,9 @@ pub struct AccountStatus {
     pub error: Option<String>,
     pub usage_age_seconds: Option<u64>,
     pub usage_stale: Option<bool>,
+    pub resets_banked: Option<i64>,
+    pub resets_redeemable: Option<i64>,
+    pub resets_next_expiry: Option<String>,
 }
 
 impl AccountStatus {
@@ -59,6 +62,9 @@ impl AccountStatus {
             error: None,
             usage_age_seconds: None,
             usage_stale: None,
+            resets_banked: None,
+            resets_redeemable: None,
+            resets_next_expiry: None,
         }
     }
 

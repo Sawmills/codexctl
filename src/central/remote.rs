@@ -870,6 +870,9 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     },
                     usage_age_seconds: account.usage_age_seconds,
                     usage_stale: Some(account.usage_stale),
+                    resets_banked: None,
+                    resets_redeemable: None,
+                    resets_next_expiry: None,
                 },
             }
         })

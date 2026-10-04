@@ -401,6 +401,7 @@ struct RateLimitColumns {
     labeled: bool,
     billing: bool,
     plan: bool,
+    resets: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -493,6 +494,7 @@ impl RateLimitColumns {
         }
         Self {
             billing: accounts.iter().any(|account| account.billing_unknown),
+            resets: accounts.iter().any(|account| account.reset_credits > 0),
             plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
             // An error row still carries its label, so consider every account
@@ -517,7 +519,10 @@ impl RateLimitColumns {
             headers.push(window.label.clone());
             headers.push(format!("{} Reset", window.label));
         }
-        headers.extend(["Resets".to_string(), "Token".to_string()]);
+        if self.resets {
+            headers.push("Resets".to_string());
+        }
+        headers.push("Token".to_string());
         if self.billing {
             headers.push("Billing".to_string());
         }
@@ -617,7 +622,11 @@ async fn fetch_and_split(
             let (_, _, _, is_active, auth, usage) = result;
             let mut row = codexctl::status_json::AccountStatus::local(&profile.meta, *is_active);
             match (auth, usage) {
-                (Ok(_), Some(Ok(usage))) => row.set_usage(usage),
+                (Ok(_), Some(Ok(usage))) => {
+                    row.set_usage(usage);
+                    row.resets_banked = Some(usage.reset_credits_available());
+                    row.resets_redeemable = Some(usage.reset_credits_applicable());
+                }
                 (Ok(auth), Some(Err(error))) => {
                     row.error = Some(
                         if error.to_string().contains("expired") {

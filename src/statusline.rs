@@ -163,6 +163,9 @@ pub(crate) fn record(
             error: None,
             usage_age_seconds: Some(age_seconds),
             usage_stale: Some(false),
+            resets_banked: None,
+            resets_redeemable: None,
+            resets_next_expiry: None,
         });
         let cache = Cache {
             version: 1,
