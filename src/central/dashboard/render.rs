@@ -238,11 +238,23 @@ fn window(w: &Window, a: &Account, fallback: &str, figure: bool, now: i64) -> St
         )
     }
 }
-fn fallback(id: &str) -> String {
+fn fallback(id: Option<&str>) -> String {
+    let action = id
+        .map(|id| command(id, "codexctl use", true))
+        .unwrap_or_default();
     format!(
         r#"<h1>Cannot confirm headroom</h1><p class="context">Check live usage before choosing an account.</p>{}<p class="effect">Checks live usage before switching this machine.</p>"#,
-        command(id, "codexctl use", true)
+        action
     )
+}
+fn stale_included(a: &Account) -> bool {
+    a.state == "available" && a.billing_class != crate::api::BillingClass::UsageBased && a.stale()
+}
+fn stale_action_safe(accounts: &[Account]) -> bool {
+    accounts
+        .iter()
+        .filter(|a| stale_included(a))
+        .all(|a| a.billing_class == crate::api::BillingClass::RateLimited)
 }
 fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
     if let Some(a) = best {
@@ -266,12 +278,8 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
             command("cmd-migrate", "codexctl migrate", true)
         );
     }
-    if accounts.iter().any(|a| {
-        a.state == "available"
-            && a.billing_class != crate::api::BillingClass::UsageBased
-            && a.stale()
-    }) {
-        return fallback("cmd-live-current");
+    if accounts.iter().any(stale_included) {
+        return fallback(stale_action_safe(accounts).then_some("cmd-live-current"));
     }
     if let Some(a) = accounts
         .iter()
@@ -338,6 +346,7 @@ fn answer(accounts: &[Account], best: Option<&Account>, now: i64) -> String {
     html
 }
 fn attention(accounts: &[Account], all_stale: bool, now: i64) -> String {
+    let has_stale_included = accounts.iter().any(stale_included);
     let mut items = Vec::new();
     for (i, a) in accounts.iter().enumerate() {
         let (class, state) = a.state();
@@ -350,7 +359,9 @@ fn attention(accounts: &[Account], all_stale: bool, now: i64) -> String {
             "Stale usage" if !all_stale => note = format!("Last observed {}. The server refreshes every 60 seconds.", age(a)),
             "Exhausted" | "Nearly exhausted" => {
                 note = [&a.primary, &a.secondary].into_iter().filter(|w| w.used_percent.is_some_and(|n| n > 80.0)).map(|w| reset(w.resets_at, now)).collect::<Vec<_>>().join(" · ");
-                if a.redeemable(now) { fix = Some(format!("codexctl reset {}", shell(&a.alias))); }
+                if a.redeemable(now) && !has_stale_included {
+                    fix = Some(format!("codexctl reset {}", shell(&a.alias)));
+                }
             }
             _ => {}
         }
@@ -578,7 +589,11 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
         notice = notice,
         notice_hidden = if all_stale { "" } else { "hidden" },
         answer = answer(&snapshot.accounts, best, snapshot.server_time),
-        fallback = fallback("cmd-live"),
+        fallback = fallback(
+            (!snapshot.accounts.iter().any(stale_included)
+                || stale_action_safe(&snapshot.accounts))
+            .then_some("cmd-live"),
+        ),
         attention = attention(&snapshot.accounts, all_stale, snapshot.server_time),
         ledger = ledger(&snapshot.accounts, best, all_stale, snapshot.server_time),
         machines = machines(snapshot)

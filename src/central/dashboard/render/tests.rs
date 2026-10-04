@@ -6,7 +6,9 @@ fn fixture() -> Snapshot {
 
 #[test]
 fn renders_every_account_and_machine_state_with_the_right_action() {
-    let html = overview(&fixture());
+    let mut data = fixture();
+    data.accounts[3].billing_class = crate::api::BillingClass::UsageBased;
+    let html = overview(&data);
     for text in [
         "Use Everyday building",
         "codexctl use studio",
@@ -119,6 +121,9 @@ fn stale_included_account_blocks_reset_advice_for_another_account() {
     let html = overview(&data);
     assert!(html.contains("Cannot confirm headroom"));
     assert!(!html.contains("id=\"cmd-reset-use\""));
+    assert!(!html.contains("codexctl reset sprint"));
+    assert!(!html.contains("id=\"cmd-live-current\""));
+    assert!(!html.contains("id=\"cmd-live\""));
 }
 
 #[test]
