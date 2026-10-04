@@ -2274,6 +2274,32 @@ fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
 }
 
 #[test]
+fn failed_import_billing_probe_keeps_retry_fenced_without_billing() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        503
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+}
+
+#[test]
 fn repeated_account_id_mismatches_do_not_spend_recovery_budget() {
     let server = Server::start();
     assert_eq!(

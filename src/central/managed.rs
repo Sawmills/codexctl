@@ -774,11 +774,10 @@ async fn token(
             owner.retry_started = Some(retry_clock_now());
             // An unknown request completion can still have rotated credentials.
             // Keep the owner fenced until settlement has durably completed.
-            if owner
-                .rpc
-                .as_mut()
-                .is_some_and(|rpc| rpc.completion_pending() && !rpc.process_exited())
-            {
+            let unsettled_healthy_rpc = owner.rpc.as_mut().is_some_and(|rpc| {
+                rpc.completion_pending() && !rpc.retryable_failure() && !rpc.process_exited()
+            });
+            if unsettled_healthy_rpc {
                 owner.available = false;
                 owner.routing_refused = true;
                 owner.refresh_enabled = false;
@@ -903,6 +902,8 @@ async fn token(
         let before = owner.vault.clone();
         let result = async {
             let owner_was_available = owner.available;
+            let billing_probe_requested =
+                request.billing || (retry && owner.retry_requires_billing);
             if retry && owner.retry_requires_billing {
                 request.billing = true;
             }
@@ -923,9 +924,21 @@ async fn token(
             }
             let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
             if settle_required && owner.rpc.is_some() {
-                if owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
-                    owner.rpc = None;
+                let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_failure);
+                if failed_rpc || owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
+                    if let Some(rpc) = owner.rpc.take() {
+                        rpc.terminate().await;
+                    }
                     owner.refresh_enabled = false;
+                    // The failed call may have rotated auth before the protocol
+                    // failure. Read the journal after the bounded child wait so
+                    // the shared store publishes that completed rotation.
+                    if failed_rpc {
+                        owner.snapshot().map_err(|error| {
+                            eprintln!("central owner failed snapshot: {error:#}");
+                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                        })?;
+                    }
                 } else {
                     retain_lease = true;
                     settled_owner_record(&mut owner, &before)
@@ -1012,7 +1025,9 @@ async fn token(
                     owner.retry_failures = 0;
                     owner.retry_started = None;
                     owner.retryable_unavailable = false;
-                    owner.retry_requires_billing = false;
+                    if billing_probe_requested {
+                        owner.retry_requires_billing = false;
+                    }
                     if retry {
                         owner.available = true;
                     }

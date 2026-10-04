@@ -79,6 +79,15 @@ impl Rpc {
 
     pub(super) async fn terminate(mut self) {
         let _ = self.input.take();
+        // A failed protocol read can race with the child finishing its
+        // credential journal write. Give that write a bounded grace period
+        // before forcing termination.
+        if timeout(Duration::from_secs(1), self._child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
         let _ = self._child.start_kill();
         let _ = timeout(Duration::from_secs(5), self._child.wait()).await;
     }

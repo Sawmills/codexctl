@@ -355,6 +355,7 @@ impl Owner {
                         if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
                             && !error.is::<RoutingPolicyError>() =>
                     {
+                        self.retry_requires_billing = true;
                         self.fence(true);
                         eprintln!("central owner refresh failed reason=owner_refresh_failed");
                         return Err(TokenFailure::Retryable(error, true));

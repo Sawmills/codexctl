@@ -669,6 +669,36 @@ impl Fixture {
         central.migrate().await.unwrap();
         self.broker.central = Some(central.clone());
         self.broker.read_only = false;
+        if store_mode != super::super::storage::StoreMode::File {
+            let user = users(&self.broker.state)
+                .unwrap()
+                .into_iter()
+                .find(|user| user.id == "test")
+                .unwrap();
+            central
+                .save_registry_entity_cas(
+                    "users",
+                    &user.id,
+                    &serde_json::to_vec(&user).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let device = vault::devices(&self.broker.state)
+                .unwrap()
+                .into_iter()
+                .find(|device| device.user == "test")
+                .unwrap();
+            central
+                .save_device_entity_cas(
+                    &device.tenant,
+                    &device.id,
+                    &serde_json::to_vec(&device).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         let owner_ref = self.broker.owners.read().await["fixture"].1.clone();
         let mut owner = owner_ref.lock().await;
         owner.vault.revision = 1;
@@ -690,6 +720,7 @@ impl Fixture {
         );
         store::atomic_write(&binary, script.as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        self.broker.binary = binary.clone();
         owner.rpc = Some(Rpc::start(&binary, &owner.home).await.unwrap());
         owner.refresh_enabled = true;
         central
@@ -715,7 +746,11 @@ async fn postgres_retry_recovers_after_marked_billing_failure() {
 
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
     store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
-    store::atomic_write(&fixture._root.path().join("retry-clock"), b"60000").unwrap();
+    fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .retry_started = Some(0);
     assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
