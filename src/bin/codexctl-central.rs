@@ -149,6 +149,17 @@ async fn main() {
 }
 
 async fn execute(cli: Cli) -> anyhow::Result<()> {
+    if matches!(
+        &cli.command,
+        Commands::Setup { .. }
+            | Commands::Init { .. }
+            | Commands::Users { .. }
+            | Commands::Register { .. }
+            | Commands::Revoke { .. }
+            | Commands::Serve { .. }
+    ) {
+        central::storage::require_file_runtime()?;
+    }
     match cli.command {
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {

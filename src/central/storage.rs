@@ -580,6 +580,11 @@ impl PostgresStore {
         let mut config: tokio_postgres::Config = url
             .parse()
             .context("invalid DATABASE_URL for PostgreSQL central storage")?;
+        config.connect_timeout(Duration::from_secs(2));
+        config.options(format!(
+            "{} -c statement_timeout=2000",
+            config.get_options().unwrap_or_default()
+        ));
         let client = if tls_enabled {
             if config.get_ssl_mode() != tokio_postgres::config::SslMode::Require {
                 bail!(
@@ -754,6 +759,16 @@ fn now_secs() -> u64 {
 /// Refuse PostgreSQL modes during server startup until the runtime is wired to
 /// the shared store. File mode remains the default and needs no migration.
 pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
+    require_file_runtime()?;
+    eprintln!(
+        "central storage: file runtime; PostgreSQL schema provisioning only; dual runtime deferred"
+    );
+    Ok(())
+}
+
+/// Runtime and local administration must agree on the authority. Only the
+/// explicit migration command may open a shared store in this phase.
+pub fn require_file_runtime() -> Result<()> {
     match StoreMode::from_env()? {
         StoreMode::File => Ok(()),
         mode => {
@@ -761,7 +776,7 @@ pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
                 "central storage: refusing startup with {mode:?}; phase 1 provisions the PostgreSQL schema only, while runtime storage still uses the file vault; run codexctl-central migrate separately"
             );
             bail!(
-                "central storage mode {mode:?} is not wired into runtime yet; startup supports only file mode"
+                "central storage mode {mode:?} is not wired into runtime yet; startup and administration support only file mode; dual runtime is deferred"
             )
         }
     }
@@ -770,8 +785,12 @@ pub async fn maybe_migrate(_state: &Path, _key: &Path) -> Result<()> {
 /// Apply the configured schema migration. This is intentionally separate from
 /// server startup while the phase 1 runtime still uses file storage.
 pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
-    let store = CentralStore::from_env(state, key).await?;
-    store.migrate().await
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let store = CentralStore::from_env(state, key).await?;
+        store.migrate().await
+    })
+    .await
+    .context("central PostgreSQL schema provisioning timed out")?
 }
 
 #[cfg(test)]

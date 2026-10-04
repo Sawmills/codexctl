@@ -16,6 +16,34 @@ struct Server {
     amir: String,
     alex: String,
 }
+
+#[test]
+fn readiness_reports_file_mode_and_registry_health() {
+    let server = Server::start();
+    let ready = || {
+        server
+            .http
+            .get(format!("{}/ready", server.url))
+            .send()
+            .unwrap()
+    };
+    let response = ready();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<Value>().unwrap(),
+        json!({
+            "ready": true, "storeMode": "file", "databaseReachable": null
+        })
+    );
+    std::fs::write(
+        server.root.path().join("state/users.json"),
+        b"invalid registry",
+    )
+    .unwrap();
+    let response = ready();
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.json::<Value>().unwrap()["ready"], false);
+}
 fn auth(subject: &str, account: &str) -> Value {
     let payload=URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":subject,"iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_plan_type":"pro"}})).unwrap());
     json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic-refresh","account_id":account}})

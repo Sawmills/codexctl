@@ -859,12 +859,18 @@ async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> 
     }
     response
 }
-async fn ready(State(broker): State<Broker>) -> StatusCode {
-    if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
+async fn ready(State(broker): State<Broker>) -> Response {
+    let healthy = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
+    let status = if !healthy {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
-    }
+    };
+    (
+        status,
+        Json(json!({"ready": healthy, "storeMode": "file", "databaseReachable": null})),
+    )
+        .into_response()
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
