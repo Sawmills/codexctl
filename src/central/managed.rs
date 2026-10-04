@@ -712,9 +712,10 @@ async fn token(
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
+    let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
-        let mut owner = owner.lock().await;
+        let mut owner = owner_ref.lock().await;
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         if worker
             .central
@@ -805,6 +806,7 @@ async fn token(
             }
             _ => None,
         };
+        let mut retain_lease = false;
         let result = async {
             let prior_auth = owner.vault.auth.clone();
             let token_result = owner.tokens(request).await;
@@ -814,14 +816,20 @@ async fn token(
                     if error.to_string().contains("timed out")
                         || error.to_string().contains("completion unknown")
             );
-            if settle_required && let Some(rpc) = owner.rpc.as_mut() {
-                let _ = rpc.settle_and_stop().await;
+            if settle_required
+                && let Some(rpc) = owner.rpc.as_mut()
+                && let Err(error) = rpc.settle_and_stop().await
+            {
+                retain_lease = true;
+                owner.available = false;
+                owner.routing_refused = true;
+                owner.refresh_enabled = false;
+                eprintln!("central owner settlement is unknown: {error:#}");
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
-            if owner.vault.auth != prior_auth {
+            let auth_changed = owner.vault.auth != prior_auth;
+            if auth_changed {
                 owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
-                vault::save(&owner.state, &owner.key, &owner.vault).map_err(|_| {
-                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?;
             }
             let record = CredentialRecord {
                 account_id: account_id.clone(),
@@ -871,7 +879,16 @@ async fn token(
                 true
             };
             if !written || renew_lost.load(Ordering::Acquire) {
+                retain_lease = true;
+                owner.available = false;
+                owner.routing_refused = true;
+                owner.refresh_enabled = false;
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            }
+            if auth_changed {
+                vault::save(&owner.state, &owner.key, &owner.vault).map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
             }
             let token = token_result.map_err(|error| worker.owner_failure(error))?;
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
@@ -880,7 +897,54 @@ async fn token(
         if let Some(task) = renew_task {
             task.abort();
         }
-        if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
+        if retain_lease {
+            if let (Some(central), Some(lease)) = (worker.central.clone(), lease.clone()) {
+                let owner_ref = owner_ref.clone();
+                let settled = Arc::new(AtomicBool::new(false));
+                let renew_done = settled.clone();
+                let renew_central = central.clone();
+                let renew_lease = lease.clone();
+                tokio::spawn(async move {
+                    while !renew_done.load(Ordering::Acquire) {
+                        if !renew_central
+                            .renew(&renew_lease, std::time::Duration::from_secs(120))
+                            .await
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    }
+                });
+                tokio::spawn(async move {
+                    loop {
+                        let stopped = {
+                            let mut owner = owner_ref.lock().await;
+                            match owner.rpc.as_mut() {
+                                Some(rpc) => match rpc.settle_and_stop().await {
+                                    Ok(_) => {
+                                        owner.rpc = None;
+                                        owner.refresh_enabled = false;
+                                        true
+                                    }
+                                    Err(error) => {
+                                        eprintln!("central owner settlement retry: {error:#}");
+                                        false
+                                    }
+                                },
+                                None => true,
+                            }
+                        };
+                        if stopped {
+                            settled.store(true, Ordering::Release);
+                            let _ = central.release_lease(&lease).await;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                });
+            }
+        } else if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
             && let Err(error) = central.release_lease(lease).await
         {
             eprintln!("central lease release: {error:#}");
@@ -939,15 +1003,12 @@ pub(super) async fn account_catalog(
         .as_ref()
         .filter(|store| store.mode() != super::storage::StoreMode::File)
     {
-        let records = central
-            .list_accounts()
+        let aliases = central
+            .list_account_aliases(user)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-        for record in records
-            .into_iter()
-            .filter(|record| record.user_id.as_deref() == Some(user))
-        {
-            let _ = broker.resolve_alias(user, &record.alias).await?;
+        for alias in aliases {
+            let _ = broker.resolve_alias(user, &alias).await?;
         }
     }
     let owners: Vec<_> = broker
@@ -1348,6 +1409,9 @@ impl Broker {
             .as_ref()
             .filter(|store| store.mode() != super::storage::StoreMode::File)
         {
+            self.ensure_owner_record(&mut owner)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             Some(
                 central
                     .acquire_lease(

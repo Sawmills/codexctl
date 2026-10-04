@@ -549,6 +549,14 @@ impl CentralStore {
         }
     }
 
+    pub async fn list_account_aliases(&self, user_id: &str) -> Result<Vec<String>> {
+        match self {
+            Self::File(_) => Ok(Vec::new()),
+            Self::Postgres(db) => bounded_db(db.list_account_aliases(user_id)).await,
+            Self::Dual { postgres, .. } => bounded_db(postgres.list_account_aliases(user_id)).await,
+        }
+    }
+
     pub async fn acquire_lease(
         &self,
         account_id: &str,
@@ -1461,6 +1469,17 @@ impl PostgresStore {
             .collect()
     }
 
+    async fn list_account_aliases(&self, user_id: &str) -> Result<Vec<String>> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT alias FROM central_accounts WHERE user_id=$1 AND deleted_at IS NULL ORDER BY alias LIMIT 10000",
+                &[&user_id],
+            )
+            .await?;
+        Ok(rows.into_iter().map(|row| row.get(0)).collect())
+    }
+
     async fn load_account_by_alias(
         &self,
         user_id: &str,
@@ -1520,7 +1539,7 @@ impl PostgresStore {
         if changed == 1 {
             return Ok(true);
         }
-        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
+        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
         Ok(row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
             vault::decrypt_bytes(&self.key, &stored)

@@ -145,9 +145,11 @@ or row counts do not match the reviewed plan.
    kubectl --context plat-staging -n codexctl cp codexctl-0:/data/state ./codexctl-state-backup
    ```
 
-2. **Provision and migrate.** After infra#1513 is merged and applied, wait for
+2. **Provision and migrate.** After infra#1513 is merged and applied, stop the
+   file-mode writer and wait for `codexctl-0` to terminate before attaching its
+   ReadWriteOncePod claim to a migration Job. Then wait for
    `externalsecret/codexctl-postgres` to be Ready. Run the explicit schema
-   migration and backfill from the current PVC using the projected vault key;
+   migration and backfill from the retained PVC using the projected vault key;
    retain the JSON count output as the migration receipt:
 
    Use one-shot migration Jobs with `secretKeyRef` inputs. Do not pass the
@@ -156,6 +158,8 @@ or row counts do not match the reviewed plan.
    a second copy with `backfill` as its command after migration completes:
 
    ```sh
+   kubectl --context plat-staging -n codexctl scale statefulset/codexctl --replicas=0
+   kubectl --context plat-staging -n codexctl wait --for=delete pod/codexctl-0 --timeout=120s
    kubectl --context plat-staging -n codexctl wait --for=condition=Ready \
      externalsecret/codexctl-postgres --timeout=120s
    ```
@@ -235,15 +239,13 @@ or row counts do not match the reviewed plan.
    `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]`.
    Keep both Job logs and the backfill JSON counts as the migration receipt.
 
-3. **Quiesce the file writer and re-backfill.** PostgreSQL mode is the only
-   serving mode; `dual` is migration-only and the server refuses to start in it.
-   Stop the old writer before the final backfill, then run the backfill from a
-   reviewed one-shot migration Job that mounts the retained PVC. Keep the
-   StatefulSet scaled to zero after this point. Do not run two refresh writers:
+3. **Re-backfill after quiescing.** PostgreSQL mode is the only serving mode;
+   `dual` is migration-only and the server refuses to start in it. Run the
+   final backfill from a reviewed one-shot migration Job that mounts the
+   retained PVC. Keep the StatefulSet scaled to zero after this point. Do not
+   run two refresh writers:
 
    ```sh
-   kubectl --context plat-staging -n codexctl scale statefulset/codexctl --replicas=0
-   kubectl --context plat-staging -n codexctl wait --for=delete pod/codexctl-0 --timeout=120s
    kubectl --context plat-staging -n codexctl apply -f - <<'YAML'
    apiVersion: batch/v1
    kind: Job
@@ -295,6 +297,8 @@ or row counts do not match the reviewed plan.
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
    `/ready` database health, one upstream refresh for a simultaneous forced
    request, and no lease or ExternalSecret errors before changing traffic.
+   Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
+   `Service/codexctl-ha` and apply the Ingress change only after validation.
 
 5. **Rollback.** Stop HA refreshes, mark the HA Service endpoints unready, and
    fence their leases by allowing the TTL to expire or explicitly releasing
@@ -302,7 +306,9 @@ or row counts do not match the reviewed plan.
    snapshot, unset PostgreSQL mode, and verify file-mode `/ready`. Because HA
    may have rotated credentials after the snapshot, require an explicit
    relogin for every affected account and verify a successful file-mode token
-   request before routing traffic back. Never run old and HA refresh writers
+   request before routing traffic back. Change the staging `Ingress/codexctl`
+   backend from `Service/codexctl-ha` back to `Service/codexctl` and apply the
+   Ingress change. Never run old and HA refresh writers
    simultaneously; preserve the database and PVC receipts for reconciliation.
 
 ## 6. Test and acceptance plan
