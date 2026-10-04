@@ -186,21 +186,25 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                 central::storage::StoreMode::from_env()?,
                 central::storage::StoreMode::Postgres
             );
-            if postgres_mode && key_file.is_none() {
-                anyhow::bail!("--key-file is required for users in postgres mode");
-            }
+            let central_key = if postgres_mode {
+                Some(key_file.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for users in postgres mode")
+                })?)
+            } else {
+                None
+            };
             if enable || disable {
                 let id = user
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("--user required"))?;
-                if let Some(key_file) = key_file {
-                    central::managed::set_user_central(&state, &key_file, id, enable).await?;
+                if let Some(key_file) = central_key {
+                    central::managed::set_user_central(&state, key_file, id, enable).await?;
                 } else {
                     central::managed::set_user(&state, id, enable)?;
                 }
             } else {
-                let users = if let Some(key_file) = key_file {
-                    central::managed::list_users_central(&state, &key_file).await?
+                let users = if let Some(key_file) = central_key {
+                    central::managed::list_users_central(&state, key_file).await?
                 } else {
                     central::managed::users(&state)?
                 };
@@ -250,13 +254,14 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             key_file,
             device,
         } => {
-            if let Some(key_file) = key_file {
-                central::revoke_central(&state, &key_file, &device).await?
-            } else if matches!(
+            if matches!(
                 central::storage::StoreMode::from_env()?,
                 central::storage::StoreMode::Postgres
             ) {
-                anyhow::bail!("--key-file is required for revoke in postgres mode")
+                let key_file = key_file.ok_or_else(|| {
+                    anyhow::anyhow!("--key-file is required for revoke in postgres mode")
+                })?;
+                central::revoke_central(&state, &key_file, &device).await?
             } else {
                 central::revoke(&state, &device)?
             }

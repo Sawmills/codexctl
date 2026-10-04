@@ -2,7 +2,7 @@ apiVersion: v1
 kind: Service
 metadata:
   namespace: codexctl
-  name: codexctl
+  name: codexctl-ha
   labels:
     app.kubernetes.io/name: codexctl
 spec:

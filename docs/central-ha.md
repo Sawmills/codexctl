@@ -202,7 +202,7 @@ or row counts do not match the reviewed plan.
                - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
                - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
              volumeMounts:
-               - {name: state, mountPath: /data/state}
+               - {name: state, mountPath: /data}
                - {name: keys, mountPath: /keys, readOnly: true}
          volumes:
            - name: state
@@ -235,9 +235,11 @@ or row counts do not match the reviewed plan.
 5. **Rollback.** Stop HA refreshes, mark the HA Service endpoints unready, and
    fence their leases by allowing the TTL to expire or explicitly releasing
    them. Restore the previous single-pod StatefulSet from the retained PVC
-   snapshot, unset PostgreSQL mode, and verify file-mode `/ready` before routing
-   traffic back. Never run old and HA refresh writers simultaneously; preserve
-   the database and PVC receipts for reconciliation.
+   snapshot, unset PostgreSQL mode, and verify file-mode `/ready`. Because HA
+   may have rotated credentials after the snapshot, require an explicit
+   relogin for every affected account and verify a successful file-mode token
+   request before routing traffic back. Never run old and HA refresh writers
+   simultaneously; preserve the database and PVC receipts for reconciliation.
 
 ## 6. Test and acceptance plan
 

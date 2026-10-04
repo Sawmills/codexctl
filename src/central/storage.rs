@@ -527,6 +527,20 @@ impl CentralStore {
         }
     }
 
+    pub async fn load_account_by_alias(
+        &self,
+        user_id: &str,
+        alias: &str,
+    ) -> Result<Option<CredentialRecord>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => bounded_db(db.load_account_by_alias(user_id, alias)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.load_account_by_alias(user_id, alias)).await
+            }
+        }
+    }
+
     pub async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
         match self {
             Self::File(_) => Ok(Vec::new()),
@@ -1020,6 +1034,8 @@ impl PostgresStore {
                     .context("invalid DATABASE_URL for PostgreSQL central storage")?
             };
         config.connect_timeout(DB_TIMEOUT);
+        config.keepalives(true);
+        config.keepalives_idle(Duration::from_secs(10));
         let client = if self.tls_enabled {
             if !self.url.is_empty()
                 && config.get_ssl_mode() != tokio_postgres::config::SslMode::Require
@@ -1062,29 +1078,17 @@ impl PostgresStore {
     }
 
     async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
-        let current = self.client.lock().await.clone();
-        if let Some(client) = current {
-            if tokio::time::timeout(DB_TIMEOUT, client.simple_query("SELECT 1"))
-                .await
-                .is_ok_and(|result| result.is_ok())
-            {
-                return Ok(client);
-            }
-            // Drop a half-open client before reconnecting. Otherwise a failed
-            // reconnect can leave the dead Arc installed and make every later
-            // request probe the same broken connection forever.
-            let mut slot = self.client.lock().await;
-            if slot
-                .as_ref()
-                .is_some_and(|stored| Arc::ptr_eq(stored, &client))
-            {
-                *slot = None;
-            }
+        let mut slot = self.client.lock().await;
+        if let Some(client) = slot.as_ref().filter(|client| !client.is_closed()) {
+            return Ok(client.clone());
         }
-        let client = tokio::time::timeout(DB_TIMEOUT, self.establish())
+        *slot = None;
+        drop(slot);
+        let client = tokio::time::timeout(Duration::from_secs(5), self.establish())
             .await
             .context("central PostgreSQL connect timed out")??;
-        *self.client.lock().await = Some(client.clone());
+        let mut slot = self.client.lock().await;
+        *slot = Some(client.clone());
         Ok(client)
     }
 
@@ -1127,10 +1131,24 @@ impl PostgresStore {
         let serialized = serde_json::to_vec(&record.vault)?;
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
         let client = self.client().await?;
-        client.execute(
-            "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision",
+        let changed = client.execute(
+            "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision AND central_accounts.deleted_at IS NULL",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision],
         ).await?;
+        if changed == 0 {
+            let current = client
+                .query_opt("SELECT encrypted_vault FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&record.account_id])
+                .await?;
+            if current.is_none_or(|row| {
+                let stored: Vec<u8> = row.get(0);
+                vault::decrypt_bytes(&self.key, &stored)
+                    .ok()
+                    .is_some_and(|plain| plain == serialized)
+            }) {
+                return Ok(());
+            }
+            bail!("central account write was fenced or tombstoned");
+        }
         Ok(())
     }
 
@@ -1437,6 +1455,30 @@ impl PostgresStore {
             .collect()
     }
 
+    async fn load_account_by_alias(
+        &self,
+        user_id: &str,
+        alias: &str,
+    ) -> Result<Option<CredentialRecord>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt("SELECT account_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE user_id=$1 AND lower(alias)=lower($2) AND deleted_at IS NULL", &[&user_id, &alias])
+            .await?;
+        row.map(|row| {
+            let encrypted: Vec<u8> = row.get(4);
+            Ok(CredentialRecord {
+                account_id: row.get(0),
+                user_id: Some(user_id.into()),
+                alias: row.get(1),
+                workspace: row.get(2),
+                login: row.get(3),
+                vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
+                revision: row.get(5),
+            })
+        })
+        .transpose()
+    }
+
     async fn acquire_lease(
         &self,
         account_id: &str,
@@ -1466,7 +1508,7 @@ impl PostgresStore {
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
         let client = self.client().await?;
         let changed = client.execute(
-            "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision < $7",
+            "UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() FROM account_refresh_leases WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.account_id=$1 AND account_refresh_leases.holder_id=$8 AND account_refresh_leases.epoch=$9 AND account_refresh_leases.expires_at > now() AND central_accounts.revision < $7",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
@@ -1779,17 +1821,23 @@ mod tests {
         // it attempts another refresh, rather than using its startup snapshot.
         assert_eq!(second.load_account(&id).await.unwrap().unwrap().revision, 3);
         let registry_id = format!("registry-{}", vault::digest(id.as_bytes()));
+        let device = vault::Device {
+            id: registry_id.clone(),
+            tenant: "sawmills".into(),
+            user: "user".into(),
+            token_hash: vault::digest(b"synthetic-device-token"),
+            revoked: true,
+        };
+        let device_bytes = serde_json::to_vec(&device).unwrap();
         first
-            .save_registry_entities(
-                "devices",
-                &[(registry_id.clone(), br#"{"revoked":true}"#.to_vec())],
-            )
+            .save_registry_entities("devices", &[(registry_id.clone(), device_bytes.clone())])
             .await
             .unwrap();
-        assert_eq!(
-            second.load_registry_entities("devices").await.unwrap(),
-            vec![br#"{"revoked":true}"#.to_vec()]
-        );
+        let seen = second
+            .load_registry_entity_revisions("devices")
+            .await
+            .unwrap();
+        assert!(seen.iter().any(|(id, _, _)| id == &registry_id));
         first
             .create_enrollment(&id, b"once", Duration::from_secs(60))
             .await
@@ -1827,6 +1875,10 @@ mod tests {
                     "DELETE FROM central_registry_entries WHERE kind=$1 AND entity_id=$2",
                     &[&"devices", &registry_id],
                 )
+                .await
+                .unwrap();
+            client
+                .execute("DELETE FROM central_devices WHERE id=$1", &[&registry_id])
                 .await
                 .unwrap();
         }

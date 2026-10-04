@@ -417,11 +417,15 @@ impl Broker {
         Ok(())
     }
 
-    async fn persist_owner(&self, owner: &Owner) -> Result<()> {
+    async fn save_owner_record(&self, owner: &Owner) -> Result<()> {
         let Some(central) = self.central.as_ref() else {
             return Ok(());
         };
-        let record = CredentialRecord {
+        central.save_account(&Self::owner_record(owner)?).await
+    }
+
+    fn owner_record(owner: &Owner) -> Result<CredentialRecord> {
+        Ok(CredentialRecord {
             account_id: account_key(&owner.vault.user, &owner.vault.alias),
             user_id: Some(owner.vault.user.clone()),
             alias: owner.vault.alias.clone(),
@@ -431,8 +435,7 @@ impl Broker {
                 .and_then(api::token_subject),
             vault: serde_json::to_value(&owner.vault)?,
             revision: owner.vault.revision.max(1),
-        };
-        central.save_account(&record).await
+        })
     }
 
     async fn ensure_owner_record(&self, owner: &mut Owner) -> Result<()> {
@@ -448,7 +451,7 @@ impl Broker {
             return Ok(());
         }
         owner.vault.revision = owner.vault.revision.max(1);
-        self.persist_owner(owner).await
+        self.save_owner_record(owner).await
     }
 
     pub(super) fn record_failure(
@@ -581,14 +584,9 @@ impl Broker {
                 .filter(|central| central.mode() != super::storage::StoreMode::File)
         {
             let record = central
-                .list_accounts()
+                .load_account_by_alias(user, alias)
                 .await
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
-                .into_iter()
-                .find(|record| {
-                    record.user_id.as_deref() == Some(user)
-                        && record.alias.eq_ignore_ascii_case(alias)
-                });
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             if let Some(record) = record {
                 let account_state = self
                     .state
@@ -612,17 +610,22 @@ impl Broker {
                     })?,
                 ));
                 let key = account_key(user, &record.alias);
-                self.owners.write().await.insert(
-                    key.clone(),
-                    (
-                        AccountIndex {
-                            user: user.to_owned(),
-                            alias: record.alias.trim().to_owned(),
-                        },
-                        owner.clone(),
-                    ),
-                );
-                selected = Some((key, owner));
+                let mut owners = self.owners.write().await;
+                if let Some((_, existing)) = owners.get(&key) {
+                    selected = Some((key, existing.clone()));
+                } else {
+                    owners.insert(
+                        key.clone(),
+                        (
+                            AccountIndex {
+                                user: user.to_owned(),
+                                alias: record.alias.trim().to_owned(),
+                            },
+                            owner.clone(),
+                        ),
+                    );
+                    selected = Some((key, owner));
+                }
             }
         }
         Ok(selected)
@@ -837,9 +840,24 @@ async fn token(
             };
             let written = if let Some(central) = worker.central.as_ref() {
                 if let Some(lease) = lease.as_ref() {
-                    central.fenced_write(lease, &record).await.map_err(|_| {
-                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                    })?
+                    let mut result = None;
+                    for attempt in 0..3 {
+                        match central.fenced_write(lease, &record).await {
+                            Ok(written) => {
+                                result = Some(written);
+                                break;
+                            }
+                            Err(error) if attempt < 2 => {
+                                eprintln!("central fenced write retry: {error:#}");
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                            Err(_error) => {
+                                return Err(worker
+                                    .error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
+                            }
+                        }
+                    }
+                    result.expect("fenced write result")
                 } else {
                     if let Err(error) = central.save_account(&record).await {
                         // The local vault remains authoritative in dual mode for
@@ -916,6 +934,22 @@ pub(super) async fn account_catalog(
     user: &str,
     freshness: catalog::Freshness,
 ) -> Result<Vec<Account>, HttpError> {
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|store| store.mode() != super::storage::StoreMode::File)
+    {
+        let records = central
+            .list_accounts()
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        for record in records
+            .into_iter()
+            .filter(|record| record.user_id.as_deref() == Some(user))
+        {
+            let _ = broker.resolve_alias(user, &record.alias).await?;
+        }
+    }
     let owners: Vec<_> = broker
         .owners
         .read()
@@ -1238,6 +1272,7 @@ impl Broker {
                 saved.auth = input.auth;
                 saved.import_rejected = false;
                 saved.label = input.label;
+                saved.revision = saved.revision.saturating_add(1).max(1);
                 vault::save(&state, &self.key, &saved).map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
@@ -1272,7 +1307,7 @@ impl Broker {
                 label: input.label,
                 verified: false,
                 import_rejected: false,
-                revision: 0,
+                revision: 1,
             };
             vault::save(&state, &self.key, &vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
@@ -1308,6 +1343,26 @@ impl Broker {
         };
         self.owners.write().await.insert(id, (identity, owner));
         let mut owner = guard;
+        let verification_lease = if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|store| store.mode() != super::storage::StoreMode::File)
+        {
+            Some(
+                central
+                    .acquire_lease(
+                        &account_key(&owner.vault.user, &owner.vault.alias),
+                        &self.holder_id,
+                        std::time::Duration::from_secs(120),
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                    })?,
+            )
+        } else {
+            None
+        };
         let verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -1336,9 +1391,31 @@ impl Broker {
             owner.vault.verified = true;
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-            self.persist_owner(&owner)
-                .await
+            owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
+            vault::save(&owner.state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            if let (Some(central), Some(lease)) =
+                (self.central.as_ref(), verification_lease.as_ref())
+            {
+                let written = central
+                    .fenced_write(
+                        lease,
+                        &Self::owner_record(&owner).map_err(|_| {
+                            self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                        })?,
+                    )
+                    .await
+                    .map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+                if !written {
+                    return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+                }
+            } else {
+                self.save_owner_record(&owner).await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+            }
             // Verification and the durable vault precede retirement. A crash or
             // retirement failure leaves reservations for an explicit migration retry.
             relogin::retire_reservations(&self.state.join("accounts"), &owner.vault.auth, &state)
@@ -1346,6 +1423,9 @@ impl Broker {
             Ok(account_summary(&owner))
         }
         .await;
+        if let (Some(central), Some(lease)) = (self.central.as_ref(), verification_lease.as_ref()) {
+            let _ = central.release_lease(lease).await;
+        }
         if verification.is_err() {
             owner.available = false;
         }
@@ -1852,46 +1932,42 @@ pub async fn serve(
     }
     drop(startup_import);
     let registry = if let Some(central) = central.as_ref() {
-        let mut users = central_registry_users(central).await?;
-        let mut devices = central_registry_devices(central).await?;
         // Convert the phase-two array snapshot to entity rows once.  After
         // this point authorization and mutations use only per-entity rows;
         // no pod can replace the shared registry with its local array.
-        if central
+        let existing_users = central
             .load_registry_entity_revisions("users")
             .await?
-            .is_empty()
-        {
-            if users.is_empty() {
-                users = self::users(state)?;
-            }
-            for user in &users {
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for user in self::users(state).unwrap_or_default() {
+            if !existing_users.contains(&user.id) {
                 central
-                    .save_registry_entity_cas("users", &user.id, &serde_json::to_vec(user)?, None)
+                    .save_registry_entity_cas("users", &user.id, &serde_json::to_vec(&user)?, None)
                     .await?;
             }
-            users = central_registry_users(central).await?;
         }
-        if central
+        let existing_devices = central
             .load_registry_entity_revisions("devices")
             .await?
-            .is_empty()
-        {
-            if devices.is_empty() {
-                devices = vault::devices(state)?;
-            }
-            for device in &devices {
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for device in vault::devices(state).unwrap_or_default() {
+            if !existing_devices.contains(&device.id) {
                 central
                     .save_registry_entity_cas(
                         "devices",
                         &device.id,
-                        &serde_json::to_vec(device)?,
+                        &serde_json::to_vec(&device)?,
                         None,
                     )
                     .await?;
             }
-            devices = central_registry_devices(central).await?;
         }
+        let users = central_registry_users(central).await?;
+        let devices = central_registry_devices(central).await?;
         Some(Arc::new(std::sync::RwLock::new(RegistryState {
             users,
             devices,

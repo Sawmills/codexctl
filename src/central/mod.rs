@@ -68,13 +68,20 @@ pub async fn register_central(
         token_hash: vault::digest(token.as_bytes()),
         revoked: false,
     };
-    if !central
+    let saved = central
         .save_registry_entity_cas("devices", id, &serde_json::to_vec(&device)?, None)
-        .await?
-    {
-        bail!("device was registered concurrently; retry");
+        .await;
+    match saved {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(token_file);
+            bail!("device was registered concurrently; retry")
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(token_file);
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 use crate::store;
