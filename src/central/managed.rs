@@ -751,7 +751,9 @@ async fn token(
         let _permit = permit;
         let retry_requested = {
             let guard = owner_ref.lock().await;
-            guard.retryable_unavailable && !guard.retry_cooldown_active()
+            guard.retryable_unavailable
+                && !guard.retry_cooldown_active()
+                && !guard.routing_refused
         };
         // Shared-store paths take imports before Owner. File mode keeps this
         // lock off the token path and remains a local, zero-central-cost path.
@@ -766,7 +768,7 @@ async fn token(
             None
         };
         let mut owner = owner_ref.lock().await;
-        let retry = retry_requested && owner.retryable_unavailable;
+        let retry = retry_requested && owner.retryable_unavailable && !owner.routing_refused;
         if retry {
             let imports = import_guard.as_ref().ok_or_else(|| {
                 worker.error(StatusCode::INTERNAL_SERVER_ERROR, "owner_recovery")
@@ -827,7 +829,6 @@ async fn token(
             owner.available = true;
             owner.retryable_unavailable = false;
             owner.retry_started = None;
-            owner.retry_failures = 0;
         }
         // A retry cannot take over recovery, even after the child stops: the
         // final credentials may still be waiting for a durable shared write.
@@ -1024,10 +1025,10 @@ async fn token(
             retain_lease = false;
             let token = match token_result {
                 Ok(token) => {
+                    owner.retry_failures = 0;
+                    owner.retry_started = None;
+                    owner.retryable_unavailable = false;
                     if retry {
-                        owner.retry_failures = 0;
-                        owner.retry_started = None;
-                        owner.retryable_unavailable = false;
                         owner.available = true;
                     }
                     token

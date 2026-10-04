@@ -27,6 +27,15 @@ impl std::fmt::Display for AppServerError {
 }
 impl std::error::Error for AppServerError {}
 
+#[derive(Debug)]
+pub(super) struct RetryableUsageRead;
+impl std::fmt::Display for RetryableUsageRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("app-server usage read rejected with an explicit retry marker")
+    }
+}
+impl std::error::Error for RetryableUsageRead {}
+
 pub(super) trait RequestHandler {
     fn keep_notifications(&self) -> bool {
         true
@@ -348,6 +357,13 @@ impl Rpc {
                             )
                         {
                             return Err(RoutingPolicyError.into());
+                        }
+                        if method == "account/rateLimits/read"
+                            && response.pointer("/error/code").and_then(Value::as_i64)
+                                == Some(-32000)
+                            && response.pointer("/error/data/retryable") == Some(&json!(true))
+                        {
+                            return Err(RetryableUsageRead.into());
                         }
                         return Err(AppServerError.into());
                     }

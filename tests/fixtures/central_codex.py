@@ -161,6 +161,9 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
+        if mode == "billing-error-marked":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
+            continue
         if mode == "rpc-unhealthy":
             print("{invalid", flush=True)
             sys.exit(1)

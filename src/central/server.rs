@@ -88,6 +88,8 @@ pub(super) enum TokenFailure {
 }
 
 pub(super) fn retry_clock_now() -> u64 {
+    // Integration tests run the debug binary; release builds cannot read this hook.
+    #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var("CENTRAL_TEST_RETRY_CLOCK")
         && let Ok(value) = std::fs::read_to_string(path)
         && let Ok(milliseconds) = value.trim().parse()
@@ -139,7 +141,6 @@ impl Owner {
         self.retryable_unavailable = retryable;
         if !retryable {
             self.retry_started = None;
-            self.retry_failures = 0;
         }
     }
 }
@@ -333,7 +334,11 @@ impl Owner {
                 }
                 if result.is_err() {
                     if snapshot.is_ok() {
-                        self.fence(false);
+                        self.fence(
+                            result
+                                .as_ref()
+                                .is_err_and(|error| error.is::<super::rpc::RetryableUsageRead>()),
+                        );
                     }
                     eprintln!("central owner refresh failed reason=owner_refresh_failed");
                 }

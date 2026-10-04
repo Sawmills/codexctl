@@ -2222,7 +2222,7 @@ fn retryable_billing_failure_replaces_rpc_and_keeps_catalog_selectable() {
             .status(),
         200
     );
-    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
     let response = server.token(&server.amir, "personal", None);
     assert_eq!(response.status(), 503);
     assert_eq!(
@@ -2346,6 +2346,9 @@ fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     assert_eq!(launches(), 3);
     store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 4);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"180000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     assert_eq!(launches(), 4);
     assert_eq!(server.accounts(&server.amir)[0]["available"], false);
