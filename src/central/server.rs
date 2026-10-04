@@ -321,7 +321,7 @@ impl Owner {
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
         if let Err(error) = result {
-            if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+            if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                 && !error.is::<RoutingPolicyError>()
             {
                 return Err(TokenFailure::Retryable(error, false));
@@ -362,7 +362,7 @@ impl Owner {
                 let limits = match result {
                     Ok(limits) => limits,
                     Err(error)
-                        if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+                        if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                             && !error.is::<RoutingPolicyError>() =>
                     {
                         self.retry_requires_billing = true;
@@ -409,7 +409,7 @@ impl Owner {
             let account = match result {
                 Ok(account) => account,
                 Err(error)
-                    if self.rpc.as_ref().is_some_and(Rpc::retryable_failure)
+                    if self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                         && !error.is::<RoutingPolicyError>() =>
                 {
                     return Err(TokenFailure::Retryable(error, false));

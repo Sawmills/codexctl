@@ -751,6 +751,16 @@ async fn token(
             guard
                 .validate_account_id(request.account_id.as_deref())
                 .map_err(|failure| worker.owner_failure(failure))?;
+            if !guard.vault.verified {
+                // An interrupted import owns a reservation, but it has not
+                // completed verification. Never let a retryable billing or
+                // transport error turn that reservation into a token source.
+                guard.available = false;
+                guard.retryable_unavailable = false;
+                guard.retry_started = None;
+                guard.retry_failures = 0;
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            }
             guard.retryable_unavailable && !guard.retry_cooldown_active() && !guard.routing_refused
         };
         // Shared-store paths take imports before Owner. File mode keeps this
@@ -775,7 +785,7 @@ async fn token(
             // An unknown request completion can still have rotated credentials.
             // Keep the owner fenced until settlement has durably completed.
             let unsettled_healthy_rpc = owner.rpc.as_mut().is_some_and(|rpc| {
-                rpc.completion_pending() && !rpc.retryable_failure() && !rpc.process_exited()
+                rpc.completion_pending() && !rpc.retryable_or_timed_out() && !rpc.process_exited()
             });
             if unsettled_healthy_rpc {
                 owner.available = false;
@@ -924,10 +934,24 @@ async fn token(
             }
             let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
             if settle_required && owner.rpc.is_some() {
-                let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_failure);
-                if failed_rpc || owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
-                    if let Some(rpc) = owner.rpc.take() {
-                        rpc.terminate().await;
+                let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out);
+                let process_exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
+                if failed_rpc || process_exited {
+                    if let Some(mut rpc) = owner.rpc.take() {
+                        if rpc.timed_out() && !process_exited {
+                            // A timeout leaves an OpenAI refresh in flight. Let
+                            // the normal settlement deadline drain it before
+                            // closing the child, so a rotated refresh token is
+                            // captured in the journal.
+                            rpc.settle_and_stop().await.map_err(|error| {
+                                eprintln!("central owner timeout settlement: {error:#}");
+                                worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                            })?;
+                            rpc.mark_retryable();
+                        } else {
+                            // Protocol/EOF failures have no response to settle.
+                            rpc.terminate().await;
+                        }
                     }
                     owner.refresh_enabled = false;
                     // The failed call may have rotated auth before the protocol
@@ -1588,6 +1612,7 @@ impl Broker {
         } else {
             None
         };
+        let verification_required = !owner.vault.verified;
         let verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -1654,6 +1679,18 @@ impl Broker {
         }
         if verification.is_err() {
             owner.available = false;
+            if verification_required {
+                // A failed import remains reserved for its original alias. It
+                // must complete verification through import retry before token
+                // recovery can become eligible.
+                owner.vault.verified = false;
+                vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                owner.retryable_unavailable = false;
+                owner.retry_started = None;
+                owner.retry_failures = 0;
+            }
         }
         verification
     }

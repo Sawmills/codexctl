@@ -2295,8 +2295,9 @@ fn failed_import_billing_probe_keeps_retry_fenced_without_billing() {
         server
             .token_without_billing(&server.amir, "personal")
             .status(),
-        200
+        503
     );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
 }
 
 #[test]

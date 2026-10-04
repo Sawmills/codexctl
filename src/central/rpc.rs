@@ -61,6 +61,7 @@ pub struct Rpc {
     next_id: u64,
     healthy: bool,
     retryable_failure: bool,
+    timed_out: bool,
     outstanding: Option<(u64, bool)>,
     verified_login: bool,
     rejected_login: bool,
@@ -94,6 +95,18 @@ impl Rpc {
 
     pub(super) fn retryable_failure(&self) -> bool {
         self.retryable_failure
+    }
+
+    pub(super) fn retryable_or_timed_out(&self) -> bool {
+        self.retryable_failure() || self.timed_out
+    }
+
+    pub(super) fn mark_retryable(&mut self) {
+        self.retryable_failure = true;
+    }
+
+    pub(super) fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     pub async fn start(binary: &Path, home: &Path) -> Result<Self> {
@@ -171,6 +184,7 @@ impl Rpc {
             next_id: 0,
             healthy: true,
             retryable_failure: false,
+            timed_out: false,
             outstanding: None,
             verified_login: false,
             rejected_login: false,
@@ -420,7 +434,7 @@ impl Rpc {
             }
             Err(_) => {
                 self.healthy = false;
-                self.retryable_failure = true;
+                self.timed_out = true;
                 bail!("app-server request timed out; completion is unknown");
             }
         }
@@ -468,12 +482,17 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert!(!rpc.retryable_failure());
+        assert!(rpc.timed_out());
         assert!(rpc._child.try_wait().unwrap().is_none());
         rpc.shutdown().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("count")).unwrap(),
             "1"
         );
+        let auth: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "synthetic-rotated-refresh");
     }
     #[tokio::test]
     async fn when_a_client_child_starts_then_it_stays_in_the_terminal_process_group() {
