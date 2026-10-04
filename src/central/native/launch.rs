@@ -103,7 +103,10 @@ impl Drop for LaunchSignals {
 
 pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()> {
     if token.statusline_usage.as_ref().is_some_and(|usage| {
-        [usage.five_hour_used_percent, usage.weekly_used_percent]
+        !matches!(
+            (usage.allowed, usage.limit_reached),
+            (Some(true), Some(false))
+        ) && [usage.five_hour_used_percent, usage.weekly_used_percent]
             .into_iter()
             .flatten()
             .any(|used| used >= 100.0)
