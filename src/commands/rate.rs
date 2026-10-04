@@ -246,7 +246,10 @@ fn collect_report(
             && let Some(pid) = process.as_deref().and_then(process_pid)
             && live_by_pid
                 .get(&pid)
-                .is_some_and(|process| timestamp >= process.started_at)
+                // A log timestamp equal to the process start second is
+                // ambiguous: the PID may have belonged to an older process
+                // earlier in that same second. Require a strictly later row.
+                .is_some_and(|process| timestamp > process.started_at)
         {
             log_owners.insert(pid, observed);
         }
@@ -443,5 +446,35 @@ mod tests {
             );
             rows.reverse();
         }
+    }
+
+    #[test]
+    fn log_ownership_rejects_the_process_start_second_boundary() {
+        let account = weekly_account();
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE logs (ts INTEGER, process_uuid TEXT, feedback_log_body TEXT)",
+        )
+        .unwrap();
+        let boundary = Utc::now().timestamp();
+        db.execute(
+            "INSERT INTO logs VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                boundary,
+                "pid:301:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                r#"/codex/responses status=200 headers={"x-codex-primary-reset-at": "4102444800"}"#,
+            ],
+        )
+        .unwrap();
+        let live = [ownership::LiveProcess {
+            pid: 301,
+            started_at: boundary,
+            account: None,
+        }];
+        let report = collect_report(Some(&db), &[account], 10, &live).unwrap();
+        assert_eq!(
+            serde_json::to_value(&report.accounts[0].owned_pids).unwrap(),
+            json!([])
+        );
     }
 }

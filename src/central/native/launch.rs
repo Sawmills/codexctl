@@ -359,40 +359,6 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn token(allowed: Option<bool>, limit_reached: Option<bool>) -> TokenResponse {
-        TokenResponse {
-            user_id: None,
-            access_token: "token".into(),
-            chatgpt_account_id: "account".into(),
-            chatgpt_plan_type: Some("promax".into()),
-            revision: "revision".into(),
-            billing_class: Some(api::BillingClass::RateLimited),
-            native_routing_supported: true,
-            statusline_usage: Some(crate::statusline::Usage {
-                age_seconds: 0,
-                weekly_used_percent: Some(100.0),
-                weekly_resets_at: None,
-                five_hour_used_percent: None,
-                five_hour_resets_at: None,
-                allowed,
-                limit_reached,
-            }),
-            label: None,
-        }
-    }
-
-    #[test]
-    fn headroom_requires_positive_admission_flags_at_one_hundred_percent() {
-        assert!(require_headroom("premium", &token(Some(true), Some(false))).is_ok());
-        assert!(require_headroom("premium", &token(None, None)).is_err());
-        assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
-    }
-}
-
 /// Live launcher PIDs and aliases, for read-only process ownership reporting.
 /// The lock and process incarnation jointly reject stale directories and PID reuse.
 pub fn launch_owners() -> Result<std::collections::BTreeMap<u32, String>> {
@@ -442,4 +408,38 @@ pub fn launch_owners() -> Result<std::collections::BTreeMap<u32, String>> {
         }
     }
     Ok(owners)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(allowed: Option<bool>, limit_reached: Option<bool>) -> TokenResponse {
+        TokenResponse {
+            user_id: None,
+            access_token: "token".into(),
+            chatgpt_account_id: "account".into(),
+            chatgpt_plan_type: Some("promax".into()),
+            revision: "revision".into(),
+            billing_class: Some(api::BillingClass::RateLimited),
+            native_routing_supported: true,
+            statusline_usage: Some(crate::statusline::Usage {
+                age_seconds: 0,
+                weekly_used_percent: Some(100.0),
+                weekly_resets_at: None,
+                five_hour_used_percent: None,
+                five_hour_resets_at: None,
+                allowed,
+                limit_reached,
+            }),
+            label: None,
+        }
+    }
+
+    #[test]
+    fn headroom_requires_positive_admission_flags_at_one_hundred_percent() {
+        assert!(require_headroom("premium", &token(Some(true), Some(false))).is_ok());
+        assert!(require_headroom("premium", &token(None, None)).is_err());
+        assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
+    }
 }

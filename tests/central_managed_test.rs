@@ -8045,6 +8045,9 @@ fn b21d_log_ownership_requires_a_live_process_and_evidence_from_its_lifetime() {
     };
     // Reused PID in historical traffic is not current ownership.
     assert_eq!(read()["accounts"][0]["owned_pids"], json!([]));
+    // Keep the live row strictly after the process start second. A row in the
+    // same second is intentionally ambiguous under the PID reuse guard.
+    std::thread::sleep(Duration::from_secs(2));
     db.execute(
         "INSERT INTO logs VALUES (?1, ?2, ?3)",
         rusqlite::params![chrono::Utc::now().timestamp(), process, header],
