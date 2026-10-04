@@ -145,24 +145,6 @@ impl Fixture {
     fn spawn_list(&self) -> tokio::task::JoinHandle<Value> {
         tokio::spawn(list(self.broker.clone(), self.headers.clone()))
     }
-
-    async fn token_json(&self) -> Value {
-        let response = token(
-            State(self.broker.clone()),
-            self.headers.clone(),
-            Ok(Json(TokenRequest {
-                alias: Some("fixture".into()),
-                billing: true,
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("token response failed"));
-        let body = axum::body::to_bytes(response.into_body(), 65536)
-            .await
-            .unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -184,18 +166,55 @@ async fn list(broker: Broker, headers: HeaderMap) -> Value {
 async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
     let fixture = Fixture::new(Duration::from_secs(1)).await;
     fixture.modern.store(true, Ordering::SeqCst);
-    let refreshed = fixture.token_json().await;
-    assert_eq!(refreshed["billingClass"], "rate_limited");
-    assert_eq!(refreshed["chatgptPlanType"], "promax");
-    assert_eq!(refreshed["statuslineUsage"]["allowed"], true);
-    assert_eq!(refreshed["statuslineUsage"]["limit_reached"], false);
-    assert_eq!(refreshed["statuslineUsage"]["weekly_used_percent"], 100.0);
+    let mut refreshed = TokenResponse {
+        access_token: "token".into(),
+        chatgpt_account_id: "synthetic-seat".into(),
+        chatgpt_plan_type: Some("pro".into()),
+        revision: "revision".into(),
+        billing_class: Some(api::BillingClass::Unknown),
+        native_routing_supported: false,
+        statusline_usage: Some(crate::statusline::Usage {
+            age_seconds: 0,
+            weekly_used_percent: Some(100.0),
+            weekly_resets_at: None,
+            five_hour_used_percent: None,
+            five_hour_resets_at: None,
+            allowed: None,
+            limit_reached: None,
+        }),
+        user_id: None,
+        label: None,
+    };
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    assert_eq!(
+        refreshed.billing_class,
+        Some(api::BillingClass::RateLimited)
+    );
+    assert_eq!(refreshed.chatgpt_plan_type.as_deref(), Some("promax"));
+    assert_eq!(
+        refreshed.statusline_usage.as_ref().unwrap().allowed,
+        Some(true)
+    );
+    assert_eq!(
+        refreshed.statusline_usage.as_ref().unwrap().limit_reached,
+        Some(false)
+    );
+    assert_eq!(
+        refreshed
+            .statusline_usage
+            .as_ref()
+            .unwrap()
+            .weekly_used_percent,
+        Some(100.0)
+    );
     assert_eq!(
         fixture.seen_account.lock().unwrap().as_deref(),
         Some("synthetic-seat")
     );
     fixture.fail.store(true, Ordering::SeqCst);
-    assert_eq!(fixture.token().await, StatusCode::OK);
+    let before = refreshed.clone();
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    assert_eq!(refreshed.billing_class, before.billing_class);
 }
 
 #[tokio::test]

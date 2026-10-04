@@ -380,11 +380,10 @@ async fn token(
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
 async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
-    if token
-        .statusline_usage
-        .as_ref()
-        .is_some_and(|usage| usage.allowed.is_some() && usage.limit_reached.is_some())
-    {
+    let Some(usage) = token.statusline_usage.as_ref() else {
+        return;
+    };
+    if usage.allowed.is_some() && usage.limit_reached.is_some() {
         return;
     }
     let authoritative = match broker
