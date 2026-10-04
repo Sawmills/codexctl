@@ -25,6 +25,8 @@ pub(in crate::central) fn promote(
         limits: None,
         limits_observed: None,
         verification_input: None,
+        #[cfg(test)]
+        retry_clock: None,
     };
     identity.validate_owned_auth(auth)?;
     saved = identity.vault;
@@ -307,6 +309,8 @@ fn finish_verified(state: &Path, key: &Path, record: &mut Record) -> Result<bool
         limits: None,
         limits_observed: None,
         verification_input: None,
+        #[cfg(test)]
+        retry_clock: None,
     };
     baseline.validate_owned_auth(&verified)?;
     retire_reservations(

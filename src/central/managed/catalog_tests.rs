@@ -701,6 +701,7 @@ impl Fixture {
         }
         let owner_ref = self.broker.owners.read().await["fixture"].1.clone();
         let mut owner = owner_ref.lock().await;
+        owner.retry_clock = Some(Arc::new(|| 60_000));
         owner.vault.revision = 1;
         vault::save(&owner.state, &owner.key, &owner.vault).unwrap();
         central

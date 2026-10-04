@@ -127,12 +127,22 @@ pub(super) struct Owner {
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
+    #[cfg(test)]
+    pub(super) retry_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
 
 impl Owner {
+    pub(super) fn retry_clock_now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = self.retry_clock.as_ref() {
+            return clock();
+        }
+        retry_clock_now()
+    }
+
     pub(super) fn retry_cooldown_active(&self) -> bool {
         self.retry_started
-            .is_some_and(|started| retry_clock_now().saturating_sub(started) < 60_000)
+            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < 60_000)
     }
     pub(super) fn selectable(&self) -> bool {
         (self.available || (self.retryable_unavailable && !self.retry_cooldown_active()))
@@ -698,6 +708,8 @@ pub async fn serve(
         limits: None,
         limits_observed: None,
         verification_input: None,
+        #[cfg(test)]
+        retry_clock: None,
     };
     if !read_only {
         let migration_lock = Mutex::new(());

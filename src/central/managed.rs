@@ -2,7 +2,7 @@
 use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
-    server::{Owner, TokenFailure, TokenRequest, TokenResponse, retry_clock_now},
+    server::{Owner, TokenFailure, TokenRequest, TokenResponse},
     storage::{CentralStore, CredentialRecord},
     transport,
     vault::{self, Vault},
@@ -771,7 +771,7 @@ async fn token(
             if owner.retry_cooldown_active() {
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
-            owner.retry_started = Some(retry_clock_now());
+            owner.retry_started = Some(owner.retry_clock_now());
             // An unknown request completion can still have rotated credentials.
             // Keep the owner fenced until settlement has durably completed.
             let unsettled_healthy_rpc = owner.rpc.as_mut().is_some_and(|rpc| {
@@ -842,7 +842,7 @@ async fn token(
                     if owner.retry_failures >= 3 {
                         owner.fence(false);
                     } else {
-                        owner.retry_started = Some(retry_clock_now());
+                        owner.retry_started = Some(owner.retry_clock_now());
                     }
                 }
                 if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
@@ -915,7 +915,7 @@ async fn token(
                 owner.fence(true);
                 if retry {
                     owner.retry_failures = owner.retry_failures.saturating_add(1);
-                    owner.retry_started = Some(retry_clock_now());
+                    owner.retry_started = Some(owner.retry_clock_now());
                     retry_failure_recorded = true;
                     if owner.retry_failures >= 3 {
                         owner.fence(false);
@@ -1039,7 +1039,7 @@ async fn token(
                         if owner.retry_failures >= 3 {
                             owner.fence(false);
                         } else {
-                            owner.retry_started = Some(retry_clock_now());
+                            owner.retry_started = Some(owner.retry_clock_now());
                         }
                     }
                     return Err(worker.owner_failure(error));
@@ -1912,6 +1912,8 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         limits: None,
         limits_observed: None,
         verification_input: None,
+        #[cfg(test)]
+        retry_clock: None,
     };
     // Reconcile the latest disk credentials before any new refresh or reseeding.
     owner.snapshot()?;
@@ -2096,6 +2098,8 @@ pub async fn serve(
                     limits: None,
                     limits_observed: None,
                     verification_input: None,
+                    #[cfg(test)]
+                    retry_clock: None,
                 }
             }
         };
