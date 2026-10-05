@@ -148,7 +148,7 @@ spec:
                   },
               }
             - name: CODEXCTL_CENTRAL_DB_CA_FILE
-              value: /etc/ssl/certs/ca-certificates.crt
+              value: /etc/codexctl/rds-ca/global-bundle.pem
           ports: [{ name: http, containerPort: 8787 }]
           readinessProbe:
             {
@@ -181,10 +181,13 @@ spec:
           volumeMounts:
             - { name: keys, mountPath: /keys, readOnly: true }
             - { name: configuration, mountPath: /configuration, readOnly: true }
+            - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
             - { name: state, mountPath: /data }
             - { name: home, mountPath: /home/codexctl }
             - { name: temporary, mountPath: /tmp }
       volumes:
+        - name: rds-ca
+          configMap: { name: codexctl-rds-ca }
         - name: projected
           secret: { secretName: codexctl-secrets, defaultMode: 288 }
         - name: keys

@@ -29,7 +29,12 @@ service. Keep those workflows on the single file-mode writer until phase 4
 adds shared TTL/one-time-consume and operation-record tables.
 
 TLS is required by default. `DATABASE_URL` must include `sslmode=require`; set
-`CODEXCTL_CENTRAL_DB_CA_FILE` to the mounted RDS CA bundle or system CA bundle.
+`CODEXCTL_CENTRAL_DB_CA_FILE` to `/etc/codexctl/rds-ca/global-bundle.pem`.
+Both staging overlays include the `codexctl-rds-ca` ConfigMap generated from the
+[official AWS RDS global CA bundle](../deploy/k8s/rds-ca/README.md).
+The HA broker and migration/backfill Jobs mount it read-only. Certificate and
+hostname verification stay enabled; the image system bundle lacks the RDS root.
+Confirm the ConfigMap has reconciled before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
 
@@ -236,6 +241,8 @@ or row counts do not match the reviewed plan.
                capabilities: { drop: [ALL] }
              env:
                - { name: CODEXCTL_CENTRAL_STORE, value: postgres }
+               - name: CODEXCTL_CENTRAL_DB_CA_FILE
+                 value: /etc/codexctl/rds-ca/global-bundle.pem
                - {
                    name: DB_HOST,
                    valueFrom:
@@ -274,9 +281,16 @@ or row counts do not match the reviewed plan.
                      },
                  }
              volumeMounts:
+               - {
+                   name: rds-ca,
+                   mountPath: /etc/codexctl/rds-ca,
+                   readOnly: true,
+                 }
                - { name: state, mountPath: /data }
                - { name: keys, mountPath: /keys, readOnly: true }
          volumes:
+           - name: rds-ca
+             configMap: { name: codexctl-rds-ca }
            - name: state
              persistentVolumeClaim: { claimName: state-codexctl-0 }
            - name: projected
@@ -342,15 +356,19 @@ or row counts do not match the reviewed plan.
                capabilities: { drop: [ALL] }
              env:
                - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
+               - {name: CODEXCTL_CENTRAL_DB_CA_FILE, value: /etc/codexctl/rds-ca/global-bundle.pem}
                - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
                - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
                - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
                - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
                - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
              volumeMounts:
+               - {name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true}
                - {name: state, mountPath: /data}
                - {name: keys, mountPath: /keys, readOnly: true}
          volumes:
+           - name: rds-ca
+             configMap: { name: codexctl-rds-ca }
            - name: state
              persistentVolumeClaim: {claimName: state-codexctl-0}
            - name: projected
