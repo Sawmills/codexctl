@@ -189,6 +189,90 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     assert!(permits.try_acquire().is_ok());
 }
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for rejection in ["deleted_at = now()", "revision = revision + 1"] {
+        for stopping in [false, true] {
+            let fixture = Fixture::new(Duration::from_secs(1)).await;
+            let initial = CentralStore::from_mode(
+                StoreMode::Postgres,
+                &fixture.broker.state,
+                &fixture.broker.key,
+            )
+            .await
+            .unwrap();
+            let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+            central.migrate().await.unwrap();
+            let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+            let (before, record) = {
+                let owner = owner_ref.lock().await;
+                (owner.vault.clone(), Broker::owner_record(&owner).unwrap())
+            };
+            central.save_account(&record).await.unwrap();
+            let lease = central
+                .acquire_lease(&record.account_id, "settling", Duration::from_secs(120))
+                .await
+                .unwrap();
+            control
+                .batch_execute(&format!("UPDATE {schema}.central_accounts SET {rejection}"))
+                .await
+                .unwrap();
+            let work = Arc::new(Semaphore::new(1));
+            let permit = work.clone().acquire_owned().await.unwrap();
+            let renew_done = Arc::new(AtomicBool::new(false));
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                settle_background_recovery(
+                    owner_ref.clone(),
+                    Some(central.clone()),
+                    Some(lease.clone()),
+                    before,
+                    true,
+                    0,
+                    permit,
+                    renew_done.clone(),
+                    None,
+                    Arc::new(AtomicBool::new(stopping)),
+                ),
+            )
+            .await
+            .expect("definitive rejection must finish settlement, including shutdown");
+            assert!(
+                !owner_ref.lock().await.available,
+                "rejected owner must stay fenced"
+            );
+            assert!(renew_done.load(Ordering::Acquire));
+            assert_eq!(work.available_permits(), 1, "shutdown work must drain");
+            assert!(
+                !central
+                    .renew(&lease, Duration::from_secs(120))
+                    .await
+                    .unwrap(),
+                "rejected lease must be released"
+            );
+            let successor = central
+                .acquire_lease(&record.account_id, "successor", Duration::from_secs(120))
+                .await
+                .unwrap();
+            central.release_lease(&successor).await.unwrap();
+            control
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
     let response = accounts(State(broker), headers)
         .await

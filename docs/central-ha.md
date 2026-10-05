@@ -20,7 +20,10 @@ launching refresh children. A token request takes and renews the database lease
 before initialization, records initialization-time rotations, and stops the child
 before releasing the lease. Failed initialization retains the lease until the
 child stops and its journal is persisted. Background recovery uses the same
-stop-and-persist rule. File-mode startup keeps its existing refresh owners.
+stop-and-persist rule. A definitive database rejection, such as a tombstone or
+newer credential, fences the owner and releases the lease and shutdown permit.
+Transient database errors retain the journal and retry, including during shutdown.
+File-mode startup keeps its existing refresh owners.
 
 If a child never settles or its journal stays unreadable, the broker retains the
 lease and fences that account. Graceful shutdown waits for this work. It can
@@ -43,7 +46,11 @@ The phase-3 PostgreSQL server fails closed for enrollment, reset listing and red
 and relogin endpoints. Their browser sessions, reset journals, and operation
 records remain file-backed, so they are not safe behind a multi-replica
 service. Keep those workflows on the single file-mode writer until phase 4
-adds shared TTL/one-time-consume and operation-record tables.
+adds shared TTL/one-time-consume and operation-record tables. Shared-store startup
+also fences retained relogin operations that still need replacement verification
+(`Promoted` or unfinished `Retiring`). Complete those operations on the file-mode
+writer before migration; shared mode does not verify them through ordinary token
+requests.
 
 TLS is required by default. `DATABASE_URL` must include `sslmode=require`; set
 `CODEXCTL_CENTRAL_DB_CA_FILE` to `/etc/codexctl/rds-ca/global-bundle.pem`.

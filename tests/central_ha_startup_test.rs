@@ -239,21 +239,25 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         })
         .await
         .expect("leased initialize did not start");
-        let waiting_http = http.clone();
-        let waiting_url = pods[0].url.clone();
-        let waiting_token = token.clone();
-        let same_account = tokio::spawn(async move {
-            waiting_http
-                .post(format!("{waiting_url}/v1/token"))
-                .bearer_auth(waiting_token)
-                .json(&json!({"alias":"seat","billing":true}))
-                .send()
-                .await
-                .unwrap()
-        });
+        let same_account: Vec<_> = (0..2)
+            .map(|_| {
+                let waiting_http = http.clone();
+                let waiting_url = pods[0].url.clone();
+                let waiting_token = token.clone();
+                tokio::spawn(async move {
+                    waiting_http
+                        .post(format!("{waiting_url}/v1/token"))
+                        .bearer_auth(waiting_token)
+                        .json(&json!({"alias":"seat","billing":true}))
+                        .send()
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            !same_account.is_finished(),
+            same_account.iter().all(|task| !task.is_finished()),
             "same-account contention should queue"
         );
         let other = timeout(
@@ -336,13 +340,18 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             .await
             .unwrap();
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
-        let queued = same_account.await.unwrap();
-        assert_eq!(
-            queued.status(),
-            200,
-            "queued same-account request must succeed"
-        );
-        assert_eq!(generation(&queued.json::<Value>().await.unwrap()), 3);
+        let mut generations = Vec::new();
+        for task in same_account {
+            let queued = task.await.unwrap();
+            assert_eq!(
+                queued.status(),
+                200,
+                "queued same-account request must succeed"
+            );
+            generations.push(generation(&queued.json::<Value>().await.unwrap()));
+        }
+        generations.sort_unstable();
+        assert_eq!(generations, [3, 4]);
     };
     let (response, ()) = tokio::join!(first_request, contenders);
     assert_eq!(response.status(), 200);
@@ -360,10 +369,10 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             next["revision"], first["revision"],
             "initialize rotation must be committed for the next replica"
         );
-        assert_eq!(generation(&next), index + 4);
+        assert_eq!(generation(&next), index + 5);
         assert!(pod.root.path().join("exited").exists());
     }
-    assert_eq!(pods.each_ref().map(Pod::launches), [3, 1, 1]);
+    assert_eq!(pods.each_ref().map(Pod::launches), [4, 1, 1]);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-error").unwrap();
     std::fs::remove_file(pods[0].root.path().join("exited")).unwrap();
     let failed = request(&http, &pods[0], &token).await;
@@ -396,7 +405,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     .expect("failed initialize retained its lease");
     assert_eq!(
         generation(&recovered),
-        7,
+        8,
         "failed initialize must publish its rotation before the next replica launches"
     );
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup").unwrap();
@@ -415,7 +424,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     })
     .await
     .expect("replica stayed fenced after initialize failure settled");
-    assert_eq!(generation(&retry), 8);
+    assert_eq!(generation(&retry), 9);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-exit").unwrap();
     let failed = request(&http, &pods[0], &token).await;
     assert_eq!(failed.status(), 503);
@@ -431,7 +440,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     })
     .await
     .expect("dead initialize child retained its lease or replica fence");
-    assert_eq!(generation(&retry), 10);
+    assert_eq!(generation(&retry), 11);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold-error").unwrap();
     for name in ["initialize-started", "release-initialize"] {
         std::fs::remove_file(pods[0].root.path().join(name)).unwrap();
@@ -506,12 +515,57 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     );
     assert_eq!(
         generation(&successor.json::<Value>().await.unwrap()),
-        12,
+        13,
         "graceful shutdown must publish initialization rotation for its successor"
     );
     for pod in &mut pods {
         pod.stop().await;
     }
+    // A migrated, verified vault can retain a promoted relogin journal.
+    // Shared-store startup must expose a fence instead of serving it through
+    // the ordinary restore path without replacement verification.
+    let [first, _, _] = pods;
+    let account = std::fs::read_dir(first.root.path().join("state/accounts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            // The stable account key is a hash of the user and alias.
+            path.file_name().unwrap().to_str().unwrap() == account_key("test", "seat")
+        })
+        .unwrap();
+    let operation = "f".repeat(64);
+    let journal = account.join("relogin").join(&operation);
+    store::ensure_private_dir(&journal.join("home")).unwrap();
+    store::atomic_write(&journal.join("home/spawn-failed"), b"not-started").unwrap();
+    store::atomic_write(
+        &journal.join("record.json"),
+        &serde_json::to_vec(&json!({
+            "sequence":1,"id":operation,"user":"test","device":"test-machine",
+            "alias":"seat","broker":{"pid":1,"incarnation":"synthetic-dead"},
+            "child":{"status":"not_started"},"original_revision":"synthetic",
+            "candidate_revision":null,"candidate":null,"phase":"promoted",
+            "code":null,"error":null,"retired":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut promoted = Pod::spawn(database.as_str(), &key, first.root, "postgres").await;
+    let response = request(&http, &promoted, &token).await;
+    assert_eq!(
+        response.status(),
+        503,
+        "unfinished shared relogin must stay fenced"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(
+        promoted.launches(),
+        0,
+        "relogin fence must precede child launch"
+    );
+    promoted.stop().await;
     control
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
@@ -529,4 +583,12 @@ fn generation(response: &Value) -> usize {
         .unwrap();
     let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
     claims["generation"].as_u64().unwrap() as usize
+}
+
+fn account_key(user: &str, alias: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(
+        "{:x}",
+        Sha256::digest(format!("{user}\0{alias}").as_bytes())
+    )
 }

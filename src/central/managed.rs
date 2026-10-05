@@ -823,7 +823,22 @@ async fn settle_background_recovery(
                 .renew(lease, std::time::Duration::from_secs(120))
                 .await
             {
-                Ok(true) => matches!(central.fenced_write(lease, &record).await, Ok(true)),
+                Ok(true) => match central.fenced_write(lease, &record).await {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        // A tombstone or newer credential is definitive rejection,
+                        // not an uncertain query. Stop renewing and let shutdown
+                        // drain without ever reopening this owner.
+                        let _ = central.release_lease(lease).await;
+                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                            .await;
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!("central settlement write retry: {error:#}");
+                        false
+                    }
+                },
                 Ok(false) => {
                     abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
                     return;
@@ -913,10 +928,15 @@ async fn token(
                 if let Ok(owner) = owner_ref.try_lock() {
                     break (Some(imports), owner);
                 }
-                // Wait without blocking admission for other accounts, then
-                // retry in the established imports -> Owner lock order.
+                // Keep the fair Owner queue position when admission is free.
+                // Never await imports with Owner held: an importer may already
+                // hold imports while waiting for this Owner.
                 drop(imports);
-                drop(owner_ref.lock().await);
+                let owner = owner_ref.lock().await;
+                if let Ok(imports) = worker.imports.try_lock() {
+                    break (Some(imports), owner);
+                }
+                drop(owner);
             }
         } else {
             (None, owner_ref.lock().await)
@@ -2731,7 +2751,7 @@ pub async fn serve(
                 }
             }
         };
-        if pending || repair.blocked || (read_only && repair.verify) {
+        if pending || repair.blocked || ((read_only || central.is_some()) && repair.verify) {
             owner.available = false;
         }
         // Use the same complete identity inventory as live import and renewal.
