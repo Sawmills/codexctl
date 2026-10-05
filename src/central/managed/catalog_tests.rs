@@ -713,6 +713,7 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
             !owner.routing_refused,
             "settled verified reimport must remain recoverable"
         );
+        owner.retry_clock = Some(Arc::new(|| 60_000));
         owner.retry_started = Some(0);
     }
     store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
