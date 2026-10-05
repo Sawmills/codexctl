@@ -111,12 +111,19 @@ pub fn format_credits(credits: Option<&api::Credits>) -> String {
     let Some(credits) = credits else {
         return "-".into();
     };
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     if let Some(balance) = credits.balance.as_deref() {
-        parts.push(match balance.parse::<f64>() {
+        let display = match balance.parse::<f64>() {
             Ok(value) if value.is_finite() => format!("${value:.2}"),
             _ => format!("${balance}"),
-        });
+        };
+        parts.push(
+            display
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(80)
+                .collect(),
+        );
     }
     if credits.has_credits {
         parts.push("available".into());

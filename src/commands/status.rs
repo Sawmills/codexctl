@@ -1433,6 +1433,39 @@ mod tests {
     }
 
     #[test]
+    fn credit_balance_text_is_bounded_and_cannot_control_the_terminal() {
+        for balance in [
+            "12.50\u{1b}[31m\n".to_string(),
+            "x".repeat(1000),
+            "1e100".into(),
+        ] {
+            let usage: api::RateLimitResponse = serde_json::from_value(serde_json::json!({
+                "plan_type":"pro", "credits":{"has_credits":true,"balance":balance}
+            }))
+            .unwrap();
+            let account =
+                RateLimitedAccount::from_usage("credits".into(), None, false, None, &usage);
+            let columns = RateLimitColumns::for_accounts(&[&account]);
+            let index = columns
+                .headers()
+                .iter()
+                .position(|header| header == "Credits")
+                .unwrap();
+            let row = render_rate_limited_row(&account, &columns);
+            let cell = row[index].content();
+            assert!(!cell.chars().any(char::is_control));
+            assert!(cell.chars().count() <= 100);
+            let mut json_row =
+                codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+            json_row.set_usage(&usage);
+            assert_eq!(
+                serde_json::to_value(json_row).unwrap()["credits"]["balance"],
+                balance
+            );
+        }
+    }
+
+    #[test]
     fn reset_column_is_present_for_banked_credits_and_error_rows_match() {
         let account = RateLimitedAccount {
             reset_credits: 2,
