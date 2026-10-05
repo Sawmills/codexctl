@@ -87,7 +87,7 @@ struct Connection {
     approved_billing_plan: Option<String>,
     #[serde(default)]
     approved_billing_class: Option<api::BillingClass>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     session_id: String,
 }
 #[derive(Serialize, Deserialize)]

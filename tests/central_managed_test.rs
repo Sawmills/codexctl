@@ -9275,7 +9275,7 @@ for arg in args:
     if arg.startswith(prefix):
         helper = json.loads(arg[len(prefix):])
         connection = pathlib.Path(helper[helper.index('--connection') + 1])
-record = {'args': args, 'connection': str(connection), 'alias': json.loads(connection.read_text())['alias']}
+record = {'args': args, 'connection': str(connection), 'alias': json.loads(connection.read_text())['alias'], 'session': json.loads(connection.read_text())['session_id']}
 log = pathlib.Path(os.environ['HOME']) / 'launches.json'
 prior = json.loads(log.read_text()) if log.exists() else []
 assert all(not pathlib.Path(row['connection']).exists() for row in prior)
@@ -9364,6 +9364,7 @@ if marker.exists():
     }
     assert_eq!(launches[0]["alias"], "lane");
     for launch in launches.as_array().unwrap() {
+        assert!(!launch["session"].as_str().unwrap().is_empty());
         assert!(!std::path::Path::new(launch["connection"].as_str().unwrap()).exists());
         let args = launch["args"].as_array().unwrap();
         let resume = args.iter().position(|arg| arg == "resume").unwrap();
@@ -9453,4 +9454,26 @@ fn b29_unknown_session_count_does_not_invalidate_verified_usage() {
         "seat"
     );
     assert!(central::remote::select_for_codex(&[account]).is_err());
+}
+
+#[test]
+fn b29_host_connection_keeps_legacy_schema_after_refresh() {
+    let server = Server::start();
+    server.import(&server.amir, "host", "login", "seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    assert!(
+        server
+            .cli(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".codexctl/central/host.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        connection.get("session_id").is_none(),
+        "legacy helpers reject new host connection fields"
+    );
 }
