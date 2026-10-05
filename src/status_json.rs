@@ -113,17 +113,7 @@ pub fn format_credits(credits: Option<&api::Credits>) -> String {
     };
     let mut parts: Vec<String> = Vec::new();
     if let Some(balance) = credits.balance.as_deref() {
-        let display = match balance.parse::<f64>() {
-            Ok(value) if value.is_finite() => format!("${value:.2}"),
-            _ => format!("${balance}"),
-        };
-        parts.push(
-            display
-                .chars()
-                .filter(|c| !c.is_control())
-                .take(80)
-                .collect(),
-        );
+        parts.push(crate::status_format::format_credit_balance(balance));
     }
     if credits.has_credits {
         parts.push("available".into());

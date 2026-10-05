@@ -511,7 +511,12 @@ fn dashboard_credits(credits: Option<&crate::api::Credits>) -> String {
     let balance = credits
         .balance
         .as_deref()
-        .map(|value| format!("Balance ${}", escape(value)))
+        .map(|value| {
+            format!(
+                "Balance {}",
+                escape(&crate::status_format::format_credit_balance(value))
+            )
+        })
         .unwrap_or_else(|| "Balance unknown".into());
     let status = format!(
         "has credits: {}; unlimited: {}; overage limit reached: {}",

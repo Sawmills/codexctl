@@ -1673,7 +1673,10 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(usage_cells(&usage), ["-", "37%", "-", "$12.50 available"]);
+        assert_eq!(
+            usage_cells(&usage),
+            ["-", "37%", "-", "12.50 credits available"]
+        );
     }
     #[test]
     fn connected_local_balance_is_short() {
@@ -1682,7 +1685,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(usage_cells(&usage)[3], "$55835.54 available");
+        assert_eq!(usage_cells(&usage)[3], "55,835.54 credits available");
     }
 
     #[test]
@@ -1706,8 +1709,8 @@ mod tests {
         };
 
         assert!(!status_columns(&[row("-")], true).contains(&7));
-        assert!(status_columns(&[row("$12.50 available")], true).contains(&7));
-        assert!(!status_columns(&[row("$12.50 available")], false).contains(&7));
+        assert!(status_columns(&[row("12.50 credits available")], true).contains(&7));
+        assert!(!status_columns(&[row("12.50 credits available")], false).contains(&7));
     }
 
     #[test]
