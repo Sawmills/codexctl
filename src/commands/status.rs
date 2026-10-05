@@ -561,7 +561,7 @@ fn usage_based_headers(accounts: &[&UsageBasedAccount]) -> Vec<String> {
         headers.push("Label".to_string());
     }
     headers.extend(
-        ["Balance", "Seat", "Credits", "Spend", "Token"]
+        ["Credit balance", "Seat", "Credits", "Spend", "Token"]
             .into_iter()
             .map(str::to_string),
     );
@@ -1058,7 +1058,7 @@ fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool) -> Vec<Cell> {
     let balance_str = s
         .credit_balance
         .as_deref()
-        .map(|b| format!("${b}"))
+        .map(codexctl::status_format::format_credit_balance)
         .unwrap_or_else(|| "-".to_string());
 
     let seat_limit_str = s
@@ -1409,7 +1409,35 @@ mod tests {
             .iter()
             .position(|header| header == "Credits")
             .unwrap();
-        assert_eq!(row[index].content(), "$12.50 available overage");
+        assert_eq!(row[index].content(), "12.50 credits available overage");
+    }
+
+    #[test]
+    fn credit_balance_uses_credit_units_in_text_and_keeps_raw_json() {
+        let usage: api::RateLimitResponse = serde_json::from_value(serde_json::json!({
+            "plan_type": "pro",
+            "credits": {"has_credits": true, "balance": "53306.1594250000"}
+        }))
+        .unwrap();
+        let account =
+            RateLimitedAccount::from_usage("credit-units".into(), None, false, None, &usage);
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let index = columns
+            .headers()
+            .iter()
+            .position(|header| header == "Credits")
+            .unwrap();
+        assert_eq!(
+            render_rate_limited_row(&account, &columns)[index].content(),
+            "53,306.16 credits available"
+        );
+        let mut json_row =
+            codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+        json_row.set_usage(&usage);
+        assert_eq!(
+            serde_json::to_value(json_row).unwrap()["credits"]["balance"],
+            "53306.1594250000"
+        );
     }
 
     #[test]
@@ -1428,7 +1456,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             render_rate_limited_row(&account, &columns)[index].content(),
-            "$0.00"
+            "0.00 credits"
         );
     }
 
@@ -1989,6 +2017,10 @@ mod tests {
     fn render_usage_based_row_has_expected_column_count() {
         let account = usage_based_account(None);
 
-        assert_eq!(render_usage_based_row(&account, false).len(), 6);
+        let row = render_usage_based_row(&account, false);
+        assert_eq!(row.len(), 6);
+        assert_eq!(row[1].content(), "10.00 credits");
+        assert_eq!(row[2].content(), "$20");
+        assert_eq!(usage_based_headers(&[&account])[1], "Credit balance");
     }
 }

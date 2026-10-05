@@ -78,7 +78,9 @@ An empty result is `{"version":1,"accounts":[]}`.
   Failed requests keep unknown billing, regardless of the table's display group.
 - `credits`: The reported credits object, when available.
   `has_credits`, `unlimited`, and `overage_limit_reached` are booleans.
-  `balance` is the upstream balance string, or `null` when unknown.
+  `balance` is the upstream OpenAI credit balance string, or `null` when unknown.
+  The unit is credits, not dollars. JSON keeps the raw value, such as
+  `"53306.1594250000"`. Text tables and the dashboard display it as `53,306.16 credits`.
   Reported zero balances and false flags remain present.
   Older account servers omit credits; upgrade the server to expose them.
 - `error`: A brief account error, or `null`.

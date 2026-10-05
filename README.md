@@ -55,12 +55,12 @@ Rate-Limited Accounts
 └──────────────────────┴───────────────────────┴─────┴──────────────────────────────┴────────┴────────┘
 
 Usage-Based Accounts
-┌───────────────────────────┬─────────┬──────┬─────────┬───────┬─────────┐
-│ Account                   ┆ Balance ┆ Seat ┆ Credits ┆ Spend ┆ Token   │
-╞═══════════════════════════╪═════════╪══════╪═════════╪═══════╪═════════╡
-│ amir+ezra@sawmills.ai     ┆ -       ┆ -    ┆ ok      ┆ ok    ┆ 9d 1h   │
-│ amir+reviewer@sawmills.ai ┆ -       ┆ -    ┆ ok      ┆ ok    ┆ expired │
-└───────────────────────────┴─────────┴──────┴─────────┴───────┴─────────┘
+┌───────────────────────────┬────────────────┬──────┬─────────┬───────┬─────────┐
+│ Account                   ┆ Credit balance ┆ Seat ┆ Credits ┆ Spend ┆ Token   │
+╞═══════════════════════════╪════════════════╪══════╪═════════╪═══════╪═════════╡
+│ amir+ezra@sawmills.ai     ┆ -              ┆ -    ┆ ok      ┆ ok    ┆ 9d 1h   │
+│ amir+reviewer@sawmills.ai ┆ -              ┆ -    ┆ ok      ┆ ok    ┆ expired │
+└───────────────────────────┴────────────────┴──────┴─────────┴───────┴─────────┘
 ```
 
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
@@ -86,8 +86,10 @@ The `Resets` column shows banked rate-limit resets (see [Banked resets](#banked-
 `3 (2 now)` means three are held and two can be redeemed this second; a bare count turns red when
 a credit lapses within three days.
 
-The `Credits` column shows purchased credit balances and availability. It appears
-when an account reports credits data, including a zero balance. `status --json`
+The `Credits` column shows OpenAI credit balances and availability. Balances use
+credits, for example `53,306.16 credits`, with two decimal places and comma separators.
+These values are not dollars. The column appears when an account reports credits data,
+including a zero balance. `status --json`
 and the server dashboard expose `has_credits`, `unlimited`, `balance`, and
 `overage_limit_reached`. Missing or null credits data stays absent in JSON.
 
@@ -99,7 +101,7 @@ seat. Prefer `codexctl use` (a pure file copy that never contacts OpenAI) over r
 only re-login a seat once its token genuinely shows `expired`.
 
 Usage-based accounts are shown in a separate table with balance, seat limit, credits, and spend
-control status.
+control status. The `Credit balance` column uses credits. The `Seat` column uses dollars.
 
 When billing classification is unknown, status still shows the returned usage windows, resets,
 and token expiry. A `Billing` column marks those accounts as `unknown`. An unrecognized plan or

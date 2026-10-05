@@ -40,14 +40,14 @@ fn renders_credit_details_for_accounts_that_report_them() {
     data.accounts[0].credits = Some(crate::api::Credits {
         has_credits: true,
         unlimited: false,
-        balance: Some("12.50".into()),
+        balance: Some("53306.1594250000".into()),
         overage_limit_reached: true,
     });
 
     let html = overview(&data);
 
     assert!(html.contains("Credits"));
-    assert!(html.contains("<div class=\"credits\"><b>Balance $12.50</b>"));
+    assert!(html.contains("<div class=\"credits\"><b>Balance 53,306.16 credits</b>"));
     assert!(html.contains("has credits: true; unlimited: false; overage limit reached: true"));
     assert!(html.contains("<span class=\"credits unknown\">Unknown</span>"));
 }
