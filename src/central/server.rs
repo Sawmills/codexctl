@@ -186,15 +186,12 @@ impl Owner {
         validate_owned_identity(&self.vault.auth, auth)
     }
 
-    pub(super) fn validate_account_id(
-        &mut self,
-        requested: Option<&str>,
-    ) -> Result<(), TokenFailure> {
+    pub(super) fn validate_account_id(&self, requested: Option<&str>) -> Result<(), TokenFailure> {
         let Some(requested) = requested else {
             return Ok(());
         };
-        let current = self.snapshot().map_err(TokenFailure::Unavailable)?;
-        if requested != current.chatgpt_account_id {
+        let current = vault::account(&self.vault.auth).map_err(TokenFailure::Unavailable)?;
+        if requested != current {
             return Err(TokenFailure::AccountMismatch);
         }
         Ok(())

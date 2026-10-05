@@ -454,7 +454,19 @@ impl Broker {
         if let Some(record) = central.load_account(&account_id).await? {
             if record.revision > owner.vault.revision {
                 let committed: Vault = serde_json::from_value(record.vault)?;
+                vault::validate_auth(&committed.auth)?;
+                vault::save(&owner.state, &owner.key, &committed)?;
+                store::atomic_write(
+                    &owner.home.join("auth.json"),
+                    &serde_json::to_vec(&committed.auth)?,
+                )?;
                 owner.vault = committed;
+                owner.vault.revision = record.revision;
+                if let Some(rpc) = owner.rpc.as_mut() {
+                    rpc.shutdown().await?;
+                }
+                owner.rpc = None;
+                owner.refresh_enabled = false;
             }
             return Ok(());
         }
@@ -729,6 +741,22 @@ fn fence_background_probe(owner: &mut Owner) {
     owner.refresh_enabled = false;
 }
 
+async fn abandon_background_recovery(
+    owner_ref: Arc<Mutex<Owner>>,
+    renew_done: Arc<AtomicBool>,
+    renew_task: Option<tokio::task::JoinHandle<()>>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let mut owner = owner_ref.lock().await;
+    fence_background_owner(&mut owner);
+    drop(owner);
+    renew_done.store(true, Ordering::Release);
+    if let Some(task) = renew_task {
+        task.abort();
+    }
+    drop(permit);
+}
+
 /// Keep a recovery lease until the stopped child has been settled and its
 /// credentials are durably published. The work permit is held by the caller
 /// or transferred to this task, so shutdown drains this work instead of
@@ -743,8 +771,13 @@ async fn settle_background_recovery(
     permit: tokio::sync::OwnedSemaphorePermit,
     renew_done: Arc<AtomicBool>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
 ) {
     loop {
+        if stopping.load(Ordering::Acquire) {
+            abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+            return;
+        }
         let record = {
             let mut owner = owner_ref.lock().await;
             if owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
@@ -781,11 +814,27 @@ async fn settle_background_recovery(
                 .await
             {
                 Ok(true) => matches!(central.fenced_write(lease, &record).await, Ok(true)),
-                _ => false,
+                Ok(false) | Err(_) => {
+                    abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                    return;
+                }
             },
             _ => true,
         };
         if !durable {
+            if stopping.load(Ordering::Acquire) {
+                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                return;
+            }
+            if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref())
+                && !central
+                    .renew(lease, std::time::Duration::from_secs(120))
+                    .await
+                    .unwrap_or(false)
+            {
+                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                return;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
@@ -2113,10 +2162,6 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         let central = broker.central.clone();
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         let lease = if let Some(central) = central.as_ref() {
-            if let Err(error) = broker.ensure_owner_record(&mut owner).await {
-                eprintln!("central background owner record: {error:#}");
-                continue;
-            }
             match central
                 .acquire_lease(
                     &account_id,
@@ -2134,6 +2179,14 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         } else {
             None
         };
+        if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref())
+            && let Err(error) = broker.ensure_owner_record(&mut owner).await
+        {
+            eprintln!("central background owner record: {error:#}");
+            let _ = central.release_lease(lease).await;
+            drop(permit);
+            continue;
+        }
         let renew_done = Arc::new(AtomicBool::new(false));
         let mut renew_task = match (central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -2168,29 +2221,48 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         if owner.retry_started.is_none() {
             owner.retry_started = Some(owner.retry_clock_now());
         }
-        // The imports guard protects journal admission and process launch only.
-        // Never hold it across the network probe or durable publication.
+        // Reacquire in the established imports -> Owner order. Never await the
+        // imports mutex while retaining an Owner guard.
+        drop(owner);
         let launched = {
             let imports = broker.imports.lock().await;
-            let proof = match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
-                .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
+            let mut owner = owner_ref.lock().await;
+            if !owner.vault.verified
+                || owner.available
+                || !owner.retryable_unavailable
+                || owner.routing_refused
+                || owner.retry_cooldown_active()
             {
-                Ok(proof) => proof,
-                Err(error) => {
-                    renew_done.store(true, Ordering::Release);
-                    if let Some(task) = renew_task.take() {
-                        task.abort();
-                    }
-                    owner.retryable_unavailable = false;
-                    eprintln!("central background owner identity fence: {error:#}");
-                    if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
-                        let _ = central.release_lease(lease).await;
-                    }
-                    continue;
-                }
-            };
-            launch_owner(&mut owner, &broker.binary, proof).await
+                None
+            } else {
+                let result =
+                    match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
+                        .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
+                    {
+                        Ok(proof) => launch_owner(&mut owner, &broker.binary, proof).await,
+                        Err(error) => {
+                            owner.routing_refused = true;
+                            Err(error)
+                        }
+                    };
+                Some(result)
+            }
         };
+        let mut owner = owner_ref.lock().await;
+        let Some(launched) = launched else {
+            renew_done.store(true, Ordering::Release);
+            if let Some(task) = renew_task.take() {
+                task.abort();
+            }
+            if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
+                let _ = central.release_lease(lease).await;
+            }
+            drop(permit);
+            continue;
+        };
+        if let Err(error) = &launched {
+            eprintln!("central background owner identity or launch failure: {error:#}");
+        }
         let before = owner.vault.clone();
         match launched {
             Ok(()) => {
@@ -2246,6 +2318,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         permit,
                         renew_done,
                         renew_task.take(),
+                        broker.stopping.clone(),
                     ));
                     return;
                 }
@@ -2297,6 +2370,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             permit,
                             renew_done,
                             renew_task.take(),
+                            broker.stopping.clone(),
                         ));
                         return;
                     }
@@ -2331,6 +2405,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             permit,
                             renew_done,
                             renew_task.take(),
+                            broker.stopping.clone(),
                         ));
                         return;
                     }
