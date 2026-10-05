@@ -1242,14 +1242,22 @@ async fn token(
     refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
-    broker.activity.delivered(&device, alias.clone());
+    let session_id = headers
+        .get("x-codexctl-session")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&device.id)
+        .to_owned();
+    broker
+        .activity
+        .delivered(&device, alias.clone(), session_id.clone());
     if let Some(central) = broker.central.as_ref()
         && let Err(error) = central
             .record_live_session(
                 &account_key(&device.user, &alias),
                 &device.user,
                 &alias,
-                &device.id,
+                &session_id,
             )
             .await
     {

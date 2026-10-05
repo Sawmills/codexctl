@@ -48,12 +48,21 @@ pub fn run(
     let selected_central_launch = if codexctl::central::native::central_active()?
         && codexctl::central::remote::connection()?.is_some()
     {
-        let alias = codexctl::central::remote::select_codex_account()
-            .context("automatic codex launch could not select an included account")?;
-        eprintln!("codexctl: selected included account {alias} (least loaded)");
-        Some(codexctl::central::native::prepare_pinned_codex(
-            &alias, false,
-        )?)
+        match codexctl::central::remote::select_codex_account() {
+            Ok(alias) => {
+                eprintln!("codexctl: selected included account {alias} (least loaded)");
+                Some(codexctl::central::native::prepare_pinned_codex(
+                    &alias,
+                    allow_billing,
+                )?)
+            }
+            Err(error) => {
+                eprintln!(
+                    "codexctl: automatic account selection unavailable ({error:#}); using the current account"
+                );
+                None
+            }
+        }
     } else {
         None
     };
@@ -104,7 +113,7 @@ pub fn run(
     let options = WrapperOptions::new(args.to_vec(), recovery_prompt.to_string(), cwd);
     // The account that hit the cap is already active; never switch back to it.
     let initial_tried: Vec<String> = failed_alias.into_iter().collect();
-    run_with_reporter(
+    let result = run_with_reporter(
         &options,
         &mut runner,
         &mut switcher,
@@ -112,7 +121,16 @@ pub fn run(
         &mut reporter,
         &mut consent,
         initial_tried,
-    )
+    );
+    #[cfg(feature = "central-prototype")]
+    if let Some(launch) = central_launch
+        .lock()
+        .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?
+        .take()
+    {
+        launch.close()?;
+    }
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -966,6 +984,9 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
                 .central_launch
                 .lock()
                 .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?;
+            if let Some(previous) = slot.take() {
+                previous.close()?;
+            }
             *slot = Some(launch);
             return Ok(());
         }
@@ -1497,7 +1518,13 @@ impl CodexRunner for PtyCodexRunner {
             .map(|launch| (launch.codex_args().to_owned(), launch.alias().to_owned()));
         #[cfg(not(feature = "central-prototype"))]
         let central_launch = None;
-        run_codex_in_pty(invocation, self.state_reporter.clone(), central_launch)
+        let allow_rate_recovery = central_launch.is_some();
+        run_codex_in_pty(
+            invocation,
+            self.state_reporter.clone(),
+            central_launch,
+            allow_rate_recovery,
+        )
     }
 }
 
@@ -1505,6 +1532,7 @@ fn run_codex_in_pty(
     invocation: &CodexInvocation,
     state_reporter: Option<HerdrAgentReporter>,
     central_launch: Option<(Vec<String>, String)>,
+    allow_rate_recovery: bool,
 ) -> Result<CodexRunOutcome> {
     let interactive = std::io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::enable(interactive)?;
@@ -1512,6 +1540,8 @@ fn run_codex_in_pty(
     let pair = pty_system
         .openpty(current_pty_size())
         .context("failed to open pty")?;
+    #[cfg(feature = "central-prototype")]
+    let central_mode = central_launch.is_some();
     let mut command = CommandBuilder::new("codex");
     if let Some((codex_args, alias)) = central_launch {
         for arg in codex_args {
@@ -1519,7 +1549,15 @@ fn run_codex_in_pty(
         }
         command.env("CODEXCTL_PINNED_ALIAS", alias);
     }
-    for arg in &invocation.args {
+    #[cfg(feature = "central-prototype")]
+    let invocation_args = if central_mode {
+        codexctl::central::native::pinned_arguments(&invocation.args)?
+    } else {
+        invocation.args.clone()
+    };
+    #[cfg(not(feature = "central-prototype"))]
+    let invocation_args = invocation.args.clone();
+    for arg in &invocation_args {
         command.arg(arg);
     }
     command.cwd(invocation.cwd.as_os_str());
@@ -1552,6 +1590,7 @@ fn run_codex_in_pty(
         Arc::clone(&writer),
         invocation.continue_goal_on_start,
         !interactive,
+        allow_rate_recovery,
         state_reporter,
         move || {
             let _ = killer.kill();
@@ -1637,6 +1676,7 @@ fn spawn_output_thread(
     continue_goal_writer: SharedPtyWriter,
     continue_goal_on_start: bool,
     normalize_newlines: bool,
+    allow_rate_recovery: bool,
     state_reporter: Option<HerdrAgentReporter>,
     mut kill_child: impl FnMut() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
@@ -1644,6 +1684,7 @@ fn spawn_output_thread(
         let mut stdout = std::io::stdout();
         let mut buffer = [0; 8192];
         let mut recent = String::new();
+        let mut pending_cr = false;
         let mut continue_goal_auto_enter = ContinueGoalAutoEnter::default();
         let mut state_watcher = state_reporter.as_ref().map(|_| CodexStateWatcher::new());
 
@@ -1655,9 +1696,7 @@ fn spawn_output_thread(
             };
             let chunk = &buffer[..bytes_read];
             if normalize_newlines {
-                let text = String::from_utf8_lossy(chunk);
-                let normalized = text.replace("\r\n", "\n");
-                let _ = stdout.write_all(normalized.as_bytes());
+                write_normalized_chunk(&mut stdout, chunk, &mut pending_cr);
             } else {
                 let _ = stdout.write_all(chunk);
             }
@@ -1678,7 +1717,7 @@ fn spawn_output_thread(
                 break;
             }
 
-            if rate_limit_seen(&recent) {
+            if allow_rate_recovery && rate_limit_seen(&recent) {
                 rate_limited.store(true, Ordering::SeqCst);
                 if let Some(id) = find_resume_hint_session_id(&recent)
                     && let Ok(mut guard) = session_id.lock()
@@ -1701,7 +1740,32 @@ fn spawn_output_thread(
                 reporter.report(state, None);
             }
         }
+        if normalize_newlines && pending_cr {
+            let _ = stdout.write_all(b"\r");
+            let _ = stdout.flush();
+        }
     })
+}
+
+fn write_normalized_chunk(output: &mut impl Write, chunk: &[u8], pending_cr: &mut bool) {
+    let mut normalized = Vec::with_capacity(chunk.len());
+    for &byte in chunk {
+        if *pending_cr {
+            if byte == b'\n' {
+                normalized.push(b'\n');
+                *pending_cr = false;
+                continue;
+            }
+            normalized.push(b'\r');
+            *pending_cr = false;
+        }
+        if byte == b'\r' {
+            *pending_cr = true;
+        } else {
+            normalized.push(byte);
+        }
+    }
+    let _ = output.write_all(&normalized);
 }
 
 #[derive(Default)]

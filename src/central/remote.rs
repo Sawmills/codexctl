@@ -1227,10 +1227,17 @@ pub fn select(accounts: &[Account]) -> Result<String> {
 /// Launches spread across the accounts that the server says are currently in
 /// use. Usage-based accounts and exhausted windows never enter this list.
 pub fn select_for_codex(accounts: &[Account]) -> Result<String> {
+    select_for_codex_excluding(accounts, &[])
+}
+
+fn select_for_codex_excluding(accounts: &[Account], excluded: &[String]) -> Result<String> {
     accounts
         .iter()
         .filter(|account| {
-            account.available
+            !excluded
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&account.alias))
+                && account.available
                 && !account.usage_stale
                 && account.billing_class == api::BillingClass::RateLimited
                 && [account.primary_used, account.secondary_used]
@@ -1316,36 +1323,7 @@ pub fn find_rate_limit_recovery_candidate(tried: &[String]) -> Result<Option<Str
     for account in &mut accounts {
         account.recent_429_rate = rates.get(&account.alias).copied();
     }
-    Ok(accounts
-        .iter()
-        .filter(|account| {
-            !tried
-                .iter()
-                .any(|alias| alias.eq_ignore_ascii_case(&account.alias))
-                && account.available
-                && !account.usage_stale
-                && account.billing_class == api::BillingClass::RateLimited
-                && [account.primary_used, account.secondary_used]
-                    .into_iter()
-                    .flatten()
-                    .next()
-                    .is_some()
-                && [account.primary_used, account.secondary_used]
-                    .into_iter()
-                    .flatten()
-                    .all(|used| used.is_finite() && used < 100.0)
-        })
-        .min_by(|left, right| {
-            left.live_sessions
-                .cmp(&right.live_sessions)
-                .then_with(|| {
-                    left.recent_429_rate
-                        .unwrap_or(f64::MAX)
-                        .total_cmp(&right.recent_429_rate.unwrap_or(f64::MAX))
-                })
-                .then_with(|| left.alias.cmp(&right.alias))
-        })
-        .map(|account| account.alias.clone()))
+    Ok(select_for_codex_excluding(&accounts, tried).ok())
 }
 
 /// Plan a reset only after included headroom is unavailable. Spending is deferred

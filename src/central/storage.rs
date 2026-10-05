@@ -168,15 +168,21 @@ CREATE TABLE IF NOT EXISTS account_refresh_leases (
     expires_at TIMESTAMPTZ NOT NULL
 );
 CREATE TABLE IF NOT EXISTS account_live_sessions (
-    account_id TEXT NOT NULL REFERENCES central_accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
     user_id TEXT NOT NULL,
     alias TEXT NOT NULL,
     device_id TEXT NOT NULL,
     last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
     PRIMARY KEY (account_id, device_id)
 );
+ALTER TABLE account_live_sessions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE account_live_sessions DROP CONSTRAINT IF EXISTS account_live_sessions_account_id_fkey;
+ALTER TABLE account_live_sessions
+    ADD CONSTRAINT account_live_sessions_account_id_fkey
+    FOREIGN KEY (account_id) REFERENCES central_accounts(account_id);
 CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
-    ON account_live_sessions (account_id, last_seen);
+    ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
     challenge_hash TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
@@ -1529,7 +1535,7 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .execute(
-                "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen) VALUES($1,$2,$3,$4,now()) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen",
+                "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen,deleted_at) VALUES($1,$2,$3,$4,now(),NULL) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen,deleted_at=NULL",
                 &[&account_id, &user_id, &alias, &device_id],
             )
             .await?;
@@ -1540,7 +1546,7 @@ impl PostgresStore {
         let client = self.client().await?;
         let row = client
             .query_one(
-                "SELECT COUNT(*)::BIGINT FROM account_live_sessions WHERE account_id=$1 AND last_seen >= now()-($2::bigint * interval '1 second')",
+                "SELECT COUNT(*)::BIGINT FROM account_live_sessions WHERE account_id=$1 AND deleted_at IS NULL AND last_seen >= now()-($2::bigint * interval '1 second')",
                 &[&account_id, &(window.as_secs() as i64)],
             )
             .await?;
@@ -1702,6 +1708,26 @@ pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_session_schema_uses_logical_delete_scope_without_cascade() {
+        let table = SCHEMA
+            .split("CREATE TABLE IF NOT EXISTS account_live_sessions")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("CREATE TABLE IF NOT EXISTS enrollment_challenges")
+                    .next()
+            })
+            .expect("live-session schema");
+        assert!(table.contains("deleted_at TIMESTAMPTZ"));
+        assert!(table.contains("FOREIGN KEY (account_id) REFERENCES central_accounts(account_id)"));
+        assert!(!table.contains("ON DELETE CASCADE"));
+        assert!(
+            SCHEMA.contains(
+                "ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL"
+            )
+        );
+    }
 
     fn record(id: &str, revision: i64) -> CredentialRecord {
         CredentialRecord {

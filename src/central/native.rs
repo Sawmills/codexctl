@@ -17,6 +17,8 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
+#[cfg(feature = "central-prototype")]
+pub use launch::pinned_arguments;
 pub(super) use launch::sweep_stale_launches;
 pub use launch::{PinnedLaunch, launch_owners, prepare_pinned_codex, run_pinned_codex};
 
@@ -85,6 +87,8 @@ struct Connection {
     approved_billing_plan: Option<String>,
     #[serde(default)]
     approved_billing_class: Option<api::BillingClass>,
+    #[serde(default)]
+    session_id: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Activation {
@@ -761,7 +765,7 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     super::transport::origin(&connection.server)?;
     let secret = String::from_utf8(vault::private_read(&connection.device_token_file)?)?;
     let http = super::transport::blocking()?;
-    let response = http
+    let mut request = http
         .post(format!(
             "{}/v1/token",
             connection.server.trim_end_matches('/')
@@ -773,9 +777,11 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
             account_id: (!connection.account_id.is_empty()).then(|| connection.account_id.clone()),
             billing: true,
             alias: connection.alias.clone(),
-        })
-        .send()
-        .context("central token request failed")?;
+        });
+    if !connection.session_id.is_empty() {
+        request = request.header("x-codexctl-session", &connection.session_id);
+    }
+    let response = request.send().context("central token request failed")?;
     let status = response.status();
     if !status.is_success() {
         if status == reqwest::StatusCode::CONFLICT
@@ -833,6 +839,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         launch_pinned: false,
         approved_billing_plan: None,
         approved_billing_class: None,
+        session_id: String::new(),
     };
     drop(_lock);
     let token = fetch(&connection, false)?;
@@ -1505,6 +1512,7 @@ pub(super) fn sync_account(
             launch_pinned: false,
             approved_billing_plan: None,
             approved_billing_class: None,
+            session_id: String::new(),
         },
     )
 }
@@ -1693,6 +1701,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();
@@ -1923,6 +1932,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         }
     }
 
@@ -2013,6 +2023,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();

@@ -122,7 +122,7 @@ pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()>
     Ok(())
 }
 
-fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
+pub fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
     let mut config_args = Vec::new();
     let mut remaining = Vec::new();
     let mut args = args.iter();
@@ -183,6 +183,17 @@ pub struct PinnedLaunch {
     lease: std::fs::File,
     alias: String,
     codex_args: Vec<String>,
+}
+
+impl Drop for PinnedLaunch {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        if let Err(error) = close_launch(prepared) {
+            eprintln!("warning: failed to close private central launch: {error:#}");
+        }
+    }
 }
 
 impl PinnedLaunch {
@@ -251,6 +262,14 @@ pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLa
         launch_pinned: true,
         approved_billing_plan: None,
         approved_billing_class: None,
+        session_id: format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ),
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
@@ -495,5 +514,18 @@ mod tests {
         assert!(require_headroom("premium", &token(Some(true), Some(false))).is_ok());
         assert!(require_headroom("premium", &token(None, None)).is_err());
         assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
+    }
+
+    #[test]
+    fn pinned_arguments_preserve_user_args_without_dropping_provider_overrides() {
+        let args = vec![
+            "resume".to_owned(),
+            "session".to_owned(),
+            "-c".to_owned(),
+            "model=astra".to_owned(),
+        ];
+        let pinned = pinned_arguments(&args).unwrap();
+        assert_eq!(pinned, vec!["-c", "model=astra", "resume", "session"]);
+        assert!(pinned_arguments(&["--profile".to_owned(), "work".to_owned()]).is_err());
     }
 }
