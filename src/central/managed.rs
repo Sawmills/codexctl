@@ -315,41 +315,6 @@ impl Broker {
             .map(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, reason))
     }
 
-    async fn ensure_refresh_owner(
-        &self,
-        owner: &mut Owner,
-        imports: &tokio::sync::MutexGuard<'_, ()>,
-        allow_retry: bool,
-    ) -> Result<(), HttpError> {
-        if owner.refresh_enabled && owner.rpc.is_some() {
-            return Ok(());
-        }
-        // Lock order is imports, then Owner. The token path takes imports before
-        // its Owner guard, and import workflows retain this guard while they
-        // inspect and replace owners.
-        if self.read_only
-            || self.stopping.load(Ordering::Acquire)
-            || self.ownership_unresolved.load(Ordering::Acquire)
-            || (!owner.available && !allow_retry)
-            || owner.routing_refused
-        {
-            return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-        }
-        let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-            .clear_for_launch(owner, relogin::AdmissionKind::Restore, imports)
-            .map_err(|error| {
-                owner.fence(false);
-                eprintln!("central owner recovery fenced reason=owner_identity_or_persistence detail={error}");
-                self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-            })?;
-        launch_owner(owner, &self.binary, proof)
-            .await
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
-        owner.refresh_enabled = true;
-        owner.available = true;
-        Ok(())
-    }
-
     pub(super) async fn record_user_central(
         &self,
         id: &str,
@@ -650,7 +615,7 @@ impl Broker {
             TokenFailure::UnsupportedRouting => {
                 self.error(StatusCode::CONFLICT, "unsupported_workspace_routing")
             }
-            TokenFailure::Unavailable(_) | TokenFailure::Retryable(_, _) => {
+            TokenFailure::Unavailable(_) | TokenFailure::Retryable(_) => {
                 self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
         }
@@ -746,62 +711,18 @@ async fn token(
     let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
         let _permit = permit;
-        let retry_requested = {
-            let mut guard = owner_ref.lock().await;
-            if !guard.vault.verified {
-                // An interrupted import owns a reservation, but it has not
-                // completed verification. Never let a retryable billing or
-                // transport error turn that reservation into a token source.
-                guard.available = false;
-                guard.retryable_unavailable = false;
-                guard.retry_started = None;
-                guard.retry_failures = 0;
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            }
-            guard
-                .validate_account_id(request.account_id.as_deref())
-                .map_err(|failure| worker.owner_failure(failure))?;
-            guard.retryable_unavailable && !guard.retry_cooldown_active() && !guard.routing_refused
-        };
-        // Shared-store paths take imports before Owner. File mode keeps this
-        // lock off the token path and remains a local, zero-central-cost path.
-        let import_guard = if worker
-            .central
-            .as_ref()
-            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
-            || retry_requested
-        {
-            Some(worker.imports.lock().await)
-        } else {
-            None
-        };
         let mut owner = owner_ref.lock().await;
-        let retry = retry_requested && owner.retryable_unavailable && !owner.routing_refused;
-        if retry {
-            if owner.retry_cooldown_active() {
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            }
-            owner.retry_started = Some(owner.retry_clock_now());
-            // An unknown request completion can still have rotated credentials.
-            // Keep the owner fenced until settlement has durably completed.
-            let unsettled_healthy_rpc = owner.rpc.as_mut().is_some_and(|rpc| {
-                rpc.completion_pending() && !rpc.retryable_failure() && !rpc.process_exited()
-            });
-            if unsettled_healthy_rpc {
-                owner.available = false;
-                owner.routing_refused = true;
-                owner.refresh_enabled = false;
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            }
-            // Recovery only drops the failed connection. The normal path below
-            // performs reconciliation, lease acquisition, and gated launch.
-            if let Some(rpc) = owner.rpc.take() {
-                rpc.terminate().await;
-            }
+        if !owner.vault.verified {
+            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
-        // A retry cannot take over recovery, even after the child stops: the
-        // final credentials may still be waiting for a durable shared write.
-        if !owner.available && owner.routing_refused {
+        owner
+            .validate_account_id(request.account_id.as_deref())
+            .map_err(|failure| worker.owner_failure(failure))?;
+        if !owner.available
+            || owner.routing_refused
+            || (!worker.read_only && owner.rpc.is_none())
+            || (owner.rpc.is_some() && !owner.refresh_enabled)
+        {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
@@ -837,30 +758,6 @@ async fn token(
         } else {
             None
         };
-        let needs_refresh_owner =
-            retry || (!worker.read_only && (owner.rpc.is_none() || !owner.refresh_enabled));
-        if needs_refresh_owner {
-            let Some(imports) = import_guard.as_ref() else {
-                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-            };
-            if let Err(error) = worker
-                .ensure_refresh_owner(&mut owner, imports, retry)
-                .await
-            {
-                if retry && owner.retryable_unavailable {
-                    owner.retry_failures = owner.retry_failures.saturating_add(1);
-                    if owner.retry_failures >= 3 {
-                        owner.fence(false);
-                    } else {
-                        owner.retry_started = Some(owner.retry_clock_now());
-                    }
-                }
-                if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
-                    let _ = central.release_lease(lease).await;
-                }
-                return Err(error);
-            }
-        }
         if lease.is_some()
             && worker
                 .central
@@ -879,7 +776,6 @@ async fn token(
         {
             request.previous_revision = None;
         }
-        drop(import_guard);
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -908,29 +804,12 @@ async fn token(
             _ => None,
         };
         let mut retain_lease = lease.is_some();
-        let mut retry_failure_recorded = false;
         let before = owner.vault.clone();
         let result = async {
-            let owner_was_available = owner.available;
-            let billing_probe_requested =
-                request.billing || (retry && owner.retry_requires_billing);
-            if retry && owner.retry_requires_billing {
-                request.billing = true;
-            }
             let token_result = owner.tokens(request).await;
-            if owner_was_available && matches!(&token_result, Err(TokenFailure::Retryable(_, _))) {
-                if matches!(&token_result, Err(TokenFailure::Retryable(_, true))) {
-                    owner.retry_requires_billing = true;
-                }
+            if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
-                if retry {
-                    owner.retry_failures = owner.retry_failures.saturating_add(1);
-                    owner.retry_started = Some(owner.retry_clock_now());
-                    retry_failure_recorded = true;
-                    if owner.retry_failures >= 3 {
-                        owner.fence(false);
-                    }
-                }
+                owner.retry_started = Some(owner.retry_clock_now());
             }
             let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
             if settle_required && owner.rpc.is_some() {
@@ -1075,30 +954,14 @@ async fn token(
                 })?;
             }
             retain_lease = false;
-            let retryable_token_failure =
-                matches!(&token_result, Err(TokenFailure::Retryable(_, _)));
             let token = match token_result {
                 Ok(token) => {
                     owner.retry_failures = 0;
                     owner.retry_started = None;
                     owner.retryable_unavailable = false;
-                    if billing_probe_requested {
-                        owner.retry_requires_billing = false;
-                    }
-                    if retry {
-                        owner.available = true;
-                    }
                     token
                 }
                 Err(error) => {
-                    if retry && retryable_token_failure && !retry_failure_recorded {
-                        owner.retry_failures = owner.retry_failures.saturating_add(1);
-                        if owner.retry_failures >= 3 {
-                            owner.fence(false);
-                        } else {
-                            owner.retry_started = Some(owner.retry_clock_now());
-                        }
-                    }
                     return Err(worker.owner_failure(error));
                 }
             };
@@ -1973,7 +1836,6 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         key: key.into(),
         available: true,
         retryable_unavailable: false,
-        retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
         routing_refused: false,
@@ -2046,6 +1908,104 @@ pub(super) async fn launch_owner(
         owner.verification_input = Some(owner.vault.auth.clone());
     }
     Ok(())
+}
+
+async fn launch_startup_owner(
+    owner: &mut Owner,
+    binary: &Path,
+    imports: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<()> {
+    let proof = relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
+        .clear_for_launch(owner, relogin::AdmissionKind::Restore, imports)?;
+    launch_owner(owner, binary, proof).await?;
+    owner.refresh_enabled = true;
+    owner.available = true;
+    Ok(())
+}
+
+async fn recover_unhealthy_owners(broker: &Broker) {
+    if broker.read_only
+        || broker.stopping.load(Ordering::Acquire)
+        || broker.ownership_unresolved.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let imports = broker.imports.lock().await;
+    let owners = broker
+        .owners
+        .read()
+        .await
+        .values()
+        .map(|(_, owner)| owner.clone())
+        .collect::<Vec<_>>();
+    for owner_ref in owners {
+        let mut owner = owner_ref.lock().await;
+        let pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
+        let exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
+        if !owner.vault.verified
+            || owner.available
+            || !owner.retryable_unavailable
+            || owner.routing_refused
+            || owner.retry_cooldown_active()
+        {
+            continue;
+        }
+        if pending && !exited {
+            continue;
+        }
+        if let Some(rpc) = owner.rpc.as_mut()
+            && !rpc.retryable_or_timed_out()
+            && !rpc.process_exited()
+        {
+            continue;
+        }
+        if let Some(mut rpc) = owner.rpc.take() {
+            // `process_exited` reaps a failed startup child. Do not wait on a
+            // child that is already dead; a live unhealthy child still gets
+            // the bounded termination path before the startup launch path.
+            if !rpc.process_exited() {
+                rpc.terminate().await;
+            }
+        }
+        owner.refresh_enabled = false;
+        owner.retry_started = Some(owner.retry_clock_now());
+        let proof = match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
+            .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
+        {
+            Ok(proof) => proof,
+            Err(error) => {
+                owner.retryable_unavailable = false;
+                eprintln!("central background owner identity fence: {error:#}");
+                continue;
+            }
+        };
+        match launch_owner(&mut owner, &broker.binary, proof).await {
+            Ok(()) => {
+                owner.refresh_enabled = true;
+                owner.available = true;
+                owner.retryable_unavailable = false;
+                owner.retry_started = None;
+                owner.retry_failures = 0;
+            }
+            Err(error) => {
+                owner.available = false;
+                owner.retry_failures = owner.retry_failures.saturating_add(1);
+                owner.retry_started = Some(owner.retry_clock_now());
+                eprintln!("central background owner recovery failed: {error:#}");
+            }
+        }
+    }
+}
+
+fn recovery_interval() -> std::time::Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("CENTRAL_TEST_RECOVERY_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return std::time::Duration::from_millis(milliseconds);
+    }
+    std::time::Duration::from_secs(60)
 }
 
 #[allow(clippy::too_many_arguments)] // Server configuration, not a request API.
@@ -2159,7 +2119,6 @@ pub async fn serve(
                     key: key.into(),
                     available: false,
                     retryable_unavailable: false,
-                    retry_requires_billing: false,
                     retry_started: None,
                     retry_failures: 0,
                     routing_refused: false,
@@ -2212,13 +2171,9 @@ pub async fn serve(
         if owner.available
             && owner.refresh_enabled
             && !repairing.contains(&account_key(&owner.vault.user, &owner.vault.alias))
-            && async {
-                let proof = relogin::identity_inventory(&owner.state, key, &owner.home)
-                    .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &startup_import)?;
-                launch_owner(&mut owner, binary, proof).await
-            }
-            .await
-            .is_err()
+            && launch_startup_owner(&mut owner, binary, &startup_import)
+                .await
+                .is_err()
         {
             owner.available = false;
             recovery_failures += 1;
@@ -2332,6 +2287,16 @@ pub async fn serve(
             StatusCode::SERVICE_UNAVAILABLE,
         );
     }
+    let recovery_broker = broker.clone();
+    let recovery_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(recovery_interval()).await;
+            if recovery_broker.stopping.load(Ordering::Acquire) {
+                break;
+            }
+            recover_unhealthy_owners(&recovery_broker).await;
+        }
+    });
     let app = Router::new()
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
@@ -2367,6 +2332,7 @@ pub async fn serve(
             }
         })
         .await?;
+    recovery_task.abort();
     let _drain = broker.work.clone().acquire_many_owned(128).await?;
     let owners: Vec<_> = broker
         .owners

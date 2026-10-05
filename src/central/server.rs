@@ -85,7 +85,7 @@ pub(super) enum TokenFailure {
     RefreshDisabled,
     UnsupportedRouting,
     Unavailable(anyhow::Error),
-    Retryable(anyhow::Error, bool),
+    Retryable(anyhow::Error),
 }
 
 pub(super) fn retry_clock_now() -> u64 {
@@ -119,7 +119,6 @@ pub(super) struct Owner {
     pub(super) key: PathBuf,
     pub(super) available: bool,
     pub(super) retryable_unavailable: bool,
-    pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
     pub(super) routing_refused: bool,
@@ -145,8 +144,7 @@ impl Owner {
             .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < 60_000)
     }
     pub(super) fn selectable(&self) -> bool {
-        (self.available || (self.retryable_unavailable && !self.retry_cooldown_active()))
-            && !self.routing_refused
+        self.available && !self.routing_refused
     }
     pub(super) fn fence(&mut self, retryable: bool) {
         self.available = false;
@@ -324,7 +322,7 @@ impl Owner {
                 && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                 && !error.is::<RoutingPolicyError>()
             {
-                return Err(TokenFailure::Retryable(error, false));
+                return Err(TokenFailure::Retryable(error));
             }
             return Err(error.into());
         }
@@ -366,10 +364,9 @@ impl Owner {
                             && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                             && !error.is::<RoutingPolicyError>() =>
                     {
-                        self.retry_requires_billing = true;
                         self.fence(true);
                         eprintln!("central owner refresh failed reason=owner_refresh_failed");
-                        return Err(TokenFailure::Retryable(error, true));
+                        return Err(TokenFailure::Retryable(error));
                     }
                     Err(error) => {
                         self.fence(false);
@@ -414,7 +411,7 @@ impl Owner {
                         && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                         && !error.is::<RoutingPolicyError>() =>
                 {
-                    return Err(TokenFailure::Retryable(error, false));
+                    return Err(TokenFailure::Retryable(error));
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -632,7 +629,7 @@ async fn tokens(
             TokenFailure::AccountMismatch => broker.error(StatusCode::BAD_REQUEST, "account_mismatch"),
             TokenFailure::RefreshDisabled => broker.error(StatusCode::CONFLICT, "refresh_disabled"),
             TokenFailure::UnsupportedRouting => broker.error(StatusCode::CONFLICT, "unsupported_workspace_routing"),
-            TokenFailure::Unavailable(error) | TokenFailure::Retryable(error, _) => {
+            TokenFailure::Unavailable(error) | TokenFailure::Retryable(error) => {
                 eprintln!("{}", json!({"operation":"token_request","stage":"owner","reason":"owner_unavailable","detail":error.to_string()}));
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
@@ -702,7 +699,6 @@ pub async fn serve(
         key: key.into(),
         available: true,
         retryable_unavailable: false,
-        retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
         routing_refused: false,

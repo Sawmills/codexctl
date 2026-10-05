@@ -424,7 +424,7 @@ impl Reader {
                 .await
                 .map_err(|error| match error {
                     super::server::TokenFailure::Unavailable(error)
-                    | super::server::TokenFailure::Retryable(error, _) => {
+                    | super::server::TokenFailure::Retryable(error) => {
                         error.context("refresh owner token request failed")
                     }
                     super::server::TokenFailure::AccountMismatch => {
