@@ -1222,6 +1222,146 @@ pub fn select(accounts: &[Account]) -> Result<String> {
     }).map(|a|a.alias.clone()).context("no available account with verified included usage; select an alias explicitly to approve credit billing")
 }
 
+/// Select an included account for a fresh `codexctl codex` launch.
+///
+/// Launches spread across the accounts that the server says are currently in
+/// use. Usage-based accounts and exhausted windows never enter this list.
+pub fn select_for_codex(accounts: &[Account]) -> Result<String> {
+    select_for_codex_excluding(accounts, &[])
+}
+
+fn select_for_codex_excluding(accounts: &[Account], excluded: &[String]) -> Result<String> {
+    accounts
+        .iter()
+        .filter(|account| {
+            !excluded
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(&account.alias))
+                && account.available
+                && account.live_sessions.is_some()
+                && !account.usage_stale
+                && account.billing_class == api::BillingClass::RateLimited
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .is_some()
+                && [account.primary_used, account.secondary_used]
+                    .into_iter()
+                    .flatten()
+                    .all(|used| used.is_finite() && used < 100.0)
+        })
+        .min_by(|left, right| {
+            left.live_sessions
+                .cmp(&right.live_sessions)
+                .then_with(|| {
+                    left.recent_429_rate
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&right.recent_429_rate.unwrap_or(f64::MAX))
+                })
+                .then_with(|| {
+                    left.usage_score
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&right.usage_score.unwrap_or(f64::MAX))
+                })
+                .then_with(|| left.alias.cmp(&right.alias))
+        })
+        .map(|account| account.alias.clone())
+        .context("no available included account with rate-limit headroom")
+}
+
+pub fn select_codex_account() -> Result<String> {
+    let catalog = catalog()?.context("codex launch requires a connected account server")?;
+    let mut accounts = catalog.accounts;
+    let rates = recent_429_rates(accounts.iter().map(|account| account.alias.as_str()));
+    for account in &mut accounts {
+        account.recent_429_rate = rates.get(&account.alias).copied();
+    }
+    select_for_codex(&accounts)
+}
+
+fn recent_429_rates<'a>(
+    aliases: impl IntoIterator<Item = &'a str>,
+) -> std::collections::BTreeMap<String, f64> {
+    let wanted: std::collections::BTreeSet<_> = aliases.into_iter().collect();
+    let Ok(report) = recent_429_report() else {
+        return std::collections::BTreeMap::new();
+    };
+    report
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let alias = row.get("account")?.as_str()?;
+            wanted
+                .contains(alias)
+                .then_some((alias.to_owned(), row.get("rate_429")?.as_f64()?))
+        })
+        .collect()
+}
+
+fn recent_429_report() -> Result<Value> {
+    use std::{io::Seek, os::unix::process::CommandExt, process::Stdio};
+
+    // A regular file cannot fill a pipe or wait for a descendant to close it.
+    let mut output = tempfile::tempfile()?;
+    let signals = native::LaunchSignals::register()?;
+    let result = (|| {
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["rate", "--json", "--minutes", "10"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let signal = signals.received();
+            if signal != 0 {
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                child.wait().context("reap cancelled rate collector")?;
+                bail!("rate collection cancelled");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        bail!("rate collection failed");
+                    }
+                    output.rewind()?;
+                    return serde_json::from_reader(output).context("invalid rate report");
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => {
+                    // Include rate's status/ps children, which may hold network or DB waits.
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    child.wait().context("reap rate collector")?;
+                    result.context("wait for rate collector")?;
+                    bail!("rate collection timed out");
+                }
+            }
+        }
+    })();
+    signals.reraise()?;
+    result
+}
+
+/// Find the next server account for a 429 recovery. This deliberately shares
+/// the fresh-launch ordering and never offers a reset as a recovery action.
+pub fn find_rate_limit_recovery_candidate(tried: &[String]) -> Result<Option<String>> {
+    let Some(catalog) = catalog()? else {
+        return Ok(None);
+    };
+    let mut accounts = catalog.accounts;
+    let rates = recent_429_rates(accounts.iter().map(|account| account.alias.as_str()));
+    for account in &mut accounts {
+        account.recent_429_rate = rates.get(&account.alias).copied();
+    }
+    Ok(select_for_codex_excluding(&accounts, tried).ok())
+}
+
 /// Plan a reset only after included headroom is unavailable. Spending is deferred
 /// until native activation has checked the home and account migration fences.
 pub(super) fn select_for_activation(

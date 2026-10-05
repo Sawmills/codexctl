@@ -201,6 +201,21 @@ Account selection during recovery:
   100%), it asks for confirmation before switching, and refuses on a non-interactive terminal.
   Pass `--allow-billing` to approve those switches without prompting (e.g. for unattended runs).
 
+When the account server is active, `codexctl codex` spreads a new launch across
+included accounts. It chooses the account with the fewest live token sessions,
+then the lowest recent 429 rate. Rate collection has a five-second timeout; if it
+times out, selection continues without 429 data. Usage-based accounts and exhausted windows are
+never selected automatically. The selected account is pinned to this child, so
+starting a new lane does not move existing sessions on the machine. If Codex stops after `exceeded retry limit, last
+status: 429`, codexctl resumes the same session on the next least-loaded included
+account, up to three recoveries per hour. A recovery keeps the original model,
+permissions, working directory, and other arguments. Automatic selection and
+429 recovery never redeem resets or select credit-billing accounts, even with
+`--allow-billing` or `--allow-resets`. Explicit `--account` keeps its billing policy.
+If no fresh included launch can be prepared, codexctl warns and launches the current
+account through the existing provider. This fallback keeps that account's existing
+approval; it does not grant new billing approval or redeem a reset.
+
 ### Pinned launches
 
 For one server-account lane, use `codexctl codex --account <alias> [codex args...]`,

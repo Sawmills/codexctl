@@ -3,7 +3,7 @@ use super::*;
 use std::io::IsTerminal;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -70,31 +70,85 @@ pub(super) fn require_live_launch(connection: &Path) -> Result<()> {
     }
 }
 
-struct LaunchSignals {
+const LAUNCH_SIGNALS: [i32; 3] = [libc::SIGHUP, libc::SIGTERM, libc::SIGINT];
+static SIGNAL_USERS: AtomicUsize = AtomicUsize::new(0);
+static SIGNAL_ACTIONS: OnceLock<std::io::Result<Vec<i32>>> = OnceLock::new();
+
+pub(crate) struct LaunchSignals {
     received: Arc<AtomicUsize>,
     handlers: Vec<signal_hook::SigId>,
+    active: bool,
 }
 impl LaunchSignals {
-    fn register() -> Result<Self> {
+    pub(crate) fn register() -> Result<Self> {
+        let watched = SIGNAL_ACTIONS
+            .get_or_init(|| {
+                let mut watched = Vec::new();
+                for signal in LAUNCH_SIGNALS {
+                    // signal-hook keeps its dispatcher after unregister. Keep one
+                    // default action when no guard exists, but preserve inherited
+                    // SIG_IGN (for example nohup) and handlers owned by other code.
+                    unsafe {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        if libc::sigaction(signal, std::ptr::null(), &mut action) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        // Installing even a flag handler replaces SIG_IGN with a
+                        // caught signal, which exec resets to SIG_DFL in children.
+                        if action.sa_sigaction == libc::SIG_IGN {
+                            continue;
+                        }
+                        if action.sa_sigaction == libc::SIG_DFL {
+                            signal_hook::low_level::register(signal, move || {
+                                if SIGNAL_USERS.load(Ordering::SeqCst) == 0 {
+                                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                                }
+                            })?;
+                        }
+                    }
+                    watched.push(signal);
+                }
+                Ok(watched)
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("cannot register default signal actions: {error}"))?;
         let mut signals = Self {
             received: Arc::new(AtomicUsize::new(0)),
             handlers: Vec::new(),
+            active: false,
         };
-        for signal in [libc::SIGHUP, libc::SIGTERM] {
+        for &signal in watched {
             signals.handlers.push(signal_hook::flag::register_usize(
                 signal,
                 signals.received.clone(),
                 signal as usize,
             )?);
         }
+        SIGNAL_USERS.fetch_add(1, Ordering::SeqCst);
+        signals.active = true;
         Ok(signals)
     }
-    fn received(&self) -> i32 {
+    pub(crate) fn received(&self) -> i32 {
         self.received.load(Ordering::Relaxed) as i32
+    }
+
+    pub(crate) fn reraise(self) -> Result<()> {
+        let received = Arc::clone(&self.received);
+        drop(self);
+        // Read after unregister so signals received during the final wait or
+        // teardown are not discarded. Remaining guards retain recovery signals.
+        let signal = received.load(Ordering::Relaxed) as i32;
+        if signal != 0 {
+            signal_hook::low_level::raise(signal)?;
+        }
+        Ok(())
     }
 }
 impl Drop for LaunchSignals {
     fn drop(&mut self) {
+        if self.active {
+            SIGNAL_USERS.fetch_sub(1, Ordering::SeqCst);
+        }
         for handler in &self.handlers {
             signal_hook::low_level::unregister(*handler);
         }
@@ -122,7 +176,7 @@ pub(super) fn require_headroom(alias: &str, token: &TokenResponse) -> Result<()>
     Ok(())
 }
 
-fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
+pub fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
     let mut config_args = Vec::new();
     let mut remaining = Vec::new();
     let mut args = args.iter();
@@ -137,7 +191,7 @@ fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
             || arg == "-p"
             || (arg.starts_with("-p") && arg.len() > 2)
         {
-            bail!("--account cannot be combined with a Codex profile override");
+            bail!("server account launches cannot be combined with a Codex profile override");
         }
         let config = if arg == "-c" || arg == "--config" {
             Some(
@@ -161,7 +215,7 @@ fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
                 || key.starts_with("profiles.")
             {
                 bail!(
-                    "--account cannot be combined with a provider or profile configuration override"
+                    "server account launches cannot be combined with a provider or profile configuration override"
                 );
             }
             config_args.extend(["-c".to_owned(), config.to_owned()]);
@@ -176,11 +230,111 @@ fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
     Ok(config_args)
 }
 
-/// Prepare consent and a private helper connection, then preserve the child exit status.
-/// Does not activate a provider, change the host pointer, or redeem resets.
-pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
+/// A private central connection and its launch lifetime guards.
+pub struct PinnedLaunch {
+    prepared: Option<tempfile::TempDir>,
+    _owner: vault::Lock,
+    lease: std::fs::File,
+    alias: String,
+    codex_args: Vec<String>,
+    signals: Arc<LaunchSignals>,
+}
+
+impl Drop for PinnedLaunch {
+    fn drop(&mut self) {
+        let Some(prepared) = self.prepared.take() else {
+            return;
+        };
+        if let Err(error) = close_launch(prepared) {
+            eprintln!("warning: failed to close private central launch: {error:#}");
+        }
+    }
+}
+
+impl PinnedLaunch {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn codex_args(&self) -> &[String] {
+        &self.codex_args
+    }
+
+    pub fn close(mut self) -> Result<()> {
+        self.revoke()
+    }
+
+    pub fn revoke(&mut self) -> Result<()> {
+        if let Some(prepared) = self.prepared.take() {
+            close_launch(prepared)?;
+        }
+        Ok(())
+    }
+
+    /// Replace a launch without losing signals received while choosing its successor.
+    pub fn replace(mut self, previous: Self) -> Result<Self> {
+        self.signals = Arc::clone(&previous.signals);
+        previous.close()?;
+        Ok(self)
+    }
+
+    pub fn received_signal(&self) -> i32 {
+        self.signals.received()
+    }
+
+    /// Spawn on a PTY while retaining the mode lease in the child after exec.
+    pub fn spawn_in_pty(
+        &self,
+        args: &[String],
+        cwd: &Path,
+        slave: &Path,
+    ) -> Result<std::process::Child> {
+        use std::os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, process::CommandExt},
+        };
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(slave)?;
+        let mut command = std::process::Command::new("codex");
+        command
+            .args(self.codex_args())
+            .args(pinned_arguments(args)?)
+            .env("CODEXCTL_PINNED_ALIAS", self.alias())
+            .current_dir(cwd)
+            .stdin(tty.try_clone()?)
+            .stdout(tty.try_clone()?)
+            .stderr(tty);
+        if std::env::var_os("TERM").is_none() {
+            command.env("TERM", "xterm-256color");
+        }
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(std::io::stdin().as_raw_fd(), libc::TIOCSCTTY as _, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        spawn_child_with_lease(&self.lease, &mut command)
+    }
+}
+
+/// Prepare an included-only private launch without changing the host pointer.
+pub fn prepare_included_codex(alias: &str) -> Result<PinnedLaunch> {
+    prepare_pinned_codex(alias, false, true)
+}
+
+fn prepare_pinned_codex(
+    alias: &str,
+    allow_billing: bool,
+    included_only: bool,
+) -> Result<PinnedLaunch> {
     store::validate_alias(alias)?;
-    let args = pinned_arguments(args)?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
@@ -195,16 +349,15 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             .is_some()
     {
         bail!(
-            "selected Codex profile overrides model_provider; remove that override before using --account"
+            "selected Codex profile overrides model_provider; remove that override before a server account launch"
         );
     }
     let paths = config::default_paths()?;
     let directory = root()?;
     sweep_stale_launches()?;
-    let signals = LaunchSignals::register()?;
     let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
     let catalog = super::super::remote::catalog()?
-        .context("--account requires a connected account server")?;
+        .context("server account launch requires a connected account server")?;
     let account = catalog
         .accounts
         .iter()
@@ -227,10 +380,17 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         launch_pinned: true,
         approved_billing_plan: None,
         approved_billing_class: None,
+        session_id: vault::digest(&super::super::enrollment::random_bytes()),
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
     let exhausted = is_exhausted(&token);
+    if included_only && token.billing_class != Some(api::BillingClass::RateLimited) {
+        bail!(
+            "server account {} no longer has verified included billing",
+            account.alias
+        );
+    }
     if !allow_billing {
         require_headroom(&account.alias, &token)?;
     }
@@ -263,7 +423,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
     connection.approved_billing_class = bills.then_some(token.billing_class).flatten();
     connection.revision = token.revision.clone();
-    let (prepared, _owner) = {
+    let (prepared, owner) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
         let _native = native_lock(&directory)?;
@@ -304,8 +464,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             .and_then(Item::as_integer)
             .unwrap_or(12)
     };
-    let mut command = std::process::Command::new("codex");
-    for override_value in [
+    let codex_args = [
         "model_provider=\"codexctl-central\"".to_owned(),
         // Replace the entire provider first, so stale API-key or header settings
         // cannot compete with this launch's explicit token helper.
@@ -329,22 +488,44 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         format!("model_providers.codexctl-central.auth.args={helper_args}"),
         "model_providers.codexctl-central.auth.refresh_interval_ms=60000".into(),
         "model_providers.codexctl-central.auth.timeout_ms=210000".into(),
-    ] {
-        command.args(["-c", &override_value]);
-    }
+    ]
+    .into_iter()
+    .flat_map(|value| ["-c".to_owned(), value])
+    .collect();
+    // Unregistering signal-hook handlers does not restore the default action.
+    // Leave fallback launches untouched when any preparation step fails.
+    let signals = Arc::new(LaunchSignals::register()?);
+    Ok(PinnedLaunch {
+        prepared: Some(prepared),
+        _owner: owner,
+        lease,
+        alias: account.alias.clone(),
+        codex_args,
+        signals,
+    })
+}
+
+/// Prepare consent and a private helper connection, then preserve the child exit status.
+/// Does not activate a provider, change the host pointer, or redeem resets.
+pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
+    let args = pinned_arguments(args)?;
+    let launch = prepare_pinned_codex(alias, allow_billing, false)?;
+    let mut command = std::process::Command::new("codex");
     command
+        .args(launch.codex_args())
         .args(args)
-        .env("CODEXCTL_PINNED_ALIAS", &account.alias);
-    if signals.received() != 0 {
-        close_launch(prepared)?;
-        return Ok(128 + signals.received());
+        .env("CODEXCTL_PINNED_ALIAS", launch.alias());
+    let signal = launch.received_signal();
+    if signal != 0 {
+        launch.close()?;
+        return Ok(128 + signal);
     }
-    let mut child = spawn_child_with_lease(&lease, &mut command)?;
+    let mut child = spawn_child_with_lease(&launch.lease, &mut command)?;
     loop {
-        let signal = signals.received();
+        let signal = launch.received_signal();
         if signal != 0 {
             // Revoke approval before forwarding the signal, even if Codex ignores it.
-            let cleanup = close_launch(prepared);
+            let cleanup = launch.close();
             // A filesystem or lock error must not strand the running child.
             // Keep that error until termination and reaping have been attempted.
             unsafe {
@@ -363,7 +544,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             return Ok(128 + signal);
         }
         if let Some(status) = child.try_wait()? {
-            close_launch(prepared)?;
+            launch.close()?;
             return Ok(status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
@@ -454,5 +635,18 @@ mod tests {
         assert!(require_headroom("premium", &token(Some(true), Some(false))).is_ok());
         assert!(require_headroom("premium", &token(None, None)).is_err());
         assert!(require_headroom("premium", &token(Some(true), Some(true))).is_err());
+    }
+
+    #[test]
+    fn pinned_arguments_preserve_user_args_without_dropping_provider_overrides() {
+        let args = vec![
+            "resume".to_owned(),
+            "session".to_owned(),
+            "-c".to_owned(),
+            "model=astra".to_owned(),
+        ];
+        let pinned = pinned_arguments(&args).unwrap();
+        assert_eq!(pinned, vec!["-c", "model=astra", "resume", "session"]);
+        assert!(pinned_arguments(&["--profile".to_owned(), "work".to_owned()]).is_err());
     }
 }

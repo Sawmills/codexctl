@@ -66,7 +66,18 @@ pub struct Account {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline_usage: Option<crate::statusline::Usage>,
+    /// Recent launch sessions, or None if the session store could not be read.
+    #[serde(default = "legacy_live_sessions")]
+    pub live_sessions: Option<usize>,
+    /// Recent 429 ratio reported by a client, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_429_rate: Option<f64>,
 }
+// Older account servers do not report load; preserve their zero-load tie-break.
+fn legacy_live_sessions() -> Option<usize> {
+    Some(0)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Import {
@@ -289,6 +300,8 @@ fn account_summary(owner: &Owner) -> Account {
             .as_ref()
             .and_then(|v| super::server::usage(v).ok())
             .and_then(|u| u.rate_limit.map(|r| r.availability_score())),
+        live_sessions: Some(0),
+        recent_429_rate: None,
     }
 }
 
@@ -1234,7 +1247,33 @@ async fn token(
     refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
-    broker.activity.delivered(&device, alias);
+    let session_id = headers
+        .get("x-codexctl-session")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("default");
+    // A client-supplied launch ID is unique only within its authenticated machine.
+    let session_id = format!("{}:{}:{session_id}", device.id.len(), device.id);
+    broker
+        .activity
+        .delivered(&device, alias.clone(), session_id.clone());
+    if let Some(central) = broker.central.as_ref()
+        && let Err(error) = central
+            .record_live_session(
+                &account_key(&device.user, &alias),
+                &device.user,
+                &alias,
+                &session_id,
+            )
+            .await
+    {
+        broker.record_failure(
+            "live_session_failed",
+            "live_session",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+        eprintln!("central live-session observation failed: {error:#}");
+    }
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
@@ -1301,8 +1340,10 @@ pub(super) async fn account_catalog(
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
+    let user = user.to_owned();
     let tasks = owners.into_iter().map(|(key, owner)| {
         let broker = broker.clone();
+        let user = user.clone();
         tokio::spawn(async move {
             // Copy only the access credential. Listing never snapshots, refreshes,
             // persists, or changes the credential owner's availability.
@@ -1350,6 +1391,30 @@ pub(super) async fn account_catalog(
                 summary.billing_class = api::BillingClass::Unknown;
                 summary.credits = None;
                 summary.usage_score = None;
+            }
+            summary.live_sessions = Some(broker.activity.live_sessions(
+                &user,
+                &summary.alias,
+                10 * 60,
+            ));
+            if let Some(central) = broker.central.as_ref()
+                && central.mode() != super::storage::StoreMode::File
+            {
+                match central
+                    .live_session_count(&key, std::time::Duration::from_secs(10 * 60))
+                    .await
+                {
+                    Ok(count) => summary.live_sessions = Some(count),
+                    Err(error) => {
+                        broker.record_failure(
+                            "live_session_failed",
+                            "live_session",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                        eprintln!("central live session count: {error:#}");
+                        summary.live_sessions = None;
+                    }
+                }
             }
             summary
         })
@@ -2725,6 +2790,7 @@ pub async fn serve(
                 "reset_auth_rejected",
                 "catalog_usage_failed",
                 "catalog_usage_timeout",
+                "live_session_failed",
                 "catalog_task_failed",
                 "persistence_failed",
                 "registry_unavailable",

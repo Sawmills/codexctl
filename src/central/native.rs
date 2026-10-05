@@ -17,8 +17,11 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
+pub(super) use launch::LaunchSignals;
+#[cfg(feature = "central-prototype")]
+pub use launch::pinned_arguments;
 pub(super) use launch::sweep_stale_launches;
-pub use launch::{launch_owners, run_pinned_codex};
+pub use launch::{PinnedLaunch, launch_owners, prepare_included_codex, run_pinned_codex};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
@@ -85,6 +88,8 @@ struct Connection {
     approved_billing_plan: Option<String>,
     #[serde(default)]
     approved_billing_class: Option<api::BillingClass>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    session_id: String,
 }
 #[derive(Serialize, Deserialize)]
 struct Activation {
@@ -691,6 +696,19 @@ fn spawn_child_with_lease(
     command.spawn().context("Codex process failed to run")
 }
 
+/// Whether this home's active provider is the account server.
+pub fn central_active() -> Result<bool> {
+    let paths = config::default_paths()?;
+    let marker = paths.codexctl_dir().join("central/.native-active.json");
+    if !marker.try_exists()? {
+        return Ok(false);
+    }
+    Ok(document(&paths.codex_home())?
+        .get("model_provider")
+        .and_then(Item::as_str)
+        == Some(PROVIDER))
+}
+
 /// Launch the active server account without restoring a resumed thread's old provider.
 /// Local account launches remain the caller's responsibility.
 pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
@@ -730,7 +748,7 @@ pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
     let mut command = std::process::Command::new("codex");
     command
         .args(["-c", "model_provider=\"codexctl-central\""])
-        .args(args);
+        .args(pinned_arguments(args)?);
     let status = run_child_with_lease(&lease, &mut command)?;
     Ok(Some(
         status
@@ -749,7 +767,7 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     super::transport::origin(&connection.server)?;
     let secret = String::from_utf8(vault::private_read(&connection.device_token_file)?)?;
     let http = super::transport::blocking()?;
-    let response = http
+    let mut request = http
         .post(format!(
             "{}/v1/token",
             connection.server.trim_end_matches('/')
@@ -761,9 +779,11 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
             account_id: (!connection.account_id.is_empty()).then(|| connection.account_id.clone()),
             billing: true,
             alias: connection.alias.clone(),
-        })
-        .send()
-        .context("central token request failed")?;
+        });
+    if !connection.session_id.is_empty() {
+        request = request.header("x-codexctl-session", &connection.session_id);
+    }
+    let response = request.send().context("central token request failed")?;
     let status = response.status();
     if !status.is_success() {
         if status == reqwest::StatusCode::CONFLICT
@@ -821,6 +841,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         launch_pinned: false,
         approved_billing_plan: None,
         approved_billing_class: None,
+        session_id: String::new(),
     };
     drop(_lock);
     let token = fetch(&connection, false)?;
@@ -1493,6 +1514,7 @@ pub(super) fn sync_account(
             launch_pinned: false,
             approved_billing_plan: None,
             approved_billing_class: None,
+            session_id: String::new(),
         },
     )
 }
@@ -1681,6 +1703,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();
@@ -1911,6 +1934,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         }
     }
 
@@ -2001,6 +2025,7 @@ mod tests {
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();

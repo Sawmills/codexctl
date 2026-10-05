@@ -167,6 +167,32 @@ CREATE TABLE IF NOT EXISTS account_refresh_leases (
     epoch BIGINT NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS account_live_sessions (
+    account_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY (account_id, device_id)
+);
+ALTER TABLE account_live_sessions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conrelid='account_live_sessions'::regclass
+        AND conname='account_live_sessions_account_id_fkey' AND confdeltype='c') THEN
+        ALTER TABLE account_live_sessions DROP CONSTRAINT account_live_sessions_account_id_fkey;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conrelid='account_live_sessions'::regclass
+        AND conname='account_live_sessions_account_id_fkey') THEN
+        ALTER TABLE account_live_sessions
+            ADD CONSTRAINT account_live_sessions_account_id_fkey
+            FOREIGN KEY (account_id) REFERENCES central_accounts(account_id);
+    END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
+    ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
     challenge_hash TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
@@ -598,6 +624,35 @@ impl CentralStore {
         }
     }
 
+    pub async fn record_live_session(
+        &self,
+        account_id: &str,
+        user_id: &str,
+        alias: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        match self {
+            Self::File(file) => file.record_live_session(account_id, user_id, alias, device_id),
+            Self::Postgres(db) => {
+                bounded_db(db.record_live_session(account_id, user_id, alias, device_id)).await
+            }
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.record_live_session(account_id, user_id, alias, device_id))
+                    .await
+            }
+        }
+    }
+
+    pub async fn live_session_count(&self, account_id: &str, window: Duration) -> Result<usize> {
+        match self {
+            Self::File(file) => file.live_session_count(account_id, window),
+            Self::Postgres(db) => bounded_db(db.live_session_count(account_id, window)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.live_session_count(account_id, window)).await
+            }
+        }
+    }
+
     pub async fn acquire_lease(
         &self,
         account_id: &str,
@@ -829,6 +884,20 @@ impl FileStore {
         let plain = serde_json::to_vec(state)?;
         let encrypted = vault::encrypt_bytes(&self.key, &plain)?;
         crate::store::atomic_write(&self.path(), &encrypted)
+    }
+
+    fn record_live_session(
+        &self,
+        _account_id: &str,
+        _user_id: &str,
+        _alias: &str,
+        _device_id: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn live_session_count(&self, _account_id: &str, _window: Duration) -> Result<usize> {
+        Ok(0)
     }
 
     fn with_lock<T>(&self, f: impl FnOnce(&mut FileState) -> Result<T>) -> Result<T> {
@@ -1466,6 +1535,35 @@ impl PostgresStore {
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
 
+    async fn record_live_session(
+        &self,
+        account_id: &str,
+        user_id: &str,
+        alias: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let client = self.client().await?;
+        client
+            .execute(
+                "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen,deleted_at) VALUES($1,$2,$3,$4,now(),NULL) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen WHERE account_live_sessions.deleted_at IS NULL",
+                &[&account_id, &user_id, &alias, &device_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn live_session_count(&self, account_id: &str, window: Duration) -> Result<usize> {
+        let client = self.client().await?;
+        let row = client
+            .query_one(
+                "SELECT COUNT(*)::BIGINT FROM account_live_sessions WHERE account_id=$1 AND deleted_at IS NULL AND last_seen >= now()-($2::bigint * interval '1 second')",
+                &[&account_id, &(window.as_secs() as i64)],
+            )
+            .await?;
+        let count: i64 = row.get(0);
+        usize::try_from(count).context("live session count overflow")
+    }
+
     async fn load_account_by_alias(
         &self,
         user_id: &str,
@@ -1785,6 +1883,18 @@ mod tests {
             .await
             .unwrap();
         first.migrate().await.unwrap();
+        if let CentralStore::Postgres(db) = &first {
+            let client = db.client().await.unwrap();
+            let query = "SELECT oid FROM pg_constraint WHERE conrelid='account_live_sessions'::regclass AND conname='account_live_sessions_account_id_fkey'";
+            let before: u32 = client.query_one(query, &[]).await.unwrap().get(0);
+            first.migrate().await.unwrap();
+            let after: u32 = client.query_one(query, &[]).await.unwrap().get(0);
+            assert_eq!(
+                before, after,
+                "startup must not rebuild a valid live-session foreign key"
+            );
+        }
+
         let legacy_state = root.path().join("accounts").join("legacy-seat");
         crate::store::ensure_private_dir(&legacy_state).unwrap();
         let legacy_vault = crate::central::vault::Vault {
@@ -1814,6 +1924,52 @@ mod tests {
             vault::digest(&crate::central::enrollment::random_bytes())
         );
         first.save_account(&record(&id, 1)).await.unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-b")
+            .await
+            .unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .live_session_count(&id, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            2
+        );
+        if let CentralStore::Postgres(db) = &first {
+            assert!(
+                db.client()
+                    .await
+                    .unwrap()
+                    .execute("DELETE FROM central_accounts WHERE account_id=$1", &[&id])
+                    .await
+                    .is_err(),
+                "session rows must not cascade-delete with their account"
+            );
+            db.client().await.unwrap().execute(
+                "UPDATE account_live_sessions SET deleted_at=now() WHERE account_id=$1 AND device_id='launch-a'",
+                &[&id],
+            ).await.unwrap();
+        }
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .live_session_count(&id, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1,
+            "a routine heartbeat must not restore a tombstoned session"
+        );
         let (a, b) = tokio::join!(
             first.acquire_lease(&id, "a", Duration::from_secs(60)),
             second.acquire_lease(&id, "b", Duration::from_secs(60))
@@ -1921,6 +2077,13 @@ mod tests {
             client
                 .execute(
                     "DELETE FROM account_refresh_leases WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "DELETE FROM account_live_sessions WHERE account_id=$1",
                     &[&id],
                 )
                 .await

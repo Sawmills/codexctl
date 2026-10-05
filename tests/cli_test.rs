@@ -917,3 +917,55 @@ fn list_json_keeps_local_metadata_without_reading_credentials() {
         }]})
     );
 }
+
+#[test]
+fn local_codex_preserves_split_utf8_and_does_not_recover_429() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("codex");
+    std::fs::write(
+        &script,
+        br#"#!/usr/bin/env python3
+import os, termios, time
+settings = termios.tcgetattr(1)
+settings[1] &= ~termios.OPOST
+termios.tcsetattr(1, termios.TCSANOW, settings)
+for part in [b'\xe2', b'\x94', b'\x82 split\r', b'\n', b'\rX\r']:
+    os.write(1, part)
+    time.sleep(0.03)
+os.write(1, '\n\u2502 exceeded retry limit, last status: 429 \u2502\n'.encode())
+time.sleep(0.1)
+os.write(1, b'local child completed\n')
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let auth = home.path().join(".codex/auth.json");
+    std::fs::create_dir(auth.parent().unwrap()).unwrap();
+    std::fs::write(&auth, b"{}").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = Command::cargo_bin("codexctl")
+        .unwrap()
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .args(["codex", "a prompt"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "│ split\n\rX\n│ exceeded retry limit, last status: 429 │\nlocal child completed\n"
+    );
+    assert_eq!(std::fs::read(auth).unwrap(), b"{}");
+}
