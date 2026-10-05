@@ -745,8 +745,12 @@ async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<Crede
         rpc.settle_and_stop().await?;
     }
     owner.snapshot()?;
-    if owner.vault.auth != before.auth {
-        owner.vault.revision = before.revision.saturating_add(1).max(1);
+    if serde_json::to_value(&owner.vault)? != serde_json::to_value(before)? {
+        owner.vault.revision = owner
+            .vault
+            .revision
+            .max(before.revision.saturating_add(1))
+            .max(1);
     }
     vault::save(&owner.state, &owner.key, &owner.vault)?;
     let record = Broker::owner_record(owner)?;
@@ -1509,6 +1513,23 @@ async fn import(
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
+    async fn lock_import_owner<'a>(
+        &self,
+        owner: &'a Mutex<Owner>,
+    ) -> Result<tokio::sync::MutexGuard<'a, Owner>, HttpError> {
+        let owner = if self.central.is_some() {
+            owner
+                .try_lock()
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress"))?
+        } else {
+            owner.lock().await
+        };
+        if owner.import_settling {
+            return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress"));
+        }
+        Ok(owner)
+    }
+
     async fn import_account(&self, user: &str, mut input: Import) -> Result<Account, HttpError> {
         let permit = self
             .work
@@ -1541,7 +1562,7 @@ impl Broker {
         // Inventory journals before filtering by a vault identity. A failed refresh
         // can leave a different seat in the journal while its vault stays unchanged.
         for (_, owner) in owners.values() {
-            let mut owner = owner.lock().await;
+            let mut owner = self.lock_import_owner(owner).await?;
             let inventory = async {
                 let inventory = relogin::identity_inventory(
                     &owner.state,
@@ -1596,7 +1617,7 @@ impl Broker {
             if key == &id {
                 continue;
             }
-            let mut owner = owner.lock().await;
+            let mut owner = self.lock_import_owner(owner).await?;
             let same = vault::account(&owner.vault.auth).ok() == vault::account(&input.auth).ok()
                 && api::token_subject(vault::token(&owner.vault.auth).unwrap_or(""))
                     == api::token_subject(vault::token(&input.auth).unwrap_or(""));
@@ -1652,7 +1673,7 @@ impl Broker {
             },
         )?;
         if let Some((_, owner)) = owners.get(&id) {
-            let mut owner = owner.lock().await;
+            let mut owner = self.lock_import_owner(owner).await?;
             let original_uid = api::token_identity(vault::token(&owner.vault.auth).unwrap_or(""))
                 .and_then(|identity| identity.user_id);
             let incoming_uid = api::token_identity(vault::token(&input.auth).unwrap_or(""))
@@ -1949,6 +1970,9 @@ impl Broker {
             Ok(account_summary(&owner))
         }
         .await;
+        let restore_after_settlement = before.verified
+            && !owner.routing_refused
+            && !owner.rpc.as_ref().is_some_and(Rpc::rejected_login);
         if verification.is_err() {
             owner.available = false;
             if verification_required {
@@ -1969,23 +1993,28 @@ impl Broker {
         }
         if verification.is_err() && verification_lease.is_some() {
             fence_background_owner(&mut owner);
+            owner.import_settling = true;
             drop(owner);
-            // Import already runs in a disconnect-safe task. Keep admission
-            // serialized until settlement, so a retry cannot replace this
-            // owner's journal while its lease still protects unpublished auth.
-            settle_background_recovery(
-                owner_ref,
-                self.central.clone(),
-                verification_lease,
-                before,
-                false,
-                recovery_generation,
-                permit,
-                renew_done,
-                renew_task,
-                self.stopping.clone(),
-            )
-            .await;
+            let central = self.central.clone();
+            let stopping = self.stopping.clone();
+            // Keep a per-owner reservation while settlement runs independently.
+            // Other accounts must not wait for this import's native child or DB.
+            tokio::spawn(async move {
+                settle_background_recovery(
+                    owner_ref.clone(),
+                    central,
+                    verification_lease,
+                    before,
+                    restore_after_settlement,
+                    recovery_generation,
+                    permit,
+                    renew_done,
+                    renew_task,
+                    stopping,
+                )
+                .await;
+                owner_ref.lock().await.import_settling = false;
+            });
         } else {
             if let (Some(central), Some(lease)) =
                 (self.central.as_ref(), verification_lease.as_ref())
@@ -2256,6 +2285,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         limits: None,
         limits_observed: None,
         verification_input: None,
+        import_settling: false,
         #[cfg(test)]
         retry_clock: None,
     };
@@ -2858,6 +2888,7 @@ pub async fn serve(
                     limits: None,
                     limits_observed: None,
                     verification_input: None,
+                    import_settling: false,
                     #[cfg(test)]
                     retry_clock: None,
                 }

@@ -727,6 +727,38 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
         "import retry must start from the latest shared credential"
     );
 
+    store::atomic_write(&importer.root.path().join("mode"), b"startup-error").unwrap();
+    let failed_retry = http
+        .post(format!("{}/v1/accounts", importer.url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"seat","auth":auth("synthetic-seat")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed_retry.status(), 503);
+    store::atomic_write(&importer.root.path().join("mode"), b"startup").unwrap();
+    let restored = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&http, &importer, &token).await;
+            if response.status() == 200 {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed verified import must not permanently fence the account");
+    assert_eq!(generation(&restored.json::<Value>().await.unwrap()), 9);
+
+    control
+        .batch_execute(&format!(
+            "CREATE FUNCTION {schema}.fail_import_write() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'synthetic import write failure'; END $$;
+         CREATE TRIGGER fail_import_write BEFORE UPDATE ON {schema}.central_accounts
+         FOR EACH ROW WHEN (NEW.alias = 'failed') EXECUTE FUNCTION {schema}.fail_import_write();"
+        ))
+        .await
+        .unwrap();
     std::fs::remove_file(importer.root.path().join("exited")).unwrap();
     store::atomic_write(&importer.root.path().join("mode"), b"startup-error").unwrap();
     let failed = http
@@ -744,6 +776,28 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
     })
     .await
     .expect("failed import must stop its refresh child");
+    store::atomic_write(&importer.root.path().join("mode"), b"startup").unwrap();
+    let other = timeout(Duration::from_secs(2), request(&http, &importer, &token))
+        .await
+        .expect("pending import settlement blocked another account");
+    assert_eq!(other.status(), 200);
+    let busy = timeout(
+        Duration::from_secs(2),
+        http.post(format!("{}/v1/accounts", importer.url))
+            .bearer_auth(&token)
+            .json(&json!({"alias":"failed","auth":auth("failed-seat")}))
+            .send(),
+    )
+    .await
+    .expect("pending import retry blocked instead of refusing")
+    .unwrap();
+    assert_eq!(busy.status(), 503);
+    control
+        .batch_execute(&format!(
+            "DROP TRIGGER fail_import_write ON {schema}.central_accounts"
+        ))
+        .await
+        .unwrap();
     let retried = timeout(Duration::from_secs(5), async {
         loop {
             let response = http
@@ -776,6 +830,39 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
         4,
         "failed import must persist initialization rotation before retry"
     );
+    store::atomic_write(&importer.root.path().join("mode"), b"cached-rejection").unwrap();
+    let mut rejected_auth = auth("rejected-seat");
+    rejected_auth["tokens"]["refresh_token"] = json!("synthetic-rejected-refresh");
+    let rejected = timeout(
+        Duration::from_secs(5),
+        http.post(format!("{}/v1/accounts", importer.url))
+            .bearer_auth(&token)
+            .json(&json!({"alias":"rejected","auth":rejected_auth}))
+            .send(),
+    )
+    .await
+    .expect("unchanged rejected grant must not hang settlement")
+    .unwrap();
+    assert_eq!(rejected.status(), 503);
+    store::atomic_write(&importer.root.path().join("mode"), b"startup").unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = http
+                .post(format!("{}/v1/accounts", importer.url))
+                .bearer_auth(&token)
+                .json(&json!({"alias":"rejected","auth":auth("rejected-seat")}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 200 {
+                break;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("rejected grant must settle so a replacement can be verified");
     importer.stop().await;
     peer.stop().await;
     control

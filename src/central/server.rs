@@ -128,6 +128,7 @@ pub(super) struct Owner {
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
+    pub(super) import_settling: bool,
     #[cfg(test)]
     pub(super) retry_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
 }
@@ -717,6 +718,7 @@ pub async fn serve(
         limits: None,
         limits_observed: None,
         verification_input: None,
+        import_settling: false,
         #[cfg(test)]
         retry_clock: None,
     };
