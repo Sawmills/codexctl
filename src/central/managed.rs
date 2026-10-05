@@ -913,7 +913,15 @@ async fn token(
         } else {
             None
         };
-        let mut owner = owner_ref.lock().await;
+        let mut owner = if import_guard.is_some() {
+            // A same-account waiter must not hold the replica-wide admission
+            // lock across another request's child lifecycle.
+            owner_ref.try_lock().map_err(|_| {
+                worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+            })?
+        } else {
+            owner_ref.lock().await
+        };
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }

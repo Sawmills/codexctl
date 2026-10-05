@@ -22,6 +22,13 @@ before releasing the lease. Failed initialization retains the lease until the
 child stops and its journal is persisted. Background recovery uses the same
 stop-and-persist rule. File-mode startup keeps its existing refresh owners.
 
+If a child never settles or its journal stays unreadable, the broker retains the
+lease and fences that account. Graceful shutdown waits for this work. It can
+exceed the Deployment's 60-second termination allowance; forced pod termination
+can lose an unpublished rotation. Preserve the pod and its journal for recovery
+when settlement errors persist. This change does not provide durable recovery
+from forced pod loss during an unfinished refresh.
+
 The HA Deployment allows up to five minutes for startup through `/health` before
 liveness checks begin. This allowance covers database hydration and registry setup.
 

@@ -239,6 +239,14 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         })
         .await
         .expect("leased initialize did not start");
+        let same_account = timeout(Duration::from_secs(2), request(&http, &pods[0], &token))
+            .await
+            .expect("same-account waiter must not hold the replica import lock");
+        assert_eq!(same_account.status(), 503);
+        assert_eq!(
+            same_account.json::<Value>().await.unwrap()["error"],
+            "refresh_in_progress"
+        );
         let other = timeout(
             Duration::from_secs(2),
             http.post(format!("{}/v1/token", pods[0].url))
