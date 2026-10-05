@@ -1738,6 +1738,16 @@ impl Broker {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
+            if self
+                .central
+                .as_ref()
+                .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+            {
+                // Requests may already hold this Arc while waiting for imports.
+                // Retire it before replacement so an orphan cannot reenter the
+                // holder's lease or be reopened by an older recovery task.
+                owner.fence(false);
+            }
             // Keep the reservation until the prepared replacement is inserted below.
             // Validation or preparation can still fail after this owner has stopped.
         }

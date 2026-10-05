@@ -572,6 +572,85 @@ async fn pending_background_settlement_cannot_reacquire_its_own_lease() {
     }
 }
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "startup")
+        .await;
+    let old_owners = fixture.broker.owners.read().await.clone();
+    let old_owner = old_owners["fixture"].1.clone();
+    let auth = old_owner.lock().await.vault.auth.clone();
+    fixture
+        .broker
+        .import_account(
+            "test",
+            Import {
+                alias: "fixture".into(),
+                label: None,
+                auth,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("verified reimport must succeed"));
+    assert!(!Arc::ptr_eq(
+        &old_owner,
+        &fixture.broker.owners.read().await["fixture"].1
+    ));
+    let count = std::fs::read_to_string(fixture._root.path().join("count")).unwrap();
+    // A request can resolve the old Arc before waiting for import admission.
+    // Keep that exact registry snapshot and exercise the public token handler.
+    let current = fixture.broker.owners.clone();
+    fixture.broker.owners = Arc::new(RwLock::new(old_owners));
+    assert_eq!(
+        fixture.token().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the replaced owner must never regain the same-holder database lease"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        count,
+        "the orphan must not refresh credentials"
+    );
+    fixture.broker.owners = current;
+    assert_eq!(
+        fixture.token().await,
+        StatusCode::OK,
+        "the replacement remains usable"
+    );
+    let drained = fixture
+        .broker
+        .session_writes
+        .clone()
+        .acquire_many_owned(32)
+        .await
+        .unwrap();
+    central.settle_test_observations().await.unwrap();
+    drop(drained);
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
     let response = accounts(State(broker), headers)
         .await
