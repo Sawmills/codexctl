@@ -34,6 +34,12 @@ codexctl list --json
       "resets_redeemable": 1,
       "resets_next_expiry": "2099-12-31T00:00:00Z",
       "billing_class": "rate_limited",
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": "12.50",
+        "overage_limit_reached": false
+      },
       "error": null,
       "usage_age_seconds": 12,
       "usage_stale": false
@@ -42,8 +48,9 @@ codexctl list --json
 }
 ```
 
-Every listed field is present in every account row.
+Every listed field except `credits` is present in every account row.
 Unknown values are `null`, except `billing_class`, which uses `unknown`.
+The optional `credits` object is omitted when upstream credits data is absent or null.
 An empty result is `{"version":1,"accounts":[]}`.
 
 - `alias`: The profile or server account alias.
@@ -69,12 +76,18 @@ An empty result is `{"version":1,"accounts":[]}`.
 - `resets_next_expiry`: RFC 3339 UTC expiry of the soonest redeemable banked reset, or `null` when no credit listing is available or no credit can be redeemed.
 - `billing_class`: `rate_limited`, `usage_based`, or `unknown`.
   Failed requests keep unknown billing, regardless of the table's display group.
+- `credits`: The reported credits object, when available.
+  `has_credits`, `unlimited`, and `overage_limit_reached` are booleans.
+  `balance` is the upstream balance string, or `null` when unknown.
+  Reported zero balances and false flags remain present.
+  Older account servers omit credits; upgrade the server to expose them.
 - `error`: A brief account error, or `null`.
   Server accounts marked unavailable use `account unavailable` because the catalog supplies no detailed cause.
 
 - `usage_age_seconds`: Age of the last successful server usage observation, or `null` when unknown or local.
 - `usage_stale`: Whether server usage is stale or missing, or `null` for local rows.
   Stale server rows retain the last usage values and include an `error`; consumers must treat their quota as unknown.
+  Their credits object is omitted to avoid presenting stale balances as current.
 
 Older account servers omit the duration fields and short-window reset time.
 Their rows report `null` for those values while retaining the known long-window reset time.
@@ -89,10 +102,12 @@ Changes to existing field types or meanings require a new version.
 ## Fetch and Failure Behavior
 
 JSON output uses the same data fetch as table output.
-It adds no upstream requests and does not change the account server.
+It adds no upstream requests.
 Local `list --json` reads metadata only, so usage stays `null` and billing stays `unknown`.
+Its credits object is omitted.
 Connected `list --json` includes the catalog usage and any unmigrated profile usage that the table already fetches.
-The schema reports the main Codex windows, not additional named limits, credits, or banked resets.
+The schema reports the main Codex windows, credits, and banked reset inventory.
+Additional named limits are excluded.
 It does not expose tokens, credentials, or workspace identifiers.
 
 `--rate-limited` and `--usage-based` retain the table's filter behavior.

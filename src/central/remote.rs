@@ -671,15 +671,7 @@ fn usage_cells(usage: &api::RateLimitResponse) -> Vec<String> {
                 .and_then(api::RateLimit::long_window)
                 .and_then(api::RateLimitWindow::reset_timestamp),
         ),
-        usage
-            .credits
-            .as_ref()
-            .and_then(|c| c.balance.as_deref())
-            .map(|balance| match balance.parse::<f64>() {
-                Ok(value) if value.is_finite() => format!("{value:.2}"),
-                _ => balance.to_owned(),
-            })
-            .unwrap_or_else(|| "-".into()),
+        crate::status_json::format_credits(usage.credits.as_ref()),
     ]
 }
 
@@ -865,7 +857,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     percentage(account.secondary_used),
                     reset_time(account.resets_at),
                     reset_cell,
-                    "-".into(),
+                    crate::status_json::format_credits(account.credits.as_ref()),
                     state.into(),
                     if account.usage_stale {
                         match account.usage_age_seconds {
@@ -903,6 +895,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     secondary_resets_at: status_json::timestamp(account.resets_at),
                     resets_at: status_json::timestamp(account.resets_at),
                     billing_class: account.billing_class,
+                    credits: account.credits.clone(),
                     error: if !account.available {
                         Some("account unavailable".into())
                     } else if account.usage_stale {
@@ -941,20 +934,11 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
             "Long used",
             "Window resets",
             "Resets",
-            "Balance",
+            "Credits",
             "State",
             "Error",
         ];
-        let columns: Vec<_> = (0..headers.len())
-            .filter(|&i| {
-                (show_usage || !(3..=7).contains(&i))
-                    && (i == 0
-                        || i == 8
-                        || server_rows
-                            .iter()
-                            .any(|row| !row.cells[i].trim().is_empty() && row.cells[i] != "-"))
-            })
-            .collect();
+        let columns = status_columns(&server_rows, show_usage);
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
         table.set_header(columns.iter().map(|&i| headers[i]));
@@ -981,6 +965,19 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
         println!("No server accounts yet. Run codexctl migrate --all on your source machine.");
     }
     Ok(true)
+}
+
+fn status_columns(rows: &[DisplayRow], show_usage: bool) -> Vec<usize> {
+    (0..10)
+        .filter(|&i| {
+            (show_usage || !(3..=7).contains(&i))
+                && (i == 0
+                    || i == 8
+                    || rows
+                        .iter()
+                        .any(|row| !row.cells[i].trim().is_empty() && row.cells[i] != "-"))
+        })
+        .collect()
 }
 
 fn display_alias(alias: &str, is_active: bool) -> String {
@@ -1536,7 +1533,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(usage_cells(&usage), ["-", "37%", "-", "12.50"]);
+        assert_eq!(usage_cells(&usage), ["-", "37%", "-", "$12.50 available"]);
     }
     #[test]
     fn connected_local_balance_is_short() {
@@ -1545,7 +1542,32 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(usage_cells(&usage)[3], "55835.54");
+        assert_eq!(usage_cells(&usage)[3], "$55835.54 available");
+    }
+
+    #[test]
+    fn server_status_hides_credits_without_data_and_shows_it_with_data() {
+        let row = |credit: &str| DisplayRow {
+            cells: vec![
+                "alias".into(),
+                "-".into(),
+                "pro".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                "-".into(),
+                credit.into(),
+                "server".into(),
+                "-".into(),
+            ],
+            billing: api::BillingClass::RateLimited,
+            account: status_json::AccountStatus::local(&profile::Meta::default(), false),
+            resets_redeemable: false,
+        };
+
+        assert!(!status_columns(&[row("-")], true).contains(&7));
+        assert!(status_columns(&[row("$12.50 available")], true).contains(&7));
+        assert!(!status_columns(&[row("$12.50 available")], false).contains(&7));
     }
 
     #[test]

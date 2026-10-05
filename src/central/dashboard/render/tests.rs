@@ -35,6 +35,24 @@ fn renders_every_account_and_machine_state_with_the_right_action() {
 }
 
 #[test]
+fn renders_credit_details_for_accounts_that_report_them() {
+    let mut data = fixture();
+    data.accounts[0].credits = Some(crate::api::Credits {
+        has_credits: true,
+        unlimited: false,
+        balance: Some("12.50".into()),
+        overage_limit_reached: true,
+    });
+
+    let html = overview(&data);
+
+    assert!(html.contains("Credits"));
+    assert!(html.contains("<div class=\"credits\"><b>Balance $12.50</b>"));
+    assert!(html.contains("has credits: true; unlimited: false; overage limit reached: true"));
+    assert!(html.contains("<span class=\"credits unknown\">Unknown</span>"));
+}
+
+#[test]
 fn recommendation_follows_no_bill_threshold_reset_and_score_order() {
     let base = fixture().accounts[0].clone();
     let mut accounts = vec![base.clone(); 5];

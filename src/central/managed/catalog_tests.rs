@@ -73,7 +73,7 @@ impl Fixture {
                         if headers.get("chatgpt-account-id").and_then(|v| v.to_str().ok()) != Some("synthetic-seat") { return StatusCode::BAD_REQUEST.into_response(); }
                         Json(json!({"plan_type":"promax","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":100,"limit_window_seconds":604800}},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0}})).into_response()
                     } else {
-                        Json(json!({"plan_type":"pro","rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
+                        Json(json!({"plan_type":"pro","credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},"rate_limit_reset_credits":{"available_count":2,"applicable_available_count":0},"rate_limit":{"primary":{"used_percent":25,"window_minutes":300}}})).into_response()
                     }
                 }
             }
@@ -370,7 +370,7 @@ async fn b8_expired_cache_refreshes_once_and_reports_age() {
 #[tokio::test]
 async fn b8_failed_refresh_retains_stale_usage_without_selection_permission() {
     let fixture = Fixture::new(Duration::from_secs(2)).await;
-    fixture.list().await;
+    assert_eq!(fixture.list().await["credits"]["balance"], "0");
     fixture.broker.catalog.expire().await;
     fixture.fail.store(true, Ordering::SeqCst);
 
@@ -385,6 +385,7 @@ async fn b8_failed_refresh_retains_stale_usage_without_selection_permission() {
         (json!(25.0), json!(true), json!(true))
     );
     assert!(stale["usageAgeSeconds"].as_u64().unwrap() >= 60);
+    assert!(stale.get("credits").is_none());
     assert_eq!(
         (
             stale["billingClass"].clone(),
@@ -581,6 +582,7 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
         assert!(!body.contains("private-reset-id"));
         let data: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(data["accounts"][0]["banked_resets"]["count"], 2);
+        assert_eq!(data["accounts"][0]["credits"]["balance"], "0");
         assert_eq!(data["accounts"][0]["banked_resets"]["redeemable_now"], 0);
         assert_eq!(
             data["accounts"][0]["banked_resets"]["nearest_expiry"],
@@ -616,6 +618,7 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
     for _ in 0..3 {
         let data: Value = read().await.unwrap().json().await.unwrap();
         assert_eq!(data["accounts"][0]["usage_stale"], true);
+        assert!(data["accounts"][0].get("credits").is_none());
     }
     assert_eq!(
         f.requests.load(Ordering::SeqCst),
@@ -623,6 +626,76 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
         "failure cooldown survives early browser requests"
     );
     credits_task.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn dashboard_omits_credits_when_credentials_change_during_snapshot() {
+    dashboard_omits_credits_after_late_staleness(true).await;
+}
+
+#[tokio::test]
+async fn dashboard_omits_credits_when_usage_expires_during_snapshot() {
+    dashboard_omits_credits_after_late_staleness(false).await;
+}
+
+async fn dashboard_omits_credits_after_late_staleness(change_credentials: bool) {
+    let mut f = Fixture::new(Duration::from_secs(2)).await;
+    f.broker.sso = Some(Arc::new(enrollment::Sso::testing_session("test")));
+    let started = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    f.broker.reset_reader = super::super::resets::Reader::with_base(&base);
+    let app = super::super::dashboard::routes(&base)
+        .route(
+            "/credits",
+            get({
+                let (started, release) = (started.clone(), release.clone());
+                move || {
+                    let (started, release) = (started.clone(), release.clone());
+                    async move {
+                        started.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                        Json(json!({"available_count":0,"credits":[]}))
+                    }
+                }
+            }),
+        )
+        .with_state(f.broker.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let response = tokio::spawn(async move {
+        reqwest::Client::new()
+            .get(format!("{base}/accounts/data"))
+            .header("cookie", "codexctl-session=synthetic-session")
+            .send()
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    let owner = f.broker.owners.read().await["fixture"].1.clone();
+    let mut current = owner.lock().await;
+    if change_credentials {
+        current.vault.auth["changed"] = json!(true);
+    }
+    release.add_permits(1);
+    if !change_credentials {
+        // Hold the owner observation until the catalog sample expires. Releasing
+        // the reset request first keeps its HTTP timeout out of this test.
+        tokio::time::sleep(super::super::catalog::TTL + Duration::from_secs(1)).await;
+    }
+    drop(current);
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let data: Value = response.json().await.unwrap();
+    assert_eq!(data["accounts"][0]["usage_stale"], true);
+    assert!(data["accounts"][0].get("credits").is_none());
     server.abort();
 }
 

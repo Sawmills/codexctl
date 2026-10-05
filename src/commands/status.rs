@@ -42,6 +42,7 @@ struct RateLimitedAccount {
     is_error: bool,
     billing_unknown: bool,
     plan: String,
+    credits: Option<api::Credits>,
     error_msg: String,
 }
 
@@ -172,6 +173,7 @@ impl RateLimitedAccount {
             .filter(|character| !character.is_control())
             .take(80)
             .collect(),
+            credits: usage.credits.clone(),
             error_msg: String::new(),
         }
     }
@@ -401,6 +403,7 @@ struct RateLimitColumns {
     labeled: bool,
     billing: bool,
     plan: bool,
+    credits: bool,
     resets: bool,
     windows: Vec<WindowColumn>,
 }
@@ -494,6 +497,7 @@ impl RateLimitColumns {
         }
         Self {
             billing: accounts.iter().any(|account| account.billing_unknown),
+            credits: accounts.iter().any(|account| account.credits.is_some()),
             resets: accounts.iter().any(|account| account.reset_credits > 0),
             plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
@@ -521,6 +525,9 @@ impl RateLimitColumns {
         }
         if self.resets {
             headers.push("Resets".to_string());
+        }
+        if self.credits {
+            headers.push("Credits".to_string());
         }
         headers.push("Token".to_string());
         if self.billing {
@@ -686,6 +693,7 @@ async fn fetch_and_split(
                         is_error: true,
                         billing_unknown: false,
                         plan: String::new(),
+                        credits: None,
                         error_msg: "bad auth.json".to_string(),
                     });
                 }
@@ -730,6 +738,7 @@ async fn fetch_and_split(
                         is_error: true,
                         billing_unknown: false,
                         plan: String::new(),
+                        credits: None,
                         error_msg: msg.to_string(),
                     });
                 }
@@ -927,6 +936,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         if columns.resets {
             row.push(Cell::new("-"));
         }
+        if columns.credits {
+            row.push(Cell::new("-"));
+        }
         row.push(token_cell(account.token_expiry, true, &account.error_msg));
         if columns.billing {
             row.push(Cell::new("-"));
@@ -983,6 +995,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
     if columns.resets {
         row.push(resets_cell(account));
     }
+    if columns.credits {
+        row.push(credits_cell(account.credits.as_ref()));
+    }
     row.push(token_cell(account.token_expiry, false, &account.error_msg));
     if columns.billing {
         row.push(if account.billing_unknown {
@@ -992,6 +1007,10 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         });
     }
     row
+}
+
+fn credits_cell(credits: Option<&api::Credits>) -> Cell {
+    Cell::new(codexctl::status_json::format_credits(credits))
 }
 
 /// The "Resets" column: banked rate-limit resets, and how many of them can be
@@ -1193,6 +1212,7 @@ mod tests {
             is_error: false,
             billing_unknown: false,
             plan: String::new(),
+            credits: None,
             error_msg: String::new(),
         }
     }
@@ -1369,6 +1389,80 @@ mod tests {
         let row = render_rate_limited_row(&account, &columns);
         assert_eq!(columns.headers().len(), 6);
         assert_eq!(row.len(), 6);
+    }
+
+    #[test]
+    fn credits_column_is_hidden_without_data_and_shows_compact_status_with_data() {
+        let without = rate_limited_account();
+        let columns = RateLimitColumns::for_accounts(&[&without]);
+        assert!(!columns.headers().contains(&"Credits".to_string()));
+
+        let usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":1}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.50","overage_limit_reached":true}}"#,
+        )
+        .unwrap();
+        let with = RateLimitedAccount::from_usage("with-credits".into(), None, false, None, &usage);
+        let columns = RateLimitColumns::for_accounts(&[&with]);
+        let headers = columns.headers();
+        let row = render_rate_limited_row(&with, &columns);
+        let index = headers
+            .iter()
+            .position(|header| header == "Credits")
+            .unwrap();
+        assert_eq!(row[index].content(), "$12.50 available overage");
+    }
+
+    #[test]
+    fn reported_zero_balance_keeps_the_credits_column_visible() {
+        let usage: api::RateLimitResponse = serde_json::from_str(
+            r#"{"plan_type":"pro","credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false}}"#,
+        )
+        .unwrap();
+        let account =
+            RateLimitedAccount::from_usage("empty-credits".into(), None, false, None, &usage);
+        let columns = RateLimitColumns::for_accounts(&[&account]);
+        let index = columns
+            .headers()
+            .iter()
+            .position(|header| header == "Credits")
+            .unwrap();
+        assert_eq!(
+            render_rate_limited_row(&account, &columns)[index].content(),
+            "$0.00"
+        );
+    }
+
+    #[test]
+    fn credit_balance_text_is_bounded_and_cannot_control_the_terminal() {
+        for balance in [
+            "12.50\u{1b}[31m\n".to_string(),
+            "x".repeat(1000),
+            "1e100".into(),
+        ] {
+            let usage: api::RateLimitResponse = serde_json::from_value(serde_json::json!({
+                "plan_type":"pro", "credits":{"has_credits":true,"balance":balance}
+            }))
+            .unwrap();
+            let account =
+                RateLimitedAccount::from_usage("credits".into(), None, false, None, &usage);
+            let columns = RateLimitColumns::for_accounts(&[&account]);
+            let index = columns
+                .headers()
+                .iter()
+                .position(|header| header == "Credits")
+                .unwrap();
+            let row = render_rate_limited_row(&account, &columns);
+            let cell = row[index].content();
+            assert!(!cell.chars().any(char::is_control));
+            assert!(cell.chars().count() <= 100);
+            let mut json_row =
+                codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+            json_row.set_usage(&usage);
+            assert_eq!(
+                serde_json::to_value(json_row).unwrap()["credits"]["balance"],
+                balance
+            );
+        }
     }
 
     #[test]
