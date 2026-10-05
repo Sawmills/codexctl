@@ -34,7 +34,7 @@ Both staging overlays include the `codexctl-rds-ca` ConfigMap generated from the
 [official AWS RDS global CA bundle](../deploy/k8s/rds-ca/README.md).
 The HA broker and migration/backfill Jobs mount it read-only. Certificate and
 hostname verification stay enabled; the image system bundle lacks the RDS root.
-Confirm the ConfigMap has reconciled before submitting either Job.
+Complete the CA reconciliation gate in section 5 before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
 
@@ -139,6 +139,25 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 The commands below are an operator runbook. This PR does not run them and does
 not reference the live Argo application. Stop if the database, role, secret,
 or row counts do not match the reviewed plan.
+
+Before stopping the writer or submitting a Job, merge the reviewed CA change into
+`main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
+Keep existing automated sync enabled and wait for that merge to sync. For an
+installation using the checked-in manual-sync Application, run the approved
+`argocd app sync codexctl`, then `argocd app wait codexctl --sync`.
+Do not apply the HA overlay to satisfy this prerequisite.
+
+Verify the synced revision is the reviewed CA merge (or a reviewed descendant
+that includes it), and verify the bundle key in namespace `codexctl`:
+
+```sh
+kubie exec staging argocd kubectl get application codexctl -o json | \
+  jq '{source: .spec.source, sync: .status.sync}'
+kubie exec staging codexctl kubectl get configmap codexctl-rds-ca -o json | \
+  jq -e '.data["global-bundle.pem"] | startswith("-----BEGIN CERTIFICATE-----")'
+```
+
+Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
 
 1. **Back up the current PVC.** Keep the single live pod serving file mode.
    Freeze administrative mutations, take the filesystem copy at one point in
