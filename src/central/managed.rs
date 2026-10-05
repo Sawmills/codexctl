@@ -824,24 +824,21 @@ async fn settle_background_recovery(
                 .await
             {
                 Ok(true) => matches!(central.fenced_write(lease, &record).await, Ok(true)),
-                Ok(false) | Err(_) => {
+                Ok(false) => {
                     abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
                     return;
+                }
+                Err(error) => {
+                    // A failed query is not proof that another holder owns
+                    // the lease. Retry while retaining the unpublished journal.
+                    eprintln!("central settlement renewal retry: {error:#}");
+                    false
                 }
             },
             _ => true,
         };
         if !durable {
             if central.is_none() && stopping.load(Ordering::Acquire) {
-                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
-                return;
-            }
-            if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref())
-                && !central
-                    .renew(lease, std::time::Duration::from_secs(120))
-                    .await
-                    .unwrap_or(false)
-            {
                 abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
                 return;
             }

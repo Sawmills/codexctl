@@ -392,6 +392,24 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         })
         .await
         .expect("server did not start shutdown");
+        // A sequence survives the failed transaction, so only the first
+        // settlement renewal fails. Later renewals can persist the rotation.
+        control
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {schema}.renew_attempts;
+             CREATE FUNCTION {schema}.fail_first_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF nextval('{schema}.renew_attempts') = 1 THEN
+                 RAISE EXCEPTION 'synthetic transient renewal failure';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER fail_first_renewal BEFORE UPDATE ON {schema}.account_refresh_leases
+             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
+             EXECUTE FUNCTION {schema}.fail_first_renewal();"
+            ))
+            .await
+            .unwrap();
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
     };
     let (response, ()) = tokio::join!(stopped_request, shutdown);
@@ -400,6 +418,18 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         .await
         .unwrap()
         .unwrap();
+    let renew_attempts: i64 = control
+        .query_one(
+            &format!("SELECT last_value FROM {schema}.renew_attempts"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        renew_attempts >= 2,
+        "shutdown abandoned a transient renewal error"
+    );
     let successor = request(&http, &pods[1], &token).await;
     assert_eq!(
         successor.status(),
