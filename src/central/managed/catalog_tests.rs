@@ -1011,6 +1011,29 @@ async fn session_observation_outage_does_not_delay_tokens_and_dual_keeps_local_c
             "a full observation queue must count one dropped write without blocking delivery"
         );
         drop(permits);
+        control.batch_execute(
+            "CREATE FUNCTION fail_session_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic cleanup failure'; END $$; CREATE TRIGGER fail_session_cleanup BEFORE DELETE ON account_live_sessions FOR EACH STATEMENT EXECUTE FUNCTION fail_session_cleanup()"
+        ).await.unwrap();
+        assert_eq!(fixture.token().await, StatusCode::OK);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if fixture.broker.failures.lock().unwrap()["live_session_failed"].count == 6 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup failure was not counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            central
+                .live_session_count(&account_key("test", "fixture"), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            2,
+            "cleanup failure must preserve the successfully stored observation"
+        );
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await

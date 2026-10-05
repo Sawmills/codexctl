@@ -194,8 +194,6 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
     ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
-CREATE INDEX IF NOT EXISTS account_live_sessions_retention_idx
-    ON account_live_sessions (last_seen) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
     challenge_hash TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
@@ -669,6 +667,15 @@ impl CentralStore {
             Self::Dual { postgres, .. } => {
                 bounded_db(postgres.record_live_session(account_id, user_id, alias, device_id))
                     .await
+            }
+        }
+    }
+
+    pub(super) async fn prune_live_sessions(&self, account_id: &str, user_id: &str) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
+                bounded_db(db.prune_live_sessions(account_id, user_id)).await
             }
         }
     }
@@ -1588,11 +1595,16 @@ impl PostgresStore {
                 &[&account_id, &user_id, &alias, &device_id],
             )
             .await?;
+        Ok(())
+    }
+
+    async fn prune_live_sessions(&self, account_id: &str, user_id: &str) -> Result<()> {
+        let client = self.cached_client(&self.observation_client).await?;
         // Session observations are ephemeral. Retain deletion evidence so an
         // old heartbeat cannot revive a tombstone, and bound each cleanup batch.
         client.execute(
-            "WITH expired AS (SELECT account_id,device_id FROM account_live_sessions WHERE deleted_at IS NULL AND last_seen < now()-interval '1 day' ORDER BY last_seen LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM account_live_sessions AS sessions USING expired WHERE sessions.account_id=expired.account_id AND sessions.device_id=expired.device_id",
-            &[],
+            "WITH expired AS (SELECT account_id,device_id FROM account_live_sessions WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL AND last_seen < now()-interval '1 day' ORDER BY last_seen LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM account_live_sessions AS sessions USING expired WHERE sessions.account_id=expired.account_id AND sessions.device_id=expired.device_id AND sessions.user_id=$2",
+            &[&account_id, &user_id],
         ).await?;
         Ok(())
     }
@@ -2017,6 +2029,17 @@ mod tests {
         );
         if let CentralStore::Postgres(db) = &first {
             let client = db.client().await.unwrap();
+            for (other_id, user) in [
+                (format!("{id}-other-user"), "other-user"),
+                (format!("{id}-other-account"), "user"),
+            ] {
+                first.save_account(&record(&other_id, 1)).await.unwrap();
+                first
+                    .record_live_session(&other_id, user, "seat", "old")
+                    .await
+                    .unwrap();
+                client.execute("UPDATE account_live_sessions SET last_seen=now()-interval '2 days' WHERE account_id=$1", &[&other_id]).await.unwrap();
+            }
             client.execute(
                 "UPDATE account_live_sessions SET last_seen=now()-interval '2 days' WHERE account_id=$1",
                 &[&id],
@@ -2025,6 +2048,31 @@ mod tests {
                 .record_live_session(&id, "user", "seat", "launch-c")
                 .await
                 .unwrap();
+            first.prune_live_sessions(&id, "wrong-user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 3, "mismatched owner must not prune any rows");
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            for other_id in [format!("{id}-other-user"), format!("{id}-other-account")] {
+                let count: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                        &[&other_id],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(
+                    count, 1,
+                    "retention must not delete another account's observations"
+                );
+            }
             let rows = client.query(
                 "SELECT device_id,deleted_at IS NOT NULL FROM account_live_sessions WHERE account_id=$1 ORDER BY device_id",
                 &[&id],

@@ -339,10 +339,23 @@ blocked observation cannot queue credential queries behind it. Each server
 permits up to 32 concurrent observation writes. A full queue or failed write
 drops that observation; a later token refresh can record
 the session again. This is best-effort activity data, not a durable delivery log.
-Each successful write also removes up to 1,000 non-deleted rows last seen more
-than one day ago. Cleanup runs with new observations, so an idle server can retain
-expired rows until activity resumes. Tombstones remain to prevent revival by
-delayed heartbeats. The account foreign key does not cascade-delete sessions.
+After each successful write, a separate cleanup attempt removes up to 1,000
+expired observations from that authenticated account and user only. Cleanup
+failure preserves the committed observation and uses the `cleanup` log stage;
+an upsert failure uses `write`. Both increment `live_session_failed` once.
+
+The central-storage retention contract implements HQ's B29 follow-up request for
+live-session retention after [#117](https://github.com/Sawmills/codexctl/pull/117).
+These rows are temporary load observations, not credential, audit, or usage
+records. The retention interval is one day after `last_seen`, well beyond the
+ten-minute live-count window. Only non-tombstoned rows older than that interval
+are physically removed. Tombstones remain indefinitely to prevent revival by
+delayed heartbeats; neither credentials nor account rows are removed. Cleanup
+uses the existing `(account_id, last_seen)` partial index and never ranges over
+another account. The account foreign key does not cascade-delete sessions.
+Cleanup runs with new observations, so an idle account can retain expired rows
+until its activity resumes. The central-storage owner controls changes to this
+retention contract; deployment and alert-delivery verification remain separate.
 
 If a session-count query fails in Dual mode, selection keeps the server's local
 in-memory count. On a successful query, Dual mode uses the larger of the local

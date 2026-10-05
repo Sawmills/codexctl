@@ -1277,15 +1277,19 @@ async fn token(
                 let user = device.user.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = central
-                        .record_live_session(
-                            &account_key(&user, &alias),
-                            &user,
-                            &alias,
-                            &session_id,
-                        )
+                    let account = account_key(&user, &alias);
+                    let failure = match central
+                        .record_live_session(&account, &user, &alias, &session_id)
                         .await
                     {
+                        Err(error) => Some(("write", error)),
+                        Ok(()) => central
+                            .prune_live_sessions(&account, &user)
+                            .await
+                            .err()
+                            .map(|error| ("cleanup", error)),
+                    };
+                    if let Some((stage, error)) = failure {
                         worker.record_failure(
                             "live_session_failed",
                             "live_session",
@@ -1293,7 +1297,7 @@ async fn token(
                         );
                         eprintln!(
                             "{}",
-                            json!({"operation":"live_session", "stage":"write", "error":error.to_string()})
+                            json!({"operation":"live_session", "stage":stage, "error":error.to_string()})
                         );
                     }
                 });
