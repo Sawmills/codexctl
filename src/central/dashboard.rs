@@ -69,6 +69,7 @@ async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, Http
             account.usage_age_seconds = Some(age);
             if age >= super::catalog::TTL.as_secs() {
                 account.usage_stale = true;
+                account.credits = None;
                 account.banked_resets.stale = true;
             }
         }
@@ -166,7 +167,7 @@ async fn account_snapshot(
         .into(),
         routing_refused,
         billing_class: account.billing_class,
-        credits: account.credits,
+        credits: if changed { None } else { account.credits },
         primary: window(
             account.primary_used,
             account.primary_window_seconds,

@@ -105,6 +105,12 @@ proof of capacity or permission to spend.
       "plan": "pro",
       "state": "available",
       "billing_class": "rate_limited",
+      "credits": {
+        "has_credits": true,
+        "unlimited": false,
+        "balance": "12.50",
+        "overage_limit_reached": false
+      },
       "primary": {
         "used_percent": 24.0,
         "left_percent": 76.0,
@@ -141,7 +147,11 @@ proof of capacity or permission to spend.
 Times are Unix seconds. `server_time` anchors browser countdowns without trusting the browser clock.
 Machine `last_used_alias` is present only after a successful token response. Account state is `available`, `unavailable`, or
 `renewal_pending`. Billing class is `rate_limited`, `usage_based`, or `unknown`.
-Unknown optional facts are null. The page displays dates in the browser's timezone.
+The optional `credits` object preserves reported zero balances and false flags.
+Its three flags are booleans; `balance` is the upstream string or null when unknown.
+Credits are omitted when upstream data is absent or null, or when usage becomes stale.
+This includes expiry or a credential change during the snapshot request.
+Other unknown optional facts are null. The page displays dates in the browser's timezone.
 This browser schema is separate from the CLI's [status JSON](status-json.md).
 
 ## Interface choice
