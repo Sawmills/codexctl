@@ -122,6 +122,7 @@ pub struct PostgresStore {
     url: String,
     tls_enabled: bool,
     client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
+    observation_client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     key: PathBuf,
 }
 
@@ -193,6 +194,8 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
     ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_live_sessions_retention_idx
+    ON account_live_sessions (account_id, last_seen);
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
     challenge_hash TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
@@ -226,6 +229,42 @@ CREATE INDEX IF NOT EXISTS central_users_enabled_idx
 "#;
 
 impl CentralStore {
+    #[cfg(all(test, feature = "central-real-db-tests"))]
+    pub(super) async fn settle_test_observations(&self) -> Result<()> {
+        if let Self::Postgres(db) | Self::Dual { postgres: db, .. } = self {
+            let client = db.cached_client(&db.observation_client).await?;
+            tokio::time::timeout(Duration::from_secs(5), client.simple_query("SELECT 1")).await??;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "central-real-db-tests"))]
+    pub(super) async fn isolated_test_schema(
+        &self,
+    ) -> Result<(Self, Arc<tokio_postgres::Client>, String)> {
+        let mut isolated = self.clone();
+        let db = match &mut isolated {
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+            Self::File(_) => bail!("PostgreSQL required for isolated schema"),
+        };
+        let schema = format!(
+            "sessions_{}",
+            &vault::digest(&super::enrollment::random_bytes())[..16]
+        );
+        db.client()
+            .await?
+            .batch_execute(&format!("CREATE SCHEMA {schema}"))
+            .await?;
+        let mut url = reqwest::Url::parse(&db.url)?;
+        url.query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        db.url = url.to_string();
+        db.client = Arc::new(tokio::sync::Mutex::new(None));
+        db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+        let control = db.establish().await?;
+        Ok((isolated, control, schema))
+    }
+
     /// Open the configured backend.  `file` does not require a database URL;
     /// PostgreSQL and dual mode fail early when one is not configured.
     pub async fn from_env(state: &Path, key: &Path) -> Result<Self> {
@@ -639,6 +678,15 @@ impl CentralStore {
             Self::Dual { postgres, .. } => {
                 bounded_db(postgres.record_live_session(account_id, user_id, alias, device_id))
                     .await
+            }
+        }
+    }
+
+    pub(super) async fn prune_live_sessions(&self, account_id: &str, user_id: &str) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
+                bounded_db(db.prune_live_sessions(account_id, user_id)).await
             }
         }
     }
@@ -1114,6 +1162,7 @@ impl PostgresStore {
             url,
             tls_enabled,
             client: Arc::new(tokio::sync::Mutex::new(None)),
+            observation_client: Arc::new(tokio::sync::Mutex::new(None)),
             key: key.into(),
         };
         let _ = store.client().await?;
@@ -1196,7 +1245,14 @@ impl PostgresStore {
     }
 
     async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
-        let mut slot = self.client.lock().await;
+        self.cached_client(&self.client).await
+    }
+
+    async fn cached_client(
+        &self,
+        cache: &tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>,
+    ) -> Result<Arc<tokio_postgres::Client>> {
+        let mut slot = cache.lock().await;
         if let Some(client) = slot.as_ref().filter(|client| !client.is_closed()) {
             return Ok(client.clone());
         }
@@ -1205,7 +1261,7 @@ impl PostgresStore {
         let client = tokio::time::timeout(Duration::from_secs(5), self.establish())
             .await
             .context("central PostgreSQL connect timed out")??;
-        let mut slot = self.client.lock().await;
+        let mut slot = cache.lock().await;
         *slot = Some(client.clone());
         Ok(client)
     }
@@ -1542,7 +1598,8 @@ impl PostgresStore {
         alias: &str,
         device_id: &str,
     ) -> Result<()> {
-        let client = self.client().await?;
+        // A blocked observation must not queue credential queries behind it.
+        let client = self.cached_client(&self.observation_client).await?;
         client
             .execute(
                 "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen,deleted_at) VALUES($1,$2,$3,$4,now(),NULL) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen WHERE account_live_sessions.deleted_at IS NULL",
@@ -1552,8 +1609,19 @@ impl PostgresStore {
         Ok(())
     }
 
+    async fn prune_live_sessions(&self, account_id: &str, user_id: &str) -> Result<()> {
+        let client = self.cached_client(&self.observation_client).await?;
+        // Reclaim ephemeral history after 24 hours, but keep recent deletion
+        // evidence through the live window even when its last heartbeat is old.
+        client.execute(
+            "WITH expired AS (SELECT account_id,device_id FROM account_live_sessions WHERE account_id=$1 AND user_id=$2 AND last_seen < now()-interval '1 day' AND (deleted_at IS NULL OR deleted_at < now()-interval '10 minutes') ORDER BY last_seen LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM account_live_sessions AS sessions USING expired WHERE sessions.account_id=expired.account_id AND sessions.device_id=expired.device_id AND sessions.user_id=$2",
+            &[&account_id, &user_id],
+        ).await?;
+        Ok(())
+    }
+
     async fn live_session_count(&self, account_id: &str, window: Duration) -> Result<usize> {
-        let client = self.client().await?;
+        let client = self.cached_client(&self.observation_client).await?;
         let row = client
             .query_one(
                 "SELECT COUNT(*)::BIGINT FROM account_live_sessions WHERE account_id=$1 AND deleted_at IS NULL AND last_seen >= now()-($2::bigint * interval '1 second')",
@@ -1970,6 +2038,116 @@ mod tests {
             1,
             "a routine heartbeat must not restore a tombstoned session"
         );
+        if let CentralStore::Postgres(db) = &first {
+            let client = db.client().await.unwrap();
+            for (other_id, user) in [
+                (format!("{id}-other-user"), "other-user"),
+                (format!("{id}-other-account"), "user"),
+            ] {
+                first.save_account(&record(&other_id, 1)).await.unwrap();
+                first
+                    .record_live_session(&other_id, user, "seat", "old")
+                    .await
+                    .unwrap();
+                client.execute("UPDATE account_live_sessions SET last_seen=now()-interval '2 days' WHERE account_id=$1", &[&other_id]).await.unwrap();
+            }
+            client.execute(
+                "UPDATE account_live_sessions SET last_seen=now()-interval '2 days' WHERE account_id=$1",
+                &[&id],
+            ).await.unwrap();
+            first
+                .record_live_session(&id, "user", "seat", "launch-c")
+                .await
+                .unwrap();
+            first.prune_live_sessions(&id, "wrong-user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(count, 3, "mismatched owner must not prune any rows");
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            for other_id in [format!("{id}-other-user"), format!("{id}-other-account")] {
+                let count: i64 = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                        &[&other_id],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                assert_eq!(
+                    count, 1,
+                    "retention must not delete another account's observations"
+                );
+            }
+            let rows = client.query(
+                "SELECT device_id,deleted_at IS NOT NULL FROM account_live_sessions WHERE account_id=$1 ORDER BY device_id",
+                &[&id],
+            ).await.unwrap();
+            let retained: Vec<(String, bool)> =
+                rows.iter().map(|row| (row.get(0), row.get(1))).collect();
+            assert_eq!(
+                retained,
+                vec![("launch-a".into(), true), ("launch-c".into(), false)],
+                "retention must remove expired live rows while preserving tombstones and fresh sessions"
+            );
+            first
+                .record_live_session(&id, "user", "seat", "launch-a")
+                .await
+                .unwrap();
+            assert_eq!(
+                second
+                    .live_session_count(&id, Duration::from_secs(60))
+                    .await
+                    .unwrap(),
+                1
+            );
+            client.execute("UPDATE account_live_sessions SET deleted_at=now()-interval '11 minutes' WHERE account_id=$1 AND device_id='launch-a'", &[&id]).await.unwrap();
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                count, 1,
+                "expired tombstones outside the live window must be reclaimed"
+            );
+            client.execute("INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen) SELECT $1,'user','seat','expired-' || n,now()-interval '2 days' FROM generate_series(1,1005) n", &[&id]).await.unwrap();
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                count, 6,
+                "one cleanup must reclaim at most 1,000 observations"
+            );
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            first
+                .record_live_session(&id, "user", "seat", "launch-a")
+                .await
+                .unwrap();
+            assert_eq!(
+                first
+                    .live_session_count(&id, Duration::from_secs(60))
+                    .await
+                    .unwrap(),
+                2,
+                "after physical expiry an authenticated same-ID heartbeat is a fresh observation"
+            );
+        }
         let (a, b) = tokio::join!(
             first.acquire_lease(&id, "a", Duration::from_secs(60)),
             second.acquire_lease(&id, "b", Duration::from_secs(60))

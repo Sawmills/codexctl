@@ -50,6 +50,7 @@ impl Fixture {
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
+            session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,

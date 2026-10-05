@@ -107,6 +107,7 @@ impl Fixture {
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
+            session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
@@ -771,10 +772,19 @@ impl Fixture {
         store_mode: super::super::storage::StoreMode,
         mode: &str,
     ) -> CentralStore {
-        use std::os::unix::fs::PermissionsExt;
         let central = CentralStore::from_mode(store_mode, &self.broker.state, &self.broker.key)
             .await
             .unwrap();
+        self.attach_refresh_store_using(central, mode).await
+    }
+
+    async fn attach_refresh_store_using(
+        &mut self,
+        central: CentralStore,
+        mode: &str,
+    ) -> CentralStore {
+        use std::os::unix::fs::PermissionsExt;
+        let store_mode = central.mode();
         central.migrate().await.unwrap();
         self.broker.central = Some(central.clone());
         self.broker.read_only = false;
@@ -834,6 +844,210 @@ impl Fixture {
         owner.rpc = Some(Rpc::start(&binary, &owner.home).await.unwrap());
         owner.refresh_enabled = true;
         central
+    }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn session_observation_outage_does_not_delay_tokens_and_dual_keeps_local_counts() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for mode in [StoreMode::Dual, StoreMode::Postgres] {
+        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+        {
+            let owners = fixture.broker.owners.read().await;
+            let mut owner = owners["fixture"].1.lock().await;
+            owner.vault.auth["tokens"]["access_token"] = json!(format!(
+                "header.{}.",
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            ));
+            store::atomic_write(
+                &owner.home.join("auth.json"),
+                &serde_json::to_vec(&owner.vault.auth).unwrap(),
+            )
+            .unwrap();
+        }
+        let initial = CentralStore::from_mode(mode, &fixture.broker.state, &fixture.broker.key)
+            .await
+            .unwrap();
+        let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+        fixture
+            .attach_refresh_store_using(central.clone(), "")
+            .await;
+        {
+            let mut owners = fixture.broker.owners.write().await;
+            let owner = owners.remove("fixture").unwrap();
+            owners.insert(account_key("test", "fixture"), owner);
+        }
+        assert_eq!(fixture.token().await, StatusCode::OK);
+        let account = account_key("test", "fixture");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while central
+            .live_session_count(&account, Duration::from_secs(60))
+            .await
+            .unwrap()
+            != 1
+        {
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let initial = fixture
+            .broker
+            .session_writes
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        central.settle_test_observations().await.unwrap();
+        drop(initial);
+        control
+            .batch_execute("BEGIN; LOCK TABLE account_live_sessions IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap();
+        fixture
+            .headers
+            .insert("x-codexctl-session", "other-launch".parse().unwrap());
+        let response = tokio::time::timeout(Duration::from_secs(1), fixture.token()).await;
+        assert_eq!(
+            response.expect("optional session write delayed token delivery"),
+            StatusCode::OK
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let waiting: bool = control.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='account_live_sessions'::regclass AND NOT granted)",
+                &[],
+            ).await.unwrap().get(0);
+            if waiting {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), fixture.token())
+                .await
+                .expect("blocked observation delayed the next token"),
+            StatusCode::OK
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            if fixture
+                .broker
+                .failures
+                .lock()
+                .unwrap()
+                .get("live_session_failed")
+                .is_some_and(|f| f.count == 2)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background failure was not counted once"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let permits = fixture
+            .broker
+            .session_writes
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        central.settle_test_observations().await.unwrap();
+        let listing = fixture.spawn_list();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let waiting: bool = control.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation='account_live_sessions'::regclass AND NOT granted AND mode='AccessShareLock')",
+                &[],
+            ).await.unwrap().get(0);
+            if waiting {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), fixture.token())
+                .await
+                .expect("blocked session count delayed token delivery"),
+            StatusCode::OK
+        );
+        let account = listing.await.unwrap();
+        assert_eq!(
+            account["liveSessions"],
+            if mode == StoreMode::Dual {
+                json!(2)
+            } else {
+                Value::Null
+            }
+        );
+        assert_eq!(
+            fixture.broker.failures.lock().unwrap()["live_session_failed"].count,
+            4
+        );
+        control.batch_execute("ROLLBACK").await.unwrap();
+        assert_eq!(
+            fixture.list().await["liveSessions"],
+            if mode == StoreMode::Dual {
+                json!(2)
+            } else {
+                json!(1)
+            },
+            "a stale successful database read must preserve the Dual local lower bound"
+        );
+        let summary = account.clone();
+        let account: Account = serde_json::from_value(account).unwrap();
+        assert_eq!(
+            crate::central::remote::select_for_codex(&[account]).is_ok(),
+            mode == StoreMode::Dual,
+            "{summary}"
+        );
+        assert_eq!(fixture.token().await, StatusCode::OK);
+        assert_eq!(
+            fixture.broker.failures.lock().unwrap()["live_session_failed"].count,
+            5,
+            "a full observation queue must count one dropped write without blocking delivery"
+        );
+        drop(permits);
+        control.batch_execute(
+            "CREATE FUNCTION fail_session_cleanup() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic cleanup failure'; END $$; CREATE TRIGGER fail_session_cleanup BEFORE DELETE ON account_live_sessions FOR EACH STATEMENT EXECUTE FUNCTION fail_session_cleanup()"
+        ).await.unwrap();
+        assert_eq!(fixture.token().await, StatusCode::OK);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if fixture.broker.failures.lock().unwrap()["live_session_failed"].count == 6 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cleanup failure was not counted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            central
+                .live_session_count(&account_key("test", "fixture"), Duration::from_secs(60))
+                .await
+                .unwrap(),
+            2,
+            "cleanup failure must preserve the successfully stored observation"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }
 

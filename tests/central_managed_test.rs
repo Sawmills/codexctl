@@ -2433,8 +2433,19 @@ fn an_unhealthy_rpc_is_replaced_after_a_protocol_failure() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = server.token(&server.amir, "personal", None).status();
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503, "unexpected recovery response");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement RPC did not recover before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         std::fs::read_to_string(server.root.path().join("launch-count"))
             .unwrap()
@@ -9257,6 +9268,41 @@ fn b29_catalog_counts_launches_and_scopes_session_ids_to_machines() {
         );
     }
     assert_eq!(server.accounts(&server.amir)[0]["liveSessions"], 3);
+}
+
+#[test]
+fn session_header_is_bounded_before_token_delivery() {
+    let server = Server::start();
+    server.import(&server.amir, "seat", "login", "workspace");
+    let before = server.accounts(&server.amir)[0]["liveSessions"].clone();
+    let response = server
+        .http
+        .post(format!("{}/v1/token", server.url))
+        .bearer_auth(&server.amir)
+        .header("x-codexctl-session", "x".repeat(129))
+        .json(&json!({"alias":"seat", "billing":true}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "invalid_session_id"
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["liveSessions"], before);
+    for session in [String::new(), "x".repeat(128)] {
+        assert_eq!(
+            server
+                .http
+                .post(format!("{}/v1/token", server.url))
+                .bearer_auth(&server.amir)
+                .header("x-codexctl-session", session)
+                .json(&json!({"alias":"seat", "billing":true}))
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
 }
 
 #[test]
