@@ -651,6 +651,90 @@ async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() 
         .unwrap();
 }
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn verified_reimport_retryable_probe_recovers_after_settlement() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central, "billing-error-marked")
+        .await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    assert!(
+        fixture
+            .broker
+            .import_account(
+                "test",
+                Import {
+                    alias: "fixture".into(),
+                    label: None,
+                    auth
+                }
+            )
+            .await
+            .is_err()
+    );
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        assert!(!owner.available, "probe must succeed before token delivery");
+        assert!(owner.retryable_unavailable);
+        assert!(
+            !owner.routing_refused,
+            "settled verified reimport must remain recoverable"
+        );
+        owner.retry_started = Some(0);
+    }
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+    recover_unhealthy_owners(&fixture.broker).await;
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    assert!(
+        owner_ref.lock().await.available,
+        "a successful probe must recover the verified import"
+    );
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
     let response = accounts(State(broker), headers)
         .await

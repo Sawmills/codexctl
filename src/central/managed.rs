@@ -1896,7 +1896,6 @@ impl Broker {
             return Err(error);
         }
         let before = owner.vault.clone();
-        let recovery_generation = owner.recovery_generation;
         let renew_done = Arc::new(AtomicBool::new(false));
         let renew_task = match (self.central.clone(), verification_lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -1935,14 +1934,20 @@ impl Broker {
                 .snapshot()
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
                 .revision;
-            owner
+            let probe = owner
                 .tokens(TokenRequest {
                     previous_revision: Some(revision),
                     billing: true,
                     ..Default::default()
                 })
-                .await
-                .map_err(|e| self.owner_failure(e))?;
+                .await;
+            if verification_lease.is_some() && matches!(&probe, Err(TokenFailure::Retryable(_))) {
+                owner.fence(true);
+                if owner.retry_started.is_none() {
+                    owner.retry_started = Some(owner.retry_clock_now());
+                }
+            }
+            probe.map_err(|e| self.owner_failure(e))?;
             if !owner.rpc.as_ref().is_some_and(Rpc::verified_login) {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
@@ -1993,6 +1998,16 @@ impl Broker {
         let restore_after_settlement = before.verified
             && !owner.routing_refused
             && !owner.rpc.as_ref().is_some_and(Rpc::rejected_login);
+        // The probe may fence the owner and advance its generation. Bind the
+        // settlement to that completed probe, before adding our temporary fence.
+        let recovery_generation = owner.recovery_generation;
+        let recovery = if restore_after_settlement && owner.retryable_unavailable {
+            SettlementRecovery::Retryable
+        } else if restore_after_settlement {
+            SettlementRecovery::Available
+        } else {
+            SettlementRecovery::Fenced
+        };
         if verification.is_err() {
             owner.available = false;
             if verification_required {
@@ -2025,11 +2040,7 @@ impl Broker {
                     central,
                     verification_lease,
                     before,
-                    if restore_after_settlement {
-                        SettlementRecovery::Available
-                    } else {
-                        SettlementRecovery::Fenced
-                    },
+                    recovery,
                     recovery_generation,
                     permit,
                     renew_done,
