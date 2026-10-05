@@ -960,12 +960,35 @@ async fn token(
                     // request completion is known. This applies to timeouts and
                     // protocol failures alike.
                     retain_lease = true;
-                    settled_owner_record(&mut owner, &before)
-                        .await
-                        .map_err(|error| {
+                    match settled_owner_record(&mut owner, &before).await {
+                        Ok(_) => {}
+                        Err(error)
+                            if failed_rpc
+                                && owner.rpc.as_mut().is_some_and(Rpc::process_exited) =>
+                        {
+                            // The protocol read reached EOF and the child has
+                            // now exited. Completion is known impossible, so
+                            // discard this dead RPC and publish its journal.
+                            retain_lease = false;
+                            if let Some(rpc) = owner.rpc.take() {
+                                rpc.terminate().await;
+                            }
+                            owner.refresh_enabled = false;
+                            owner.snapshot().map_err(|snapshot_error| {
+                                eprintln!(
+                                    "central owner dead-child snapshot: {snapshot_error:#} (settle: {error:#})"
+                                );
+                                worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                            })?;
+                        }
+                        Err(error) => {
                             eprintln!("central owner settlement: {error:#}");
-                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-                        })?;
+                            return Err(worker.error(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "owner_unavailable",
+                            ));
+                        }
+                    }
                 }
             }
             let auth_changed = owner.vault.auth != before.auth;
