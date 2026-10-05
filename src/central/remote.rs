@@ -1284,19 +1284,7 @@ fn recent_429_rates<'a>(
     aliases: impl IntoIterator<Item = &'a str>,
 ) -> std::collections::BTreeMap<String, f64> {
     let wanted: std::collections::BTreeSet<_> = aliases.into_iter().collect();
-    let Ok(executable) = std::env::current_exe() else {
-        return std::collections::BTreeMap::new();
-    };
-    let Ok(output) = std::process::Command::new(executable)
-        .args(["rate", "--json", "--minutes", "10"])
-        .output()
-    else {
-        return std::collections::BTreeMap::new();
-    };
-    if !output.status.success() {
-        return std::collections::BTreeMap::new();
-    }
-    let Ok(report) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+    let Ok(report) = recent_429_report() else {
         return std::collections::BTreeMap::new();
     };
     report
@@ -1311,6 +1299,42 @@ fn recent_429_rates<'a>(
                 .then_some((alias.to_owned(), row.get("rate_429")?.as_f64()?))
         })
         .collect()
+}
+
+fn recent_429_report() -> Result<Value> {
+    use std::{io::Seek, os::unix::process::CommandExt, process::Stdio};
+
+    // A regular file cannot fill a pipe or wait for a descendant to close it.
+    let mut output = tempfile::tempfile()?;
+    let mut child = std::process::Command::new(std::env::current_exe()?)
+        .args(["rate", "--json", "--minutes", "10"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(output.try_clone()?)
+        .stderr(Stdio::null())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    bail!("rate collection failed");
+                }
+                output.rewind()?;
+                return serde_json::from_reader(output).context("invalid rate report");
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            result => {
+                // Include rate's status/ps children, which may hold network or DB waits.
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                child.wait().context("reap rate collector")?;
+                result.context("wait for rate collector")?;
+                bail!("rate collection timed out");
+            }
+        }
+    }
 }
 
 /// Find the next server account for a 429 recovery. This deliberately shares

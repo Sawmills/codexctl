@@ -281,7 +281,6 @@ fn prepare_pinned_codex(
     included_only: bool,
 ) -> Result<PinnedLaunch> {
     store::validate_alias(alias)?;
-    let signals = Arc::new(LaunchSignals::register()?);
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
@@ -439,6 +438,9 @@ fn prepare_pinned_codex(
     .into_iter()
     .flat_map(|value| ["-c".to_owned(), value])
     .collect();
+    // Unregistering signal-hook handlers does not restore the default action.
+    // Leave fallback launches untouched when any preparation step fails.
+    let signals = Arc::new(LaunchSignals::register()?);
     Ok(PinnedLaunch {
         prepared: Some(prepared),
         _owner: owner,

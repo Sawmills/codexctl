@@ -7143,7 +7143,10 @@ fn automatic_reset_attempt(
         .unwrap();
     }
     let bin = home.path().join("bin");
-    if matches!(fence, Some("codex" | "codex-stale")) {
+    if matches!(
+        fence,
+        Some("codex" | "codex-stale" | "codex-term" | "codex-hup")
+    ) {
         use std::os::unix::fs::PermissionsExt;
         store::atomic_write(
             &directory.join(".native-active.json"),
@@ -7165,6 +7168,19 @@ fn automatic_reset_attempt(
         .unwrap();
         std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
+        if let Some(signal) = match fence {
+            Some("codex-term") => Some("TERM"),
+            Some("codex-hup") => Some("HUP"),
+            _ => None,
+        } {
+            store::atomic_write(
+                &bin.join("codex"),
+                format!("#!/bin/sh\nkill -{signal} \"$PPID\"\nsleep 0.2\n").as_bytes(),
+            )
+            .unwrap();
+            std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
     }
     let received = Arc::new(Mutex::new(Vec::<Value>::new()));
     let requests = received.clone();
@@ -9427,6 +9443,97 @@ fn b29_token_policy_change_falls_back_without_new_billing_approval() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("using the current account"));
     assert!(String::from_utf8_lossy(&output.stdout).contains("current account launched"));
     assert_eq!(resets, 0);
+}
+
+#[test]
+fn b29_failed_prepare_preserves_fallback_termination_signals() {
+    use std::os::unix::process::ExitStatusExt;
+    for (fence, signal) in [("codex-term", libc::SIGTERM), ("codex-hup", libc::SIGHUP)] {
+        let (resets, output) = automatic_reset_attempt(&["codex"], "pro", 20.0, Some(fence));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("no longer has verified included billing"),
+            "{error}"
+        );
+        assert!(error.contains("using the current account"), "{error}");
+        assert_eq!(output.status.signal(), Some(signal), "{error}");
+        assert_eq!(resets, 0);
+    }
+}
+
+#[test]
+fn b29_automatic_launch_bounds_rate_collection() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "login", "seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "lane"]).status.success());
+    let bin = home.path().join("bin");
+    store::atomic_write(
+        &bin.join("codex"),
+        b"#!/bin/sh\nprintf 'launched %s\\n' \"$CODEXCTL_PINNED_ALIAS\"\n",
+    )
+    .unwrap();
+    store::atomic_write(
+        &bin.join("ps"),
+        br#"#!/usr/bin/env python3
+import os, pathlib, sys, time
+if '-u' in sys.argv:
+    (pathlib.Path(os.environ['HOME']) / 'rate-started').write_text(str(os.getpid()))
+    time.sleep(12)
+os.execv('/bin/ps', ['/bin/ps'] + sys.argv[1:])
+"#,
+    )
+    .unwrap();
+    for name in ["codex", "ps"] {
+        std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .arg("codex")
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        home.path().join("rate-started").exists(),
+        "rate did not reach the stalled child"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "optional rate data blocked launch for {:?}",
+        started.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("launched lane"));
+    let pid = std::fs::read_to_string(home.path().join("rate-started")).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let process = Command::new("/bin/ps")
+            .args(["-p", &pid, "-o", "stat="])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&process.stdout);
+        if state.trim().is_empty() || state.trim().starts_with('Z') {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rate descendant survived timeout: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
