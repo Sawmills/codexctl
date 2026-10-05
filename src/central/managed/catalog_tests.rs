@@ -108,6 +108,7 @@ impl Fixture {
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
+            recovery_stop: Arc::new(tokio::sync::Notify::new()),
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: None,
             holder_id: "test-holder".into(),
