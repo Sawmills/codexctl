@@ -137,7 +137,7 @@ pub fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
             || arg == "-p"
             || (arg.starts_with("-p") && arg.len() > 2)
         {
-            bail!("--account cannot be combined with a Codex profile override");
+            bail!("server account launches cannot be combined with a Codex profile override");
         }
         let config = if arg == "-c" || arg == "--config" {
             Some(
@@ -161,7 +161,7 @@ pub fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
                 || key.starts_with("profiles.")
             {
                 bail!(
-                    "--account cannot be combined with a provider or profile configuration override"
+                    "server account launches cannot be combined with a provider or profile configuration override"
                 );
             }
             config_args.extend(["-c".to_owned(), config.to_owned()]);
@@ -295,7 +295,7 @@ fn prepare_pinned_codex(
             .is_some()
     {
         bail!(
-            "selected Codex profile overrides model_provider; remove that override before using --account"
+            "selected Codex profile overrides model_provider; remove that override before a server account launch"
         );
     }
     let paths = config::default_paths()?;
@@ -303,7 +303,7 @@ fn prepare_pinned_codex(
     sweep_stale_launches()?;
     let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
     let catalog = super::super::remote::catalog()?
-        .context("--account requires a connected account server")?;
+        .context("server account launch requires a connected account server")?;
     let account = catalog
         .accounts
         .iter()
