@@ -9295,12 +9295,13 @@ else:
         store::atomic_write(
             &ps,
             br#"#!/usr/bin/env python3
-import os, pathlib, signal
+import os, pathlib, signal, sys
 marker = pathlib.Path(os.environ['HOME']) / 'recovery-pid'
 if marker.exists():
     pid = int(marker.read_text())
     marker.unlink()
     os.kill(pid, signal.SIGTERM)
+os.execv('/bin/ps', ['/bin/ps'] + sys.argv[1:])
 "#,
         )
         .unwrap();
@@ -9338,8 +9339,15 @@ if marker.exists():
         .current_dir(home.path())
         .output()
         .unwrap();
-    let launches: Value =
-        serde_json::from_slice(&std::fs::read(home.path().join("launches.json")).unwrap()).unwrap();
+    let launches: Value = serde_json::from_slice(
+        &std::fs::read(home.path().join("launches.json")).unwrap_or_else(|error| {
+            panic!(
+                "missing launch records: {error}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        }),
+    )
+    .unwrap();
     if interrupt {
         assert_eq!(
             output.status.code(),
