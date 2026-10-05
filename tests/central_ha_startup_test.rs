@@ -21,11 +21,17 @@ impl Pod {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         central::managed::setup(&state, &root.path().join("key")).unwrap();
+        Self::spawn(database, key, root, "postgres").await
+    }
+
+    async fn spawn(database: &str, key: &Path, root: tempfile::TempDir, mode: &str) -> Self {
+        let state = root.path().join("state");
         store::atomic_write(&root.path().join("mode"), b"startup").unwrap();
         for name in ["count", "launch-count"] {
             store::atomic_write(&root.path().join(name), b"0").unwrap();
         }
         let mut child = command(database, &state, key, "serve")
+            .env("CODEXCTL_CENTRAL_STORE", mode)
             .args([
                 "--listen",
                 "127.0.0.1:0",
@@ -142,28 +148,8 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
 
-    let state = root.path().join("source");
+    let state = root.path().join("state");
     let key = root.path().join("key");
-    let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,
-        "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
-    let auth = root.path().join("auth.json");
-    store::atomic_write(
-        &auth,
-        &serde_json::to_vec(&json!({"tokens":{
-        "access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),
-        "refresh_token":"synthetic-refresh","account_id":"synthetic-seat"}}))
-        .unwrap(),
-    )
-    .unwrap();
-    central::init(
-        &state.join("accounts/seed"),
-        &key,
-        &auth,
-        "seat",
-        "sawmills",
-        "test",
-    )
-    .unwrap();
     central::managed::setup(&state, &key).unwrap();
     store::atomic_write(
         &state.join("users.json"),
@@ -175,6 +161,32 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     .unwrap();
     let token_file = root.path().join("machine-token");
     central::register(&state, "test-machine", "sawmills", "test", &token_file).unwrap();
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let mut seed = Pod::spawn(database.as_str(), &key, root, "file").await;
+    store::atomic_write(&seed.root.path().join("mode"), b"").unwrap();
+    for (alias, account) in [("seat", "synthetic-seat"), ("other", "other-seat")] {
+        let claims = json!({"sub":account,"iat":2000000000_u64,"exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_plan_type":"pro"}});
+        let auth = json!({"tokens":{
+            "access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),
+            "refresh_token":"synthetic-refresh","account_id":account}});
+        let response = http
+            .post(format!("{}/v1/accounts", seed.url))
+            .bearer_auth(&token)
+            .json(&json!({"alias":alias,"auth":auth}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "file-mode seed import");
+    }
+    let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
+    assert_eq!(generation(&seed_token), 1);
+    seed.stop().await;
     for operation in ["migrate", "backfill"] {
         let output = command(database.as_str(), &state, &key, operation)
             .output()
@@ -225,6 +237,18 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         })
         .await
         .expect("leased initialize did not start");
+        let other = timeout(
+            Duration::from_secs(2),
+            http.post(format!("{}/v1/token", pods[0].url))
+                .bearer_auth(&token)
+                .json(&json!({"alias":"other","billing":true}))
+                .send(),
+        )
+        .await
+        .expect("held initialize blocked another account on the same replica")
+        .unwrap();
+        assert_eq!(other.status(), 200);
+        std::fs::remove_file(pods[0].root.path().join("exited")).unwrap();
         let leases: i64 = control
             .query_one(
                 &format!(
@@ -247,13 +271,13 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
                 "refresh_in_progress"
             );
         }
-        assert_eq!(pods.each_ref().map(Pod::launches), [1, 0, 0]);
+        assert_eq!(pods.each_ref().map(Pod::launches), [2, 0, 0]);
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
     };
     let (response, ()) = tokio::join!(first_request, contenders);
     assert_eq!(response.status(), 200);
     let first: Value = response.json().await.unwrap();
-    assert_eq!(generation(&first), 1);
+    assert_eq!(generation(&first), 2);
     assert!(
         pods[0].root.path().join("exited").exists(),
         "lease must not be released with a refresh child alive"
@@ -266,10 +290,10 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             next["revision"], first["revision"],
             "initialize rotation must be committed for the next replica"
         );
-        assert_eq!(generation(&next), index + 2);
+        assert_eq!(generation(&next), index + 3);
         assert!(pod.root.path().join("exited").exists());
     }
-    assert_eq!(pods.each_ref().map(Pod::launches), [1, 1, 1]);
+    assert_eq!(pods.each_ref().map(Pod::launches), [2, 1, 1]);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-error").unwrap();
     std::fs::remove_file(pods[0].root.path().join("exited")).unwrap();
     let failed = request(&http, &pods[0], &token).await;
@@ -302,7 +326,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     .expect("failed initialize retained its lease");
     assert_eq!(
         generation(&recovered),
-        5,
+        6,
         "failed initialize must publish its rotation before the next replica launches"
     );
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup").unwrap();
@@ -321,7 +345,23 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     })
     .await
     .expect("replica stayed fenced after initialize failure settled");
-    assert_eq!(generation(&retry), 6);
+    assert_eq!(generation(&retry), 7);
+    store::atomic_write(&pods[0].root.path().join("mode"), b"startup-exit").unwrap();
+    let failed = request(&http, &pods[0], &token).await;
+    assert_eq!(failed.status(), 503);
+    store::atomic_write(&pods[0].root.path().join("mode"), b"startup").unwrap();
+    let retry = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&http, &pods[0], &token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("dead initialize child retained its lease or replica fence");
+    assert_eq!(generation(&retry), 9);
     for pod in &mut pods {
         pod.stop().await;
     }

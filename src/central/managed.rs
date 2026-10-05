@@ -337,7 +337,7 @@ impl Broker {
     async fn ensure_refresh_owner(
         &self,
         owner: &mut Owner,
-        imports: &tokio::sync::MutexGuard<'_, ()>,
+        imports: tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<(), HttpError> {
         if owner.refresh_enabled && owner.rpc.is_some() {
             return Ok(());
@@ -353,9 +353,14 @@ impl Broker {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
         let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-            .clear_for_launch(owner, relogin::AdmissionKind::Restore, imports)
+            .clear_for_launch(owner, relogin::AdmissionKind::Restore, &imports)
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
-        launch_owner(owner, &self.binary, proof)
+        spawn_owner(owner, &self.binary, proof)
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        // Admission and PID evidence are complete. Initialization is covered by
+        // the account lease and owner mutex, not the replica-wide import lock.
+        drop(imports);
+        initialize_owner(owner)
             .await
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         owner.refresh_enabled = true;
@@ -734,7 +739,9 @@ async fn reconcile_owner_from_central(
 // RPC attached through snapshot so its final journal is read as this owner's
 // output (including refresh-only rotations with unchanged access claims).
 async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
-    if let Some(rpc) = owner.rpc.as_mut() {
+    if let Some(rpc) = owner.rpc.as_mut()
+        && !rpc.process_exited()
+    {
         rpc.settle_and_stop().await?;
     }
     owner.snapshot()?;
@@ -799,21 +806,7 @@ async fn settle_background_recovery(
         }
         let record = {
             let mut owner = owner_ref.lock().await;
-            if owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
-                // EOF from a dead child is the one case where completion is
-                // already known. Read the journal directly, then publish it.
-                owner.rpc.take();
-                owner.refresh_enabled = false;
-                owner.snapshot().and_then(|_| {
-                    if owner.vault.auth != before.auth {
-                        owner.vault.revision = before.revision.saturating_add(1).max(1);
-                    }
-                    vault::save(&owner.state, &owner.key, &owner.vault)?;
-                    Broker::owner_record(&owner)
-                })
-            } else {
-                settled_owner_record(&mut owner, &before).await
-            }
+            settled_owner_record(&mut owner, &before).await
         };
         let Ok(record) = record else {
             let exited = owner_ref
@@ -916,7 +909,6 @@ async fn token(
     let worker = broker.clone();
     let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
-        let _permit = permit;
         let import_guard = if worker
             .central
             .as_ref()
@@ -1026,13 +1018,12 @@ async fn token(
         let mut restore_after_settlement = false;
         let result = async {
             if lease.is_some()
-                && let Some(import_guard) = import_guard.as_ref()
+                && let Some(import_guard) = import_guard
                 && let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await
             {
                 restore_after_settlement = owner.available && !owner.routing_refused;
                 return Err(error);
             }
-            drop(import_guard);
             let token_result = owner.tokens(request).await;
             if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
@@ -1207,69 +1198,31 @@ async fn token(
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
         }
         .await;
-        if let Some(task) = renew_task {
-            task.abort();
-        }
         if retain_lease {
             owner.available = false;
             owner.routing_refused = true;
             owner.refresh_enabled = false;
-            if let (Some(central), Some(lease)) = (worker.central.clone(), lease.clone()) {
-                let owner_ref = owner_ref.clone();
-                let settled = Arc::new(AtomicBool::new(false));
-                let renew_done = settled.clone();
-                let renew_central = central.clone();
-                let renew_lease = lease.clone();
-                tokio::spawn(async move {
-                    while !renew_done.load(Ordering::Acquire) {
-                        if !renew_central
-                            .renew(&renew_lease, std::time::Duration::from_secs(120))
-                            .await
-                            .unwrap_or(false)
-                        {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    }
-                });
-                tokio::spawn(async move {
-                    loop {
-                        let record = {
-                            let mut owner = owner_ref.lock().await;
-                            settled_owner_record(&mut owner, &before).await
-                        };
-                        match record {
-                            Ok(record) => match central.fenced_write(&lease, &record).await {
-                                Ok(true) => {
-                                    settled.store(true, Ordering::Release);
-                                    if central.release_lease(&lease).await.is_ok()
-                                        && restore_after_settlement
-                                    {
-                                        let mut owner = owner_ref.lock().await;
-                                        if owner.recovery_generation == recovery_generation {
-                                            owner.available = true;
-                                            owner.routing_refused = false;
-                                        }
-                                    }
-                                    break;
-                                }
-                                Ok(false) => {
-                                    eprintln!("central recovery lost its credential fence")
-                                }
-                                Err(error) => {
-                                    eprintln!("central fenced write reconciliation: {error:#}")
-                                }
-                            },
-                            Err(error) => eprintln!("central owner settlement retry: {error:#}"),
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                });
+            tokio::spawn(settle_background_recovery(
+                owner_ref.clone(),
+                worker.central.clone(),
+                lease,
+                before,
+                restore_after_settlement,
+                recovery_generation,
+                permit,
+                Arc::new(AtomicBool::new(false)),
+                renew_task,
+                worker.stopping.clone(),
+            ));
+        } else {
+            if let Some(task) = renew_task {
+                task.abort();
             }
-        } else if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
-            && let Err(error) = central.release_lease(lease).await
-        {
-            eprintln!("central lease release: {error:#}");
+            if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref())
+                && let Err(error) = central.release_lease(lease).await
+            {
+                eprintln!("central lease release: {error:#}");
+            }
         }
         result
     })
@@ -2198,6 +2151,15 @@ pub(super) async fn launch_owner(
     binary: &Path,
     proof: relogin::ClearedIdentity<'_>,
 ) -> Result<()> {
+    spawn_owner(owner, binary, proof)?;
+    initialize_owner(owner).await
+}
+
+fn spawn_owner(
+    owner: &mut Owner,
+    binary: &Path,
+    proof: relogin::ClearedIdentity<'_>,
+) -> Result<()> {
     proof.validate(owner)?;
     if !owner.vault.verified {
         owner.vault.import_rejected = false;
@@ -2227,6 +2189,10 @@ pub(super) async fn launch_owner(
         &owner.home.join("pid"),
         &serde_json::to_vec(&super::process::Process::capture(pid)?)?,
     )?;
+    Ok(())
+}
+
+async fn initialize_owner(owner: &mut Owner) -> Result<()> {
     owner
         .rpc
         .as_mut()
