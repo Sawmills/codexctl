@@ -177,7 +177,7 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
         None,
         None,
         before,
-        true,
+        SettlementRecovery::Available,
         0,
         permit,
         renew_done,
@@ -237,7 +237,7 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
                     Some(central.clone()),
                     Some(lease.clone()),
                     before,
-                    true,
+                    SettlementRecovery::Available,
                     0,
                     permit,
                     renew_done.clone(),
@@ -271,6 +271,74 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
                 .unwrap();
         }
     }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn retryable_token_failure_can_recover_after_deferred_child_shutdown() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "billing-error-slow-exit")
+        .await;
+    assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .expect("deferred shutdown must settle")
+    .unwrap();
+    drop(drained);
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        assert!(
+            !owner.available,
+            "retryable failure still needs a successful probe"
+        );
+        assert!(owner.retryable_unavailable);
+        assert!(
+            !owner.routing_refused,
+            "settlement must not invent a permanent refusal"
+        );
+        owner.retry_started = Some(owner.retry_clock_now().saturating_sub(60_000));
+    }
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+    recover_unhealthy_owners(&fixture.broker).await;
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    assert!(
+        owner_ref.lock().await.available,
+        "a successful recovery probe must reopen the owner"
+    );
+    central.settle_test_observations().await.unwrap();
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }
 
 async fn list(broker: Broker, headers: HeaderMap) -> Value {

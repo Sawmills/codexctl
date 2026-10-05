@@ -173,7 +173,7 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode == "billing-error-marked":
+        if mode in ["billing-error-marked", "billing-error-slow-exit"]:
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
             continue
         if mode == "rpc-unhealthy":
@@ -253,3 +253,6 @@ if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).rea
 
 if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
     pathlib.Path(os.environ["CENTRAL_TEST_EXIT_FILE"]).write_text("exited")
+
+if mode == "billing-error-slow-exit":
+    time.sleep(31)

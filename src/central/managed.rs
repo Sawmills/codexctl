@@ -782,6 +782,12 @@ async fn abandon_background_recovery(
     drop(permit);
 }
 
+enum SettlementRecovery {
+    Available,
+    Retryable,
+    Fenced,
+}
+
 /// Keep a recovery lease until the stopped child has been settled and its
 /// credentials are durably published. The work permit is held by the caller
 /// or transferred to this task, so shutdown drains this work instead of
@@ -792,7 +798,7 @@ async fn settle_background_recovery(
     central: Option<CentralStore>,
     lease: Option<super::storage::Lease>,
     before: Vault,
-    available_after: bool,
+    recovery: SettlementRecovery,
     recovery_generation: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
     renew_done: Arc<AtomicBool>,
@@ -863,9 +869,11 @@ async fn settle_background_recovery(
         if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
             let _ = central.release_lease(lease).await;
         }
-        if available_after {
+        {
             let mut owner = owner_ref.lock().await;
-            if owner.recovery_generation == recovery_generation {
+            if owner.recovery_generation == recovery_generation
+                && matches!(recovery, SettlementRecovery::Available)
+            {
                 owner.available = true;
                 owner.refresh_enabled = true;
                 owner.routing_refused = false;
@@ -873,6 +881,12 @@ async fn settle_background_recovery(
                 owner.retry_requires_billing = false;
                 owner.retry_started = None;
                 owner.retry_failures = 0;
+            } else if owner.recovery_generation == recovery_generation
+                && matches!(recovery, SettlementRecovery::Retryable)
+            {
+                // Settlement cleared the temporary lease fence. A retryable
+                // failure still needs its normal recovery probe before serving.
+                owner.routing_refused = false;
             }
         }
         renew_done.store(true, Ordering::Release);
@@ -1034,7 +1048,6 @@ async fn token(
         // initialize can rotate credentials too. Capture the committed baseline
         // and renew the lease before launching, then settle even a failed launch.
         let before = owner.vault.clone();
-        let recovery_generation = owner.recovery_generation;
         let mut restore_after_settlement = false;
         let result = async {
             if lease.is_some()
@@ -1219,6 +1232,14 @@ async fn token(
         }
         .await;
         if retain_lease {
+            let recovery = if restore_after_settlement {
+                SettlementRecovery::Available
+            } else if owner.retryable_unavailable && !owner.routing_refused {
+                SettlementRecovery::Retryable
+            } else {
+                SettlementRecovery::Fenced
+            };
+            let recovery_generation = owner.recovery_generation;
             owner.available = false;
             owner.routing_refused = true;
             owner.refresh_enabled = false;
@@ -1227,7 +1248,7 @@ async fn token(
                 worker.central.clone(),
                 lease,
                 before,
-                restore_after_settlement,
+                recovery,
                 recovery_generation,
                 permit,
                 Arc::new(AtomicBool::new(false)),
@@ -2468,7 +2489,11 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         central,
                         lease,
                         before,
-                        probe_ok && local_saved,
+                        if probe_ok && local_saved {
+                            SettlementRecovery::Available
+                        } else {
+                            SettlementRecovery::Fenced
+                        },
                         recovery_generation,
                         permit,
                         renew_done,
@@ -2522,7 +2547,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             central,
                             lease,
                             before,
-                            true,
+                            SettlementRecovery::Available,
                             recovery_generation,
                             permit,
                             renew_done,
@@ -2559,7 +2584,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             central,
                             lease,
                             before,
-                            false,
+                            SettlementRecovery::Fenced,
                             recovery_generation,
                             permit,
                             renew_done,
@@ -2586,7 +2611,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         central.clone(),
                         lease.clone(),
                         before,
-                        false,
+                        SettlementRecovery::Fenced,
                         recovery_generation,
                         permit,
                         renew_done,
