@@ -4967,6 +4967,7 @@ fn server_selection_succeeds_while_a_session_or_its_orphaned_child_holds_a_lease
         .arg("codex")
         .env("HOME", home.path())
         .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
         .stdin(Stdio::piped())
