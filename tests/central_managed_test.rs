@@ -129,6 +129,8 @@ impl Server {
         .unwrap();
         store::atomic_write(&root.path().join("mode"), b"").unwrap();
         store::atomic_write(&root.path().join("count"), b"0").unwrap();
+        store::atomic_write(&root.path().join("retry-clock"), b"0").unwrap();
+        store::atomic_write(&root.path().join("launch-count"), b"0").unwrap();
         let (child, url) = Self::spawn(&root);
         let amir = std::fs::read_to_string(root.path().join("amir.token")).unwrap();
         let alex = std::fs::read_to_string(root.path().join("alex.token")).unwrap();
@@ -159,7 +161,20 @@ impl Server {
         binary: &std::path::Path,
         flags: &[&str],
     ) -> (Child, String) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        Self::spawn_binary_with_recovery(root, binary, flags, Some("1"))
+    }
+    fn spawn_binary_with_recovery(
+        root: &tempfile::TempDir,
+        binary: &std::path::Path,
+        flags: &[&str],
+        recovery: Option<&str>,
+    ) -> (Child, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl-central"));
+        command.env_remove("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY");
+        if let Some(value) = recovery {
+            command.env("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY", value);
+        }
+        let mut child = command
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(root.path().join("state"))
@@ -183,8 +198,14 @@ impl Server {
             .env("no_proxy", "127.0.0.1,localhost")
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
+            .env("CENTRAL_TEST_RETRY_CLOCK", root.path().join("retry-clock"))
+            .env(
+                "CENTRAL_TEST_LAUNCH_COUNTER",
+                root.path().join("launch-count"),
+            )
             .env("CENTRAL_TEST_KEY_FILE", root.path().join("key"))
             .env("CENTRAL_TEST_OWNER_CWD_FILE", root.path().join("owner-cwd"))
+            .env("CENTRAL_TEST_RECOVERY_INTERVAL_MS", "20")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -232,6 +253,27 @@ impl Server {
             .post(format!("{}/v1/token", self.url))
             .bearer_auth(token)
             .json(&json!({"alias":alias,"previousRevision":previous,"billing":true}))
+            .send()
+            .unwrap()
+    }
+    fn token_without_billing(&self, token: &str, alias: &str) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/token", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .unwrap()
+    }
+    fn token_with_account(
+        &self,
+        token: &str,
+        alias: &str,
+        account_id: &str,
+    ) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/token", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias,"accountId":account_id,"billing":true}))
             .send()
             .unwrap()
     }
@@ -2192,6 +2234,492 @@ fn when_a_saved_import_failed_to_start_then_retry_reconciles_it() {
     assert_eq!(response.status(), 200);
     assert_eq!(server.accounts(&server.amir)[0]["accountId"], "amir-seat");
 }
+
+#[test]
+fn marked_billing_failure_stays_fenced_until_an_explicit_repair() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    let response = server.token(&server.amir, "personal", None);
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if server
+            .token_without_billing(&server.amir, "personal")
+            .status()
+            == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background billing probe did not recover the owner"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn failed_import_billing_probe_keeps_retry_fenced_without_billing() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        503
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn account_id_validation_cannot_reopen_a_failed_import() {
+    let mut server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(
+        server
+            .token_with_account(&server.amir, "personal", "wrong-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        503
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    server.stop();
+    server.restart();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn repeated_account_id_mismatches_do_not_spend_recovery_budget() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        503
+    );
+    for _ in 0..4 {
+        assert_eq!(
+            server
+                .token_with_account(&server.amir, "personal", "wrong-seat")
+                .status(),
+            409
+        );
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if server.token(&server.amir, "personal", None).status() == 200 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn an_unhealthy_rpc_is_replaced_after_a_protocol_failure() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2
+    );
+}
+
+#[test]
+fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy-once").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = server.token(&server.amir, "personal", None).status();
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background recovery timed out"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2
+    );
+}
+
+#[test]
+fn background_recovery_is_off_by_default_and_import_can_repair() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn background_recovery_recreates_an_unhealthy_owner() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2,
+        "background task must relaunch before a token request"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if server.token(&server.amir, "personal", None).status() == 200 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background recovery timed out"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 2
+    );
+}
+
+#[test]
+fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let launches = || {
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(launches(), 2);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"300000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(launches(), 3);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"900000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(launches(), 4);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"900001").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(launches(), 4);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    // Exhausting automatic recovery must still leave an explicit import able
+    // to repair the owner.
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let repaired = server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    let repaired_status = repaired.status();
+    let repaired_body = repaired.text().unwrap();
+    assert_eq!(repaired_status, 200, "repair response: {repaired_body}");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn an_unmarked_billing_rejection_is_permanent_without_respawn() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-permanent-error").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
+        "1"
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+}
+
+#[test]
+fn retryable_owner_cannot_lift_a_relogin_fence() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let id = "d".repeat(64);
+    assert_eq!(
+        server
+            .login_request(&server.amir, "start", "personal", &id)
+            .status(),
+        200
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn retry_snapshot_identity_failure_stays_fenced_after_journal_repair() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let account = std::fs::read_dir(server.root.path().join("state/accounts"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let journal = account.join("runtime/auth.json");
+    let saved = std::fs::read(&journal).unwrap();
+    store::atomic_write(
+        &journal,
+        &serde_json::to_vec(&auth("different-login", "amir-seat")).unwrap(),
+    )
+    .unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    std::thread::sleep(Duration::from_millis(100));
+    store::atomic_write(&journal, &saved).unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+}
+
+#[test]
+fn failed_respawn_is_retried_with_a_real_launch_attempt() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"respawn-launch-fail-once",
+    )
+    .unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        2
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"360000").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let recovered = server.token(&server.amir, "personal", None);
+        if recovered.status() == 200 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+            >= 3
+    );
+}
+
 fn retry_import(server: &Server) -> reqwest::blocking::Response {
     retry_import_for(server, &server.amir, "personal", "amir-login", "amir-seat")
 }
@@ -2398,10 +2926,11 @@ fn when_an_import_has_an_uncertain_reply_then_its_owner_finishes_before_shutdown
     );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     assert_eq!(retry_import(&server).status(), 200);
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
-        "1"
+        "2"
     );
 }
 #[test]
@@ -2500,7 +3029,7 @@ fn when_an_uncertain_import_matches_another_request_then_the_first_owner_settles
         server
             .import(&server.amir, "personal", "same-login", "same-seat")
             .status(),
-        409
+        503
     );
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
@@ -2660,7 +3189,7 @@ fn retry_import_for(
 }
 
 #[test]
-fn when_a_replacement_fails_validation_then_its_account_stays_reserved() {
+fn retryable_owner_reimport_stays_reserved_without_identity_conflict() {
     let server = Server::start();
     assert_eq!(
         server
@@ -2668,14 +3197,14 @@ fn when_a_replacement_fails_validation_then_its_account_stays_reserved() {
             .status(),
         200
     );
-    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
     assert_eq!(server.token(&server.amir, "Personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     assert_eq!(
         server
             .import(&server.amir, "personal", "amir-login", "amir-seat")
             .status(),
-        409
+        503
     );
     assert_eq!(server.token(&server.amir, "Personal", None).status(), 503);
     assert_eq!(
@@ -6275,7 +6804,11 @@ fn connected_status_json_keeps_unavailable_accounts() {
     let server = Server::start();
     server.import(&server.amir, "personal", "server-login", "server-seat");
     let home = server.connected_home();
-    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"routing-policy-wrong-code",
+    )
+    .unwrap();
 
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let output = server.cli(home.path(), &["status", "--json"]);

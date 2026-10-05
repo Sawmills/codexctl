@@ -221,7 +221,7 @@ async fn fence(broker: &Broker, auth: &Value) -> Result<()> {
         if !inventory.needs_fence(auth) {
             continue;
         }
-        owner.available = false;
+        owner.fence(false);
         let stopped = if let Some(rpc) = owner.rpc.as_mut() {
             rpc.settle_and_stop().await.map(|_| ())
         } else {

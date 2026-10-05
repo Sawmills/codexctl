@@ -90,6 +90,17 @@ for line in sys.stdin:
     params = message.get("params", {})
     result = {}
     if method == "initialize":
+        launch_counter = os.environ.get("CENTRAL_TEST_LAUNCH_COUNTER")
+        if launch_counter:
+            counter = pathlib.Path(launch_counter)
+            counter.write_text(str(int(counter.read_text()) + 1))
+        mode_path = os.environ.get("CENTRAL_TEST_MODE_FILE")
+        mode = pathlib.Path(mode_path).read_text() if mode_path else ""
+        if mode == "respawn-launch-fail-once":
+            marker = pathlib.Path(mode_path).with_name("launch-failed")
+            if not marker.exists():
+                marker.write_text("failed")
+                sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
         if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "startup":
@@ -150,6 +161,24 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
+        if mode == "billing-error-marked":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
+            continue
+        if mode == "rpc-unhealthy":
+            print("{invalid", flush=True)
+            sys.exit(1)
+        if mode == "billing-permanent-error":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic permanent billing rejection"}})
+            continue
+        if mode in ["billing-error-once", "rpc-unhealthy-once"]:
+            marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("billing-failed")
+            if not marker.exists():
+                marker.write_text("failed")
+                if mode == "billing-error-once":
+                    send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
+                    continue
+                print("{invalid", flush=True)
+                sys.exit(1)
         if mode == "billing-slow":
             pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("billing-started").write_text("started")
             time.sleep(6)

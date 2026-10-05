@@ -18,6 +18,24 @@ impl std::fmt::Display for RoutingPolicyError {
 }
 impl std::error::Error for RoutingPolicyError {}
 
+#[derive(Debug)]
+struct AppServerError;
+impl std::fmt::Display for AppServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("app-server rejected request")
+    }
+}
+impl std::error::Error for AppServerError {}
+
+#[derive(Debug)]
+pub(super) struct RetryableUsageRead;
+impl std::fmt::Display for RetryableUsageRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("app-server usage read rejected with an explicit retry marker")
+    }
+}
+impl std::error::Error for RetryableUsageRead {}
+
 pub(super) trait RequestHandler {
     fn keep_notifications(&self) -> bool {
         true
@@ -42,6 +60,8 @@ pub struct Rpc {
     output: BufReader<ChildStdout>,
     next_id: u64,
     healthy: bool,
+    retryable_failure: bool,
+    timed_out: bool,
     outstanding: Option<(u64, bool)>,
     verified_login: bool,
     rejected_login: bool,
@@ -52,6 +72,37 @@ pub struct Rpc {
 impl Rpc {
     pub(super) fn completion_pending(&self) -> bool {
         self.outstanding.is_some()
+    }
+
+    pub(super) fn process_exited(&mut self) -> bool {
+        self._child.try_wait().ok().flatten().is_some()
+    }
+
+    pub(super) async fn terminate(mut self) {
+        let _ = self.input.take();
+        // A failed protocol read can race with the child finishing its
+        // credential journal write. Give that write a bounded grace period
+        // before forcing termination.
+        if timeout(Duration::from_secs(1), self._child.wait())
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        let _ = self._child.start_kill();
+        let _ = timeout(Duration::from_secs(5), self._child.wait()).await;
+    }
+
+    pub(super) fn retryable_failure(&self) -> bool {
+        self.retryable_failure
+    }
+
+    pub(super) fn retryable_or_timed_out(&self) -> bool {
+        self.retryable_failure() || self.timed_out
+    }
+
+    pub(super) fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     pub async fn start(binary: &Path, home: &Path) -> Result<Self> {
@@ -128,6 +179,8 @@ impl Rpc {
             output,
             next_id: 0,
             healthy: true,
+            retryable_failure: false,
+            timed_out: false,
             outstanding: None,
             verified_login: false,
             rejected_login: false,
@@ -257,6 +310,17 @@ impl Rpc {
             .context("could not confirm owner exit; runtime retained")
     }
 
+    /// After an EOF/protocol failure, close stdin and wait without killing the
+    /// child. This establishes the dead-child condition before its journal is
+    /// used for recovery.
+    pub(super) async fn wait_after_eof(&mut self) -> bool {
+        drop(self.input.take());
+        matches!(
+            timeout(Duration::from_secs(30), self._child.wait()).await,
+            Ok(Ok(_))
+        )
+    }
+
     pub async fn send(&mut self, value: Value) -> Result<()> {
         let input = self.input.as_mut().context("app-server input is closed")?;
         input
@@ -334,7 +398,14 @@ impl Rpc {
                         {
                             return Err(RoutingPolicyError.into());
                         }
-                        bail!("app-server rejected {method}");
+                        if method == "account/rateLimits/read"
+                            && response.pointer("/error/code").and_then(Value::as_i64)
+                                == Some(-32000)
+                            && response.pointer("/error/data/retryable") == Some(&json!(true))
+                        {
+                            return Err(RetryableUsageRead.into());
+                        }
+                        return Err(AppServerError.into());
                     }
                     return response
                         .get("result")
@@ -360,16 +431,17 @@ impl Rpc {
         };
         match timeout(deadline, operation).await {
             Ok(result) => {
-                if result
-                    .as_ref()
-                    .is_err_and(|error| !error.is::<RoutingPolicyError>())
-                {
+                if result.as_ref().is_err_and(|error| {
+                    !error.is::<RoutingPolicyError>() && !error.is::<AppServerError>()
+                }) {
                     self.healthy = false;
+                    self.retryable_failure = true;
                 }
                 result
             }
             Err(_) => {
                 self.healthy = false;
+                self.timed_out = true;
                 bail!("app-server request timed out; completion is unknown");
             }
         }
@@ -417,12 +489,17 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+        assert!(!rpc.retryable_failure());
+        assert!(rpc.timed_out());
         assert!(rpc._child.try_wait().unwrap().is_none());
         rpc.shutdown().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("count")).unwrap(),
             "1"
         );
+        let auth: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "synthetic-rotated-refresh");
     }
     #[tokio::test]
     async fn when_a_client_child_starts_then_it_stays_in_the_terminal_process_group() {

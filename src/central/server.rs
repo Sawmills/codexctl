@@ -17,7 +17,8 @@ use std::{
     collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
+    time::Instant,
 };
 use tokio::sync::Mutex;
 
@@ -84,6 +85,20 @@ pub(super) enum TokenFailure {
     RefreshDisabled,
     UnsupportedRouting,
     Unavailable(anyhow::Error),
+    Retryable(anyhow::Error),
+}
+
+pub(super) fn retry_clock_now() -> u64 {
+    // Integration tests run the debug binary; release builds cannot read this hook.
+    #[cfg(debug_assertions)]
+    if let Ok(path) = std::env::var("CENTRAL_TEST_RETRY_CLOCK")
+        && let Ok(value) = std::fs::read_to_string(path)
+        && let Ok(milliseconds) = value.trim().parse()
+    {
+        return milliseconds;
+    }
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 impl From<anyhow::Error> for TokenFailure {
@@ -103,11 +118,52 @@ pub(super) struct Owner {
     pub(super) state: PathBuf,
     pub(super) key: PathBuf,
     pub(super) available: bool,
+    pub(super) retryable_unavailable: bool,
+    pub(super) retry_requires_billing: bool,
+    pub(super) retry_started: Option<u64>,
+    pub(super) retry_failures: u8,
+    pub(super) recovery_generation: u64,
     pub(super) routing_refused: bool,
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
     pub(super) verification_input: Option<Value>,
+    #[cfg(test)]
+    pub(super) retry_clock: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+}
+
+impl Owner {
+    pub(super) fn retry_clock_now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = self.retry_clock.as_ref() {
+            return clock();
+        }
+        retry_clock_now()
+    }
+
+    pub(super) fn retry_cooldown_active(&self) -> bool {
+        if self.retry_failures >= 3 {
+            return true;
+        }
+        let backoff = match self.retry_failures {
+            0 => 60_000,
+            1 => 300_000,
+            _ => 900_000,
+        };
+        self.retry_started
+            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
+    }
+    pub(super) fn selectable(&self) -> bool {
+        self.available && !self.routing_refused
+    }
+    pub(super) fn fence(&mut self, retryable: bool) {
+        self.recovery_generation = self.recovery_generation.wrapping_add(1);
+        self.available = false;
+        self.retryable_unavailable = retryable && self.vault.verified;
+        if !retryable {
+            self.retry_started = None;
+        }
+    }
 }
 
 pub(super) fn validate_owned_identity(original_auth: &Value, auth: &Value) -> Result<()> {
@@ -130,6 +186,17 @@ pub(super) fn validate_owned_identity(original_auth: &Value, auth: &Value) -> Re
 impl Owner {
     pub(super) fn validate_owned_auth(&self, auth: &Value) -> Result<()> {
         validate_owned_identity(&self.vault.auth, auth)
+    }
+
+    pub(super) fn validate_account_id(&self, requested: Option<&str>) -> Result<(), TokenFailure> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let current = vault::account(&self.vault.auth).map_err(TokenFailure::Unavailable)?;
+        if requested != current {
+            return Err(TokenFailure::AccountMismatch);
+        }
+        Ok(())
     }
 
     pub(super) fn reconcile_journal(&mut self) -> Result<()> {
@@ -170,10 +237,9 @@ impl Owner {
             &self.home.as_path().join("auth.json"),
         )?)?;
         self.validate_owned_auth(&auth)?;
-        if self.rpc.as_ref().is_some_and(Rpc::verified_login) {
-            self.vault.verified = true;
-            self.vault.import_rejected = false;
-        } else if !self.vault.verified {
+        // A journal snapshot preserves credentials, not import eligibility.
+        // Only a completed import or replacement verification grants eligibility.
+        if !self.vault.verified {
             if let Some(rpc) = self.rpc.as_ref() {
                 self.vault.import_rejected =
                     rpc.rejected_login() && self.verification_input.as_ref() == Some(&auth);
@@ -203,17 +269,16 @@ impl Owner {
     ) -> Result<TokenResponse, TokenFailure> {
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
-                "credential owner unavailable; restart after diagnosis"
+                "credential owner unavailable"
             )));
         }
-        let current = self.snapshot()?;
-        if request
-            .account_id
-            .as_ref()
-            .is_some_and(|id| *id != current.chatgpt_account_id)
-        {
-            return Err(TokenFailure::AccountMismatch);
-        }
+        let current = match self.snapshot() {
+            Ok(current) => current,
+            Err(error) => {
+                self.fence(false);
+                return Err(error.into());
+            }
+        };
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
                 return self.with_billing(current, request.billing).await;
@@ -245,7 +310,7 @@ impl Owner {
             .as_ref()
             .is_err_and(|error| !error.is::<RoutingPolicyError>())
         {
-            self.available = false;
+            self.fence(false);
         }
         if force
             && !self.vault.verified
@@ -256,11 +321,19 @@ impl Owner {
         }
         let snapshot = self.snapshot();
         if snapshot.is_err() {
-            self.available = false;
+            self.fence(false);
         }
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
-        result?;
+        if let Err(error) = result {
+            if self.vault.verified
+                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                && !error.is::<RoutingPolicyError>()
+            {
+                return Err(TokenFailure::Retryable(error));
+            }
+            return Err(error.into());
+        }
         self.with_billing(current, request.billing).await
     }
 
@@ -288,11 +361,28 @@ impl Owner {
                     .await;
                 let observed_at = std::time::Instant::now();
                 let snapshot = self.snapshot();
-                if result.is_err() || snapshot.is_err() {
-                    self.available = false;
+                if snapshot.is_err() {
+                    self.fence(false);
                 }
-                let limits = result?;
                 token = snapshot?;
+                let limits = match result {
+                    Ok(limits) => limits,
+                    Err(error)
+                        if self.vault.verified
+                            && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                            && !error.is::<RoutingPolicyError>() =>
+                    {
+                        self.retry_requires_billing = true;
+                        self.fence(true);
+                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
+                        return Err(TokenFailure::Retryable(error));
+                    }
+                    Err(error) => {
+                        self.fence(false);
+                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
+                        return Err(error.into());
+                    }
+                };
                 token.billing_class = Some(billing_class(&limits));
                 token.chatgpt_plan_type = limits
                     .pointer("/rateLimits/planType")
@@ -314,7 +404,7 @@ impl Owner {
                 .is_err_and(|error| !error.is::<RoutingPolicyError>())
                 || snapshot.is_err()
             {
-                self.available = false;
+                self.fence(false);
             }
             let mut current = snapshot?;
             if result
@@ -323,7 +413,17 @@ impl Owner {
             {
                 self.routing_refused = true;
             }
-            let account = result?;
+            let account = match result {
+                Ok(account) => account,
+                Err(error)
+                    if self.vault.verified
+                        && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                        && !error.is::<RoutingPolicyError>() =>
+                {
+                    return Err(TokenFailure::Retryable(error));
+                }
+                Err(error) => return Err(error.into()),
+            };
             if supported_native_routing(&account) != Some(current.chatgpt_account_id.as_str()) {
                 self.routing_refused = true;
                 return Err(TokenFailure::UnsupportedRouting);
@@ -526,7 +626,11 @@ async fn tokens(
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     // A disconnected HTTP client must not cancel a refresh after OpenAI rotates its token.
     let owner = broker.owner.clone();
-    let task = tokio::spawn(async move { owner.lock().await.tokens(request).await });
+    let task = tokio::spawn(async move {
+        let mut owner = owner.lock().await;
+        owner.validate_account_id(request.account_id.as_deref())?;
+        owner.tokens(request).await
+    });
     let result = task
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?
@@ -534,7 +638,7 @@ async fn tokens(
             TokenFailure::AccountMismatch => broker.error(StatusCode::BAD_REQUEST, "account_mismatch"),
             TokenFailure::RefreshDisabled => broker.error(StatusCode::CONFLICT, "refresh_disabled"),
             TokenFailure::UnsupportedRouting => broker.error(StatusCode::CONFLICT, "unsupported_workspace_routing"),
-            TokenFailure::Unavailable(error) => {
+            TokenFailure::Unavailable(error) | TokenFailure::Retryable(error) => {
                 eprintln!("{}", json!({"operation":"token_request","stage":"owner","reason":"owner_unavailable","detail":error.to_string()}));
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
             }
@@ -603,11 +707,18 @@ pub async fn serve(
         state: state.into(),
         key: key.into(),
         available: true,
+        retryable_unavailable: false,
+        retry_requires_billing: false,
+        retry_started: None,
+        retry_failures: 0,
+        recovery_generation: 0,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
         limits_observed: None,
         verification_input: None,
+        #[cfg(test)]
+        retry_clock: None,
     };
     if !read_only {
         let migration_lock = Mutex::new(());

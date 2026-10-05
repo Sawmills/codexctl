@@ -108,6 +108,8 @@ impl Fixture {
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
+            recovery_stop: Arc::new(tokio::sync::Notify::new()),
+            background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: None,
             holder_id: "test-holder".into(),
@@ -155,6 +157,35 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.http.abort();
     }
+}
+
+#[tokio::test]
+async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let before = owner_ref.lock().await.vault.clone();
+    let permits = Arc::new(Semaphore::new(1));
+    let permit = permits.clone().acquire_owned().await.unwrap();
+    let renew_done = Arc::new(AtomicBool::new(false));
+    {
+        let mut owner = owner_ref.lock().await;
+        owner.fence(false);
+    }
+    settle_background_recovery(
+        owner_ref.clone(),
+        None,
+        None,
+        before,
+        true,
+        0,
+        permit,
+        renew_done,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    assert!(!owner_ref.lock().await.available);
+    assert!(permits.try_acquire().is_ok());
 }
 
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
@@ -653,19 +684,55 @@ async fn dashboard_redirects_if_session_ends_during_snapshot() {
 
 impl Fixture {
     async fn attach_refresh_store(&mut self, mode: &str) -> CentralStore {
+        self.attach_refresh_store_with_mode(super::super::storage::StoreMode::File, mode)
+            .await
+    }
+
+    async fn attach_refresh_store_with_mode(
+        &mut self,
+        store_mode: super::super::storage::StoreMode,
+        mode: &str,
+    ) -> CentralStore {
         use std::os::unix::fs::PermissionsExt;
-        let central = CentralStore::from_mode(
-            super::super::storage::StoreMode::File,
-            &self.broker.state,
-            &self.broker.key,
-        )
-        .await
-        .unwrap();
+        let central = CentralStore::from_mode(store_mode, &self.broker.state, &self.broker.key)
+            .await
+            .unwrap();
         central.migrate().await.unwrap();
         self.broker.central = Some(central.clone());
         self.broker.read_only = false;
+        if store_mode != super::super::storage::StoreMode::File {
+            let user = users(&self.broker.state)
+                .unwrap()
+                .into_iter()
+                .find(|user| user.id == "test")
+                .unwrap();
+            central
+                .save_registry_entity_cas(
+                    "users",
+                    &user.id,
+                    &serde_json::to_vec(&user).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+            let device = vault::devices(&self.broker.state)
+                .unwrap()
+                .into_iter()
+                .find(|device| device.user == "test")
+                .unwrap();
+            central
+                .save_device_entity_cas(
+                    &device.tenant,
+                    &device.id,
+                    &serde_json::to_vec(&device).unwrap(),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
         let owner_ref = self.broker.owners.read().await["fixture"].1.clone();
         let mut owner = owner_ref.lock().await;
+        owner.retry_clock = Some(Arc::new(|| 60_000));
         owner.vault.revision = 1;
         vault::save(&owner.state, &owner.key, &owner.vault).unwrap();
         central
@@ -685,10 +752,52 @@ impl Fixture {
         );
         store::atomic_write(&binary, script.as_bytes()).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        self.broker.binary = binary.clone();
         owner.rpc = Some(Rpc::start(&binary, &owner.home).await.unwrap());
         owner.refresh_enabled = true;
         central
     }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
+    if std::env::var("DATABASE_URL").is_err() {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("DATABASE_URL must be set for PostgreSQL managed retry scenarios in CI");
+        }
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(2)).await;
+    let central = fixture
+        .attach_refresh_store_with_mode(super::super::storage::StoreMode::Postgres, "rpc-unhealthy")
+        .await;
+
+    assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+    store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let mut owner = owner_ref.lock().await;
+    let now = owner.retry_clock_now();
+    owner.retry_started = Some(now.saturating_sub(60_000));
+    drop(owner);
+    recover_unhealthy_owners(&fixture.broker).await;
+    assert_eq!(fixture.token().await, StatusCode::OK);
+    // A central reconcile can stop a stale child while the owner remains
+    // available. The pre-existing shared-store launch path must recreate it.
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        owner.rpc = None;
+        owner.refresh_enabled = false;
+        owner.available = true;
+    }
+    assert_eq!(fixture.token().await, StatusCode::OK);
+    let committed = central
+        .load_account(&account_key("test", "fixture"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.vault["revision"], committed.revision);
 }
 
 #[tokio::test]

@@ -1903,6 +1903,8 @@ fn a_slow_token_fetch_does_not_hold_native_lock() {
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["central-token", "--active"])
         .env("HOME", &client.home)
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
