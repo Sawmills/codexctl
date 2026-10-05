@@ -46,15 +46,12 @@ pub fn run(
     }
     #[cfg(feature = "central-prototype")]
     let selected_central_launch = if codexctl::central::native::central_active()? {
-        match codexctl::central::remote::select_codex_account() {
-            Ok(alias) => {
-                eprintln!("codexctl: selected included account {alias} (least loaded)");
-                Some(codexctl::central::native::prepare_pinned_codex(
-                    &alias, false,
-                )?)
-            }
-            Err(_) => None,
-        }
+        let alias = codexctl::central::remote::select_codex_account()
+            .context("automatic codex launch could not select an included account")?;
+        eprintln!("codexctl: selected included account {alias} (least loaded)");
+        Some(codexctl::central::native::prepare_pinned_codex(
+            &alias, false,
+        )?)
     } else {
         None
     };

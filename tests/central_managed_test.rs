@@ -7956,6 +7956,40 @@ fn dashboard_identity_and_sign_out_are_scoped_to_the_browser_session() {
 
 // B21's public CLI seams; these regressions are prepared before B17 merges.
 #[test]
+fn automatic_launch_refuses_when_account_selection_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let pointer = home.path().join(".codexctl/central/.active-account");
+    let before = std::fs::read(&pointer).unwrap();
+    let bin = home.path().join("bin/codex");
+    store::atomic_write(&bin, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // An unreadable registration must not silently reuse the active account.
+    store::atomic_write(
+        &home.path().join(".codexctl/central/.server.json"),
+        b"invalid",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env("PATH", bin.parent().unwrap())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .arg("codex")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "launched despite failed selection"
+    );
+    assert_eq!(std::fs::read(pointer).unwrap(), before);
+}
+
+#[test]
 fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();
