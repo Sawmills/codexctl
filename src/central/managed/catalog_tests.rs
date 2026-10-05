@@ -631,15 +631,6 @@ async fn dashboard_caches_usage_and_reset_expiry_without_refreshing_credentials(
 
 #[tokio::test]
 async fn dashboard_omits_credits_when_credentials_change_during_snapshot() {
-    dashboard_omits_credits_after_late_staleness(true).await;
-}
-
-#[tokio::test]
-async fn dashboard_omits_credits_when_usage_expires_during_snapshot() {
-    dashboard_omits_credits_after_late_staleness(false).await;
-}
-
-async fn dashboard_omits_credits_after_late_staleness(change_credentials: bool) {
     let mut f = Fixture::new(Duration::from_secs(2)).await;
     f.broker.sso = Some(Arc::new(enrollment::Sso::testing_session("test")));
     let started = Arc::new(Semaphore::new(0));
@@ -681,15 +672,8 @@ async fn dashboard_omits_credits_after_late_staleness(change_credentials: bool) 
         .forget();
     let owner = f.broker.owners.read().await["fixture"].1.clone();
     let mut current = owner.lock().await;
-    if change_credentials {
-        current.vault.auth["changed"] = json!(true);
-    }
+    current.vault.auth["changed"] = json!(true);
     release.add_permits(1);
-    if !change_credentials {
-        // Hold the owner observation until the catalog sample expires. Releasing
-        // the reset request first keeps its HTTP timeout out of this test.
-        tokio::time::sleep(super::super::catalog::TTL + Duration::from_secs(1)).await;
-    }
     drop(current);
     let response = response.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);

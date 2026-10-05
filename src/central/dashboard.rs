@@ -64,15 +64,7 @@ async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, Http
         .map(|account| account_snapshot(broker, &user, account));
     let mut accounts: Vec<_> = futures::future::try_join_all(tasks).await?;
     for account in &mut accounts {
-        if let Some(age) = account.usage_age_seconds {
-            let age = age.saturating_add(sampled_at.elapsed().as_secs());
-            account.usage_age_seconds = Some(age);
-            if age >= super::catalog::TTL.as_secs() {
-                account.usage_stale = true;
-                account.credits = None;
-                account.banked_resets.stale = true;
-            }
-        }
+        account.advance_usage_age(sampled_at.elapsed());
     }
     let machines: Vec<_> = vault::devices(&broker.state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
@@ -101,6 +93,21 @@ async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, Http
         machines,
     })
 }
+
+impl Account {
+    fn advance_usage_age(&mut self, elapsed: std::time::Duration) {
+        if let Some(age) = self.usage_age_seconds {
+            let age = age.saturating_add(elapsed.as_secs());
+            self.usage_age_seconds = Some(age);
+            if age >= super::catalog::TTL.as_secs() {
+                self.usage_stale = true;
+                self.credits = None;
+                self.banked_resets.stale = true;
+            }
+        }
+    }
+}
+
 async fn account_snapshot(
     broker: &Broker,
     user: &str,
@@ -299,4 +306,82 @@ fn font(bytes: &'static [u8]) -> Response {
         bytes,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn account(age: Option<u64>) -> Account {
+        serde_json::from_value(json!({
+            "alias": "fixture",
+            "label": null,
+            "plan": "pro",
+            "state": "available",
+            "routing_refused": false,
+            "billing_class": "rate_limited",
+            "credits": {
+                "has_credits": false,
+                "unlimited": false,
+                "balance": "0",
+                "overage_limit_reached": false
+            },
+            "primary": {},
+            "secondary": {},
+            "usage_age_seconds": age,
+            "usage_stale": false,
+            "usage_error": null,
+            "banked_resets": {"stale": false}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dashboard_omits_credits_when_usage_expires_during_snapshot() {
+        let mut account = account(Some(58));
+        account.advance_usage_age(Duration::from_secs(1));
+        assert_eq!(account.usage_age_seconds, Some(59));
+        assert!(!account.usage_stale);
+        assert!(!account.banked_resets.stale);
+        assert_eq!(
+            serde_json::to_value(&account).unwrap()["credits"]["balance"],
+            "0"
+        );
+
+        account.advance_usage_age(Duration::from_secs(1));
+        assert_eq!(account.usage_age_seconds, Some(60));
+        assert!(account.usage_stale);
+        assert!(account.banked_resets.stale);
+        assert!(
+            serde_json::to_value(&account)
+                .unwrap()
+                .get("credits")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn usage_age_saturates_and_keeps_expired_data_stale() {
+        let mut account = account(Some(u64::MAX - 1));
+        account.advance_usage_age(Duration::from_secs(2));
+        assert_eq!(account.usage_age_seconds, Some(u64::MAX));
+        assert!(account.usage_stale);
+        assert!(account.banked_resets.stale);
+        assert!(account.credits.is_none());
+    }
+
+    #[test]
+    fn unknown_usage_age_preserves_existing_staleness() {
+        let mut account = account(None);
+        account.usage_stale = true;
+        account.banked_resets.stale = true;
+        account.credits = None;
+        account.advance_usage_age(Duration::from_secs(60));
+        assert_eq!(account.usage_age_seconds, None);
+        assert!(account.usage_stale);
+        assert!(account.banked_resets.stale);
+        assert!(account.credits.is_none());
+    }
 }
