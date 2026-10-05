@@ -12,8 +12,10 @@ keep `PodDisruptionBudget.minAvailable: 1`. The overlay has no
 ExternalSecret supplies the vault key, SSO secret, and metrics token; the
 The infra#1513 manifest owns the `codexctl-postgres` ExternalSecret and its five
 SSM references. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
-uses the image system CA bundle through
-`CODEXCTL_CENTRAL_DB_CA_FILE`. Kustomize rewrites the workload image to the
+mounts the [AWS RDS global CA bundle](../../rds-ca/README.md) read-only at
+`/etc/codexctl/rds-ca/global-bundle.pem` through
+`CODEXCTL_CENTRAL_DB_CA_FILE`. Certificate and hostname verification stay enabled.
+Kustomize rewrites the workload image to the
 reviewed immutable ECR manifest digest; it does not use the mutable staging tag.
 
 Build it with:

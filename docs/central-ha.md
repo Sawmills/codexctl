@@ -29,7 +29,12 @@ service. Keep those workflows on the single file-mode writer until phase 4
 adds shared TTL/one-time-consume and operation-record tables.
 
 TLS is required by default. `DATABASE_URL` must include `sslmode=require`; set
-`CODEXCTL_CENTRAL_DB_CA_FILE` to the mounted RDS CA bundle or system CA bundle.
+`CODEXCTL_CENTRAL_DB_CA_FILE` to `/etc/codexctl/rds-ca/global-bundle.pem`.
+Both staging overlays include the `codexctl-rds-ca` ConfigMap generated from the
+[official AWS RDS global CA bundle](../deploy/k8s/rds-ca/README.md).
+The HA broker and migration/backfill Jobs mount it read-only. Certificate and
+hostname verification stay enabled; the image system bundle lacks the RDS root.
+Complete the CA reconciliation gate in section 5 before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
 
@@ -131,9 +136,27 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
-The commands below are an operator runbook. This PR does not run them and does
-not reference the live Argo application. Stop if the database, role, secret,
-or row counts do not match the reviewed plan.
+The commands below require operator execution approval. Stop if the database,
+role, secret, or row counts do not match the reviewed plan.
+
+Before stopping the writer or submitting a Job, merge the reviewed CA change into
+`main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
+Keep existing automated sync enabled and wait for that merge to sync. For an
+installation using the checked-in manual-sync Application, run the approved
+`argocd app sync codexctl`, then `argocd app wait codexctl --sync`.
+Do not apply the HA overlay to satisfy this prerequisite.
+
+Verify the synced revision is the reviewed CA merge (or a reviewed descendant
+that includes it), and verify the bundle key in namespace `codexctl`:
+
+```sh
+kubie exec plat-staging argocd kubectl get application codexctl -o json | \
+  jq '{source: .spec.source, sync: .status.sync}'
+kubie exec plat-staging codexctl kubectl get configmap codexctl-rds-ca -o json | \
+  jq -e '.data["global-bundle.pem"] | startswith("-----BEGIN CERTIFICATE-----")'
+```
+
+Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
 
 1. **Back up the current PVC.** Keep the single live pod serving file mode.
    Freeze administrative mutations, take the filesystem copy at one point in
@@ -236,6 +259,8 @@ or row counts do not match the reviewed plan.
                capabilities: { drop: [ALL] }
              env:
                - { name: CODEXCTL_CENTRAL_STORE, value: postgres }
+               - name: CODEXCTL_CENTRAL_DB_CA_FILE
+                 value: /etc/codexctl/rds-ca/global-bundle.pem
                - {
                    name: DB_HOST,
                    valueFrom:
@@ -274,9 +299,16 @@ or row counts do not match the reviewed plan.
                      },
                  }
              volumeMounts:
+               - {
+                   name: rds-ca,
+                   mountPath: /etc/codexctl/rds-ca,
+                   readOnly: true,
+                 }
                - { name: state, mountPath: /data }
                - { name: keys, mountPath: /keys, readOnly: true }
          volumes:
+           - name: rds-ca
+             configMap: { name: codexctl-rds-ca }
            - name: state
              persistentVolumeClaim: { claimName: state-codexctl-0 }
            - name: projected
@@ -342,15 +374,19 @@ or row counts do not match the reviewed plan.
                capabilities: { drop: [ALL] }
              env:
                - {name: CODEXCTL_CENTRAL_STORE, value: postgres}
+               - {name: CODEXCTL_CENTRAL_DB_CA_FILE, value: /etc/codexctl/rds-ca/global-bundle.pem}
                - {name: DB_HOST, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-hostname}}}
                - {name: DB_PORT, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-port}}}
                - {name: DB_NAME, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-name}}}
                - {name: DB_USER, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-user}}}
                - {name: DB_PASSWORD, valueFrom: {secretKeyRef: {name: codexctl-postgres, key: db-password}}}
              volumeMounts:
+               - {name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true}
                - {name: state, mountPath: /data}
                - {name: keys, mountPath: /keys, readOnly: true}
          volumes:
+           - name: rds-ca
+             configMap: { name: codexctl-rds-ca }
            - name: state
              persistentVolumeClaim: {claimName: state-codexctl-0}
            - name: projected
