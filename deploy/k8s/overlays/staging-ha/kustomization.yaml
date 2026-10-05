@@ -4,6 +4,7 @@ namespace: codexctl
 resources:
   - namespace.yaml
   - service.yaml
+  - ingress.yaml
   - networkpolicy.yaml
   - migration-networkpolicy.yaml
   - sso.yaml
@@ -13,4 +14,4 @@ resources:
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
-    digest: sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
+    digest: sha256:ecf8c1dbce22a59067731c4cf47b62ddc9e92986a6433a22064ee6419439ba2b
