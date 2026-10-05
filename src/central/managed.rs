@@ -2025,7 +2025,11 @@ impl Broker {
                     central,
                     verification_lease,
                     before,
-                    restore_after_settlement,
+                    if restore_after_settlement {
+                        SettlementRecovery::Available
+                    } else {
+                        SettlementRecovery::Fenced
+                    },
                     recovery_generation,
                     permit,
                     renew_done,

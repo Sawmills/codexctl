@@ -32,7 +32,9 @@ Import admission still requires a stable identity inventory across local
 accounts. A busy or settling owner returns `refresh_in_progress` to imports,
 including a different alias, instead of blocking the replica's token requests.
 Retry the import after the pending work settles; existing accounts can continue
-to request tokens.
+to request tokens. If a reimport cannot prepare its replacement after stopping
+the previous owner, that account remains fenced. Retry the import after fixing
+the preparation error; token traffic does not override the failed admission.
 
 If a child never settles or its journal stays unreadable, the broker retains the
 lease and fences that account. Graceful shutdown waits for this work. It can
