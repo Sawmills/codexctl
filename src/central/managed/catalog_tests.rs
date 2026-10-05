@@ -730,7 +730,7 @@ impl Fixture {
 
 #[cfg(feature = "central-real-db-tests")]
 #[tokio::test]
-async fn postgres_retry_recovers_after_marked_billing_failure() {
+async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
     if std::env::var("DATABASE_URL").is_err() {
         if std::env::var("CI").ok().as_deref() == Some("true") {
             panic!("DATABASE_URL must be set for PostgreSQL managed retry scenarios in CI");
@@ -739,10 +739,7 @@ async fn postgres_retry_recovers_after_marked_billing_failure() {
     }
     let mut fixture = Fixture::new(Duration::from_secs(2)).await;
     let _central = fixture
-        .attach_refresh_store_with_mode(
-            super::super::storage::StoreMode::Postgres,
-            "billing-error-marked",
-        )
+        .attach_refresh_store_with_mode(super::super::storage::StoreMode::Postgres, "rpc-unhealthy")
         .await;
 
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
@@ -752,6 +749,7 @@ async fn postgres_retry_recovers_after_marked_billing_failure() {
     let now = owner.retry_clock_now();
     owner.retry_started = Some(now.saturating_sub(60_000));
     drop(owner);
+    recover_unhealthy_owners(&fixture.broker).await;
     assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
