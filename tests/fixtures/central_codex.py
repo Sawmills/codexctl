@@ -105,7 +105,7 @@ for line in sys.stdin:
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
         if mode in ["startup-hold", "startup-hold-error"] and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
             pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + 75
             while not pathlib.Path(mode_path).with_name("release-initialize").exists():
                 if time.monotonic() >= deadline:
                     sys.exit(1)

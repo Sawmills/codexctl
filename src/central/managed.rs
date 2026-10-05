@@ -904,23 +904,22 @@ async fn token(
     let worker = broker.clone();
     let owner_ref = owner.clone();
     let (mut token, alias) = tokio::spawn(async move {
-        let import_guard = if worker
-            .central
-            .as_ref()
+        let (import_guard, mut owner) = if worker
+            .central.as_ref()
             .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
         {
-            Some(worker.imports.lock().await)
+            loop {
+                let imports = worker.imports.lock().await;
+                if let Ok(owner) = owner_ref.try_lock() {
+                    break (Some(imports), owner);
+                }
+                // Wait without blocking admission for other accounts, then
+                // retry in the established imports -> Owner lock order.
+                drop(imports);
+                drop(owner_ref.lock().await);
+            }
         } else {
-            None
-        };
-        let mut owner = if import_guard.is_some() {
-            // A same-account waiter must not hold the replica-wide admission
-            // lock across another request's child lifecycle.
-            owner_ref.try_lock().map_err(|_| {
-                worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
-            })?
-        } else {
-            owner_ref.lock().await
+            (None, owner_ref.lock().await)
         };
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
@@ -1004,8 +1003,6 @@ async fn token(
                             }
                             Err(error) => {
                                 eprintln!("central lease renewal: {error:#}");
-                                lost.store(true, Ordering::Release);
-                                break;
                             }
                         }
                     }
@@ -2326,12 +2323,13 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         if done.load(Ordering::Acquire) {
                             break;
                         }
-                        if !central
+                        match central
                             .renew(&lease, std::time::Duration::from_secs(120))
                             .await
-                            .unwrap_or(false)
                         {
-                            break;
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => eprintln!("central background lease renewal: {error:#}"),
                         }
                     }
                 }))

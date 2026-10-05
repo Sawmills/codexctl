@@ -166,7 +166,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     let token = std::fs::read_to_string(&token_file).unwrap();
     let http = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(75))
         .build()
         .unwrap();
     let mut seed = Pod::spawn(database.as_str(), &key, root, "file").await;
@@ -209,7 +209,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     let mut pods = [first, second, third];
     let http = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(75))
         .build()
         .unwrap();
     for pod in &pods {
@@ -239,13 +239,22 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         })
         .await
         .expect("leased initialize did not start");
-        let same_account = timeout(Duration::from_secs(2), request(&http, &pods[0], &token))
-            .await
-            .expect("same-account waiter must not hold the replica import lock");
-        assert_eq!(same_account.status(), 503);
-        assert_eq!(
-            same_account.json::<Value>().await.unwrap()["error"],
-            "refresh_in_progress"
+        let waiting_http = http.clone();
+        let waiting_url = pods[0].url.clone();
+        let waiting_token = token.clone();
+        let same_account = tokio::spawn(async move {
+            waiting_http
+                .post(format!("{waiting_url}/v1/token"))
+                .bearer_auth(waiting_token)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !same_account.is_finished(),
+            "same-account contention should queue"
         );
         let other = timeout(
             Duration::from_secs(2),
@@ -282,7 +291,58 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             );
         }
         assert_eq!(pods.each_ref().map(Pod::launches), [2, 0, 0]);
+        // Fail one scheduled renewal while initialize is still unfinished.
+        // The renewer must survive the query error and retry on its next tick.
+        control
+            .batch_execute(&format!(
+                "CREATE SEQUENCE {schema}.live_renew_attempts;
+             CREATE FUNCTION {schema}.fail_live_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF nextval('{schema}.live_renew_attempts') = 1 THEN
+                 RAISE EXCEPTION 'synthetic live renewal failure';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER fail_live_renewal BEFORE UPDATE ON {schema}.account_refresh_leases
+             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
+             EXECUTE FUNCTION {schema}.fail_live_renewal();"
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(65), async {
+            loop {
+                let retried: bool = control
+                    .query_one(
+                        &format!(
+                            "SELECT is_called AND last_value >= 2 FROM {schema}.live_renew_attempts"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if retried {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("transient renewal failure stopped the live child lease renewer");
+        control
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_live_renewal ON {schema}.account_refresh_leases"
+            ))
+            .await
+            .unwrap();
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
+        let queued = same_account.await.unwrap();
+        assert_eq!(
+            queued.status(),
+            200,
+            "queued same-account request must succeed"
+        );
+        assert_eq!(generation(&queued.json::<Value>().await.unwrap()), 3);
     };
     let (response, ()) = tokio::join!(first_request, contenders);
     assert_eq!(response.status(), 200);
@@ -300,10 +360,10 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             next["revision"], first["revision"],
             "initialize rotation must be committed for the next replica"
         );
-        assert_eq!(generation(&next), index + 3);
+        assert_eq!(generation(&next), index + 4);
         assert!(pod.root.path().join("exited").exists());
     }
-    assert_eq!(pods.each_ref().map(Pod::launches), [2, 1, 1]);
+    assert_eq!(pods.each_ref().map(Pod::launches), [3, 1, 1]);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-error").unwrap();
     std::fs::remove_file(pods[0].root.path().join("exited")).unwrap();
     let failed = request(&http, &pods[0], &token).await;
@@ -336,7 +396,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     .expect("failed initialize retained its lease");
     assert_eq!(
         generation(&recovered),
-        6,
+        7,
         "failed initialize must publish its rotation before the next replica launches"
     );
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup").unwrap();
@@ -355,7 +415,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     })
     .await
     .expect("replica stayed fenced after initialize failure settled");
-    assert_eq!(generation(&retry), 7);
+    assert_eq!(generation(&retry), 8);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-exit").unwrap();
     let failed = request(&http, &pods[0], &token).await;
     assert_eq!(failed.status(), 503);
@@ -371,7 +431,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     })
     .await
     .expect("dead initialize child retained its lease or replica fence");
-    assert_eq!(generation(&retry), 9);
+    assert_eq!(generation(&retry), 10);
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold-error").unwrap();
     for name in ["initialize-started", "release-initialize"] {
         std::fs::remove_file(pods[0].root.path().join(name)).unwrap();
@@ -446,7 +506,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     );
     assert_eq!(
         generation(&successor.json::<Value>().await.unwrap()),
-        11,
+        12,
         "graceful shutdown must publish initialization rotation for its successor"
     );
     for pod in &mut pods {
