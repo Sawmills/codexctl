@@ -45,7 +45,9 @@ pub fn run(
         bail!("server account launch for {alias} requires central support");
     }
     #[cfg(feature = "central-prototype")]
-    let selected_central_launch = if codexctl::central::native::central_active()? {
+    let selected_central_launch = if codexctl::central::native::central_active()?
+        && codexctl::central::remote::connection()?.is_some()
+    {
         let alias = codexctl::central::remote::select_codex_account()
             .context("automatic codex launch could not select an included account")?;
         eprintln!("codexctl: selected included account {alias} (least loaded)");

@@ -835,6 +835,7 @@ impl NativeClient {
             .current_dir(&self.home)
             .env("PATH", &bin)
             .env("HOME", &self.home)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS");
         command
