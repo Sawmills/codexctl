@@ -310,6 +310,17 @@ impl Rpc {
             .context("could not confirm owner exit; runtime retained")
     }
 
+    /// After an EOF/protocol failure, close stdin and wait without killing the
+    /// child. This establishes the dead-child condition before its journal is
+    /// used for recovery.
+    pub(super) async fn wait_after_eof(&mut self) -> bool {
+        drop(self.input.take());
+        matches!(
+            timeout(Duration::from_secs(30), self._child.wait()).await,
+            Ok(Ok(_))
+        )
+    }
+
     pub async fn send(&mut self, value: Value) -> Result<()> {
         let input = self.input.as_mut().context("app-server input is closed")?;
         input

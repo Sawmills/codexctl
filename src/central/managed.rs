@@ -962,10 +962,25 @@ async fn token(
                     retain_lease = true;
                     match settled_owner_record(&mut owner, &before).await {
                         Ok(_) => {}
-                        Err(error)
-                            if failed_rpc
-                                && owner.rpc.as_mut().is_some_and(Rpc::process_exited) =>
-                        {
+                        Err(error) if failed_rpc => {
+                            let exited = owner
+                                .rpc
+                                .as_mut()
+                                .is_some_and(|rpc| rpc.process_exited());
+                            let exited = if exited {
+                                true
+                            } else if let Some(rpc) = owner.rpc.as_mut() {
+                                rpc.wait_after_eof().await
+                            } else {
+                                false
+                            };
+                            if !exited {
+                                eprintln!("central owner settlement: {error:#}");
+                                return Err(worker.error(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "owner_unavailable",
+                                ));
+                            }
                             // The protocol read reached EOF and the child has
                             // now exited. Completion is known impossible, so
                             // discard this dead RPC and publish its journal.
