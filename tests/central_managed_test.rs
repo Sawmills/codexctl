@@ -6596,7 +6596,7 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
             usage_stale: false,
             usage_error: None,
             statusline_usage: None,
-            live_sessions: 0,
+            live_sessions: Some(0),
             recent_429_rate: None,
         }
     };
@@ -6636,7 +6636,7 @@ fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
             usage_stale: false,
             usage_error: None,
             statusline_usage: None,
-            live_sessions,
+            live_sessions: Some(live_sessions),
             recent_429_rate,
             credits: None,
         }
@@ -9249,6 +9249,15 @@ fn b29_automatic_signals_remove_launch_approval_and_reap_child() {
 
 #[test]
 fn b29_automatic_recovery_keeps_arguments_and_closes_each_private_launch() {
+    b29_recovery_scenario(false);
+}
+
+#[test]
+fn b29_signal_during_recovery_prevents_another_child() {
+    b29_recovery_scenario(true);
+}
+
+fn b29_recovery_scenario(interrupt: bool) {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();
     server.import(&server.amir, "host", "host-login", "host-seat");
@@ -9272,6 +9281,8 @@ prior = json.loads(log.read_text()) if log.exists() else []
 assert all(not pathlib.Path(row['connection']).exists() for row in prior)
 log.write_text(json.dumps(prior + [record]))
 if not prior:
+    if os.environ.get('B29_INTERRUPT') == '1':
+        (pathlib.Path(os.environ['HOME']) / 'recovery-pid').write_text(str(os.getppid()))
     print('To continue, run codex resume 019e8489-aa28-7071-ab90-16b81c7cfd1d', flush=True)
     print('\u2502 exceeded retry limit, last status: 429 \u2502', flush=True)
     time.sleep(30)
@@ -9279,14 +9290,41 @@ else:
     print('recovered', flush=True)
 "#).unwrap();
     std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if interrupt {
+        let ps = bin.with_file_name("ps");
+        store::atomic_write(
+            &ps,
+            br#"#!/usr/bin/env python3
+import os, pathlib, signal
+marker = pathlib.Path(os.environ['HOME']) / 'recovery-pid'
+if marker.exists():
+    pid = int(marker.read_text())
+    marker.unlink()
+    os.kill(pid, signal.SIGTERM)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(ps, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let path = std::env::join_paths(
         std::iter::once(bin.parent().unwrap().to_path_buf())
             .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command
         .env("HOME", home.path())
         .env("PATH", path)
+        .env("B29_INTERRUPT", if interrupt { "1" } else { "0" })
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -9300,17 +9338,31 @@ else:
         .current_dir(home.path())
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("recovered"));
     let launches: Value =
         serde_json::from_slice(&std::fs::read(home.path().join("launches.json")).unwrap()).unwrap();
-    assert_eq!(launches.as_array().unwrap().len(), 2);
+    if interrupt {
+        assert_eq!(
+            output.status.code(),
+            Some(128 + libc::SIGTERM),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            launches.as_array().unwrap().len(),
+            1,
+            "signal must prevent recovery launch"
+        );
+    } else {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("recovered"));
+        assert_eq!(launches.as_array().unwrap().len(), 2);
+        assert_eq!(launches[1]["alias"], "host");
+    }
     assert_eq!(launches[0]["alias"], "lane");
-    assert_eq!(launches[1]["alias"], "host");
     for launch in launches.as_array().unwrap() {
         assert!(!std::path::Path::new(launch["connection"].as_str().unwrap()).exists());
         let args = launch["args"].as_array().unwrap();
@@ -9348,7 +9400,7 @@ fn b29_fallback_warns_and_never_redeems_a_reset() {
 }
 
 #[test]
-fn b29_automatic_selection_does_not_approve_new_billing() {
+fn b29_token_policy_change_falls_back_without_new_billing_approval() {
     let (resets, output) = automatic_reset_attempt(
         &["codex", "--allow-billing", "--allow-resets"],
         "pro",
@@ -9356,10 +9408,15 @@ fn b29_automatic_selection_does_not_approve_new_billing() {
         Some("codex"),
     );
     assert!(
-        !output.status.success(),
-        "automatically approved a token with unknown billing"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("current account launched"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no longer has verified included billing")
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("using the current account"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("current account launched"));
     assert_eq!(resets, 0);
 }
 
@@ -9381,4 +9438,19 @@ fn b29_automatic_child_retains_mode_lease_if_launcher_is_killed() {
         matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
         "a surviving child must still block mode changes"
     );
+}
+
+#[test]
+fn b29_unknown_session_count_does_not_invalidate_verified_usage() {
+    let account: central::managed::Account = serde_json::from_value(json!({
+        "userId":"synthetic-user", "alias":"seat", "accountId":"workspace", "plan":"pro",
+        "billingClass":"rate_limited", "primaryUsed":20.0, "secondaryUsed":30.0,
+        "available":true, "usageScore":30.0, "usageStale":false, "liveSessions":null
+    }))
+    .unwrap();
+    assert_eq!(
+        central::remote::select(std::slice::from_ref(&account)).unwrap(),
+        "seat"
+    );
+    assert!(central::remote::select_for_codex(&[account]).is_err());
 }

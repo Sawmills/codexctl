@@ -183,7 +183,7 @@ pub struct PinnedLaunch {
     lease: std::fs::File,
     alias: String,
     codex_args: Vec<String>,
-    signals: LaunchSignals,
+    signals: Arc<LaunchSignals>,
 }
 
 impl Drop for PinnedLaunch {
@@ -217,6 +217,13 @@ impl PinnedLaunch {
         Ok(())
     }
 
+    /// Replace a launch without losing signals received while choosing its successor.
+    pub fn replace(mut self, previous: Self) -> Result<Self> {
+        self.signals = Arc::clone(&previous.signals);
+        previous.close()?;
+        Ok(self)
+    }
+
     pub fn received_signal(&self) -> i32 {
         self.signals.received()
     }
@@ -228,10 +235,14 @@ impl PinnedLaunch {
         cwd: &Path,
         slave: &Path,
     ) -> Result<std::process::Child> {
-        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        use std::os::{
+            fd::AsRawFd,
+            unix::{fs::OpenOptionsExt, process::CommandExt},
+        };
         let tty = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
+            .custom_flags(libc::O_NOCTTY)
             .open(slave)?;
         let mut command = std::process::Command::new("codex");
         command
@@ -270,7 +281,7 @@ fn prepare_pinned_codex(
     included_only: bool,
 ) -> Result<PinnedLaunch> {
     store::validate_alias(alias)?;
-    let signals = LaunchSignals::register()?;
+    let signals = Arc::new(LaunchSignals::register()?);
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {

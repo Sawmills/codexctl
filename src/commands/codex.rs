@@ -49,10 +49,15 @@ pub fn run(
         && codexctl::central::remote::connection()?.is_some()
     {
         codexctl::central::native::pinned_arguments(args)?;
-        match codexctl::central::remote::select_codex_account() {
-            Ok(alias) => {
-                eprintln!("codexctl: selected included account {alias} (least loaded)");
-                Some(codexctl::central::native::prepare_included_codex(&alias)?)
+        match codexctl::central::remote::select_codex_account()
+            .and_then(|alias| codexctl::central::native::prepare_included_codex(&alias))
+        {
+            Ok(launch) => {
+                eprintln!(
+                    "codexctl: selected included account {} (least loaded)",
+                    launch.alias()
+                );
+                Some(launch)
             }
             Err(error) => {
                 eprintln!(
@@ -977,13 +982,13 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
     fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()> {
         #[cfg(feature = "central-prototype")]
         if self.central {
-            let launch = codexctl::central::native::prepare_included_codex(alias)?;
+            let mut launch = codexctl::central::native::prepare_included_codex(alias)?;
             let mut slot = self
                 .central_launch
                 .lock()
                 .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?;
             if let Some(previous) = slot.take() {
-                previous.close()?;
+                launch = launch.replace(previous)?;
             }
             *slot = Some(launch);
             return Ok(());
@@ -2151,12 +2156,33 @@ fn spend_cap_seen(output: &str) -> bool {
 }
 
 fn rate_limit_seen(output: &str) -> bool {
-    let normalized = strip_ansi_escapes(output)
-        .split(['\n', '\r'])
-        .filter(|line| line.chars().any(is_box_drawing))
-        .map(normalize_spend_cap_text)
-        .collect::<String>();
-    normalized.contains(&normalize_spend_cap_text(RATE_LIMIT_MESSAGE))
+    let text = strip_ansi_escapes(output);
+    let needle = normalize_spend_cap_text(RATE_LIMIT_MESSAGE);
+    if normalize_spend_cap_text(&text).contains(&format!("■{needle}")) {
+        return true;
+    }
+    // Some Codex versions draw a dedicated bordered error row without a square
+    // marker. Require that row's contents, not a quote in a tool-output tree.
+    let mut candidate = String::new();
+    for line in text.split(['\n', '\r']) {
+        if !line.contains(['│', '▕'])
+            || line
+                .chars()
+                .any(|c| is_box_drawing(c) && !matches!(c, '│' | '▕'))
+        {
+            candidate.clear();
+            continue;
+        }
+        let part = normalize_spend_cap_text(line);
+        candidate.push_str(&part);
+        if !needle.starts_with(&candidate) {
+            candidate = part;
+        }
+        if candidate == needle {
+            return true;
+        }
+    }
+    false
 }
 
 /// Flatten Codex's bordered error box for matching: drop ANSI escapes,
@@ -2514,6 +2540,15 @@ mod tests {
         assert!(spend_cap_seen(&format!(
             "\u{25a0} {SELF_MANAGED_SPEND_CAP_MESSAGE}"
         )));
+    }
+
+    #[test]
+    fn rate_limit_detection_rejects_tool_quotes_and_accepts_error_markers() {
+        assert!(!rate_limit_seen("└ exceeded retry limit, last status: 429"));
+        assert!(!rate_limit_seen(
+            "│ tool output: exceeded retry limit, last status: 429 │"
+        ));
+        assert!(rate_limit_seen("■ exceeded retry limit, last status: 429"));
     }
 
     #[test]

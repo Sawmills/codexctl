@@ -211,7 +211,7 @@ account, up to three recoveries per hour. A recovery keeps the original model,
 permissions, working directory, and other arguments. Automatic selection and
 429 recovery never redeem resets or select credit-billing accounts, even with
 `--allow-billing` or `--allow-resets`. Explicit `--account` keeps its billing policy.
-If selection has no fresh included account, codexctl warns and launches the current
+If no fresh included launch can be prepared, codexctl warns and launches the current
 account through the existing provider. This fallback keeps that account's existing
 approval; it does not grant new billing approval or redeem a reset.
 

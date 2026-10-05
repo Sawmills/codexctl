@@ -747,7 +747,7 @@ pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
     let mut command = std::process::Command::new("codex");
     command
         .args(["-c", "model_provider=\"codexctl-central\""])
-        .args(args);
+        .args(pinned_arguments(args)?);
     let status = run_child_with_lease(&lease, &mut command)?;
     Ok(Some(
         status

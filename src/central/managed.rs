@@ -66,13 +66,18 @@ pub struct Account {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline_usage: Option<crate::statusline::Usage>,
-    /// Number of launch sessions that received this account's token recently.
-    #[serde(default)]
-    pub live_sessions: usize,
+    /// Recent launch sessions, or None if the session store could not be read.
+    #[serde(default = "legacy_live_sessions")]
+    pub live_sessions: Option<usize>,
     /// Recent 429 ratio reported by a client, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_429_rate: Option<f64>,
 }
+// Older account servers do not report load; preserve their zero-load tie-break.
+fn legacy_live_sessions() -> Option<usize> {
+    Some(0)
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Import {
@@ -295,7 +300,7 @@ fn account_summary(owner: &Owner) -> Account {
             .as_ref()
             .and_then(|v| super::server::usage(v).ok())
             .and_then(|u| u.rate_limit.map(|r| r.availability_score())),
-        live_sessions: 0,
+        live_sessions: Some(0),
         recent_429_rate: None,
     }
 }
@@ -1387,9 +1392,11 @@ pub(super) async fn account_catalog(
                 summary.credits = None;
                 summary.usage_score = None;
             }
-            summary.live_sessions = broker
-                .activity
-                .live_sessions(&user, &summary.alias, 10 * 60);
+            summary.live_sessions = Some(broker.activity.live_sessions(
+                &user,
+                &summary.alias,
+                10 * 60,
+            ));
             if let Some(central) = broker.central.as_ref()
                 && central.mode() != super::storage::StoreMode::File
             {
@@ -1397,7 +1404,7 @@ pub(super) async fn account_catalog(
                     .live_session_count(&key, std::time::Duration::from_secs(10 * 60))
                     .await
                 {
-                    Ok(count) => summary.live_sessions = count,
+                    Ok(count) => summary.live_sessions = Some(count),
                     Err(error) => {
                         broker.record_failure(
                             "live_session_failed",
@@ -1405,7 +1412,7 @@ pub(super) async fn account_catalog(
                             StatusCode::SERVICE_UNAVAILABLE,
                         );
                         eprintln!("central live session count: {error:#}");
-                        summary.usage_stale = true;
+                        summary.live_sessions = None;
                     }
                 }
             }

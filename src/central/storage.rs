@@ -177,10 +177,20 @@ CREATE TABLE IF NOT EXISTS account_live_sessions (
     PRIMARY KEY (account_id, device_id)
 );
 ALTER TABLE account_live_sessions ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
-ALTER TABLE account_live_sessions DROP CONSTRAINT IF EXISTS account_live_sessions_account_id_fkey;
-ALTER TABLE account_live_sessions
-    ADD CONSTRAINT account_live_sessions_account_id_fkey
-    FOREIGN KEY (account_id) REFERENCES central_accounts(account_id);
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conrelid='account_live_sessions'::regclass
+        AND conname='account_live_sessions_account_id_fkey' AND confdeltype='c') THEN
+        ALTER TABLE account_live_sessions DROP CONSTRAINT account_live_sessions_account_id_fkey;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+        WHERE conrelid='account_live_sessions'::regclass
+        AND conname='account_live_sessions_account_id_fkey') THEN
+        ALTER TABLE account_live_sessions
+            ADD CONSTRAINT account_live_sessions_account_id_fkey
+            FOREIGN KEY (account_id) REFERENCES central_accounts(account_id);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
     ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
@@ -1873,6 +1883,18 @@ mod tests {
             .await
             .unwrap();
         first.migrate().await.unwrap();
+        if let CentralStore::Postgres(db) = &first {
+            let client = db.client().await.unwrap();
+            let query = "SELECT oid FROM pg_constraint WHERE conrelid='account_live_sessions'::regclass AND conname='account_live_sessions_account_id_fkey'";
+            let before: u32 = client.query_one(query, &[]).await.unwrap().get(0);
+            first.migrate().await.unwrap();
+            let after: u32 = client.query_one(query, &[]).await.unwrap().get(0);
+            assert_eq!(
+                before, after,
+                "startup must not rebuild a valid live-session foreign key"
+            );
+        }
+
         let legacy_state = root.path().join("accounts").join("legacy-seat");
         crate::store::ensure_private_dir(&legacy_state).unwrap();
         let legacy_vault = crate::central::vault::Vault {

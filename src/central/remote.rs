@@ -1238,6 +1238,7 @@ fn select_for_codex_excluding(accounts: &[Account], excluded: &[String]) -> Resu
                 .iter()
                 .any(|alias| alias.eq_ignore_ascii_case(&account.alias))
                 && account.available
+                && account.live_sessions.is_some()
                 && !account.usage_stale
                 && account.billing_class == api::BillingClass::RateLimited
                 && [account.primary_used, account.secondary_used]
