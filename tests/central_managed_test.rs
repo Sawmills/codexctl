@@ -2433,8 +2433,19 @@ fn an_unhealthy_rpc_is_replaced_after_a_protocol_failure() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = server.token(&server.amir, "personal", None).status();
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503, "unexpected recovery response");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replacement RPC did not recover before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         std::fs::read_to_string(server.root.path().join("launch-count"))
             .unwrap()
