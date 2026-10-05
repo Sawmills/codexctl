@@ -194,6 +194,8 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS account_live_sessions_recent_idx
     ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_live_sessions_retention_idx
+    ON account_live_sessions (account_id, last_seen);
 CREATE TABLE IF NOT EXISTS enrollment_challenges (
     challenge_hash TEXT PRIMARY KEY,
     encrypted_payload BYTEA NOT NULL,
@@ -227,6 +229,15 @@ CREATE INDEX IF NOT EXISTS central_users_enabled_idx
 "#;
 
 impl CentralStore {
+    #[cfg(all(test, feature = "central-real-db-tests"))]
+    pub(super) async fn settle_test_observations(&self) -> Result<()> {
+        if let Self::Postgres(db) | Self::Dual { postgres: db, .. } = self {
+            let client = db.cached_client(&db.observation_client).await?;
+            tokio::time::timeout(Duration::from_secs(5), client.simple_query("SELECT 1")).await??;
+        }
+        Ok(())
+    }
+
     #[cfg(all(test, feature = "central-real-db-tests"))]
     pub(super) async fn isolated_test_schema(
         &self,
@@ -1600,10 +1611,10 @@ impl PostgresStore {
 
     async fn prune_live_sessions(&self, account_id: &str, user_id: &str) -> Result<()> {
         let client = self.cached_client(&self.observation_client).await?;
-        // Session observations are ephemeral. Retain deletion evidence so an
-        // old heartbeat cannot revive a tombstone, and bound each cleanup batch.
+        // Reclaim ephemeral history after 24 hours, but keep recent deletion
+        // evidence through the live window even when its last heartbeat is old.
         client.execute(
-            "WITH expired AS (SELECT account_id,device_id FROM account_live_sessions WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL AND last_seen < now()-interval '1 day' ORDER BY last_seen LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM account_live_sessions AS sessions USING expired WHERE sessions.account_id=expired.account_id AND sessions.device_id=expired.device_id AND sessions.user_id=$2",
+            "WITH expired AS (SELECT account_id,device_id FROM account_live_sessions WHERE account_id=$1 AND user_id=$2 AND last_seen < now()-interval '1 day' AND (deleted_at IS NULL OR deleted_at < now()-interval '10 minutes') ORDER BY last_seen LIMIT 1000 FOR UPDATE SKIP LOCKED) DELETE FROM account_live_sessions AS sessions USING expired WHERE sessions.account_id=expired.account_id AND sessions.device_id=expired.device_id AND sessions.user_id=$2",
             &[&account_id, &user_id],
         ).await?;
         Ok(())
@@ -2094,6 +2105,47 @@ mod tests {
                     .await
                     .unwrap(),
                 1
+            );
+            client.execute("UPDATE account_live_sessions SET deleted_at=now()-interval '11 minutes' WHERE account_id=$1 AND device_id='launch-a'", &[&id]).await.unwrap();
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                count, 1,
+                "expired tombstones outside the live window must be reclaimed"
+            );
+            client.execute("INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen) SELECT $1,'user','seat','expired-' || n,now()-interval '2 days' FROM generate_series(1,1005) n", &[&id]).await.unwrap();
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM account_live_sessions WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(
+                count, 6,
+                "one cleanup must reclaim at most 1,000 observations"
+            );
+            first.prune_live_sessions(&id, "user").await.unwrap();
+            first
+                .record_live_session(&id, "user", "seat", "launch-a")
+                .await
+                .unwrap();
+            assert_eq!(
+                first
+                    .live_session_count(&id, Duration::from_secs(60))
+                    .await
+                    .unwrap(),
+                2,
+                "after physical expiry an authenticated same-ID heartbeat is a fresh observation"
             );
         }
         let (a, b) = tokio::join!(

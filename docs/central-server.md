@@ -344,17 +344,22 @@ expired observations from that authenticated account and user only. Cleanup
 failure preserves the committed observation and uses the `cleanup` log stage;
 an upsert failure uses `write`. Both increment `live_session_failed` once.
 
-The central-storage retention contract implements HQ's B29 follow-up request for
-live-session retention after [#117](https://github.com/Sawmills/codexctl/pull/117).
+The central-storage retention contract follows HQ's explicit decision at
+2026-10-05 19:48 UTC, superseding the physical-deletion deferral in
+[#117](https://github.com/Sawmills/codexctl/pull/117).
 These rows are temporary load observations, not credential, audit, or usage
 records. The retention interval is one day after `last_seen`, well beyond the
-ten-minute live-count window. Only non-tombstoned rows older than that interval
-are physically removed. Tombstones remain indefinitely to prevent revival by
-delayed heartbeats; neither credentials nor account rows are removed. Cleanup
-uses the existing `(account_id, last_seen)` partial index and never ranges over
-another account. The account foreign key does not cascade-delete sessions.
+ten-minute live-count window. Both live rows and tombstones older than that
+interval are physically removed, but a tombstone remains for at least ten minutes
+after `deleted_at`. Heartbeats cannot revive retained tombstones. After physical
+expiry, a new authenticated heartbeat with the same session ID creates a fresh
+observation; this is allowed because observations have no audit or billing value.
+Neither credentials nor account rows are removed. An `(account_id, last_seen)`
+index covering both live rows and tombstones supports cleanup; the existing
+partial index still supports live counts. Cleanup never ranges over another
+account. The account foreign key does not cascade-delete sessions.
 Cleanup runs with new observations, so an idle account can retain expired rows
-until its activity resumes. The central-storage owner controls changes to this
+until its activity resumes. Codexctl HQ owns changes to this
 retention contract; deployment and alert-delivery verification remain separate.
 
 If a session-count query fails in Dual mode, selection keeps the server's local

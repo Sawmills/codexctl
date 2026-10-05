@@ -900,6 +900,15 @@ async fn session_observation_outage_does_not_delay_tokens_and_dual_keeps_local_c
             assert!(std::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let initial = fixture
+            .broker
+            .session_writes
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        central.settle_test_observations().await.unwrap();
+        drop(initial);
         control
             .batch_execute("BEGIN; LOCK TABLE account_live_sessions IN ACCESS EXCLUSIVE MODE")
             .await
@@ -955,6 +964,7 @@ async fn session_observation_outage_does_not_delay_tokens_and_dual_keeps_local_c
             .acquire_many_owned(32)
             .await
             .unwrap();
+        central.settle_test_observations().await.unwrap();
         let listing = fixture.spawn_list();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
