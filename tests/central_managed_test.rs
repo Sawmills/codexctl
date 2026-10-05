@@ -4966,7 +4966,10 @@ fn server_selection_succeeds_while_a_session_or_its_orphaned_child_holds_a_lease
     let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .arg("codex")
         .env("HOME", home.path())
-        .env("PATH", &bin)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
