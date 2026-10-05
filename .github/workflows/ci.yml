@@ -95,11 +95,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+      - name: Set up Trunk
+        uses: trunk-io/trunk-action/setup@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
       - name: Trunk Check
-        uses: trunk-io/trunk-action@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
-        with:
-          cache: false
-          check-mode: ${{ github.event_name == 'pull_request' && 'pull_request' || 'all' }}
+        run: |
+          "$TRUNK_PATH" check --all --ci
+          .trunk/tools/osv-scanner --version
+          .trunk/tools/osv-scanner --lockfile=Cargo.lock --format json
 
   build-macos:
     name: Build (macOS)

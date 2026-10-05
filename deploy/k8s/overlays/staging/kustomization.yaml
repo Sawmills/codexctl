@@ -13,3 +13,9 @@ images:
     digest: sha256:78774ed363301d264fe8770016707c97b1c0d0f2e7585016fbbb2e80cee064e2
 patches:
   - path: codexctl-restart-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: codexctl
+      namespace: codexctl
