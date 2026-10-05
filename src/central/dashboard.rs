@@ -166,6 +166,7 @@ async fn account_snapshot(
         .into(),
         routing_refused,
         billing_class: account.billing_class,
+        credits: account.credits,
         primary: window(
             account.primary_used,
             account.primary_window_seconds,

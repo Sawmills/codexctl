@@ -35,6 +35,8 @@ pub struct AccountStatus {
     pub secondary_resets_at: Option<String>,
     pub resets_at: Option<String>,
     pub billing_class: api::BillingClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<api::Credits>,
     pub error: Option<String>,
     pub usage_age_seconds: Option<u64>,
     pub usage_stale: Option<bool>,
@@ -59,6 +61,7 @@ impl AccountStatus {
             secondary_resets_at: None,
             resets_at: None,
             billing_class: api::BillingClass::Unknown,
+            credits: None,
             error: None,
             usage_age_seconds: None,
             usage_stale: None,
@@ -71,6 +74,7 @@ impl AccountStatus {
     pub fn set_usage(&mut self, usage: &api::RateLimitResponse) {
         self.plan = usage.plan_type.clone().or_else(|| self.plan.take());
         self.billing_class = usage.billing_class();
+        self.credits = usage.credits.clone();
         let limits = usage.rate_limit.as_ref();
         self.primary_used_percent = limits
             .and_then(api::RateLimit::short_window)
@@ -101,6 +105,33 @@ impl AccountStatus {
 pub fn timestamp(seconds: Option<i64>) -> Option<String> {
     chrono::DateTime::from_timestamp(seconds?, 0)
         .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
+pub fn format_credits(credits: Option<&api::Credits>) -> String {
+    let Some(credits) = credits else {
+        return "-".into();
+    };
+    let mut parts = Vec::new();
+    if let Some(balance) = credits.balance.as_deref() {
+        parts.push(match balance.parse::<f64>() {
+            Ok(value) if value.is_finite() => format!("${value:.2}"),
+            _ => format!("${balance}"),
+        });
+    }
+    if credits.has_credits {
+        parts.push("available".into());
+    }
+    if credits.unlimited {
+        parts.push("unlimited".into());
+    }
+    if credits.overage_limit_reached {
+        parts.push("overage".into());
+    }
+    if parts.is_empty() {
+        "none".into()
+    } else {
+        parts.join(" ")
+    }
 }
 
 pub fn print(accounts: &[AccountStatus]) -> Result<()> {
@@ -162,6 +193,52 @@ mod tests {
         );
         assert_eq!(row.secondary_resets_at, None);
         assert_eq!(row.resets_at, None);
+    }
+
+    #[test]
+    fn usage_json_exposes_all_credit_fields_when_the_server_returns_them() {
+        let usage = serde_json::from_value(json!({
+            "plan_type": "pro",
+            "credits": {
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "12.50",
+                "overage_limit_reached": true
+            }
+        }))
+        .unwrap();
+        let mut row = AccountStatus::local(&profile::Meta::default(), false);
+
+        row.set_usage(&usage);
+
+        assert_eq!(
+            serde_json::to_value(row).unwrap()["credits"],
+            json!({
+                "has_credits": true,
+                "unlimited": false,
+                "balance": "12.50",
+                "overage_limit_reached": true
+            })
+        );
+    }
+
+    #[test]
+    fn usage_json_omits_credits_when_the_server_omits_or_nulls_them() {
+        for raw in [
+            json!({"plan_type":"pro"}),
+            json!({"plan_type":"pro", "credits":null}),
+        ] {
+            let usage = serde_json::from_value(raw).unwrap();
+            let mut row = AccountStatus::local(&profile::Meta::default(), false);
+            row.set_usage(&usage);
+            assert!(
+                !serde_json::to_value(row)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .contains_key("credits")
+            );
+        }
     }
 
     #[test]

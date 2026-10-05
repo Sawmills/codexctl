@@ -48,6 +48,8 @@ pub struct Account {
     pub account_id: String,
     pub plan: Option<String>,
     pub billing_class: api::BillingClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<api::Credits>,
     pub primary_used: Option<f64>,
     pub secondary_used: Option<f64>,
     pub primary_window_seconds: Option<u64>,
@@ -250,6 +252,7 @@ fn account_summary(owner: &Owner) -> Account {
                 api::token_identity(vault::token(&owner.vault.auth).ok()?).and_then(|i| i.plan)
             }),
         billing_class: billing,
+        credits: usage.as_ref().and_then(|u| u.credits.clone()),
         statusline_usage: None,
         primary_used: windows
             .and_then(|r| r.short_window())
@@ -1113,6 +1116,7 @@ pub(super) async fn account_catalog(
             if summary.usage_stale {
                 summary.statusline_usage = None;
                 summary.billing_class = api::BillingClass::Unknown;
+                summary.credits = None;
                 summary.usage_score = None;
             }
             summary

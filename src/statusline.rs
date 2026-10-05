@@ -160,6 +160,7 @@ pub(crate) fn record(
             secondary_resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
             resets_at: crate::status_json::timestamp(usage.weekly_resets_at),
             billing_class: api::BillingClass::Unknown,
+            credits: None,
             error: None,
             usage_age_seconds: Some(age_seconds),
             usage_stale: Some(false),

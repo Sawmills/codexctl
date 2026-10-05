@@ -531,7 +531,7 @@ pub fn new_redeem_request_id(alias: &str) -> String {
     format!("codexctl-{alias}-{nanos}")
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Credits {
     pub has_credits: bool,
     #[serde(default)]

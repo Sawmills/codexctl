@@ -755,13 +755,16 @@ details > summary:hover {
   padding-right: 0;
 }
 .ledger .col-usage {
-  width: 19%;
+  width: 16%;
 }
 .ledger .col-banked {
-  width: 15%;
+  width: 14%;
+}
+.ledger .col-credits {
+  width: 14%;
 }
 .ledger .col-state {
-  width: 20%;
+  width: 16%;
 }
 .ledger tr.recommended td {
   background: linear-gradient(var(--accent-soft), var(--accent-soft)) no-repeat;
@@ -862,6 +865,18 @@ details > summary:hover {
 .banked .expiring {
   color: var(--warn);
   font-weight: 600;
+}
+.credits {
+  display: grid;
+  gap: 2px;
+}
+.credits span {
+  color: var(--ink-3);
+  font-size: var(--t-xs);
+}
+.credits.unknown {
+  color: var(--ink-3);
+  font-size: var(--t-base);
 }
 .status {
   display: grid;
@@ -1226,6 +1241,9 @@ details > summary:hover {
     flex-wrap: wrap;
     align-items: baseline;
     gap: 2px var(--s2);
+  }
+  .ledger td.cell-credits {
+    grid-column: 1 / -1;
   }
   .ledger td.cell-banked .banked {
     display: flex;

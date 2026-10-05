@@ -227,6 +227,7 @@ impl Reader {
         summary.resets_at = None;
         summary.usage_score = None;
         summary.billing_class = api::BillingClass::Unknown;
+        summary.credits = None;
         if let Some((usage, _)) = &entry.sample {
             let limits = usage.rate_limit.as_ref();
             summary.plan = usage.plan_type.clone().or_else(|| summary.plan.clone());
@@ -246,6 +247,7 @@ impl Reader {
             summary.resets_at = limits
                 .and_then(|r| r.long_window())
                 .and_then(|w| w.reset_timestamp());
+            summary.credits = usage.credits.clone();
             if !summary.usage_stale {
                 let mut snapshot = crate::statusline::Usage::from_usage(usage);
                 snapshot.age_seconds = summary.usage_age_seconds.unwrap_or_default();

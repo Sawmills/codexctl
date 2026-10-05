@@ -23,6 +23,8 @@ pub(super) struct Account {
     pub state: String,
     pub routing_refused: bool,
     pub billing_class: crate::api::BillingClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<crate::api::Credits>,
     pub primary: Window,
     pub secondary: Window,
     pub usage_age_seconds: Option<u64>,
@@ -483,12 +485,13 @@ fn ledger(accounts: &[Account], best: Option<&Account>, all_stale: bool, now: i6
             state
         };
         rows += &format!(
-            r#"<tr role="row" class="{class}"><td role="cell" class="cell-account"><div class="account-name"><strong>{}</strong><span class="line"><span class="alias" translate="no">{}</span>{plan}</span><span class="note {}">{note}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>{count}</b>{expiry}{redeemable}{inventory}</div></td><td role="cell" class="cell-state"><div class="status"><span class="state {state_class}">{state}</span><span class="status-detail" data-age="{}">Last observed {}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{class}"><td role="cell" class="cell-account"><div class="account-name"><strong>{}</strong><span class="line"><span class="alias" translate="no">{}</span>{plan}</span><span class="note {}">{note}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-credits"><span class="cell-label" aria-hidden="true">Credits</span>{}</td><td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>{count}</b>{expiry}{redeemable}{inventory}</div></td><td role="cell" class="cell-state"><div class="status"><span class="state {state_class}">{state}</span><span class="status-detail" data-age="{}">Last observed {}</span></div></td></tr>"#,
             escape(a.name()),
             escape(&a.alias),
             if pick { "pick" } else { "billing" },
             window(&a.primary, a, "5-hour", false, now),
             window(&a.secondary, a, "7-day", false, now),
+            dashboard_credits(a.credits.as_ref()),
             a.usage_age_seconds
                 .map(|n| n.to_string())
                 .unwrap_or_default(),
@@ -496,9 +499,25 @@ fn ledger(accounts: &[Account], best: Option<&Account>, all_stale: bool, now: i6
         );
     }
     format!(
-        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">All accounts <span class="count">{}</span></h2><p>Refreshes every 60 seconds</p></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th><th scope="col" class="col-banked">Banked resets</th><th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
+        r#"<section class="section" aria-labelledby="accounts-title"><div class="section-head"><h2 id="accounts-title">All accounts <span class="count">{}</span></h2><p>Refreshes every 60 seconds</p></div><table class="ledger" role="table" aria-labelledby="accounts-title"><thead role="rowgroup"><tr role="row"><th scope="col">Account</th><th scope="col" class="col-usage">5-hour window</th><th scope="col" class="col-usage">7-day window</th><th scope="col" class="col-credits">Credits</th><th scope="col" class="col-banked">Banked resets</th><th scope="col" class="col-state">State</th></tr></thead><tbody role="rowgroup">{rows}</tbody></table></section>"#,
         accounts.len()
     )
+}
+
+fn dashboard_credits(credits: Option<&crate::api::Credits>) -> String {
+    let Some(credits) = credits else {
+        return "<span class=\"credits unknown\">Unknown</span>".into();
+    };
+    let balance = credits
+        .balance
+        .as_deref()
+        .map(|value| format!("Balance ${}", escape(value)))
+        .unwrap_or_else(|| "Balance unknown".into());
+    let status = format!(
+        "has credits: {}; unlimited: {}; overage limit reached: {}",
+        credits.has_credits, credits.unlimited, credits.overage_limit_reached
+    );
+    format!("<div class=\"credits\"><b>{balance}</b><span>{status}</span></div>")
 }
 fn machines(snapshot: &Snapshot) -> String {
     let mut rows = String::new();

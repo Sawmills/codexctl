@@ -86,6 +86,11 @@ The `Resets` column shows banked rate-limit resets (see [Banked resets](#banked-
 `3 (2 now)` means three are held and two can be redeemed this second; a bare count turns red when
 a credit lapses within three days.
 
+The `Credits` column shows purchased credit balances and availability. It appears
+when an account reports credits data, including a zero balance. `status --json`
+and the server dashboard expose `has_credits`, `unlimited`, `balance`, and
+`overage_limit_reached`. Missing or null credits data stays absent in JSON.
+
 The `Token` column shows how long the stored access token is good for **without re-logging in**
 (green = days left, yellow = hours, red = under an hour). An `invalidated` value means OpenAI revoked
 the grant server-side even though the token has not yet timed out — this happens when another seat
