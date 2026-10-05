@@ -7,6 +7,7 @@ resources:
   - externalsecret.yaml
   - sso.yaml
   - monitoring.yaml
+  - migration-networkpolicy.yaml
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
