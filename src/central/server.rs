@@ -122,6 +122,7 @@ pub(super) struct Owner {
     pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
+    pub(super) recovery_generation: u64,
     pub(super) routing_refused: bool,
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
@@ -156,6 +157,7 @@ impl Owner {
         self.available && !self.routing_refused
     }
     pub(super) fn fence(&mut self, retryable: bool) {
+        self.recovery_generation = self.recovery_generation.wrapping_add(1);
         self.available = false;
         self.retryable_unavailable = retryable && self.vault.verified;
         if !retryable {
@@ -709,6 +711,7 @@ pub async fn serve(
         retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
+        recovery_generation: 0,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,

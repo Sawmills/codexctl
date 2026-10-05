@@ -768,6 +768,7 @@ async fn settle_background_recovery(
     lease: Option<super::storage::Lease>,
     before: Vault,
     available_after: bool,
+    recovery_generation: u64,
     permit: tokio::sync::OwnedSemaphorePermit,
     renew_done: Arc<AtomicBool>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
@@ -840,13 +841,15 @@ async fn settle_background_recovery(
         }
         if available_after {
             let mut owner = owner_ref.lock().await;
-            owner.available = true;
-            owner.refresh_enabled = true;
-            owner.routing_refused = false;
-            owner.retryable_unavailable = false;
-            owner.retry_requires_billing = false;
-            owner.retry_started = None;
-            owner.retry_failures = 0;
+            if owner.recovery_generation == recovery_generation {
+                owner.available = true;
+                owner.refresh_enabled = true;
+                owner.routing_refused = false;
+                owner.retryable_unavailable = false;
+                owner.retry_requires_billing = false;
+                owner.retry_started = None;
+                owner.retry_failures = 0;
+            }
         }
         renew_done.store(true, Ordering::Release);
         if let Some(task) = renew_task {
@@ -1535,7 +1538,7 @@ impl Broker {
             {
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
-            if owner.retryable_unavailable {
+            if owner.retryable_unavailable && owner.retry_failures < 3 {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
             if owner.vault.verified && owner.available && !admission.quarantine_repair {
@@ -1550,7 +1553,9 @@ impl Broker {
                     .map_err(|e| self.owner_failure(e))?;
                 return Ok(account_summary(&owner));
             }
-            if let Some(rpc) = owner.rpc.as_mut() {
+            if owner.rpc.as_mut().is_some_and(Rpc::process_exited) {
+                owner.rpc.take();
+            } else if let Some(rpc) = owner.rpc.as_mut() {
                 rpc.shutdown().await.map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
                 })?;
@@ -1705,6 +1710,7 @@ impl Broker {
             None
         };
         let verification_required = !owner.vault.verified;
+        let mut central_published = false;
         let verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -1754,6 +1760,7 @@ impl Broker {
                 if !written {
                     return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
                 }
+                central_published = true;
             } else {
                 self.save_owner_record(&owner).await.map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
@@ -1774,10 +1781,12 @@ impl Broker {
                 // A failed import remains reserved for its original alias. It
                 // must complete verification through import retry before token
                 // recovery can become eligible.
-                owner.vault.verified = false;
-                vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
-                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?;
+                if !central_published {
+                    owner.vault.verified = false;
+                    vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+                }
                 owner.retryable_unavailable = false;
                 owner.retry_started = None;
                 owner.retry_failures = 0;
@@ -2035,6 +2044,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
+        recovery_generation: 0,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
@@ -2135,10 +2145,20 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         .map(|(_, owner)| owner.clone())
         .collect::<Vec<_>>();
     for owner_ref in owners {
-        let permit = match broker.work.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => return,
+        if broker.stopping.load(Ordering::Acquire) {
+            return;
+        }
+        let permit = tokio::select! {
+            _ = broker.recovery_stop.notified() => return,
+            permit = broker.work.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
         };
+        if broker.stopping.load(Ordering::Acquire) {
+            drop(permit);
+            return;
+        }
         let mut owner = owner_ref.lock().await;
         let pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
         let exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
@@ -2187,6 +2207,10 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             drop(permit);
             continue;
         }
+        // Capture the committed baseline before stopping or relaunching the
+        // child. launch_owner snapshots its journal, so taking this later can
+        // hide a refresh-token rotation completed by the old child.
+        let before = owner.vault.clone();
         let renew_done = Arc::new(AtomicBool::new(false));
         let mut renew_task = match (central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -2263,7 +2287,6 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         if let Err(error) = &launched {
             eprintln!("central background owner identity or launch failure: {error:#}");
         }
-        let before = owner.vault.clone();
         match launched {
             Ok(()) => {
                 // Launching proves only that a child exists. Keep the owner
@@ -2306,6 +2329,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                     } else {
                         fence_background_owner(&mut owner);
                     }
+                    let recovery_generation = owner.recovery_generation;
                     let owner_ref = owner_ref.clone();
                     let central = central.clone();
                     let lease = lease.clone();
@@ -2315,6 +2339,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         lease,
                         before,
                         probe_ok && local_saved,
+                        recovery_generation,
                         permit,
                         renew_done,
                         renew_task.take(),
@@ -2358,6 +2383,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                     }
                     (Ok(_), true, false) => {
                         fence_background_owner(&mut owner);
+                        let recovery_generation = owner.recovery_generation;
                         let owner_ref = owner_ref.clone();
                         let central = central.clone();
                         let lease = lease.clone();
@@ -2367,6 +2393,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             lease,
                             before,
                             true,
+                            recovery_generation,
                             permit,
                             renew_done,
                             renew_task.take(),
@@ -2393,6 +2420,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                     }
                     (Err(_), true, false) => {
                         fence_background_owner(&mut owner);
+                        let recovery_generation = owner.recovery_generation;
                         let owner_ref = owner_ref.clone();
                         let central = central.clone();
                         let lease = lease.clone();
@@ -2402,6 +2430,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             lease,
                             before,
                             false,
+                            recovery_generation,
                             permit,
                             renew_done,
                             renew_task.take(),
@@ -2557,6 +2586,7 @@ pub async fn serve(
                     retry_requires_billing: false,
                     retry_started: None,
                     retry_failures: 0,
+                    recovery_generation: 0,
                     routing_refused: false,
                     refresh_enabled: false,
                     limits: None,
@@ -2727,6 +2757,9 @@ pub async fn serve(
     let recovery_broker = broker.clone();
     let recovery_task = tokio::spawn(async move {
         loop {
+            if recovery_broker.stopping.load(Ordering::Acquire) {
+                break;
+            }
             tokio::select! {
                 _ = recovery_broker.recovery_stop.notified() => break,
                 _ = tokio::time::sleep(recovery_interval()) => {
@@ -2766,17 +2799,17 @@ pub async fn serve(
             {
                 tokio::select! {_=term.recv()=>{},_=tokio::signal::ctrl_c()=>{}}
                 stopping.store(true, Ordering::Release);
-                recovery_stop.notify_waiters();
+                recovery_stop.notify_one();
             }
             #[cfg(not(unix))]
             {
                 let _ = tokio::signal::ctrl_c().await;
                 stopping.store(true, Ordering::Release);
-                recovery_stop.notify_waiters();
+                recovery_stop.notify_one();
             }
         })
         .await?;
-    broker.recovery_stop.notify_waiters();
+    broker.recovery_stop.notify_one();
     let _ = recovery_task.await;
     let _drain = broker.work.clone().acquire_many_owned(128).await?;
     let owners: Vec<_> = broker

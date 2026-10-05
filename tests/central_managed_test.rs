@@ -2530,6 +2530,14 @@ fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(launches(), 4);
     assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    // Exhausting automatic recovery must still leave an explicit import able
+    // to repair the owner.
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let repaired = server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    let repaired_status = repaired.status();
+    let repaired_body = repaired.text().unwrap();
+    assert_eq!(repaired_status, 200, "repair response: {repaired_body}");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 
 #[test]

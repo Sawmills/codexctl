@@ -158,6 +158,35 @@ impl Drop for Fixture {
     }
 }
 
+#[tokio::test]
+async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let before = owner_ref.lock().await.vault.clone();
+    let permits = Arc::new(Semaphore::new(1));
+    let permit = permits.clone().acquire_owned().await.unwrap();
+    let renew_done = Arc::new(AtomicBool::new(false));
+    {
+        let mut owner = owner_ref.lock().await;
+        owner.fence(false);
+    }
+    settle_background_recovery(
+        owner_ref.clone(),
+        None,
+        None,
+        before,
+        true,
+        0,
+        permit,
+        renew_done,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    assert!(!owner_ref.lock().await.available);
+    assert!(permits.try_acquire().is_ok());
+}
+
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
     let response = accounts(State(broker), headers)
         .await
