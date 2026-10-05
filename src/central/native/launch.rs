@@ -3,7 +3,7 @@ use super::*;
 use std::io::IsTerminal;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -70,31 +70,85 @@ pub(super) fn require_live_launch(connection: &Path) -> Result<()> {
     }
 }
 
-struct LaunchSignals {
+const LAUNCH_SIGNALS: [i32; 3] = [libc::SIGHUP, libc::SIGTERM, libc::SIGINT];
+static SIGNAL_USERS: AtomicUsize = AtomicUsize::new(0);
+static SIGNAL_ACTIONS: OnceLock<std::io::Result<Vec<i32>>> = OnceLock::new();
+
+pub(crate) struct LaunchSignals {
     received: Arc<AtomicUsize>,
     handlers: Vec<signal_hook::SigId>,
+    active: bool,
 }
 impl LaunchSignals {
-    fn register() -> Result<Self> {
+    pub(crate) fn register() -> Result<Self> {
+        let watched = SIGNAL_ACTIONS
+            .get_or_init(|| {
+                let mut watched = Vec::new();
+                for signal in LAUNCH_SIGNALS {
+                    // signal-hook keeps its dispatcher after unregister. Keep one
+                    // default action when no guard exists, but preserve inherited
+                    // SIG_IGN (for example nohup) and handlers owned by other code.
+                    unsafe {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        if libc::sigaction(signal, std::ptr::null(), &mut action) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        // Installing even a flag handler replaces SIG_IGN with a
+                        // caught signal, which exec resets to SIG_DFL in children.
+                        if action.sa_sigaction == libc::SIG_IGN {
+                            continue;
+                        }
+                        if action.sa_sigaction == libc::SIG_DFL {
+                            signal_hook::low_level::register(signal, move || {
+                                if SIGNAL_USERS.load(Ordering::SeqCst) == 0 {
+                                    let _ = signal_hook::low_level::emulate_default_handler(signal);
+                                }
+                            })?;
+                        }
+                    }
+                    watched.push(signal);
+                }
+                Ok(watched)
+            })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("cannot register default signal actions: {error}"))?;
         let mut signals = Self {
             received: Arc::new(AtomicUsize::new(0)),
             handlers: Vec::new(),
+            active: false,
         };
-        for signal in [libc::SIGHUP, libc::SIGTERM] {
+        for &signal in watched {
             signals.handlers.push(signal_hook::flag::register_usize(
                 signal,
                 signals.received.clone(),
                 signal as usize,
             )?);
         }
+        SIGNAL_USERS.fetch_add(1, Ordering::SeqCst);
+        signals.active = true;
         Ok(signals)
     }
-    fn received(&self) -> i32 {
+    pub(crate) fn received(&self) -> i32 {
         self.received.load(Ordering::Relaxed) as i32
+    }
+
+    pub(crate) fn reraise(self) -> Result<()> {
+        let received = Arc::clone(&self.received);
+        drop(self);
+        // Read after unregister so signals received during the final wait or
+        // teardown are not discarded. Remaining guards retain recovery signals.
+        let signal = received.load(Ordering::Relaxed) as i32;
+        if signal != 0 {
+            signal_hook::low_level::raise(signal)?;
+        }
+        Ok(())
     }
 }
 impl Drop for LaunchSignals {
     fn drop(&mut self) {
+        if self.active {
+            SIGNAL_USERS.fetch_sub(1, Ordering::SeqCst);
+        }
         for handler in &self.handlers {
             signal_hook::low_level::unregister(*handler);
         }

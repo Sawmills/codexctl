@@ -1306,35 +1306,46 @@ fn recent_429_report() -> Result<Value> {
 
     // A regular file cannot fill a pipe or wait for a descendant to close it.
     let mut output = tempfile::tempfile()?;
-    let mut child = std::process::Command::new(std::env::current_exe()?)
-        .args(["rate", "--json", "--minutes", "10"])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(output.try_clone()?)
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    bail!("rate collection failed");
-                }
-                output.rewind()?;
-                return serde_json::from_reader(output).context("invalid rate report");
-            }
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            result => {
-                // Include rate's status/ps children, which may hold network or DB waits.
+    let signals = native::LaunchSignals::register()?;
+    let result = (|| {
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["rate", "--json", "--minutes", "10"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(output.try_clone()?)
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let signal = signals.received();
+            if signal != 0 {
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-                child.wait().context("reap rate collector")?;
-                result.context("wait for rate collector")?;
-                bail!("rate collection timed out");
+                child.wait().context("reap cancelled rate collector")?;
+                bail!("rate collection cancelled");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        bail!("rate collection failed");
+                    }
+                    output.rewind()?;
+                    return serde_json::from_reader(output).context("invalid rate report");
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => {
+                    // Include rate's status/ps children, which may hold network or DB waits.
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    child.wait().context("reap rate collector")?;
+                    result.context("wait for rate collector")?;
+                    bail!("rate collection timed out");
+                }
             }
         }
-    }
+    })();
+    signals.reraise()?;
+    result
 }
 
 /// Find the next server account for a 429 recovery. This deliberately shares

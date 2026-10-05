@@ -7145,7 +7145,7 @@ fn automatic_reset_attempt(
     let bin = home.path().join("bin");
     if matches!(
         fence,
-        Some("codex" | "codex-stale" | "codex-term" | "codex-hup")
+        Some("codex" | "codex-stale" | "codex-term" | "codex-hup" | "codex-ignore-hup")
     ) {
         use std::os::unix::fs::PermissionsExt;
         store::atomic_write(
@@ -7170,12 +7170,18 @@ fn automatic_reset_attempt(
             .unwrap();
         if let Some(signal) = match fence {
             Some("codex-term") => Some("TERM"),
-            Some("codex-hup") => Some("HUP"),
+            Some("codex-hup" | "codex-ignore-hup") => Some("HUP"),
             _ => None,
         } {
+            let child_signal = if fence == Some("codex-ignore-hup") {
+                "kill -HUP \"$$\"\n"
+            } else {
+                ""
+            };
             store::atomic_write(
                 &bin.join("codex"),
-                format!("#!/bin/sh\nkill -{signal} \"$PPID\"\nsleep 0.2\n").as_bytes(),
+                format!("#!/bin/sh\n{child_signal}kill -{signal} \"$PPID\"\nsleep 0.2\n")
+                    .as_bytes(),
             )
             .unwrap();
             std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
@@ -7235,7 +7241,19 @@ fn automatic_reset_attempt(
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+    if fence == Some("codex-ignore-hup") {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let output = command
         .env("HOME", home.path())
         .env("PATH", child_path)
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
@@ -9462,8 +9480,33 @@ fn b29_failed_prepare_preserves_fallback_termination_signals() {
 }
 
 #[test]
+fn b29_failed_prepare_preserves_an_inherited_ignored_hangup() {
+    let (resets, output) =
+        automatic_reset_attempt(&["codex"], "pro", 20.0, Some("codex-ignore-hup"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("no longer has verified included billing"),
+        "{error}"
+    );
+    assert!(output.status.success(), "{error}");
+    assert_eq!(resets, 0);
+}
+
+#[test]
 fn b29_automatic_launch_bounds_rate_collection() {
+    b29_rate_collection(None);
+}
+
+#[test]
+fn b29_cancelling_rate_collection_stops_descendants() {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        b29_rate_collection(Some(signal));
+    }
+}
+
+fn b29_rate_collection(signal: Option<i32>) {
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::ExitStatusExt;
     let server = Server::start();
     server.import(&server.amir, "lane", "login", "seat");
     let home = server.connected_home();
@@ -9479,7 +9522,7 @@ fn b29_automatic_launch_bounds_rate_collection() {
         br#"#!/usr/bin/env python3
 import os, pathlib, sys, time
 if '-u' in sys.argv:
-    (pathlib.Path(os.environ['HOME']) / 'rate-started').write_text(str(os.getpid()))
+    (pathlib.Path(os.environ['HOME']) / 'rate-started').write_text(f'{os.getpid()} {os.getppid()}')
     time.sleep(12)
 os.execv('/bin/ps', ['/bin/ps'] + sys.argv[1:])
 "#,
@@ -9493,20 +9536,46 @@ os.execv('/bin/ps', ['/bin/ps'] + sys.argv[1:])
     )
     .unwrap();
     let started = std::time::Instant::now();
-    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .arg("codex")
         .env("HOME", home.path())
         .env("PATH", path)
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    if let Some(signal) = signal {
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        while !home.path().join("rate-started").exists() {
+            assert!(
+                launcher.try_wait().unwrap().is_none(),
+                "launcher exited before rate started"
+            );
+            assert!(std::time::Instant::now() < deadline, "rate did not start");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(unsafe { libc::kill(launcher.id() as i32, signal) }, 0);
+    }
+    let output = launcher.wait_with_output().unwrap();
+    if let Some(signal) = signal {
+        assert_eq!(
+            output.status.signal(),
+            Some(signal),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("launched lane"));
+    } else {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("launched lane"));
+    }
     assert!(
         home.path().join("rate-started").exists(),
         "rate did not reach the stalled child"
@@ -9516,22 +9585,23 @@ os.execv('/bin/ps', ['/bin/ps'] + sys.argv[1:])
         "optional rate data blocked launch for {:?}",
         started.elapsed()
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("launched lane"));
-    let pid = std::fs::read_to_string(home.path().join("rate-started")).unwrap();
+    let processes = std::fs::read_to_string(home.path().join("rate-started")).unwrap();
+    let (pid, collector) = processes.split_once(' ').unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     loop {
         let process = Command::new("/bin/ps")
-            .args(["-p", &pid, "-o", "stat="])
+            .args(["-p", pid, "-o", "stat="])
             .output()
             .unwrap();
         let state = String::from_utf8_lossy(&process.stdout);
         if state.trim().is_empty() || state.trim().starts_with('Z') {
             break;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "rate descendant survived timeout: {state}"
-        );
+        if std::time::Instant::now() >= deadline {
+            // Keep the red cancellation test from leaving an orphaned process group.
+            unsafe { libc::kill(-collector.parse::<i32>().unwrap(), libc::SIGKILL) };
+            panic!("rate descendant survived cancellation or timeout: {state}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -17,6 +17,7 @@ use std::{
 use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
+pub(super) use launch::LaunchSignals;
 #[cfg(feature = "central-prototype")]
 pub use launch::pinned_arguments;
 pub(super) use launch::sweep_stale_launches;
