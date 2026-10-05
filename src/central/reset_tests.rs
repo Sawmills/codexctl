@@ -52,6 +52,7 @@ impl Fixture {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
+            background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: None,
             holder_id: "test-holder".into(),
@@ -614,4 +615,50 @@ async fn every_machine_that_retries_an_uncertain_reset_gets_the_same_receipt() {
         3,
         "an intermediate machine retried as a new spend"
     );
+}
+
+#[tokio::test]
+async fn explicit_import_repairs_a_fenced_retryable_owner() {
+    for (background_recovery, routing_refused) in [(true, true), (false, true), (false, false)] {
+        let mut fixture = Fixture::start("http://127.0.0.1:1").await;
+        fixture.broker.background_recovery = background_recovery;
+        let id = account_key("test-user", "personal");
+        let owner_ref = fixture.broker.owners.read().await[&id].1.clone();
+        let auth = {
+            let mut owner = owner_ref.lock().await;
+            owner.fence(true);
+            owner.retry_failures = 1;
+            if routing_refused {
+                fence_background_owner(&mut owner);
+            }
+            owner.vault.auth.clone()
+        };
+        let repaired = fixture
+            .broker
+            .import_account(
+                "test-user",
+                Import {
+                    alias: "personal".into(),
+                    label: None,
+                    auth,
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("explicit import must repair the fenced owner"));
+        assert!(repaired.available);
+        let response = token(
+            State(fixture.broker.clone()),
+            fixture.headers.clone(),
+            Ok(Json(TokenRequest {
+                alias: Some("personal".into()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_or_else(IntoResponse::into_response);
+        assert_eq!(response.status(), StatusCode::OK);
+        let owner_ref = fixture.broker.owners.read().await[&id].1.clone();
+        let mut owner = owner_ref.lock().await;
+        owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+    }
 }

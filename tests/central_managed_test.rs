@@ -161,7 +161,20 @@ impl Server {
         binary: &std::path::Path,
         flags: &[&str],
     ) -> (Child, String) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        Self::spawn_binary_with_recovery(root, binary, flags, Some("1"))
+    }
+    fn spawn_binary_with_recovery(
+        root: &tempfile::TempDir,
+        binary: &std::path::Path,
+        flags: &[&str],
+        recovery: Option<&str>,
+    ) -> (Child, String) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl-central"));
+        command.env_remove("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY");
+        if let Some(value) = recovery {
+            command.env("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY", value);
+        }
+        let mut child = command
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(root.path().join("state"))
@@ -2444,8 +2457,19 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = server.token(&server.amir, "personal", None).status();
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background recovery timed out"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         std::fs::read_to_string(server.root.path().join("launch-count"))
             .unwrap()
@@ -2453,6 +2477,39 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
             .unwrap()
             >= 2
     );
+}
+
+#[test]
+fn background_recovery_is_off_by_default_and_import_can_repair() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 
 #[test]

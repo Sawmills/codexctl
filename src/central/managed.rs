@@ -108,6 +108,7 @@ pub(super) struct Broker {
     pub(super) work: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
     pub(super) recovery_stop: Arc<tokio::sync::Notify>,
+    pub(super) background_recovery: bool,
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     pub(super) central: Option<CentralStore>,
     pub(super) holder_id: String,
@@ -1538,7 +1539,11 @@ impl Broker {
             {
                 return Err(self.error(StatusCode::CONFLICT, "alias_identity_conflict"));
             }
-            if owner.retryable_unavailable && owner.retry_failures < 3 {
+            if self.background_recovery
+                && owner.retryable_unavailable
+                && owner.retry_failures < 3
+                && !owner.routing_refused
+            {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
             if owner.vault.verified && owner.available && !admission.quarantine_repair {
@@ -2345,7 +2350,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         renew_task.take(),
                         broker.stopping.clone(),
                     ));
-                    return;
+                    continue;
                 }
                 let written = if let (Some(central), Some(lease)) =
                     (central.as_ref(), lease.as_ref())
@@ -2399,7 +2404,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             renew_task.take(),
                             broker.stopping.clone(),
                         ));
-                        return;
+                        continue;
                     }
                     (Err(TokenFailure::Retryable(error)), true, true) => {
                         owner.available = false;
@@ -2436,7 +2441,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             renew_task.take(),
                             broker.stopping.clone(),
                         ));
-                        return;
+                        continue;
                     }
                     (_, false, _) => unreachable!("local save failure enters settlement path"),
                 }
@@ -2730,6 +2735,7 @@ pub async fn serve(
         work: Arc::new(Semaphore::new(128)),
         stopping: Arc::new(AtomicBool::new(false)),
         recovery_stop: Arc::new(tokio::sync::Notify::new()),
+        background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         holder_id: instance_holder_id(),
         registry,
@@ -2756,6 +2762,9 @@ pub async fn serve(
     }
     let recovery_broker = broker.clone();
     let recovery_task = tokio::spawn(async move {
+        if !recovery_broker.background_recovery {
+            return;
+        }
         loop {
             if recovery_broker.stopping.load(Ordering::Acquire) {
                 break;
@@ -2837,6 +2846,17 @@ pub async fn serve(
     Ok(())
 }
 
+fn background_recovery_enabled() -> bool {
+    std::env::var("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2912,6 +2932,7 @@ mod tests {
             work: Arc::new(Semaphore::new(128)),
             stopping: Arc::new(AtomicBool::new(false)),
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
+            background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: Some(central),
             holder_id: "test-holder".into(),

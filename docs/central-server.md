@@ -630,6 +630,11 @@ Confirm enforcement with the platform owner before relying on it for access cont
 
 One owner process refreshes each account. Different accounts have separate request locks.
 Server owners run in their private homes with the OpenAI provider and ChatGPT login mode fixed.
+Background recovery is controlled by `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY`. It is
+disabled by default. Explicit import remains available to repair an unavailable
+owner through the normal identity and verification checks. Enable background
+recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, or
+`on`; the setting takes effect when the server starts.
 Concurrent requests for the same old revision reuse the refreshed token.
 Revisions cover the full credential state, including refresh-only rotations.
 Client disconnection does not cancel a refresh or an import that already started.
