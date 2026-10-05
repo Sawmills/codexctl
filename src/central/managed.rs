@@ -119,6 +119,7 @@ pub(super) struct Broker {
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
+    pub(super) session_writes: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
     pub(super) recovery_stop: Arc<tokio::sync::Notify>,
     pub(super) background_recovery: bool,
@@ -886,6 +887,19 @@ async fn token(
     body: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers).await?;
+    let session_id = match headers.get("x-codexctl-session") {
+        Some(value) => value
+            .to_str()
+            .ok()
+            .filter(|value| value.len() <= 128)
+            .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_session_id"))?,
+        None => "default",
+    };
+    let session_id = if session_id.is_empty() {
+        "default"
+    } else {
+        session_id
+    };
     let Json(mut request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let alias = request
@@ -1247,32 +1261,49 @@ async fn token(
     refresh_legacy_usage(&broker, &mut token).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
-    let session_id = headers
-        .get("x-codexctl-session")
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("default");
     // A client-supplied launch ID is unique only within its authenticated machine.
     let session_id = format!("{}:{}:{session_id}", device.id.len(), device.id);
     broker
         .activity
         .delivered(&device, alias.clone(), session_id.clone());
-    if let Some(central) = broker.central.as_ref()
-        && let Err(error) = central
-            .record_live_session(
-                &account_key(&device.user, &alias),
-                &device.user,
-                &alias,
-                &session_id,
-            )
-            .await
+    if let Some(central) = broker
+        .central
+        .clone()
+        .filter(|store| store.mode() != super::storage::StoreMode::File)
     {
-        broker.record_failure(
-            "live_session_failed",
-            "live_session",
-            StatusCode::SERVICE_UNAVAILABLE,
-        );
-        eprintln!("central live-session observation failed: {error:#}");
+        match broker.session_writes.clone().try_acquire_owned() {
+            Ok(permit) => {
+                let worker = broker.clone();
+                let user = device.user.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) = central
+                        .record_live_session(
+                            &account_key(&user, &alias),
+                            &user,
+                            &alias,
+                            &session_id,
+                        )
+                        .await
+                    {
+                        worker.record_failure(
+                            "live_session_failed",
+                            "live_session",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                        eprintln!(
+                            "{}",
+                            json!({"operation":"live_session", "stage":"write", "error":error.to_string()})
+                        );
+                    }
+                });
+            }
+            Err(_) => broker.record_failure(
+                "live_session_failed",
+                "live_session_queue",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        }
     }
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
@@ -1392,6 +1423,7 @@ pub(super) async fn account_catalog(
                 summary.credits = None;
                 summary.usage_score = None;
             }
+            drop(current);
             summary.live_sessions = Some(broker.activity.live_sessions(
                 &user,
                 &summary.alias,
@@ -1404,7 +1436,14 @@ pub(super) async fn account_catalog(
                     .live_session_count(&key, std::time::Duration::from_secs(10 * 60))
                     .await
                 {
-                    Ok(count) => summary.live_sessions = Some(count),
+                    Ok(count) => {
+                        summary.live_sessions =
+                            Some(if central.mode() == super::storage::StoreMode::Dual {
+                                count.max(summary.live_sessions.unwrap_or(0))
+                            } else {
+                                count
+                            });
+                    }
                     Err(error) => {
                         broker.record_failure(
                             "live_session_failed",
@@ -1412,7 +1451,9 @@ pub(super) async fn account_catalog(
                             StatusCode::SERVICE_UNAVAILABLE,
                         );
                         eprintln!("central live session count: {error:#}");
-                        summary.live_sessions = None;
+                        if central.mode() == super::storage::StoreMode::Postgres {
+                            summary.live_sessions = None;
+                        }
                     }
                 }
             }
@@ -2803,6 +2844,7 @@ pub async fn serve(
             .collect(),
         )),
         work: Arc::new(Semaphore::new(128)),
+        session_writes: Arc::new(Semaphore::new(32)),
         stopping: Arc::new(AtomicBool::new(false)),
         recovery_stop: Arc::new(tokio::sync::Notify::new()),
         background_recovery: background_recovery_enabled(),
@@ -3000,6 +3042,7 @@ mod tests {
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
+            session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,

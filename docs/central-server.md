@@ -326,6 +326,31 @@ Exit status is the child's status (including `128 + signal` on Unix), 1 for laun
 or policy failures, and 2 for invalid CLI options. Herdr pane management stays outside
 codexctl: stop the intended lane, then run the pinned launch in that lane.
 
+### Live-session observations
+
+The account server counts token sessions seen in the last ten minutes. The
+optional `x-codexctl-session` header accepts at most 128 bytes. A longer or invalid
+header returns HTTP 400 before token delivery. Missing and empty headers retain
+the legacy default session. Session IDs are scoped to the authenticated machine.
+
+PostgreSQL observations run after token preparation without delaying the token
+response. Session writes and counts use a separate PostgreSQL connection so a
+blocked observation cannot queue credential queries behind it. Each server
+permits up to 32 concurrent observation writes. A full queue or failed write
+drops that observation; a later token refresh can record
+the session again. This is best-effort activity data, not a durable delivery log.
+Each successful write also removes up to 1,000 non-deleted rows last seen more
+than one day ago. Cleanup runs with new observations, so an idle server can retain
+expired rows until activity resumes. Tombstones remain to prevent revival by
+delayed heartbeats. The account foreign key does not cascade-delete sessions.
+
+If a session-count query fails in Dual mode, selection keeps the server's local
+in-memory count. On a successful query, Dual mode uses the larger of the local
+and database counts, so pending or dropped observations cannot lower the local
+count. PostgreSQL mode retains an unknown count on failure and excludes that
+account from automatic spreading. Credential authorization and refresh still
+depend on their configured authoritative store.
+
 ### Read per-account response rates
 
 ```sh
@@ -692,6 +717,8 @@ Usage fetch failures during listing have separate bounded reasons:
 `catalog_usage_failed` and `catalog_usage_timeout`. The server counts each failed
 fetch once, even when several polls share it. These reasons use the existing
 account-operation alert. A usage alert does not mean token delivery has failed.
+Session-write, cleanup, count, and queue failures use `live_session_failed` and
+the same alert. Each failed observation or count attempt is counted once.
 The staging overlay includes a PrometheusRule for the existing `kube-prometheus` selector.
 The staging `ScrapeConfig` supplies an authenticated scrape through the existing
 Prometheus operator. Its Secret reference selects only the metrics credential.

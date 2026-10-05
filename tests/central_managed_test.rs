@@ -9260,6 +9260,41 @@ fn b29_catalog_counts_launches_and_scopes_session_ids_to_machines() {
 }
 
 #[test]
+fn session_header_is_bounded_before_token_delivery() {
+    let server = Server::start();
+    server.import(&server.amir, "seat", "login", "workspace");
+    let before = server.accounts(&server.amir)[0]["liveSessions"].clone();
+    let response = server
+        .http
+        .post(format!("{}/v1/token", server.url))
+        .bearer_auth(&server.amir)
+        .header("x-codexctl-session", "x".repeat(129))
+        .json(&json!({"alias":"seat", "billing":true}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 400);
+    assert_eq!(
+        response.json::<Value>().unwrap()["error"],
+        "invalid_session_id"
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["liveSessions"], before);
+    for session in [String::new(), "x".repeat(128)] {
+        assert_eq!(
+            server
+                .http
+                .post(format!("{}/v1/token", server.url))
+                .bearer_auth(&server.amir)
+                .header("x-codexctl-session", session)
+                .json(&json!({"alias":"seat", "billing":true}))
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[test]
 fn b29_automatic_signals_remove_launch_approval_and_reap_child() {
     let server = Server::start();
     server.import(&server.amir, "lane", "login", "seat");
