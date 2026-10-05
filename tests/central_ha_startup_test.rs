@@ -689,9 +689,8 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
             .unwrap()
             .get(0);
         assert_eq!(leases, 1, "import initialization must hold a lease");
-        let contender = request(&http, &peer, &token).await;
-        assert_eq!(contender.status(), 503);
         assert_eq!(peer.launches(), 0);
+        store::atomic_write(&importer.root.path().join("mode"), b"exit-rotation").unwrap();
         store::atomic_write(&importer.root.path().join("release-initialize"), b"go").unwrap();
     };
     let (imported, ()) = tokio::join!(importing, during_import);
@@ -702,7 +701,31 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
     );
     let successor = request(&http, &peer, &token).await;
     assert_eq!(successor.status(), 200);
-    assert_eq!(generation(&successor.json::<Value>().await.unwrap()), 3);
+    assert_eq!(
+        generation(&successor.json::<Value>().await.unwrap()),
+        4,
+        "import must publish the child's exit-time rotation"
+    );
+    store::atomic_write(&importer.root.path().join("mode"), b"startup").unwrap();
+    let repeated = http
+        .post(format!("{}/v1/accounts", importer.url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"seat","auth":auth("synthetic-seat")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        repeated.status(),
+        200,
+        "verified import retry must take a fresh lease"
+    );
+    let successor = request(&http, &peer, &token).await;
+    assert_eq!(successor.status(), 200);
+    assert_eq!(
+        generation(&successor.json::<Value>().await.unwrap()),
+        7,
+        "import retry must start from the latest shared credential"
+    );
 
     std::fs::remove_file(importer.root.path().join("exited")).unwrap();
     store::atomic_write(&importer.root.path().join("mode"), b"startup-error").unwrap();

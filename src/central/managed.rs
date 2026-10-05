@@ -1503,22 +1503,19 @@ async fn import(
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_auth"))?;
     // Import commits continue on disconnect. The client can safely retry the same identity.
     let worker = broker.clone();
-    let permit = broker
-        .work
-        .clone()
-        .acquire_owned()
+    let result = tokio::spawn(async move { worker.import_account(&device.user, input).await })
         .await
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
-    let result = tokio::spawn(async move {
-        let _permit = permit;
-        worker.import_account(&device.user, input).await
-    })
-    .await
-    .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "import_unavailable"))??;
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "import_unavailable"))??;
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
     async fn import_account(&self, user: &str, mut input: Import) -> Result<Account, HttpError> {
+        let permit = self
+            .work
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
         input.alias = normalize_alias(&input.alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
             .to_owned();
@@ -1674,7 +1671,11 @@ impl Broker {
             {
                 return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
-            if owner.vault.verified && owner.available && !admission.quarantine_repair {
+            if owner.vault.verified
+                && owner.available
+                && !admission.quarantine_repair
+                && self.central.is_none()
+            {
                 // A retained proof owns the grant, but cannot establish current
                 // routing or billing eligibility after a restart or policy change.
                 owner
@@ -1817,7 +1818,11 @@ impl Broker {
             user: user.into(),
             alias: guard.vault.alias.trim().into(),
         };
-        self.owners.write().await.insert(id, (identity, owner));
+        self.owners
+            .write()
+            .await
+            .insert(id, (identity, owner.clone()));
+        let owner_ref = owner;
         let mut owner = guard;
         let verification_lease = if let Some(central) = self
             .central
@@ -1842,9 +1847,38 @@ impl Broker {
         } else {
             None
         };
+        if let (Some(central), Some(lease)) = (self.central.as_ref(), verification_lease.as_ref())
+            && let Err(error) =
+                reconcile_owner_from_central(self, &mut owner, &lease.account_id).await
+        {
+            let _ = central.release_lease(lease).await;
+            return Err(error);
+        }
+        let before = owner.vault.clone();
+        let recovery_generation = owner.recovery_generation;
+        let renew_done = Arc::new(AtomicBool::new(false));
+        let renew_task = match (self.central.clone(), verification_lease.clone()) {
+            (Some(central), Some(lease)) => {
+                let done = renew_done.clone();
+                Some(tokio::spawn(async move {
+                    while !done.load(Ordering::Acquire) {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        match central
+                            .renew(&lease, std::time::Duration::from_secs(120))
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => eprintln!("central import lease renewal: {error:#}"),
+                        }
+                    }
+                }))
+            }
+            _ => None,
+        };
         let verification_required = !owner.vault.verified;
         let mut central_published = false;
-        let verification = async {
+        let mut verification = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
@@ -1855,6 +1889,7 @@ impl Broker {
             launch_owner(&mut owner, &self.binary, proof)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            owner.refresh_enabled = true;
             let revision = owner
                 .snapshot()
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
@@ -1872,6 +1907,15 @@ impl Broker {
             }
             owner.vault.verified = true;
             owner.vault.revision = owner.vault.revision.saturating_add(1).max(1);
+            if verification_lease.is_some() {
+                // Initialization, verification, and process exit may all rotate
+                // credentials. Stop and snapshot before publishing or releasing.
+                settled_owner_record(&mut owner, &before)
+                    .await
+                    .map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?;
+            }
             vault::save(&state, &self.key, &owner.vault)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             vault::save(&owner.state, &self.key, &owner.vault)
@@ -1905,9 +1949,6 @@ impl Broker {
             Ok(account_summary(&owner))
         }
         .await;
-        if let (Some(central), Some(lease)) = (self.central.as_ref(), verification_lease.as_ref()) {
-            let _ = central.release_lease(lease).await;
-        }
         if verification.is_err() {
             owner.available = false;
             if verification_required {
@@ -1916,13 +1957,45 @@ impl Broker {
                 // recovery can become eligible.
                 if !central_published {
                     owner.vault.verified = false;
-                    vault::save(&owner.state, &self.key, &owner.vault).map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                    })?;
+                    if vault::save(&owner.state, &self.key, &owner.vault).is_err() {
+                        verification =
+                            Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
+                    }
                 }
                 owner.retryable_unavailable = false;
                 owner.retry_started = None;
                 owner.retry_failures = 0;
+            }
+        }
+        if verification.is_err() && verification_lease.is_some() {
+            fence_background_owner(&mut owner);
+            drop(owner);
+            // Import already runs in a disconnect-safe task. Keep admission
+            // serialized until settlement, so a retry cannot replace this
+            // owner's journal while its lease still protects unpublished auth.
+            settle_background_recovery(
+                owner_ref,
+                self.central.clone(),
+                verification_lease,
+                before,
+                false,
+                recovery_generation,
+                permit,
+                renew_done,
+                renew_task,
+                self.stopping.clone(),
+            )
+            .await;
+        } else {
+            if let (Some(central), Some(lease)) =
+                (self.central.as_ref(), verification_lease.as_ref())
+                && let Err(error) = central.release_lease(lease).await
+            {
+                eprintln!("central import lease release: {error:#}");
+            }
+            renew_done.store(true, Ordering::Release);
+            if let Some(task) = renew_task {
+                task.abort();
             }
         }
         verification

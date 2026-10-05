@@ -25,6 +25,10 @@ newer credential, fences the owner and releases the lease and shutdown permit.
 Transient database errors retain the journal and retry, including during shutdown.
 File-mode startup keeps its existing refresh owners.
 
+Shared-store imports also renew their lease through verification and child exit.
+An import retry reads the latest committed credential under that lease. Failed
+verification settles and persists its rotation before another import can retry.
+
 If a child never settles or its journal stays unreadable, the broker retains the
 lease and fences that account. Graceful shutdown waits for this work. It can
 exceed the Deployment's 60-second termination allowance; forced pod termination
