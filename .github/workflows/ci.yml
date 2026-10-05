@@ -100,6 +100,11 @@ jobs:
         with:
           cache: false
           check-mode: ${{ github.event_name == 'pull_request' && 'pull_request' || 'all' }}
+      - name: Verify OSV scanner
+        run: |
+          "$TRUNK_PATH" tools install osv-scanner
+          .trunk/tools/osv-scanner --version
+          .trunk/tools/osv-scanner --lockfile=Cargo.lock --format json
 
   build-macos:
     name: Build (macOS)
