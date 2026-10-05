@@ -15,14 +15,24 @@ credential payloads are encrypted before PostgreSQL insertion.
 PostgreSQL mode opens a reconnecting client with bounded connect, statement, and
 operation timeouts. Every token request reads the committed account revision;
 only a holder of the per-account lease and fencing epoch may run a refresh child
-or persist a rotated credential. Holder IDs contain the pod hostname and a
+or persist a rotated credential. Shared-store startup hydrates accounts without
+launching refresh children. A token request takes and renews the database lease
+before initialization, records initialization-time rotations, and stops the child
+before releasing the lease. Failed initialization retains the lease until the
+child stops and its journal is persisted. Background recovery uses the same
+stop-and-persist rule. File-mode startup keeps its existing refresh owners.
+
+The HA Deployment allows up to five minutes for startup through `/health` before
+liveness checks begin. This allowance covers database hydration and registry setup.
+
+Holder IDs contain the pod hostname and a
 random boot nonce. Registry authorization reads PostgreSQL on every request and
 mutations use one entity per compare-and-swap revision, so a stale pod cannot
 replace a concurrent revoke, enrollment, or re-enable. Dual mode is retained
 only for explicit migration commands and still requires
 `CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
-The phase-3 PostgreSQL server fails closed for enrollment, reset redemption,
+The phase-3 PostgreSQL server fails closed for enrollment, reset listing and redemption,
 and relogin endpoints. Their browser sessions, reset journals, and operation
 records remain file-backed, so they are not safe behind a multi-replica
 service. Keep those workflows on the single file-mode writer until phase 4

@@ -150,6 +150,10 @@ spec:
             - name: CODEXCTL_CENTRAL_DB_CA_FILE
               value: /etc/codexctl/rds-ca/global-bundle.pem
           ports: [{ name: http, containerPort: 8787 }]
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             {
               httpGet: { path: /ready, port: http },

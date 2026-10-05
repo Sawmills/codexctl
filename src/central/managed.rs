@@ -857,6 +857,9 @@ async fn settle_background_recovery(
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             continue;
         }
+        if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
+            let _ = central.release_lease(lease).await;
+        }
         if available_after {
             let mut owner = owner_ref.lock().await;
             if owner.recovery_generation == recovery_generation {
@@ -872,9 +875,6 @@ async fn settle_background_recovery(
         renew_done.store(true, Ordering::Release);
         if let Some(task) = renew_task {
             task.abort();
-        }
-        if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
-            let _ = central.release_lease(lease).await;
         }
         drop(permit);
         return;
@@ -991,20 +991,6 @@ async fn token(
         if reconciled {
             request.previous_revision = None;
         }
-        if lease.is_some()
-            && worker
-                .central
-                .as_ref()
-                .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
-            && let Some(import_guard) = import_guard.as_ref()
-            && let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await
-        {
-            if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
-                let _ = central.release_lease(lease).await;
-            }
-            return Err(error);
-        }
-        drop(import_guard);
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
@@ -1033,8 +1019,21 @@ async fn token(
             _ => None,
         };
         let mut retain_lease = lease.is_some();
+        // initialize can rotate credentials too. Capture the committed baseline
+        // and renew the lease before launching, then settle even a failed launch.
         let before = owner.vault.clone();
+        let recovery_generation = owner.recovery_generation;
+        let mut restore_after_settlement = false;
         let result = async {
+            if lease.is_some()
+                && let Some(import_guard) = import_guard.as_ref()
+            {
+                if let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await {
+                    restore_after_settlement = owner.available && !owner.routing_refused;
+                    return Err(error);
+                }
+            }
+            drop(import_guard);
             let token_result = owner.tokens(request).await;
             if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
@@ -1113,6 +1112,17 @@ async fn token(
                             ));
                         }
                     }
+                }
+            }
+            if lease.is_some() && owner.rpc.is_some() {
+                // No refresh-capable child may outlive its lease, even after a
+                // successful cached-token read. Save any exit-time rotation.
+                if let Err(error) = settled_owner_record(&mut owner, &before).await {
+                    restore_after_settlement = token_result.is_ok()
+                        && owner.available
+                        && !owner.routing_refused;
+                    eprintln!("central owner shutdown: {error:#}");
+                    return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
                 }
             }
             let auth_changed = owner.vault.auth != before.auth;
@@ -1233,7 +1243,15 @@ async fn token(
                             Ok(record) => match central.fenced_write(&lease, &record).await {
                                 Ok(true) => {
                                     settled.store(true, Ordering::Release);
-                                    let _ = central.release_lease(&lease).await;
+                                    if central.release_lease(&lease).await.is_ok()
+                                        && restore_after_settlement
+                                    {
+                                        let mut owner = owner_ref.lock().await;
+                                        if owner.recovery_generation == recovery_generation {
+                                            owner.available = true;
+                                            owner.routing_refused = false;
+                                        }
+                                    }
                                     break;
                                 }
                                 Ok(false) => {
@@ -2435,7 +2453,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 }
                 let probe_pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
                 let probe_ok = probe.is_ok();
-                if probe_pending || !local_saved {
+                if probe_pending || !local_saved || lease.is_some() {
                     if matches!(probe, Err(TokenFailure::Retryable(_))) {
                         owner.retryable_unavailable = owner.vault.verified;
                         owner.retry_failures = owner.retry_failures.saturating_add(1);
@@ -2567,6 +2585,23 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                     owner.retry_started = Some(owner.retry_clock_now());
                 }
                 eprintln!("central background owner recovery failed: {error:#}");
+                if lease.is_some() {
+                    let recovery_generation = owner.recovery_generation;
+                    drop(owner);
+                    tokio::spawn(settle_background_recovery(
+                        owner_ref.clone(),
+                        central.clone(),
+                        lease.clone(),
+                        before,
+                        false,
+                        recovery_generation,
+                        permit,
+                        renew_done,
+                        renew_task.take(),
+                        broker.stopping.clone(),
+                    ));
+                    continue;
+                }
             }
         }
         renew_done.store(true, Ordering::Release);
@@ -2688,7 +2723,14 @@ pub async fn serve(
         {
             Err(anyhow::anyhow!("candidate has not started"))
         } else {
-            prepare_owner(&entry.path(), key, read_only || pending)
+            // Shared-store replicas hydrate credentials without starting a native
+            // refresh owner. The token path acquires the account's database lease
+            // before launching one, including its initialize call.
+            prepare_owner(
+                &entry.path(),
+                key,
+                read_only || pending || central.is_some(),
+            )
         };
         let mut owner = match prepared {
             Ok(o) => o,

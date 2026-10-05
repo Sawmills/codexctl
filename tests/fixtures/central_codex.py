@@ -103,8 +103,18 @@ for line in sys.stdin:
                 sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
-        if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "startup":
+        if mode == "startup-hold":
+            pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
+            deadline = time.monotonic() + 10
+            while not pathlib.Path(mode_path).with_name("release-initialize").exists():
+                if time.monotonic() >= deadline:
+                    sys.exit(1)
+                time.sleep(0.01)
+        if auth_path.exists() and mode in ["startup", "startup-hold", "startup-error"]:
             rotate()
+        if mode == "startup-error":
+            send({"id": message["id"], "error": {"code": -32000, "message": "synthetic initialize failure"}})
+            continue
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
         if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
@@ -238,3 +248,6 @@ if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).rea
     claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
     if claims.get("sub") == "different-login":
         sys.exit(1)
+
+if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
+    pathlib.Path(os.environ["CENTRAL_TEST_EXIT_FILE"]).write_text("exited")

@@ -1066,13 +1066,40 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
         .await;
 
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
-    store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
     let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
     let mut owner = owner_ref.lock().await;
     let now = owner.retry_clock_now();
     owner.retry_started = Some(now.saturating_sub(60_000));
     drop(owner);
     recover_unhealthy_owners(&fixture.broker).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let owner = owner_ref.lock().await;
+            if owner.available {
+                assert!(
+                    owner.rpc.is_none(),
+                    "recovery must stop the child before making the account available"
+                );
+                break;
+            }
+            drop(owner);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = account_key("test", "fixture");
+    let committed = central.load_account(&id).await.unwrap().unwrap();
+    assert_eq!(
+        committed.revision, 2,
+        "recovery must publish initialization-time rotation"
+    );
+    let peer = central
+        .acquire_lease(&id, "peer-after-recovery", Duration::from_secs(60))
+        .await
+        .unwrap();
+    central.release_lease(&peer).await.unwrap();
     assert_eq!(fixture.token().await, StatusCode::OK);
     // A central reconcile can stop a stale child while the owner remains
     // available. The pre-existing shared-store launch path must recreate it.
