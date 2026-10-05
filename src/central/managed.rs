@@ -1517,7 +1517,14 @@ impl Broker {
         &self,
         owner: &'a Mutex<Owner>,
     ) -> Result<tokio::sync::MutexGuard<'a, Owner>, HttpError> {
-        let owner = if self.central.is_some() {
+        // Admission audits every local journal, including possible identity
+        // changes. Refuse an unstable inventory instead of holding imports
+        // while waiting for native work; existing accounts can still serve.
+        let owner = if self
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+        {
             owner
                 .try_lock()
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress"))?
@@ -1695,7 +1702,10 @@ impl Broker {
             if owner.vault.verified
                 && owner.available
                 && !admission.quarantine_repair
-                && self.central.is_none()
+                && self
+                    .central
+                    .as_ref()
+                    .is_none_or(|central| central.mode() == super::storage::StoreMode::File)
             {
                 // A retained proof owns the grant, but cannot establish current
                 // routing or billing eligibility after a restart or policy change.
@@ -1998,7 +2008,7 @@ impl Broker {
             let central = self.central.clone();
             let stopping = self.stopping.clone();
             // Keep a per-owner reservation while settlement runs independently.
-            // Other accounts must not wait for this import's native child or DB.
+            // Other accounts' token requests must not wait for this child or DB.
             tokio::spawn(async move {
                 settle_background_recovery(
                     owner_ref.clone(),
