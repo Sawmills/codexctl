@@ -647,7 +647,13 @@ async fn dashboard_omits_credits_after_late_staleness(change_credentials: bool) 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     f.broker.reset_reader = super::super::resets::Reader::with_base(&base);
-    let app = super::super::dashboard::routes(&base)
+    let routes = if change_credentials {
+        super::super::dashboard::routes(&base)
+    } else {
+        // Model a delayed snapshot without waiting for its real 60-second TTL.
+        super::super::dashboard::testing_routes(&base, |_| Duration::from_secs(61))
+    };
+    let app = routes
         .route(
             "/credits",
             get({
@@ -685,17 +691,16 @@ async fn dashboard_omits_credits_after_late_staleness(change_credentials: bool) 
         current.vault.auth["changed"] = json!(true);
     }
     release.add_permits(1);
-    if !change_credentials {
-        // Hold the owner observation until the catalog sample expires. Releasing
-        // the reset request first keeps its HTTP timeout out of this test.
-        tokio::time::sleep(super::super::catalog::TTL + Duration::from_secs(1)).await;
-    }
     drop(current);
     let response = response.await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let data: Value = response.json().await.unwrap();
     assert_eq!(data["accounts"][0]["usage_stale"], true);
+    assert_eq!(data["accounts"][0]["banked_resets"]["stale"], true);
     assert!(data["accounts"][0].get("credits").is_none());
+    if !change_credentials {
+        assert!(data["accounts"][0]["usage_age_seconds"].as_u64().unwrap() >= 61);
+    }
     server.abort();
 }
 
