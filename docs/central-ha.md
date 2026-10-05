@@ -136,9 +136,8 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
-The commands below are an operator runbook. This PR does not run them and does
-not reference the live Argo application. Stop if the database, role, secret,
-or row counts do not match the reviewed plan.
+The commands below require operator execution approval. Stop if the database,
+role, secret, or row counts do not match the reviewed plan.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
@@ -151,9 +150,9 @@ Verify the synced revision is the reviewed CA merge (or a reviewed descendant
 that includes it), and verify the bundle key in namespace `codexctl`:
 
 ```sh
-kubie exec staging argocd kubectl get application codexctl -o json | \
+kubie exec plat-staging argocd kubectl get application codexctl -o json | \
   jq '{source: .spec.source, sync: .status.sync}'
-kubie exec staging codexctl kubectl get configmap codexctl-rds-ca -o json | \
+kubie exec plat-staging codexctl kubectl get configmap codexctl-rds-ca -o json | \
   jq -e '.data["global-bundle.pem"] | startswith("-----BEGIN CERTIFICATE-----")'
 ```
 
