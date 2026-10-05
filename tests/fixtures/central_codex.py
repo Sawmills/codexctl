@@ -103,18 +103,18 @@ for line in sys.stdin:
                 sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
-        if mode == "startup-hold" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
+        if mode in ["startup-hold", "startup-hold-error"] and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
             pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
             deadline = time.monotonic() + 10
             while not pathlib.Path(mode_path).with_name("release-initialize").exists():
                 if time.monotonic() >= deadline:
                     sys.exit(1)
                 time.sleep(0.01)
-        if auth_path.exists() and mode in ["startup", "startup-hold", "startup-error", "startup-exit"]:
+        if auth_path.exists() and mode in ["startup", "startup-hold", "startup-hold-error", "startup-error", "startup-exit"]:
             rotate()
         if mode == "startup-exit":
             sys.exit(1)
-        if mode == "startup-error":
+        if mode in ["startup-error", "startup-hold-error"]:
             send({"id": message["id"], "error": {"code": -32000, "message": "synthetic initialize failure"}})
             continue
         result = {"userAgent": "synthetic-codex"}

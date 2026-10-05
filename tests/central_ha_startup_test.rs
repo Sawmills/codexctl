@@ -76,8 +76,10 @@ impl Pod {
     }
 
     async fn stop(&mut self) {
-        unsafe {
-            libc::kill(self.child.id().unwrap() as i32, libc::SIGTERM);
+        if let Some(pid) = self.child.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
         }
         timeout(Duration::from_secs(10), self.child.wait())
             .await
@@ -362,6 +364,53 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     .await
     .expect("dead initialize child retained its lease or replica fence");
     assert_eq!(generation(&retry), 9);
+    store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold-error").unwrap();
+    for name in ["initialize-started", "release-initialize"] {
+        std::fs::remove_file(pods[0].root.path().join(name)).unwrap();
+    }
+    let stopped_request = request(&http, &pods[0], &token);
+    let shutdown = async {
+        timeout(Duration::from_secs(5), async {
+            while !pods[0].root.path().join("initialize-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        unsafe {
+            libc::kill(pods[0].child.id().unwrap() as i32, libc::SIGTERM);
+        }
+        timeout(Duration::from_secs(5), async {
+            while http
+                .get(format!("{}/ready", pods[0].url))
+                .send()
+                .await
+                .is_ok_and(|r| r.status() == 200)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server did not start shutdown");
+        store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
+    };
+    let (response, ()) = tokio::join!(stopped_request, shutdown);
+    assert_eq!(response.status(), 503);
+    timeout(Duration::from_secs(10), pods[0].child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let successor = request(&http, &pods[1], &token).await;
+    assert_eq!(
+        successor.status(),
+        200,
+        "graceful shutdown must release its settled lease"
+    );
+    assert_eq!(
+        generation(&successor.json::<Value>().await.unwrap()),
+        11,
+        "graceful shutdown must publish initialization rotation for its successor"
+    );
     for pod in &mut pods {
         pod.stop().await;
     }

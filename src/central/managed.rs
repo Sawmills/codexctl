@@ -800,7 +800,9 @@ async fn settle_background_recovery(
     stopping: Arc<AtomicBool>,
 ) {
     loop {
-        if stopping.load(Ordering::Acquire) {
+        // Shared-store shutdown must drain the child's final rotation to the
+        // database before releasing its lease and the shutdown work permit.
+        if central.is_none() && stopping.load(Ordering::Acquire) {
             abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
             return;
         }
@@ -808,17 +810,13 @@ async fn settle_background_recovery(
             let mut owner = owner_ref.lock().await;
             settled_owner_record(&mut owner, &before).await
         };
-        let Ok(record) = record else {
-            let exited = owner_ref
-                .lock()
-                .await
-                .rpc
-                .as_mut()
-                .is_some_and(Rpc::process_exited);
-            if !exited {
+        let record = match record {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("central child settlement retry: {error:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
-            continue;
         };
         let durable = match (central.as_ref(), lease.as_ref()) {
             (Some(central), Some(lease)) => match central
@@ -834,7 +832,7 @@ async fn settle_background_recovery(
             _ => true,
         };
         if !durable {
-            if stopping.load(Ordering::Acquire) {
+            if central.is_none() && stopping.load(Ordering::Acquire) {
                 abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
                 return;
             }
