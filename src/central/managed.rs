@@ -1027,11 +1027,10 @@ async fn token(
         let result = async {
             if lease.is_some()
                 && let Some(import_guard) = import_guard.as_ref()
+                && let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await
             {
-                if let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await {
-                    restore_after_settlement = owner.available && !owner.routing_refused;
-                    return Err(error);
-                }
+                restore_after_settlement = owner.available && !owner.routing_refused;
+                return Err(error);
             }
             drop(import_guard);
             let token_result = owner.tokens(request).await;
