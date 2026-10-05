@@ -18,7 +18,7 @@ use toml_edit::{DocumentMut, Item, Table, value};
 
 mod launch;
 pub(super) use launch::sweep_stale_launches;
-pub use launch::{launch_owners, run_pinned_codex};
+pub use launch::{PinnedLaunch, launch_owners, prepare_pinned_codex, run_pinned_codex};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
@@ -703,36 +703,6 @@ pub fn central_active() -> Result<bool> {
         .get("model_provider")
         .and_then(Item::as_str)
         == Some(PROVIDER))
-}
-
-/// Move only the central provider's account pointer for a launch. A fresh
-/// `codexctl codex` launch must not run session repair or restart an unrelated
-/// daemon while spreading work across accounts.
-pub fn set_active_for_codex(alias: &str) -> Result<()> {
-    let catalog =
-        super::remote::catalog()?.context("codex launch requires a connected account server")?;
-    let account = catalog
-        .accounts
-        .iter()
-        .find(|account| account.alias.eq_ignore_ascii_case(alias))
-        .context("server account alias not found")?;
-    let path = connection_path(alias)?;
-    let directory = root()?;
-    let _lock = native_lock(&directory)?;
-    sync_account(&catalog.connection, account)?;
-    let connection =
-        read_connection(&path).with_context(|| format!("server account {alias} is unavailable"))?;
-    let pointer = active_pointer_path()?;
-    let previous = read_optional_file(&pointer)?;
-    write_pointer_with_rollback(
-        &path,
-        &connection,
-        &pointer,
-        format!("{}\n", connection_alias(&path, &connection)).as_bytes(),
-        previous.as_deref(),
-        PointerCause::UseAuto,
-        store::atomic_write,
-    )
 }
 
 pub fn run_codex(args: &[String]) -> Result<Option<i32>> {

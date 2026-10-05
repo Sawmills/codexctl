@@ -204,7 +204,8 @@ Account selection during recovery:
 When the account server is active, `codexctl codex` spreads a new launch across
 included accounts. It chooses the account with the fewest live token sessions,
 then the lowest recent 429 rate. Usage-based accounts and exhausted windows are
-never selected automatically. If Codex stops after `exceeded retry limit, last
+never selected automatically. The selected account is pinned to this child, so
+starting a new lane does not move existing sessions on the machine. If Codex stops after `exceeded retry limit, last
 status: 429`, codexctl resumes the same session on the next least-loaded included
 account, up to three recoveries per hour. A recovery keeps the original model,
 permissions, working directory, and other arguments. It never redeems a reset or

@@ -45,12 +45,13 @@ pub fn run(
         bail!("server account launch for {alias} requires central support");
     }
     #[cfg(feature = "central-prototype")]
-    let selected_central_alias = if codexctl::central::native::central_active()? {
+    let selected_central_launch = if codexctl::central::native::central_active()? {
         match codexctl::central::remote::select_codex_account() {
             Ok(alias) => {
                 eprintln!("codexctl: selected included account {alias} (least loaded)");
-                codexctl::central::native::set_active_for_codex(&alias)?;
-                Some(alias)
+                Some(codexctl::central::native::prepare_pinned_codex(
+                    &alias, false,
+                )?)
             }
             Err(_) => None,
         }
@@ -58,14 +59,19 @@ pub fn run(
         None
     };
     #[cfg(feature = "central-prototype")]
-    // Existing noninteractive callers rely on native exit-status and signal
-    // forwarding. Interactive launches use the PTY wrapper so 429 output can
-    // stop and resume the session safely.
-    let central_mode = selected_central_alias.is_some() && std::io::stdin().is_terminal();
+    let selected_central_alias = selected_central_launch
+        .as_ref()
+        .map(|launch| launch.alias().to_owned());
+    #[cfg(feature = "central-prototype")]
+    // Automatic central launches use a private account connection so the host
+    // pointer and unrelated sessions remain unchanged while 429 recovery runs.
+    let central_mode = selected_central_launch.is_some();
     #[cfg(not(feature = "central-prototype"))]
     let central_mode = false;
     #[cfg(not(feature = "central-prototype"))]
     let selected_central_alias: Option<String> = None;
+    #[cfg(feature = "central-prototype")]
+    let central_launch = Arc::new(Mutex::new(selected_central_launch));
     #[cfg(feature = "central-prototype")]
     if !central_mode
         && let Some(code) =
@@ -79,9 +85,18 @@ pub fn run(
         .transpose()?;
     let paths = config::default_paths()?;
     let mut reporter = HerdrAgentReporter::from_env();
-    let mut runner = PtyCodexRunner::new(reporter.clone());
+    let mut runner = PtyCodexRunner::new(
+        reporter.clone(),
+        #[cfg(feature = "central-prototype")]
+        Arc::clone(&central_launch),
+    );
     let failed_alias = selected_central_alias.or_else(|| failed_alias_for_child_auth(&paths));
-    let mut switcher = CodexctlProfileSwitcher::new(&paths, central_mode);
+    let mut switcher = CodexctlProfileSwitcher::new(
+        &paths,
+        central_mode,
+        #[cfg(feature = "central-prototype")]
+        Arc::clone(&central_launch),
+    );
     let mut sessions = FilesystemSessionStore::new(&paths)?;
     let mut consent = InteractiveConsent {
         allow_billing,
@@ -903,13 +918,23 @@ struct CodexctlProfileSwitcher {
     auth_json: PathBuf,
     #[cfg_attr(not(feature = "central-prototype"), allow(dead_code))]
     central: bool,
+    #[cfg(feature = "central-prototype")]
+    central_launch: Arc<Mutex<Option<codexctl::central::native::PinnedLaunch>>>,
 }
 
 impl CodexctlProfileSwitcher {
-    fn new(paths: &Paths, central: bool) -> Self {
+    fn new(
+        paths: &Paths,
+        central: bool,
+        #[cfg(feature = "central-prototype")] central_launch: Arc<
+            Mutex<Option<codexctl::central::native::PinnedLaunch>>,
+        >,
+    ) -> Self {
         Self {
             auth_json: codex_auth_json_for_child(paths),
             central,
+            #[cfg(feature = "central-prototype")]
+            central_launch,
         }
     }
 }
@@ -937,7 +962,12 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
     fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()> {
         #[cfg(feature = "central-prototype")]
         if self.central {
-            codexctl::central::native::activate(Some(alias), true, false, true)?;
+            let launch = codexctl::central::native::prepare_pinned_codex(alias, false)?;
+            let mut slot = self
+                .central_launch
+                .lock()
+                .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?;
+            *slot = Some(launch);
             return Ok(());
         }
         // Inside a pinned lane the outgoing token is this lane's own account,
@@ -1436,11 +1466,22 @@ fn string_at_path<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a
 
 struct PtyCodexRunner {
     state_reporter: Option<HerdrAgentReporter>,
+    #[cfg(feature = "central-prototype")]
+    central_launch: Arc<Mutex<Option<codexctl::central::native::PinnedLaunch>>>,
 }
 
 impl PtyCodexRunner {
-    fn new(state_reporter: Option<HerdrAgentReporter>) -> Self {
-        Self { state_reporter }
+    fn new(
+        state_reporter: Option<HerdrAgentReporter>,
+        #[cfg(feature = "central-prototype")] central_launch: Arc<
+            Mutex<Option<codexctl::central::native::PinnedLaunch>>,
+        >,
+    ) -> Self {
+        Self {
+            state_reporter,
+            #[cfg(feature = "central-prototype")]
+            central_launch,
+        }
     }
 }
 
@@ -1448,13 +1489,23 @@ type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 impl CodexRunner for PtyCodexRunner {
     fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
-        run_codex_in_pty(invocation, self.state_reporter.clone())
+        #[cfg(feature = "central-prototype")]
+        let central_launch = self
+            .central_launch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?
+            .as_ref()
+            .map(|launch| (launch.codex_args().to_owned(), launch.alias().to_owned()));
+        #[cfg(not(feature = "central-prototype"))]
+        let central_launch = None;
+        run_codex_in_pty(invocation, self.state_reporter.clone(), central_launch)
     }
 }
 
 fn run_codex_in_pty(
     invocation: &CodexInvocation,
     state_reporter: Option<HerdrAgentReporter>,
+    central_launch: Option<(Vec<String>, String)>,
 ) -> Result<CodexRunOutcome> {
     let interactive = std::io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::enable(interactive)?;
@@ -1463,6 +1514,12 @@ fn run_codex_in_pty(
         .openpty(current_pty_size())
         .context("failed to open pty")?;
     let mut command = CommandBuilder::new("codex");
+    if let Some((codex_args, alias)) = central_launch {
+        for arg in codex_args {
+            command.arg(arg);
+        }
+        command.env("CODEXCTL_PINNED_ALIAS", alias);
+    }
     for arg in &invocation.args {
         command.arg(arg);
     }

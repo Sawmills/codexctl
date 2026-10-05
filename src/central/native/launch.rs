@@ -176,11 +176,36 @@ fn pinned_arguments(args: &[String]) -> Result<Vec<String>> {
     Ok(config_args)
 }
 
-/// Prepare consent and a private helper connection, then preserve the child exit status.
-/// Does not activate a provider, change the host pointer, or redeem resets.
-pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
+/// A private central connection and its launch lifetime guards.
+pub struct PinnedLaunch {
+    prepared: Option<tempfile::TempDir>,
+    _owner: vault::Lock,
+    lease: std::fs::File,
+    alias: String,
+    codex_args: Vec<String>,
+}
+
+impl PinnedLaunch {
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    pub fn codex_args(&self) -> &[String] {
+        &self.codex_args
+    }
+
+    pub fn close(mut self) -> Result<()> {
+        let prepared = self
+            .prepared
+            .take()
+            .context("private central launch was already closed")?;
+        close_launch(prepared)
+    }
+}
+
+/// Prepare consent and a private helper connection without changing the host pointer.
+pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLaunch> {
     store::validate_alias(alias)?;
-    let args = pinned_arguments(args)?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
@@ -201,7 +226,6 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     let paths = config::default_paths()?;
     let directory = root()?;
     sweep_stale_launches()?;
-    let signals = LaunchSignals::register()?;
     let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
     let catalog = super::super::remote::catalog()?
         .context("--account requires a connected account server")?;
@@ -263,7 +287,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
     connection.approved_billing_class = bills.then_some(token.billing_class).flatten();
     connection.revision = token.revision.clone();
-    let (prepared, _owner) = {
+    let (prepared, owner) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
         let _native = native_lock(&directory)?;
@@ -304,8 +328,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             .and_then(Item::as_integer)
             .unwrap_or(12)
     };
-    let mut command = std::process::Command::new("codex");
-    for override_value in [
+    let codex_args = [
         "model_provider=\"codexctl-central\"".to_owned(),
         // Replace the entire provider first, so stale API-key or header settings
         // cannot compete with this launch's explicit token helper.
@@ -329,22 +352,40 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
         format!("model_providers.codexctl-central.auth.args={helper_args}"),
         "model_providers.codexctl-central.auth.refresh_interval_ms=60000".into(),
         "model_providers.codexctl-central.auth.timeout_ms=210000".into(),
-    ] {
-        command.args(["-c", &override_value]);
-    }
+    ]
+    .into_iter()
+    .flat_map(|value| ["-c".to_owned(), value])
+    .collect();
+    Ok(PinnedLaunch {
+        prepared: Some(prepared),
+        _owner: owner,
+        lease,
+        alias: account.alias.clone(),
+        codex_args,
+    })
+}
+
+/// Prepare consent and a private helper connection, then preserve the child exit status.
+/// Does not activate a provider, change the host pointer, or redeem resets.
+pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
+    let args = pinned_arguments(args)?;
+    let signals = LaunchSignals::register()?;
+    let launch = prepare_pinned_codex(alias, allow_billing)?;
+    let mut command = std::process::Command::new("codex");
     command
+        .args(launch.codex_args())
         .args(args)
-        .env("CODEXCTL_PINNED_ALIAS", &account.alias);
+        .env("CODEXCTL_PINNED_ALIAS", launch.alias());
     if signals.received() != 0 {
-        close_launch(prepared)?;
+        launch.close()?;
         return Ok(128 + signals.received());
     }
-    let mut child = spawn_child_with_lease(&lease, &mut command)?;
+    let mut child = spawn_child_with_lease(&launch.lease, &mut command)?;
     loop {
         let signal = signals.received();
         if signal != 0 {
             // Revoke approval before forwarding the signal, even if Codex ignores it.
-            let cleanup = close_launch(prepared);
+            let cleanup = launch.close();
             // A filesystem or lock error must not strand the running child.
             // Keep that error until termination and reaping have been attempted.
             unsafe {
@@ -363,7 +404,7 @@ pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Re
             return Ok(128 + signal);
         }
         if let Some(status) = child.try_wait()? {
-            close_launch(prepared)?;
+            launch.close()?;
             return Ok(status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)));
