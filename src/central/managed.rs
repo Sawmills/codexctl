@@ -2366,7 +2366,14 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                     match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
                         .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
                     {
-                        Ok(proof) => launch_owner(&mut owner, &broker.binary, proof).await,
+                        Ok(proof) => {
+                            let spawned = spawn_owner(&mut owner, &broker.binary, proof);
+                            drop(imports);
+                            match spawned {
+                                Ok(()) => initialize_owner(&mut owner).await,
+                                Err(error) => Err(error),
+                            }
+                        }
                         Err(error) => {
                             owner.routing_refused = true;
                             Err(error)
