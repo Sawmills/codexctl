@@ -432,9 +432,7 @@ impl Rpc {
         match timeout(deadline, operation).await {
             Ok(result) => {
                 if result.as_ref().is_err_and(|error| {
-                    !error.is::<RoutingPolicyError>()
-                        && !error.is::<AppServerError>()
-                        && !error.is::<RetryableUsageRead>()
+                    !error.is::<RoutingPolicyError>() && !error.is::<AppServerError>()
                 }) {
                     self.healthy = false;
                     self.retryable_failure = true;

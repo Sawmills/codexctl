@@ -119,6 +119,7 @@ pub(super) struct Owner {
     pub(super) key: PathBuf,
     pub(super) available: bool,
     pub(super) retryable_unavailable: bool,
+    pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
     pub(super) routing_refused: bool,
@@ -140,8 +141,16 @@ impl Owner {
     }
 
     pub(super) fn retry_cooldown_active(&self) -> bool {
+        if self.retry_failures >= 3 {
+            return true;
+        }
+        let backoff = match self.retry_failures {
+            0 => 60_000,
+            1 => 300_000,
+            _ => 900_000,
+        };
         self.retry_started
-            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < 60_000)
+            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
     }
     pub(super) fn selectable(&self) -> bool {
         self.available && !self.routing_refused
@@ -364,6 +373,7 @@ impl Owner {
                             && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
                             && !error.is::<RoutingPolicyError>() =>
                     {
+                        self.retry_requires_billing = true;
                         self.fence(true);
                         eprintln!("central owner refresh failed reason=owner_refresh_failed");
                         return Err(TokenFailure::Retryable(error));
@@ -699,6 +709,7 @@ pub async fn serve(
         key: key.into(),
         available: true,
         retryable_unavailable: false,
+        retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
         routing_refused: false,

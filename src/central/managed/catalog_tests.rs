@@ -751,6 +751,16 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
     drop(owner);
     recover_unhealthy_owners(&fixture.broker).await;
     assert_eq!(fixture.token().await, StatusCode::OK);
+    // A central reconcile can stop a stale child while the owner remains
+    // available. The pre-existing shared-store launch path must recreate it.
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        owner.rpc = None;
+        owner.refresh_enabled = false;
+        owner.available = true;
+    }
+    assert_eq!(fixture.token().await, StatusCode::OK);
 }
 
 #[tokio::test]

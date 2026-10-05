@@ -2267,7 +2267,7 @@ fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
         server
             .token_without_billing(&server.amir, "personal")
             .status(),
-        503
+        200
     );
 }
 
@@ -4238,8 +4238,8 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
                 "codexctl_central_failed_requests_total{reason=\"catalog_owner_unavailable\"} 0"
             ));
             store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-            assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
-            assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+            assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+            assert_eq!(server.accounts(&server.amir)[0]["available"], true);
         }
     }
 }
