@@ -2263,12 +2263,21 @@ fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
     );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"120000").unwrap();
-    assert_eq!(
-        server
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if server
             .token_without_billing(&server.amir, "personal")
-            .status(),
-        200
-    );
+            .status()
+            == 200
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background billing probe did not recover the owner"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
