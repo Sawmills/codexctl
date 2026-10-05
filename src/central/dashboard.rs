@@ -15,9 +15,10 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 
 async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
-    match snapshot(&broker, &headers).await {
+    match snapshot(&broker, &headers, Instant::elapsed).await {
         Ok(snapshot) => document(&render::overview(&snapshot)),
         Err(error) => {
             let error = error.into_response();
@@ -38,8 +39,12 @@ async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
         }
     }
 }
-async fn data(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
-    let snapshot = snapshot(&broker, &headers).await?;
+async fn data(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    elapsed: fn(&Instant) -> Duration,
+) -> Result<Response, HttpError> {
+    let snapshot = snapshot(&broker, &headers, elapsed).await?;
     if headers.get("accept").is_some_and(|v| v == "text/html") {
         return Ok(document(&render::overview(&snapshot)));
     }
@@ -52,19 +57,23 @@ async fn data(State(broker): State<Broker>, headers: HeaderMap) -> Result<Respon
     )
         .into_response())
 }
-async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, HttpError> {
+async fn snapshot(
+    broker: &Broker,
+    headers: &HeaderMap,
+    elapsed: fn(&Instant) -> Duration,
+) -> Result<Snapshot, HttpError> {
     let identity = enrollment::browser_user(broker, headers)?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     let user = identity.id;
     let catalog =
         managed::account_catalog(broker, &user, super::catalog::Freshness::RefreshAhead).await?;
-    let sampled_at = std::time::Instant::now();
+    let sampled_at = Instant::now();
     let tasks = catalog
         .into_iter()
         .map(|account| account_snapshot(broker, &user, account));
     let mut accounts: Vec<_> = futures::future::try_join_all(tasks).await?;
     for account in &mut accounts {
-        account.advance_usage_age(sampled_at.elapsed());
+        account.advance_usage_age(elapsed(&sampled_at));
     }
     let machines: Vec<_> = vault::devices(&broker.state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
@@ -95,7 +104,7 @@ async fn snapshot(broker: &Broker, headers: &HeaderMap) -> Result<Snapshot, Http
 }
 
 impl Account {
-    fn advance_usage_age(&mut self, elapsed: std::time::Duration) {
+    fn advance_usage_age(&mut self, elapsed: Duration) {
         if let Some(age) = self.usage_age_seconds {
             let age = age.saturating_add(elapsed.as_secs());
             self.usage_age_seconds = Some(age);
@@ -207,6 +216,18 @@ fn window(used: Option<f64>, seconds: Option<u64>, reset: Option<i64>) -> Window
 }
 
 pub(super) fn routes(public_url: &str) -> Router<Broker> {
+    routes_with_elapsed(public_url, Instant::elapsed)
+}
+
+#[cfg(test)]
+pub(super) fn testing_routes(
+    public_url: &str,
+    elapsed: fn(&Instant) -> Duration,
+) -> Router<Broker> {
+    routes_with_elapsed(public_url, elapsed)
+}
+
+fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> Router<Broker> {
     // This is operator configuration validated at startup, never a request header.
     // Quote for the shell, then escape for the HTML text node.
     let server = format!(
@@ -233,7 +254,10 @@ pub(super) fn routes(public_url: &str) -> Router<Broker> {
             get(|| async { font(include_bytes!("../../design/v3/fonts/jetbrains-mono.woff2")) }),
         )
         .route("/accounts", get(page))
-        .route("/accounts/data", get(data))
+        .route(
+            "/accounts/data",
+            get(move |state, headers| data(state, headers, elapsed)),
+        )
         .route("/accounts/sign-in", get(enrollment::accounts_sign_in))
         .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
 }
@@ -312,7 +336,6 @@ fn font(bytes: &'static [u8]) -> Response {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::Duration;
 
     fn account(age: Option<u64>) -> Account {
         serde_json::from_value(json!({
