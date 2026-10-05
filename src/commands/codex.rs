@@ -48,13 +48,11 @@ pub fn run(
     let selected_central_launch = if codexctl::central::native::central_active()?
         && codexctl::central::remote::connection()?.is_some()
     {
+        codexctl::central::native::pinned_arguments(args)?;
         match codexctl::central::remote::select_codex_account() {
             Ok(alias) => {
                 eprintln!("codexctl: selected included account {alias} (least loaded)");
-                Some(codexctl::central::native::prepare_pinned_codex(
-                    &alias,
-                    allow_billing,
-                )?)
+                Some(codexctl::central::native::prepare_included_codex(&alias)?)
             }
             Err(error) => {
                 eprintln!(
@@ -979,7 +977,7 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
     fn switch_to(&mut self, alias: &str, own_session: Option<&str>) -> Result<()> {
         #[cfg(feature = "central-prototype")]
         if self.central {
-            let launch = codexctl::central::native::prepare_pinned_codex(alias, false)?;
+            let launch = codexctl::central::native::prepare_included_codex(alias)?;
             let mut slot = self
                 .central_launch
                 .lock()
@@ -1510,20 +1508,15 @@ type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 impl CodexRunner for PtyCodexRunner {
     fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
         #[cfg(feature = "central-prototype")]
-        let central_launch = self
+        let mut central_launch = self
             .central_launch
             .lock()
-            .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?
-            .as_ref()
-            .map(|launch| (launch.codex_args().to_owned(), launch.alias().to_owned()));
-        #[cfg(not(feature = "central-prototype"))]
-        let central_launch = None;
-        let allow_rate_recovery = central_launch.is_some();
+            .map_err(|_| anyhow::anyhow!("central launch state lock poisoned"))?;
         run_codex_in_pty(
             invocation,
             self.state_reporter.clone(),
-            central_launch,
-            allow_rate_recovery,
+            #[cfg(feature = "central-prototype")]
+            central_launch.as_mut(),
         )
     }
 }
@@ -1531,8 +1524,9 @@ impl CodexRunner for PtyCodexRunner {
 fn run_codex_in_pty(
     invocation: &CodexInvocation,
     state_reporter: Option<HerdrAgentReporter>,
-    central_launch: Option<(Vec<String>, String)>,
-    allow_rate_recovery: bool,
+    #[cfg(feature = "central-prototype")] mut central_launch: Option<
+        &mut codexctl::central::native::PinnedLaunch,
+    >,
 ) -> Result<CodexRunOutcome> {
     let interactive = std::io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::enable(interactive)?;
@@ -1541,23 +1535,11 @@ fn run_codex_in_pty(
         .openpty(current_pty_size())
         .context("failed to open pty")?;
     #[cfg(feature = "central-prototype")]
-    let central_mode = central_launch.is_some();
-    let mut command = CommandBuilder::new("codex");
-    if let Some((codex_args, alias)) = central_launch {
-        for arg in codex_args {
-            command.arg(arg);
-        }
-        command.env("CODEXCTL_PINNED_ALIAS", alias);
-    }
-    #[cfg(feature = "central-prototype")]
-    let invocation_args = if central_mode {
-        codexctl::central::native::pinned_arguments(&invocation.args)?
-    } else {
-        invocation.args.clone()
-    };
+    let allow_rate_recovery = central_launch.is_some();
     #[cfg(not(feature = "central-prototype"))]
-    let invocation_args = invocation.args.clone();
-    for arg in &invocation_args {
+    let allow_rate_recovery = false;
+    let mut command = CommandBuilder::new("codex");
+    for arg in &invocation.args {
         command.arg(arg);
     }
     command.cwd(invocation.cwd.as_os_str());
@@ -1565,6 +1547,20 @@ fn run_codex_in_pty(
         command.env("TERM", "xterm-256color");
     }
 
+    #[cfg(feature = "central-prototype")]
+    let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+        if let Some(launch) = central_launch.as_deref() {
+            if launch.received_signal() != 0 {
+                return Ok(CodexRunOutcome::Exited(128 + launch.received_signal()));
+            }
+            let slave = pair.master.tty_name().context("PTY has no slave path")?;
+            Box::new(launch.spawn_in_pty(&invocation.args, &invocation.cwd, &slave)?)
+        } else {
+            pair.slave
+                .spawn_command(command)
+                .context("failed to run `codex`")?
+        };
+    #[cfg(not(feature = "central-prototype"))]
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -1608,7 +1604,44 @@ fn run_codex_in_pty(
         })
     };
 
-    let status = child.wait().context("failed to wait for codex")?;
+    #[cfg_attr(not(feature = "central-prototype"), allow(unused_mut))]
+    let mut received_signal = 0;
+    #[cfg_attr(not(feature = "central-prototype"), allow(unused_mut))]
+    let mut cleanup: Result<()> = Ok(());
+    let status = loop {
+        #[cfg(feature = "central-prototype")]
+        if let Some(launch) = central_launch.as_deref_mut()
+            && launch.received_signal() != 0
+        {
+            received_signal = launch.received_signal();
+            cleanup = launch.revoke();
+            if let Some(pid) = child.process_id() {
+                unsafe {
+                    libc::kill(pid as i32, received_signal);
+                }
+            }
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    if let Some(pid) = child.process_id() {
+                        unsafe {
+                            libc::kill(pid as i32, libc::SIGKILL);
+                        }
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            break child.wait().context("failed to reap codex after signal")?;
+        }
+        if let Some(status) = child.try_wait().context("failed to wait for codex")? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     stop_input.store(true, Ordering::SeqCst);
     if let Some(input_thread) = input_thread
         && input_thread.join_on_stop
@@ -1617,6 +1650,10 @@ fn run_codex_in_pty(
     }
     let _ = reader_thread.join();
 
+    cleanup?;
+    if received_signal != 0 {
+        return Ok(CodexRunOutcome::Exited(128 + received_signal));
+    }
     if spend_cap.load(Ordering::SeqCst) {
         let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
         Ok(CodexRunOutcome::SpendCap { session_id })

@@ -183,6 +183,7 @@ pub struct PinnedLaunch {
     lease: std::fs::File,
     alias: String,
     codex_args: Vec<String>,
+    signals: LaunchSignals,
 }
 
 impl Drop for PinnedLaunch {
@@ -206,17 +207,70 @@ impl PinnedLaunch {
     }
 
     pub fn close(mut self) -> Result<()> {
-        let prepared = self
-            .prepared
-            .take()
-            .context("private central launch was already closed")?;
-        close_launch(prepared)
+        self.revoke()
+    }
+
+    pub fn revoke(&mut self) -> Result<()> {
+        if let Some(prepared) = self.prepared.take() {
+            close_launch(prepared)?;
+        }
+        Ok(())
+    }
+
+    pub fn received_signal(&self) -> i32 {
+        self.signals.received()
+    }
+
+    /// Spawn on a PTY while retaining the mode lease in the child after exec.
+    pub fn spawn_in_pty(
+        &self,
+        args: &[String],
+        cwd: &Path,
+        slave: &Path,
+    ) -> Result<std::process::Child> {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        let tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(slave)?;
+        let mut command = std::process::Command::new("codex");
+        command
+            .args(self.codex_args())
+            .args(pinned_arguments(args)?)
+            .env("CODEXCTL_PINNED_ALIAS", self.alias())
+            .current_dir(cwd)
+            .stdin(tty.try_clone()?)
+            .stdout(tty.try_clone()?)
+            .stderr(tty);
+        if std::env::var_os("TERM").is_none() {
+            command.env("TERM", "xterm-256color");
+        }
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1
+                    || libc::ioctl(std::io::stdin().as_raw_fd(), libc::TIOCSCTTY as _, 0) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        spawn_child_with_lease(&self.lease, &mut command)
     }
 }
 
-/// Prepare consent and a private helper connection without changing the host pointer.
-pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLaunch> {
+/// Prepare an included-only private launch without changing the host pointer.
+pub fn prepare_included_codex(alias: &str) -> Result<PinnedLaunch> {
+    prepare_pinned_codex(alias, false, true)
+}
+
+fn prepare_pinned_codex(
+    alias: &str,
+    allow_billing: bool,
+    included_only: bool,
+) -> Result<PinnedLaunch> {
     store::validate_alias(alias)?;
+    let signals = LaunchSignals::register()?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
@@ -262,18 +316,17 @@ pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLa
         launch_pinned: true,
         approved_billing_plan: None,
         approved_billing_class: None,
-        session_id: format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ),
+        session_id: vault::digest(&super::super::enrollment::random_bytes()),
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
     let exhausted = is_exhausted(&token);
+    if included_only && token.billing_class != Some(api::BillingClass::RateLimited) {
+        bail!(
+            "server account {} no longer has verified included billing",
+            account.alias
+        );
+    }
     if !allow_billing {
         require_headroom(&account.alias, &token)?;
     }
@@ -381,6 +434,7 @@ pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLa
         lease,
         alias: account.alias.clone(),
         codex_args,
+        signals,
     })
 }
 
@@ -388,20 +442,20 @@ pub fn prepare_pinned_codex(alias: &str, allow_billing: bool) -> Result<PinnedLa
 /// Does not activate a provider, change the host pointer, or redeem resets.
 pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
     let args = pinned_arguments(args)?;
-    let signals = LaunchSignals::register()?;
-    let launch = prepare_pinned_codex(alias, allow_billing)?;
+    let launch = prepare_pinned_codex(alias, allow_billing, false)?;
     let mut command = std::process::Command::new("codex");
     command
         .args(launch.codex_args())
         .args(args)
         .env("CODEXCTL_PINNED_ALIAS", launch.alias());
-    if signals.received() != 0 {
+    let signal = launch.received_signal();
+    if signal != 0 {
         launch.close()?;
-        return Ok(128 + signals.received());
+        return Ok(128 + signal);
     }
     let mut child = spawn_child_with_lease(&launch.lease, &mut command)?;
     loop {
-        let signal = signals.received();
+        let signal = launch.received_signal();
         if signal != 0 {
             // Revoke approval before forwarding the signal, even if Codex ignores it.
             let cleanup = launch.close();

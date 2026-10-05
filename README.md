@@ -208,8 +208,12 @@ never selected automatically. The selected account is pinned to this child, so
 starting a new lane does not move existing sessions on the machine. If Codex stops after `exceeded retry limit, last
 status: 429`, codexctl resumes the same session on the next least-loaded included
 account, up to three recoveries per hour. A recovery keeps the original model,
-permissions, working directory, and other arguments. It never redeems a reset or
-uses a credit-billing account without `--allow-billing`.
+permissions, working directory, and other arguments. Automatic selection and
+429 recovery never redeem resets or select credit-billing accounts, even with
+`--allow-billing` or `--allow-resets`. Explicit `--account` keeps its billing policy.
+If selection has no fresh included account, codexctl warns and launches the current
+account through the existing provider. This fallback keeps that account's existing
+approval; it does not grant new billing approval or redeem a reset.
 
 ### Pinned launches
 

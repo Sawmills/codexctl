@@ -66,7 +66,7 @@ pub struct Account {
     pub usage_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub statusline_usage: Option<crate::statusline::Usage>,
-    /// Number of machines that received this account's token recently.
+    /// Number of launch sessions that received this account's token recently.
     #[serde(default)]
     pub live_sessions: usize,
     /// Recent 429 ratio reported by a client, when available.
@@ -1246,8 +1246,9 @@ async fn token(
         .get("x-codexctl-session")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.is_empty())
-        .unwrap_or(&device.id)
-        .to_owned();
+        .unwrap_or("default");
+    // A client-supplied launch ID is unique only within its authenticated machine.
+    let session_id = format!("{}:{}:{session_id}", device.id.len(), device.id);
     broker
         .activity
         .delivered(&device, alias.clone(), session_id.clone());
@@ -1390,11 +1391,23 @@ pub(super) async fn account_catalog(
                 .activity
                 .live_sessions(&user, &summary.alias, 10 * 60);
             if let Some(central) = broker.central.as_ref()
-                && let Ok(count) = central
+                && central.mode() != super::storage::StoreMode::File
+            {
+                match central
                     .live_session_count(&key, std::time::Duration::from_secs(10 * 60))
                     .await
-            {
-                summary.live_sessions = summary.live_sessions.max(count);
+                {
+                    Ok(count) => summary.live_sessions = count,
+                    Err(error) => {
+                        broker.record_failure(
+                            "live_session_failed",
+                            "live_session",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                        eprintln!("central live session count: {error:#}");
+                        summary.usage_stale = true;
+                    }
+                }
             }
             summary
         })

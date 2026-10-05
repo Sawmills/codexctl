@@ -20,7 +20,7 @@ mod launch;
 #[cfg(feature = "central-prototype")]
 pub use launch::pinned_arguments;
 pub(super) use launch::sweep_stale_launches;
-pub use launch::{PinnedLaunch, launch_owners, prepare_pinned_codex, run_pinned_codex};
+pub use launch::{PinnedLaunch, launch_owners, prepare_included_codex, run_pinned_codex};
 
 pub(super) const PROVIDER: &str = "codexctl-central";
 const ACTIVE_POINTER: &str = ".active-account";
@@ -695,8 +695,7 @@ fn spawn_child_with_lease(
     command.spawn().context("Codex process failed to run")
 }
 
-/// Launch the active server account without restoring a resumed thread's old provider.
-/// Local account launches remain the caller's responsibility.
+/// Whether this home's active provider is the account server.
 pub fn central_active() -> Result<bool> {
     let paths = config::default_paths()?;
     let marker = paths.codexctl_dir().join("central/.native-active.json");
@@ -709,6 +708,8 @@ pub fn central_active() -> Result<bool> {
         == Some(PROVIDER))
 }
 
+/// Launch the active server account without restoring a resumed thread's old provider.
+/// Local account launches remain the caller's responsibility.
 pub fn run_codex(args: &[String]) -> Result<Option<i32>> {
     use std::os::unix::process::ExitStatusExt;
     let paths = config::default_paths()?;

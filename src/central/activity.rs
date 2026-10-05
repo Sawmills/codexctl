@@ -16,13 +16,16 @@ pub(super) struct Activity {
 impl Activity {
     pub(super) fn delivered(&self, device: &Device, alias: String, session_id: String) {
         let seen_at = chrono::Utc::now().timestamp();
-        self.entries.lock().expect("machine activity lock").insert(
+        let mut entries = self.entries.lock().expect("machine activity lock");
+        entries.retain(|_, entry| entry.seen_at >= seen_at.saturating_sub(10 * 60));
+        entries.insert(
             (device.user.clone(), session_id),
             LastUse {
                 alias: alias.clone(),
                 seen_at,
             },
         );
+        drop(entries);
         self.devices.lock().expect("machine activity lock").insert(
             (device.user.clone(), device.id.clone()),
             LastUse { alias, seen_at },

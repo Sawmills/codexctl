@@ -1535,7 +1535,7 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .execute(
-                "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen,deleted_at) VALUES($1,$2,$3,$4,now(),NULL) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen,deleted_at=NULL",
+                "INSERT INTO account_live_sessions(account_id,user_id,alias,device_id,last_seen,deleted_at) VALUES($1,$2,$3,$4,now(),NULL) ON CONFLICT(account_id,device_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,last_seen=EXCLUDED.last_seen WHERE account_live_sessions.deleted_at IS NULL",
                 &[&account_id, &user_id, &alias, &device_id],
             )
             .await?;
@@ -1708,26 +1708,6 @@ pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn live_session_schema_uses_logical_delete_scope_without_cascade() {
-        let table = SCHEMA
-            .split("CREATE TABLE IF NOT EXISTS account_live_sessions")
-            .nth(1)
-            .and_then(|tail| {
-                tail.split("CREATE TABLE IF NOT EXISTS enrollment_challenges")
-                    .next()
-            })
-            .expect("live-session schema");
-        assert!(table.contains("deleted_at TIMESTAMPTZ"));
-        assert!(table.contains("FOREIGN KEY (account_id) REFERENCES central_accounts(account_id)"));
-        assert!(!table.contains("ON DELETE CASCADE"));
-        assert!(
-            SCHEMA.contains(
-                "ON account_live_sessions (account_id, last_seen) WHERE deleted_at IS NULL"
-            )
-        );
-    }
 
     fn record(id: &str, revision: i64) -> CredentialRecord {
         CredentialRecord {
@@ -1922,6 +1902,52 @@ mod tests {
             vault::digest(&crate::central::enrollment::random_bytes())
         );
         first.save_account(&record(&id, 1)).await.unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-b")
+            .await
+            .unwrap();
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .live_session_count(&id, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            2
+        );
+        if let CentralStore::Postgres(db) = &first {
+            assert!(
+                db.client()
+                    .await
+                    .unwrap()
+                    .execute("DELETE FROM central_accounts WHERE account_id=$1", &[&id])
+                    .await
+                    .is_err(),
+                "session rows must not cascade-delete with their account"
+            );
+            db.client().await.unwrap().execute(
+                "UPDATE account_live_sessions SET deleted_at=now() WHERE account_id=$1 AND device_id='launch-a'",
+                &[&id],
+            ).await.unwrap();
+        }
+        first
+            .record_live_session(&id, "user", "seat", "launch-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .live_session_count(&id, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1,
+            "a routine heartbeat must not restore a tombstoned session"
+        );
         let (a, b) = tokio::join!(
             first.acquire_lease(&id, "a", Duration::from_secs(60)),
             second.acquire_lease(&id, "b", Duration::from_secs(60))
@@ -2029,6 +2055,13 @@ mod tests {
             client
                 .execute(
                     "DELETE FROM account_refresh_leases WHERE account_id=$1",
+                    &[&id],
+                )
+                .await
+                .unwrap();
+            client
+                .execute(
+                    "DELETE FROM account_live_sessions WHERE account_id=$1",
                     &[&id],
                 )
                 .await

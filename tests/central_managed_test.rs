@@ -6638,6 +6638,7 @@ fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
             statusline_usage: None,
             live_sessions,
             recent_429_rate,
+            credits: None,
         }
     };
 
@@ -7141,6 +7142,30 @@ fn automatic_reset_attempt(
         )
         .unwrap();
     }
+    let bin = home.path().join("bin");
+    if matches!(fence, Some("codex" | "codex-stale")) {
+        use std::os::unix::fs::PermissionsExt;
+        store::atomic_write(
+            &directory.join(".native-active.json"),
+            &serde_json::to_vec(
+                &json!({"home":home.path().join(".codex"),"original_provider":null}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        store::atomic_write(
+            &home.path().join(".codex/config.toml"),
+            b"model_provider = 'codexctl-central'\n",
+        )
+        .unwrap();
+        store::atomic_write(
+            &bin.join("codex"),
+            b"#!/bin/sh\nprintf 'current account launched\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+    }
     let received = Arc::new(Mutex::new(Vec::<Value>::new()));
     let requests = received.clone();
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -7156,7 +7181,7 @@ fn automatic_reset_attempt(
         .unwrap(),
     )
     .unwrap();
-    let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":false});
+    let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":fence == Some("codex-stale")});
     let token_auth = auth("synthetic-login", "synthetic-seat");
     let token = json!({"userId":"synthetic-user","accessToken":token_auth["tokens"]["access_token"],"chatgptAccountId":"synthetic-seat","chatgptPlanType":plan,"revision":"synthetic-revision","billingClass":"unknown","nativeRoutingSupported":true});
     let token_calls = Arc::new(Mutex::new(0));
@@ -7190,8 +7215,13 @@ fn automatic_reset_attempt(
                 .unwrap();
         })
     });
+    let child_path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .env("HOME", home.path())
+        .env("PATH", child_path)
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -8435,11 +8465,17 @@ struct B21Lane {
 
 impl B21Lane {
     fn start(home: &std::path::Path, name: &str) -> Self {
+        Self::start_with_mode(home, name, false)
+    }
+
+    fn start_with_mode(home: &std::path::Path, name: &str, automatic: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let bin = home.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         store::atomic_write(&bin.join("codex"), br#"#!/usr/bin/env python3
-import json, os, pathlib, sys, time
+import json, os, pathlib, signal, sys, time
+if os.environ.get('B29_IGNORE_HUP') == '1':
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 for arg in sys.argv:
     prefix = 'model_providers.codexctl-central.auth.args='
     if arg.startswith(prefix):
@@ -8456,10 +8492,18 @@ while True: time.sleep(0.1)
         )
         .unwrap();
         let mut launcher = Command::new(env!("CARGO_BIN_EXE_codexctl"))
-            .args(["codex", "--account", "lane", "--allow-billing", "a prompt"])
+            .args(if automatic {
+                vec!["codex", "a prompt"]
+            } else {
+                vec!["codex", "--account", "lane", "--allow-billing", "a prompt"]
+            })
             .env("HOME", home)
             .env("PATH", path)
             .env("B21_READY", &ready)
+            .env(
+                "B29_IGNORE_HUP",
+                if name == "orphan-lease" { "1" } else { "0" },
+            )
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -9112,4 +9156,229 @@ fn dashboard_review_landing_readiness_matches_ready_endpoint() {
             }
         }
     }
+}
+
+#[test]
+fn b29_automatic_launch_rejects_overrides_before_token_delivery() {
+    let server = Server::start();
+    server.import(&server.amir, "host", "login", "seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let catalog = || {
+        server
+            .http
+            .get(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .send()
+            .unwrap()
+            .json::<Value>()
+            .unwrap()
+    };
+    let before = catalog()[0]["liveSessions"].clone();
+    for args in [
+        vec!["codex", "resume", "--last", "-c", "model_provider=other"],
+        vec!["codex", "--profile", "work"],
+    ] {
+        let output = server.cli(home.path(), &args);
+        assert!(!output.status.success());
+        assert_eq!(
+            catalog()[0]["liveSessions"],
+            before,
+            "rejected arguments must not prepare a launch or deliver a token"
+        );
+    }
+}
+
+#[test]
+fn b29_catalog_counts_launches_and_scopes_session_ids_to_machines() {
+    let server = Server::start();
+    server.import(&server.amir, "seat", "login", "workspace");
+    let other_file = server.root.path().join("other.token");
+    central::register(
+        &server.root.path().join("state"),
+        "other-machine",
+        "sawmills",
+        "amir",
+        &other_file,
+    )
+    .unwrap();
+    let other = std::fs::read_to_string(other_file).unwrap();
+    for (token, session) in [
+        (&server.amir, "a"),
+        (&server.amir, "b"),
+        (&server.amir, "a"),
+        (&other, "a"),
+    ] {
+        assert_eq!(
+            server
+                .http
+                .post(format!("{}/v1/token", server.url))
+                .bearer_auth(token)
+                .header("x-codexctl-session", session)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    assert_eq!(server.accounts(&server.amir)[0]["liveSessions"], 3);
+}
+
+#[test]
+fn b29_automatic_signals_remove_launch_approval_and_reap_child() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "login", "seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "lane"]).status.success());
+    for signal in [libc::SIGHUP, libc::SIGTERM] {
+        let mut lane = B21Lane::start_with_mode(home.path(), &format!("automatic-{signal}"), true);
+        let status = lane.signal_and_wait(signal);
+        assert!(
+            !lane.connection.parent().unwrap().exists(),
+            "signal left launch approval behind"
+        );
+        assert_eq!(status.code(), Some(128 + signal));
+        assert_ne!(
+            unsafe { libc::kill(lane.child_pid, 0) },
+            0,
+            "child was not reaped"
+        );
+    }
+}
+
+#[test]
+fn b29_automatic_recovery_keeps_arguments_and_closes_each_private_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let pointer = home.path().join(".codexctl/central/.active-account");
+    let before = std::fs::read(&pointer).unwrap();
+    let bin = home.path().join("bin/codex");
+    store::atomic_write(&bin, br#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+args = sys.argv[1:]
+for arg in args:
+    prefix = 'model_providers.codexctl-central.auth.args='
+    if arg.startswith(prefix):
+        helper = json.loads(arg[len(prefix):])
+        connection = pathlib.Path(helper[helper.index('--connection') + 1])
+record = {'args': args, 'connection': str(connection), 'alias': json.loads(connection.read_text())['alias']}
+log = pathlib.Path(os.environ['HOME']) / 'launches.json'
+prior = json.loads(log.read_text()) if log.exists() else []
+assert all(not pathlib.Path(row['connection']).exists() for row in prior)
+log.write_text(json.dumps(prior + [record]))
+if not prior:
+    print('To continue, run codex resume 019e8489-aa28-7071-ab90-16b81c7cfd1d', flush=True)
+    print('\u2502 exceeded retry limit, last status: 429 \u2502', flush=True)
+    time.sleep(30)
+else:
+    print('recovered', flush=True)
+"#).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin.parent().unwrap().to_path_buf())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .args([
+            "codex",
+            "resume",
+            "019e8489-aa28-7071-ab90-16b81c7cfd1d",
+            "-c",
+            "model=synthetic",
+        ])
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("recovered"));
+    let launches: Value =
+        serde_json::from_slice(&std::fs::read(home.path().join("launches.json")).unwrap()).unwrap();
+    assert_eq!(launches.as_array().unwrap().len(), 2);
+    assert_eq!(launches[0]["alias"], "lane");
+    assert_eq!(launches[1]["alias"], "host");
+    for launch in launches.as_array().unwrap() {
+        assert!(!std::path::Path::new(launch["connection"].as_str().unwrap()).exists());
+        let args = launch["args"].as_array().unwrap();
+        let resume = args.iter().position(|arg| arg == "resume").unwrap();
+        assert_eq!(args[resume + 1], "019e8489-aa28-7071-ab90-16b81c7cfd1d");
+        assert!(args[..resume].iter().any(|arg| arg == "model=synthetic"));
+        assert!(!args[resume..].iter().any(|arg| arg == "-c"));
+        assert!(
+            args[..resume]
+                .iter()
+                .any(|arg| arg == "model_provider=\"codexctl-central\"")
+        );
+    }
+    assert_eq!(std::fs::read(pointer).unwrap(), before);
+}
+
+#[test]
+fn b29_fallback_warns_and_never_redeems_a_reset() {
+    for (used, fence) in [(100.0, "codex"), (20.0, "codex-stale")] {
+        let (resets, output) = automatic_reset_attempt(
+            &["codex", "--allow-billing", "--allow-resets"],
+            "pro",
+            used,
+            Some(fence),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("using the current account"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("current account launched"));
+        assert_eq!(resets, 0);
+    }
+}
+
+#[test]
+fn b29_automatic_selection_does_not_approve_new_billing() {
+    let (resets, output) = automatic_reset_attempt(
+        &["codex", "--allow-billing", "--allow-resets"],
+        "pro",
+        20.0,
+        Some("codex"),
+    );
+    assert!(
+        !output.status.success(),
+        "automatically approved a token with unknown billing"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("current account launched"));
+    assert_eq!(resets, 0);
+}
+
+#[test]
+fn b29_automatic_child_retains_mode_lease_if_launcher_is_killed() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "login", "seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "lane"]).status.success());
+    let mut lane = B21Lane::start_with_mode(home.path(), "orphan-lease", true);
+    lane.signal_and_wait(libc::SIGKILL);
+    assert_eq!(unsafe { libc::kill(lane.child_pid, 0) }, 0);
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.path().join(".codexctl/central/mode.lock"))
+        .unwrap();
+    assert!(
+        matches!(lease.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        "a surviving child must still block mode changes"
+    );
 }
