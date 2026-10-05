@@ -2013,6 +2013,30 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         {
             continue;
         }
+        let central = broker.central.clone();
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
+        let lease = if let Some(central) = central.as_ref() {
+            if let Err(error) = broker.ensure_owner_record(&mut owner).await {
+                eprintln!("central background owner record: {error:#}");
+                continue;
+            }
+            match central
+                .acquire_lease(
+                    &account_id,
+                    &broker.holder_id,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    eprintln!("central background owner lease: {error:#}");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(mut rpc) = owner.rpc.take() {
             // `process_exited` reaps a failed startup child. Do not wait on a
             // child that is already dead; a live unhealthy child still gets
@@ -2030,11 +2054,15 @@ async fn recover_unhealthy_owners(broker: &Broker) {
         {
             Ok(proof) => proof,
             Err(error) => {
+                if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
+                    let _ = central.release_lease(lease).await;
+                }
                 owner.retryable_unavailable = false;
                 eprintln!("central background owner identity fence: {error:#}");
                 continue;
             }
         };
+        let before = owner.vault.clone();
         match launch_owner(&mut owner, &broker.binary, proof).await {
             Ok(()) => {
                 // Launching proves only that a child exists. Keep the owner
@@ -2049,15 +2077,49 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         ..Default::default()
                     })
                     .await;
-                match probe {
-                    Ok(_) => {
+                let auth_changed = owner.vault.auth != before.auth;
+                if auth_changed {
+                    owner.vault.revision = before.revision.saturating_add(1).max(1);
+                    if let Err(error) = vault::save(&owner.state, &owner.key, &owner.vault) {
+                        owner.available = false;
+                        owner.refresh_enabled = false;
+                        owner.retryable_unavailable = false;
+                        eprintln!("central background owner vault save: {error:#}");
+                    }
+                }
+                let written =
+                    if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
+                        match Broker::owner_record(&owner) {
+                            Ok(record) => match central.fenced_write(lease, &record).await {
+                                Ok(written) => written,
+                                Err(error) => {
+                                    eprintln!("central background owner fenced write: {error:#}");
+                                    false
+                                }
+                            },
+                            Err(error) => {
+                                eprintln!("central background owner record: {error:#}");
+                                false
+                            }
+                        }
+                    } else {
+                        true
+                    };
+                match (probe, written) {
+                    (Ok(_), true) => {
                         owner.available = true;
                         owner.retryable_unavailable = false;
                         owner.retry_requires_billing = false;
                         owner.retry_started = None;
                         owner.retry_failures = 0;
                     }
-                    Err(TokenFailure::Retryable(error)) => {
+                    (Ok(_), false) => {
+                        owner.available = false;
+                        owner.routing_refused = true;
+                        owner.refresh_enabled = false;
+                        owner.retryable_unavailable = false;
+                    }
+                    (Err(TokenFailure::Retryable(error)), true) => {
                         owner.available = false;
                         owner.refresh_enabled = false;
                         owner.retryable_unavailable = owner.vault.verified;
@@ -2067,12 +2129,18 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         }
                         eprintln!("central background owner probe failed: {error:#}");
                     }
-                    Err(_error) => {
+                    (Err(_error), true) => {
                         owner.available = false;
                         owner.refresh_enabled = false;
                         owner.retryable_unavailable = false;
                         owner.retry_started = None;
                         eprintln!("central background owner probe refused");
+                    }
+                    (Err(_), false) => {
+                        owner.available = false;
+                        owner.routing_refused = true;
+                        owner.refresh_enabled = false;
+                        owner.retryable_unavailable = false;
                     }
                 }
             }
@@ -2084,6 +2152,9 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 }
                 eprintln!("central background owner recovery failed: {error:#}");
             }
+        }
+        if let (Some(central), Some(lease)) = (central.as_ref(), lease.as_ref()) {
+            let _ = central.release_lease(lease).await;
         }
     }
 }

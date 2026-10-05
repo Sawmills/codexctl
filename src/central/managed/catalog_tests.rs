@@ -738,7 +738,7 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
         return;
     }
     let mut fixture = Fixture::new(Duration::from_secs(2)).await;
-    let _central = fixture
+    let central = fixture
         .attach_refresh_store_with_mode(super::super::storage::StoreMode::Postgres, "rpc-unhealthy")
         .await;
 
@@ -761,6 +761,12 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
         owner.available = true;
     }
     assert_eq!(fixture.token().await, StatusCode::OK);
+    let committed = central
+        .load_account(&account_key("test", "fixture"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.vault["revision"], committed.revision);
 }
 
 #[tokio::test]
