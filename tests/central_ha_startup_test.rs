@@ -592,3 +592,173 @@ fn account_key(user: &str, alias: &str) -> String {
         Sha256::digest(format!("{user}\0{alias}").as_bytes())
     )
 }
+
+#[tokio::test]
+async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
+    let Ok(database) = std::env::var("DATABASE_URL") else {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        eprintln!("skipping real PostgreSQL startup test: DATABASE_URL unset");
+        return;
+    };
+    let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let schema = format!(
+        "startup_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    control
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut database = reqwest::Url::parse(&database).unwrap();
+    database
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    central::managed::setup(&state, &key).unwrap();
+    store::atomic_write(
+        &state.join("users.json"),
+        &serde_json::to_vec(&json!([
+            {"id":"test","email":"test@example.invalid","enabled":true}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let token_file = root.path().join("machine-token");
+    central::register(&state, "test-machine", "sawmills", "test", &token_file).unwrap();
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+
+    for operation in ["migrate", "backfill"] {
+        let output = command(database.as_str(), &state, &key, operation)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let mut importer = Pod::start(database.as_str(), &key).await;
+    let mut peer = Pod::start(database.as_str(), &key).await;
+    let auth = |account: &str| {
+        let claims = json!({"sub":account,"iat":2000000000_u64,"exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_plan_type":"pro"}});
+        json!({"tokens":{"access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),
+            "refresh_token":"synthetic-refresh","account_id":account}})
+    };
+    store::atomic_write(&importer.root.path().join("mode"), b"startup-hold").unwrap();
+    let importing = http
+        .post(format!("{}/v1/accounts", importer.url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"seat","auth":auth("synthetic-seat")}))
+        .send();
+    let during_import = async {
+        timeout(Duration::from_secs(5), async {
+            while !importer.root.path().join("initialize-started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let leases: i64 = control
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM {schema}.account_refresh_leases WHERE expires_at > now()"
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(leases, 1, "import initialization must hold a lease");
+        let contender = request(&http, &peer, &token).await;
+        assert_eq!(contender.status(), 503);
+        assert_eq!(peer.launches(), 0);
+        store::atomic_write(&importer.root.path().join("release-initialize"), b"go").unwrap();
+    };
+    let (imported, ()) = tokio::join!(importing, during_import);
+    assert_eq!(imported.unwrap().status(), 200);
+    assert!(
+        importer.root.path().join("exited").exists(),
+        "import released its lease with a live refresh child"
+    );
+    let successor = request(&http, &peer, &token).await;
+    assert_eq!(successor.status(), 200);
+    assert_eq!(generation(&successor.json::<Value>().await.unwrap()), 3);
+
+    std::fs::remove_file(importer.root.path().join("exited")).unwrap();
+    store::atomic_write(&importer.root.path().join("mode"), b"startup-error").unwrap();
+    let failed = http
+        .post(format!("{}/v1/accounts", importer.url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"failed","auth":auth("failed-seat")}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 503);
+    timeout(Duration::from_secs(5), async {
+        while !importer.root.path().join("exited").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed import must stop its refresh child");
+    let retried = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = http
+                .post(format!("{}/v1/accounts", peer.url))
+                .bearer_auth(&token)
+                .json(&json!({"alias":"failed","auth":auth("failed-seat")}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 200 {
+                break response;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("failed import kept its lease after settlement");
+    assert_eq!(retried.status(), 200);
+    let recovered = http
+        .post(format!("{}/v1/token", peer.url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"failed","billing":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), 200);
+    assert_eq!(
+        generation(&recovered.json::<Value>().await.unwrap()),
+        4,
+        "failed import must persist initialization rotation before retry"
+    );
+    importer.stop().await;
+    peer.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    drop(control);
+    connection.await.unwrap();
+}
