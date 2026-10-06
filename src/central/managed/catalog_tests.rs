@@ -602,6 +602,7 @@ async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() 
     fixture
         .broker
         .import_account(
+            fixture.broker.work.clone().acquire_owned().await.unwrap(),
             "test",
             Import {
                 alias: "fixture".into(),
@@ -686,6 +687,7 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
         fixture
             .broker
             .import_account(
+                fixture.broker.work.clone().acquire_owned().await.unwrap(),
                 "test",
                 Import {
                     alias: "fixture".into(),
@@ -734,6 +736,57 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_import_waiting_for_admission_does_not_leave_detached_work() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    let occupied = fixture
+        .broker
+        .work
+        .clone()
+        .acquire_many_owned(128)
+        .await
+        .unwrap();
+    let mut request = Box::pin(import(
+        State(fixture.broker.clone()),
+        fixture.headers.clone(),
+        Ok(Json(Import {
+            alias: "fixture".into(),
+            label: None,
+            auth,
+        })),
+    ));
+    assert!(futures::poll!(&mut request).is_pending());
+    tokio::task::yield_now().await;
+    // Disconnect before admission, then release the entire work gate. A task
+    // spawned before admission would remain queued and run after disconnect.
+    drop(request);
+    drop(occupied);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(2),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !fixture
+            .broker
+            .failures
+            .lock()
+            .unwrap()
+            .contains_key("verification_requires_refresh"),
+        "an import that disconnected before admission must not reach import_account"
+    );
+    drop(drained);
 }
 
 async fn list(broker: Broker, headers: HeaderMap) -> Value {

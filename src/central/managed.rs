@@ -1505,11 +1505,19 @@ async fn import(
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_label"))?;
     vault::validate_auth(&input.auth)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_auth"))?;
-    // Import commits continue on disconnect. The client can safely retry the same identity.
-    let worker = broker.clone();
-    let result = tokio::spawn(async move { worker.import_account(&device.user, input).await })
+    // Only admitted imports continue on disconnect. Waiting handlers retain no
+    // detached task; settlement can inherit this same permit after admission.
+    let permit = broker
+        .work
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "import_unavailable"))??;
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
+    let worker = broker.clone();
+    let result =
+        tokio::spawn(async move { worker.import_account(permit, &device.user, input).await })
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "import_unavailable"))??;
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
@@ -1537,13 +1545,12 @@ impl Broker {
         Ok(owner)
     }
 
-    async fn import_account(&self, user: &str, mut input: Import) -> Result<Account, HttpError> {
-        let permit = self
-            .work
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
+    async fn import_account(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        user: &str,
+        mut input: Import,
+    ) -> Result<Account, HttpError> {
         input.alias = normalize_alias(&input.alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
             .to_owned();
@@ -3272,6 +3279,7 @@ mod tests {
         let claims = json!({"sub":"synthetic-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
         let auth = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh","account_id":"synthetic-seat"}});
         let mut imported = Box::pin(broker.import_account(
+            broker.work.clone().acquire_owned().await.unwrap(),
             "test-user",
             Import {
                 alias: "personal".into(),
