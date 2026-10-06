@@ -882,7 +882,10 @@ fn server_add_refusals_clear_the_client_receipt_and_never_fall_back_to_local_log
     let refused = server.cli(home.path(), &["login", "taken", "--no-browser"]);
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
-    assert!(!receipt.exists(), "a refused start must not wedge the alias");
+    assert!(
+        !receipt.exists(),
+        "a refused start must not wedge the alias"
+    );
 
     server.stop();
     let offline = server.cli(home.path(), &["login", "new-account", "--no-browser"]);
