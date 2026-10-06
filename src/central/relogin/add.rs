@@ -84,11 +84,24 @@ fn device_active(broker: &Broker, id: &str) -> bool {
 /// relaunch each verified owner it fenced through the restore clearance; any
 /// other evidence keeps that owner fenced.
 async fn release(broker: &Broker, guard: &tokio::sync::MutexGuard<'_, ()>, grant: &Value) {
+    if broker.read_only
+        || broker.stopping.load(Ordering::Acquire)
+        || broker.ownership_unresolved.load(Ordering::Acquire)
+    {
+        return;
+    }
     let owners = broker.owners.read().await.clone();
     for (_, owner) in owners.values() {
         let mut owner = owner.lock().await;
+        // An owner with its own unfinished or failed renewal stays fenced
+        // for that reason, whatever happened to this grant.
+        let own_login = current(&owner.state).map_or(true, |r| {
+            r.is_some_and(|r| r.phase != Phase::Completed && !r.retired)
+        });
         if owner.available
             || owner.rpc.is_some()
+            || !owner.refresh_enabled
+            || own_login
             || !owner.vault.verified
             || owner.routing_refused
             || owner.retryable_unavailable
@@ -131,6 +144,13 @@ async fn view(broker: &Broker, state: &Path, mut record: Record) -> Result<Recor
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
     record.phase = renewal.phase;
     record.error = renewal.error;
+    // A landed renewal that stopped with an error is retried through the
+    // alias it landed on, never through this add operation.
+    let stalled = record.error.is_some() && !live(broker, state, &record.id);
+    if record.phase == Phase::Failed || (stalled && !terminal(&record.phase)) {
+        record.phase = Phase::Failed;
+        record.error = Some("landed_renewal_failed".into());
+    }
     if terminal(&record.phase) {
         save(state, &record)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;

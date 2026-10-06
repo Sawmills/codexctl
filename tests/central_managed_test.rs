@@ -988,6 +988,64 @@ fn server_add_saved_grant_releases_on_refusal_and_on_device_revocation() {
     server.await_add(&desktop, "orphan", &next, "canceled");
 }
 
+#[test]
+fn server_add_landing_that_fails_verification_names_the_alias_to_renew() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let id = "a9".repeat(32);
+    server.add_request(&server.amir, "start", "duplicate", &id, None);
+    server.release_login("amir-login", "amir-seat");
+    let failed = server.await_add(&server.amir, "duplicate", &id, "failed");
+    assert_eq!(failed["error"], "landed_renewal_failed");
+    assert_eq!(failed["landedAlias"], "personal");
+    // The landed alias retries through its own renewal.
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let retry = "b9".repeat(32);
+    server.login_request(&server.amir, "start", "personal", &retry);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.token(&server.amir, "personal", None).status() != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "personal never recovered"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn server_add_receipt_from_an_earlier_registration_does_not_block_the_alias() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let receipt = home
+        .path()
+        .join(format!(".codexctl/central/.login-{}.json", digest("team")));
+    store::atomic_write(
+        &receipt,
+        &serde_json::to_vec(&json!({
+            "server":"https://old.example.invalid","userId":"amir","alias":"team",
+            "id":"c9".repeat(32),"kind":"add","label":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    server.release_login("team-login", "team-seat");
+    let added = server.cli(home.path(), &["login", "team", "--no-browser"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(String::from_utf8_lossy(&added.stdout).contains("Server account added"));
+    assert!(!receipt.exists());
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

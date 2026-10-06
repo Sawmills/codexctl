@@ -101,7 +101,11 @@ pub fn login(
     };
     // A pending add resumes before catalog routing: after a lost completion the
     // alias is already in the catalog, and renewal would start a second login.
-    if login_receipt(alias)?.is_some_and(|saved| saved["kind"] == "add") {
+    if login_receipt(alias)?.is_some_and(|saved| {
+        saved["kind"] == "add"
+            && saved["server"] == connection.server
+            && saved["userId"] == connection.user_id
+    }) {
         if local {
             bail!(
                 "a server account login for {alias} is pending; finish it or run codexctl login {alias} --cancel"
@@ -234,7 +238,19 @@ fn server_login(
             .map(str::to_owned),
         None => None,
     };
-    let mut id = if let Some(saved) = login_receipt(alias)? {
+    let mut saved = login_receipt(alias)?;
+    if saved.as_ref().is_some_and(|saved| {
+        saved["kind"] == "add"
+            && (saved["server"] != connection.server || saved["userId"] != connection.user_id)
+    }) {
+        // An add receipt holds no credential; its operation belongs to a
+        // registration this machine no longer has and cannot reach.
+        eprintln!("warning: discarding a pending add for {alias} from an earlier registration");
+        std::fs::remove_file(&path)?;
+        store::sync_directory(&directory)?;
+        saved = None;
+    }
+    let mut id = if let Some(saved) = saved {
         if saved["server"] != connection.server
             || saved["userId"] != connection.user_id
             || !saved["alias"]
@@ -446,6 +462,14 @@ fn server_login(
                     }
                     Some("alias_identity_conflict") => {
                         "this OpenAI login conflicts with a retained server account; no account was added"
+                    }
+                    Some("landed_renewal_failed") => {
+                        let landed = status["landedAlias"]
+                            .as_str()
+                            .unwrap_or("the existing account");
+                        bail!(
+                            "this OpenAI account is already server account {landed}, and its renewal did not verify. Run codexctl login {landed} to retry"
+                        );
                     }
                     Some("relogin_reserved") => {
                         "another login operation reserves this OpenAI account; no account was added"
