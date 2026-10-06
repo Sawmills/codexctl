@@ -574,12 +574,15 @@ Rules:
 - A loan pauses (`loan_paused`) while the lender is disabled or the lender's
   login differs from the login at grant time. A removed lender alias ends it.
 - Both parties can read the audit log: grant, token issue (one event per
-  machine and hour), end, expiry, and pause. The server deletes ended loans and
+  machine and hour), end, expiry, and pause. `codexctl loans audit` shows the
+  newest events first, one page at a time; when older events exist it prints
+  the `--before` value for the next page. The server deletes ended loans and
   audit events after 90 days.
 
 Loans work in file, PostgreSQL, and dual storage. File mode keeps them in the
 encrypted `central-storage.enc`; an older server binary that rewrites that file
-drops them, so a rollback ends every loan.
+drops them, so a rollback ends every loan. The PostgreSQL backfill copies
+file-mode loans with their audit events, once.
 
 ## Run the Server
 

@@ -118,15 +118,20 @@ pub fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a full loan ID or an unambiguous prefix shown by `loans list`.
+fn resolve(id: &str) -> Result<Grant> {
+    let grants: Vec<Grant> = serde_json::from_value(get("/v1/loans")?)?;
+    let mut matches = grants.into_iter().filter(|g| g.id.starts_with(id));
+    match (matches.next(), matches.next()) {
+        (Some(grant), None) => Ok(grant),
+        (None, _) => bail!("no loan with ID {id}"),
+        (Some(_), Some(_)) => bail!("loan ID {id} is ambiguous; use more characters"),
+    }
+}
+
 /// End a loan by ID or by an unambiguous ID prefix from `codexctl loans list`.
 pub fn end(id: &str) -> Result<()> {
-    let grants: Vec<Grant> = serde_json::from_value(get("/v1/loans")?)?;
-    let matches: Vec<_> = grants.iter().filter(|g| g.id.starts_with(id)).collect();
-    let grant = match matches.as_slice() {
-        [grant] => grant,
-        [] => bail!("no loan with ID {id}"),
-        _ => bail!("loan ID {id} is ambiguous; use more characters"),
-    };
+    let grant = resolve(id)?;
     let ended: Grant = serde_json::from_value(post("/v1/loans/end", json!({"id": grant.id}))?)?;
     println!(
         "Loan of {} ended ({}).",
@@ -139,17 +144,34 @@ pub fn end(id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn audit(id: Option<&str>, json: bool) -> Result<()> {
-    let path = match id {
-        Some(id) => format!("/v1/loans/audit?id={id}"),
-        None => "/v1/loans/audit".into(),
+/// Show one page of audit events, newest first.
+pub fn audit(
+    id: Option<&str>,
+    before: Option<i64>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let mut query = Vec::new();
+    if let Some(id) = id {
+        query.push(format!("id={}", resolve(id)?.id));
+    }
+    if let Some(before) = before {
+        query.push(format!("before={before}"));
+    }
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    let path = if query.is_empty() {
+        "/v1/loans/audit".to_owned()
+    } else {
+        format!("/v1/loans/audit?{}", query.join("&"))
     };
     let value = get(&path)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
-    let events: Vec<AuditEvent> = serde_json::from_value(value)?;
+    let events: Vec<AuditEvent> = serde_json::from_value(value["events"].clone())?;
     if events.is_empty() {
         println!("No loan events.");
         return Ok(());
@@ -171,6 +193,9 @@ pub fn audit(id: Option<&str>, json: bool) -> Result<()> {
         ]);
     }
     println!("{table}");
+    if let Some(before) = value["before"].as_i64() {
+        println!("Older events exist: codexctl loans audit --before {before}");
+    }
     Ok(())
 }
 
@@ -193,9 +218,15 @@ pub enum LoansAction {
     },
     /// End a loan, as the lender or the borrower.
     End { id: String },
-    /// Show the audit events of your loans.
+    /// Show the audit events of your loans, newest first.
     Audit {
         id: Option<String>,
+        /// Show events recorded before this cursor from the previous page.
+        #[arg(long)]
+        before: Option<i64>,
+        /// Events per page (default 1000, at most 10000).
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -206,6 +237,11 @@ pub fn run(action: LoansAction) -> Result<()> {
         LoansAction::Lend { alias, to, until } => lend(&alias, &to, until.as_deref()),
         LoansAction::List { json } => list(json),
         LoansAction::End { id } => end(&id),
-        LoansAction::Audit { id, json } => audit(id.as_deref(), json),
+        LoansAction::Audit {
+            id,
+            before,
+            limit,
+            json,
+        } => audit(id.as_deref(), before, limit, json),
     }
 }

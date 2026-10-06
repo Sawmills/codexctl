@@ -449,6 +449,47 @@ async fn end(
 struct AuditQuery {
     #[serde(default)]
     id: Option<String>,
+    /// Return events recorded before this time; the previous page's cursor.
+    #[serde(default)]
+    before: Option<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+const AUDIT_PAGE: usize = 1_000;
+const AUDIT_PAGE_MAX: usize = 10_000;
+
+/// One page of audit events, newest first. `before` is set when older
+/// events remain; pass it back to read them.
+#[derive(serde::Serialize)]
+struct AuditPage {
+    events: Vec<AuditEvent>,
+    before: Option<i64>,
+}
+
+/// Cut a newest-first page of `limit + 1` events. Events that share the
+/// boundary time all move to the next page, so the time cursor loses none.
+/// `None` means every event on the page shares the boundary time.
+fn audit_page(mut events: Vec<AuditEvent>, limit: usize) -> Option<AuditPage> {
+    if events.len() <= limit {
+        return Some(AuditPage {
+            events,
+            before: None,
+        });
+    }
+    let boundary = events[limit].at;
+    let kept = events
+        .iter()
+        .take_while(|event| event.at > boundary)
+        .count();
+    if kept == 0 {
+        return None;
+    }
+    events.truncate(kept);
+    Some(AuditPage {
+        events,
+        before: Some(boundary.saturating_add(1)),
+    })
 }
 
 async fn audit(
@@ -471,12 +512,31 @@ async fn audit(
     if query.id.is_some() && ids.is_empty() {
         return Err(broker.error(StatusCode::NOT_FOUND, "loan_not_found"));
     }
-    let mut events = store
-        .loan_audit(&ids)
+    let limit = query.limit.unwrap_or(AUDIT_PAGE).clamp(1, AUDIT_PAGE_MAX);
+    let events = store
+        .loan_audit(&ids, query.before, limit + 1)
         .await
         .map_err(|error| broker.loan_failure("audit", error))?;
-    events.sort_by_key(|event| event.at);
-    Ok(([("cache-control", "no-store")], Json(events)).into_response())
+    let newest = events.first().map(|event| event.at);
+    let page = match (audit_page(events, limit), newest) {
+        (Some(page), _) => page,
+        // More than one page in one second: return that whole second.
+        (None, Some(newest)) => AuditPage {
+            events: store
+                .loan_audit(&ids, Some(newest.saturating_add(1)), AUDIT_PAGE_MAX)
+                .await
+                .map_err(|error| broker.loan_failure("audit", error))?
+                .into_iter()
+                .filter(|event| event.at == newest)
+                .collect(),
+            before: Some(newest),
+        },
+        (None, None) => AuditPage {
+            events: Vec::new(),
+            before: None,
+        },
+    };
+    Ok(([("cache-control", "no-store")], Json(page)).into_response())
 }
 
 #[cfg(test)]

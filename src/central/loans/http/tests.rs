@@ -221,12 +221,16 @@ impl Fixture {
             .await
     }
 
+    /// The whole audit, oldest first.
     async fn audit(&self, headers: &HeaderMap) -> Vec<Value> {
         let (status, body) = self
             .call("GET", "/v1/loans/audit", headers, Value::Null)
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        body.as_array().unwrap().clone()
+        assert!(body["before"].is_null(), "{body}");
+        let mut events = body["events"].as_array().unwrap().clone();
+        events.reverse();
+        events
     }
 
     fn set_user(&self, id: &str, change: impl FnOnce(&mut crate::central::managed::User)) {
@@ -725,4 +729,51 @@ async fn an_automatic_expiry_applies_the_retention() {
     );
     assert!(store.load_loan(id).await.unwrap().is_none());
     assert!(store.load_loan("expiring").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn the_audit_pages_by_time_without_losing_events_at_a_boundary() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let id = grant["id"].as_str().unwrap();
+    let store = fixture.broker.loan_store();
+    // Three machines at one time straddle the page boundary.
+    for (at, machine) in [(100, "a"), (200, "b"), (200, "c"), (200, "d"), (300, "e")] {
+        store
+            .append_loan_audit(&crate::central::loans::AuditEvent::token_issued(
+                at, id, machine,
+            ))
+            .await
+            .unwrap();
+    }
+    let mut seen = Vec::new();
+    let mut before: Option<i64> = None;
+    for _ in 0..10 {
+        let path = match before {
+            Some(before) => format!("/v1/loans/audit?limit=2&before={before}"),
+            None => "/v1/loans/audit?limit=2".to_owned(),
+        };
+        let (status, page) = fixture
+            .call("GET", &path, &fixture.lender, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let events = page["events"].as_array().unwrap();
+        assert!(!events.is_empty(), "{page}");
+        seen.extend(events.iter().map(|e| e["at"].as_i64().unwrap()));
+        match page["before"].as_i64() {
+            Some(next) => before = Some(next),
+            None => break,
+        }
+    }
+    let granted = grant["createdAt"].as_i64().unwrap();
+    assert_eq!(seen, [granted, 300, 200, 200, 200, 100]);
+    let (status, _) = fixture
+        .call(
+            "GET",
+            "/v1/loans/audit?id=unknown",
+            &fixture.lender,
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

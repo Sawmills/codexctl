@@ -94,7 +94,10 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         .append_loan_audit(&AuditEvent::token_issued(2_600, &id("two"), "machine"))
         .await
         .unwrap();
-    let mut audit = store.loan_audit(&[id("one"), id("two")]).await.unwrap();
+    let mut audit = store
+        .loan_audit(&[id("one"), id("two")], None, 100)
+        .await
+        .unwrap();
     audit.sort_by_key(|event| (event.at, event.grant_id.clone()));
     assert_eq!(
         audit
@@ -112,7 +115,7 @@ async fn scenario(store: &CentralStore, prefix: &str) {
     );
 
     store.prune_loans(3_000 + RETENTION_SECONDS).await.unwrap();
-    let audit = store.loan_audit(&[id("two")]).await.unwrap();
+    let audit = store.loan_audit(&[id("two")], None, 100).await.unwrap();
     assert_eq!(audit.iter().map(|e| e.at).collect::<Vec<_>>(), vec![5_000]);
     assert!(
         store.load_loan(&id("one")).await.unwrap().is_none(),
@@ -189,4 +192,69 @@ async fn postgres_and_dual_stores_keep_loans_in_tables() {
             .await
             .unwrap();
     }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn backfill_copies_file_loans_with_their_audit_once() {
+    if std::env::var("DATABASE_URL").is_err() {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("DATABASE_URL must be set for PostgreSQL scenarios in CI");
+        }
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
+    let file = CentralStore::file(root.path(), &key);
+    file.migrate().await.unwrap();
+    assert!(
+        file.create_loan(&grant("active", "a", i64::MAX / 2))
+            .await
+            .unwrap()
+    );
+    assert!(
+        file.create_loan(&grant("ended", "b", i64::MAX / 2))
+            .await
+            .unwrap()
+    );
+    file.end_loan("ended", 2_000, "lender", EndReason::Revoked)
+        .await
+        .unwrap();
+
+    let shared = CentralStore::from_mode(super::super::StoreMode::Postgres, root.path(), &key)
+        .await
+        .unwrap();
+    let (db, control, schema) = shared.isolated_test_schema().await.unwrap();
+    db.migrate().await.unwrap();
+    assert_eq!(db.backfill(root.path(), &key).await.unwrap().loans, 2);
+    assert_eq!(
+        db.backfill(root.path(), &key).await.unwrap().loans,
+        0,
+        "idempotent"
+    );
+    assert!(
+        db.load_loan("active")
+            .await
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none()
+    );
+    assert_eq!(
+        db.load_loan("ended").await.unwrap().unwrap().end_reason,
+        Some(EndReason::Revoked)
+    );
+    let kinds: Vec<_> = db
+        .loan_audit(&["ended".into()], None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(kinds, [AuditKind::Ended, AuditKind::Granted]);
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
 }

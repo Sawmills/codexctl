@@ -126,17 +126,32 @@ impl CentralStore {
         }
     }
 
-    pub async fn loan_audit(&self, grant_ids: &[String]) -> Result<Vec<AuditEvent>> {
+    /// Audit events of the grants, newest first, recorded before `before`
+    /// (when set), at most `limit` of them.
+    pub async fn loan_audit(
+        &self,
+        grant_ids: &[String],
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
         match self {
-            Self::File(file) => Ok(file
-                .read_state()?
-                .loan_audit
-                .into_iter()
-                .filter(|event| grant_ids.contains(&event.grant_id))
-                .take(READ_LIMIT)
-                .collect()),
+            Self::File(file) => {
+                let mut events: Vec<_> = file
+                    .read_state()?
+                    .loan_audit
+                    .into_iter()
+                    .filter(|event| grant_ids.contains(&event.grant_id))
+                    .filter(|event| before.is_none_or(|before| event.at < before))
+                    .collect();
+                // Newest first; within one timestamp, the latest append first,
+                // as PostgreSQL orders by `at DESC, id DESC`.
+                events.reverse();
+                events.sort_by_key(|event| std::cmp::Reverse(event.at));
+                events.truncate(limit);
+                Ok(events)
+            }
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
-                bounded_db(db.loan_audit(grant_ids)).await
+                bounded_db(db.loan_audit(grant_ids, before, limit)).await
             }
         }
     }
@@ -385,17 +400,63 @@ impl PostgresStore {
         Ok(())
     }
 
-    async fn loan_audit(&self, grant_ids: &[String]) -> Result<Vec<AuditEvent>> {
+    async fn loan_audit(
+        &self,
+        grant_ids: &[String],
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AuditEvent>> {
         let client = self.client().await?;
         client
             .query(
-                "SELECT event_json FROM account_loan_audit WHERE grant_id = ANY($1) ORDER BY at, id LIMIT 10000",
-                &[&grant_ids],
+                "SELECT event_json FROM account_loan_audit WHERE grant_id = ANY($1) AND ($2::bigint IS NULL OR at < $2) ORDER BY at DESC, id DESC LIMIT $3",
+                &[&grant_ids, &before, &i64::try_from(limit)?],
             )
             .await?
             .into_iter()
             .map(|row| Ok(serde_json::from_str(row.get(0))?))
             .collect()
+    }
+
+    /// Copy file-mode grants with their audit events. A grant already in the
+    /// table is skipped with its events, so a repeated backfill adds nothing.
+    /// Returns the number of grants copied.
+    pub(super) async fn import_loans(
+        &self,
+        grants: &std::collections::BTreeMap<String, Grant>,
+        audit: &[AuditEvent],
+    ) -> Result<usize> {
+        let client = self.client().await?;
+        let mut copied = 0;
+        for grant in grants.values() {
+            let events: Vec<_> = audit.iter().filter(|e| e.grant_id == grant.id).collect();
+            let at: Vec<i64> = events.iter().map(|e| e.at).collect();
+            let keys: Vec<Option<String>> = events.iter().map(|e| e.coalesce_key.clone()).collect();
+            let json = events
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()?;
+            let row = client
+                .query_one(
+                    "WITH created AS (INSERT INTO account_loans(id,account_id,lender_id,borrower_id,ends_at,ended_at,grant_json) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING RETURNING id), copied AS (INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT created.id, e.at, e.key, e.json FROM created, unnest($8::bigint[], $9::text[], $10::text[]) AS e(at, key, json) ON CONFLICT DO NOTHING) SELECT count(*)::BIGINT FROM created",
+                    &[
+                        &grant.id,
+                        &grant.account_id,
+                        &grant.lender,
+                        &grant.borrower,
+                        &grant.ends_at,
+                        &grant.ended_at,
+                        &serde_json::to_string(grant)?,
+                        &at,
+                        &keys,
+                        &json,
+                    ],
+                )
+                .await?;
+            let created: i64 = row.get(0);
+            copied += usize::try_from(created)?;
+        }
+        Ok(copied)
     }
 
     async fn prune_loans(&self, cutoff: i64) -> Result<()> {

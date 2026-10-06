@@ -11098,9 +11098,16 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         "forgetting the registration removes borrowed connections too"
     );
 
+    let by_prefix = server.cli(lender_home.path(), &["loans", "audit", "synthetic"]);
+    assert!(
+        by_prefix.status.success()
+            && String::from_utf8_lossy(&by_prefix.stdout).contains("token_issued"),
+        "{}",
+        String::from_utf8_lossy(&by_prefix.stderr)
+    );
     let audit = server.cli(lender_home.path(), &["loans", "audit", "--json"]);
     let events: Value = serde_json::from_slice(&audit.stdout).unwrap();
-    let kinds: Vec<_> = events
+    let kinds: Vec<_> = events["events"]
         .as_array()
         .unwrap()
         .iter()

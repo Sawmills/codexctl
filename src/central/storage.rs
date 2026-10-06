@@ -149,6 +149,8 @@ pub struct BackfillCounts {
     pub users: usize,
     pub devices: usize,
     pub observed_relogins: usize,
+    /// Loan grants copied with their audit events.
+    pub loans: usize,
 }
 
 const SCHEMA: &str = r#"
@@ -545,6 +547,7 @@ impl CentralStore {
             users: 0,
             devices: 0,
             observed_relogins: 0,
+            loans: 0,
         };
         let accounts = state.join("accounts");
         if accounts.exists() {
@@ -627,6 +630,16 @@ impl CentralStore {
                 .filter_map(Result::ok)
                 .filter(|e| e.path().join("record.json").exists())
                 .count();
+        }
+        let file = FileStore {
+            state: state.into(),
+            key: key.into(),
+        };
+        if file.path().exists() {
+            let file_state = file.read_state()?;
+            counts.loans = target
+                .import_loans(&file_state.loans, &file_state.loan_audit)
+                .await?;
         }
         Ok(counts)
     }
