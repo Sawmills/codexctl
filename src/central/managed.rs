@@ -256,7 +256,7 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnr
 pub(super) fn normalize_alias(alias: &str) -> Result<&str> {
     store::validate_alias(alias)
 }
-pub(super) fn account_key(user: &str, alias: &str) -> String {
+pub fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
 

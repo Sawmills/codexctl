@@ -1,6 +1,6 @@
 # ADR 0004: Loan a Server Account to a Teammate
 
-- **Status:** proposed
+- **Status:** accepted (HQ plan approval with changes L1 to L8, 2026-10-06)
 - **Date:** 2026-10-06
 - **Ticket:** SAW-12444
 - **Supersedes:** [ADR 0001](0001-server-account-has-one-company-user.md)
@@ -133,9 +133,9 @@ writes PostgreSQL first and mirrors to the file, like other records.
 The audit log records grant, token issue, end, expiry, and pause events. A
 token issue event has a coalescing key of grant, machine, and UTC hour.
 PostgreSQL enforces the key with a unique index and `ON CONFLICT DO NOTHING`;
-file mode skips an append whose key is already in `loan_audit`. Each loan
-write prunes grants that ended more than 90 days ago and audit events older
-than 90 days, in both modes.
+file mode skips an append whose key is already in `loan_audit`. Each grant
+and each end prunes grants that ended more than 90 days ago and audit events
+older than 90 days, in both modes.
 
 Live sessions of a borrower use the lender's account key with the borrower's
 user ID, so the PostgreSQL foreign key holds and both users count in the

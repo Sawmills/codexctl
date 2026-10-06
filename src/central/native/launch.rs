@@ -334,7 +334,7 @@ fn prepare_pinned_codex(
     allow_billing: bool,
     included_only: bool,
 ) -> Result<PinnedLaunch> {
-    store::validate_alias(alias)?;
+    super::super::loans::AccountRef::parse(alias)?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {

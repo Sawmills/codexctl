@@ -536,6 +536,51 @@ A disabled user cannot enroll or use an existing device.
 The API does not provide administrators with another user's OpenAI tokens.
 Host administrators with the encryption key and storage can decrypt credentials.
 
+## Lend a Server Account
+
+A lender can lend one server account to another company user until the
+account's next weekly reset, or until an earlier time. The design is in
+[ADR 0004](adr/0004-loan-a-server-account-to-a-teammate.md).
+
+```sh
+codexctl loans lend personal --to teammate@sawmills.ai
+codexctl loans lend personal --to teammate@sawmills.ai --until 2026-10-09T18:00:00-07:00
+codexctl loans list
+codexctl loans end <id>
+codexctl loans audit
+```
+
+The grant prints the borrowed name, `<lender>/<alias>`, for example
+`amir/personal`. The borrower selects it like an owned account with
+`codexctl use amir/personal` or `codexctl codex --account amir/personal`.
+All machines of the borrower can use it, and the lender keeps access.
+The credential stays in the lender's catalog; the server issues access tokens
+to the borrower while the loan is active.
+
+Rules:
+
+- The lender's own request is the approval. One account has at most one active
+  loan; a renewal is a new loan after the old one ends.
+- The server refuses a grant when it has no fresh weekly reset time for the
+  account (`weekly_reset_unknown`).
+- Automatic selection and recovery rank owned accounts first. They pick a
+  borrowed account only with verified included usage and only while every
+  window is below 95 percent, so the lender's lanes come first.
+- Credit billing needs `--allow-billing`, as for an owned account. Only the
+  lender can redeem a banked reset, start a login renewal, or import.
+- Either party can end a loan. The server then issues no new tokens. An access
+  token already issued stays valid until it expires; a login renewal is the
+  only hard cut, and it also logs out the lender's sessions.
+- A loan pauses (`loan_paused`) while the lender is disabled or the lender's
+  login differs from the login at grant time. A removed lender alias ends it.
+- Both parties can read the audit log: grant, token issue (one event per
+  machine and hour), end, expiry, and pause. The server deletes ended loans and
+  audit events after 90 days.
+
+Loans work in file, PostgreSQL, and dual storage. File mode keeps them in the
+encrypted `central-storage.enc`; an older server binary that rewrites that file
+drops them, so a rollback ends every loan.
+
 ## Run the Server
 
 Build the standard binaries with `cargo build --release --locked`.

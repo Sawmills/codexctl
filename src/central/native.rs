@@ -1,4 +1,5 @@
 //! Native TUI credentials through Codex's command-backed provider authentication.
+use super::loans::AccountRef;
 use super::{
     server::{TokenRequest, TokenResponse},
     vault,
@@ -109,7 +110,9 @@ fn alias_from_pointer_bytes(bytes: Option<&[u8]>) -> Option<String> {
     {
         return None;
     }
-    store::validate_alias(alias).ok().map(str::to_owned)
+    AccountRef::parse(alias)
+        .ok()
+        .map(|reference| reference.name())
 }
 
 fn render_parent_cmd(args: &[String]) -> String {
@@ -335,8 +338,14 @@ pub fn print_history(limit: usize, json: bool) -> Result<()> {
     Ok(())
 }
 fn connection_path(alias: &str) -> Result<PathBuf> {
-    let alias = store::validate_alias(alias)?;
-    Ok(root()?.join(format!("{alias}.json")))
+    let reference = AccountRef::parse(alias)?;
+    let path = reference.connection_file(&root()?);
+    if reference.is_borrowed()
+        && let Some(parent) = path.parent()
+    {
+        store::ensure_private_dir(parent)?;
+    }
+    Ok(path)
 }
 fn codex_home() -> Result<PathBuf> {
     Ok(config::default_paths()?.codex_home())
@@ -790,27 +799,37 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     if !status.is_success() {
         let body = response.json::<serde_json::Value>().ok();
         let reason = body.as_ref().and_then(|v| v["error"].as_str());
-        if status == reqwest::StatusCode::CONFLICT
-            && reason == Some("unsupported_workspace_routing")
-        {
-            bail!(
+        match (status, reason) {
+            (reqwest::StatusCode::CONFLICT, Some("unsupported_workspace_routing")) => bail!(
                 "this account requires workspace routing that the central native provider does not yet support"
-            );
-        }
-        if status == reqwest::StatusCode::NOT_FOUND
-            && reason == Some("account_renamed")
-            && let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str())
-        {
-            // Never follow a rename silently: the operator picks the account.
-            let old = connection.alias.as_deref().unwrap_or("this account");
-            if connection.launch_pinned {
-                bail!(
-                    "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
-                );
+            ),
+            (reqwest::StatusCode::NOT_FOUND, Some("account_renamed")) => {
+                if let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str()) {
+                    // Never follow a rename silently: the operator picks the account.
+                    let old = connection.alias.as_deref().unwrap_or("this account");
+                    if connection.launch_pinned {
+                        bail!(
+                            "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
+                        );
+                    }
+                    bail!(
+                        "server account {old} was renamed to {renamed}; run codexctl use {renamed}"
+                    );
+                }
+                bail!("central token request rejected (HTTP {})", status)
             }
-            bail!("server account {old} was renamed to {renamed}; run codexctl use {renamed}");
+            // A loan never moves a lane to another account by itself.
+            (_, Some("loan_ended")) => bail!(
+                "the loan of this server account ended; select another account with codexctl use"
+            ),
+            (_, Some("loan_paused")) => bail!(
+                "the loan of this server account is paused: the lender is disabled or the lender's login changed"
+            ),
+            (_, Some("ambiguous_loan")) => {
+                bail!("two active loans share this borrowed name; ask a lender to end one")
+            }
+            _ => bail!("central token request rejected (HTTP {})", status),
         }
-        bail!("central token request rejected (HTTP {})", status);
     }
     let token: TokenResponse = response.json().context("invalid central token response")?;
     if !token.native_routing_supported {
@@ -1075,8 +1094,8 @@ fn read_active_alias() -> Result<String> {
     {
         bail!("invalid active account pointer; run codexctl use again");
     }
-    store::validate_alias(alias)
-        .map(|alias| alias.to_owned())
+    AccountRef::parse(alias)
+        .map(|reference| reference.name())
         .map_err(|_| anyhow::anyhow!("invalid active account pointer; run codexctl use again"))
 }
 
@@ -1220,6 +1239,9 @@ fn document(home: &Path) -> Result<DocumentMut> {
 
 /// Resolve explicit unmigrated local names without requiring an online catalog.
 pub fn known_local_alias(alias: &str) -> Result<bool> {
+    if AccountRef::parse(alias)?.is_borrowed() {
+        return Ok(false);
+    }
     let paths = config::default_paths()?;
     let local = store::profile_dir(&paths, alias)?;
     if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
@@ -1239,6 +1261,19 @@ pub fn activate(
     restart_daemon: bool,
 ) -> Result<bool> {
     let explicit = alias.is_some();
+    // A borrowed reference is matched in its normalized, lowercase form.
+    let normalized = alias
+        .map(|alias| {
+            AccountRef::parse(alias).map(|reference| {
+                if reference.is_borrowed() {
+                    reference.name()
+                } else {
+                    alias.to_owned()
+                }
+            })
+        })
+        .transpose()?;
+    let alias = normalized.as_deref();
     if let Some(alias) = alias
         && known_local_alias(alias)?
     {
@@ -1338,9 +1373,12 @@ pub fn activate(
     if !path.try_exists()? {
         return Ok(false);
     }
-    let local = store::profile_dir(&config::default_paths()?, alias)?;
-    if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
-        bail!("remote alias conflicts with a local profile; rename one before selection");
+    // A borrowed reference has no local profile namespace to collide with.
+    if !AccountRef::parse(alias)?.is_borrowed() {
+        let local = store::profile_dir(&config::default_paths()?, alias)?;
+        if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
+            bail!("remote alias conflicts with a local profile; rename one before selection");
+        }
     }
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
@@ -1690,8 +1728,13 @@ pub(super) fn sync_account(
         bail!("server user identity changed");
     }
     let path = connection_path(&account.alias)?;
-    let local = store::profile_dir(&config::default_paths()?, &account.alias)?;
-    if !super::remote::local_alias_matches(device, account, &local)? {
+    if account.loan.is_none()
+        && !super::remote::local_alias_matches(
+            device,
+            account,
+            &store::profile_dir(&config::default_paths()?, &account.alias)?,
+        )?
+    {
         bail!(
             "server alias {} conflicts with a local profile; migrate or rename it",
             account.alias

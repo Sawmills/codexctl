@@ -4,15 +4,12 @@
 //! the catalog call `borrowed_owner`, so every other path keeps refusing a
 //! borrowed reference.
 use super::{AccountRef, AuditEvent, AuditKind, EndReason, Grant, GrantRequest};
-use crate::{
-    api,
-    central::{
-        catalog,
-        managed::{self, Broker, HttpError, User, account_key},
-        server::{Owner, TokenResponse},
-        storage::{CentralStore, StoreMode},
-        vault,
-    },
+use crate::central::{
+    catalog,
+    managed::{self, Broker, HttpError, User, account_key},
+    server::{Owner, TokenResponse},
+    storage::{CentralStore, StoreMode},
+    vault,
 };
 use axum::{
     Json, Router,
@@ -36,14 +33,8 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Digest of the credential workspace and login. A changed digest pauses a loan.
-pub(super) fn subject(workspace: &str, access_token: &str) -> String {
-    let login = api::token_subject(access_token).unwrap_or_default();
-    vault::digest(format!("{workspace}\0{login}").as_bytes())
-}
-
 fn owner_subject(owner: &Owner) -> Option<String> {
-    Some(subject(
+    Some(super::credential_subject(
         &vault::account(&owner.vault.auth).ok()?,
         vault::token(&owner.vault.auth).ok()?,
     ))
@@ -280,7 +271,9 @@ impl Broker {
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(grant, "lender_disabled").await);
         }
-        if subject(&token.chatgpt_account_id, &token.access_token) != grant.subject {
+        if super::credential_subject(&token.chatgpt_account_id, &token.access_token)
+            != grant.subject
+        {
             return Err(self.pause(grant, "subject_changed").await);
         }
         self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))

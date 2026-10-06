@@ -83,8 +83,8 @@ storage in `src/central/storage/loans.rs`):
   `FileState` under `central-storage.lock`. PostgreSQL adds `account_loans`
   and `account_loan_audit`. Dual mode writes PostgreSQL first, then the file.
   Loans do not use `reject_unshared_workflow`.
-- **Retention (L4):** every loan write prunes grants that ended more than 90
-  days ago and audit events older than 90 days, in both modes. Token issue
+- **Retention (L4):** every grant and every end prunes grants that ended more
+  than 90 days ago and audit events older than 90 days, in both modes. Token issue
   events coalesce on (grant, machine, UTC hour): a unique index in
   PostgreSQL, a key check before the append in file mode.
 - **Failures:** loan handlers record failures with `record_failure` and
@@ -94,8 +94,8 @@ storage in `src/central/storage/loans.rs`):
 
 1. Grant rules: self-loan, unknown borrower, second active grant, `--until`
    after the weekly reset, stale usage or a past `resets_at`, non-lender.
-2. Lender-only paths: a borrowed reference gets 404 from reset redeem, login
-   renewal start, status, and cancel, and import.
+2. Lender-only paths: a borrowed reference gets 400 `invalid_alias` or 404
+   from reset redeem, login renewal start, status, and cancel, and import.
 3. Token: the borrower gets a token while active; `loan_ended` after end and
    after expiry; `loan_paused` after lender disable and after a subject change;
    no token when the loan ends during the refresh (race test); a revoked

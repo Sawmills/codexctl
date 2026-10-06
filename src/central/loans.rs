@@ -8,6 +8,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod client;
 pub(super) mod http;
 
 /// Ended grants and audit events are kept this long.
@@ -65,6 +66,13 @@ impl AccountRef {
                 .join(format!("{alias}.json")),
         }
     }
+}
+
+/// Digest of a credential's workspace and login. A grant records it at
+/// creation; a token with another digest pauses the loan.
+pub fn credential_subject(workspace: &str, access_token: &str) -> String {
+    let login = crate::api::token_subject(access_token).unwrap_or_default();
+    super::vault::digest(format!("{workspace}\0{login}").as_bytes())
 }
 
 /// Build the borrowed reference stored on a grant at creation.

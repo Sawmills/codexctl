@@ -26,7 +26,7 @@ fn mirror_failure(store: &CentralStore, stage: &str, error: &anyhow::Error) {
 impl CentralStore {
     /// End every active grant whose end time has passed. Returns the grants
     /// this call ended, so the caller can audit each one once.
-    pub(crate) async fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
+    pub async fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
         match self {
             Self::File(file) => file.expire_loans(now),
             Self::Postgres(db) => bounded_db(db.expire_loans(now)).await,
@@ -41,7 +41,7 @@ impl CentralStore {
     }
 
     /// Insert a grant. Returns false when the account already has an active one.
-    pub(crate) async fn create_loan(&self, grant: &Grant) -> Result<bool> {
+    pub async fn create_loan(&self, grant: &Grant) -> Result<bool> {
         match self {
             Self::File(file) => file.create_loan(grant),
             Self::Postgres(db) => bounded_db(db.create_loan(grant)).await,
@@ -56,7 +56,7 @@ impl CentralStore {
     }
 
     /// End an active grant. Returns the ended grant only when this call ended it.
-    pub(crate) async fn end_loan(
+    pub async fn end_loan(
         &self,
         id: &str,
         at: i64,
@@ -78,7 +78,7 @@ impl CentralStore {
         }
     }
 
-    pub(crate) async fn load_loan(&self, id: &str) -> Result<Option<Grant>> {
+    pub async fn load_loan(&self, id: &str) -> Result<Option<Grant>> {
         match self {
             Self::File(file) => Ok(file.read_state()?.loans.get(id).cloned()),
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
@@ -88,7 +88,7 @@ impl CentralStore {
     }
 
     /// Grants where the user is the lender or the borrower.
-    pub(crate) async fn loans_for_user(&self, user: &str) -> Result<Vec<Grant>> {
+    pub async fn loans_for_user(&self, user: &str) -> Result<Vec<Grant>> {
         match self {
             Self::File(file) => Ok(file
                 .read_state()?
@@ -104,7 +104,7 @@ impl CentralStore {
     }
 
     /// Append an audit event. An event whose coalescing key exists is skipped.
-    pub(crate) async fn append_loan_audit(&self, event: &AuditEvent) -> Result<()> {
+    pub async fn append_loan_audit(&self, event: &AuditEvent) -> Result<()> {
         match self {
             Self::File(file) => file.append_loan_audit(event),
             Self::Postgres(db) => bounded_db(db.append_loan_audit(event)).await,
@@ -118,7 +118,7 @@ impl CentralStore {
         }
     }
 
-    pub(crate) async fn loan_audit(&self, grant_ids: &[String]) -> Result<Vec<AuditEvent>> {
+    pub async fn loan_audit(&self, grant_ids: &[String]) -> Result<Vec<AuditEvent>> {
         match self {
             Self::File(file) => Ok(file
                 .read_state()?
@@ -135,7 +135,7 @@ impl CentralStore {
 
     /// Delete grants that ended, and audit events recorded, before the
     /// retention window.
-    pub(crate) async fn prune_loans(&self, now: i64) -> Result<()> {
+    pub async fn prune_loans(&self, now: i64) -> Result<()> {
         let cutoff = now.saturating_sub(RETENTION_SECONDS);
         match self {
             Self::File(file) => file.prune_loans(cutoff),
@@ -153,6 +153,15 @@ impl CentralStore {
 
 impl FileStore {
     fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
+        // Token requests call this; rewrite the encrypted state only when needed.
+        if !self
+            .read_state()?
+            .loans
+            .values()
+            .any(|grant| grant.ended_at.is_none() && grant.ends_at <= now)
+        {
+            return Ok(Vec::new());
+        }
         self.with_lock(|state| {
             let mut expired = Vec::new();
             for grant in state.loans.values_mut() {

@@ -1,5 +1,8 @@
 # A server account belongs to one company user
 
+Superseded by [ADR 0004](0004-loan-a-server-account-to-a-teammate.md): one company
+user still owns a server account and can lend its use to another company user.
+
 Each server account belongs to exactly one company user. The account server keys
 it by that user and the alias. If a second company user adds the same OpenAI login,
 the server reports a conflict. All machines of the owning company user can use the
