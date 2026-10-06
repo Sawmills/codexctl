@@ -118,6 +118,22 @@ impl CentralStore {
         }
     }
 
+    /// Every unended grant of a borrower, for authorization. An account has
+    /// at most one, so the number of accounts bounds this read.
+    pub async fn active_loans_for_borrower(&self, borrower: &str) -> Result<Vec<Grant>> {
+        match self {
+            Self::File(file) => Ok(file
+                .read_state()?
+                .loans
+                .into_values()
+                .filter(|grant| grant.borrower == borrower && grant.ended_at.is_none())
+                .collect()),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
+                bounded_db(db.active_loans_for_borrower(borrower)).await
+            }
+        }
+    }
+
     /// Append an audit event. An event whose coalescing key exists is skipped.
     pub async fn append_loan_audit(&self, event: &AuditEvent) -> Result<()> {
         match self {
@@ -388,6 +404,19 @@ impl PostgresStore {
             .query(
                 "SELECT grant_json FROM account_loans WHERE lender_id=$1 OR borrower_id=$1 ORDER BY id LIMIT 10000",
                 &[&user],
+            )
+            .await?
+            .into_iter()
+            .map(|row| Ok(serde_json::from_str(row.get(0))?))
+            .collect()
+    }
+
+    async fn active_loans_for_borrower(&self, borrower: &str) -> Result<Vec<Grant>> {
+        let client = self.client().await?;
+        client
+            .query(
+                "SELECT grant_json FROM account_loans WHERE borrower_id=$1 AND ended_at IS NULL",
+                &[&borrower],
             )
             .await?
             .into_iter()

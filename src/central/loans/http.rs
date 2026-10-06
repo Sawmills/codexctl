@@ -36,7 +36,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn owner_subject(owner: &Owner) -> Option<String> {
+fn owner_subject(owner: &Owner) -> Option<super::CredentialSubject> {
     Some(super::credential_subject(
         &vault::account(&owner.vault.auth).ok()?,
         vault::token(&owner.vault.auth).ok()?,
@@ -174,7 +174,7 @@ impl Broker {
         let now = now();
         Ok(self
             .loan_store()
-            .loans_for_user(borrower)
+            .active_loans_for_borrower(borrower)
             .await
             .map_err(|error| self.loan_failure("load", error))?
             .into_iter()
@@ -275,9 +275,10 @@ impl Broker {
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(grant, "lender_disabled").await);
         }
-        if super::credential_subject(&token.chatgpt_account_id, &token.access_token)
-            != grant.subject
-        {
+        if !grant.subject.same_login(&super::credential_subject(
+            &token.chatgpt_account_id,
+            &token.access_token,
+        )) {
             return Err(self.pause(grant, "subject_changed").await);
         }
         self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))
@@ -297,7 +298,9 @@ impl Broker {
             };
             let paused = if !self.lender_enabled(&grant.lender).await? {
                 Some("lender_disabled")
-            } else if owner_subject(&*owner.lock().await).as_deref() != Some(&grant.subject) {
+            } else if !owner_subject(&*owner.lock().await)
+                .is_some_and(|subject| grant.subject.same_login(&subject))
+            {
                 Some("subject_changed")
             } else {
                 None
@@ -359,9 +362,12 @@ async fn lend(
         (
             owner.vault.alias.trim().to_owned(),
             account_key(&owner.vault.user, &owner.vault.alias),
-            owner_subject(&owner).ok_or_else(|| {
-                broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
-            })?,
+            // A grant must name a login, or no later token could match it.
+            owner_subject(&owner)
+                .filter(|subject| subject.uid.is_some() || subject.sub.is_some())
+                .ok_or_else(|| {
+                    broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })?,
         )
     };
     let users = broker.company_users().await?;

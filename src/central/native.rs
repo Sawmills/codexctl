@@ -1366,6 +1366,7 @@ pub fn activate(
         drop(shared);
         exclusive_mode(&paths)?
     };
+    let mut selected_loan = None;
     if let Some(catalog) = catalog.as_ref() {
         let _lock = native_lock(&root()?)?;
         super::remote::require_current_connection(&catalog.connection)?;
@@ -1375,6 +1376,7 @@ pub fn activate(
             .find(|a| a.alias == alias)
             .context("server account alias not found")?;
         sync_account(&catalog.connection, account)?;
+        selected_loan = Some(account.loan.as_ref().map(|loan| loan.id.clone()));
     }
     if !path.try_exists()? {
         return Ok(false);
@@ -1389,6 +1391,14 @@ pub fn activate(
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
     drop(_lock);
+    // Selecting a borrowed account pins it to the current grant. The new ID is
+    // saved only with a successful activation, under its rollback.
+    if let Some(loan_id) = selected_loan
+        && connection.loan_id != loan_id
+    {
+        connection.loan_id = loan_id;
+        connection.revision = String::new();
+    }
     let token = fetch(&connection, false)?;
     let usage_based = token.billing_class != Some(api::BillingClass::RateLimited);
     if redeem_reset
@@ -1537,7 +1547,13 @@ pub fn activate(
         bail!("remote connection changed during activation");
     }
     let previous_connection = serde_json::to_vec(&latest)?;
+    // Keep the grant this activation fetched with; the save below commits it.
+    let selected_loan = connection.loan_id.take();
     connection = latest;
+    if connection.loan_id != selected_loan {
+        connection.loan_id = selected_loan;
+        connection.revision = String::new();
+    }
     connection.allow_billing = approve_billing;
     connection.approved_billing_plan = approve_billing
         .then(|| token.chatgpt_plan_type.clone())
@@ -1748,7 +1764,7 @@ pub(super) fn sync_account(
     }
     let loan_id = account.loan.as_ref().map(|loan| loan.id.clone());
     if path.try_exists()? {
-        let mut existing = read_connection(&path)?;
+        let existing = read_connection(&path)?;
         if existing.server != device.server
             || existing.account_id != account.account_id
             || existing.alias.as_deref() != Some(&account.alias)
@@ -1757,12 +1773,7 @@ pub(super) fn sync_account(
         {
             bail!("remote account identity changed");
         }
-        // Selecting a borrowed account again pins it to the current grant.
-        if existing.loan_id != loan_id {
-            existing.loan_id = loan_id;
-            existing.revision = String::new();
-            save_connection(&path, &existing)?;
-        }
+        // A changed grant is committed by activation, with its rollback.
         return Ok(());
     }
     save_connection(

@@ -39,7 +39,7 @@ A grant has these fields:
 | `account_key` | The lender's existing account key |
 | `lender`, `borrower` | Company-user IDs |
 | `alias` | The lender's alias at grant time |
-| `subject` | Digest of the credential subject at grant time |
+| `subject` | Digests of the credential workspace and of each login claim (`uid`, `sub`) at grant time |
 | `created_at`, `ends_at` | Start and end; `ends_at` is at or before the account's next weekly reset |
 | `ended_at`, `ended_by`, `end_reason` | Set once, when the loan ends (`revoked`, `returned`, `expired`) |
 
@@ -80,7 +80,7 @@ path stay single. In PostgreSQL mode it loads the lender's account with
 `load_account_by_alias(lender, alias)`. If the lender's alias no longer
 resolves, the grant ends with reason `account_removed`. A re-import under the
 same alias before that check makes the same account key, so the grant goes on
-only while the credential subject matches; a different login pauses it.
+only while the login claims agree; a different login pauses it.
 
 ## Who May Do What
 
@@ -113,9 +113,10 @@ its next token request and never moves to another account without a new
 selection.
 
 A loan pauses, with the error `loan_paused`, when the lender's user is disabled
-or the credential subject differs from the grant's `subject` (for example after
-a login renewal to another login). A pause issues no tokens and does not end the
-grant.
+or the token's login claims do not positively agree with the grant's `subject`,
+for example after a login renewal to another login. The claims are compared
+inside one namespace, so a token that gains a `uid` still matches through its
+`sub`. A pause issues no tokens and does not end the grant.
 
 ## Storage
 

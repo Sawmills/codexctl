@@ -11,7 +11,7 @@ fn grant(id: &str, account: &str, ends_at: i64) -> Grant {
         borrower_email: "bob@sawmills.ai".into(),
         alias: "main".into(),
         reference: "alice/main".into(),
-        subject: "subject".into(),
+        subject: Default::default(),
         created_at: 1_000,
         ends_at,
         ended_at: None,
@@ -61,6 +61,15 @@ async fn scenario(store: &CentralStore, prefix: &str) {
             .await
             .unwrap()
     );
+    let active: Vec<_> = store
+        .active_loans_for_borrower("borrower")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|g| g.id.starts_with(prefix))
+        .map(|g| g.id)
+        .collect();
+    assert_eq!(active, [id("two")], "an ended grant is not active");
     let expired = store.expire_loans(5_000).await.unwrap();
     assert!(
         expired

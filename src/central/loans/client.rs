@@ -194,7 +194,14 @@ pub fn audit(
     }
     println!("{table}");
     if let Some(before) = value["before"].as_i64() {
-        println!("Older events exist: codexctl loans audit --before {before}");
+        let mut next = String::from("codexctl loans audit");
+        if let Some(id) = id {
+            next.push_str(&format!(" {id}"));
+        }
+        if let Some(limit) = limit {
+            next.push_str(&format!(" --limit {limit}"));
+        }
+        println!("Older events exist: {next} --before {before}");
     }
     Ok(())
 }

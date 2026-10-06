@@ -4,6 +4,35 @@ use crate::{
     central::managed::{Account, User},
 };
 
+static SUBJECT: std::sync::LazyLock<CredentialSubject> =
+    std::sync::LazyLock::new(CredentialSubject::default);
+
+#[test]
+fn a_login_matches_through_a_shared_claim_and_never_by_silence() {
+    let token = |claims: serde_json::Value| {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        format!(
+            "h.{}.",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        )
+    };
+    let auth = |uid: Option<&str>| serde_json::json!({"https://api.openai.com/auth":{"chatgpt_user_id":uid}});
+    let legacy = credential_subject("w", &token(serde_json::json!({"sub":"s"})));
+    let mut gained_claims = auth(Some("u1"));
+    gained_claims["sub"] = "s".into();
+    let gained = credential_subject("w", &token(gained_claims.clone()));
+    let mut other_claims = auth(Some("u2"));
+    other_claims["sub"] = "s".into();
+    let other = credential_subject("w", &token(other_claims));
+    assert!(legacy.same_login(&gained), "a gained UID keeps the subject");
+    assert!(
+        !gained.same_login(&other),
+        "a conflicting UID is another login"
+    );
+    assert!(!gained.same_login(&credential_subject("x", &token(gained_claims))));
+    assert!(!CredentialSubject::default().same_login(&CredentialSubject::default()));
+}
+
 fn user(id: &str, email: &str) -> User {
     User {
         id: id.into(),
@@ -19,7 +48,7 @@ fn request<'a>(lender: &'a User, borrower: Option<&'a User>) -> GrantRequest<'a>
         borrower,
         alias: "Main",
         account_id: "key",
-        subject: "subject",
+        subject: &SUBJECT,
         weekly_reset: Some(10_000),
         until: None,
         now: 1_000,

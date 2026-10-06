@@ -11013,16 +11013,19 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         ended_by: None,
         end_reason: None,
     };
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let store = central::storage::CentralStore::from_mode(
-            central::storage::StoreMode::File,
-            &server.root.path().join("state"),
-            &server.root.path().join("key"),
-        )
-        .await
-        .unwrap();
-        assert!(store.create_loan(&grant).await.unwrap());
-    });
+    let seed = |grant: &central::loans::Grant| {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = central::storage::CentralStore::from_mode(
+                central::storage::StoreMode::File,
+                &server.root.path().join("state"),
+                &server.root.path().join("key"),
+            )
+            .await
+            .unwrap();
+            assert!(store.create_loan(grant).await.unwrap());
+        })
+    };
+    seed(&grant);
 
     let home = tempfile::tempdir().unwrap();
     let directory = home.path().join(".codexctl/central");
@@ -11090,6 +11093,36 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+
+    // A renewal is a new grant. The ended selection stays refused until the
+    // borrower selects the name again, which pins the new grant.
+    seed(&central::loans::Grant {
+        id: "renewed-grant".into(),
+        ..grant.clone()
+    });
+    assert!(
+        !server
+            .cli(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    let reselected = server.cli(home.path(), &["use", "amir/personal", "--allow-billing"]);
+    assert!(
+        reselected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reselected.stderr)
+    );
+    let renewed = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(
+        renewed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renewed.stderr)
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("borrowed/amir/personal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(connection["loan_id"], "renewed-grant");
 
     let forgotten = server.cli(home.path(), &["disconnect", "--forget"]);
     assert!(

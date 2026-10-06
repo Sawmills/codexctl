@@ -20,8 +20,12 @@ const BORROWER: &str = "borrower";
 const STRANGER: &str = "stranger";
 
 fn auth(login: &str, seat: &str) -> Value {
+    auth_with_uid(login, None, seat)
+}
+
+fn auth_with_uid(login: &str, uid: Option<&str>, seat: &str) -> Value {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    let claims = json!({"sub":login,"iat":2_000_000_000_i64,"https://api.openai.com/auth":{"chatgpt_account_id":seat}});
+    let claims = json!({"sub":login,"iat":2_000_000_000_i64,"https://api.openai.com/auth":{"chatgpt_account_id":seat,"chatgpt_user_id":uid}});
     json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh","account_id":seat}})
 }
 
@@ -132,9 +136,19 @@ impl Fixture {
     }
 
     async fn add_owner(&self, user: &str, alias: &str, login: &str) {
+        self.add_owner_with(
+            user,
+            alias,
+            login,
+            auth(login, &format!("seat-{user}-{alias}")),
+        )
+        .await;
+    }
+
+    async fn add_owner_with(&self, user: &str, alias: &str, tag: &str, credential: Value) {
         let key = account_key(user, alias);
         // A fresh state directory per login, as a renewed owner would get.
-        let account = self.state.join("accounts").join(format!("{key}-{login}"));
+        let account = self.state.join("accounts").join(format!("{key}-{tag}"));
         crate::store::ensure_private_dir(&account).unwrap();
         vault::save(
             &account,
@@ -144,7 +158,7 @@ impl Fixture {
                 tenant: "sawmills".into(),
                 alias: alias.into(),
                 label: None,
-                auth: auth(login, &format!("seat-{user}-{alias}")),
+                auth: credential,
                 verified: true,
                 import_rejected: false,
                 revision: 0,
@@ -801,5 +815,49 @@ async fn a_lane_pinned_to_an_ended_loan_never_moves_to_a_new_grant_of_that_name(
     assert_eq!(
         fixture.token(&fixture.borrower, "alice/main").await.0,
         StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_conflicting_login_uid_pauses_and_a_gained_uid_does_not() {
+    let fixture = Fixture::new().await;
+    // The grant records a login without a UID; the token then gains one.
+    fixture.lend_main().await;
+    fixture
+        .add_owner_with(
+            LENDER,
+            "main",
+            "gained",
+            auth_with_uid("synthetic-login", Some("u1"), "seat-lender-main"),
+        )
+        .await;
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+
+    // A new grant records the UID; the same subject with another UID differs.
+    let fixture = Fixture::new().await;
+    fixture
+        .add_owner_with(
+            LENDER,
+            "main",
+            "first",
+            auth_with_uid("synthetic-login", Some("u1"), "seat-lender-main"),
+        )
+        .await;
+    fixture.lend_main().await;
+    fixture
+        .add_owner_with(
+            LENDER,
+            "main",
+            "other",
+            auth_with_uid("synthetic-login", Some("u2"), "seat-lender-main"),
+        )
+        .await;
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("loan_paused"))
     );
 }

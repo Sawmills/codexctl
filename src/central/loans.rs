@@ -68,11 +68,44 @@ impl AccountRef {
     }
 }
 
-/// Digest of a credential's workspace and login. A grant records it at
-/// creation; a token with another digest pauses the loan.
-pub fn credential_subject(workspace: &str, access_token: &str) -> String {
-    let login = crate::api::token_subject(access_token).unwrap_or_default();
-    super::vault::digest(format!("{workspace}\0{login}").as_bytes())
+/// Digests of a credential's workspace and of each login claim. A grant
+/// records them at creation; a token that positively proves another login, or
+/// cannot prove the same one, pauses the loan.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialSubject {
+    pub workspace: String,
+    #[serde(default)]
+    pub uid: Option<String>,
+    #[serde(default)]
+    pub sub: Option<String>,
+}
+
+impl CredentialSubject {
+    fn logins(&self) -> crate::api::Logins {
+        crate::api::Logins {
+            uid: self.uid.clone(),
+            sub: self.sub.clone(),
+        }
+    }
+
+    /// Same workspace, and positive agreement inside one login namespace. A
+    /// token that gains a UID still matches through its unchanged subject.
+    pub fn same_login(&self, other: &Self) -> bool {
+        self.workspace == other.workspace && self.logins().same(&other.logins())
+    }
+}
+
+pub fn credential_subject(workspace: &str, access_token: &str) -> CredentialSubject {
+    let logins = crate::api::token_logins(access_token);
+    let digest = |namespace: &str, value: String| {
+        super::vault::digest(format!("{namespace}:{value}").as_bytes())
+    };
+    CredentialSubject {
+        workspace: digest("workspace", workspace.to_owned()),
+        uid: logins.uid.map(|uid| digest("uid", uid)),
+        sub: logins.sub.map(|sub| digest("sub", sub)),
+    }
 }
 
 /// Build the borrowed reference stored on a grant at creation.
@@ -119,8 +152,8 @@ pub struct Grant {
     pub alias: String,
     /// The borrowed reference, `<lender>/<alias>`, fixed at grant time.
     pub reference: String,
-    /// Digest of the credential workspace and login at grant time.
-    pub subject: String,
+    /// The credential workspace and login claims at grant time, as digests.
+    pub subject: CredentialSubject,
     pub created_at: i64,
     pub ends_at: i64,
     #[serde(default)]
@@ -235,7 +268,7 @@ pub(super) struct GrantRequest<'a> {
     pub borrower: Option<&'a super::managed::User>,
     pub alias: &'a str,
     pub account_id: &'a str,
-    pub subject: &'a str,
+    pub subject: &'a CredentialSubject,
     /// The account's next weekly reset, from fresh usage only.
     pub weekly_reset: Option<i64>,
     pub until: Option<i64>,
@@ -272,7 +305,7 @@ pub(super) fn plan_grant(request: GrantRequest<'_>, id: String) -> Result<Grant,
         borrower_email: borrower.email.clone(),
         alias: request.alias.to_owned(),
         reference,
-        subject: request.subject.to_owned(),
+        subject: request.subject.clone(),
         created_at: request.now,
         ends_at,
         ended_at: None,
