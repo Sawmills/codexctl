@@ -3,7 +3,7 @@
 //! `Broker::owner` and `resolve_alias` stay lender-only. Only `/v1/token` and
 //! the catalog call `borrowed_owner`, so every other path keeps refusing a
 //! borrowed reference.
-use super::{AccountRef, AuditEvent, AuditKind, EndReason, Grant, GrantRequest};
+use super::{AccountRef, AuditEvent, EndReason, Grant, GrantRequest};
 use crate::central::{
     catalog,
     managed::{self, Broker, HttpError, User, account_key},
@@ -28,6 +28,9 @@ pub(in crate::central) fn routes() -> Router<Broker> {
         .route("/v1/loans/end", post(end))
         .route("/v1/loans/audit", get(audit))
 }
+
+/// A weekly rate-limit window.
+const WEEK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
@@ -113,30 +116,29 @@ impl Broker {
             .map_err(|error| self.loan_failure("audit", error))
     }
 
-    /// End grants past their end time and audit each one.
+    /// End grants past their end time. The store audits each end.
     async fn expire_loans(&self) -> Result<(), HttpError> {
         let expired = self
             .loan_store()
             .expire_loans(now())
             .await
             .map_err(|error| self.loan_failure("expire", error))?;
-        for grant in expired {
-            self.audit_ended(&grant).await?;
+        if !expired.is_empty() {
+            self.prune_loans().await;
         }
         Ok(())
     }
 
-    async fn audit_ended(&self, grant: &Grant) -> Result<(), HttpError> {
-        self.audit_event(AuditEvent {
-            actor: grant.ended_by.clone(),
-            reason: grant.end_reason.map(|reason| reason.as_str().to_owned()),
-            ..AuditEvent::new(
-                grant.ended_at.unwrap_or_else(now),
-                &grant.id,
-                AuditKind::Ended,
-            )
-        })
-        .await
+    /// Apply the 90-day retention after a grant or an end. The grant or end
+    /// is already committed, so a failed prune is recorded, not returned.
+    async fn prune_loans(&self) {
+        if let Err(error) = self.loan_store().prune_loans(now()).await {
+            self.record_failure("loan_prune_failed", "loan", StatusCode::SERVICE_UNAVAILABLE);
+            eprintln!(
+                "{}",
+                serde_json::json!({"operation":"loan","stage":"prune","error":error.to_string()})
+            );
+        }
     }
 
     async fn end_grant(
@@ -150,12 +152,8 @@ impl Broker {
             .end_loan(&grant.id, now(), by, reason)
             .await
             .map_err(|error| self.loan_failure("end", error))?;
-        if let Some(ended) = ended.as_ref() {
-            self.audit_ended(ended).await?;
-            self.loan_store()
-                .prune_loans(now())
-                .await
-                .map_err(|error| self.loan_failure("prune", error))?;
+        if ended.is_some() {
+            self.prune_loans().await;
         }
         Ok(ended)
     }
@@ -343,6 +341,12 @@ async fn lend(
         .into_iter()
         .find(|account| account.loan.is_none() && account.alias.eq_ignore_ascii_case(alias))
         .filter(|account| !account.usage_stale)
+        // `resets_at` belongs to the longest window; only a weekly one counts.
+        .filter(|account| {
+            account
+                .secondary_window_seconds
+                .is_some_and(|seconds| seconds >= WEEK_SECONDS)
+        })
         .and_then(|account| account.resets_at);
     let (lender_alias, account_id, subject) = {
         let owner = owner.lock().await;
@@ -386,16 +390,7 @@ async fn lend(
     {
         return Err(broker.error(StatusCode::CONFLICT, "loan_exists"));
     }
-    broker
-        .audit_event(AuditEvent {
-            actor: Some(device.user.clone()),
-            ..AuditEvent::new(grant.created_at, &grant.id, AuditKind::Granted)
-        })
-        .await?;
-    store
-        .prune_loans(now())
-        .await
-        .map_err(|error| broker.loan_failure("prune", error))?;
+    broker.prune_loans().await;
     Ok((StatusCode::CREATED, Json(grant)).into_response())
 }
 

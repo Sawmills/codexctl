@@ -1769,6 +1769,39 @@ pub(super) fn sync_account(
         },
     )
 }
+/// Every connection file: owned ones in the root and borrowed ones under
+/// `borrowed/<lender>/`.
+pub(super) fn connection_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let visible_json = |path: &Path| {
+        path.extension().is_some_and(|e| e == "json")
+            && !path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+    };
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if visible_json(&path) {
+            files.push(path);
+        }
+    }
+    let borrowed = root.join("borrowed");
+    if borrowed.try_exists()? {
+        for lender in std::fs::read_dir(borrowed)? {
+            let lender = lender?.path();
+            if !lender.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(lender)? {
+                let path = entry?.path();
+                if visible_json(&path) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    Ok(files)
+}
 pub(super) fn remove_managed_connection(
     path: &Path,
     device: &super::remote::Connection,
@@ -1857,12 +1890,18 @@ fn statusline_identity(
     path: &Path,
     connection: &Connection,
 ) -> Result<crate::statusline::Selection> {
-    Ok(crate::statusline::Selection {
-        alias: path
+    // The file stem of a borrowed connection drops the lender, so prefer the
+    // recorded alias; older connections have only the file name.
+    let alias = match connection.alias.as_ref() {
+        Some(alias) => alias.clone(),
+        None => path
             .file_stem()
             .and_then(|v| v.to_str())
             .context("invalid connection path")?
             .to_owned(),
+    };
+    Ok(crate::statusline::Selection {
+        alias,
         source: crate::statusline::Source::Server {
             server: connection.server.clone(),
             user_id: connection.user_id.clone(),
@@ -1908,7 +1947,7 @@ mod tests {
         billing_switch_prompt, is_billing_approved, remove_active_pointer_audited,
         remove_active_pointer_with, remove_pointer_then_marker_audited,
         remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
-        rollback_or_context, save_connection, validate_token_account,
+        rollback_or_context, save_connection, statusline_identity, validate_token_account,
         write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
@@ -1970,6 +2009,33 @@ mod tests {
             session_id: String::new(),
         };
         assert!(is_billing_approved(&connection, &changed_billing_token()));
+    }
+
+    #[test]
+    fn statusline_identity_keeps_the_borrowed_reference() {
+        let connection = Connection {
+            user_id: Some("borrower".into()),
+            alias: Some("alice/main".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: false,
+            launch_pinned: false,
+            approved_billing_plan: None,
+            approved_billing_class: None,
+            session_id: String::new(),
+        };
+        let path = std::path::Path::new("/central/borrowed/alice/main.json");
+        assert_eq!(
+            statusline_identity(path, &connection).unwrap().alias,
+            "alice/main"
+        );
+        let legacy = Connection {
+            alias: None,
+            ..connection
+        };
+        assert_eq!(statusline_identity(path, &legacy).unwrap().alias, "main");
     }
 
     #[test]

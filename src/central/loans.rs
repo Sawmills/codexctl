@@ -189,6 +189,27 @@ impl AuditEvent {
         }
     }
 
+    /// The event stored together with a new grant.
+    pub(crate) fn granted(grant: &Grant) -> Self {
+        Self {
+            actor: Some(grant.lender.clone()),
+            ..Self::new(grant.created_at, &grant.id, AuditKind::Granted)
+        }
+    }
+
+    /// The event stored together with an ended grant.
+    pub(crate) fn ended(grant: &Grant) -> Self {
+        Self {
+            actor: grant.ended_by.clone(),
+            reason: grant.end_reason.map(|reason| reason.as_str().to_owned()),
+            ..Self::new(
+                grant.ended_at.unwrap_or(grant.ends_at),
+                &grant.id,
+                AuditKind::Ended,
+            )
+        }
+    }
+
     /// One token issue event per grant, machine, and UTC hour.
     pub(super) fn token_issued(at: i64, grant_id: &str, machine: &str) -> Self {
         Self {

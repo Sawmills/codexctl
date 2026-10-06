@@ -32,6 +32,7 @@ struct Fixture {
     broker: Broker,
     base: String,
     weekly_reset: Arc<AtomicI64>,
+    long_window_seconds: Arc<AtomicI64>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     lender: HeaderMap,
     borrower: HeaderMap,
@@ -74,19 +75,22 @@ impl Fixture {
             headers.push(map);
         }
         let weekly_reset = Arc::new(AtomicI64::new(now() + 3 * 24 * 3600));
+        let long_window_seconds = Arc::new(AtomicI64::new(604_800));
         let usage = axum::Router::new().route(
             "/usage",
             axum::routing::get({
                 let weekly_reset = weekly_reset.clone();
+                let long_window_seconds = long_window_seconds.clone();
                 move || {
                     let reset = weekly_reset.load(Ordering::SeqCst);
+                    let long = long_window_seconds.load(Ordering::SeqCst);
                     async move {
                         axum::Json(json!({
                             "plan_type":"pro",
                             "credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},
                             "rate_limit":{"allowed":true,"limit_reached":false,
                                 "primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":reset - 1000},
-                                "secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":reset}}
+                                "secondary_window":{"used_percent":20,"limit_window_seconds":long,"reset_at":reset}}
                         }))
                     }
                 }
@@ -117,6 +121,7 @@ impl Fixture {
             broker,
             base,
             weekly_reset,
+            long_window_seconds,
             tasks,
             lender,
             borrower,
@@ -426,6 +431,19 @@ async fn a_past_weekly_reset_refuses_the_grant() {
 }
 
 #[tokio::test]
+async fn a_long_window_shorter_than_a_week_refuses_the_grant() {
+    let fixture = Fixture::new().await;
+    fixture.long_window_seconds.store(86_400, Ordering::SeqCst);
+    let (status, answer) = fixture
+        .lend(json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}))
+        .await;
+    assert_eq!(
+        (status, answer["error"].clone()),
+        (StatusCode::CONFLICT, json!("weekly_reset_unknown"))
+    );
+}
+
+#[tokio::test]
 async fn an_expired_loan_ends_itself_at_the_next_token_request() {
     let fixture = Fixture::new().await;
     let grant = fixture.lend_main().await;
@@ -650,4 +668,61 @@ async fn the_stored_reference_survives_an_email_change_and_a_twin_is_ambiguous()
         (status, body["error"].clone()),
         (StatusCode::CONFLICT, json!("ambiguous_loan"))
     );
+}
+
+#[tokio::test]
+async fn the_borrowers_dashboard_keeps_working_and_leaves_out_borrowed_accounts() {
+    let fixture = Fixture::new().await;
+    fixture.add_owner(BORROWER, "own", "borrower-login").await;
+    fixture.lend_main().await;
+    let mut broker = fixture.broker.clone();
+    broker.sso = Some(Arc::new(crate::central::enrollment::Sso::testing_session(
+        BORROWER,
+    )));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/accounts/data", listener.local_addr().unwrap());
+    let app = crate::central::dashboard::routes("https://accounts.example").with_state(broker);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let response = reqwest::Client::new()
+        .get(&url)
+        .header("cookie", "codexctl-session=synthetic-session")
+        .send()
+        .await
+        .unwrap();
+    server.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let data: Value = response.json().await.unwrap();
+    let aliases: Vec<_> = data["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|account| account["alias"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(aliases, ["own"]);
+}
+
+#[tokio::test]
+async fn an_automatic_expiry_applies_the_retention() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let store = fixture.broker.loan_store();
+    let id = grant["id"].as_str().unwrap();
+    let mut stored = store.load_loan(id).await.unwrap().unwrap();
+    let old = now() - crate::central::loans::RETENTION_SECONDS - 60;
+    store
+        .end_loan(id, old, "test", crate::central::loans::EndReason::Revoked)
+        .await
+        .unwrap();
+    stored.id = "expiring".into();
+    stored.ends_at = now() - 1;
+    assert!(store.create_loan(&stored).await.unwrap());
+    // The next request expires the second grant and prunes the old one.
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert!(store.load_loan(id).await.unwrap().is_none());
+    assert!(store.load_loan("expiring").await.unwrap().is_some());
 }

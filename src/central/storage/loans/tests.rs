@@ -86,26 +86,34 @@ async fn scenario(store: &CentralStore, prefix: &str) {
             .all(|g| !g.id.starts_with(prefix))
     );
 
-    let issued = AuditEvent::token_issued(2_500, &id("two"), "machine");
-    store.append_loan_audit(&issued).await.unwrap();
+    store
+        .append_loan_audit(&AuditEvent::token_issued(2_500, &id("two"), "machine"))
+        .await
+        .unwrap();
     store
         .append_loan_audit(&AuditEvent::token_issued(2_600, &id("two"), "machine"))
         .await
         .unwrap();
-    store
-        .append_loan_audit(&AuditEvent::new(8_000, &id("two"), AuditKind::Ended))
-        .await
-        .unwrap();
-    let audit = store.loan_audit(&[id("two")]).await.unwrap();
+    let mut audit = store.loan_audit(&[id("one"), id("two")]).await.unwrap();
+    audit.sort_by_key(|event| (event.at, event.grant_id.clone()));
     assert_eq!(
-        audit.iter().map(|e| (e.at, e.kind)).collect::<Vec<_>>(),
-        vec![(2_500, AuditKind::TokenIssued), (8_000, AuditKind::Ended)],
-        "token issue events coalesce per machine and hour"
+        audit
+            .iter()
+            .map(|e| (e.at, e.kind, e.reason.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (1_000, AuditKind::Granted, None),
+            (1_000, AuditKind::Granted, None),
+            (2_000, AuditKind::Ended, Some("returned")),
+            (2_500, AuditKind::TokenIssued, None),
+            (5_000, AuditKind::Ended, Some("expired")),
+        ],
+        "each transition stores its event; token issue events coalesce per machine and hour"
     );
 
     store.prune_loans(3_000 + RETENTION_SECONDS).await.unwrap();
     let audit = store.loan_audit(&[id("two")]).await.unwrap();
-    assert_eq!(audit.iter().map(|e| e.at).collect::<Vec<_>>(), vec![8_000]);
+    assert_eq!(audit.iter().map(|e| e.at).collect::<Vec<_>>(), vec![5_000]);
     assert!(
         store.load_loan(&id("one")).await.unwrap().is_none(),
         "ended 90 days ago"
@@ -130,6 +138,28 @@ async fn file_store_keeps_loans_in_the_encrypted_state() {
         "grants are encrypted at rest"
     );
     assert!(!root.path().join("loans.json").exists());
+}
+
+#[test]
+fn a_delayed_mirror_never_reopens_an_ended_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
+    let file = FileStore {
+        state: root.path().into(),
+        key,
+    };
+    let active = grant("race", "account", 5_000);
+    let mut ended = active.clone();
+    ended.end(2_000, "lender", EndReason::Revoked);
+    file.mirror_loan(&ended, &AuditEvent::ended(&ended))
+        .unwrap();
+    file.mirror_loan(&active, &AuditEvent::granted(&active))
+        .unwrap();
+    assert_eq!(
+        file.read_state().unwrap().loans["race"].end_reason,
+        Some(EndReason::Revoked)
+    );
 }
 
 #[cfg(feature = "central-real-db-tests")]

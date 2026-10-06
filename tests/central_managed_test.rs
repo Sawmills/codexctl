@@ -11087,6 +11087,17 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         String::from_utf8_lossy(&refused.stderr)
     );
 
+    let forgotten = server.cli(home.path(), &["disconnect", "--forget"]);
+    assert!(
+        forgotten.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    assert!(
+        !directory.join("borrowed/amir/personal.json").exists(),
+        "forgetting the registration removes borrowed connections too"
+    );
+
     let audit = server.cli(lender_home.path(), &["loans", "audit", "--json"]);
     let events: Value = serde_json::from_slice(&audit.stdout).unwrap();
     let kinds: Vec<_> = events

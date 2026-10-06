@@ -1357,15 +1357,8 @@ pub fn disconnect(forget: bool) -> Result<()> {
             .collect();
         for connection in &registrations {
             // Remove only this connection's files after the provider is restored.
-            for entry in std::fs::read_dir(root()?)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "json")
-                    && !path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-                {
-                    native::remove_managed_connection(&path, connection)?;
-                }
+            for path in native::connection_files(&root()?)? {
+                native::remove_managed_connection(&path, connection)?;
             }
             // Keep the connection as a durable cleanup reference until its credential
             // is gone. A retry after either removal must tolerate a missing token.

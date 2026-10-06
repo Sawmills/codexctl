@@ -2,7 +2,10 @@
 //!
 //! File mode keeps both in the encrypted `FileState`. PostgreSQL keeps them in
 //! `account_loans` and `account_loan_audit`. Dual mode writes PostgreSQL first
-//! and mirrors to the file.
+//! and mirrors the authoritative grant to the file; an ended grant always wins,
+//! so a delayed mirror can never reopen a loan.
+//!
+//! Every grant, end, and expiry is written together with its audit event.
 use super::{CentralStore, FileStore, PostgresStore, bounded_db};
 use crate::central::loans::{AuditEvent, EndReason, Grant, RETENTION_SECONDS};
 use anyhow::Result;
@@ -24,30 +27,34 @@ fn mirror_failure(store: &CentralStore, stage: &str, error: &anyhow::Error) {
 }
 
 impl CentralStore {
-    /// End every active grant whose end time has passed. Returns the grants
-    /// this call ended, so the caller can audit each one once.
+    /// End every active grant whose end time has passed, each with its audit
+    /// event. Returns the grants this call ended.
     pub async fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
         match self {
             Self::File(file) => file.expire_loans(now),
             Self::Postgres(db) => bounded_db(db.expire_loans(now)).await,
             Self::Dual { file, postgres, .. } => {
                 let expired = bounded_db(postgres.expire_loans(now)).await?;
-                if let Err(error) = file.expire_loans(now) {
-                    mirror_failure(self, "expire_loans", &error);
+                for grant in &expired {
+                    if let Err(error) = file.mirror_loan(grant, &AuditEvent::ended(grant)) {
+                        mirror_failure(self, "expire_loans", &error);
+                    }
                 }
                 Ok(expired)
             }
         }
     }
 
-    /// Insert a grant. Returns false when the account already has an active one.
+    /// Insert a grant with its audit event. Returns false when the account
+    /// already has an active grant.
     pub async fn create_loan(&self, grant: &Grant) -> Result<bool> {
         match self {
             Self::File(file) => file.create_loan(grant),
             Self::Postgres(db) => bounded_db(db.create_loan(grant)).await,
             Self::Dual { file, postgres, .. } => {
                 let created = bounded_db(postgres.create_loan(grant)).await?;
-                if created && let Err(error) = file.create_loan(grant) {
+                if created && let Err(error) = file.mirror_loan(grant, &AuditEvent::granted(grant))
+                {
                     mirror_failure(self, "create_loan", &error);
                 }
                 Ok(created)
@@ -55,7 +62,8 @@ impl CentralStore {
         }
     }
 
-    /// End an active grant. Returns the ended grant only when this call ended it.
+    /// End an active grant with its audit event. Returns the ended grant only
+    /// when this call ended it.
     pub async fn end_loan(
         &self,
         id: &str,
@@ -68,8 +76,8 @@ impl CentralStore {
             Self::Postgres(db) => bounded_db(db.end_loan(id, at, by, reason)).await,
             Self::Dual { file, postgres, .. } => {
                 let ended = bounded_db(postgres.end_loan(id, at, by, reason)).await?;
-                if ended.is_some()
-                    && let Err(error) = file.end_loan(id, at, by, reason)
+                if let Some(grant) = ended.as_ref()
+                    && let Err(error) = file.mirror_loan(grant, &AuditEvent::ended(grant))
                 {
                     mirror_failure(self, "end_loan", &error);
                 }
@@ -170,6 +178,9 @@ impl FileStore {
                     expired.push(grant.clone());
                 }
             }
+            state
+                .loan_audit
+                .extend(expired.iter().map(AuditEvent::ended));
             Ok(expired)
         })
     }
@@ -185,24 +196,54 @@ impl FileStore {
                 return Ok(false);
             }
             state.loans.insert(grant.id.clone(), grant.clone());
+            state.loan_audit.push(AuditEvent::granted(grant));
             Ok(true)
+        })
+    }
+
+    /// Copy an authoritative grant and its event into the file mirror. An
+    /// ended copy is terminal: a delayed active copy never replaces it.
+    fn mirror_loan(&self, grant: &Grant, event: &AuditEvent) -> Result<()> {
+        self.with_lock(|state| {
+            if state
+                .loans
+                .get(&grant.id)
+                .is_none_or(|existing| existing.ended_at.is_none())
+            {
+                state.loans.insert(grant.id.clone(), grant.clone());
+            }
+            state.loan_audit.push(event.clone());
+            Ok(())
         })
     }
 
     fn end_loan(&self, id: &str, at: i64, by: &str, reason: EndReason) -> Result<Option<Grant>> {
         self.with_lock(|state| {
-            Ok(state
+            let ended = state
                 .loans
                 .get_mut(id)
                 .filter(|grant| grant.ended_at.is_none())
                 .map(|grant| {
                     grant.end(at, by, reason);
                     grant.clone()
-                }))
+                });
+            state.loan_audit.extend(ended.iter().map(AuditEvent::ended));
+            Ok(ended)
         })
     }
 
     fn append_loan_audit(&self, event: &AuditEvent) -> Result<()> {
+        // Most token issue events are duplicates; skip the encrypted rewrite.
+        let duplicate = |state: &super::FileState| {
+            event.coalesce_key.is_some()
+                && state
+                    .loan_audit
+                    .iter()
+                    .any(|existing| existing.coalesce_key == event.coalesce_key)
+        };
+        if duplicate(&self.read_state()?) {
+            return Ok(());
+        }
         self.with_lock(|state| {
             if event.coalesce_key.is_none()
                 || !state
@@ -247,23 +288,33 @@ impl PostgresStore {
         Ok(expired)
     }
 
-    /// Persist an ended grant once; a concurrent end wins and returns false.
+    /// Persist an ended grant and its event in one statement. A concurrent
+    /// end wins and this returns false.
     async fn store_end(&self, grant: &Grant) -> Result<bool> {
+        let event = AuditEvent::ended(grant);
         let client = self.client().await?;
         let changed = client
             .execute(
-                "UPDATE account_loans SET ended_at=$2, grant_json=$3 WHERE id=$1 AND ended_at IS NULL",
-                &[&grant.id, &grant.ended_at, &serde_json::to_string(grant)?],
+                "WITH ended AS (UPDATE account_loans SET ended_at=$2, grant_json=$3 WHERE id=$1 AND ended_at IS NULL RETURNING id) INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT id,$4,NULL,$5 FROM ended",
+                &[
+                    &grant.id,
+                    &grant.ended_at,
+                    &serde_json::to_string(grant)?,
+                    &event.at,
+                    &serde_json::to_string(&event)?,
+                ],
             )
             .await?;
         Ok(changed == 1)
     }
 
+    /// Insert a grant and its event in one statement.
     async fn create_loan(&self, grant: &Grant) -> Result<bool> {
+        let event = AuditEvent::granted(grant);
         let client = self.client().await?;
         let changed = client
             .execute(
-                "INSERT INTO account_loans(id,account_id,lender_id,borrower_id,ends_at,ended_at,grant_json) VALUES($1,$2,$3,$4,$5,NULL,$6) ON CONFLICT DO NOTHING",
+                "WITH created AS (INSERT INTO account_loans(id,account_id,lender_id,borrower_id,ends_at,ended_at,grant_json) VALUES($1,$2,$3,$4,$5,NULL,$6) ON CONFLICT DO NOTHING RETURNING id) INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT id,$7,NULL,$8 FROM created",
                 &[
                     &grant.id,
                     &grant.account_id,
@@ -271,6 +322,8 @@ impl PostgresStore {
                     &grant.borrower,
                     &grant.ends_at,
                     &serde_json::to_string(grant)?,
+                    &event.at,
+                    &serde_json::to_string(&event)?,
                 ],
             )
             .await?;
