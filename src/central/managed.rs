@@ -1182,9 +1182,12 @@ async fn token(
                             }
                             Err(error) => {
                                 retain_lease = true;
-                                owner.available = false;
-                                owner.routing_refused = true;
-                                owner.refresh_enabled = false;
+                                // Preserve the token outcome until the deferred
+                                // settlement is classified below. This DB error
+                                // is not a permanent routing refusal.
+                                restore_after_settlement = token_result.is_ok()
+                                    && owner.available
+                                    && !owner.routing_refused;
                                 eprintln!("central fenced write deferred: {error:#}");
                                 return Err(worker
                                     .error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
@@ -2475,10 +2478,19 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             owner.retry_started = Some(owner.retry_clock_now());
                         }
                     }
-                    if local_saved {
-                        fence_background_probe(&mut owner);
+                    let recovery = if probe_ok && local_saved {
+                        SettlementRecovery::Available
+                    } else if local_saved && owner.retryable_unavailable && !owner.routing_refused {
+                        SettlementRecovery::Retryable
                     } else {
+                        SettlementRecovery::Fenced
+                    };
+                    if lease.is_some() || !local_saved {
+                        // Reserve this owner until settlement finishes. A second
+                        // same-holder acquire would invalidate the retained epoch.
                         fence_background_owner(&mut owner);
+                    } else {
+                        fence_background_probe(&mut owner);
                     }
                     let recovery_generation = owner.recovery_generation;
                     let owner_ref = owner_ref.clone();
@@ -2489,11 +2501,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         central,
                         lease,
                         before,
-                        if probe_ok && local_saved {
-                            SettlementRecovery::Available
-                        } else {
-                            SettlementRecovery::Fenced
-                        },
+                        recovery,
                         recovery_generation,
                         permit,
                         renew_done,
@@ -2604,6 +2612,12 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 }
                 eprintln!("central background owner recovery failed: {error:#}");
                 if lease.is_some() {
+                    let recovery = if owner.retryable_unavailable && !owner.routing_refused {
+                        SettlementRecovery::Retryable
+                    } else {
+                        SettlementRecovery::Fenced
+                    };
+                    fence_background_owner(&mut owner);
                     let recovery_generation = owner.recovery_generation;
                     drop(owner);
                     tokio::spawn(settle_background_recovery(
@@ -2611,7 +2625,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         central.clone(),
                         lease.clone(),
                         before,
-                        SettlementRecovery::Fenced,
+                        recovery,
                         recovery_generation,
                         permit,
                         renew_done,

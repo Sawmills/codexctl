@@ -341,6 +341,237 @@ async fn retryable_token_failure_can_recover_after_deferred_child_shutdown() {
         .unwrap();
 }
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn transient_token_write_errors_preserve_the_settled_recovery_outcome() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for mode in ["startup", "billing-error-marked", "routing-missing"] {
+        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        let initial = CentralStore::from_mode(
+            StoreMode::Postgres,
+            &fixture.broker.state,
+            &fixture.broker.key,
+        )
+        .await
+        .unwrap();
+        let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+        fixture
+            .attach_refresh_store_using(central.clone(), mode)
+            .await;
+        control.batch_execute(&format!("CREATE SEQUENCE {schema}.write_attempts;
+            CREATE FUNCTION {schema}.fail_three_writes() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN IF nextval('{schema}.write_attempts') <= 3 THEN RAISE EXCEPTION 'synthetic transient write failure'; END IF; RETURN NULL; END $$;
+            CREATE TRIGGER fail_three_writes BEFORE UPDATE ON {schema}.central_accounts FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_three_writes();")).await.unwrap();
+        assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.broker.work.clone().acquire_many_owned(128),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(drained);
+        let attempts: i64 = control
+            .query_one(
+                &format!("SELECT last_value FROM {schema}.write_attempts"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            attempts >= 4,
+            "three failed writes must reach deferred settlement"
+        );
+        let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+        {
+            let mut owner = owner_ref.lock().await;
+            assert_eq!(
+                owner.available,
+                mode == "startup",
+                "{mode}: settlement availability"
+            );
+            assert_eq!(
+                owner.routing_refused,
+                mode == "routing-missing",
+                "{mode}: preserve only a real routing refusal"
+            );
+            let committed = central
+                .load_account(&account_key("test", "fixture"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.vault, serde_json::to_value(&owner.vault).unwrap());
+            owner.retry_clock = Some(Arc::new(|| 60_000));
+            owner.retry_started = Some(0);
+        }
+        store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+        if mode == "billing-error-marked" {
+            recover_unhealthy_owners(&fixture.broker).await;
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.broker.work.clone().acquire_many_owned(128),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(drained);
+        }
+        assert_eq!(
+            fixture.token().await,
+            if mode == "routing-missing" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        );
+        let drained = fixture
+            .broker
+            .session_writes
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        central.settle_test_observations().await.unwrap();
+        drop(drained);
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn pending_background_settlement_cannot_reacquire_its_own_lease() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for mode in ["startup", "billing-error-marked", "startup-error"] {
+        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        let initial = CentralStore::from_mode(
+            StoreMode::Postgres,
+            &fixture.broker.state,
+            &fixture.broker.key,
+        )
+        .await
+        .unwrap();
+        let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+        fixture
+            .attach_refresh_store_using(central.clone(), "")
+            .await;
+        let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+        {
+            let mut owner = owner_ref.lock().await;
+            owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+            owner.rpc = None;
+            owner.fence(true);
+            owner.retry_requires_billing = true;
+            owner.retry_started = Some(0);
+            owner.retry_clock = Some(Arc::new(|| 1_000_000));
+        }
+        store::atomic_write(&fixture._root.path().join("mode"), mode.as_bytes()).unwrap();
+        control.batch_execute(&format!("CREATE SEQUENCE {schema}.write_attempts;
+            CREATE FUNCTION {schema}.fail_settlement() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM nextval('{schema}.write_attempts'); RAISE EXCEPTION 'synthetic persistent write failure'; END $$;
+            CREATE TRIGGER fail_settlement BEFORE UPDATE ON {schema}.central_accounts FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_settlement();")).await.unwrap();
+        recover_unhealthy_owners(&fixture.broker).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let attempted: bool = control
+                    .query_one(
+                        &format!("SELECT is_called FROM {schema}.write_attempts"),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if attempted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let epoch: i64 = control
+            .query_one(
+                &format!("SELECT epoch FROM {schema}.account_refresh_leases"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        owner_ref.lock().await.retry_started = Some(0);
+        recover_unhealthy_owners(&fixture.broker).await;
+        let after: i64 = control
+            .query_one(
+                &format!("SELECT epoch FROM {schema}.account_refresh_leases"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        control
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_settlement ON {schema}.central_accounts"
+            ))
+            .await
+            .unwrap();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.broker.work.clone().acquire_many_owned(128),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(drained);
+        assert_eq!(
+            after, epoch,
+            "{mode}: recovery must not replace an unsettled epoch"
+        );
+        assert!(
+            !owner_ref.lock().await.routing_refused,
+            "{mode}: settlement must preserve future recovery"
+        );
+        if mode != "startup" {
+            store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+            owner_ref.lock().await.retry_started = Some(0);
+            recover_unhealthy_owners(&fixture.broker).await;
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.broker.work.clone().acquire_many_owned(128),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(drained);
+        }
+        assert!(
+            owner_ref.lock().await.available,
+            "{mode}: owner must recover after persistence returns"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
     let response = accounts(State(broker), headers)
         .await
