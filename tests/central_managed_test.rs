@@ -7750,6 +7750,7 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
             statusline_usage: None,
             live_sessions: Some(0),
             recent_429_rate: None,
+            loan: None,
         }
     };
     let selected = central::remote::select(&[
@@ -7791,6 +7792,7 @@ fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
             live_sessions: Some(live_sessions),
             recent_429_rate,
             credits: None,
+            loan: None,
         }
     };
 

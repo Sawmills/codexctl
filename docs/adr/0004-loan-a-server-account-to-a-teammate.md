@@ -78,8 +78,9 @@ an active grant to the lender's existing `Owner`. Only `/v1/token` and the
 catalog call it, so the refresh lease, the credential revision, and the refresh
 path stay single. In PostgreSQL mode it loads the lender's account with
 `load_account_by_alias(lender, alias)`. If the lender's alias no longer
-exists, the grant ends with reason `account_removed`; a re-import with the same
-alias makes the same account key but needs a new grant.
+resolves, the grant ends with reason `account_removed`. A re-import under the
+same alias before that check makes the same account key, so the grant goes on
+only while the credential subject matches; a different login pauses it.
 
 ## Who May Do What
 

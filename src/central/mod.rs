@@ -4,6 +4,7 @@ mod catalog;
 mod client;
 mod dashboard;
 pub mod enrollment;
+pub mod loans;
 pub mod managed;
 pub mod native;
 mod process;

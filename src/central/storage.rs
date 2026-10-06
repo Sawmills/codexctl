@@ -20,6 +20,8 @@ use std::{
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod loans;
+
 async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(DB_TIMEOUT, future)
         .await
@@ -95,6 +97,10 @@ struct FileState {
     accounts: BTreeMap<String, Vec<u8>>,
     leases: BTreeMap<String, FileLeaseOnDisk>,
     enrollments: BTreeMap<String, EnrollmentOnDisk>,
+    #[serde(default)]
+    loans: BTreeMap<String, super::loans::Grant>,
+    #[serde(default)]
+    loan_audit: Vec<super::loans::AuditEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,9 +232,39 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
+CREATE TABLE IF NOT EXISTS account_loans (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    lender_id TEXT NOT NULL,
+    borrower_id TEXT NOT NULL,
+    ends_at BIGINT NOT NULL,
+    ended_at BIGINT,
+    grant_json TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS account_loans_one_active
+    ON account_loans (account_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loans_lender_idx ON account_loans (lender_id);
+CREATE INDEX IF NOT EXISTS account_loans_borrower_idx ON account_loans (borrower_id);
+CREATE TABLE IF NOT EXISTS account_loan_audit (
+    id BIGSERIAL PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    at BIGINT NOT NULL,
+    coalesce_key TEXT UNIQUE,
+    event_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS account_loan_audit_grant_idx ON account_loan_audit (grant_id, at);
+CREATE INDEX IF NOT EXISTS account_loan_audit_at_idx ON account_loan_audit (at);
 "#;
 
 impl CentralStore {
+    /// File storage at the account server's state directory.
+    pub(super) fn file(state: &Path, key: &Path) -> Self {
+        Self::File(FileStore {
+            state: state.into(),
+            key: key.into(),
+        })
+    }
+
     #[cfg(all(test, feature = "central-real-db-tests"))]
     pub(super) async fn settle_test_observations(&self) -> Result<()> {
         if let Self::Postgres(db) | Self::Dual { postgres: db, .. } = self {

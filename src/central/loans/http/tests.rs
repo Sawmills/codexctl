@@ -1,0 +1,653 @@
+//! Loans through the real API routes with synthetic users and accounts.
+use crate::central::{
+    catalog,
+    managed::{AccountIndex, Broker, account_key, prepare_owner, record_user, users},
+    vault::{self, Vault},
+};
+use axum::http::{HeaderMap, StatusCode};
+use serde_json::{Value, json};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
+
+const LENDER: &str = "lender";
+const BORROWER: &str = "borrower";
+const STRANGER: &str = "stranger";
+
+fn auth(login: &str, seat: &str) -> Value {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let claims = json!({"sub":login,"iat":2_000_000_000_i64,"https://api.openai.com/auth":{"chatgpt_account_id":seat}});
+    json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())),"refresh_token":"synthetic-refresh","account_id":seat}})
+}
+
+struct Fixture {
+    _root: tempfile::TempDir,
+    state: PathBuf,
+    key: PathBuf,
+    broker: Broker,
+    base: String,
+    weekly_reset: Arc<AtomicI64>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    lender: HeaderMap,
+    borrower: HeaderMap,
+    stranger: HeaderMap,
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+impl Fixture {
+    async fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let key = root.path().join("key");
+        crate::central::managed::setup(&state, &key).unwrap();
+        let mut headers = Vec::new();
+        for (user, email) in [
+            (LENDER, "Alice@sawmills.ai"),
+            (BORROWER, "bob@sawmills.ai"),
+            (STRANGER, "carol@sawmills.ai"),
+        ] {
+            record_user(&state, user, email).unwrap();
+            let credential = root.path().join(format!("{user}-machine"));
+            crate::central::register(
+                &state,
+                &format!("{user}-machine"),
+                "sawmills",
+                user,
+                &credential,
+            )
+            .unwrap();
+            let mut map = HeaderMap::new();
+            map.insert(
+                "authorization",
+                format!("Bearer {}", std::fs::read_to_string(credential).unwrap())
+                    .parse()
+                    .unwrap(),
+            );
+            headers.push(map);
+        }
+        let weekly_reset = Arc::new(AtomicI64::new(now() + 3 * 24 * 3600));
+        let usage = axum::Router::new().route(
+            "/usage",
+            axum::routing::get({
+                let weekly_reset = weekly_reset.clone();
+                move || {
+                    let reset = weekly_reset.load(Ordering::SeqCst);
+                    async move {
+                        axum::Json(json!({
+                            "plan_type":"pro",
+                            "credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},
+                            "rate_limit":{"allowed":true,"limit_reached":false,
+                                "primary_window":{"used_percent":10,"limit_window_seconds":18000,"reset_at":reset - 1000},
+                                "secondary_window":{"used_percent":20,"limit_window_seconds":604800,"reset_at":reset}}
+                        }))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/usage", listener.local_addr().unwrap());
+        let mut tasks = vec![tokio::spawn(async move {
+            axum::serve(listener, usage).await.unwrap();
+        })];
+        let broker = Broker::testing(
+            state.clone(),
+            key.clone(),
+            Vec::new(),
+            catalog::Reader::testing(endpoint, Duration::from_secs(2)),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::central::managed::api_routes().with_state(broker.clone());
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        }));
+        let [lender, borrower, stranger] = headers.try_into().unwrap();
+        let fixture = Self {
+            _root: root,
+            state,
+            key,
+            broker,
+            base,
+            weekly_reset,
+            tasks,
+            lender,
+            borrower,
+            stranger,
+        };
+        fixture.add_owner(LENDER, "main", "synthetic-login").await;
+        fixture
+    }
+
+    async fn add_owner(&self, user: &str, alias: &str, login: &str) {
+        let key = account_key(user, alias);
+        // A fresh state directory per login, as a renewed owner would get.
+        let account = self.state.join("accounts").join(format!("{key}-{login}"));
+        crate::store::ensure_private_dir(&account).unwrap();
+        vault::save(
+            &account,
+            &self.key,
+            &Vault {
+                user: user.into(),
+                tenant: "sawmills".into(),
+                alias: alias.into(),
+                label: None,
+                auth: auth(login, &format!("seat-{user}-{alias}")),
+                verified: true,
+                import_rejected: false,
+                revision: 0,
+            },
+        )
+        .unwrap();
+        let owner = prepare_owner(&account, &self.key, true).unwrap();
+        self.broker.owners.write().await.insert(
+            key,
+            (
+                AccountIndex {
+                    user: user.into(),
+                    alias: alias.into(),
+                },
+                Arc::new(tokio::sync::Mutex::new(owner)),
+            ),
+        );
+    }
+
+    async fn owner(
+        &self,
+        user: &str,
+        alias: &str,
+    ) -> Arc<tokio::sync::Mutex<crate::central::server::Owner>> {
+        self.broker.owners.read().await[&account_key(user, alias)]
+            .1
+            .clone()
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &HeaderMap,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let client = reqwest::Client::new();
+        let url = format!("{}{path}", self.base);
+        let request = match method {
+            "GET" => client.get(url),
+            _ => client.post(url).json(&body),
+        };
+        let response = request.headers(headers.clone()).send().await.unwrap();
+        let status = response.status();
+        let text = response.text().await.unwrap();
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    async fn lend(&self, body: Value) -> (StatusCode, Value) {
+        self.call("POST", "/v1/loans", &self.lender, body).await
+    }
+
+    async fn lend_main(&self) -> Value {
+        let (status, grant) = self
+            .lend(json!({"alias":"main","borrowerEmail":"BOB@sawmills.ai"}))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{grant}");
+        grant
+    }
+
+    async fn token(&self, headers: &HeaderMap, alias: &str) -> (StatusCode, Value) {
+        self.call("POST", "/v1/token", headers, json!({"alias":alias}))
+            .await
+    }
+
+    async fn catalog(&self, headers: &HeaderMap) -> Vec<Value> {
+        let (status, body) = self.call("GET", "/v1/accounts", headers, Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array().unwrap().clone()
+    }
+
+    async fn end(&self, headers: &HeaderMap, id: &str) -> (StatusCode, Value) {
+        self.call("POST", "/v1/loans/end", headers, json!({"id":id}))
+            .await
+    }
+
+    async fn audit(&self, headers: &HeaderMap) -> Vec<Value> {
+        let (status, body) = self
+            .call("GET", "/v1/loans/audit", headers, Value::Null)
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body.as_array().unwrap().clone()
+    }
+
+    fn set_user(&self, id: &str, change: impl FnOnce(&mut crate::central::managed::User)) {
+        let mut all = users(&self.state).unwrap();
+        change(all.iter_mut().find(|user| user.id == id).unwrap());
+        crate::store::atomic_write(
+            &self.state.join("users.json"),
+            &serde_json::to_vec(&all).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+fn kinds(events: &[Value]) -> Vec<String> {
+    events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_borrower_sees_and_uses_a_loaned_account_until_the_lender_ends_it() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    assert_eq!(grant["reference"], "alice/main");
+    assert_eq!(grant["endsAt"], fixture.weekly_reset.load(Ordering::SeqCst));
+
+    let borrowed = fixture.catalog(&fixture.borrower).await;
+    assert_eq!(borrowed.len(), 1);
+    assert_eq!(borrowed[0]["alias"], "alice/main");
+    assert_eq!(borrowed[0]["userId"], BORROWER);
+    assert_eq!(borrowed[0]["loan"]["lenderEmail"], "Alice@sawmills.ai");
+    assert_eq!(borrowed[0]["loan"]["endsAt"], grant["endsAt"]);
+    let lent = fixture.catalog(&fixture.lender).await;
+    assert_eq!(lent[0]["alias"], "main");
+    assert!(lent[0].get("loan").is_none());
+    assert!(fixture.catalog(&fixture.stranger).await.is_empty());
+
+    let (status, token) = fixture.token(&fixture.borrower, "ALICE/Main").await;
+    assert_eq!(status, StatusCode::OK, "{token}");
+    assert_eq!(token["userId"], BORROWER);
+    assert_eq!(token["chatgptAccountId"], "seat-lender-main");
+    assert_eq!(
+        fixture.token(&fixture.stranger, "alice/main").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Both users count on the one shared account.
+    assert_eq!(
+        fixture.token(&fixture.lender, "main").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(fixture.catalog(&fixture.lender).await[0]["liveSessions"], 2);
+    assert_eq!(
+        fixture.catalog(&fixture.borrower).await[0]["liveSessions"],
+        2
+    );
+
+    let (status, ended) = fixture
+        .end(&fixture.lender, grant["id"].as_str().unwrap())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{ended}");
+    assert_eq!(ended["endReason"], "revoked");
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::FORBIDDEN, json!("loan_ended"))
+    );
+    assert!(fixture.catalog(&fixture.borrower).await.is_empty());
+    assert_eq!(
+        fixture
+            .end(&fixture.borrower, grant["id"].as_str().unwrap())
+            .await
+            .0,
+        StatusCode::OK,
+        "ending an ended loan is idempotent"
+    );
+    assert_eq!(
+        fixture
+            .end(&fixture.stranger, grant["id"].as_str().unwrap())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    for headers in [&fixture.lender, &fixture.borrower] {
+        assert_eq!(
+            kinds(&fixture.audit(headers).await),
+            ["granted", "token_issued", "ended"]
+        );
+    }
+    assert!(fixture.audit(&fixture.stranger).await.is_empty());
+    let (status, loans) = fixture
+        .call("GET", "/v1/loans", &fixture.borrower, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(loans[0]["id"], grant["id"]);
+}
+
+#[tokio::test]
+async fn the_borrower_can_return_a_loan_and_a_renewal_is_a_new_grant() {
+    let fixture = Fixture::new().await;
+    let first = fixture.lend_main().await;
+    let (status, returned) = fixture
+        .end(&fixture.borrower, first["id"].as_str().unwrap())
+        .await;
+    assert_eq!(
+        (status, returned["endReason"].clone()),
+        (StatusCode::OK, json!("returned"))
+    );
+    let second = fixture.lend_main().await;
+    assert_ne!(first["id"], second["id"]);
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn grant_rules_are_enforced_by_the_server() {
+    let fixture = Fixture::new().await;
+    let reset = fixture.weekly_reset.load(Ordering::SeqCst);
+    let cases = [
+        (
+            json!({"alias":"main","borrowerEmail":"nobody@sawmills.ai"}),
+            StatusCode::NOT_FOUND,
+            "borrower_not_found",
+        ),
+        (
+            json!({"alias":"main","borrowerEmail":"alice@sawmills.ai"}),
+            StatusCode::BAD_REQUEST,
+            "self_loan",
+        ),
+        (
+            json!({"alias":"main","borrowerEmail":"bob@sawmills.ai","until":reset + 1}),
+            StatusCode::BAD_REQUEST,
+            "loan_end_after_weekly_reset",
+        ),
+        (
+            json!({"alias":"main","borrowerEmail":"bob@sawmills.ai","until":now() - 1}),
+            StatusCode::BAD_REQUEST,
+            "loan_end_in_past",
+        ),
+        (
+            json!({"alias":"other","borrowerEmail":"bob@sawmills.ai"}),
+            StatusCode::NOT_FOUND,
+            "account_not_found",
+        ),
+        (
+            json!({"alias":"x/main","borrowerEmail":"bob@sawmills.ai"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_alias",
+        ),
+    ];
+    for (body, status, reason) in cases {
+        let (got, answer) = fixture.lend(body.clone()).await;
+        assert_eq!(
+            (got, answer["error"].clone()),
+            (status, json!(reason)),
+            "{body}"
+        );
+    }
+    // Only the lender can lend the account.
+    let (status, _) = fixture
+        .call(
+            "POST",
+            "/v1/loans",
+            &fixture.borrower,
+            json!({"alias":"main","borrowerEmail":"carol@sawmills.ai"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    fixture.lend_main().await;
+    let (status, answer) = fixture
+        .lend(json!({"alias":"main","borrowerEmail":"carol@sawmills.ai"}))
+        .await;
+    assert_eq!(
+        (status, answer["error"].clone()),
+        (StatusCode::CONFLICT, json!("loan_exists"))
+    );
+}
+
+#[tokio::test]
+async fn a_past_weekly_reset_refuses_the_grant() {
+    let fixture = Fixture::new().await;
+    fixture.weekly_reset.store(now() - 60, Ordering::SeqCst);
+    let (status, answer) = fixture
+        .lend(json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}))
+        .await;
+    assert_eq!(
+        (status, answer["error"].clone()),
+        (StatusCode::CONFLICT, json!("weekly_reset_unknown"))
+    );
+}
+
+#[tokio::test]
+async fn an_expired_loan_ends_itself_at_the_next_token_request() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let store = fixture.broker.loan_store();
+    let id = grant["id"].as_str().unwrap();
+    let mut stored = store.load_loan(id).await.unwrap().unwrap();
+    // Move the end into the past through the store, as time would.
+    store
+        .end_loan(id, 0, "test", crate::central::loans::EndReason::Revoked)
+        .await
+        .unwrap();
+    store.prune_loans(i64::MAX / 2).await.unwrap();
+    stored.ends_at = now() - 1;
+    assert!(store.create_loan(&stored).await.unwrap());
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::FORBIDDEN, json!("loan_ended"))
+    );
+    let expired = store.load_loan(id).await.unwrap().unwrap();
+    assert_eq!(
+        expired.end_reason,
+        Some(crate::central::loans::EndReason::Expired)
+    );
+    assert!(kinds(&fixture.audit(&fixture.lender).await).contains(&"ended".to_owned()));
+}
+
+#[tokio::test]
+async fn a_disabled_lender_or_a_changed_login_pauses_the_loan() {
+    let fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    fixture.set_user(LENDER, |user| user.enabled = false);
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("loan_paused"))
+    );
+    let paused = fixture.catalog(&fixture.borrower).await;
+    assert_eq!(
+        (
+            paused[0]["available"].clone(),
+            paused[0]["loan"]["paused"].clone()
+        ),
+        (json!(false), json!("lender_disabled"))
+    );
+    fixture.set_user(LENDER, |user| user.enabled = true);
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+
+    // A login renewal to another login replaces the lender's owner.
+    fixture.add_owner(LENDER, "main", "another-login").await;
+    assert_eq!(
+        fixture.token(&fixture.lender, "main").await.0,
+        StatusCode::OK
+    );
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("loan_paused"))
+    );
+    assert!(kinds(&fixture.audit(&fixture.borrower).await).contains(&"paused".to_owned()));
+}
+
+#[tokio::test]
+async fn a_removed_lender_alias_ends_the_loan() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    fixture.broker.owners.write().await.clear();
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::FORBIDDEN, json!("loan_ended"))
+    );
+    let stored = fixture
+        .broker
+        .loan_store()
+        .load_loan(grant["id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.end_reason,
+        Some(crate::central::loans::EndReason::AccountRemoved)
+    );
+}
+
+#[tokio::test]
+async fn lender_only_paths_refuse_a_borrowed_reference() {
+    let fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    let id = "0".repeat(64);
+    for (path, body) in [
+        (
+            "/v1/resets/redeem",
+            json!({"alias":"alice/main","redeem_request_id":"r"}),
+        ),
+        ("/v1/relogin/start", json!({"alias":"alice/main","id":id})),
+        ("/v1/relogin/status", json!({"alias":"alice/main","id":id})),
+        ("/v1/relogin/cancel", json!({"alias":"alice/main","id":id})),
+        (
+            "/v1/accounts",
+            json!({"alias":"alice/main","label":null,"auth":auth("x","y")}),
+        ),
+    ] {
+        let (status, answer) = fixture.call("POST", path, &fixture.borrower, body).await;
+        assert!(
+            matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND),
+            "{path}: {status} {answer}"
+        );
+    }
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_loan_that_ends_during_the_refresh_delivers_no_token() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let owner = fixture.owner(LENDER, "main").await;
+    let held = owner.lock().await;
+    let request = {
+        let base = fixture.base.clone();
+        let headers = fixture.borrower.clone();
+        tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{base}/v1/token"))
+                .headers(headers)
+                .json(&json!({"alias":"alice/main"}))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture.broker.work.available_permits() == 128 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("token request reached the owner");
+    assert_eq!(
+        fixture
+            .end(&fixture.lender, grant["id"].as_str().unwrap())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    drop(held);
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "loan_ended"
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_borrower_machine_gets_no_token() {
+    let fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    let mut devices = vault::devices(&fixture.state).unwrap();
+    devices
+        .iter_mut()
+        .filter(|d| d.user == BORROWER)
+        .for_each(|d| d.revoked = true);
+    vault::save_devices(&fixture.state, &devices).unwrap();
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn the_stored_reference_survives_an_email_change_and_a_twin_is_ambiguous() {
+    let fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    fixture.set_user(LENDER, |user| user.email = "a.smith@sawmills.ai".into());
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        fixture.token(&fixture.borrower, "a.smith/main").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // A new user with the old local part cannot take over the reference
+    // silently: two grants with one reference are refused.
+    record_user(&fixture.state, "twin", "alice@other.example").unwrap();
+    let credential = fixture.state.join("../twin-machine");
+    crate::central::register(
+        &fixture.state,
+        "twin-machine",
+        "sawmills",
+        "twin",
+        &credential,
+    )
+    .unwrap();
+    let mut twin = HeaderMap::new();
+    twin.insert(
+        "authorization",
+        format!("Bearer {}", std::fs::read_to_string(credential).unwrap())
+            .parse()
+            .unwrap(),
+    );
+    fixture.add_owner("twin", "main", "twin-login").await;
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/loans",
+            &twin,
+            json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("ambiguous_loan"))
+    );
+}
