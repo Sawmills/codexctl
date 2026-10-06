@@ -161,6 +161,159 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn lease_loss_terminates_import_verification_before_provider_rotation() {
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    fixture.attach_refresh_store("lease-loss-hold").await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let mut owner = owner_ref.lock().await;
+    let revision = owner.snapshot().unwrap().revision;
+    let lost = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let mut verification = Box::pin(lease_guarded_verification(
+        async {
+            owner
+                .tokens(TokenRequest {
+                    previous_revision: Some(revision),
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    fixture
+                        .broker
+                        .error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })
+        },
+        lost.clone(),
+        signal.clone(),
+    ));
+    let started = fixture._root.path().join("refresh-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if started.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "verification did not start"
+        );
+        tokio::select! {
+            result = &mut verification => panic!("verification completed before lease loss: {}", result.is_ok()),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    lost.store(true, Ordering::Release);
+    signal.notify_waiters();
+    let result = verification.await;
+    assert!(result.is_err(), "lease loss must reject verification");
+    terminate_lost_import(&mut owner).await;
+    assert!(
+        owner.rpc.is_none(),
+        "the lost import RPC must be terminated"
+    );
+    assert!(!owner.available);
+    assert!(owner.routing_refused);
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "0"
+    );
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn import_account_fences_when_lease_is_lost_during_verification() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "lease-loss-hold")
+        .await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    let account = account_key("test", "fixture");
+    let worker = fixture.broker.clone();
+    let task = tokio::spawn(async move {
+        let permit = worker.work.clone().acquire_owned().await.unwrap();
+        worker
+            .import_account(
+                permit,
+                "test",
+                Import {
+                    alias: "fixture".into(),
+                    label: None,
+                    auth,
+                },
+            )
+            .await
+    });
+    let started = fixture._root.path().join("refresh-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "import verification did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    control
+        .execute(
+            "UPDATE account_refresh_leases SET expires_at=now() WHERE account_id=$1",
+            &[&account],
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(12), task)
+        .await
+        .expect("lease loss must stop import verification")
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "expired import lease must fence verification"
+    );
+    let successor = central
+        .acquire_lease(&account, "successor", IMPORT_LEASE_TTL)
+        .await
+        .unwrap();
+    central.release_lease(&successor).await.unwrap();
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let owner = owner_ref.lock().await;
+    assert!(
+        owner.rpc.is_none(),
+        "expired import child must be terminated"
+    );
+    assert!(!owner.available);
+    assert!(owner.routing_refused);
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "0"
+    );
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     let fixture = Fixture::new(Duration::from_secs(1)).await;
     let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
@@ -174,6 +327,7 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     }
     settle_background_recovery(
         owner_ref.clone(),
+        None,
         None,
         None,
         before,
@@ -236,6 +390,7 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
                     owner_ref.clone(),
                     Some(central.clone()),
                     Some(lease.clone()),
+                    None,
                     before,
                     SettlementRecovery::Available,
                     0,
@@ -570,6 +725,223 @@ async fn pending_background_settlement_cannot_reacquire_its_own_lease() {
             .await
             .unwrap();
     }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "startup")
+        .await;
+    let old_owners = fixture.broker.owners.read().await.clone();
+    let old_owner = old_owners["fixture"].1.clone();
+    let auth = old_owner.lock().await.vault.auth.clone();
+    fixture
+        .broker
+        .import_account(
+            fixture.broker.work.clone().acquire_owned().await.unwrap(),
+            "test",
+            Import {
+                alias: "fixture".into(),
+                label: None,
+                auth,
+            },
+        )
+        .await
+        .unwrap_or_else(|_| panic!("verified reimport must succeed"));
+    assert!(!Arc::ptr_eq(
+        &old_owner,
+        &fixture.broker.owners.read().await["fixture"].1
+    ));
+    let count = std::fs::read_to_string(fixture._root.path().join("count")).unwrap();
+    // A request can resolve the old Arc before waiting for import admission.
+    // Keep that exact registry snapshot and exercise the public token handler.
+    let current = fixture.broker.owners.clone();
+    fixture.broker.owners = Arc::new(RwLock::new(old_owners));
+    assert_eq!(
+        fixture.token().await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the replaced owner must never regain the same-holder database lease"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        count,
+        "the orphan must not refresh credentials"
+    );
+    fixture.broker.owners = current;
+    assert_eq!(
+        fixture.token().await,
+        StatusCode::OK,
+        "the replacement remains usable"
+    );
+    let drained = fixture
+        .broker
+        .session_writes
+        .clone()
+        .acquire_many_owned(32)
+        .await
+        .unwrap();
+    central.settle_test_observations().await.unwrap();
+    drop(drained);
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn verified_reimport_retryable_probe_recovers_after_settlement() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central, "billing-error-marked")
+        .await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    assert!(
+        fixture
+            .broker
+            .import_account(
+                fixture.broker.work.clone().acquire_owned().await.unwrap(),
+                "test",
+                Import {
+                    alias: "fixture".into(),
+                    label: None,
+                    auth
+                }
+            )
+            .await
+            .is_err()
+    );
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        assert!(!owner.available, "probe must succeed before token delivery");
+        assert!(owner.retryable_unavailable);
+        assert!(
+            !owner.routing_refused,
+            "settled verified reimport must remain recoverable"
+        );
+        owner.retry_clock = Some(Arc::new(|| 60_000));
+        owner.retry_started = Some(0);
+    }
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+    recover_unhealthy_owners(&fixture.broker).await;
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    assert!(
+        owner_ref.lock().await.available,
+        "a successful probe must recover the verified import"
+    );
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disconnected_import_waiting_for_admission_does_not_leave_detached_work() {
+    let fixture = Fixture::new(Duration::from_secs(1)).await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    let occupied = fixture
+        .broker
+        .work
+        .clone()
+        .acquire_many_owned(128)
+        .await
+        .unwrap();
+    let mut request = Box::pin(import(
+        State(fixture.broker.clone()),
+        fixture.headers.clone(),
+        Ok(Json(Import {
+            alias: "fixture".into(),
+            label: None,
+            auth,
+        })),
+    ));
+    assert!(futures::poll!(&mut request).is_pending());
+    tokio::task::yield_now().await;
+    // Disconnect before admission, then release the entire work gate. A task
+    // spawned before admission would remain queued and run after disconnect.
+    drop(request);
+    drop(occupied);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(2),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        !fixture
+            .broker
+            .failures
+            .lock()
+            .unwrap()
+            .contains_key("verification_requires_refresh"),
+        "an import that disconnected before admission must not reach import_account"
+    );
+    drop(drained);
 }
 
 async fn list(broker: Broker, headers: HeaderMap) -> Value {

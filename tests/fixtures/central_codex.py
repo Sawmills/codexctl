@@ -136,6 +136,11 @@ for line in sys.stdin:
                 definitive_rejection = mode != "routing-error"
                 send({"id": message["id"], "error": {"code": -32000, "message": "synthetic upstream rejection"}})
                 continue
+            if mode == "lease-loss-hold":
+                pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("refresh-started").write_text("started")
+                release = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release")
+                while not release.exists():
+                    time.sleep(0.01)
             if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "late-error":
                 print("{invalid", flush=True)
             rotate()

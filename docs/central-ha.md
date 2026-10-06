@@ -25,6 +25,17 @@ newer credential, fences the owner and releases the lease and shutdown permit.
 Transient database errors retain the journal and retry, including during shutdown.
 File-mode startup keeps its existing refresh owners.
 
+Shared-store imports also renew their lease through verification and child exit.
+An import retry reads the latest committed credential under that lease. Failed
+verification settles and persists its rotation before another import can retry.
+Import admission still requires a stable identity inventory across local
+accounts. A busy or settling owner returns `refresh_in_progress` to imports,
+including a different alias, instead of blocking the replica's token requests.
+Retry the import after the pending work settles; existing accounts can continue
+to request tokens. If a reimport cannot prepare its replacement after stopping
+the previous owner, that account remains fenced. Retry the import after fixing
+the preparation error; token traffic does not override the failed admission.
+
 If a child never settles or its journal stays unreadable, the broker retains the
 lease and fences that account. Graceful shutdown waits for this work. It can
 exceed the Deployment's 60-second termination allowance; forced pod termination
