@@ -1,44 +1,53 @@
 # Plan: Add a New Server Account With `codexctl login`
 
-**Decision.** Replace the WIP client upload with a server-managed device login, the same protocol that renewal uses. The server runs `codex login --device-auth` in a private server home and admits the result through the existing import admission (`Broker::import_account`). The refresh token never reaches the client disk, and `--no-browser` works because the client only prints the code.
+**Decision.** Replace the WIP client upload with a server-managed device login, the same protocol that renewal uses. The server runs `codex login --device-auth` in a private server home. A new identity goes through the existing import admission (`Broker::import_account`); an identity this user already holds under alias X lands on X through X's renewal path. The refresh token never reaches the client disk, and `--no-browser` works because the client only prints the code. HQ approved this plan with changes C1 to C6 on 2026-10-06.
 
 ## Why Not the WIP Client Upload
 
-The WIP (`9e5a9ee`) runs the device login on the client, keeps `auth.json` in a pending receipt under `~/.codexctl`, and posts it to `POST /v1/accounts`. Three defects follow from that design. A refresh-bearing credential sits on the client until the server confirms it. The flow refuses `--no-browser`. It also treats the import endpoint as a login protocol, although the docs describe import as migration and repair ("Transfer Existing Accounts", "Failure and Recovery"). The WIP's alias routing in `remote::login` (catalog miss plus not-known alias) is correct and stays.
+The WIP (`9e5a9ee`) runs the device login on the client, keeps `auth.json` in a pending receipt under `~/.codexctl`, and posts it to `POST /v1/accounts`. A refresh-bearing credential sits on the client until the server confirms it, and the flow refuses `--no-browser`. The docs describe import as migration and repair, not as a login protocol.
 
-## Design
+## Server
 
-Server: three routes `POST /v1/accounts/login/{start,status,cancel}` with body `{alias, label?, id}`. The operation record and login home live at `state/account-logins/<account_key(user, alias)>/<id>/`, so aliases stay per-user. The handlers reuse the renewal parts in `relogin/worker.rs`: `challenge`, `spawn_login`, `process::isolate`, the 30-second challenge deadline, the cancel flag, and the device-revocation check. On a clean exit the worker passes the candidate auth to `import_account` with `AdmissionKind::Migration`. Import admission then performs identity, ownership, verification, and owner launch. The worker deletes the login home after a terminal result.
+Routes: `POST /v1/accounts/login/{start,status,cancel}` with body `{alias, id, label?}`, in `src/central/relogin/add.rs` so they reuse the renewal parts (`Record`, `publish`, `challenge`, `spawn_login`, `process::isolate`, the cancel flag, and the device-revocation check).
 
-Client: `remote::login` keeps one receipt `.login-<digest(alias)>.json` with `{server, userId, alias, id, kind: "add", label}`. It persists the receipt before `start`, polls `status`, prints the code, and opens the browser unless `--no-browser` is set. `--cancel` with an `add` receipt calls `cancel`. `--label` is valid only for `add`. On `completed`, the client clears the receipt and fetches the catalog.
+Add records live at `state/account-logins/<account_key(user, alias)>/relogin/<id>/`, beside `accounts/`, so a vault-less directory never enters the account registry. **C1:** `clear_registry`, `retire_reservations`, and broker startup also inventory this root. A stopped add record with a candidate reserves its identity against imports and renewals, and startup fences any owner that overlaps it. A live or unidentifiable login child blocks replacements, the same as under `accounts/`. Startup turns an exited child with a saved grant into a resumable record (`verifying`), and an exited child without a grant into `failed` (`login_interrupted_retry`).
 
-## B33 (PostgreSQL Mode)
+Start order, all under the imports lock:
 
-- Gate the new routes with `reject_unshared_workflow("account_login_unavailable")`, the same gate that renewal, enrollment, and resets use today. The login record is replica-local, and a status poll can reach another replica. The client reports "adding accounts is unavailable while the server runs in shared mode".
-- The admission step is `import_account` unchanged. Its first refresh owner therefore starts under the import lease and settlement from #133 and the startup lease order from #131. This plan adds no second launch path.
-- A shared-mode login record (durable in PostgreSQL) is a later ticket, together with renewal. I need HQ to confirm this scope in the questions file.
+1. **C2:** look up the request id first. A known id returns its record; a non-terminal record with an exited child and a saved grant resumes admission. No second login starts.
+2. Refuse an alias this user already has with 409 `alias_exists`.
+3. **C4:** a non-terminal record for this alias from another device returns 409 `login_belongs_to_another_device`. From the same device, a live record is returned unchanged, so the client adopts its id. One alias has at most one non-terminal record.
+4. Publish the record and spawn the login worker.
 
-## Failure Cases
+Admission after the child exits with a grant, under the imports lock:
 
-| Case | Behavior |
-|---|---|
-| Transport failure after `start` | The receipt keeps `id`. A rerun calls `start` with the same `id`; the server returns the stored record. No second login. |
-| Alias already on the server for this user | The client routes to renewal (current code). The server `start` also refuses with 409 `alias_exists`. |
-| Account owned by another user | Admission returns 409 `account_already_owned`. The server retains and fences the grant, as renewal does for `wrong_account`. |
-| Account owned by this user under alias X | Recommendation: land the grant on X as a renewal, per the AGENTS.md rule that `login` lands on the profile that already holds the account. The approval already happened, and a refusal can leave X with an invalidated grant. The client reports X. Open as Q2 for HQ. |
-| Same alias pending on another device | 409 `login_belongs_to_another_device`. |
-| Cancel | The worker kills the child, records `canceled`, and deletes the home. No account appears. |
-| Verification fails | `failed`, no catalog entry, and the grant stays reserved by import admission. |
+- **C3, same user holds the identity under X:** settle X's owner, publish a renewal record with the grant in X's state, then run `check_claim`, `promote`, and `verify_replacement`. X keeps its label. The add record retires, records `landed = X`, and reports X's renewal phase with `landedAlias`.
+- **New identity:** retire the add record's own reservation, then call `import_account` with the worker's permit and the held imports guard (split into a locked variant). Its first refresh owner therefore starts under the import lease and settlement from #133.
+- **Refusals** (`account_already_owned`, `alias_identity_conflict`, `relogin_reserved`): the record fails and the server deletes the grant. **C6:** no fence runs, so another user's verified account keeps serving tokens.
+- **Transient failure** (503 classes): the record stays `verifying` with an error and keeps its grant; rerunning the same command resumes admission.
 
-## Tests (TDD, `tests/central_managed_test.rs` with the protocol fixture)
+Cancel and device revocation kill the child, delete the login home, and leave no candidate (**C6**).
 
-1. New alias: login completes, `list` on a second device shows it, and the token route serves it.
-2. Retry: the client drops after `start`; a rerun with the same receipt finishes with one fixture login.
-3. Existing alias: renewal path runs; direct `start` gets `alias_exists`.
-4. Other user owns the account: 409 `account_already_owned`; the grant is not in either catalog.
-5. Cancel: the record is `canceled`, no account exists, and the home directory is gone.
-6. `--no-browser`: the code prints and no browser starts.
-7. Shared mode: routes return 503 `account_login_unavailable`.
-8. No client file holds a refresh token after any case.
+## Client
 
-Gates: `cargo fmt --all -- --check`, `cargo clippy --all-targets`, `cargo test --all-targets`. Docs: rewrite the WIP paragraph in `docs/central-server.md`. Live e2e on staging needs Amir to approve the OpenAI device code.
+`remote::login` reads the add receipt `.login-<digest(alias)>.json` (`kind: "add"`, `label`) **before** catalog routing (**C2**), so a lost `completed` response resumes the same operation. The add flow shares the renewal poll loop with the add endpoints, prints the code, and opens the browser unless `--no-browser` is set. `--label` is valid only for an add; a receipt with another label refuses. On `completed`, the client clears the receipt and refreshes the catalog; with `landedAlias`, it prints that the account is X.
+
+## PostgreSQL Mode (C5, Q1)
+
+The routes return 503 `account_login_unavailable` in non-File modes, through `reject_unshared_workflow`, the same as renewal. This is a known gap: add records and renewal records are replica-local. HQ records "renewal and add in PostgreSQL mode" as a B33 prerequisite. The docs state the gap.
+
+## Tests (TDD, `tests/central_managed_test.rs`, protocol fixture)
+
+1. New alias completes; a second device lists it; the token route serves it.
+2. Retry: a second `start` with the same id after `completed` returns `completed`; a CLI rerun with the receipt and the alias already in the catalog finishes without a second login.
+3. Existing alias: `start` returns 409 `alias_exists`.
+4. Another user owns the identity: `failed` with `account_already_owned`; that user's account keeps serving. Another user's identical alias name does not interfere.
+5. Cancel: `canceled`, no account, no login home, no candidate.
+6. Device revocation mid-login cancels and deletes the home.
+7. C1: kill the broker after the child saves its grant; after restart, the overlapping owner is fenced and `start` with the same id completes without a second login.
+8. C3: approving an identity held as `personal` completes with `landedAlias: personal`, adds no alias, and `personal` keeps serving.
+9. C4: two ids for one alias on one device return one record; another device gets 409.
+10. CLI with `--no-browser`: the code prints, the account appears, and no client file holds a refresh token.
+11. PostgreSQL mode returns 503 `account_login_unavailable` (`tests/central_ha_startup_test.rs`, runs in CI).
+
+Gates: `cargo fmt --all -- --check`, `cargo clippy --all-targets`, `cargo test --all-targets`. Live e2e on staging needs Amir to approve the OpenAI device code.
