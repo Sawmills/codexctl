@@ -146,7 +146,8 @@ async fn view(broker: &Broker, state: &Path, mut record: Record) -> Result<Recor
     record.error = renewal.error;
     // A landed renewal that stopped with an error is retried through the
     // alias it landed on, never through this add operation.
-    let stalled = record.error.is_some() && !live(broker, state, &record.id);
+    // Without its add job, nothing advances this renewal through the add.
+    let stalled = !live(broker, state, &record.id);
     if record.phase == Phase::Failed || (stalled && !terminal(&record.phase)) {
         record.phase = Phase::Failed;
         record.error = Some("landed_renewal_failed".into());
@@ -703,13 +704,7 @@ async fn admit(
         Err(error) => {
             // Import keeps a retained account for this alias reserved itself.
             // Otherwise the grant returns to this record for a retry.
-            let imported = broker
-                .state
-                .join("accounts")
-                .join(account_key(&record.user, &record.alias))
-                .join("vault.enc")
-                .try_exists()?;
-            record.retired = imported;
+            record.retired = import_holds(&broker.state, &broker.key, &record)?;
             record.error = Some(error.reason.into());
             save(state, &record)
         }
@@ -803,6 +798,20 @@ async fn land(
     verified
 }
 
+/// Import holds this grant only when the alias vault carries the same identity.
+fn import_holds(broker_state: &Path, key: &Path, record: &Record) -> Result<bool> {
+    let account = broker_state
+        .join("accounts")
+        .join(account_key(&record.user, &record.alias));
+    if !account.join("vault.enc").try_exists()? {
+        return Ok(false);
+    }
+    let Some(grant) = record.candidate.as_ref() else {
+        return Ok(false);
+    };
+    Ok(overlaps(&vault::load(&account, key)?.auth, grant))
+}
+
 /// Startup audit of new-account logins. Returns every reserved grant so the
 /// caller fences overlapping owners. An unidentified login child is an error.
 pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec<Value>> {
@@ -818,7 +827,24 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
                 continue;
             }
             stopped(&state, &record)?;
-            if record.landed.is_none()
+            let revoked = vault::devices(broker_state).is_ok_and(|devices| {
+                !devices
+                    .iter()
+                    .any(|device| device.id == record.device && !device.revoked)
+            });
+            if record.landed.is_none() && !terminal(&record.phase) && revoked {
+                // No device can resume or cancel this grant any more.
+                if record.retired && record.candidate.is_some() {
+                    discard(
+                        &state,
+                        &mut record,
+                        Phase::Canceled,
+                        "account_import_retained",
+                    )?;
+                } else {
+                    discard(&state, &mut record, Phase::Failed, "device_revoked")?;
+                }
+            } else if record.landed.is_none()
                 && !terminal(&record.phase)
                 && record.retired
                 && record.candidate.is_none()
@@ -862,11 +888,7 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
                         record.code = None;
                         if record.retired {
                             // Import retains its own reservation once it wrote a vault.
-                            record.retired = broker_state
-                                .join("accounts")
-                                .join(account_key(&record.user, &record.alias))
-                                .join("vault.enc")
-                                .try_exists()?;
+                            record.retired = import_holds(broker_state, key, &record)?;
                         }
                         save(&state, &record)?;
                     }
