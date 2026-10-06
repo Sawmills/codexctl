@@ -65,6 +65,7 @@ impl Fixture {
 
         broker
             .import_account(
+                broker.work.clone().acquire_owned().await.unwrap(),
                 "test-user",
                 Import {
                     alias: "personal".into(),
@@ -637,6 +638,7 @@ async fn explicit_import_repairs_a_fenced_retryable_owner() {
         let repaired = fixture
             .broker
             .import_account(
+                fixture.broker.work.clone().acquire_owned().await.unwrap(),
                 "test-user",
                 Import {
                     alias: "personal".into(),
