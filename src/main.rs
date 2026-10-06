@@ -309,6 +309,9 @@ fn main() {
             )? {
                 return Ok(());
             }
+            // Without server support every login is local.
+            #[cfg(not(feature = "central-prototype"))]
+            let _ = local;
             #[cfg(feature = "central-prototype")]
             codexctl::central::native::require_local_mode()?;
             if no_browser || cancel {

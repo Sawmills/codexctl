@@ -281,7 +281,8 @@ receipt of the operation and resumes it, even after the alias appears in the cat
 so it never starts a second OpenAI login. If the server restarts after OpenAI issued
 the grant, the server keeps that grant reserved and fences any account it overlaps
 until the same command resumes it. One alias has one pending add at a time; another
-machine cannot start, resume, or cancel it. `codexctl login <alias> --cancel` stops a
+machine cannot start, resume, or cancel it, unless the machine that started it was
+revoked, in which case the server deletes its grant and the new machine starts over. `codexctl login <alias> --cancel` stops a
 pending add, and the server deletes its login home and any grant. If an earlier attempt
 already left the account on the server unverified, cancel refuses with
 `account_import_retained`; rerun the same command to retry its verification.

@@ -900,6 +900,94 @@ fn server_add_refusals_clear_the_client_receipt_and_never_fall_back_to_local_log
     server.restart();
 }
 
+#[test]
+fn server_add_cli_rerun_after_failed_verification_succeeds() {
+    let server = Server::start();
+    let home = server.connected_home();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    server.release_login("routed-login", "routed-seat");
+    let failed = server.cli(home.path(), &["login", "routed", "--no-browser"]);
+    assert!(!failed.status.success());
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    // The documented remedy: rerun the same command to retry verification.
+    let retried = server.cli(home.path(), &["login", "routed", "--no-browser"]);
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(String::from_utf8_lossy(&retried.stdout).contains("Server account added"));
+    assert_eq!(server.token(&server.amir, "routed", None).status(), 200);
+}
+
+#[test]
+fn server_add_saved_grant_releases_on_refusal_and_on_device_revocation() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.alex, "work", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let desktop = server.register("amir-desktop", "amir");
+    let crash = |server: &mut Server, alias: &str, id: &str, subject: &str, account: &str| {
+        store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+        server.add_request(&server.amir, "start", alias, id, None);
+        server.release_login(subject, account);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.root.path().join("login-saved").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let record = server.add_record(&server.amir, alias, id);
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        unsafe {
+            libc::kill(
+                record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+                libc::SIGKILL,
+            );
+        }
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        for file in ["login-release", "login-saved"] {
+            let _ = std::fs::remove_file(server.root.path().join(file));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        server.restart();
+    };
+    // A saved grant for alex's seat fences alex's account until it is refused.
+    let id = "a6".repeat(32);
+    crash(&mut server, "stolen", &id, "alex-login", "alex-seat");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    server.add_request(&server.amir, "start", "stolen", &id, None);
+    let failed = server.await_add(&server.amir, "stolen", &id, "failed");
+    assert_eq!(failed["error"], "account_already_owned");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+
+    // A saved grant from a revoked device no longer blocks the alias.
+    let id = "a7".repeat(32);
+    crash(&mut server, "orphan", &id, "orphan-login", "orphan-seat");
+    let response = server
+        .http
+        .post(format!("{}/v1/devices/revoke", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"id":"amir-laptop"}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let next = "a8".repeat(32);
+    let started: Value = server
+        .add_request(&desktop, "start", "orphan", &next, None)
+        .json()
+        .unwrap();
+    assert_eq!(started["id"], next, "{started}");
+    let orphan = server.add_record(&server.amir, "orphan", &id);
+    assert_eq!(orphan["error"], "device_revoked");
+    assert!(!server.add_home(&server.amir, "orphan", &id).exists());
+    server.add_request(&desktop, "cancel", "orphan", &next, None);
+    server.await_add(&desktop, "orphan", &next, "canceled");
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))
@@ -6868,14 +6956,29 @@ fn p3_new_local_login_survives_failed_discovery_but_known_server_aliases_stay_fe
     let result = run("new-profile");
     done.store(true, std::sync::atomic::Ordering::Release);
     let contacted_server = probe.join().unwrap();
+    // A new alias on a connected machine is a server add; failed discovery
+    // never stores a local refresh token unless --local asks for one.
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(!error.contains("LOCAL_LOGIN_REACHED"), "{error}");
+    assert!(error.contains("--local"), "{error}");
+    assert!(
+        contacted_server,
+        "login must try fresh discovery before refusing"
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["login", "new-profile", "--local"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("LOCAL_LOGIN_REACHED"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
-    );
-    assert!(
-        contacted_server,
-        "login must try fresh discovery before falling back to local login"
     );
     let collision = home.path().join(".codexctl/profiles/personal");
     store::ensure_private_dir(&collision).unwrap();
@@ -6913,8 +7016,17 @@ fn p3_new_local_login_survives_failed_discovery_but_known_server_aliases_stay_fe
         "aliases cached for another registration cannot route this login"
     );
     std::fs::remove_file(&cache).unwrap();
+    let local = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["login", "new-profile", "--local"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
     assert!(
-        String::from_utf8_lossy(&run("new-profile").stderr).contains("LOCAL_LOGIN_REACHED"),
+        String::from_utf8_lossy(&local.stderr).contains("LOCAL_LOGIN_REACHED"),
         "a new machine does not need a cached catalog to start local login"
     );
     store::atomic_write(&cache, b"{").unwrap();

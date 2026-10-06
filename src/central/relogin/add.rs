@@ -70,6 +70,51 @@ fn discard(state: &Path, record: &mut Record, phase: Phase, error: &str) -> Resu
     save(state, record)
 }
 
+/// A revoked or unknown device can never resume, cancel, or delete its record.
+/// An unreadable registry counts as active, so the record stays protected.
+fn device_active(broker: &Broker, id: &str) -> bool {
+    vault::devices(&broker.state).map_or(true, |devices| {
+        devices
+            .iter()
+            .any(|device| device.id == id && !device.revoked)
+    })
+}
+
+/// Startup fences every owner a saved grant overlaps. Once the grant is gone,
+/// relaunch each verified owner it fenced through the restore clearance; any
+/// other evidence keeps that owner fenced.
+async fn release(broker: &Broker, guard: &tokio::sync::MutexGuard<'_, ()>, grant: &Value) {
+    let owners = broker.owners.read().await.clone();
+    for (_, owner) in owners.values() {
+        let mut owner = owner.lock().await;
+        if owner.available
+            || owner.rpc.is_some()
+            || !owner.vault.verified
+            || owner.routing_refused
+            || owner.retryable_unavailable
+            || !overlaps(&owner.vault.auth, grant)
+        {
+            continue;
+        }
+        if relaunch(broker, guard, &mut owner).await.is_ok() {
+            owner.available = true;
+        }
+    }
+}
+async fn relaunch(
+    broker: &Broker,
+    guard: &tokio::sync::MutexGuard<'_, ()>,
+    owner: &mut Owner,
+) -> Result<()> {
+    owner.snapshot()?;
+    let proof = identity_inventory(&owner.state, &broker.key, &owner.home).clear_for_launch(
+        owner,
+        AdmissionKind::Restore,
+        guard,
+    )?;
+    launch_owner(owner, &broker.binary, proof).await
+}
+
 /// Report a grant that landed on an existing alias with that renewal's phase.
 async fn view(broker: &Broker, state: &Path, mut record: Record) -> Result<Record, HttpError> {
     let Some(landed) = record.landed.clone() else {
@@ -159,8 +204,12 @@ pub(in crate::central) async fn cancel(
             // Deleting only this record would leave that account behind.
             return Err(broker.error(StatusCode::CONFLICT, "account_import_retained"));
         }
+        let grant = candidate(&state, &record).ok().flatten();
         discard(&state, &mut record, Phase::Canceled, "login_canceled")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        if let Some(grant) = grant {
+            release(&broker, &_import, &grant).await;
+        }
     }
     Ok(response(&record))
 }
@@ -208,35 +257,35 @@ async fn start_owned(
     let alias = normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
         .to_owned();
-    if broker.read_only
+    let available = !(broker.read_only
         || broker.stopping.load(Ordering::Acquire)
-        || broker.ownership_unresolved.load(Ordering::Acquire)
-    {
-        return Err(broker.error(StatusCode::CONFLICT, "account_login_unavailable"));
-    }
+        || broker.ownership_unresolved.load(Ordering::Acquire));
     let state = add_state(&broker.state, &device.user, &alias);
     let persistence = |_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed");
-    store::ensure_private_dir(&root(&broker.state)).map_err(persistence)?;
-    store::ensure_private_dir(&state).map_err(persistence)?;
 
-    // A known operation id resumes before any alias check, so a lost
-    // completion or a crash after the grant never starts a second login.
+    // A known operation id answers before any availability or alias check, so
+    // a lost completion or a crash after the grant never starts a second login.
     if directory(&state, &request.id)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?
         .join("record.json")
         .try_exists()
         .unwrap_or(true)
     {
-        let record = load(&state, &request.id)
+        let mut record = load(&state, &request.id)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
         if record.device != device.id {
             return Err(broker.error(StatusCode::CONFLICT, "login_belongs_to_another_device"));
         }
-        if resumable(&broker, &state, &record) {
-            resume(&broker, &headers, &state, &record)?;
+        if available && resumable(&broker, &state, &record) {
+            resume(&broker, &headers, &state, &mut record)?;
         }
         return Ok(response(&view(&broker, &state, record).await?));
     }
+    if !available {
+        return Err(broker.error(StatusCode::CONFLICT, "account_login_unavailable"));
+    }
+    store::ensure_private_dir(&root(&broker.state)).map_err(persistence)?;
+    store::ensure_private_dir(&state).map_err(persistence)?;
     if broker.resolve_alias(&device.user, &alias).await?.is_some() {
         return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
     }
@@ -245,25 +294,42 @@ async fn start_owned(
     if let Some(mut record) = latest.clone()
         && !terminal(&record.phase)
     {
-        if record.device != device.id {
+        let stale = record.device != device.id
+            && !device_active(&broker, &record.device)
+            && !live(&broker, &state, &record.id)
+            && record.landed.is_none()
+            && stopped(&state, &record).is_ok();
+        if record.device != device.id && !stale {
             return Err(broker.error(StatusCode::CONFLICT, "login_belongs_to_another_device"));
         }
-        if live(&broker, &state, &record.id) || record.landed.is_some() {
+        if !stale && (live(&broker, &state, &record.id) || record.landed.is_some()) {
             return Ok(response(&view(&broker, &state, record).await?));
         }
-        if resumable(&broker, &state, &record) {
-            resume(&broker, &headers, &state, &record)?;
+        if !stale && resumable(&broker, &state, &record) {
+            resume(&broker, &headers, &state, &mut record)?;
             return Ok(response(&record));
         }
         stopped(&state, &record)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        if record.retired && record.candidate.is_some() {
+            // Import holds this grant as an unverified account under the alias.
+            return Err(broker.error(StatusCode::CONFLICT, "account_import_retained"));
+        }
+        let grant = candidate(&state, &record).ok().flatten();
         discard(
             &state,
             &mut record,
             Phase::Failed,
-            "login_interrupted_retry",
+            if stale {
+                "device_revoked"
+            } else {
+                "login_interrupted_retry"
+            },
         )
         .map_err(persistence)?;
+        if let Some(grant) = grant {
+            release(&broker, &import, &grant).await;
+        }
     }
     let permit = broker
         .work
@@ -373,13 +439,17 @@ fn resume(
     broker: &Broker,
     headers: &HeaderMap,
     state: &Path,
-    record: &Record,
+    record: &mut Record,
 ) -> Result<(), HttpError> {
     let permit = broker
         .work
         .clone()
         .try_acquire_owned()
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_busy"))?;
+    // The retry starts now; an earlier attempt's error no longer describes it.
+    record.error = None;
+    save(state, record)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     let flag = Arc::new(AtomicBool::new(false));
     broker
         .relogins
@@ -546,11 +616,12 @@ async fn admit(
     if terminal(&record.phase) || record.landed.is_some() {
         return Ok(());
     }
+    let auth = candidate(state, &record)?.context("missing saved grant")?;
     if broker.authorize(headers).await.is_err() {
         discard(state, &mut record, Phase::Canceled, "login_canceled")?;
+        release(broker, &guard, &auth).await;
         return Ok(());
     }
-    let auth = candidate(state, &record)?.context("missing saved grant")?;
     let owners = broker.owners.read().await.clone();
     let mut held = None;
     for (identity, owner) in owners.values() {
@@ -588,7 +659,12 @@ async fn admit(
             save(state, &record)
         }
         Err(error) if REFUSALS.contains(&error.reason) => {
-            discard(state, &mut record, Phase::Failed, error.reason)
+            let grant = candidate(state, &record).ok().flatten();
+            discard(state, &mut record, Phase::Failed, error.reason)?;
+            if let Some(grant) = grant {
+                release(broker, &guard, &grant).await;
+            }
+            Ok(())
         }
         Err(error) => {
             // Import keeps a retained account for this alias reserved itself.

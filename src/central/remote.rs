@@ -121,8 +121,9 @@ pub fn login(
         Err(error) => {
             if !known? {
                 // A connected machine adds new aliases on the server. Never
-                // fall back to a local login that stores a refresh token here.
-                if local {
+                // fall back to a local login that stores a refresh token here,
+                // unless the operator asked for one or renews a local profile.
+                if local || local_profile(alias)? {
                     return Ok(false);
                 }
                 return Err(error).with_context(|| {
@@ -152,7 +153,7 @@ pub fn login(
                 "known server account {alias} is absent from the catalog; local login is disabled; reconcile its migration or connection records"
             );
         }
-        if local {
+        if local || (!cancel && local_profile(alias)?) {
             return Ok(false);
         }
         if cancel {
@@ -175,6 +176,13 @@ pub fn login(
         no_browser,
         cancel,
     )
+}
+
+/// An existing local profile renews locally; only a new alias becomes a server account.
+fn local_profile(alias: &str) -> Result<bool> {
+    Ok(store::profile_dir(&config::default_paths()?, alias)?
+        .join("auth.json")
+        .try_exists()?)
 }
 
 fn login_receipt_path(alias: &str) -> Result<PathBuf> {
@@ -296,15 +304,18 @@ fn server_login(
                 .and_then(|v| v["error"].as_str().map(str::to_owned));
             // These refusals prove the server never published this add
             // operation, so its receipt must not block later commands.
+            // A known id is answered before these checks, so each one proves
+            // this id was never published. Shared mode refuses with HTTP 503.
+            let shared_mode = status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                && reason.as_deref() == Some("account_login_unavailable");
             let unpublished = match operation {
-                "start" => matches!(
-                    reason.as_deref(),
-                    Some(
-                        "account_login_unavailable"
-                            | "alias_exists"
-                            | "login_belongs_to_another_device"
-                    )
-                ),
+                "start" => {
+                    shared_mode
+                        || matches!(
+                            reason.as_deref(),
+                            Some("alias_exists" | "login_belongs_to_another_device")
+                        )
+                }
                 _ => reason.as_deref() == Some("relogin_not_found"),
             };
             if add.is_some() && unpublished && !id.is_empty() {
@@ -314,8 +325,11 @@ fn server_login(
                 Some("account_import_retained") => bail!(
                     "the server holds this account unverified from an earlier attempt; rerun codexctl login {alias} to retry its verification"
                 ),
+                Some("account_login_unavailable") if shared_mode => bail!(
+                    "the server cannot add accounts; adding accounts is unavailable while the server runs in shared mode"
+                ),
                 Some("account_login_unavailable") => bail!(
-                    "the server cannot add accounts now; adding accounts is unavailable while the server runs in shared mode"
+                    "the server cannot start a login now; the operation is retained, rerun codexctl login {alias} later"
                 ),
                 Some("alias_exists") => {
                     bail!("server account {alias} already exists; run codexctl login {alias} again")
