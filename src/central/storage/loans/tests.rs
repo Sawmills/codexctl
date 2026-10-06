@@ -258,3 +258,69 @@ async fn backfill_copies_file_loans_with_their_audit_once() {
         .await
         .unwrap();
 }
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn a_retried_end_repairs_a_missed_dual_mirror() {
+    if std::env::var("DATABASE_URL").is_err() {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("DATABASE_URL must be set for PostgreSQL scenarios in CI");
+        }
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
+    let shared = CentralStore::from_mode(super::super::StoreMode::Dual, root.path(), &key)
+        .await
+        .unwrap();
+    let (dual, control, schema) = shared.isolated_test_schema().await.unwrap();
+    dual.migrate().await.unwrap();
+    assert!(
+        dual.create_loan(&grant("missed", "a", i64::MAX / 2))
+            .await
+            .unwrap()
+    );
+    let CentralStore::Dual { file, postgres, .. } = &dual else {
+        unreachable!()
+    };
+    // The PostgreSQL end commits; its file mirror is lost.
+    postgres
+        .end_loan("missed", 2_000, "lender", EndReason::Revoked)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        file.read_state().unwrap().loans["missed"]
+            .ended_at
+            .is_none()
+    );
+    assert!(
+        dual.end_loan("missed", 3_000, "lender", EndReason::Revoked)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mirrored = file.read_state().unwrap();
+    assert_eq!(mirrored.loans["missed"].ended_at, Some(2_000));
+    assert_eq!(
+        mirrored
+            .loan_audit
+            .iter()
+            .filter(|e| e.kind == AuditKind::Ended)
+            .count(),
+        1
+    );
+    // Another retry changes nothing.
+    dual.end_loan("missed", 4_000, "lender", EndReason::Revoked)
+        .await
+        .unwrap();
+    assert_eq!(
+        file.read_state().unwrap().loan_audit.len(),
+        mirrored.loan_audit.len()
+    );
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}

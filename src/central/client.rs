@@ -62,6 +62,7 @@ impl RequestHandler for TokenHandler {
                 account_id: Some(self.current.chatgpt_account_id.clone()),
                 billing: false,
                 alias: None,
+                loan_id: None,
             },
         )
         .await?;

@@ -31,6 +31,9 @@ pub struct TokenRequest {
     pub billing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
+    /// The grant a borrowed connection was selected with (ADR 0004).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loan_id: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Clone)]

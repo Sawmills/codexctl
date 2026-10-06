@@ -11042,7 +11042,11 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         "{}",
         String::from_utf8_lossy(&selected.stderr)
     );
-    assert!(directory.join("borrowed/amir/personal.json").exists());
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("borrowed/amir/personal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(connection["loan_id"], "synthetic-grant");
     let active = server.cli(home.path(), &["central-token", "--active"]);
     assert!(
         active.status.success(),

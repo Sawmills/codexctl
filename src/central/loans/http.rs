@@ -208,6 +208,7 @@ impl Broker {
         &self,
         device: &vault::Device,
         reference: &str,
+        loan_id: Option<&str>,
     ) -> Result<Borrowed, HttpError> {
         let reference = match AccountRef::parse(reference) {
             Ok(reference @ AccountRef::Borrowed { .. }) => reference.name(),
@@ -219,6 +220,11 @@ impl Broker {
             Ok(None) => return Err(self.ended_or_missing(&device.user, &reference).await?),
             Err(reason) => return Err(self.error(StatusCode::CONFLICT, reason)),
         };
+        // A connection selected with an earlier grant never moves to a later
+        // grant of the same name; that needs a new selection.
+        if loan_id.is_some_and(|id| id != grant.id) {
+            return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
+        }
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(&grant, "lender_disabled").await);
         }

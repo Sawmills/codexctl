@@ -76,7 +76,14 @@ impl CentralStore {
             Self::Postgres(db) => bounded_db(db.end_loan(id, at, by, reason)).await,
             Self::Dual { file, postgres, .. } => {
                 let ended = bounded_db(postgres.end_loan(id, at, by, reason)).await?;
-                if let Some(grant) = ended.as_ref()
+                // A retry after a lost mirror copies the committed end.
+                let mirror = match ended.clone() {
+                    Some(grant) => Some(grant),
+                    None => bounded_db(postgres.load_loan(id))
+                        .await?
+                        .filter(|grant| grant.ended_at.is_some()),
+                };
+                if let Some(grant) = mirror.as_ref()
                     && let Err(error) = file.mirror_loan(grant, &AuditEvent::ended(grant))
                 {
                     mirror_failure(self, "end_loan", &error);
@@ -217,17 +224,21 @@ impl FileStore {
     }
 
     /// Copy an authoritative grant and its event into the file mirror. An
-    /// ended copy is terminal: a delayed active copy never replaces it.
+    /// ended copy is terminal: a delayed active copy never replaces it. The
+    /// event is added only when the copy changes the mirror.
     fn mirror_loan(&self, grant: &Grant, event: &AuditEvent) -> Result<()> {
+        let changes = |state: &super::FileState| match state.loans.get(&grant.id) {
+            None => true,
+            Some(existing) => existing.ended_at.is_none() && existing != grant,
+        };
+        if !changes(&self.read_state()?) {
+            return Ok(());
+        }
         self.with_lock(|state| {
-            if state
-                .loans
-                .get(&grant.id)
-                .is_none_or(|existing| existing.ended_at.is_none())
-            {
+            if changes(state) {
                 state.loans.insert(grant.id.clone(), grant.clone());
+                state.loan_audit.push(event.clone());
             }
-            state.loan_audit.push(event.clone());
             Ok(())
         })
     }

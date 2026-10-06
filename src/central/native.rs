@@ -93,6 +93,10 @@ struct Connection {
     approved_billing_class: Option<api::BillingClass>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     session_id: String,
+    /// The grant a borrowed account was selected with. Token requests send
+    /// it, so a later grant of the same name needs a new selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loan_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Activation {
@@ -790,6 +794,7 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
             account_id: (!connection.account_id.is_empty()).then(|| connection.account_id.clone()),
             billing: true,
             alias: connection.alias.clone(),
+            loan_id: connection.loan_id.clone(),
         });
     if !connection.session_id.is_empty() {
         request = request.header("x-codexctl-session", &connection.session_id);
@@ -875,6 +880,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         approved_billing_plan: None,
         approved_billing_class: None,
         session_id: String::new(),
+        loan_id: None,
     };
     drop(_lock);
     let token = fetch(&connection, false)?;
@@ -1740,8 +1746,9 @@ pub(super) fn sync_account(
             account.alias
         );
     }
+    let loan_id = account.loan.as_ref().map(|loan| loan.id.clone());
     if path.try_exists()? {
-        let existing = read_connection(&path)?;
+        let mut existing = read_connection(&path)?;
         if existing.server != device.server
             || existing.account_id != account.account_id
             || existing.alias.as_deref() != Some(&account.alias)
@@ -1749,6 +1756,12 @@ pub(super) fn sync_account(
             || existing.device_token_file != device.token_file
         {
             bail!("remote account identity changed");
+        }
+        // Selecting a borrowed account again pins it to the current grant.
+        if existing.loan_id != loan_id {
+            existing.loan_id = loan_id;
+            existing.revision = String::new();
+            save_connection(&path, &existing)?;
         }
         return Ok(());
     }
@@ -1766,6 +1779,7 @@ pub(super) fn sync_account(
             approved_billing_plan: None,
             approved_billing_class: None,
             session_id: String::new(),
+            loan_id,
         },
     )
 }
@@ -2007,6 +2021,7 @@ mod tests {
             approved_billing_plan: Some("pro".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         assert!(is_billing_approved(&connection, &changed_billing_token()));
     }
@@ -2025,6 +2040,7 @@ mod tests {
             approved_billing_plan: None,
             approved_billing_class: None,
             session_id: String::new(),
+            loan_id: None,
         };
         let path = std::path::Path::new("/central/borrowed/alice/main.json");
         assert_eq!(
@@ -2052,6 +2068,7 @@ mod tests {
             approved_billing_plan: Some("pro".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         assert!(!is_billing_approved(&connection, &changed_billing_token()));
     }
@@ -2073,6 +2090,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();
@@ -2304,6 +2322,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         }
     }
 
@@ -2395,6 +2414,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();

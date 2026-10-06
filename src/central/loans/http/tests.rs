@@ -777,3 +777,29 @@ async fn the_audit_pages_by_time_without_losing_events_at_a_boundary() {
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_lane_pinned_to_an_ended_loan_never_moves_to_a_new_grant_of_that_name() {
+    let fixture = Fixture::new().await;
+    let first = fixture.lend_main().await;
+    let first_id = first["id"].as_str().unwrap();
+    let pinned = json!({"alias":"alice/main","loanId":first_id});
+    let (status, body) = fixture
+        .call("POST", "/v1/token", &fixture.borrower, pinned.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    fixture.end(&fixture.lender, first_id).await;
+    fixture.lend_main().await;
+    let (status, body) = fixture
+        .call("POST", "/v1/token", &fixture.borrower, pinned)
+        .await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::FORBIDDEN, json!("loan_ended"))
+    );
+    // A new selection of the name reaches the new grant.
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+}

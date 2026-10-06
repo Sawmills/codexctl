@@ -1063,7 +1063,11 @@ async fn token(
         .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "alias_required"))?;
     // A borrowed reference resolves only through an active grant (ADR 0004).
     let borrowed = if alias.contains('/') {
-        Some(broker.borrowed_owner(&device, alias).await?)
+        Some(
+            broker
+                .borrowed_owner(&device, alias, request.loan_id.as_deref())
+                .await?,
+        )
     } else {
         None
     };

@@ -385,6 +385,7 @@ fn prepare_pinned_codex(
         approved_billing_plan: None,
         approved_billing_class: None,
         session_id: vault::digest(&super::super::enrollment::random_bytes()),
+        loan_id: account.loan.as_ref().map(|loan| loan.id.clone()),
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
