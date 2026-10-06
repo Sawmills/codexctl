@@ -31,6 +31,11 @@ use std::{
 };
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
+const IMPORT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+const IMPORT_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const IMPORT_LEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+const IMPORT_LEASE_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: String,
@@ -834,6 +839,13 @@ enum SettlementRecovery {
     Fenced,
 }
 
+#[derive(Clone)]
+struct LeaseWindow {
+    deadline: Arc<Mutex<std::time::Instant>>,
+    lost: Arc<AtomicBool>,
+    signal: Arc<Notify>,
+}
+
 /// Keep a recovery lease until the stopped child has been settled and its
 /// credentials are durably published. The work permit is held by the caller
 /// or transferred to this task, so shutdown drains this work instead of
@@ -843,6 +855,7 @@ async fn settle_background_recovery(
     owner_ref: Arc<Mutex<Owner>>,
     central: Option<CentralStore>,
     lease: Option<super::storage::Lease>,
+    lease_window: Option<Arc<LeaseWindow>>,
     before: Vault,
     recovery: SettlementRecovery,
     recovery_generation: u64,
@@ -858,9 +871,56 @@ async fn settle_background_recovery(
             abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
             return;
         }
+        if let Some(window) = lease_window.as_ref() {
+            let remaining = window
+                .deadline
+                .lock()
+                .await
+                .saturating_duration_since(std::time::Instant::now());
+            if window.lost.load(Ordering::Acquire) || remaining <= IMPORT_LEASE_SAFETY_MARGIN {
+                let mut owner = owner_ref.lock().await;
+                terminate_lost_import(&mut owner).await;
+                drop(owner);
+                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                return;
+            }
+        }
         let record = {
-            let mut owner = owner_ref.lock().await;
-            settled_owner_record(&mut owner, &before).await
+            let settle = async {
+                let mut owner = owner_ref.lock().await;
+                settled_owner_record(&mut owner, &before).await
+            };
+            if let Some(window) = lease_window.as_ref() {
+                let remaining = window
+                    .deadline
+                    .lock()
+                    .await
+                    .saturating_duration_since(std::time::Instant::now())
+                    .saturating_sub(IMPORT_LEASE_SAFETY_MARGIN);
+                tokio::select! {
+                    result = tokio::time::timeout(remaining, settle) => match result {
+                        Ok(record) => record,
+                        Err(_) => {
+                            let mut owner = owner_ref.lock().await;
+                            terminate_lost_import(&mut owner).await;
+                            drop(owner);
+                            abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                                .await;
+                            return;
+                        }
+                    },
+                    _ = wait_for_lease_loss(window.lost.clone(), window.signal.clone()) => {
+                        let mut owner = owner_ref.lock().await;
+                        terminate_lost_import(&mut owner).await;
+                        drop(owner);
+                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                settle.await
+            }
         };
         let record = match record {
             Ok(record) => record,
@@ -1296,6 +1356,7 @@ async fn token(
                 owner_ref.clone(),
                 worker.central.clone(),
                 lease,
+                None,
                 before,
                 recovery,
                 recovery_generation,
@@ -1927,7 +1988,7 @@ impl Broker {
                     .acquire_lease(
                         &account_key(&owner.vault.user, &owner.vault.alias),
                         &self.holder_id,
-                        std::time::Duration::from_secs(120),
+                        IMPORT_LEASE_TTL,
                     )
                     .await
                     .map_err(|_| {
@@ -1948,25 +2009,65 @@ impl Broker {
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_done = Arc::new(AtomicBool::new(false));
         let lease_lost_signal = Arc::new(Notify::new());
+        let lease_window = verification_lease.as_ref().map(|_| {
+            Arc::new(LeaseWindow {
+                deadline: Arc::new(Mutex::new(std::time::Instant::now() + IMPORT_LEASE_TTL)),
+                lost: renew_lost.clone(),
+                signal: lease_lost_signal.clone(),
+            })
+        });
         let renew_task = match (self.central.clone(), verification_lease.clone()) {
             (Some(central), Some(lease)) => {
                 let done = renew_done.clone();
                 let lost = renew_lost.clone();
                 let signal = lease_lost_signal.clone();
+                let window = lease_window.clone().expect("central lease window");
                 Some(tokio::spawn(async move {
                     while !done.load(Ordering::Acquire) {
-                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                        match central
-                            .renew(&lease, std::time::Duration::from_secs(120))
+                        let remaining = window
+                            .deadline
+                            .lock()
                             .await
-                        {
-                            Ok(true) => {}
+                            .saturating_duration_since(std::time::Instant::now());
+                        if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
+                            lost.store(true, Ordering::Release);
+                            signal.notify_waiters();
+                            break;
+                        }
+                        let wait = IMPORT_LEASE_RENEW_INTERVAL
+                            .min(remaining.saturating_sub(IMPORT_LEASE_SAFETY_MARGIN));
+                        tokio::time::sleep(wait).await;
+                        if done.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match central.renew(&lease, IMPORT_LEASE_TTL).await {
+                            Ok(true) => {
+                                *window.deadline.lock().await =
+                                    std::time::Instant::now() + IMPORT_LEASE_TTL;
+                            }
                             Ok(false) => {
                                 lost.store(true, Ordering::Release);
                                 signal.notify_waiters();
                                 break;
                             }
-                            Err(error) => eprintln!("central import lease renewal: {error:#}"),
+                            Err(error) => {
+                                eprintln!("central import lease renewal: {error:#}");
+                                let remaining = window
+                                    .deadline
+                                    .lock()
+                                    .await
+                                    .saturating_duration_since(std::time::Instant::now());
+                                if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
+                                    lost.store(true, Ordering::Release);
+                                    signal.notify_waiters();
+                                    break;
+                                }
+                                tokio::time::sleep(
+                                    IMPORT_LEASE_RETRY_INTERVAL
+                                        .min(remaining.saturating_sub(IMPORT_LEASE_SAFETY_MARGIN)),
+                                )
+                                .await;
+                            }
                         }
                     }
                 }))
@@ -2102,7 +2203,7 @@ impl Broker {
                 owner.retry_failures = 0;
             }
         }
-        if verification.is_err() && verification_lease.is_some() {
+        if verification.is_err() && verification_lease.is_some() && !lease_lost {
             fence_background_owner(&mut owner);
             owner.import_settling = true;
             drop(owner);
@@ -2115,6 +2216,7 @@ impl Broker {
                     owner_ref.clone(),
                     central,
                     verification_lease,
+                    lease_window.clone(),
                     before,
                     recovery,
                     recovery_generation,
@@ -2126,6 +2228,15 @@ impl Broker {
                 .await;
                 owner_ref.lock().await.import_settling = false;
             });
+        } else if lease_lost {
+            // The lease is no longer live, so deferred settlement must not
+            // retain or persist a child under the expired epoch.
+            drop(owner);
+            renew_done.store(true, Ordering::Release);
+            if let Some(task) = renew_task {
+                task.abort();
+            }
+            drop(permit);
         } else {
             if let (Some(central), Some(lease)) =
                 (self.central.as_ref(), verification_lease.as_ref())
@@ -2714,6 +2825,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         owner_ref,
                         central,
                         lease,
+                        None,
                         before,
                         recovery,
                         recovery_generation,
@@ -2768,6 +2880,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             owner_ref,
                             central,
                             lease,
+                            None,
                             before,
                             SettlementRecovery::Available,
                             recovery_generation,
@@ -2805,6 +2918,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                             owner_ref,
                             central,
                             lease,
+                            None,
                             before,
                             SettlementRecovery::Fenced,
                             recovery_generation,
@@ -2838,6 +2952,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         owner_ref.clone(),
                         central.clone(),
                         lease.clone(),
+                        None,
                         before,
                         recovery,
                         recovery_generation,

@@ -219,6 +219,100 @@ async fn lease_loss_terminates_import_verification_before_provider_rotation() {
     );
 }
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn import_account_fences_when_lease_is_lost_during_verification() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "lease-loss-hold")
+        .await;
+    let auth = fixture.broker.owners.read().await["fixture"]
+        .1
+        .lock()
+        .await
+        .vault
+        .auth
+        .clone();
+    let account = account_key("test", "fixture");
+    let worker = fixture.broker.clone();
+    let task = tokio::spawn(async move {
+        let permit = worker.work.clone().acquire_owned().await.unwrap();
+        worker
+            .import_account(
+                permit,
+                "test",
+                Import {
+                    alias: "fixture".into(),
+                    label: None,
+                    auth,
+                },
+            )
+            .await
+    });
+    let started = fixture._root.path().join("refresh-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "import verification did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    control
+        .execute(
+            "UPDATE account_refresh_leases SET expires_at=now() WHERE account_id=$1",
+            &[&account],
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(12), task)
+        .await
+        .expect("lease loss must stop import verification")
+        .unwrap();
+    assert!(
+        result.is_err(),
+        "expired import lease must fence verification"
+    );
+    let successor = central
+        .acquire_lease(&account, "successor", IMPORT_LEASE_TTL)
+        .await
+        .unwrap();
+    central.release_lease(&successor).await.unwrap();
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let owner = owner_ref.lock().await;
+    assert!(
+        owner.rpc.is_none(),
+        "expired import child must be terminated"
+    );
+    assert!(!owner.available);
+    assert!(owner.routing_refused);
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "0"
+    );
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     let fixture = Fixture::new(Duration::from_secs(1)).await;
@@ -233,6 +327,7 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     }
     settle_background_recovery(
         owner_ref.clone(),
+        None,
         None,
         None,
         before,
@@ -295,6 +390,7 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
                     owner_ref.clone(),
                     Some(central.clone()),
                     Some(lease.clone()),
+                    None,
                     before,
                     SettlementRecovery::Available,
                     0,
