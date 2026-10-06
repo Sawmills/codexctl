@@ -844,18 +844,40 @@ fn server_add_retry_after_failed_verification_imports_the_same_alias() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(status["error"].is_string(), "{status}");
-    // Import already holds the grant as an unverified account; cancel must not hide it.
-    let canceled = server.add_request(&server.amir, "cancel", "routed", &id, None);
-    assert_eq!(canceled.status(), 409);
-    assert_eq!(
-        canceled.json::<Value>().unwrap()["error"],
-        "account_import_retained"
-    );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     server.add_request(&server.amir, "start", "routed", &id, None);
     let done = server.await_add(&server.amir, "routed", &id, "completed");
     assert!(done["landedAlias"].is_null(), "{done}");
     assert_eq!(server.token(&server.amir, "routed", None).status(), 200);
+
+    // A retained import that cannot verify ends on cancel; its alias then
+    // renews through the ordinary server login.
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let id = "a0".repeat(32);
+    server.add_request(&server.amir, "start", "stuck", &id, None);
+    server.release_login("stuck-login", "stuck-seat");
+    for _ in 0..500 {
+        let status: Value = server
+            .add_request(&server.amir, "status", "stuck", &id, None)
+            .json()
+            .unwrap();
+        if status["error"].is_string() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let canceled: Value = server
+        .add_request(&server.amir, "cancel", "stuck", &id, None)
+        .json()
+        .unwrap();
+    assert_eq!(canceled["status"], "canceled");
+    assert_eq!(canceled["error"], "account_import_retained");
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let renewal = "d0".repeat(32);
+    server.login_request(&server.amir, "start", "stuck", &renewal);
+    server.await_login(&server.amir, "stuck", &renewal, "completed");
+    assert_eq!(server.token(&server.amir, "stuck", None).status(), 200);
 }
 
 #[test]
@@ -1044,6 +1066,49 @@ fn server_add_receipt_from_an_earlier_registration_does_not_block_the_alias() {
     );
     assert!(String::from_utf8_lossy(&added.stdout).contains("Server account added"));
     assert!(!receipt.exists());
+}
+
+#[test]
+fn server_add_unreadable_saved_grant_fails_only_its_own_record_at_startup() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    let id = "e2".repeat(32);
+    server.add_request(&server.amir, "start", "garbled", &id, None);
+    server.release_login("garbled-login", "garbled-seat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.root.path().join("login-saved").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = server.add_record(&server.amir, "garbled", &id);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    unsafe {
+        libc::kill(
+            record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    store::atomic_write(
+        &server
+            .add_home(&server.amir, "garbled", &id)
+            .join("auth.json"),
+        b"{not json",
+    )
+    .unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let failed = server.add_record(&server.amir, "garbled", &id);
+    assert_eq!(failed["phase"], "failed");
+    assert_eq!(failed["error"], "unsupported_login_output");
 }
 
 fn digest(alias: &str) -> String {

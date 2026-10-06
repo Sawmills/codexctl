@@ -221,8 +221,15 @@ pub(in crate::central) async fn cancel(
     } else if resumable(&broker, &state, &record) {
         if record.retired {
             // Import already holds this grant as an unverified server account.
-            // Deleting only this record would leave that account behind.
-            return Err(broker.error(StatusCode::CONFLICT, "account_import_retained"));
+            // End this operation; the account stays and renews through its alias.
+            discard(
+                &state,
+                &mut record,
+                Phase::Canceled,
+                "account_import_retained",
+            )
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            return Ok(response(&record));
         }
         let grant = candidate(&state, &record).ok().flatten();
         discard(&state, &mut record, Phase::Canceled, "login_canceled")
@@ -296,7 +303,10 @@ async fn start_owned(
         if record.device != device.id {
             return Err(broker.error(StatusCode::CONFLICT, "login_belongs_to_another_device"));
         }
-        if available && resumable(&broker, &state, &record) {
+        if resumable(&broker, &state, &record) {
+            if !available {
+                return Err(broker.error(StatusCode::CONFLICT, "account_login_unavailable"));
+            }
             resume(&broker, &headers, &state, &mut record)?;
         }
         return Ok(response(&view(&broker, &state, record).await?));
@@ -309,8 +319,12 @@ async fn start_owned(
     if broker.resolve_alias(&device.user, &alias).await?.is_some() {
         return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
     }
-    let latest = current(&state)
+    let mut latest = current(&state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
+    if let Some(record) = latest.take() {
+        // A landed record ends with its renewal, whichever device asks.
+        latest = Some(view(&broker, &state, record).await?);
+    }
     if let Some(mut record) = latest.clone()
         && !terminal(&record.phase)
     {
@@ -718,6 +732,9 @@ async fn land(
     if latest.as_ref().is_some_and(|r| !terminal(&r.phase)) {
         return discard(state, record, Phase::Failed, "relogin_reserved");
     }
+    // Fence before stopping, as renewal does, so a later failure never leaves
+    // an available owner without its refresh process.
+    held.fence(false);
     if let Some(rpc) = held.rpc.as_mut() {
         rpc.settle_and_stop().await?;
     } else {
@@ -826,7 +843,18 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
                     )?;
                 }
             } else if record.landed.is_none() && !terminal(&record.phase) {
-                match candidate(&state, &record)? {
+                // Unusable native output after proven exit fails this record
+                // alone; its bytes stay for diagnosis but reserve nothing.
+                let grant = candidate(&state, &record);
+                if grant.is_err() {
+                    record.phase = Phase::Failed;
+                    record.code = None;
+                    record.retired = true;
+                    record.error = Some("unsupported_login_output".into());
+                    save(&state, &record)?;
+                    continue;
+                }
+                match grant? {
                     Some(auth) => {
                         record.candidate = Some(auth);
                         record.child = Child::Exited;

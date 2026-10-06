@@ -338,9 +338,6 @@ fn server_login(
                 clear_receipt_for(&directory, &lock_name, alias, id)?;
             }
             match reason.as_deref() {
-                Some("account_import_retained") => bail!(
-                    "the server holds this account unverified from an earlier attempt; rerun codexctl login {alias} to retry its verification"
-                ),
                 Some("account_login_unavailable") if shared_mode => bail!(
                     "the server cannot add accounts; adding accounts is unavailable while the server runs in shared mode"
                 ),
@@ -423,6 +420,11 @@ fn server_login(
     loop {
         match status["status"].as_str() {
             Some("verifying") if status["error"].is_string() => {
+                if add.is_some() {
+                    bail!(
+                        "server could not finish verifying the new account; the operation is retained. Rerun codexctl login {alias} to retry, or add --cancel and sign in again"
+                    );
+                }
                 bail!(
                     "server could not finish credential verification; the operation is retained. Retry codexctl login {alias}"
                 );
@@ -457,6 +459,9 @@ fn server_login(
                         "login stopped; the account requires a new login"
                     }
                     Some("login_canceled") => "login canceled; no account was added",
+                    Some("account_import_retained") => {
+                        "login canceled; the server keeps this account unverified"
+                    }
                     Some("account_already_owned") => {
                         "this OpenAI account belongs to another company user; no account was added"
                     }
