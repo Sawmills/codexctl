@@ -914,6 +914,13 @@ fn billing_error(alias: &str, token: &TokenResponse) -> anyhow::Error {
     }
 }
 
+fn is_billing_approved(connection: &Connection, token: &TokenResponse) -> bool {
+    connection.allow_billing
+        && (connection.launch_pinned
+            || (connection.approved_billing_plan == token.chatgpt_plan_type
+                && connection.approved_billing_class == token.billing_class))
+}
+
 fn finish_token(
     path: &Path,
     connection: &Connection,
@@ -938,9 +945,7 @@ fn finish_token(
     {
         bail!("remote connection changed during token retrieval");
     }
-    let billing_approved = latest.allow_billing
-        && latest.approved_billing_plan == token.chatgpt_plan_type
-        && latest.approved_billing_class == token.billing_class;
+    let billing_approved = is_billing_approved(&latest, &token);
     if connection.launch_pinned && !billing_approved {
         launch::require_headroom(&alias, &token)?;
     }
@@ -1650,12 +1655,14 @@ pub(crate) fn statusline_selection(
 
 #[cfg(test)]
 mod tests {
+    use super::super::server::TokenResponse;
     use super::{
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
-        billing_switch_prompt, remove_active_pointer_audited, remove_active_pointer_with,
-        remove_pointer_then_marker_audited, remove_pointer_then_marker_with, render_parent_cmd,
-        restore_active_pointer, rollback_or_context, save_connection, validate_token_account,
+        billing_switch_prompt, is_billing_approved, remove_active_pointer_audited,
+        remove_active_pointer_with, remove_pointer_then_marker_audited,
+        remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
+        rollback_or_context, save_connection, validate_token_account,
         write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
@@ -1685,6 +1692,56 @@ mod tests {
         let token = format!("header.{payload}.signature");
         let error = validate_token_account(&token, "workspace-a").unwrap_err();
         assert!(error.to_string().contains("workspace does not match"));
+    }
+
+    fn changed_billing_token() -> TokenResponse {
+        TokenResponse {
+            user_id: None,
+            access_token: "token".into(),
+            chatgpt_account_id: "account".into(),
+            chatgpt_plan_type: Some("team_usage_based".into()),
+            revision: "new-revision".into(),
+            billing_class: Some(api::BillingClass::UsageBased),
+            native_routing_supported: true,
+            statusline_usage: None,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn pinned_launch_keeps_billing_approval_when_refresh_metadata_changes() {
+        let connection = Connection {
+            user_id: None,
+            alias: Some("lane".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: true,
+            launch_pinned: true,
+            approved_billing_plan: Some("pro".into()),
+            approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
+        };
+        assert!(is_billing_approved(&connection, &changed_billing_token()));
+    }
+
+    #[test]
+    fn active_refresh_still_requires_matching_billing_approval() {
+        let connection = Connection {
+            user_id: None,
+            alias: Some("remote".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: true,
+            launch_pinned: false,
+            approved_billing_plan: Some("pro".into()),
+            approved_billing_class: Some(api::BillingClass::Unknown),
+            session_id: String::new(),
+        };
+        assert!(!is_billing_approved(&connection, &changed_billing_token()));
     }
 
     #[test]
