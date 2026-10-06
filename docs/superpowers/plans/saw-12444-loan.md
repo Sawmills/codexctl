@@ -3,8 +3,8 @@
 A lender grants one server account to one borrower until the account's next
 weekly reset or an earlier end time. The account server then issues access
 tokens to every machine of the borrower. The design is in
-[ADR 0004](../../adr/0004-loan-a-server-account-to-a-teammate.md). This plan
-covers the surface, the rules, and the test-first order.
+[ADR 0004](../../adr/0004-loan-a-server-account-to-a-teammate.md). HQ approved
+this plan with changes L1 to L8 on 2026-10-06; this version includes them.
 
 ## Surface
 
@@ -19,89 +19,100 @@ CLI (new `codexctl loans` command group; client code in a new module, not in
 | `codexctl loans audit [<id>]` | both | Shows the audit events for loans the caller is part of |
 
 No accept step: the lender's grant is the approval (Q2). The borrower selects
-the account as `<lender>/<alias>` with `codexctl use`, `codexctl codex
---account`, or auto-select.
+the account by its borrowed reference `<lender>/<alias>`.
 
-Account server (new `src/central/loans.rs` for handlers and grant rules;
-storage in a new `src/central/storage/loans.rs` submodule):
+Account server (handlers and grant rules in a new `src/central/loans.rs`;
+storage in `src/central/storage/loans.rs`):
 
 | Route | Purpose |
 |---|---|
-| `POST /v1/loans` | Grant. Lender only; refuses an unknown weekly reset, a second active grant, a self-loan, and a disabled or ambiguous borrower |
+| `POST /v1/loans` | Grant. Lender only. Refuses a self-loan, an unknown or disabled borrower, a second active grant, and stale usage or a past weekly reset |
 | `GET /v1/loans` | Grants where the caller is lender or borrower |
 | `POST /v1/loans/end` | End by lender or borrower; idempotent for an ended grant |
 | `GET /v1/loans/audit` | Audit events, filtered to the caller's grants |
 
-Small edits to existing paths, kept narrow because of the parallel
-`feat/central-add-account` lane:
+## Seams (L1, L5, L6, L7)
 
-- `managed.rs` `resolve_alias` and `owner()`: parse `<lender>/<alias>`, check
-  the active grant, return the lender's `Owner`.
-- `managed.rs` `account_catalog`: append active borrowed accounts with a new
-  optional `loan` field (`lender`, `endsAt`, `id`) on `Account`.
-- `managed.rs` `token`: write a coalesced `token_issued` audit event and record
-  the borrower on the live session.
-- Client: native homes and selection treat a `loan` account as a borrowed
-  reference; local state goes under `borrowed/<lender>/<alias>`.
+- `owner()` and `resolve_alias` stay unchanged (L1). A new
+  `Broker::borrowed_owner(device, reference)` resolves the borrower's active
+  grant to the lender's `Owner`. Only `/v1/token` and `account_catalog` call
+  it. All other `owner()` callers keep answering 404 for a borrowed reference:
+  reset redeem (`resets.rs:290`), login renewal start, status, and cancel
+  (`relogin/http.rs:14,48,112`), and import.
+- In PostgreSQL mode `borrowed_owner` loads the lender's account through
+  `resolve_alias(lender, alias)`, which calls
+  `load_account_by_alias(lender, alias)` (L7). A missing lender alias ends the
+  grant with reason `account_removed`.
+- Recovery seams (L5): server-account recovery and resets use
+  `remote::select_for_activation` (`remote.rs:1367`, called at
+  `native.rs:1057`), `remote::select_for_codex`, and
+  `remote::find_rate_limit_recovery_candidate`. Local-profile recovery
+  (`commands/codex.rs` `recovery_plan`, `use_profile::ResetPlan`) never sees a
+  server account and needs no change.
+- Client names (L6): a typed `AccountRef { Owned, Borrowed }` parses a name;
+  `store::validate_alias` stays strict. The touched commands are `codexctl use`
+  (`native::activate`, connection file and active pointer), `codexctl codex
+  --account` (`prepare_pinned_codex`), and the status line (active pointer
+  read).
 
 ## Rules
 
-- **Token issue:** each `/v1/token` call for a borrowed reference rechecks the
-  grant. An ended grant gives 403 `loan_ended`; an expired one ends itself with
-  reason `expired` and gives the same error. A disabled lender or a changed
+- **Token issue (L2):** `/v1/token` checks the grant before the refresh and
+  again after it, next to the existing machine re-authorization. An ended or
+  expired grant gives 403 `loan_ended`. A disabled lender or a changed
   credential subject gives 409 `loan_paused`. A running lane shows the error
   and never moves to another account by itself.
-- **Revoke:** no new tokens after the end. Issued tokens live until their OpenAI
-  `exp`. The CLI output says this and names login renewal as the hard cut.
-- **Quota:** the lender's lanes come first. The borrower's catalog marks a
-  borrowed account as unavailable for auto-select when any window is at or
-  above 95 percent. An explicit `--account` still works until the window is
+- **Revoke:** no new tokens after the end. Issued tokens live until their
+  OpenAI `exp`. The CLI says this and names login renewal as the hard cut.
+- **Borrowed reference (Q2):** built and stored at grant time, lowercase, each
+  half validated as a path component. Resolved only through the borrower's
+  active grants. More than one match gives 409 `ambiguous_loan`.
+- **Quota (Q1):** the borrower's selection ranks owned accounts before borrowed
+  ones. Auto-select and recovery skip a borrowed account when any window is at
+  or above 95 percent. An explicit `--account` still works until the window is
   exhausted.
-- **Billing:** the same as an owned account. Auto-select and recovery pick a
-  borrowed account only with verified included usage, never a usage-based one.
-  Credits need `--allow-billing` on the borrower's machine (Q6).
-- **Resets:** only the lender redeems. `/v1/resets/redeem` keeps its
-  `vault.user != device.user` refusal, and `select_for_activation` skips
-  borrowed accounts as reset candidates.
-- **Lender-only actions:** login renewal, import, and machine revoke keep
-  resolving the caller's own aliases only; a borrowed reference gives 404.
-- **Storage:** file mode `loans.json` plus `loan-audit.jsonl`; PostgreSQL
-  tables `account_loans` and `account_loan_audit`; dual mode writes both.
-  Loans do not use `reject_unshared_workflow`, so they work in every mode.
-- **Audit:** grant, token issue (one row per machine, grant, and hour), end,
-  expiry, pause, and session usage. Both parties read it. Rows older than 90
-  days are deleted on the existing retention pass.
-- **Failures:** each loan handler records failures with the existing
-  `record_failure` metric, with bounded `operation`, `stage`, and `reason`
-  labels.
+- **Billing:** same as an owned account. Auto-select and recovery pick only
+  verified included usage, never a usage-based account. Credits need
+  `--allow-billing` on the borrower's machine (Q6).
+- **Resets:** only the lender redeems. `select_for_activation` skips borrowed
+  accounts as reset candidates; the server answers 404 through `owner()`.
+- **Live sessions (L3):** a borrower's session uses the lender's account key
+  with the borrower's user ID, so the PostgreSQL foreign key holds and both
+  users count. In file mode the token issue audit events are the usage record.
+- **Storage (L8):** file mode adds `loans` and `loan_audit` to the encrypted
+  `FileState` under `central-storage.lock`. PostgreSQL adds `account_loans`
+  and `account_loan_audit`. Dual mode writes PostgreSQL first, then the file.
+  Loans do not use `reject_unshared_workflow`.
+- **Retention (L4):** every loan write prunes grants that ended more than 90
+  days ago and audit events older than 90 days, in both modes. Token issue
+  events coalesce on (grant, machine, UTC hour): a unique index in
+  PostgreSQL, a key check before the append in file mode.
+- **Failures:** loan handlers record failures with `record_failure` and
+  bounded `operation`, `stage`, and `reason` labels.
 
 ## Tests (red first, one seam at a time)
 
 1. Grant rules: self-loan, unknown borrower, second active grant, `--until`
-   after the weekly reset, unknown weekly reset, non-lender grant.
-2. Resolution: borrower resolves `<lender>/<alias>`; a third user and an ended
-   grant get 404 or `loan_ended`; an owned alias never resolves to a loan.
-3. Token: borrower gets a token while active; `loan_ended` after end and after
-   expiry; `loan_paused` after lender disable and after a subject change.
-4. Escalation: borrower gets 404 on reset redeem, login renewal, and import of
-   the borrowed reference.
-5. Catalog: borrowed account shows `loan`; unavailable for auto-select at 95
-   percent; a usage-based borrowed account is never auto-selected.
-6. Client: `select_for_activation` skips borrowed accounts for resets; native
-   home paths for a borrowed reference stay under `borrowed/`.
-7. Storage: file and PostgreSQL round trip, the one-active-grant index, audit
-   retention at 90 days. PostgreSQL tests use the existing test-database gate.
-8. CLI: `loans lend`, `list`, `end`, `audit` against a synthetic account server
-   with synthetic users only.
+   after the weekly reset, stale usage or a past `resets_at`, non-lender.
+2. Lender-only paths: a borrowed reference gets 404 from reset redeem, login
+   renewal start, status, and cancel, and import.
+3. Token: the borrower gets a token while active; `loan_ended` after end and
+   after expiry; `loan_paused` after lender disable and after a subject change;
+   no token when the loan ends during the refresh (race test); a revoked
+   borrower machine gets 401.
+4. Reference: a lender email change and a new same-local-part user do not
+   redirect a grant; two matching grants give `ambiguous_loan`.
+5. Catalog: the borrowed account shows `loan`, `user_id` is the borrower, and
+   live sessions count both users.
+6. Client selection: owned before borrowed; skip borrowed at 95 percent; never
+   a usage-based borrowed account; no reset on a borrowed account.
+7. Client names: `AccountRef` parse, the borrowed connection path, and the
+   active pointer round trip.
+8. Storage: file round trip, one active grant, coalescing, 90-day prune.
+   PostgreSQL tests use the `central-real-db-tests` feature.
+9. CLI: `loans lend`, `list`, `end`, and `audit` against a synthetic account
+   server with synthetic users only.
 
 Gates on the Mac: `CARGO_BUILD_JOBS=2` for `cargo fmt --all -- --check`,
 `cargo clippy --all-targets`, and `cargo test --all-targets -- --test-threads=2`.
 The staging proof (one borrower request) waits for HQ approval of a real loan.
-
-## Open Points for the Challenge
-
-- The challenge (item 3) said to keep borrowed accounts out of auto-select. The
-  HQ decision for Q8 allows auto-select under the owned-account rules. This
-  plan follows HQ and adds the 95 percent backoff.
-- `<lender>` is the email local part. The server refuses a grant if two
-  enabled company users share that local part.

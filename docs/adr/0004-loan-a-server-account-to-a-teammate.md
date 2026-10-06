@@ -55,15 +55,31 @@ Rules for grants:
 
 ## How a Borrowed Account Resolves
 
-The borrower addresses a loaned account as `<lender>/<alias>`. `<lender>` is
-the local part of the lender's company email. Aliases cannot contain `/`
-(`src/store.rs:34`), so a borrowed reference can never collide with an owned
-alias. On the client, borrowed accounts keep local state in a separate
-`borrowed/` directory, never in the owned alias namespace.
+The borrower addresses a loaned account as `<lender>/<alias>`, the borrowed
+reference. The server builds it once, at grant time, from the lowercase local
+part of the lender's company email and the lender's alias, and stores it on the
+grant. It is a display name only: the server resolves it through the
+borrower's active grants, never through the user table, so a later email change
+or a new user with the same local part cannot redirect it. If more than one
+active grant of the borrower matches, the server answers 409 `ambiguous_loan`.
+Each half is validated as a path component, and aliases cannot contain `/`
+(`src/store.rs:34`), so a borrowed reference never collides with an owned
+alias.
 
-`resolve_alias` and `owner()` accept a borrowed reference only when an active
-grant exists for that borrower. Both return the lender's existing `Owner`, so
-the refresh lease, the credential revision, and the refresh path stay single.
+The client parses an account name into a typed `AccountRef` (`Owned` or
+`Borrowed`) instead of loosening `store::validate_alias`. A borrowed account
+keeps its local connection file under `central/borrowed/<lender>/<alias>.json`,
+outside the owned alias namespace.
+
+`resolve_alias` and `owner()` do not change, so every caller that must be
+lender-only (reset redeem, login renewal, import, machine revoke) keeps
+answering 404 for a borrowed reference. A separate `borrowed_owner()` resolves
+an active grant to the lender's existing `Owner`. Only `/v1/token` and the
+catalog call it, so the refresh lease, the credential revision, and the refresh
+path stay single. In PostgreSQL mode it loads the lender's account with
+`load_account_by_alias(lender, alias)`. If the lender's alias no longer
+exists, the grant ends with reason `account_removed`; a re-import with the same
+alias makes the same account key but needs a new grant.
 
 ## Who May Do What
 
@@ -87,8 +103,10 @@ approval stays separate from billing approval.
 
 `/v1/token` returns the raw ChatGPT access token, so the server cannot cancel a
 token it already issued. After a loan ends, the server issues no new token to
-the borrower. A token already issued stays valid until its OpenAI `exp`. A
-lender who needs a hard cut must run a login renewal, which also invalidates
+the borrower. The token path checks the grant before the refresh and again
+after it, next to the machine re-authorization, so a loan that ends during a
+slow refresh delivers no token. A token already issued stays valid until its
+OpenAI `exp`. A lender who needs a hard cut must run a login renewal, which also invalidates
 the lender's own sessions. The borrower's running lane gets a clear `loan_ended` error at
 its next token request and never moves to another account without a new
 selection.
@@ -101,26 +119,35 @@ grant.
 ## Storage
 
 Grants and the audit log work in file mode and in PostgreSQL mode. Dual mode
-writes both, like other registries.
+writes PostgreSQL first and mirrors to the file, like other records.
 
-- **File mode:** `loans.json` holds the grants and uses `store::atomic_write`
-  under the existing state lock. `loan-audit.jsonl` holds the audit events,
-  append-only.
+- **File mode:** the encrypted `FileState` in `central-storage.enc` gets two
+  new fields, `loans` and `loan_audit`, written under `central-storage.lock`.
+  No plaintext loan file exists. An older binary that rewrites this file drops
+  the two fields, so a rollback ends every loan.
 - **PostgreSQL mode:** the `account_loans` table holds the grants. A partial
-  unique index on `account_key` where `ended_at IS NULL` enforces one active
+  unique index on `account_id` where `ended_at IS NULL` enforces one active
   grant. The `account_loan_audit` table holds the audit events.
 
-The audit log records grant, token issue, revoke, return, expiry, pause, and the
-borrower's sessions with usage observations. The server deletes audit rows
-older than 90 days. Token issue events are coalesced to one row per machine and
-grant per hour so that the log size stays bounded.
+The audit log records grant, token issue, end, expiry, and pause events. A
+token issue event has a coalescing key of grant, machine, and UTC hour.
+PostgreSQL enforces the key with a unique index and `ON CONFLICT DO NOTHING`;
+file mode skips an append whose key is already in `loan_audit`. Each loan
+write prunes grants that ended more than 90 days ago and audit events older
+than 90 days, in both modes.
+
+Live sessions of a borrower use the lender's account key with the borrower's
+user ID, so the PostgreSQL foreign key holds and both users count in the
+catalog load. File mode has no live-session store (`record_live_session` is a
+no-op there), so the token issue events in the loan audit are the file-mode
+usage record.
 
 ## Consequences
 
 - Both users share one rate-limit window and can cause each other's 429
-  responses. The lender's lanes come first: borrower auto-placement stops when
-  any window of the account reaches 95 percent use.
-- Live sessions record the borrowing user, so the audit can attribute usage.
+  responses. The lender's lanes come first: the borrower's selection ranks
+  owned accounts before borrowed ones, and auto-select and recovery skip a
+  borrowed account when any window is at or above 95 percent use.
 - The OpenAI terms risk stays with Amir's decision. A suspension of the
   lender's seat affects the lender's own work too.
 
