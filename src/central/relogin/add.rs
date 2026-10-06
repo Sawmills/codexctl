@@ -814,7 +814,15 @@ fn import_holds(broker_state: &Path, key: &Path, record: &Record) -> Result<bool
 
 /// Startup audit of new-account logins. Returns every reserved grant so the
 /// caller fences overlapping owners. An unidentified login child is an error.
-pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec<Value>> {
+///
+/// A shared store cannot manage these replica-local records: its routes refuse
+/// them. Shared startup therefore ends every outstanding add instead of letting
+/// an unmanageable grant fence an existing account.
+pub(in crate::central) fn recover(
+    broker_state: &Path,
+    key: &Path,
+    shared: bool,
+) -> Result<Vec<Value>> {
     let root = root(broker_state);
     let mut reserved = Vec::new();
     if !root.try_exists()? {
@@ -833,7 +841,23 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
                     .any(|device| device.id == record.device && !device.revoked)
             });
             let interrupted_discard = record.retired && record.candidate.is_none();
-            if record.landed.is_none()
+            if shared && record.landed.is_none() && !terminal(&record.phase) {
+                if import_holds(broker_state, key, &record)? {
+                    discard(
+                        &state,
+                        &mut record,
+                        Phase::Canceled,
+                        "account_import_retained",
+                    )?;
+                } else {
+                    discard(
+                        &state,
+                        &mut record,
+                        Phase::Failed,
+                        "account_login_unavailable",
+                    )?;
+                }
+            } else if record.landed.is_none()
                 && !terminal(&record.phase)
                 && revoked
                 && !interrupted_discard
@@ -975,4 +999,56 @@ pub(in crate::central) fn retire(accounts: &Path, auth: &Value, skip: &Path) -> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn shared_startup_ends_a_file_mode_add_grant_instead_of_fencing_with_it() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[7; 32]).unwrap();
+        let claims = json!({"sub":"login","iat":2000000000_u64,"exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":"seat"}});
+        let grant = json!({"tokens":{
+            "access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
+            "refresh_token":"synthetic","account_id":"seat"}});
+        let state = add_state(root.path(), "amir", "new-account");
+        store::ensure_private_dir(&root.path().join("account-logins")).unwrap();
+        store::ensure_private_dir(&state).unwrap();
+        let record = Record {
+            sequence: 1,
+            id: "a".repeat(64),
+            user: "amir".into(),
+            device: "laptop".into(),
+            alias: "new-account".into(),
+            broker: process::Process::capture(std::process::id()).unwrap(),
+            child: Child::Exited,
+            verifier_broker: None,
+            original_revision: String::new(),
+            candidate_revision: None,
+            candidate: Some(grant),
+            phase: Phase::Committing,
+            code: None,
+            error: None,
+            retired: false,
+            label: None,
+            landed: None,
+        };
+        publish(&state, &record).unwrap();
+
+        let file_mode = recover(root.path(), &key, false).unwrap();
+        assert_eq!(file_mode.len(), 1, "file mode keeps the grant reserved");
+
+        let shared = recover(root.path(), &key, true).unwrap();
+        assert!(shared.is_empty(), "shared mode must not fence with it");
+        let ended = load(&state, &record.id).unwrap();
+        assert_eq!(ended.phase, Phase::Failed);
+        assert_eq!(ended.error.as_deref(), Some("account_login_unavailable"));
+        assert!(ended.candidate.is_none() && ended.retired);
+        assert!(!directory(&state, &record.id).unwrap().join("home").exists());
+    }
 }

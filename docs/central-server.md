@@ -285,8 +285,9 @@ machine cannot start, resume, or cancel it, unless the machine that started it w
 revoked, in which case the server deletes its grant and the new machine starts over. `codexctl login <alias> --cancel` stops a
 pending add, and the server deletes its login home and any grant. Once OpenAI approval
 returns and the server has started admitting the grant, cancel no longer stops it. If an earlier attempt
-already left the account on the server unverified, cancel refuses with
-`account_import_retained`; rerun the same command to retry its verification.
+already left the account on the server unverified, cancel ends the add with
+`account_import_retained` and the server keeps that unverified account. Run
+`codexctl login <alias>` again to renew and verify it through the ordinary server login.
 
 To save a local profile on a connected machine instead, add `--local`:
 `codexctl login <alias> --local`. A server alias still renews on the server.
@@ -294,6 +295,8 @@ To save a local profile on a connected machine instead, add `--local`:
 Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
 the server answers HTTP 503 with `account_login_unavailable`, because login records are
 local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
+A server that starts in PostgreSQL mode ends every add that file mode left pending
+and deletes its grant, so no unmanageable grant fences an existing account.
 
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine

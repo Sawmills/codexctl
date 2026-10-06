@@ -3056,8 +3056,9 @@ pub async fn serve(
         }
     }
     // A saved new-account grant fences every owner it overlaps until its
-    // admission resumes. An unidentified login child can hold any identity.
-    match relogin::add::recover(state, key) {
+    // admission resumes; shared startup ends such grants instead. An
+    // unidentified login child can hold any identity.
+    match relogin::add::recover(state, key, central.is_some()) {
         Ok(reserved) => conflicting_journals.extend(reserved),
         Err(_) => {
             replacements_blocked = true;
