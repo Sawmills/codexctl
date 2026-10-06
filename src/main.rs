@@ -103,6 +103,10 @@ enum Commands {
         /// Stop a pending server-managed login and wait for its terminal status.
         #[arg(long)]
         cancel: bool,
+        /// On a connected machine, save a local profile instead of adding a
+        /// server account. Server aliases still renew on the server.
+        #[arg(long, conflicts_with_all = ["no_browser", "cancel"])]
+        local: bool,
     },
     /// Save current ~/.codex/auth.json as a profile
     Save {
@@ -292,6 +296,7 @@ fn main() {
             allow_adopt,
             no_browser,
             cancel,
+            local,
         } => (|| {
             #[cfg(feature = "central-prototype")]
             if codexctl::central::remote::login(
@@ -300,6 +305,7 @@ fn main() {
                 allow_adopt,
                 no_browser,
                 cancel,
+                local,
             )? {
                 return Ok(());
             }

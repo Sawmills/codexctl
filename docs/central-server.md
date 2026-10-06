@@ -258,20 +258,38 @@ Other accounts remain available.
 A migration whose login identity conflicts with retained credentials returns HTTP 409 with `alias_identity_conflict`.
 The account stays fenced. This refusal does not record a recovery failure or trigger the credential-operation alert.
 
-To add a new account while the machine is connected, use the same command with an
-alias that is absent from the server catalog:
+To add a new account while the machine is connected, run the same command with an
+alias that is absent from the server catalog. `--label` sets its label:
 
 ```sh
-codexctl login new-account
+codexctl login new-account --label "Team"
 ```
 
-The client runs the device login in an isolated temporary `CODEX_HOME`, then sends
-the resulting credential through the authenticated account-import endpoint. The
-server verifies the account, becomes its refresh owner, and the client removes the
-temporary login home without changing the active server provider. If the import
-request has an unknown outcome, the client keeps a private pending receipt and
-rerunning the same command reconciles it without starting a second login. The
-account is not installed as a local profile.
+The server runs the OpenAI device login in a private server home, the same as renewal.
+The command prints the code and opens the sign-in page; `--no-browser` only prints it.
+The refresh token stays on the server. After sign-in, the server verifies the account
+and starts its refresh owner. Your machine's credentials and active account do not change,
+and the account is not installed as a local profile.
+
+If the approved OpenAI account is already a server account of yours under another alias,
+the server renews that alias instead and adds nothing. The command names that alias.
+An OpenAI account that belongs to another company user is refused with
+`account_already_owned`; the server deletes the new grant and that user's account keeps working.
+
+If your terminal disconnects, run the same command again. The machine keeps a private
+receipt of the operation and resumes it, even after the alias appears in the catalog,
+so it never starts a second OpenAI login. If the server restarts after OpenAI issued
+the grant, the server keeps that grant reserved and fences any account it overlaps
+until the same command resumes it. One alias has one pending add at a time; another
+machine cannot start, resume, or cancel it. `codexctl login <alias> --cancel` stops a
+pending add, and the server deletes its login home and any grant.
+
+To save a local profile on a connected machine instead, add `--local`:
+`codexctl login <alias> --local`. A server alias still renews on the server.
+
+Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
+the server answers HTTP 503 with `account_login_unavailable`, because login records are
+local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
 
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine

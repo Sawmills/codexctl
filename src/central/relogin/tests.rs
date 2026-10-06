@@ -48,6 +48,8 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
         code: None,
         error: None,
         retired: false,
+        label: None,
+        landed: None,
     };
     let home = directory(&state, &record.id).unwrap().join("home");
     store::ensure_private_dir(&home).unwrap();

@@ -140,8 +140,8 @@ pub(super) struct RegistryState {
     pub devices: Vec<vault::Device>,
 }
 pub(super) struct HttpError {
-    status: StatusCode,
-    reason: &'static str,
+    pub(super) status: StatusCode,
+    pub(super) reason: &'static str,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
@@ -603,7 +603,7 @@ impl Broker {
                 }
             })
     }
-    async fn resolve_alias(
+    pub(super) async fn resolve_alias(
         &self,
         user: &str,
         alias: &str,
@@ -1657,14 +1657,28 @@ impl Broker {
         &self,
         permit: tokio::sync::OwnedSemaphorePermit,
         user: &str,
+        input: Import,
+    ) -> Result<Account, HttpError> {
+        // Lock order is imports, then Owner. Token requests take the same
+        // imports guard before locking their selected Owner.
+        let import_guard = self.imports.lock().await;
+        self.import_account_locked(import_guard, permit, user, input)
+            .await
+    }
+
+    /// Import admission for a caller that already holds the imports guard, such
+    /// as a server-managed new-account login that must not release it between
+    /// retiring its own reservation and admission.
+    pub(super) async fn import_account_locked(
+        &self,
+        import_guard: tokio::sync::MutexGuard<'_, ()>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        user: &str,
         mut input: Import,
     ) -> Result<Account, HttpError> {
         input.alias = normalize_alias(&input.alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
             .to_owned();
-        // Lock order is imports, then Owner. Token requests take the same
-        // imports guard before locking their selected Owner.
-        let import_guard = self.imports.lock().await;
         let id = self
             .resolve_alias(user, &input.alias)
             .await?
@@ -3041,6 +3055,15 @@ pub async fn serve(
             ownership_unresolved = true;
         }
     }
+    // A saved new-account grant fences every owner it overlaps until its
+    // admission resumes. An unidentified login child can hold any identity.
+    match relogin::add::recover(state) {
+        Ok(reserved) => conflicting_journals.extend(reserved),
+        Err(_) => {
+            replacements_blocked = true;
+            ownership_unresolved = true;
+        }
+    }
     for entry in std::fs::read_dir(state.join("accounts"))? {
         let entry = entry?;
         let inventory =
@@ -3315,6 +3338,9 @@ pub async fn serve(
         .route("/v1/relogin/start", post(relogin::start))
         .route("/v1/relogin/status", post(relogin::status))
         .route("/v1/relogin/cancel", post(relogin::cancel))
+        .route("/v1/accounts/login/start", post(relogin::add::start))
+        .route("/v1/accounts/login/status", post(relogin::add::status))
+        .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }));

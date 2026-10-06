@@ -227,6 +227,19 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         [0, 0, 0],
         "startup must not create refresh children on any replica"
     );
+    // Login records are replica-local, so shared mode refuses new-account login.
+    let add = http
+        .post(format!("{}/v1/accounts/login/start", pods[0].url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"new-account","id":"a".repeat(64)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), 503);
+    assert_eq!(
+        add.json::<Value>().await.unwrap()["error"],
+        "account_login_unavailable"
+    );
 
     let token = std::fs::read_to_string(token_file).unwrap();
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold").unwrap();

@@ -167,7 +167,7 @@ pub(in crate::central) fn retire_reservations(
             }
         }
     }
-    Ok(())
+    add::retire(accounts, auth, skip)
 }
 #[derive(Default)]
 pub(in crate::central) struct Recovery {

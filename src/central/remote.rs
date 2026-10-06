@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
-    process::Command,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 const RATE_LIMIT_SWITCH_THRESHOLD: f64 = 95.0;
@@ -85,18 +84,34 @@ fn browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Existing remote aliases renew on the server. Local login retains its old contract.
+/// Server aliases renew on the server, and an alias absent from the catalog is
+/// added there. Both run the OpenAI device login in a private server home.
+/// Without server registration, local login retains its old contract.
 pub fn login(
     alias: &str,
     label: Option<&str>,
     allow_adopt: bool,
     no_browser: bool,
     cancel: bool,
+    local: bool,
 ) -> Result<bool> {
     let alias = store::validate_alias(alias)?;
     let Some(connection) = connection()? else {
         return Ok(false);
     };
+    // A pending add resumes before catalog routing: after a lost completion the
+    // alias is already in the catalog, and renewal would start a second login.
+    if login_receipt(alias)?.is_some_and(|saved| saved["kind"] == "add") {
+        if local {
+            bail!(
+                "a server account login for {alias} is pending; finish it or run codexctl login {alias} --cancel"
+            );
+        }
+        if allow_adopt {
+            bail!("server account login never adopts local credentials; omit --allow-adopt");
+        }
+        return server_login(&connection, alias, Some(label), no_browser, cancel);
+    }
     // Retain prior alias evidence before discovery replaces the cache. A fresh
     // catalog can discover accounts created on another machine; failed discovery
     // must still allow unrelated local logins without weakening existing fences.
@@ -128,18 +143,55 @@ pub fn login(
                 "known server account {alias} is absent from the catalog; local login is disabled; reconcile its migration or connection records"
             );
         }
+        if local {
+            return Ok(false);
+        }
         if cancel {
             bail!("no pending server account login for {alias}");
         }
-        return add_account(&catalog.connection, alias, label, no_browser);
+        if allow_adopt {
+            bail!("server account login never adopts local credentials; omit --allow-adopt");
+        }
+        return server_login(&catalog.connection, alias, Some(label), no_browser, false);
     };
     if label.is_some() || allow_adopt {
         bail!(
             "server login preserves the account identity and label; omit --label and --allow-adopt"
         );
     }
-    let connection = catalog.connection;
-    let alias = &account.alias;
+    server_login(
+        &catalog.connection,
+        &account.alias,
+        None,
+        no_browser,
+        cancel,
+    )
+}
+
+fn login_receipt_path(alias: &str) -> Result<PathBuf> {
+    Ok(root()?.join(format!(
+        ".login-{}.json",
+        vault::digest(alias.to_ascii_lowercase().as_bytes())
+    )))
+}
+
+fn login_receipt(alias: &str) -> Result<Option<Value>> {
+    let path = login_receipt_path(alias)?;
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&vault::private_read(&path)?)?))
+}
+
+/// Run one server-managed login operation. `add` carries the requested label
+/// for a new account and is `None` for renewal of an existing alias.
+fn server_login(
+    connection: &Connection,
+    alias: &str,
+    add: Option<Option<&str>>,
+    no_browser: bool,
+    cancel: bool,
+) -> Result<bool> {
     let directory = root()?;
     store::ensure_private_dir(&directory)?;
     let lock_name = format!(
@@ -147,19 +199,39 @@ pub fn login(
         vault::digest(alias.to_ascii_lowercase().as_bytes())
     );
     let receipt_lock = vault::registry_lock(&directory, &lock_name)?;
-    let path = directory.join(format!(
-        ".login-{}.json",
-        vault::digest(alias.to_ascii_lowercase().as_bytes())
-    ));
-    let mut id = if path.try_exists()? {
-        let saved: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
+    let path = login_receipt_path(alias)?;
+    let mut label = match add {
+        Some(label) => label
+            .map(store::validate_label)
+            .transpose()?
+            .flatten()
+            .map(str::to_owned),
+        None => None,
+    };
+    let mut id = if let Some(saved) = login_receipt(alias)? {
         if saved["server"] != connection.server
             || saved["userId"] != connection.user_id
-            || saved["alias"] != *alias
+            || !saved["alias"]
+                .as_str()
+                .is_some_and(|saved| saved.eq_ignore_ascii_case(alias))
         {
             bail!(
                 "saved server login belongs to another registration; retain it until ownership is reconciled"
             );
+        }
+        if (saved["kind"] == "add") != add.is_some() {
+            bail!(
+                "saved server login for {alias} is a different operation; finish it or add --cancel"
+            );
+        }
+        if add.is_some() {
+            let saved_label = saved["label"].as_str().map(str::to_owned);
+            if label.is_some() && label != saved_label {
+                bail!(
+                    "pending server account login for {alias} has a different label; retry with the original label"
+                );
+            }
+            label = saved_label;
         }
         saved["id"]
             .as_str()
@@ -168,34 +240,64 @@ pub fn login(
     } else {
         vault::digest(&super::enrollment::random_bytes())
     };
-    let persist = |id: &str| {
-        store::atomic_write(
-            &path,
-            &serde_json::to_vec(
-                &json!({"server":connection.server,"userId":connection.user_id,"alias":alias,"id":id}),
-            )?,
-        )
+    let endpoint = if add.is_some() {
+        "/v1/accounts/login"
+    } else {
+        "/v1/relogin"
     };
-    let call = |endpoint: &str, id: &str| -> Result<Value> {
-        require_current_connection(&connection)?;
+    let persist = |id: &str| {
+        let mut receipt = json!({
+            "server":connection.server,"userId":connection.user_id,"alias":alias,"id":id
+        });
+        if add.is_some() {
+            receipt["kind"] = json!("add");
+            receipt["label"] = json!(label);
+        }
+        store::atomic_write(&path, &serde_json::to_vec(&receipt)?)
+    };
+    let call = |operation: &str, id: &str| -> Result<Value> {
+        require_current_connection(connection)?;
         let http = transport::blocking()?;
+        let mut body = json!({"alias":alias,"id":id});
+        if add.is_some() {
+            body["label"] = json!(label);
+        }
         let response = http
             .post(format!(
-                "{}{endpoint}",
+                "{}{endpoint}/{operation}",
                 connection.server.trim_end_matches('/')
             ))
-            .bearer_auth(secret(&connection)?)
-            .json(&json!({"alias":alias,"id":id}))
+            .bearer_auth(secret(connection)?)
+            .json(&body)
             .send()?;
         if !response.status().is_success() {
-            bail!(
-                "server login request rejected (HTTP {}); the operation is retained, rerun codexctl login {alias}",
-                response.status()
-            );
+            let status = response.status();
+            let reason = response
+                .json::<Value>()
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_owned));
+            match reason.as_deref() {
+                Some("account_login_unavailable") => bail!(
+                    "the server cannot add accounts now; adding accounts is unavailable while the server runs in shared mode"
+                ),
+                Some("alias_exists") => {
+                    bail!("server account {alias} already exists; run codexctl login {alias} again")
+                }
+                Some("login_belongs_to_another_device") => bail!(
+                    "another machine has a pending login for {alias}; finish or cancel it there"
+                ),
+                _ => bail!(
+                    "server login request rejected (HTTP {status}); the operation is retained, rerun codexctl login {alias}"
+                ),
+            }
         }
         let value: Value = response.json()?;
-        require_current_connection(&connection)?;
-        if value["userId"] != connection.user_id || value["alias"] != *alias {
+        require_current_connection(connection)?;
+        if value["userId"] != connection.user_id
+            || !value["alias"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(alias))
+        {
             bail!("server login identity changed");
         }
         let response_id = value["id"]
@@ -217,13 +319,19 @@ pub fn login(
     drop(receipt_lock);
     let requested_id = id.clone();
     let mut status = if cancel {
-        call("/v1/relogin/status", if had_receipt { &id } else { "" })?
+        call("status", if had_receipt { &id } else { "" })?
     } else {
-        println!(
-            "Renewing OpenAI login for server account {alias}. Sign in to that same OpenAI account and workspace."
-        );
-        println!("Approving a different account can invalidate its previous OpenAI login.");
-        call("/v1/relogin/start", &id)?
+        if add.is_some() {
+            println!(
+                "Adding server account {alias}. Sign in to the OpenAI account and workspace to add."
+            );
+        } else {
+            println!(
+                "Renewing OpenAI login for server account {alias}. Sign in to that same OpenAI account and workspace."
+            );
+            println!("Approving a different account can invalidate its previous OpenAI login.");
+        }
+        call("start", &id)?
     };
     id = status["id"]
         .as_str()
@@ -231,13 +339,7 @@ pub fn login(
         .into();
     {
         let _lock = vault::registry_lock(&directory, &lock_name)?;
-        let saved = if path.try_exists()? {
-            Some(serde_json::from_slice::<Value>(&vault::private_read(
-                &path,
-            )?)?)
-        } else {
-            None
-        };
+        let saved = login_receipt(alias)?;
         if saved
             .as_ref()
             .is_none_or(|value| value["id"] == requested_id)
@@ -246,16 +348,13 @@ pub fn login(
         }
     }
     if cancel {
-        status = call("/v1/relogin/cancel", &id)?;
+        status = call("cancel", &id)?;
     }
     let clear_receipt = || -> Result<()> {
         let _lock = vault::registry_lock(&directory, &lock_name)?;
-        if path.try_exists()? {
-            let saved: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
-            if saved["id"] == id {
-                std::fs::remove_file(&path)?;
-                store::sync_directory(&directory)?;
-            }
+        if login_receipt(alias)?.is_some_and(|saved| saved["id"] == id) {
+            std::fs::remove_file(&path)?;
+            store::sync_directory(&directory)?;
         }
         Ok(())
     };
@@ -270,9 +369,22 @@ pub fn login(
             }
             Some("completed") => {
                 clear_receipt()?;
-                println!(
-                    "Server login renewed for {alias}. Connected machines can keep using this account."
-                );
+                match (add.is_some(), status["landedAlias"].as_str()) {
+                    (true, Some(landed)) => println!(
+                        "This OpenAI account is already server account {landed}. Its login was renewed; no new account was added."
+                    ),
+                    (true, None) => {
+                        println!(
+                            "Server account added for {alias}. Run codexctl use {alias} to activate it."
+                        );
+                        if let Err(error) = catalog() {
+                            eprintln!("warning: account catalog refresh failed: {error:#}");
+                        }
+                    }
+                    _ => println!(
+                        "Server login renewed for {alias}. Connected machines can keep using this account."
+                    ),
+                }
                 return Ok(true);
             }
             Some("failed" | "canceled") => {
@@ -284,6 +396,17 @@ pub fn login(
                     Some("login_stopped_account_requires_relogin") => {
                         "login stopped; the account requires a new login"
                     }
+                    Some("login_canceled") => "login canceled; no account was added",
+                    Some("account_already_owned") => {
+                        "this OpenAI account belongs to another company user; no account was added"
+                    }
+                    Some("alias_identity_conflict") => {
+                        "this OpenAI login conflicts with a retained server account; no account was added"
+                    }
+                    Some("relogin_reserved") => {
+                        "another login operation reserves this OpenAI account; no account was added"
+                    }
+                    _ if add.is_some() => "server login failed; no account was added",
                     _ => "server login failed; the account remains unavailable",
                 };
                 bail!("{reason}. Retry with codexctl login {alias}");
@@ -313,200 +436,13 @@ pub fn login(
             );
         }
         std::thread::sleep(Duration::from_secs(1));
-        status = call("/v1/relogin/status", &id)?;
+        status = call("status", &id)?;
         if status["id"] != id {
             bail!("server login operation changed");
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PendingAccountLogin {
-    connection: Connection,
-    alias: String,
-    label: Option<String>,
-    auth: Value,
-}
-
-fn pending_account_login_path(alias: &str) -> Result<PathBuf> {
-    Ok(root()?.join(format!(
-        ".account-login-{}.json",
-        vault::digest(alias.to_ascii_lowercase().as_bytes())
-    )))
-}
-
-fn isolated_login_home(alias: &str) -> Result<PathBuf> {
-    let paths = config::default_paths()?;
-    let _lock = store::lock(&paths)?;
-    let alias_home = store::login_home(&paths, alias)?;
-    store::ensure_private_dir(&alias_home)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    for attempt in 0..16 {
-        let home = alias_home.join(format!("session-{}-{nonce}-{attempt}", std::process::id()));
-        match std::fs::create_dir(&home) {
-            Ok(()) => {
-                store::ensure_private_dir(&home)?;
-                return Ok(home);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    bail!("failed to allocate a unique isolated login home")
-}
-
-fn remove_isolated_login_home(home: &Path) -> Result<()> {
-    std::fs::remove_dir_all(home)
-        .with_context(|| format!("failed to remove isolated login home {}", home.display()))?;
-    for parent in [home.parent(), home.parent().and_then(Path::parent)] {
-        let Some(parent) = parent else { continue };
-        let empty = std::fs::read_dir(parent)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false);
-        if empty {
-            let _ = std::fs::remove_dir(parent);
-        }
-    }
-    Ok(())
-}
-
-fn run_device_login(alias: &str) -> Result<Value> {
-    let home = isolated_login_home(alias)?;
-    let result = (|| {
-        let status = Command::new("codex")
-            .args([
-                "login",
-                "--device-auth",
-                "-c",
-                "cli_auth_credentials_store=\"file\"",
-                "-c",
-                "forced_login_method=\"chatgpt\"",
-                "-c",
-                "features.daemon_auto_start=false",
-            ])
-            .env("CODEX_HOME", &home)
-            .env_remove("CODEXCTL_PINNED_ALIAS")
-            .env_remove("CODEX_ACCESS_TOKEN")
-            .env_remove("OPENAI_API_KEY")
-            .status()
-            .context("failed to run `codex login --device-auth`")?;
-        if !status.success() {
-            bail!("codex login failed with status {status}");
-        }
-        let auth_path = home.join("auth.json");
-        if !auth_path.exists() {
-            bail!("codex login did not create {}", auth_path.display());
-        }
-        api::read_auth_json(&auth_path).with_context(|| {
-            format!(
-                "codex login wrote credentials that cannot be read at {}",
-                auth_path.display()
-            )
-        })?;
-        Ok(serde_json::from_slice(&std::fs::read(auth_path)?)?)
-    })();
-    let cleanup = remove_isolated_login_home(&home);
-    match (result, cleanup) {
-        (Ok(auth), Ok(())) => Ok(auth),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "also failed to remove isolated login home: {cleanup_error:#}"
-        ))),
-    }
-}
-
-/// Add a new account through the existing server import protocol.
-///
-/// The device login is isolated from the active Codex home. The refresh-bearing
-/// auth file is retained in a private pending receipt until the server confirms
-/// ownership, so a transport failure can be retried without a second login.
-fn add_account(
-    connection: &Connection,
-    alias: &str,
-    label: Option<&str>,
-    no_browser: bool,
-) -> Result<bool> {
-    if no_browser {
-        bail!(
-            "--no-browser is supported for existing server-account renewal; new-account login uses the local Codex device flow"
-        );
-    }
-    let alias = store::validate_alias(alias)?.to_owned();
-    let label = label
-        .map(store::validate_label)
-        .transpose()?
-        .flatten()
-        .map(str::to_owned);
-    let pending_path = pending_account_login_path(&alias)?;
-    let pending = if pending_path.try_exists()? {
-        let saved: PendingAccountLogin =
-            serde_json::from_slice(&vault::private_read(&pending_path)?)?;
-        if saved.connection != *connection || !saved.alias.eq_ignore_ascii_case(&alias) {
-            bail!(
-                "pending account login for '{alias}' belongs to another server registration; resolve it before retrying"
-            );
-        }
-        if saved.label != label {
-            bail!(
-                "pending account login for '{alias}' has a different label; retry with the original label"
-            );
-        }
-        saved
-    } else {
-        println!("Logging into new server account '{alias}'.");
-        let auth = run_device_login(&alias)?;
-        let pending = PendingAccountLogin {
-            connection: connection.clone(),
-            alias: alias.clone(),
-            label: label.clone(),
-            auth,
-        };
-        store::atomic_write(&pending_path, &serde_json::to_vec(&pending)?)?;
-        pending
-    };
-
-    let response = transport::blocking()?
-        .post(format!(
-            "{}/v1/accounts",
-            connection.server.trim_end_matches('/')
-        ))
-        .bearer_auth(secret(connection)?)
-        .json(&Import {
-            alias: pending.alias.clone(),
-            label: pending.label.clone(),
-            auth: pending.auth.clone(),
-        })
-        .send()
-        .context("account import outcome unknown; rerun the same login command")?;
-    if !response.status().is_success() {
-        bail!(
-            "server account import rejected (HTTP {}); the pending login is retained, rerun codexctl login {alias}",
-            response.status()
-        );
-    }
-    let account: Account = response
-        .json()
-        .context("account import outcome unknown; rerun the same login command")?;
-    if account.user_id != connection.user_id
-        || !account.alias.eq_ignore_ascii_case(&pending.alias)
-        || !account.available
-    {
-        bail!("server did not verify the new account; the pending login is retained");
-    }
-    require_current_connection(connection)?;
-    std::fs::remove_file(&pending_path)?;
-    store::sync_directory(&root()?)?;
-    println!(
-        "Server account added for {}. Run codexctl use {} to activate it.",
-        account.alias, account.alias
-    );
-    Ok(true)
-}
 pub fn connect(server: &str, name: Option<&str>, no_browser: bool) -> Result<()> {
     transport::origin(server)?;
     if connection()?.is_some() || registration(&pending_path()?)?.is_some() {

@@ -240,6 +240,30 @@ impl IdentityInventory {
     }
 }
 
+/// A login grant reserves its identity: only a stopped one may yield, and a
+/// migration must preserve every login claim it makes.
+fn admit_candidate(
+    candidate: &Reservation,
+    auth: &Value,
+    kind: AdmissionKind,
+    admission: &mut Admission,
+) -> Result<()> {
+    if !overlaps(&candidate.auth, auth) {
+        return Ok(());
+    }
+    if kind == AdmissionKind::Restore || candidate.process != ProcessState::Stopped {
+        return Err(AdmissionDenied::Reserved.into());
+    }
+    if kind == AdmissionKind::Migration {
+        // A new grant must preserve every known login claim before it
+        // can retire a quarantine, even when no server account exists.
+        super::super::server::validate_owned_identity(&candidate.auth, auth)
+            .map_err(|_| AdmissionDenied::IdentityConflict)?;
+    }
+    admission.quarantine_repair = true;
+    Ok(())
+}
+
 /// The sole registry admission policy, shared by migration, renewal and launch.
 /// Call under the migration lock, after settling any conflicting refresh processes.
 pub(in crate::central) fn clear_registry(
@@ -258,6 +282,10 @@ pub(in crate::central) fn clear_registry(
     let mut admission = Admission {
         quarantine_repair: false,
     };
+    // New-account logins hold grants outside the registry until admission.
+    for candidate in add::reservations(accounts)? {
+        admit_candidate(&candidate, auth, kind, &mut admission)?;
+    }
     for entry in std::fs::read_dir(accounts)? {
         let state = entry?.path();
         if state == selected {
@@ -266,18 +294,7 @@ pub(in crate::central) fn clear_registry(
         let inventory = identity_inventory(&state, key, &state.join("runtime"));
         let conflict = inventory.journal_conflicts();
         for candidate in inventory.candidates? {
-            if overlaps(&candidate.auth, auth) {
-                if restoring_verified || candidate.process != ProcessState::Stopped {
-                    return Err(AdmissionDenied::Reserved.into());
-                }
-                if kind == AdmissionKind::Migration {
-                    // A new grant must preserve every known login claim before it
-                    // can retire a quarantine, even when no server account exists.
-                    super::super::server::validate_owned_identity(&candidate.auth, auth)
-                        .map_err(|_| AdmissionDenied::IdentityConflict)?;
-                }
-                admission.quarantine_repair = true;
-            }
+            admit_candidate(&candidate, auth, kind, &mut admission)?;
         }
         let journal = match inventory.journal {
             Ok(journal) => journal,
