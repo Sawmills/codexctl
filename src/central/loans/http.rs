@@ -352,6 +352,9 @@ async fn lend(
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
+    // Loans cover Codex (OpenAI) server accounts only. Server accounts have no
+    // provider field today; when one is added (SAW-12454), refuse a loan here
+    // for any provider other than OpenAI.
     let owner = broker.owner(&device, alias).await?;
     // Fresh usage gives the weekly reset; a stale reading refuses the grant.
     let weekly_reset = managed::account_catalog(&broker, &device.user, catalog::Freshness::Cached)

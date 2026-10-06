@@ -281,3 +281,46 @@ fn the_launch_fallback_refuses_a_borrowed_account_at_the_backoff() {
         "owned accounts keep the old fallback"
     );
 }
+
+#[test]
+fn the_launch_fallback_needs_verified_included_usage_with_a_window() {
+    let mut stale = account("alice/main", 10.0, true);
+    stale.usage_stale = true;
+    assert!(fallback_refusal("alice/main", &[stale]).is_some());
+    let mut billed = account("alice/main", 10.0, true);
+    billed.billing_class = api::BillingClass::UsageBased;
+    assert!(fallback_refusal("alice/main", &[billed]).is_some());
+    let mut blind = account("alice/main", 10.0, true);
+    blind.primary_used = None;
+    assert!(fallback_refusal("alice/main", &[blind]).is_some());
+}
+
+#[test]
+fn fresh_token_usage_rechecks_the_backoff() {
+    let usage = |five: Option<f64>, weekly: Option<f64>| crate::statusline::Usage {
+        age_seconds: 0,
+        weekly_used_percent: weekly,
+        weekly_resets_at: None,
+        five_hour_used_percent: five,
+        five_hour_resets_at: None,
+        allowed: Some(true),
+        limit_reached: Some(false),
+    };
+    assert!(token_below_borrower_backoff(Some(&usage(
+        Some(94.0),
+        Some(10.0)
+    ))));
+    assert!(!token_below_borrower_backoff(Some(&usage(
+        Some(96.0),
+        Some(10.0)
+    ))));
+    assert!(!token_below_borrower_backoff(Some(&usage(
+        None,
+        Some(95.0)
+    ))));
+    assert!(
+        !token_below_borrower_backoff(Some(&usage(None, None))),
+        "no window, no proof"
+    );
+    assert!(!token_below_borrower_backoff(None));
+}

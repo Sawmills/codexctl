@@ -396,6 +396,18 @@ fn prepare_pinned_codex(
             account.alias
         );
     }
+    // Automatic placement rechecks the borrower backoff on this catalog and on
+    // the usage that came with the token; selection may have seen older data.
+    if included_only
+        && account.loan.is_some()
+        && !(super::super::loans::borrowed_auto_eligible(account)
+            && super::super::loans::token_below_borrower_backoff(token.statusline_usage.as_ref()))
+    {
+        bail!(
+            "borrowed account {} reached the borrower backoff; the lender's lanes come first",
+            account.alias
+        );
+    }
     if !allow_billing {
         require_headroom(&account.alias, &token)?;
     }

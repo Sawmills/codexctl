@@ -363,8 +363,33 @@ pub fn owned_then_borrowed<T>(
     })
 }
 
+/// True when a borrowed catalog entry may receive automatic placement:
+/// fresh, verified included usage with a reported window below the backoff.
+pub fn borrowed_auto_eligible(account: &super::managed::Account) -> bool {
+    account.available
+        && !account.usage_stale
+        && account.billing_class == crate::api::BillingClass::RateLimited
+        && (account.primary_used.is_some() || account.secondary_used.is_some())
+        && below_borrower_backoff(account)
+}
+
+/// The backoff on a freshly issued token's usage. Without a reported window
+/// there is no proof of room, so the answer is no.
+pub fn token_below_borrower_backoff(usage: Option<&crate::statusline::Usage>) -> bool {
+    usage.is_some_and(|usage| {
+        let used: Vec<_> = [usage.five_hour_used_percent, usage.weekly_used_percent]
+            .into_iter()
+            .flatten()
+            .collect();
+        !used.is_empty()
+            && used
+                .iter()
+                .all(|used| used.is_finite() && *used < BORROWER_BACKOFF_PERCENT)
+    })
+}
+
 /// Why a fallback launch must not run on the active account: it is
-/// borrowed and at the borrower backoff, or no longer listed.
+/// borrowed and not eligible for automatic placement, or no longer listed.
 pub fn fallback_refusal(active: &str, accounts: &[super::managed::Account]) -> Option<String> {
     if !AccountRef::parse(active).is_ok_and(|reference| reference.is_borrowed()) {
         return None;
@@ -373,9 +398,9 @@ pub fn fallback_refusal(active: &str, accounts: &[super::managed::Account]) -> O
         .iter()
         .find(|account| account.alias.eq_ignore_ascii_case(active));
     match account {
-        Some(account) if account.available && below_borrower_backoff(account) => None,
+        Some(account) if borrowed_auto_eligible(account) => None,
         _ => Some(format!(
-            "the active account {active} is borrowed and the lender's lanes come first at {BORROWER_BACKOFF_PERCENT}% use; run codexctl codex --account {active} to use it anyway"
+            "the active account {active} is borrowed and has no verified included usage below {BORROWER_BACKOFF_PERCENT}%; the lender's lanes come first; run codexctl codex --account {active} to use it anyway"
         )),
     }
 }

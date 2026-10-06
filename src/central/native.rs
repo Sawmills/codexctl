@@ -1417,6 +1417,15 @@ pub fn activate(
     if usage_based && !explicit && !redeem_reset {
         bail!("automatic remote selection refuses usage-based or unknown billing");
     }
+    // Automatic selection rechecks the borrower backoff on fresh usage.
+    if !explicit
+        && AccountRef::parse(alias)?.is_borrowed()
+        && !super::loans::token_below_borrower_backoff(token.statusline_usage.as_ref())
+    {
+        bail!(
+            "borrowed account {alias} reached the borrower backoff; the lender's lanes come first"
+        );
+    }
     if usage_based && !allow_billing && !redeem_reset {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
