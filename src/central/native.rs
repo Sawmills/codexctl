@@ -1167,7 +1167,10 @@ fn finish_token(
     {
         bail!("active account changed during token retrieval; retry");
     }
+    // A borrowed connection may share its workspace with a newer grant, so
+    // the grant pin is part of the identity checked before publishing.
     if latest.account_id != connection.account_id
+        || latest.loan_id != connection.loan_id
         || latest.server != connection.server
         || latest.device_token_file != connection.device_token_file
     {
@@ -1993,7 +1996,7 @@ mod tests {
     use super::{
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
-        billing_switch_prompt, is_billing_approved, remove_active_pointer_audited,
+        billing_switch_prompt, finish_token, is_billing_approved, remove_active_pointer_audited,
         remove_active_pointer_with, remove_pointer_then_marker_audited,
         remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
         rollback_or_context, save_connection, statusline_identity, validate_token_account,
@@ -2059,6 +2062,46 @@ mod tests {
             loan_id: None,
         };
         assert!(is_billing_approved(&connection, &changed_billing_token()));
+    }
+
+    #[test]
+    fn a_token_fetched_under_an_earlier_grant_is_not_published() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.json");
+        let pinned = |loan: &str| Connection {
+            user_id: Some("borrower".into()),
+            alias: Some("alice/main".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "shared-workspace".into(),
+            revision: "revision".into(),
+            allow_billing: false,
+            launch_pinned: false,
+            approved_billing_plan: None,
+            approved_billing_class: None,
+            session_id: String::new(),
+            loan_id: Some(loan.into()),
+        };
+        // A reselection committed the second grant while the first was in flight.
+        save_connection(&path, &pinned("second")).unwrap();
+        let claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"shared-workspace"}});
+        let token = TokenResponse {
+            user_id: None,
+            access_token: format!(
+                "h.{}.",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            ),
+            chatgpt_account_id: "shared-workspace".into(),
+            chatgpt_plan_type: Some("pro".into()),
+            revision: "new-revision".into(),
+            billing_class: Some(api::BillingClass::RateLimited),
+            native_routing_supported: true,
+            statusline_usage: None,
+            label: None,
+        };
+        let error = finish_token(&path, &pinned("first"), token, None).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error:#}");
     }
 
     #[test]
