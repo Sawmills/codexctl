@@ -463,6 +463,48 @@ fn server_login_discovers_an_alias_without_a_cached_catalog() {
     server_login_cli_scenario(false, false);
 }
 
+#[test]
+fn server_login_adds_an_unknown_alias_without_switching_the_local_provider() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = Server::start();
+    let home = server.connected_home();
+    let bin = tempfile::tempdir().unwrap();
+    let codex = bin.path().join("codex");
+    let auth = serde_json::to_string(&auth("new-login", "new-seat")).unwrap();
+    std::fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nprintf '%s' '{}' > \"$CODEX_HOME/auth.json\"\n",
+            auth
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let path = format!(
+        "{}:{}",
+        bin.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("HOME", home.path())
+        .env("PATH", path)
+        .args(["login", "new-account"])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(String::from_utf8_lossy(&result.stdout).contains("Server account added"));
+    assert!(home.path().join(".codexctl/central/.catalog.json").exists());
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "new-account");
+}
+
 fn server_login_cli_scenario(active: bool, cached: bool) {
     let server = Server::start();
     assert!(

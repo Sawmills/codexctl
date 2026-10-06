@@ -258,6 +258,21 @@ Other accounts remain available.
 A migration whose login identity conflicts with retained credentials returns HTTP 409 with `alias_identity_conflict`.
 The account stays fenced. This refusal does not record a recovery failure or trigger the credential-operation alert.
 
+To add a new account while the machine is connected, use the same command with an
+alias that is absent from the server catalog:
+
+```sh
+codexctl login new-account
+```
+
+The client runs the device login in an isolated temporary `CODEX_HOME`, then sends
+the resulting credential through the authenticated account-import endpoint. The
+server verifies the account, becomes its refresh owner, and the client removes the
+temporary login home without changing the active server provider. If the import
+request has an unknown outcome, the client keeps a private pending receipt and
+rerunning the same command reconciles it without starting a second login. The
+account is not installed as a local profile.
+
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine
 can renew without a prior `list` or `status` command, even while a server provider is active.
