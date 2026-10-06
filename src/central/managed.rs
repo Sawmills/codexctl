@@ -1662,7 +1662,7 @@ impl Broker {
         // Lock order is imports, then Owner. Token requests take the same
         // imports guard before locking their selected Owner.
         let import_guard = self.imports.lock().await;
-        self.import_account_locked(import_guard, permit, user, input)
+        self.import_account_locked(&import_guard, permit, user, input)
             .await
     }
 
@@ -1671,7 +1671,7 @@ impl Broker {
     /// retiring its own reservation and admission.
     pub(super) async fn import_account_locked(
         &self,
-        import_guard: tokio::sync::MutexGuard<'_, ()>,
+        import_guard: &tokio::sync::MutexGuard<'_, ()>,
         permit: tokio::sync::OwnedSemaphorePermit,
         user: &str,
         mut input: Import,
@@ -2101,7 +2101,7 @@ impl Broker {
             }
             // The imports guard was acquired before the new Owner guard.
             let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, &import_guard)
+                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, import_guard)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut owner, &self.binary, proof)
                 .await
@@ -3057,7 +3057,7 @@ pub async fn serve(
     }
     // A saved new-account grant fences every owner it overlaps until its
     // admission resumes. An unidentified login child can hold any identity.
-    match relogin::add::recover(state) {
+    match relogin::add::recover(state, key) {
         Ok(reserved) => conflicting_journals.extend(reserved),
         Err(_) => {
             replacements_blocked = true;

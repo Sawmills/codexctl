@@ -154,6 +154,11 @@ pub(in crate::central) async fn cancel(
         // An acknowledgment, not proof of exit. Poll for the terminal result.
         flag.store(true, Ordering::Release);
     } else if resumable(&broker, &state, &record) {
+        if record.retired {
+            // Import already holds this grant as an unverified server account.
+            // Deleting only this record would leave that account behind.
+            return Err(broker.error(StatusCode::CONFLICT, "account_import_retained"));
+        }
         discard(&state, &mut record, Phase::Canceled, "login_canceled")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     }
@@ -549,7 +554,9 @@ async fn admit(
     let owners = broker.owners.read().await.clone();
     let mut held = None;
     for (identity, owner) in owners.values() {
-        if identity.user != record.user {
+        // An earlier attempt may have imported this alias unverified; its
+        // retry is import verification, not a renewal of the same alias.
+        if identity.user != record.user || identity.alias.eq_ignore_ascii_case(&record.alias) {
             continue;
         }
         let guarded = owner.lock().await;
@@ -571,9 +578,8 @@ async fn admit(
         auth,
     };
     let result = broker
-        .import_account_locked(guard, permit, &record.user, input)
+        .import_account_locked(&guard, permit, &record.user, input)
         .await;
-    let _import = broker.imports.lock().await;
     let mut record = load(state, id)?;
     match result {
         Ok(_) => {
@@ -686,7 +692,7 @@ async fn land(
 
 /// Startup audit of new-account logins. Returns every reserved grant so the
 /// caller fences overlapping owners. An unidentified login child is an error.
-pub(in crate::central) fn recover(broker_state: &Path) -> Result<Vec<Value>> {
+pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec<Value>> {
     let root = root(broker_state);
     let mut reserved = Vec::new();
     if !root.try_exists()? {
@@ -704,13 +710,25 @@ pub(in crate::central) fn recover(broker_state: &Path) -> Result<Vec<Value>> {
                 && record.retired
                 && record.candidate.is_none()
             {
-                // A discard stopped between retiring the grant and its terminal write.
-                discard(
-                    &state,
-                    &mut record,
-                    Phase::Failed,
-                    "login_interrupted_retry",
-                )?;
+                // A discard stopped between retiring the grant and its terminal
+                // write. A verified account under this alias means admission won.
+                let account = broker_state
+                    .join("accounts")
+                    .join(account_key(&record.user, &record.alias));
+                let admitted =
+                    account.join("vault.enc").try_exists()? && vault::load(&account, key)?.verified;
+                if admitted {
+                    discard(&state, &mut record, Phase::Completed, "")?;
+                    record.error = None;
+                    save(&state, &record)?;
+                } else {
+                    discard(
+                        &state,
+                        &mut record,
+                        Phase::Failed,
+                        "login_interrupted_retry",
+                    )?;
+                }
             } else if record.landed.is_none() && !terminal(&record.phase) {
                 match candidate(&state, &record)? {
                     Some(auth) => {

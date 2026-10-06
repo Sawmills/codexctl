@@ -818,6 +818,85 @@ fn server_login_adds_an_unknown_alias_without_a_client_credential() {
     );
 }
 
+#[test]
+fn server_add_retry_after_failed_verification_imports_the_same_alias() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let id = "a4".repeat(32);
+    server.add_request(&server.amir, "start", "routed", &id, None);
+    server.release_login("routed-login", "routed-seat");
+    let mut status = Value::Null;
+    for _ in 0..500 {
+        status = server
+            .add_request(&server.amir, "status", "routed", &id, None)
+            .json()
+            .unwrap();
+        if status["status"] == "verifying" && status["error"].is_string() {
+            break;
+        }
+        assert!(
+            !matches!(
+                status["status"].as_str(),
+                Some("completed" | "failed" | "canceled")
+            ),
+            "{status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(status["error"].is_string(), "{status}");
+    // Import already holds the grant as an unverified account; cancel must not hide it.
+    let canceled = server.add_request(&server.amir, "cancel", "routed", &id, None);
+    assert_eq!(canceled.status(), 409);
+    assert_eq!(
+        canceled.json::<Value>().unwrap()["error"],
+        "account_import_retained"
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    server.add_request(&server.amir, "start", "routed", &id, None);
+    let done = server.await_add(&server.amir, "routed", &id, "completed");
+    assert!(done["landedAlias"].is_null(), "{done}");
+    assert_eq!(server.token(&server.amir, "routed", None).status(), 200);
+}
+
+#[test]
+fn server_add_refusals_clear_the_client_receipt_and_never_fall_back_to_local_login() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "taken", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let home = server.connected_home();
+    let directory = home.path().join(".codexctl/central");
+    let receipt = directory.join(format!(".login-{}.json", digest("taken")));
+    store::atomic_write(
+        &receipt,
+        &serde_json::to_vec(&json!({
+            "server":server.url,"userId":"amir","alias":"taken","id":"a5".repeat(32),
+            "kind":"add","label":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = server.cli(home.path(), &["login", "taken", "--no-browser"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    assert!(!receipt.exists(), "a refused start must not wedge the alias");
+
+    server.stop();
+    let offline = server.cli(home.path(), &["login", "new-account", "--no-browser"]);
+    assert!(!offline.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline.stderr).contains("--local"),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+    assert!(!home.path().join(".codexctl/profiles/new-account").exists());
+    server.restart();
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

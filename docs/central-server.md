@@ -282,7 +282,9 @@ so it never starts a second OpenAI login. If the server restarts after OpenAI is
 the grant, the server keeps that grant reserved and fences any account it overlaps
 until the same command resumes it. One alias has one pending add at a time; another
 machine cannot start, resume, or cancel it. `codexctl login <alias> --cancel` stops a
-pending add, and the server deletes its login home and any grant.
+pending add, and the server deletes its login home and any grant. If an earlier attempt
+already left the account on the server unverified, cancel refuses with
+`account_import_retained`; rerun the same command to retry its verification.
 
 To save a local profile on a connected machine instead, add `--local`:
 `codexctl login <alias> --local`. A server alias still renews on the server.
@@ -297,7 +299,8 @@ can renew without a prior `list` or `status` command, even while a server provid
 If discovery fails, the machine uses its last successful catalog and retained migration
 or connection records to distinguish known server aliases from local aliases.
 Known server aliases require the account server; an outage never starts local login for them.
-Other aliases can still start local login when the server is unavailable.
+When the server is unavailable, a new alias needs `--local` to start a local login;
+without it the command fails instead of storing a refresh token on the machine.
 Local login keeps the existing migration and active-provider checks.
 `whoami` reports the active account. Retiring live credentials also clears the local active marker.
 After disconnect, it reports a local profile only when local credentials remain active.

@@ -120,7 +120,16 @@ pub fn login(
         Ok(Some(catalog)) => catalog,
         Err(error) => {
             if !known? {
-                return Ok(false);
+                // A connected machine adds new aliases on the server. Never
+                // fall back to a local login that stores a refresh token here.
+                if local {
+                    return Ok(false);
+                }
+                return Err(error).with_context(|| {
+                    format!(
+                        "cannot reach the account server to add {alias}; retry, or add --local for a local profile"
+                    )
+                });
             }
             return Err(error).with_context(|| {
                 format!("cannot renew server account {alias}; local login is disabled")
@@ -181,6 +190,15 @@ fn login_receipt(alias: &str) -> Result<Option<Value>> {
         return Ok(None);
     }
     Ok(Some(serde_json::from_slice(&vault::private_read(&path)?)?))
+}
+
+fn clear_receipt_for(directory: &Path, lock_name: &str, alias: &str, id: &str) -> Result<()> {
+    let _lock = vault::registry_lock(directory, lock_name)?;
+    if login_receipt(alias)?.is_some_and(|saved| saved["id"] == id) {
+        std::fs::remove_file(login_receipt_path(alias)?)?;
+        store::sync_directory(directory)?;
+    }
+    Ok(())
 }
 
 /// Run one server-managed login operation. `add` carries the requested label
@@ -276,7 +294,26 @@ fn server_login(
                 .json::<Value>()
                 .ok()
                 .and_then(|v| v["error"].as_str().map(str::to_owned));
+            // These refusals prove the server never published this add
+            // operation, so its receipt must not block later commands.
+            let unpublished = match operation {
+                "start" => matches!(
+                    reason.as_deref(),
+                    Some(
+                        "account_login_unavailable"
+                            | "alias_exists"
+                            | "login_belongs_to_another_device"
+                    )
+                ),
+                _ => reason.as_deref() == Some("relogin_not_found"),
+            };
+            if add.is_some() && unpublished && !id.is_empty() {
+                clear_receipt_for(&directory, &lock_name, alias, id)?;
+            }
             match reason.as_deref() {
+                Some("account_import_retained") => bail!(
+                    "the server holds this account unverified from an earlier attempt; rerun codexctl login {alias} to retry its verification"
+                ),
                 Some("account_login_unavailable") => bail!(
                     "the server cannot add accounts now; adding accounts is unavailable while the server runs in shared mode"
                 ),
@@ -350,14 +387,7 @@ fn server_login(
     if cancel {
         status = call("cancel", &id)?;
     }
-    let clear_receipt = || -> Result<()> {
-        let _lock = vault::registry_lock(&directory, &lock_name)?;
-        if login_receipt(alias)?.is_some_and(|saved| saved["id"] == id) {
-            std::fs::remove_file(&path)?;
-            store::sync_directory(&directory)?;
-        }
-        Ok(())
-    };
+    let clear_receipt = || clear_receipt_for(&directory, &lock_name, alias, &id);
     let started = std::time::Instant::now();
     let mut displayed = false;
     loop {
