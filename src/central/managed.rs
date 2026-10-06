@@ -891,16 +891,28 @@ async fn settle_background_recovery(
                 settled_owner_record(&mut owner, &before).await
             };
             if let Some(window) = lease_window.as_ref() {
-                let remaining = window
-                    .deadline
-                    .lock()
-                    .await
-                    .saturating_duration_since(std::time::Instant::now())
-                    .saturating_sub(IMPORT_LEASE_SAFETY_MARGIN);
-                tokio::select! {
-                    result = tokio::time::timeout(remaining, settle) => match result {
-                        Ok(record) => record,
-                        Err(_) => {
+                let mut settle = Box::pin(settle);
+                loop {
+                    let remaining = window
+                        .deadline
+                        .lock()
+                        .await
+                        .saturating_duration_since(std::time::Instant::now());
+                    if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
+                        drop(settle);
+                        let mut owner = owner_ref.lock().await;
+                        terminate_lost_import(&mut owner).await;
+                        drop(owner);
+                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                            .await;
+                        return;
+                    }
+                    let check_after = IMPORT_LEASE_RENEW_INTERVAL
+                        .min(remaining.saturating_sub(IMPORT_LEASE_SAFETY_MARGIN));
+                    tokio::select! {
+                        record = &mut settle => break record,
+                        _ = wait_for_lease_loss(window.lost.clone(), window.signal.clone()) => {
+                            drop(settle);
                             let mut owner = owner_ref.lock().await;
                             terminate_lost_import(&mut owner).await;
                             drop(owner);
@@ -908,14 +920,7 @@ async fn settle_background_recovery(
                                 .await;
                             return;
                         }
-                    },
-                    _ = wait_for_lease_loss(window.lost.clone(), window.signal.clone()) => {
-                        let mut owner = owner_ref.lock().await;
-                        terminate_lost_import(&mut owner).await;
-                        drop(owner);
-                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
-                            .await;
-                        return;
+                        _ = tokio::time::sleep(check_after) => {}
                     }
                 }
             } else {
