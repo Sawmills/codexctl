@@ -239,20 +239,31 @@ impl FileStore {
         })
     }
 
-    /// Copy an authoritative grant and its event into the file mirror. An
-    /// ended copy is terminal: a delayed active copy never replaces it. The
-    /// event is added only when the copy changes the mirror.
+    /// Copy an authoritative grant and its grant or end event into the file
+    /// mirror. An ended copy is terminal: a delayed active copy never replaces
+    /// it. Each grant has one event of each kind, added once in any order.
     fn mirror_loan(&self, grant: &Grant, event: &AuditEvent) -> Result<()> {
-        let changes = |state: &super::FileState| match state.loans.get(&grant.id) {
-            None => true,
-            Some(existing) => existing.ended_at.is_none() && existing != grant,
+        let replaces = |state: &super::FileState| {
+            state
+                .loans
+                .get(&grant.id)
+                .is_none_or(|existing| existing.ended_at.is_none() && existing != grant)
         };
-        if !changes(&self.read_state()?) {
+        let missing = |state: &super::FileState| {
+            !state
+                .loan_audit
+                .iter()
+                .any(|existing| existing.grant_id == event.grant_id && existing.kind == event.kind)
+        };
+        let current = self.read_state()?;
+        if !replaces(&current) && !missing(&current) {
             return Ok(());
         }
         self.with_lock(|state| {
-            if changes(state) {
+            if replaces(state) {
                 state.loans.insert(grant.id.clone(), grant.clone());
+            }
+            if missing(state) {
                 state.loan_audit.push(event.clone());
             }
             Ok(())

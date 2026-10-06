@@ -247,7 +247,10 @@ impl AuditEvent {
     pub(super) fn token_issued(at: i64, grant_id: &str, machine: &str) -> Self {
         Self {
             machine: Some(machine.to_owned()),
-            coalesce_key: Some(format!("{grant_id}:{machine}:{}", at.div_euclid(3600))),
+            coalesce_key: Some(format!(
+                "token:{grant_id}:{machine}:{}",
+                at.div_euclid(3600)
+            )),
             ..Self::new(at, grant_id, AuditKind::TokenIssued)
         }
     }
@@ -256,7 +259,7 @@ impl AuditEvent {
     pub(super) fn paused(at: i64, grant_id: &str, reason: &'static str) -> Self {
         Self {
             reason: Some(reason.to_owned()),
-            coalesce_key: Some(format!("{grant_id}:{reason}:{}", at.div_euclid(3600))),
+            coalesce_key: Some(format!("pause:{grant_id}:{reason}:{}", at.div_euclid(3600))),
             ..Self::new(at, grant_id, AuditKind::Paused)
         }
     }
@@ -388,37 +391,28 @@ pub fn token_below_borrower_backoff(usage: Option<&crate::statusline::Usage>) ->
     })
 }
 
-/// Why a fallback launch must not run on the active account: it is
-/// borrowed and not eligible for automatic placement, or no longer listed.
-pub fn fallback_refusal(active: &str, accounts: &[super::managed::Account]) -> Option<String> {
-    if !AccountRef::parse(active).is_ok_and(|reference| reference.is_borrowed()) {
-        return None;
-    }
-    let account = accounts
-        .iter()
-        .find(|account| account.alias.eq_ignore_ascii_case(active));
-    match account {
-        Some(account) if borrowed_auto_eligible(account) => None,
-        _ => Some(format!(
-            "the active account {active} is borrowed and has no verified included usage below {BORROWER_BACKOFF_PERCENT}%; the lender's lanes come first; run codexctl codex --account {active} to use it anyway"
-        )),
-    }
+/// Why a fallback launch must not run on the active account. The fallback
+/// runs only after automatic selection found no eligible account, and that
+/// selection includes the active one; so a borrowed active account is never
+/// eligible here, whatever an older catalog reading says.
+pub fn fallback_refusal(active: &str) -> Option<String> {
+    AccountRef::parse(active)
+        .is_ok_and(|reference| reference.is_borrowed())
+        .then(|| {
+            format!(
+                "the active account {active} is borrowed and automatic selection found it ineligible (the lender's lanes come first below {BORROWER_BACKOFF_PERCENT}% use); run codexctl codex --account {active} to use it anyway"
+            )
+        })
 }
 
-/// Refuse the automatic launch fallback onto a borrowed account at the backoff.
+/// Refuse the automatic launch fallback onto a borrowed account.
 pub fn guard_borrowed_fallback() -> Result<()> {
     // Only a known borrowed account is guarded; the fallback reports its own
     // errors for an unreadable provider.
     let Ok(Some(active)) = super::native::active_alias() else {
         return Ok(());
     };
-    if !AccountRef::parse(&active).is_ok_and(|reference| reference.is_borrowed()) {
-        return Ok(());
-    }
-    let accounts = super::remote::catalog()?
-        .map(|catalog| catalog.accounts)
-        .unwrap_or_default();
-    match fallback_refusal(&active, &accounts) {
+    match fallback_refusal(&active) {
         Some(reason) => bail!(reason),
         None => Ok(()),
     }

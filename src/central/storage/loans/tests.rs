@@ -168,10 +168,18 @@ fn a_delayed_mirror_never_reopens_an_ended_grant() {
         .unwrap();
     file.mirror_loan(&active, &AuditEvent::granted(&active))
         .unwrap();
+    let mirrored = file.read_state().unwrap();
+    assert_eq!(mirrored.loans["race"].end_reason, Some(EndReason::Revoked));
+    let mut kinds: Vec<_> = mirrored.loan_audit.iter().map(|e| e.kind).collect();
+    kinds.sort_by_key(|kind| *kind as u8);
     assert_eq!(
-        file.read_state().unwrap().loans["race"].end_reason,
-        Some(EndReason::Revoked)
+        kinds,
+        [AuditKind::Granted, AuditKind::Ended],
+        "each event once"
     );
+    file.mirror_loan(&ended, &AuditEvent::ended(&ended))
+        .unwrap();
+    assert_eq!(file.read_state().unwrap().loan_audit.len(), 2);
 }
 
 #[cfg(feature = "central-real-db-tests")]

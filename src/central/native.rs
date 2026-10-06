@@ -1395,6 +1395,7 @@ pub fn activate(
     let mut connection = read_connection(&path)?;
     drop(_lock);
     let read_account_id = connection.account_id.clone();
+    let read_loan_id = connection.loan_id.clone();
     // Selecting a borrowed account pins it to the current grant and its
     // account. Both are saved only with a successful activation.
     if let Some((loan_id, account_id)) = selected_loan
@@ -1556,6 +1557,7 @@ pub fn activate(
     let latest = read_connection(&path)?;
     if latest.server != connection.server
         || latest.account_id != read_account_id
+        || latest.loan_id != read_loan_id
         || latest.device_token_file != connection.device_token_file
     {
         bail!("remote connection changed during activation");

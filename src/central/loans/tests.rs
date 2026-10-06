@@ -267,32 +267,35 @@ fn pause_events_coalesce_per_reason_and_hour() {
 }
 
 #[test]
-fn the_launch_fallback_refuses_a_borrowed_account_at_the_backoff() {
-    let busy = account("alice/main", 96.0, true);
-    let roomy = account("alice/main", 50.0, true);
-    assert!(fallback_refusal("alice/main", std::slice::from_ref(&busy)).is_some());
-    assert!(fallback_refusal("alice/main", &[roomy]).is_none());
+fn the_launch_fallback_refuses_every_borrowed_active_account() {
+    assert!(fallback_refusal("alice/main").is_some());
     assert!(
-        fallback_refusal("alice/main", &[]).is_some(),
-        "an unlisted loan is refused"
-    );
-    assert!(
-        fallback_refusal("own", &[busy]).is_none(),
+        fallback_refusal("own").is_none(),
         "owned accounts keep the old fallback"
     );
 }
 
 #[test]
-fn the_launch_fallback_needs_verified_included_usage_with_a_window() {
+fn a_machine_named_like_a_pause_reason_keeps_both_events() {
+    assert_ne!(
+        AuditEvent::token_issued(7_200, "grant", "lender_disabled").coalesce_key,
+        AuditEvent::paused(7_200, "grant", "lender_disabled").coalesce_key
+    );
+}
+
+#[test]
+fn borrowed_auto_eligibility_needs_verified_included_usage_with_a_window() {
+    assert!(borrowed_auto_eligible(&account("alice/main", 10.0, true)));
     let mut stale = account("alice/main", 10.0, true);
     stale.usage_stale = true;
-    assert!(fallback_refusal("alice/main", &[stale]).is_some());
+    assert!(!borrowed_auto_eligible(&stale));
     let mut billed = account("alice/main", 10.0, true);
     billed.billing_class = api::BillingClass::UsageBased;
-    assert!(fallback_refusal("alice/main", &[billed]).is_some());
+    assert!(!borrowed_auto_eligible(&billed));
     let mut blind = account("alice/main", 10.0, true);
     blind.primary_used = None;
-    assert!(fallback_refusal("alice/main", &[blind]).is_some());
+    assert!(!borrowed_auto_eligible(&blind));
+    assert!(!borrowed_auto_eligible(&account("alice/main", 95.0, true)));
 }
 
 #[test]
