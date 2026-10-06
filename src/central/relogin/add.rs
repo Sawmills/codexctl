@@ -832,9 +832,14 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
                     .iter()
                     .any(|device| device.id == record.device && !device.revoked)
             });
-            if record.landed.is_none() && !terminal(&record.phase) && revoked {
+            let interrupted_discard = record.retired && record.candidate.is_none();
+            if record.landed.is_none()
+                && !terminal(&record.phase)
+                && revoked
+                && !interrupted_discard
+            {
                 // No device can resume or cancel this grant any more.
-                if record.retired && record.candidate.is_some() {
+                if import_holds(broker_state, key, &record)? {
                     discard(
                         &state,
                         &mut record,
