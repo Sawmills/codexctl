@@ -21,3 +21,6 @@ patches:
       kind: StatefulSet
       name: codexctl
       namespace: codexctl
+replicas:
+  - name: codexctl
+    count: 0
