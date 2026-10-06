@@ -758,9 +758,12 @@ async fn land(
         label: None,
         landed: None,
     };
-    // The renewal record reserves the grant before the add record releases it.
-    publish(&owner_state, &renewal)?;
+    // Record the landing first, while this record still reserves the grant, so
+    // a crash after the renewal publish always leaves the link for recovery.
+    // The renewal record then reserves the grant before this record releases it.
     record.landed = Some(held.vault.alias.trim().into());
+    save(state, record)?;
+    publish(&owner_state, &renewal)?;
     record.retired = true;
     record.candidate = None;
     save(state, record)?;
@@ -835,6 +838,32 @@ pub(in crate::central) fn recover(
                 continue;
             }
             stopped(&state, &record)?;
+            if !terminal(&record.phase)
+                && let Some(landed) = record.landed.clone()
+            {
+                // Settle a landing that a crash split between its two writes.
+                let owner_state = broker_state
+                    .join("accounts")
+                    .join(account_key(&record.user, &landed));
+                let published = directory(&owner_state, &record.id)?
+                    .join("record.json")
+                    .try_exists()?;
+                if !published {
+                    // The renewal never started: this record still owns the grant.
+                    record.landed = None;
+                    save(&state, &record)?;
+                } else if !record.retired {
+                    // The renewal owns the grant now; release this copy.
+                    record.retired = true;
+                    record.candidate = None;
+                    save(&state, &record)?;
+                    let operation = directory(&state, &record.id)?;
+                    if operation.join("home").try_exists()? {
+                        std::fs::remove_dir_all(operation.join("home"))?;
+                        store::sync_directory(&operation)?;
+                    }
+                }
+            }
             let revoked = vault::devices(broker_state).is_ok_and(|devices| {
                 !devices
                     .iter()
@@ -1050,5 +1079,84 @@ mod tests {
         assert_eq!(ended.error.as_deref(), Some("account_login_unavailable"));
         assert!(ended.candidate.is_none() && ended.retired);
         assert!(!directory(&state, &record.id).unwrap().join("home").exists());
+    }
+
+    fn landed_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[7; 32]).unwrap();
+        let claims = json!({"sub":"login","iat":2000000000_u64,"exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":"seat"}});
+        let grant = json!({"tokens":{
+            "access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
+            "refresh_token":"synthetic","account_id":"seat"}});
+        let state = add_state(root.path(), "amir", "duplicate");
+        store::ensure_private_dir(&root.path().join("account-logins")).unwrap();
+        store::ensure_private_dir(&state).unwrap();
+        store::ensure_private_dir(&root.path().join("accounts")).unwrap();
+        // The state the first write of land() leaves: landed, grant still held.
+        let record = Record {
+            sequence: 1,
+            id: "b".repeat(64),
+            user: "amir".into(),
+            device: "laptop".into(),
+            alias: "duplicate".into(),
+            broker: process::Process::capture(std::process::id()).unwrap(),
+            child: Child::Exited,
+            verifier_broker: None,
+            original_revision: String::new(),
+            candidate_revision: None,
+            candidate: Some(grant),
+            phase: Phase::Committing,
+            code: None,
+            error: None,
+            retired: false,
+            label: None,
+            landed: Some("personal".into()),
+        };
+        publish(&state, &record).unwrap();
+        (root, key, state, record)
+    }
+
+    #[test]
+    fn a_crash_before_the_landing_renewal_publish_keeps_the_add_resumable() {
+        let (root, key, state, record) = landed_fixture();
+        let reserved = recover(root.path(), &key, false).unwrap();
+        assert_eq!(reserved.len(), 1, "the add record still reserves the grant");
+        let settled = load(&state, &record.id).unwrap();
+        assert!(
+            settled.landed.is_none(),
+            "no renewal exists, so admission resumes"
+        );
+        assert!(settled.candidate.is_some() && !settled.retired);
+    }
+
+    #[test]
+    fn a_crash_after_the_landing_renewal_publish_hands_the_grant_to_the_renewal() {
+        let (root, key, state, record) = landed_fixture();
+        let owner_state = root
+            .path()
+            .join("accounts")
+            .join(account_key("amir", "personal"));
+        store::ensure_private_dir(&owner_state).unwrap();
+        let mut renewal = record.clone();
+        renewal.alias = "personal".into();
+        renewal.landed = None;
+        renewal.phase = Phase::Starting;
+        publish(&owner_state, &renewal).unwrap();
+
+        for shared in [false, true] {
+            let reserved = recover(root.path(), &key, shared).unwrap();
+            assert!(
+                reserved.is_empty(),
+                "the renewal owns the grant (shared: {shared})"
+            );
+            let settled = load(&state, &record.id).unwrap();
+            assert_eq!(settled.landed.as_deref(), Some("personal"));
+            assert!(settled.retired && settled.candidate.is_none());
+            assert!(!directory(&state, &record.id).unwrap().join("home").exists());
+        }
+        // The linked renewal keeps its grant for its own recovery.
+        assert!(load(&owner_state, &record.id).unwrap().candidate.is_some());
     }
 }
