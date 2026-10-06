@@ -292,11 +292,20 @@ impl Broker {
         borrower: &str,
     ) -> Result<Vec<BorrowedEntry>, HttpError> {
         let mut entries = Vec::new();
-        for grant in self.borrowed_grants(borrower).await? {
+        let grants = self.borrowed_grants(borrower).await?;
+        for grant in grants.iter().cloned() {
             let Some((key, owner)) = self.grant_owner(&grant).await? else {
                 continue;
             };
-            let paused = if !self.lender_enabled(&grant.lender).await? {
+            let ambiguous = grants
+                .iter()
+                .filter(|other| other.reference.eq_ignore_ascii_case(&grant.reference))
+                .count()
+                > 1;
+            // Token issue refuses these too; the catalog keeps them unselectable.
+            let paused = if ambiguous {
+                Some("ambiguous_loan")
+            } else if !self.lender_enabled(&grant.lender).await? {
                 Some("lender_disabled")
             } else if !owner_subject(&*owner.lock().await)
                 .is_some_and(|subject| grant.subject.same_login(&subject))

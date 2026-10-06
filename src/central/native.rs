@@ -1376,7 +1376,10 @@ pub fn activate(
             .find(|a| a.alias == alias)
             .context("server account alias not found")?;
         sync_account(&catalog.connection, account)?;
-        selected_loan = Some(account.loan.as_ref().map(|loan| loan.id.clone()));
+        selected_loan = Some((
+            account.loan.as_ref().map(|loan| loan.id.clone()),
+            account.account_id.clone(),
+        ));
     }
     if !path.try_exists()? {
         return Ok(false);
@@ -1391,12 +1394,14 @@ pub fn activate(
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
     drop(_lock);
-    // Selecting a borrowed account pins it to the current grant. The new ID is
-    // saved only with a successful activation, under its rollback.
-    if let Some(loan_id) = selected_loan
+    let read_account_id = connection.account_id.clone();
+    // Selecting a borrowed account pins it to the current grant and its
+    // account. Both are saved only with a successful activation.
+    if let Some((loan_id, account_id)) = selected_loan
         && connection.loan_id != loan_id
     {
         connection.loan_id = loan_id;
+        connection.account_id = account_id;
         connection.revision = String::new();
     }
     let token = fetch(&connection, false)?;
@@ -1541,17 +1546,20 @@ pub fn activate(
     doc["model_providers"][PROVIDER] = Item::Table(provider);
     let latest = read_connection(&path)?;
     if latest.server != connection.server
-        || latest.account_id != connection.account_id
+        || latest.account_id != read_account_id
         || latest.device_token_file != connection.device_token_file
     {
         bail!("remote connection changed during activation");
     }
     let previous_connection = serde_json::to_vec(&latest)?;
-    // Keep the grant this activation fetched with; the save below commits it.
+    // Keep the grant and account this activation fetched with; the save below
+    // commits them.
     let selected_loan = connection.loan_id.take();
+    let selected_account_id = std::mem::take(&mut connection.account_id);
     connection = latest;
     if connection.loan_id != selected_loan {
         connection.loan_id = selected_loan;
+        connection.account_id = selected_account_id;
         connection.revision = String::new();
     }
     connection.allow_billing = approve_billing;
@@ -1765,6 +1773,11 @@ pub(super) fn sync_account(
     let loan_id = account.loan.as_ref().map(|loan| loan.id.clone());
     if path.try_exists()? {
         let existing = read_connection(&path)?;
+        // A new grant behind a borrowed name may serve another account.
+        // Activation stages it and commits it with its rollback.
+        if account.loan.is_some() && existing.loan_id != loan_id {
+            return Ok(());
+        }
         if existing.server != device.server
             || existing.account_id != account.account_id
             || existing.alias.as_deref() != Some(&account.alias)

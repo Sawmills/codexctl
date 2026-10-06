@@ -686,6 +686,15 @@ async fn the_stored_reference_survives_an_email_change_and_a_twin_is_ambiguous()
         (status, body["error"].clone()),
         (StatusCode::CONFLICT, json!("ambiguous_loan"))
     );
+    // Automatic selection must not pick a name that cannot resolve.
+    let listed = fixture.catalog(&fixture.borrower).await;
+    assert_eq!(listed.len(), 2);
+    for entry in listed {
+        assert_eq!(
+            (entry["available"].clone(), entry["loan"]["paused"].clone()),
+            (json!(false), json!("ambiguous_loan"))
+        );
+    }
 }
 
 #[tokio::test]

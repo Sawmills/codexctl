@@ -265,3 +265,19 @@ fn pause_events_coalesce_per_reason_and_hour() {
         AuditEvent::paused(7_200, "grant", "subject_changed").coalesce_key
     );
 }
+
+#[test]
+fn the_launch_fallback_refuses_a_borrowed_account_at_the_backoff() {
+    let busy = account("alice/main", 96.0, true);
+    let roomy = account("alice/main", 50.0, true);
+    assert!(fallback_refusal("alice/main", std::slice::from_ref(&busy)).is_some());
+    assert!(fallback_refusal("alice/main", &[roomy]).is_none());
+    assert!(
+        fallback_refusal("alice/main", &[]).is_some(),
+        "an unlisted loan is refused"
+    );
+    assert!(
+        fallback_refusal("own", &[busy]).is_none(),
+        "owned accounts keep the old fallback"
+    );
+}

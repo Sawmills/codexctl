@@ -11096,8 +11096,23 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
 
     // A renewal is a new grant. The ended selection stays refused until the
     // borrower selects the name again, which pins the new grant.
+    // The new grant behind the same name serves another account in another
+    // workspace; an explicit selection adopts it.
+    assert!(
+        server
+            .import(&server.amir, "work", "amir-work-login", "work-seat")
+            .status()
+            .is_success()
+    );
+    let work_access = auth("amir-work-login", "work-seat")["tokens"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     seed(&central::loans::Grant {
         id: "renewed-grant".into(),
+        account_id: central::managed::account_key("amir", "work"),
+        alias: "work".into(),
+        subject: central::loans::credential_subject("work-seat", &work_access),
         ..grant.clone()
     });
     assert!(
@@ -11123,6 +11138,7 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
     )
     .unwrap();
     assert_eq!(connection["loan_id"], "renewed-grant");
+    assert_eq!(connection["account_id"], "work-seat");
 
     let forgotten = server.cli(home.path(), &["disconnect", "--forget"]);
     assert!(

@@ -363,5 +363,41 @@ pub fn owned_then_borrowed<T>(
     })
 }
 
+/// Why a fallback launch must not run on the active account: it is
+/// borrowed and at the borrower backoff, or no longer listed.
+pub fn fallback_refusal(active: &str, accounts: &[super::managed::Account]) -> Option<String> {
+    if !AccountRef::parse(active).is_ok_and(|reference| reference.is_borrowed()) {
+        return None;
+    }
+    let account = accounts
+        .iter()
+        .find(|account| account.alias.eq_ignore_ascii_case(active));
+    match account {
+        Some(account) if account.available && below_borrower_backoff(account) => None,
+        _ => Some(format!(
+            "the active account {active} is borrowed and the lender's lanes come first at {BORROWER_BACKOFF_PERCENT}% use; run codexctl codex --account {active} to use it anyway"
+        )),
+    }
+}
+
+/// Refuse the automatic launch fallback onto a borrowed account at the backoff.
+pub fn guard_borrowed_fallback() -> Result<()> {
+    // Only a known borrowed account is guarded; the fallback reports its own
+    // errors for an unreadable provider.
+    let Ok(Some(active)) = super::native::active_alias() else {
+        return Ok(());
+    };
+    if !AccountRef::parse(&active).is_ok_and(|reference| reference.is_borrowed()) {
+        return Ok(());
+    }
+    let accounts = super::remote::catalog()?
+        .map(|catalog| catalog.accounts)
+        .unwrap_or_default();
+    match fallback_refusal(&active, &accounts) {
+        Some(reason) => bail!(reason),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests;
