@@ -25,7 +25,7 @@ Client: `remote::login` keeps one receipt `.login-<digest(alias)>.json` with `{s
 | Transport failure after `start` | The receipt keeps `id`. A rerun calls `start` with the same `id`; the server returns the stored record. No second login. |
 | Alias already on the server for this user | The client routes to renewal (current code). The server `start` also refuses with 409 `alias_exists`. |
 | Account owned by another user | Admission returns 409 `account_already_owned`. The server retains and fences the grant, as renewal does for `wrong_account`. |
-| Account owned by this user under alias X | Admission refuses (`clear_registry` denial; exact code to be pinned by a test); the client names X. Recommendation: refuse and name X. AGENTS.md says `login` lands on the existing profile; I ask HQ whether that rule applies here. |
+| Account owned by this user under alias X | Recommendation: land the grant on X as a renewal, per the AGENTS.md rule that `login` lands on the profile that already holds the account. The approval already happened, and a refusal can leave X with an invalidated grant. The client reports X. Open as Q2 for HQ. |
 | Same alias pending on another device | 409 `login_belongs_to_another_device`. |
 | Cancel | The worker kills the child, records `canceled`, and deletes the home. No account appears. |
 | Verification fails | `failed`, no catalog entry, and the grant stays reserved by import admission. |
