@@ -103,8 +103,20 @@ for line in sys.stdin:
                 sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
-        if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "startup":
+        if mode in ["startup-hold", "startup-hold-error"] and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
+            pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
+            deadline = time.monotonic() + 75
+            while not pathlib.Path(mode_path).with_name("release-initialize").exists():
+                if time.monotonic() >= deadline:
+                    sys.exit(1)
+                time.sleep(0.01)
+        if auth_path.exists() and mode in ["startup", "startup-hold", "startup-hold-error", "startup-error", "startup-exit"]:
             rotate()
+        if mode == "startup-exit":
+            sys.exit(1)
+        if mode in ["startup-error", "startup-hold-error"]:
+            send({"id": message["id"], "error": {"code": -32000, "message": "synthetic initialize failure"}})
+            continue
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
         if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
@@ -161,7 +173,7 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode == "billing-error-marked":
+        if mode in ["billing-error-marked", "billing-error-slow-exit"]:
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
             continue
         if mode == "rpc-unhealthy":
@@ -238,3 +250,9 @@ if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).rea
     claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
     if claims.get("sub") == "different-login":
         sys.exit(1)
+
+if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
+    pathlib.Path(os.environ["CENTRAL_TEST_EXIT_FILE"]).write_text("exited")
+
+if mode == "billing-error-slow-exit":
+    time.sleep(31)

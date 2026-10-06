@@ -177,7 +177,7 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
         None,
         None,
         before,
-        true,
+        SettlementRecovery::Available,
         0,
         permit,
         renew_done,
@@ -187,6 +187,389 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     .await;
     assert!(!owner_ref.lock().await.available);
     assert!(permits.try_acquire().is_ok());
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for rejection in ["deleted_at = now()", "revision = revision + 1"] {
+        for stopping in [false, true] {
+            let fixture = Fixture::new(Duration::from_secs(1)).await;
+            let initial = CentralStore::from_mode(
+                StoreMode::Postgres,
+                &fixture.broker.state,
+                &fixture.broker.key,
+            )
+            .await
+            .unwrap();
+            let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+            central.migrate().await.unwrap();
+            let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+            let (before, record) = {
+                let owner = owner_ref.lock().await;
+                (owner.vault.clone(), Broker::owner_record(&owner).unwrap())
+            };
+            central.save_account(&record).await.unwrap();
+            let lease = central
+                .acquire_lease(&record.account_id, "settling", Duration::from_secs(120))
+                .await
+                .unwrap();
+            control
+                .batch_execute(&format!("UPDATE {schema}.central_accounts SET {rejection}"))
+                .await
+                .unwrap();
+            let work = Arc::new(Semaphore::new(1));
+            let permit = work.clone().acquire_owned().await.unwrap();
+            let renew_done = Arc::new(AtomicBool::new(false));
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                settle_background_recovery(
+                    owner_ref.clone(),
+                    Some(central.clone()),
+                    Some(lease.clone()),
+                    before,
+                    SettlementRecovery::Available,
+                    0,
+                    permit,
+                    renew_done.clone(),
+                    None,
+                    Arc::new(AtomicBool::new(stopping)),
+                ),
+            )
+            .await
+            .expect("definitive rejection must finish settlement, including shutdown");
+            assert!(
+                !owner_ref.lock().await.available,
+                "rejected owner must stay fenced"
+            );
+            assert!(renew_done.load(Ordering::Acquire));
+            assert_eq!(work.available_permits(), 1, "shutdown work must drain");
+            assert!(
+                !central
+                    .renew(&lease, Duration::from_secs(120))
+                    .await
+                    .unwrap(),
+                "rejected lease must be released"
+            );
+            let successor = central
+                .acquire_lease(&record.account_id, "successor", Duration::from_secs(120))
+                .await
+                .unwrap();
+            central.release_lease(&successor).await.unwrap();
+            control
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+        }
+    }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn retryable_token_failure_can_recover_after_deferred_child_shutdown() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let initial = CentralStore::from_mode(
+        StoreMode::Postgres,
+        &fixture.broker.state,
+        &fixture.broker.key,
+    )
+    .await
+    .unwrap();
+    let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+    fixture
+        .attach_refresh_store_using(central.clone(), "billing-error-slow-exit")
+        .await;
+    assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+    let drained = tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .expect("deferred shutdown must settle")
+    .unwrap();
+    drop(drained);
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    {
+        let mut owner = owner_ref.lock().await;
+        assert!(
+            !owner.available,
+            "retryable failure still needs a successful probe"
+        );
+        assert!(owner.retryable_unavailable);
+        assert!(
+            !owner.routing_refused,
+            "settlement must not invent a permanent refusal"
+        );
+        owner.retry_started = Some(owner.retry_clock_now().saturating_sub(60_000));
+    }
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+    recover_unhealthy_owners(&fixture.broker).await;
+    let drained = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.broker.work.clone().acquire_many_owned(128),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(drained);
+    assert!(
+        owner_ref.lock().await.available,
+        "a successful recovery probe must reopen the owner"
+    );
+    central.settle_test_observations().await.unwrap();
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn transient_token_write_errors_preserve_the_settled_recovery_outcome() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for mode in ["startup", "billing-error-marked", "routing-missing"] {
+        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        let initial = CentralStore::from_mode(
+            StoreMode::Postgres,
+            &fixture.broker.state,
+            &fixture.broker.key,
+        )
+        .await
+        .unwrap();
+        let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+        fixture
+            .attach_refresh_store_using(central.clone(), mode)
+            .await;
+        control.batch_execute(&format!("CREATE SEQUENCE {schema}.write_attempts;
+            CREATE FUNCTION {schema}.fail_three_writes() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN IF nextval('{schema}.write_attempts') <= 3 THEN RAISE EXCEPTION 'synthetic transient write failure'; END IF; RETURN NULL; END $$;
+            CREATE TRIGGER fail_three_writes BEFORE UPDATE ON {schema}.central_accounts FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_three_writes();")).await.unwrap();
+        assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.broker.work.clone().acquire_many_owned(128),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(drained);
+        let attempts: i64 = control
+            .query_one(
+                &format!("SELECT last_value FROM {schema}.write_attempts"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            attempts >= 4,
+            "three failed writes must reach deferred settlement"
+        );
+        let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+        {
+            let mut owner = owner_ref.lock().await;
+            assert_eq!(
+                owner.available,
+                mode == "startup",
+                "{mode}: settlement availability"
+            );
+            assert_eq!(
+                owner.routing_refused,
+                mode == "routing-missing",
+                "{mode}: preserve only a real routing refusal"
+            );
+            let committed = central
+                .load_account(&account_key("test", "fixture"))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(committed.vault, serde_json::to_value(&owner.vault).unwrap());
+            owner.retry_clock = Some(Arc::new(|| 60_000));
+            owner.retry_started = Some(0);
+        }
+        store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+        if mode == "billing-error-marked" {
+            recover_unhealthy_owners(&fixture.broker).await;
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.broker.work.clone().acquire_many_owned(128),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(drained);
+        }
+        assert_eq!(
+            fixture.token().await,
+            if mode == "routing-missing" {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        );
+        let drained = fixture
+            .broker
+            .session_writes
+            .clone()
+            .acquire_many_owned(32)
+            .await
+            .unwrap();
+        central.settle_test_observations().await.unwrap();
+        drop(drained);
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn pending_background_settlement_cannot_reacquire_its_own_lease() {
+    use super::super::storage::StoreMode;
+    if std::env::var("DATABASE_URL").is_err() {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        return;
+    }
+    for mode in ["startup", "billing-error-marked", "startup-error"] {
+        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        let initial = CentralStore::from_mode(
+            StoreMode::Postgres,
+            &fixture.broker.state,
+            &fixture.broker.key,
+        )
+        .await
+        .unwrap();
+        let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
+        fixture
+            .attach_refresh_store_using(central.clone(), "")
+            .await;
+        let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+        {
+            let mut owner = owner_ref.lock().await;
+            owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+            owner.rpc = None;
+            owner.fence(true);
+            owner.retry_requires_billing = true;
+            owner.retry_started = Some(0);
+            owner.retry_clock = Some(Arc::new(|| 1_000_000));
+        }
+        store::atomic_write(&fixture._root.path().join("mode"), mode.as_bytes()).unwrap();
+        control.batch_execute(&format!("CREATE SEQUENCE {schema}.write_attempts;
+            CREATE FUNCTION {schema}.fail_settlement() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM nextval('{schema}.write_attempts'); RAISE EXCEPTION 'synthetic persistent write failure'; END $$;
+            CREATE TRIGGER fail_settlement BEFORE UPDATE ON {schema}.central_accounts FOR EACH STATEMENT EXECUTE FUNCTION {schema}.fail_settlement();")).await.unwrap();
+        recover_unhealthy_owners(&fixture.broker).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let attempted: bool = control
+                    .query_one(
+                        &format!("SELECT is_called FROM {schema}.write_attempts"),
+                        &[],
+                    )
+                    .await
+                    .unwrap()
+                    .get(0);
+                if attempted {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let epoch: i64 = control
+            .query_one(
+                &format!("SELECT epoch FROM {schema}.account_refresh_leases"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        owner_ref.lock().await.retry_started = Some(0);
+        recover_unhealthy_owners(&fixture.broker).await;
+        let after: i64 = control
+            .query_one(
+                &format!("SELECT epoch FROM {schema}.account_refresh_leases"),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        control
+            .batch_execute(&format!(
+                "DROP TRIGGER fail_settlement ON {schema}.central_accounts"
+            ))
+            .await
+            .unwrap();
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.broker.work.clone().acquire_many_owned(128),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        drop(drained);
+        assert_eq!(
+            after, epoch,
+            "{mode}: recovery must not replace an unsettled epoch"
+        );
+        assert!(
+            !owner_ref.lock().await.routing_refused,
+            "{mode}: settlement must preserve future recovery"
+        );
+        if mode != "startup" {
+            store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
+            owner_ref.lock().await.retry_started = Some(0);
+            recover_unhealthy_owners(&fixture.broker).await;
+            let drained = tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture.broker.work.clone().acquire_many_owned(128),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            drop(drained);
+        }
+        assert!(
+            owner_ref.lock().await.available,
+            "{mode}: owner must recover after persistence returns"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
 }
 
 async fn list(broker: Broker, headers: HeaderMap) -> Value {
@@ -1066,13 +1449,40 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
         .await;
 
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
-    store::atomic_write(&fixture._root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&fixture._root.path().join("mode"), b"startup").unwrap();
     let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
     let mut owner = owner_ref.lock().await;
     let now = owner.retry_clock_now();
     owner.retry_started = Some(now.saturating_sub(60_000));
     drop(owner);
     recover_unhealthy_owners(&fixture.broker).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let owner = owner_ref.lock().await;
+            if owner.available {
+                assert!(
+                    owner.rpc.is_none(),
+                    "recovery must stop the child before making the account available"
+                );
+                break;
+            }
+            drop(owner);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = account_key("test", "fixture");
+    let committed = central.load_account(&id).await.unwrap().unwrap();
+    assert_eq!(
+        committed.revision, 2,
+        "recovery must publish initialization-time rotation"
+    );
+    let peer = central
+        .acquire_lease(&id, "peer-after-recovery", Duration::from_secs(60))
+        .await
+        .unwrap();
+    central.release_lease(&peer).await.unwrap();
     assert_eq!(fixture.token().await, StatusCode::OK);
     // A central reconcile can stop a stale child while the owner remains
     // available. The pre-existing shared-store launch path must recreate it.
