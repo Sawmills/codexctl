@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
+    future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
@@ -28,7 +29,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
@@ -768,6 +769,47 @@ fn fence_background_owner(owner: &mut Owner) {
 fn fence_background_probe(owner: &mut Owner) {
     owner.available = false;
     owner.refresh_enabled = false;
+}
+
+async fn wait_for_lease_loss(lost: Arc<AtomicBool>, signal: Arc<Notify>) {
+    loop {
+        // Create the notification future before checking the flag so a loss
+        // between the check and the await cannot be missed.
+        let notified = signal.notified();
+        if lost.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn lease_guarded_verification<T, F>(
+    verification: F,
+    lost: Arc<AtomicBool>,
+    signal: Arc<Notify>,
+) -> Result<T, HttpError>
+where
+    F: Future<Output = Result<T, HttpError>>,
+{
+    tokio::select! {
+        result = verification => result,
+        _ = wait_for_lease_loss(lost, signal) => {
+            Err(HttpError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                reason: "refresh_fenced",
+            })
+        }
+    }
+}
+
+async fn terminate_lost_import(owner: &mut Owner) {
+    // Closing the RPC is the first action after lease loss. This prevents an
+    // in-flight account/read from rotating credentials after a successor
+    // acquires the account lease.
+    if let Some(rpc) = owner.rpc.take() {
+        rpc.terminate().await;
+    }
+    fence_background_owner(owner);
 }
 
 async fn abandon_background_recovery(
@@ -1903,10 +1945,14 @@ impl Broker {
             return Err(error);
         }
         let before = owner.vault.clone();
+        let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_done = Arc::new(AtomicBool::new(false));
+        let lease_lost_signal = Arc::new(Notify::new());
         let renew_task = match (self.central.clone(), verification_lease.clone()) {
             (Some(central), Some(lease)) => {
                 let done = renew_done.clone();
+                let lost = renew_lost.clone();
+                let signal = lease_lost_signal.clone();
                 Some(tokio::spawn(async move {
                     while !done.load(Ordering::Acquire) {
                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
@@ -1915,7 +1961,11 @@ impl Broker {
                             .await
                         {
                             Ok(true) => {}
-                            Ok(false) => break,
+                            Ok(false) => {
+                                lost.store(true, Ordering::Release);
+                                signal.notify_waiters();
+                                break;
+                            }
                             Err(error) => eprintln!("central import lease renewal: {error:#}"),
                         }
                     }
@@ -1925,7 +1975,7 @@ impl Broker {
         };
         let verification_required = !owner.vault.verified;
         let mut central_published = false;
-        let mut verification = async {
+        let verification_work = async {
             if self.read_only {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
@@ -2000,8 +2050,27 @@ impl Broker {
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             owner.verification_input = None;
             Ok(account_summary(&owner))
+        };
+        let mut verification = if verification_lease.is_some() {
+            lease_guarded_verification(
+                verification_work,
+                renew_lost.clone(),
+                lease_lost_signal.clone(),
+            )
+            .await
+        } else {
+            verification_work.await
+        };
+        // If the provider completed at the same time as the renewal failed,
+        // prefer the lease-loss path before any result is published.
+        let lease_lost = renew_lost.load(Ordering::Acquire);
+        if lease_lost {
+            verification = Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
         }
-        .await;
+        if lease_lost {
+            terminate_lost_import(&mut owner).await;
+            renew_done.store(true, Ordering::Release);
+        }
         let restore_after_settlement = before.verified
             && !owner.routing_refused
             && !owner.rpc.as_ref().is_some_and(Rpc::rejected_login);

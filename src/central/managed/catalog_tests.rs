@@ -161,6 +161,65 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn lease_loss_terminates_import_verification_before_provider_rotation() {
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    fixture.attach_refresh_store("lease-loss-hold").await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let mut owner = owner_ref.lock().await;
+    let revision = owner.snapshot().unwrap().revision;
+    let lost = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(tokio::sync::Notify::new());
+    let mut verification = Box::pin(lease_guarded_verification(
+        async {
+            owner
+                .tokens(TokenRequest {
+                    previous_revision: Some(revision),
+                    ..Default::default()
+                })
+                .await
+                .map(|_| ())
+                .map_err(|_| {
+                    fixture
+                        .broker
+                        .error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })
+        },
+        lost.clone(),
+        signal.clone(),
+    ));
+    let started = fixture._root.path().join("refresh-started");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if started.exists() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "verification did not start"
+        );
+        tokio::select! {
+            result = &mut verification => panic!("verification completed before lease loss: {}", result.is_ok()),
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+    }
+    lost.store(true, Ordering::Release);
+    signal.notify_waiters();
+    let result = verification.await;
+    assert!(result.is_err(), "lease loss must reject verification");
+    terminate_lost_import(&mut owner).await;
+    assert!(
+        owner.rpc.is_none(),
+        "the lost import RPC must be terminated"
+    );
+    assert!(!owner.available);
+    assert!(owner.routing_refused);
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "0"
+    );
+}
+
+#[tokio::test]
 async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     let fixture = Fixture::new(Duration::from_secs(1)).await;
     let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
