@@ -55,6 +55,10 @@ pub struct RateLimitResponse {
     pub additional_rate_limits: Vec<AdditionalRateLimit>,
     /// Banked rate-limit reset credits, when the plan has any.
     pub rate_limit_reset_credits: Option<ResetCreditsSummary>,
+    /// Set when the response was rebuilt from a source that drops some
+    /// windows, so no all-window maximum can be claimed from it.
+    #[serde(skip)]
+    pub windows_partial: bool,
 }
 
 impl RateLimitResponse {

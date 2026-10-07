@@ -60,6 +60,9 @@ pub fn run(
                 Some(launch)
             }
             Err(error) => {
+                // The lender's lanes come first: never fall back onto a
+                // borrowed account at the borrower backoff.
+                codexctl::central::loans::guard_borrowed_fallback()?;
                 eprintln!(
                     "codexctl: automatic account selection unavailable ({error:#}); using the current account"
                 );

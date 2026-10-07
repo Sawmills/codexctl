@@ -68,8 +68,10 @@ async fn snapshot(
     let catalog =
         managed::account_catalog(broker, &user, super::catalog::Freshness::RefreshAhead).await?;
     let sampled_at = Instant::now();
+    // The dashboard offers lender-only actions, so it shows owned accounts only.
     let tasks = catalog
         .into_iter()
+        .filter(|account| account.loan.is_none())
         .map(|account| account_snapshot(broker, &user, account));
     let mut accounts: Vec<_> = futures::future::try_join_all(tasks).await?;
     for account in &mut accounts {

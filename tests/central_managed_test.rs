@@ -7750,6 +7750,7 @@ fn server_selection_skips_a_rate_limited_account_at_the_switch_threshold() {
             statusline_usage: None,
             live_sessions: Some(0),
             recent_429_rate: None,
+            loan: None,
         }
     };
     let selected = central::remote::select(&[
@@ -7791,6 +7792,7 @@ fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
             live_sessions: Some(live_sessions),
             recent_429_rate,
             credits: None,
+            loan: None,
         }
     };
 
@@ -7810,6 +7812,72 @@ fn codex_selection_prefers_live_session_count_then_recent_429_rate() {
         .unwrap(),
         "lower-429"
     );
+}
+
+#[test]
+fn selection_ranks_owned_accounts_first_and_backs_off_borrowed_ones() {
+    let account = |alias: &str, used: f64, borrowed: bool, billing: codexctl::api::BillingClass| {
+        central::managed::Account {
+            user_id: "synthetic-user".into(),
+            alias: alias.into(),
+            label: None,
+            account_id: format!("{alias}-seat"),
+            plan: Some("pro".into()),
+            billing_class: billing,
+            primary_used: Some(used),
+            secondary_used: Some(10.0),
+            primary_window_seconds: Some(5 * 60 * 60),
+            secondary_window_seconds: Some(7 * 24 * 60 * 60),
+            primary_resets_at: None,
+            resets_at: None,
+            available: true,
+            usage_score: Some(used),
+            usage_age_seconds: Some(1),
+            usage_stale: false,
+            usage_error: None,
+            statusline_usage: serde_json::from_value(json!({
+                "weekly_used_percent": null,
+                "weekly_resets_at": null,
+                "five_hour_used_percent": used,
+                "max_used_percent": used
+            }))
+            .ok(),
+            live_sessions: Some(0),
+            recent_429_rate: None,
+            credits: None,
+            loan: borrowed.then(|| central::managed::LoanInfo {
+                id: "grant".into(),
+                lender_email: "alice@sawmills.ai".into(),
+                ends_at: 1,
+                paused: None,
+            }),
+        }
+    };
+    use codexctl::api::BillingClass::{RateLimited, UsageBased};
+    let mixed = [
+        account("alice/roomy", 5.0, true, RateLimited),
+        account("own", 80.0, false, RateLimited),
+    ];
+    assert_eq!(central::remote::select(&mixed).unwrap(), "own");
+    assert_eq!(central::remote::select_for_codex(&mixed).unwrap(), "own");
+
+    let borrowed_only = [account("alice/roomy", 5.0, true, RateLimited)];
+    assert_eq!(
+        central::remote::select(&borrowed_only).unwrap(),
+        "alice/roomy"
+    );
+    assert_eq!(
+        central::remote::select_for_codex(&borrowed_only).unwrap(),
+        "alice/roomy"
+    );
+
+    let backed_off = [account("alice/busy", 95.0, true, RateLimited)];
+    assert!(central::remote::select(&backed_off).is_err());
+    assert!(central::remote::select_for_codex(&backed_off).is_err());
+
+    let usage_based = [account("alice/paid", 5.0, true, UsageBased)];
+    assert!(central::remote::select(&usage_based).is_err());
+    assert!(central::remote::select_for_codex(&usage_based).is_err());
 }
 
 #[test]
@@ -10905,5 +10973,208 @@ fn b29_host_connection_keeps_legacy_schema_after_refresh() {
     assert!(
         connection.get("session_id").is_none(),
         "legacy helpers reject new host connection fields"
+    );
+}
+
+#[test]
+fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "shared-seat")
+            .status()
+            .is_success()
+    );
+    // The usage API is unreachable here, so the server refuses a CLI grant.
+    // Seed the grant in the server's encrypted file state instead.
+    let lender_home = server.connected_home();
+    let refused = server.cli(
+        lender_home.path(),
+        &["loans", "lend", "personal", "--to", "alex@sawmills.ai"],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("weekly_reset_unknown"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let now = chrono::Utc::now().timestamp();
+    let access = auth("amir-login", "shared-seat")["tokens"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let grant = central::loans::Grant {
+        id: "synthetic-grant".into(),
+        account_id: central::managed::account_key("amir", "personal"),
+        lender: "amir".into(),
+        borrower: "alex".into(),
+        lender_email: "amir@sawmills.ai".into(),
+        borrower_email: "alex@sawmills.ai".into(),
+        alias: "personal".into(),
+        reference: "amir/personal".into(),
+        subject: central::loans::credential_subject("shared-seat", &access),
+        created_at: now,
+        ends_at: now + 3600,
+        ended_at: None,
+        ended_by: None,
+        end_reason: None,
+        deleted_at: None,
+    };
+    let seed = |grant: &central::loans::Grant| {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let store = central::storage::CentralStore::from_mode(
+                central::storage::StoreMode::File,
+                &server.root.path().join("state"),
+                &server.root.path().join("key"),
+            )
+            .await
+            .unwrap();
+            assert!(store.create_loan(grant).await.unwrap());
+        })
+    };
+    seed(&grant);
+
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/central");
+    store::ensure_private_dir(&directory).unwrap();
+    let token = directory.join(".device.token");
+    store::atomic_write(&token, server.alex.as_bytes()).unwrap();
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(&json!({"server":server.url,"token_file":token,"user_id":"alex"}))
+            .unwrap(),
+    )
+    .unwrap();
+
+    let selected = server.cli(home.path(), &["use", "Amir/Personal", "--allow-billing"]);
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("borrowed/amir/personal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(connection["loan_id"], "synthetic-grant");
+    let active = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(
+        active.status.success(),
+        "{}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    let payload: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                String::from_utf8(active.stdout)
+                    .unwrap()
+                    .trim()
+                    .split('.')
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["sub"], "amir-login");
+
+    let listed = server.cli(home.path(), &["loans", "list"]);
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(
+        listed.contains("amir/personal")
+            && listed.contains("borrowed")
+            && listed.contains("active"),
+        "{listed}"
+    );
+    let ended = server.cli(home.path(), &["loans", "end", "synthetic"]);
+    assert!(
+        ended.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ended.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ended.stdout).contains("returned"));
+    let refused = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("the loan of this server account ended"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // A renewal is a new grant. The ended selection stays refused until the
+    // borrower selects the name again, which pins the new grant.
+    // The new grant behind the same name serves another account in another
+    // workspace; an explicit selection adopts it.
+    assert!(
+        server
+            .import(&server.amir, "work", "amir-work-login", "work-seat")
+            .status()
+            .is_success()
+    );
+    let work_access = auth("amir-work-login", "work-seat")["tokens"]["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    seed(&central::loans::Grant {
+        id: "renewed-grant".into(),
+        account_id: central::managed::account_key("amir", "work"),
+        alias: "work".into(),
+        subject: central::loans::credential_subject("work-seat", &work_access),
+        ..grant.clone()
+    });
+    assert!(
+        !server
+            .cli(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    let reselected = server.cli(home.path(), &["use", "amir/personal", "--allow-billing"]);
+    assert!(
+        reselected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reselected.stderr)
+    );
+    let renewed = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(
+        renewed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renewed.stderr)
+    );
+    let connection: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("borrowed/amir/personal.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(connection["loan_id"], "renewed-grant");
+    assert_eq!(connection["account_id"], "work-seat");
+
+    let forgotten = server.cli(home.path(), &["disconnect", "--forget"]);
+    assert!(
+        forgotten.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forgotten.stderr)
+    );
+    assert!(
+        !directory.join("borrowed/amir/personal.json").exists(),
+        "forgetting the registration removes borrowed connections too"
+    );
+
+    let by_prefix = server.cli(lender_home.path(), &["loans", "audit", "synthetic"]);
+    assert!(
+        by_prefix.status.success()
+            && String::from_utf8_lossy(&by_prefix.stdout).contains("token_issued"),
+        "{}",
+        String::from_utf8_lossy(&by_prefix.stderr)
+    );
+    let audit = server.cli(lender_home.path(), &["loans", "audit", "--json"]);
+    let events: Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let kinds: Vec<_> = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        kinds.contains(&"token_issued") && kinds.contains(&"ended"),
+        "{kinds:?}"
     );
 }

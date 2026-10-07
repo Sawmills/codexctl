@@ -334,7 +334,7 @@ fn prepare_pinned_codex(
     allow_billing: bool,
     included_only: bool,
 ) -> Result<PinnedLaunch> {
-    store::validate_alias(alias)?;
+    super::super::loans::AccountRef::parse(alias)?;
     if std::env::var_os("CODEX_HOME").is_some()
         || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
     {
@@ -385,6 +385,7 @@ fn prepare_pinned_codex(
         approved_billing_plan: None,
         approved_billing_class: None,
         session_id: vault::digest(&super::super::enrollment::random_bytes()),
+        loan_id: account.loan.as_ref().map(|loan| loan.id.clone()),
     };
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
@@ -392,6 +393,18 @@ fn prepare_pinned_codex(
     if included_only && token.billing_class != Some(api::BillingClass::RateLimited) {
         bail!(
             "server account {} no longer has verified included billing",
+            account.alias
+        );
+    }
+    // Automatic placement rechecks the borrower backoff on this catalog and on
+    // the usage that came with the token; selection may have seen older data.
+    if included_only
+        && account.loan.is_some()
+        && !(super::super::loans::borrowed_auto_eligible(account)
+            && super::super::loans::token_below_borrower_backoff(token.statusline_usage.as_ref()))
+    {
+        bail!(
+            "borrowed account {} reached the borrower backoff; the lender's lanes come first",
             account.alias
         );
     }
@@ -629,6 +642,7 @@ mod tests {
                 five_hour_resets_at: None,
                 allowed,
                 limit_reached,
+                max_used_percent: None,
             }),
             label: None,
         }

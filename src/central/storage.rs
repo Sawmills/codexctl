@@ -20,6 +20,8 @@ use std::{
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod loans;
+
 async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(DB_TIMEOUT, future)
         .await
@@ -95,6 +97,10 @@ struct FileState {
     accounts: BTreeMap<String, Vec<u8>>,
     leases: BTreeMap<String, FileLeaseOnDisk>,
     enrollments: BTreeMap<String, EnrollmentOnDisk>,
+    #[serde(default)]
+    loans: BTreeMap<String, super::loans::Grant>,
+    #[serde(default)]
+    loan_audit: Vec<super::loans::AuditEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -143,6 +149,8 @@ pub struct BackfillCounts {
     pub users: usize,
     pub devices: usize,
     pub observed_relogins: usize,
+    /// Loan grants copied with their audit events.
+    pub loans: usize,
 }
 
 const SCHEMA: &str = r#"
@@ -229,6 +237,14 @@ CREATE INDEX IF NOT EXISTS central_users_enabled_idx
 "#;
 
 impl CentralStore {
+    /// File storage at the account server's state directory.
+    pub(super) fn file(state: &Path, key: &Path) -> Self {
+        Self::File(FileStore {
+            state: state.into(),
+            key: key.into(),
+        })
+    }
+
     #[cfg(all(test, feature = "central-real-db-tests"))]
     pub(super) async fn settle_test_observations(&self) -> Result<()> {
         if let Self::Postgres(db) | Self::Dual { postgres: db, .. } = self {
@@ -509,6 +525,7 @@ impl CentralStore {
             users: 0,
             devices: 0,
             observed_relogins: 0,
+            loans: 0,
         };
         let accounts = state.join("accounts");
         if accounts.exists() {
@@ -591,6 +608,16 @@ impl CentralStore {
                 .filter_map(Result::ok)
                 .filter(|e| e.path().join("record.json").exists())
                 .count();
+        }
+        let file = FileStore {
+            state: state.into(),
+            key: key.into(),
+        };
+        if file.path().exists() {
+            let file_state = file.read_state()?;
+            counts.loans = target
+                .import_loans(&file_state.loans, &file_state.loan_audit)
+                .await?;
         }
         Ok(counts)
     }
@@ -1292,6 +1319,10 @@ impl PostgresStore {
             .batch_execute(SCHEMA)
             .await
             .context("migrate central PostgreSQL schema")?;
+        client
+            .batch_execute(loans::SCHEMA)
+            .await
+            .context("migrate central PostgreSQL loan schema")?;
         client
             .execute(
                 "INSERT INTO central_schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING",

@@ -49,7 +49,7 @@ fn registration(path: &Path) -> Result<Option<Connection>> {
 pub fn connection() -> Result<Option<Connection>> {
     registration(&path()?)
 }
-fn secret(connection: &Connection) -> Result<String> {
+pub(super) fn secret(connection: &Connection) -> Result<String> {
     transport::origin(&connection.server)?;
     Ok(
         String::from_utf8(vault::private_read(&connection.token_file)?)?
@@ -1357,15 +1357,8 @@ pub fn disconnect(forget: bool) -> Result<()> {
             .collect();
         for connection in &registrations {
             // Remove only this connection's files after the provider is restored.
-            for entry in std::fs::read_dir(root()?)? {
-                let path = entry?.path();
-                if path.extension().is_some_and(|e| e == "json")
-                    && !path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
-                {
-                    native::remove_managed_connection(&path, connection)?;
-                }
+            for path in native::connection_files(&root()?)? {
+                native::remove_managed_connection(&path, connection)?;
             }
             // Keep the connection as a durable cleanup reference until its credential
             // is gone. A retry after either removal must tolerate a missing token.
@@ -1513,7 +1506,12 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
     Ok(())
 }
 
+/// Owned accounts rank first; a borrowed account enters below the borrower backoff.
 pub fn select(accounts: &[Account]) -> Result<String> {
+    super::loans::owned_then_borrowed(accounts, select_included)
+}
+
+fn select_included(accounts: &[Account]) -> Result<String> {
     let most = std::env::var("CODEXCTL_SELECT").ok().is_some_and(|v| {
         matches!(
             v.to_ascii_lowercase().as_str(),
@@ -1553,6 +1551,10 @@ pub fn select_for_codex(accounts: &[Account]) -> Result<String> {
 }
 
 fn select_for_codex_excluding(accounts: &[Account], excluded: &[String]) -> Result<String> {
+    super::loans::owned_then_borrowed(accounts, |accounts| select_least_loaded(accounts, excluded))
+}
+
+fn select_least_loaded(accounts: &[Account], excluded: &[String]) -> Result<String> {
     accounts
         .iter()
         .filter(|account| {
@@ -1709,7 +1711,9 @@ pub(super) fn select_for_activation(
     let inventory = resets()?.context("account server disconnected")?;
     let mut candidates = Vec::new();
     for account in accounts {
-        if !account.available
+        // Only the lender redeems a banked reset (ADR 0004).
+        if account.loan.is_some()
+            || !account.available
             || account.usage_stale
             || account.billing_class == api::BillingClass::UsageBased
             || !account

@@ -25,6 +25,10 @@ pub struct Usage {
     pub allowed: Option<bool>,
     #[serde(default)]
     pub limit_reached: Option<bool>,
+    /// The highest use over every reported window, including windows that
+    /// have no duration and so no weekly or five-hour slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_used_percent: Option<f64>,
 }
 impl Usage {
     pub(crate) fn from_usage(usage: &api::RateLimitResponse) -> Self {
@@ -46,6 +50,23 @@ impl Usage {
             five_hour_resets_at: short.and_then(api::RateLimitWindow::reset_timestamp),
             allowed: usage.rate_limit.as_ref().and_then(|r| r.allowed),
             limit_reached: usage.rate_limit.as_ref().and_then(|r| r.limit_reached),
+            // Every window counts, model-specific buckets included. A partial
+            // source cannot prove the maximum, so it reports none.
+            max_used_percent: (!usage.windows_partial)
+                .then(|| {
+                    usage
+                        .rate_limit
+                        .iter()
+                        .chain(
+                            usage
+                                .additional_rate_limits
+                                .iter()
+                                .filter_map(|extra| extra.rate_limit.as_ref()),
+                        )
+                        .flat_map(|limit| limit.windows().map(|(_, w)| w.used_percent))
+                        .reduce(f64::max)
+                })
+                .flatten(),
         }
     }
 }

@@ -78,6 +78,20 @@ pub struct Account {
     /// Recent 429 ratio reported by a client, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent_429_rate: Option<f64>,
+    /// Set when the account is borrowed from another company user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loan: Option<LoanInfo>,
+}
+/// The loan behind a borrowed catalog entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoanInfo {
+    pub id: String,
+    pub lender_email: String,
+    pub ends_at: i64,
+    /// A bounded reason when the loan cannot issue tokens now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<String>,
 }
 // Older account servers do not report load; preserve their zero-load tie-break.
 fn legacy_live_sessions() -> Option<usize> {
@@ -242,7 +256,7 @@ pub(super) fn record_user(state: &Path, id: &str, email: &str) -> Result<UserEnr
 pub(super) fn normalize_alias(alias: &str) -> Result<&str> {
     store::validate_alias(alias)
 }
-pub(super) fn account_key(user: &str, alias: &str) -> String {
+pub fn account_key(user: &str, alias: &str) -> String {
     vault::digest(format!("{user}\0{}", alias.to_ascii_lowercase()).as_bytes())
 }
 
@@ -315,10 +329,11 @@ pub(super) fn account_summary(owner: &Owner) -> Account {
             .and_then(|u| u.rate_limit.map(|r| r.availability_score())),
         live_sessions: Some(0),
         recent_429_rate: None,
+        loan: None,
     }
 }
 
-async fn central_registry_users(central: &CentralStore) -> Result<Vec<User>> {
+pub(super) async fn central_registry_users(central: &CentralStore) -> Result<Vec<User>> {
     let entities = central.load_registry_entities("users").await?;
     entities
         .into_iter()
@@ -1046,7 +1061,20 @@ async fn token(
         .alias
         .as_deref()
         .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "alias_required"))?;
-    let owner = broker.owner(&device, alias).await?;
+    // A borrowed reference resolves only through an active grant (ADR 0004).
+    let borrowed = if alias.contains('/') {
+        Some(
+            broker
+                .borrowed_owner(&device, alias, request.loan_id.as_deref())
+                .await?,
+        )
+    } else {
+        None
+    };
+    let owner = match borrowed.as_ref() {
+        Some(borrowed) => borrowed.owner.clone(),
+        None => broker.owner(&device, alias).await?,
+    };
     let permit = broker
         .work
         .clone()
@@ -1055,7 +1083,11 @@ async fn token(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
     let owner_ref = owner.clone();
-    let (mut token, alias) = tokio::spawn(async move {
+    // A borrowed request names the lender's alias through its grant.
+    let lender_alias = borrowed
+        .as_ref()
+        .map(|borrowed| borrowed.grant.alias.clone());
+    let (mut token, alias, account_id) = tokio::spawn(async move {
         let (import_guard, mut owner) = if worker
             .central.as_ref()
             .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
@@ -1081,11 +1113,21 @@ async fn token(
         // A rename can re-key this owner while the request waits for its lock.
         // The old alias must never be served once the rename committed.
         let requested = request.alias.as_deref().unwrap_or_default().trim();
-        if !owner.vault.alias.trim().eq_ignore_ascii_case(requested) {
-            return Err(
-                super::rename::renamed_error(&worker, &owner.vault.user, requested)
-                    .unwrap_or_else(|| worker.error(StatusCode::NOT_FOUND, "account_not_found")),
-            );
+        match lender_alias.as_deref() {
+            // A rename of a lent account ends the borrower's access here.
+            Some(expected) if !owner.vault.alias.trim().eq_ignore_ascii_case(expected) => {
+                return Err(worker.error(StatusCode::FORBIDDEN, "loan_ended"));
+            }
+            Some(_) => {}
+            None if !owner.vault.alias.trim().eq_ignore_ascii_case(requested) => {
+                return Err(
+                    super::rename::renamed_error(&worker, &owner.vault.user, requested)
+                        .unwrap_or_else(|| {
+                            worker.error(StatusCode::NOT_FOUND, "account_not_found")
+                        }),
+                );
+            }
+            None => {}
         }
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
@@ -1363,7 +1405,7 @@ async fn token(
                     return Err(worker.owner_failure(error));
                 }
             };
-            Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned()))
+            Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned(), account_id.clone()))
         }
         .await;
         if retain_lease {
@@ -1405,14 +1447,33 @@ async fn token(
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
-    refresh_legacy_usage(&broker, &mut token).await;
+    refresh_legacy_usage(&broker, &mut token, borrowed.is_some()).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
+    // A loan that ended or paused during the refresh delivers no token either.
+    let alias = match borrowed.as_ref() {
+        Some(borrowed) => {
+            broker
+                .confirm_borrowed_token(&borrowed.grant, &token)
+                .await?;
+            // The checks above can wait; a machine revoked meanwhile gets
+            // nothing. The atomic issue step is last before the response.
+            broker.authorize(&headers).await?;
+            broker
+                .issue_borrowed_token(&borrowed.grant, &device)
+                .await?;
+            borrowed.grant.reference.clone()
+        }
+        None => alias,
+    };
     // A client-supplied launch ID is unique only within its authenticated machine.
     let session_id = format!("{}:{}:{session_id}", device.id.len(), device.id);
-    broker
-        .activity
-        .delivered(&device, alias.clone(), session_id.clone());
+    broker.activity.delivered(
+        &device,
+        alias.clone(),
+        session_id.clone(),
+        account_id.clone(),
+    );
     if let Some(central) = broker
         .central
         .clone()
@@ -1424,7 +1485,9 @@ async fn token(
                 let user = device.user.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let account = account_key(&user, &alias);
+                    // Keyed by the owning account, so a borrower's session
+                    // counts on the lender's account too.
+                    let account = account_id;
                     let failure = match central
                         .record_live_session(&account, &user, &alias, &session_id)
                         .await
@@ -1460,11 +1523,16 @@ async fn token(
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
 
-async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
+/// `need_all_windows`: a borrowed token's placement checks need the
+/// all-window maximum, which native usage cannot give.
+async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse, need_all_windows: bool) {
     let Some(usage) = token.statusline_usage.as_ref() else {
         return;
     };
-    if usage.allowed.is_some() && usage.limit_reached.is_some() {
+    if usage.allowed.is_some()
+        && usage.limit_reached.is_some()
+        && (!need_all_windows || usage.max_used_percent.is_some())
+    {
         return;
     }
     let authoritative = match broker
@@ -1511,25 +1579,40 @@ pub(super) async fn account_catalog(
             let _ = broker.resolve_alias(user, &alias).await?;
         }
     }
-    let owners: Vec<_> = broker
+    let mut owners: Vec<_> = broker
         .owners
         .read()
         .await
         .iter()
         .filter(|(_, (identity, _))| identity.user == user)
-        .map(|(key, (_, owner))| (key.clone(), owner.clone()))
+        .map(|(key, (_, owner))| (key.clone(), owner.clone(), None))
         .collect();
+    // A loan-store fault hides borrowed entries only; owned accounts stay
+    // listed. The failure is already counted, and token issue stays strict.
+    match broker.borrowed_catalog(user).await {
+        Ok(borrowed) => owners.extend(
+            borrowed
+                .into_iter()
+                .map(|entry| (entry.key, entry.owner, Some((entry.grant, entry.paused)))),
+        ),
+        Err(error) => eprintln!(
+            "{}",
+            json!({"operation":"account_catalog","stage":"borrowed","error":error.reason})
+        ),
+    }
+    // Borrowed entries count too: a borrower with no owned account can still
+    // list a healthy loan while an unrelated account awaits recovery.
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
     let user = user.to_owned();
-    let tasks = owners.into_iter().map(|(key, owner)| {
+    let tasks = owners.into_iter().map(|(key, owner, loan)| {
         let broker = broker.clone();
         let user = user.clone();
         tokio::spawn(async move {
             // Copy only the access credential. Listing never snapshots, refreshes,
             // persists, or changes the credential owner's availability.
-            let (mut summary, revision, access, seed) = {
+            let (mut summary, revision, access, seed, account) = {
                 let owner = owner.lock().await;
                 let revision = vault::digest(owner.vault.auth.to_string().as_bytes());
                 let seed = owner
@@ -1544,6 +1627,7 @@ pub(super) async fn account_catalog(
                     revision,
                     vault::token(&owner.vault.auth).ok().map(str::to_owned),
                     seed,
+                    account_key(&owner.vault.user, &owner.vault.alias),
                 )
             };
             let failure = broker
@@ -1575,11 +1659,7 @@ pub(super) async fn account_catalog(
                 summary.usage_score = None;
             }
             drop(current);
-            summary.live_sessions = Some(broker.activity.live_sessions(
-                &user,
-                &summary.alias,
-                10 * 60,
-            ));
+            summary.live_sessions = Some(broker.activity.live_sessions(&account, 10 * 60));
             if let Some(central) = broker.central.as_ref()
                 && central.mode() != super::storage::StoreMode::File
             {
@@ -1607,6 +1687,33 @@ pub(super) async fn account_catalog(
                         }
                     }
                 }
+            }
+            if let Some((grant, paused)) = loan {
+                // A native seed has no all-window maximum, which borrowed
+                // placement needs; fetch complete usage for this entry only.
+                if !summary.usage_stale
+                    && summary
+                        .statusline_usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.max_used_percent.is_none())
+                    && let Some(access) = access.as_deref()
+                    && let Some(snapshot) = broker
+                        .complete_usage(&key, access, &summary.account_id)
+                        .await
+                {
+                    summary.statusline_usage = Some(snapshot);
+                }
+                summary.alias = grant.reference;
+                summary.user_id = user;
+                if paused.is_some() {
+                    summary.available = false;
+                }
+                summary.loan = Some(LoanInfo {
+                    id: grant.id,
+                    lender_email: grant.lender_email,
+                    ends_at: grant.ends_at,
+                    paused: paused.map(str::to_owned),
+                });
             }
             summary
         })
@@ -2520,7 +2627,7 @@ pub(super) fn previous_owner_exited(home: &Path) -> Result<()> {
     pid_evidence
 }
 
-fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
+pub(super) fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
     let vault = vault::load(state, key)?;
     vault::validate_auth(&vault.auth)?;
     let home = state.join("runtime");
@@ -3371,25 +3478,7 @@ pub async fn serve(
             }
         }
     });
-    let app = Router::new()
-        .route("/v1/token", post(token))
-        .route("/v1/accounts", get(accounts).post(import))
-        .route("/v1/accounts/rename", post(super::rename::rename))
-        .route("/v1/accounts/renamed", get(super::rename::renamed_aliases))
-        .merge(super::resets::routes())
-        .route("/v1/me", get(me))
-        .route("/v1/devices", get(devices))
-        .route("/v1/devices/revoke", post(revoke_device))
-        .route("/v1/relogin/start", post(relogin::start))
-        .route("/v1/relogin/status", post(relogin::status))
-        .route("/v1/relogin/cancel", post(relogin::cancel))
-        .route("/v1/accounts/login/start", post(relogin::add::start))
-        .route("/v1/accounts/login/status", post(relogin::add::status))
-        .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
-        .route("/metrics", get(metrics))
-        .route("/ready", get(ready))
-        .route("/health", get(|| async { StatusCode::OK }));
-    let app = enrollment::routes(app.merge(super::dashboard::routes(public_url)))
+    let app = enrollment::routes(api_routes().merge(super::dashboard::routes(public_url)))
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(broker.clone(), observe))
         .with_state(broker.clone());
@@ -3451,6 +3540,70 @@ fn background_recovery_enabled() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
+}
+
+impl Broker {
+    /// A file-mode broker over prepared owners, for tests outside this module.
+    #[cfg(test)]
+    pub(super) fn testing(
+        state: PathBuf,
+        key: PathBuf,
+        owners: Vec<(String, AccountIndex, Owner)>,
+        catalog: catalog::Reader,
+    ) -> Self {
+        Self {
+            state,
+            key,
+            binary: "unused".into(),
+            read_only: true,
+            ownership_unresolved: Arc::new(AtomicBool::new(false)),
+            owners: Arc::new(RwLock::new(
+                owners
+                    .into_iter()
+                    .map(|(key, index, owner)| (key, (index, Arc::new(Mutex::new(owner)))))
+                    .collect(),
+            )),
+            imports: Arc::new(Mutex::new(())),
+            sso: None,
+            activity: Arc::default(),
+            reset_reader: super::resets::Reader::new().expect("reset reader"),
+            catalog: Arc::new(catalog),
+            failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            metrics_hash: None,
+            work: Arc::new(Semaphore::new(128)),
+            session_writes: Arc::new(Semaphore::new(32)),
+            stopping: Arc::new(AtomicBool::new(false)),
+            recovery_stop: Arc::new(tokio::sync::Notify::new()),
+            background_recovery: false,
+            relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            central: None,
+            holder_id: "test-holder".into(),
+            registry: None,
+        }
+    }
+}
+
+/// The machine-facing API. The dashboard and enrollment routes are added by `serve`.
+pub(super) fn api_routes() -> Router<Broker> {
+    Router::new()
+        .route("/v1/token", post(token))
+        .route("/v1/accounts", get(accounts).post(import))
+        .route("/v1/accounts/rename", post(super::rename::rename))
+        .route("/v1/accounts/renamed", get(super::rename::renamed_aliases))
+        .merge(super::resets::routes())
+        .merge(super::loans::http::routes())
+        .route("/v1/me", get(me))
+        .route("/v1/devices", get(devices))
+        .route("/v1/devices/revoke", post(revoke_device))
+        .route("/v1/relogin/start", post(relogin::start))
+        .route("/v1/relogin/status", post(relogin::status))
+        .route("/v1/relogin/cancel", post(relogin::cancel))
+        .route("/v1/accounts/login/start", post(relogin::add::start))
+        .route("/v1/accounts/login/status", post(relogin::add::status))
+        .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
+        .route("/metrics", get(metrics))
+        .route("/ready", get(ready))
+        .route("/health", get(|| async { StatusCode::OK }))
 }
 
 #[cfg(test)]

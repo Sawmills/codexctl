@@ -1,4 +1,5 @@
 //! Native TUI credentials through Codex's command-backed provider authentication.
+use super::loans::AccountRef;
 use super::{
     server::{TokenRequest, TokenResponse},
     vault,
@@ -92,6 +93,10 @@ struct Connection {
     approved_billing_class: Option<api::BillingClass>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     session_id: String,
+    /// The grant a borrowed account was selected with. Token requests send
+    /// it, so a later grant of the same name needs a new selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loan_id: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 struct Activation {
@@ -109,7 +114,9 @@ fn alias_from_pointer_bytes(bytes: Option<&[u8]>) -> Option<String> {
     {
         return None;
     }
-    store::validate_alias(alias).ok().map(str::to_owned)
+    AccountRef::parse(alias)
+        .ok()
+        .map(|reference| reference.name())
 }
 
 fn render_parent_cmd(args: &[String]) -> String {
@@ -335,8 +342,14 @@ pub fn print_history(limit: usize, json: bool) -> Result<()> {
     Ok(())
 }
 fn connection_path(alias: &str) -> Result<PathBuf> {
-    let alias = store::validate_alias(alias)?;
-    Ok(root()?.join(format!("{alias}.json")))
+    let reference = AccountRef::parse(alias)?;
+    let path = reference.connection_file(&root()?);
+    if reference.is_borrowed()
+        && let Some(parent) = path.parent()
+    {
+        store::ensure_private_dir(parent)?;
+    }
+    Ok(path)
 }
 fn codex_home() -> Result<PathBuf> {
     Ok(config::default_paths()?.codex_home())
@@ -781,6 +794,7 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
             account_id: (!connection.account_id.is_empty()).then(|| connection.account_id.clone()),
             billing: true,
             alias: connection.alias.clone(),
+            loan_id: connection.loan_id.clone(),
         });
     if !connection.session_id.is_empty() {
         request = request.header("x-codexctl-session", &connection.session_id);
@@ -790,27 +804,37 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     if !status.is_success() {
         let body = response.json::<serde_json::Value>().ok();
         let reason = body.as_ref().and_then(|v| v["error"].as_str());
-        if status == reqwest::StatusCode::CONFLICT
-            && reason == Some("unsupported_workspace_routing")
-        {
-            bail!(
+        match (status, reason) {
+            (reqwest::StatusCode::CONFLICT, Some("unsupported_workspace_routing")) => bail!(
                 "this account requires workspace routing that the central native provider does not yet support"
-            );
-        }
-        if status == reqwest::StatusCode::NOT_FOUND
-            && reason == Some("account_renamed")
-            && let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str())
-        {
-            // Never follow a rename silently: the operator picks the account.
-            let old = connection.alias.as_deref().unwrap_or("this account");
-            if connection.launch_pinned {
-                bail!(
-                    "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
-                );
+            ),
+            (reqwest::StatusCode::NOT_FOUND, Some("account_renamed")) => {
+                if let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str()) {
+                    // Never follow a rename silently: the operator picks the account.
+                    let old = connection.alias.as_deref().unwrap_or("this account");
+                    if connection.launch_pinned {
+                        bail!(
+                            "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
+                        );
+                    }
+                    bail!(
+                        "server account {old} was renamed to {renamed}; run codexctl use {renamed}"
+                    );
+                }
+                bail!("central token request rejected (HTTP {})", status)
             }
-            bail!("server account {old} was renamed to {renamed}; run codexctl use {renamed}");
+            // A loan never moves a lane to another account by itself.
+            (_, Some("loan_ended")) => bail!(
+                "the loan of this server account ended; select another account with codexctl use"
+            ),
+            (_, Some("loan_paused")) => bail!(
+                "the loan of this server account is paused: the lender is disabled or the lender's login changed"
+            ),
+            (_, Some("ambiguous_loan")) => {
+                bail!("two active loans share this borrowed name; ask a lender to end one")
+            }
+            _ => bail!("central token request rejected (HTTP {})", status),
         }
-        bail!("central token request rejected (HTTP {})", status);
     }
     let token: TokenResponse = response.json().context("invalid central token response")?;
     if !token.native_routing_supported {
@@ -856,6 +880,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         approved_billing_plan: None,
         approved_billing_class: None,
         session_id: String::new(),
+        loan_id: None,
     };
     drop(_lock);
     let token = fetch(&connection, false)?;
@@ -1075,8 +1100,8 @@ fn read_active_alias() -> Result<String> {
     {
         bail!("invalid active account pointer; run codexctl use again");
     }
-    store::validate_alias(alias)
-        .map(|alias| alias.to_owned())
+    AccountRef::parse(alias)
+        .map(|reference| reference.name())
         .map_err(|_| anyhow::anyhow!("invalid active account pointer; run codexctl use again"))
 }
 
@@ -1142,7 +1167,10 @@ fn finish_token(
     {
         bail!("active account changed during token retrieval; retry");
     }
+    // A borrowed connection may share its workspace with a newer grant, so
+    // the grant pin is part of the identity checked before publishing.
     if latest.account_id != connection.account_id
+        || latest.loan_id != connection.loan_id
         || latest.server != connection.server
         || latest.device_token_file != connection.device_token_file
     {
@@ -1169,8 +1197,22 @@ fn finish_token(
     println!("{}", token.access_token);
     Ok(())
 }
+/// The directory whose native lock guards a connection file. Borrowed
+/// connections share the central root lock with activation; private launch
+/// connections keep their own directory's lock.
+fn connection_lock_directory(path: &Path, root: &Path) -> Result<PathBuf> {
+    if path.starts_with(root.join("borrowed")) {
+        return Ok(root.to_owned());
+    }
+    Ok(path
+        .parent()
+        .context("missing connection directory")?
+        .to_owned())
+}
+
 pub fn print_token(path: &Path) -> Result<()> {
-    let directory = path.parent().context("missing connection directory")?;
+    let directory = connection_lock_directory(path, &root()?)?;
+    let directory = directory.as_path();
     let connection = {
         let _lock = native_lock(directory)?;
         read_connection(path)?
@@ -1220,6 +1262,9 @@ fn document(home: &Path) -> Result<DocumentMut> {
 
 /// Resolve explicit unmigrated local names without requiring an online catalog.
 pub fn known_local_alias(alias: &str) -> Result<bool> {
+    if AccountRef::parse(alias)?.is_borrowed() {
+        return Ok(false);
+    }
     let paths = config::default_paths()?;
     let local = store::profile_dir(&paths, alias)?;
     if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
@@ -1239,6 +1284,19 @@ pub fn activate(
     restart_daemon: bool,
 ) -> Result<bool> {
     let explicit = alias.is_some();
+    // A borrowed reference is matched in its normalized, lowercase form.
+    let normalized = alias
+        .map(|alias| {
+            AccountRef::parse(alias).map(|reference| {
+                if reference.is_borrowed() {
+                    reference.name()
+                } else {
+                    alias.to_owned()
+                }
+            })
+        })
+        .transpose()?;
+    let alias = normalized.as_deref();
     if let Some(alias) = alias
         && known_local_alias(alias)?
     {
@@ -1325,6 +1383,7 @@ pub fn activate(
         drop(shared);
         exclusive_mode(&paths)?
     };
+    let mut selected_loan = None;
     if let Some(catalog) = catalog.as_ref() {
         let _lock = native_lock(&root()?)?;
         super::remote::require_current_connection(&catalog.connection)?;
@@ -1334,17 +1393,35 @@ pub fn activate(
             .find(|a| a.alias == alias)
             .context("server account alias not found")?;
         sync_account(&catalog.connection, account)?;
+        selected_loan = Some((
+            account.loan.as_ref().map(|loan| loan.id.clone()),
+            account.account_id.clone(),
+        ));
     }
     if !path.try_exists()? {
         return Ok(false);
     }
-    let local = store::profile_dir(&config::default_paths()?, alias)?;
-    if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
-        bail!("remote alias conflicts with a local profile; rename one before selection");
+    // A borrowed reference has no local profile namespace to collide with.
+    if !AccountRef::parse(alias)?.is_borrowed() {
+        let local = store::profile_dir(&config::default_paths()?, alias)?;
+        if local.try_exists()? && !local.join(".central-transfer.json").try_exists()? {
+            bail!("remote alias conflicts with a local profile; rename one before selection");
+        }
     }
     let _lock = native_lock(&root()?)?;
     let mut connection = read_connection(&path)?;
     drop(_lock);
+    let read_account_id = connection.account_id.clone();
+    let read_loan_id = connection.loan_id.clone();
+    // Selecting a borrowed account pins it to the current grant and its
+    // account. Both are saved only with a successful activation.
+    if let Some((loan_id, account_id)) = selected_loan
+        && connection.loan_id != loan_id
+    {
+        connection.loan_id = loan_id;
+        connection.account_id = account_id;
+        connection.revision = String::new();
+    }
     let token = fetch(&connection, false)?;
     let usage_based = token.billing_class != Some(api::BillingClass::RateLimited);
     if redeem_reset
@@ -1357,6 +1434,15 @@ pub fn activate(
     }
     if usage_based && !explicit && !redeem_reset {
         bail!("automatic remote selection refuses usage-based or unknown billing");
+    }
+    // Automatic selection rechecks the borrower backoff on fresh usage.
+    if !explicit
+        && AccountRef::parse(alias)?.is_borrowed()
+        && !super::loans::token_below_borrower_backoff(token.statusline_usage.as_ref())
+    {
+        bail!(
+            "borrowed account {alias} reached the borrower backoff; the lender's lanes come first"
+        );
     }
     if usage_based && !allow_billing && !redeem_reset {
         use std::io::IsTerminal;
@@ -1487,13 +1573,23 @@ pub fn activate(
     doc["model_providers"][PROVIDER] = Item::Table(provider);
     let latest = read_connection(&path)?;
     if latest.server != connection.server
-        || latest.account_id != connection.account_id
+        || latest.account_id != read_account_id
+        || latest.loan_id != read_loan_id
         || latest.device_token_file != connection.device_token_file
     {
         bail!("remote connection changed during activation");
     }
     let previous_connection = serde_json::to_vec(&latest)?;
+    // Keep the grant and account this activation fetched with; the save below
+    // commits them.
+    let selected_loan = connection.loan_id.take();
+    let selected_account_id = std::mem::take(&mut connection.account_id);
     connection = latest;
+    if connection.loan_id != selected_loan {
+        connection.loan_id = selected_loan;
+        connection.account_id = selected_account_id;
+        connection.revision = String::new();
+    }
     connection.allow_billing = approve_billing;
     connection.approved_billing_plan = approve_billing
         .then(|| token.chatgpt_plan_type.clone())
@@ -1690,15 +1786,26 @@ pub(super) fn sync_account(
         bail!("server user identity changed");
     }
     let path = connection_path(&account.alias)?;
-    let local = store::profile_dir(&config::default_paths()?, &account.alias)?;
-    if !super::remote::local_alias_matches(device, account, &local)? {
+    if account.loan.is_none()
+        && !super::remote::local_alias_matches(
+            device,
+            account,
+            &store::profile_dir(&config::default_paths()?, &account.alias)?,
+        )?
+    {
         bail!(
             "server alias {} conflicts with a local profile; migrate or rename it",
             account.alias
         );
     }
+    let loan_id = account.loan.as_ref().map(|loan| loan.id.clone());
     if path.try_exists()? {
         let existing = read_connection(&path)?;
+        // A new grant behind a borrowed name may serve another account.
+        // Activation stages it and commits it with its rollback.
+        if account.loan.is_some() && existing.loan_id != loan_id {
+            return Ok(());
+        }
         if existing.server != device.server
             || existing.account_id != account.account_id
             || existing.alias.as_deref() != Some(&account.alias)
@@ -1707,6 +1814,7 @@ pub(super) fn sync_account(
         {
             bail!("remote account identity changed");
         }
+        // A changed grant is committed by activation, with its rollback.
         return Ok(());
     }
     save_connection(
@@ -1723,8 +1831,42 @@ pub(super) fn sync_account(
             approved_billing_plan: None,
             approved_billing_class: None,
             session_id: String::new(),
+            loan_id,
         },
     )
+}
+/// Every connection file: owned ones in the root and borrowed ones under
+/// `borrowed/<lender>/`.
+pub(super) fn connection_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let visible_json = |path: &Path| {
+        path.extension().is_some_and(|e| e == "json")
+            && !path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+    };
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root)? {
+        let path = entry?.path();
+        if visible_json(&path) {
+            files.push(path);
+        }
+    }
+    let borrowed = root.join("borrowed");
+    if borrowed.try_exists()? {
+        for lender in std::fs::read_dir(borrowed)? {
+            let lender = lender?.path();
+            if !lender.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(lender)? {
+                let path = entry?.path();
+                if visible_json(&path) {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    Ok(files)
 }
 pub(super) fn remove_managed_connection(
     path: &Path,
@@ -1814,12 +1956,18 @@ fn statusline_identity(
     path: &Path,
     connection: &Connection,
 ) -> Result<crate::statusline::Selection> {
-    Ok(crate::statusline::Selection {
-        alias: path
+    // The file stem of a borrowed connection drops the lender, so prefer the
+    // recorded alias; older connections have only the file name.
+    let alias = match connection.alias.as_ref() {
+        Some(alias) => alias.clone(),
+        None => path
             .file_stem()
             .and_then(|v| v.to_str())
             .context("invalid connection path")?
             .to_owned(),
+    };
+    Ok(crate::statusline::Selection {
+        alias,
         source: crate::statusline::Source::Server {
             server: connection.server.clone(),
             user_id: connection.user_id.clone(),
@@ -1862,11 +2010,11 @@ mod tests {
     use super::{
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
-        billing_switch_prompt, is_billing_approved, remove_active_pointer_audited,
-        remove_active_pointer_with, remove_pointer_then_marker_audited,
-        remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
-        rollback_or_context, save_connection, validate_token_account,
-        write_pointer_after_connection, write_pointer_with_rollback,
+        billing_switch_prompt, connection_lock_directory, finish_token, is_billing_approved,
+        remove_active_pointer_audited, remove_active_pointer_with,
+        remove_pointer_then_marker_audited, remove_pointer_then_marker_with, render_parent_cmd,
+        restore_active_pointer, rollback_or_context, save_connection, statusline_identity,
+        validate_token_account, write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1925,8 +2073,94 @@ mod tests {
             approved_billing_plan: Some("pro".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         assert!(is_billing_approved(&connection, &changed_billing_token()));
+    }
+
+    #[test]
+    fn borrowed_connections_share_the_activation_lock() {
+        let root = std::path::Path::new("/home/central");
+        assert_eq!(
+            connection_lock_directory(&root.join("borrowed/alice/main.json"), root).unwrap(),
+            root
+        );
+        assert_eq!(
+            connection_lock_directory(&root.join("main.json"), root).unwrap(),
+            root
+        );
+        assert_eq!(
+            connection_lock_directory(&root.join("lanes/launch-x/connection.json"), root).unwrap(),
+            root.join("lanes/launch-x")
+        );
+    }
+
+    #[test]
+    fn a_token_fetched_under_an_earlier_grant_is_not_published() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("main.json");
+        let pinned = |loan: &str| Connection {
+            user_id: Some("borrower".into()),
+            alias: Some("alice/main".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "shared-workspace".into(),
+            revision: "revision".into(),
+            allow_billing: false,
+            launch_pinned: false,
+            approved_billing_plan: None,
+            approved_billing_class: None,
+            session_id: String::new(),
+            loan_id: Some(loan.into()),
+        };
+        // A reselection committed the second grant while the first was in flight.
+        save_connection(&path, &pinned("second")).unwrap();
+        let claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"shared-workspace"}});
+        let token = TokenResponse {
+            user_id: None,
+            access_token: format!(
+                "h.{}.",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+            ),
+            chatgpt_account_id: "shared-workspace".into(),
+            chatgpt_plan_type: Some("pro".into()),
+            revision: "new-revision".into(),
+            billing_class: Some(api::BillingClass::RateLimited),
+            native_routing_supported: true,
+            statusline_usage: None,
+            label: None,
+        };
+        let error = finish_token(&path, &pinned("first"), token, None).unwrap_err();
+        assert!(error.to_string().contains("changed"), "{error:#}");
+    }
+
+    #[test]
+    fn statusline_identity_keeps_the_borrowed_reference() {
+        let connection = Connection {
+            user_id: Some("borrower".into()),
+            alias: Some("alice/main".into()),
+            server: "https://server.invalid".into(),
+            device_token_file: "device.token".into(),
+            account_id: "account".into(),
+            revision: "revision".into(),
+            allow_billing: false,
+            launch_pinned: false,
+            approved_billing_plan: None,
+            approved_billing_class: None,
+            session_id: String::new(),
+            loan_id: None,
+        };
+        let path = std::path::Path::new("/central/borrowed/alice/main.json");
+        assert_eq!(
+            statusline_identity(path, &connection).unwrap().alias,
+            "alice/main"
+        );
+        let legacy = Connection {
+            alias: None,
+            ..connection
+        };
+        assert_eq!(statusline_identity(path, &legacy).unwrap().alias, "main");
     }
 
     #[test]
@@ -1943,6 +2177,7 @@ mod tests {
             approved_billing_plan: Some("pro".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         assert!(!is_billing_approved(&connection, &changed_billing_token()));
     }
@@ -1964,6 +2199,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();
@@ -2195,6 +2431,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         }
     }
 
@@ -2286,6 +2523,7 @@ mod tests {
             approved_billing_plan: Some("usage_based".into()),
             approved_billing_class: Some(api::BillingClass::Unknown),
             session_id: String::new(),
+            loan_id: None,
         };
         save_connection(&connection_path, &connection).unwrap();
         fs::write(&pointer, b"old\n").unwrap();

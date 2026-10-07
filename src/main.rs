@@ -57,6 +57,12 @@ enum Commands {
         revoke: Option<String>,
     },
     #[cfg(feature = "central-prototype")]
+    /// Lend a server account to a teammate, or manage your loans.
+    Loans {
+        #[command(subcommand)]
+        action: codexctl::central::loans::client::LoansAction,
+    },
+    #[cfg(feature = "central-prototype")]
     #[command(hide = true)]
     #[command(group(ArgGroup::new("token_source").required(true).args(["connection", "active"])))]
     CentralToken {
@@ -284,6 +290,8 @@ fn main() {
         Commands::SessionProvider { action } => codexctl::central::native::session_provider(action),
         #[cfg(feature = "central-prototype")]
         Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
+        #[cfg(feature = "central-prototype")]
+        Commands::Loans { action } => codexctl::central::loans::client::run(action),
         Commands::Status {
             json,
             rate_limited,
