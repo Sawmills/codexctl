@@ -58,10 +58,20 @@ pub async fn supervise_login(state: &Path, key: &Path, binary: &Path) -> Result<
         .stderr(Stdio::null())
         .kill_on_drop(true);
     process::isolate(&mut command);
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            // A failed spawn started no native writer. Preserve that proof only
+            // when the original private home still contains no issued grant.
+            intact_home(home, &receipt)?;
+            if home.join("auth.json").try_exists()? {
+                bail!("unexpected grant after failed polling spawn");
+            }
+            db.login_record_polling_absence(&op).await?;
+            return Err(error.into());
+        }
+    };
     let mut output = child.stdout.take().context("polling output missing")?;
-    let native = process::Process::capture(child.id().context("polling child missing")?)?;
-    store::atomic_write(&home.join("process.json"), &serde_json::to_vec(&native)?)?;
 
     let (send, mut receive) = tokio::sync::mpsc::channel(1);
     std::thread::spawn(move || {
@@ -79,6 +89,17 @@ pub async fn supervise_login(state: &Path, key: &Path, binary: &Path) -> Result<
     let mut bytes = Vec::new();
     let mut output_open = true;
     let result: Result<bool> = async {
+        match process::Process::capture(child.id().context("polling child missing")?) {
+            Ok(native) => store::atomic_write(&home.join("process.json"), &serde_json::to_vec(&native)?)?,
+            Err(error) => {
+                // A fast child can already be a zombie. Reaping it supplies
+                // exit evidence without requiring a live process incarnation.
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status.success());
+                }
+                return Err(error);
+            }
+        }
         loop {
             tokio::select! {
                 status = child.wait() => break Ok(status?.success()),

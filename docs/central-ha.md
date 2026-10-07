@@ -164,7 +164,10 @@ heartbeat stops and awaits the native child. The child is also bound to the
 supervisor's death. The supervisor owns both challenge and candidate publication. It reads durable
 cancellation every second without renewing parent authority. It publishes the
 captured grant before normal completion, or a durable absence receipt after
-confirmed exit with no grant in an intact private home.
+confirmed exit with no grant in an intact private home. A failed native spawn
+also records absence only when that original home contains no grant. If the
+native child exits before its process identity is recorded, the supervisor
+reaps it and settles its grant evidence.
 An expired polling operation and holder can release reservations only with
 that absence receipt. The old receipt reports `expired`; a fresh request ID
 can complete on another replica without first polling the abandoned ID.

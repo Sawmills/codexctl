@@ -60,9 +60,10 @@ async fn record_login_failure(broker: &Broker, op: &mut LoginOperation) -> Resul
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
     {
-        let reason = if (op.phase == LoginPhase::Unresolved
-            || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear))
-            && op.payload.candidate.is_none()
+        let reason = if op.payload.error.as_deref() == Some("account_identity_unresolved")
+            || ((op.phase == LoginPhase::Unresolved
+                || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear))
+                && op.payload.candidate.is_none())
         {
             "relogin_identity_unresolved"
         } else {
@@ -124,14 +125,12 @@ async fn recover(
         && !broker.ownership_unresolved.load(Ordering::Acquire)
         && broker.login_holder_live.load(Ordering::Acquire)
         && let Ok(permit) = broker.work.clone().try_acquire_owned()
-    {
-        if database(broker)?
+        && database(broker)?
             .login_takeover_candidate(op, &broker.holder_id)
             .await
             .map_err(|_| failure(broker))?
-        {
-            spawn_worker(broker.clone(), headers.clone(), op.clone(), permit);
-        }
+    {
+        spawn_worker(broker.clone(), headers.clone(), op.clone(), permit);
     }
     Ok(())
 }
@@ -564,6 +563,14 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             return Ok(());
         }
         let settled: Result<()> = async {
+            // Durable supervisor settlement also covers spawn failure and exit
+            // before a live process identity could be recorded.
+            if op.polling_clear
+                || (matches!(op.phase, LoginPhase::Candidate | LoginPhase::Rejected)
+                    && op.payload.candidate.is_some())
+            {
+                return Ok(());
+            }
             let native: process::Process =
                 serde_json::from_slice(&vault::private_read(&home.join("process.json"))?)?;
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -639,11 +646,9 @@ async fn continue_candidate(
         if matches!(reason, "account_identity_unresolved" | "login_canceled") {
             db.login_save(op, LoginPhase::Rejected).await?;
             if reason == "account_identity_unresolved" {
-                broker.record_failure(
-                    "relogin_identity_unresolved",
-                    "relogin",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                record_login_failure(broker, op)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("login failure report unavailable"))?;
             }
         } else {
             op.payload.candidate = None;

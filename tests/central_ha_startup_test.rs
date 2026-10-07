@@ -35,6 +35,18 @@ impl Pod {
         mode: &str,
         recovery: bool,
     ) -> Self {
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        Self::spawn_with_binary(database, key, root, mode, recovery, &binary).await
+    }
+
+    async fn spawn_with_binary(
+        database: &str,
+        key: &Path,
+        root: tempfile::TempDir,
+        mode: &str,
+        recovery: bool,
+        binary: &Path,
+    ) -> Self {
         let state = root.path().join("state");
         store::atomic_write(&root.path().join("mode"), b"startup").unwrap();
         for name in ["count", "launch-count"] {
@@ -55,7 +67,7 @@ impl Pod {
                 "http://127.0.0.1:8787",
                 "--codex-bin",
             ])
-            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"))
+            .arg(binary)
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
             .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
@@ -3075,6 +3087,90 @@ async fn postgres_another_machine_retries_an_expired_polling_alias_without_old_r
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_native_spawn_failure_does_not_leave_an_unidentified_grant_fence() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    let binary = f.first.root.path().join("unlaunchable-codex");
+    store::atomic_write(&binary, b"#!/missing-synthetic-interpreter\n").unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.first = Pod::spawn_with_binary(
+        &f.database,
+        &f.key,
+        f.first.root,
+        "postgres",
+        false,
+        &binary,
+    )
+    .await;
+    let operation = json!({"alias":"new-one","id":"20".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    let receipt = wait_add_terminal(&f, &operation).await;
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        200,
+        "a failed spawn issued no grant and must not fence the company user's accounts"
+    );
+    let retry = json!({"alias":"new-one","id":"21".repeat(32)});
+    assert_eq!(
+        add_request(&f, &f.second, "start", &retry).await["id"],
+        retry["id"]
+    );
+    complete_add(
+        &f,
+        &f.second,
+        &retry,
+        &add_grant("new-workspace", Some("new-login"), None),
+    )
+    .await;
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_immediate_native_exit_can_retry_without_process_identity() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    f.first = Pod::spawn_with_binary(
+        &f.database,
+        &f.key,
+        f.first.root,
+        "postgres",
+        false,
+        Path::new("/bin/false"),
+    )
+    .await;
+    // Repeat the real fast-exit race: the child may exit before /proc supplies
+    // its incarnation. Every awaited failure still proves no grant was saved.
+    for attempt in 0..24 {
+        let operation = json!({"alias":"new-one","id":format!("{:064x}", 256 + attempt)});
+        add_request(&f, &f.first, "start", &operation).await;
+        assert_eq!(wait_add_terminal(&f, &operation).await["status"], "failed");
+        assert_eq!(
+            request(&f.http, &f.second, &f.token).await.status(),
+            200,
+            "an awaited fast exit without a grant must not fence accounts (attempt {attempt})"
+        );
+    }
+    let retry = json!({"alias":"new-one","id":"22".repeat(32)});
+    assert_eq!(
+        add_request(&f, &f.second, "start", &retry).await["id"],
+        retry["id"]
+    );
+    complete_add(
+        &f,
+        &f.second,
+        &retry,
+        &add_grant("new-workspace", Some("new-login"), None),
+    )
+    .await;
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_fast_login_commits_before_parent_reads_its_challenge() {
     let f = login_fixture().await;
     let id = "10".repeat(32);
@@ -4311,6 +4407,13 @@ async fn postgres_equal_text_in_different_login_namespaces_is_unresolved_and_kee
     let receipt = wait_add_terminal(&f, &second).await;
     assert_eq!(receipt["status"], "failed");
     assert_eq!(receipt["error"], "account_identity_unresolved");
+    for _ in 0..3 {
+        assert_eq!(
+            add_request(&f, &f.second, "status", &second).await,
+            receipt,
+            "receipt reads preserve the admission failure"
+        );
+    }
     let token = f
         .http
         .post(format!("{}/v1/token", f.second.url))
@@ -4339,6 +4442,14 @@ async fn postgres_equal_text_in_different_login_namespaces_is_unresolved_and_kee
             "codexctl_central_failed_requests_total{reason=\"relogin_identity_unresolved\"} 1"
         ),
         "count the failed admission once: {metrics}"
+    );
+    assert!(
+        metrics
+            .lines()
+            .filter(|line| line
+                .starts_with("codexctl_central_failed_requests_total{reason=\"relogin_failed\"}"))
+            .all(|line| line.ends_with(" 0")),
+        "receipt recovery must not count the admission failure again: {metrics}"
     );
     assert_eq!(
         f.second.launches(),

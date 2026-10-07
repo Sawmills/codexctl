@@ -341,7 +341,9 @@ seconds without an authorized operation heartbeat. The native child is bound
 to the supervisor's death. The supervisor owns challenge and candidate publication and reads durable
 cancellation every second without renewing parent authority. Before completion,
 it publishes the captured grant, or confirms exit with no grant in an intact
-private home through a durable absence receipt.
+private home through a durable absence receipt. A failed native spawn records
+absence only in that intact, grant-free home. An exit before process identity
+capture is reaped and settled through the same durable receipt.
 
 Only that absence receipt permits polling fence cleanup after operation and
 holder expiry. The old request reports `expired`; a fresh ID can run on B
