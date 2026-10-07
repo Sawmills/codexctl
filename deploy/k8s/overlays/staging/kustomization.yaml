@@ -12,7 +12,7 @@ resources:
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
-    digest: sha256:b55a6a99b07faef0feb4cd9503bb7f0f79b098926e09ab2753abb77d51adf9f0
+    digest: sha256:3fb3c91a969052dd6dd8f6cf13ffb6eaf114fe2b3aff30d45ef2ebed43ca3bcf
 patches:
   - path: codexctl-restart-patch.yaml
     target:
