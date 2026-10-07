@@ -576,8 +576,8 @@ Rules:
 - Both parties can read the audit log: grant, token issue (one event per
   machine and hour), end, expiry, and pause. `codexctl loans audit` shows the
   newest events first, one page at a time; when older events exist it prints
-  the `--before` value for the next page. The server deletes ended loans and
-  audit events after 90 days.
+  the `--before` value for the next page. After 90 days the server marks
+  ended loans and audit events deleted and hides them; it does not purge them.
 
 Loans work in file, PostgreSQL, and dual storage. File mode keeps them in the
 encrypted `central-storage.enc`; an older server binary that rewrites that file

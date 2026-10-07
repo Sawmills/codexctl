@@ -127,16 +127,25 @@ writes PostgreSQL first and mirrors to the file, like other records.
   new fields, `loans` and `loan_audit`, written under `central-storage.lock`.
   No plaintext loan file exists. An older binary that rewrites this file drops
   the two fields, so a rollback ends every loan.
-- **PostgreSQL mode:** the `account_loans` table holds the grants. A partial
-  unique index on `account_id` where `ended_at IS NULL` enforces one active
-  grant. The `account_loan_audit` table holds the audit events.
+- **PostgreSQL mode:** the `account_loans` table holds the grants in typed
+  columns, with `CHECK` constraints on the end reason. A partial unique index
+  on `account_id` where `ended_at IS NULL` enforces one active grant. The
+  `account_loan_audit` table holds the audit events in typed columns, with a
+  foreign key to the grant. One set of table and column names serves the DDL
+  and every query.
 
 The audit log records grant, token issue, end, expiry, and pause events. A
 token issue event has a coalescing key of grant, machine, and UTC hour.
 PostgreSQL enforces the key with a unique index and `ON CONFLICT DO NOTHING`;
-file mode skips an append whose key is already in `loan_audit`. Each grant
-and each end prunes grants that ended more than 90 days ago and audit events
-older than 90 days, in both modes.
+file mode skips an append whose key is already in `loan_audit`.
+
+Retention is a logical deletion (HQ Q3, 2026-10-06). Each grant and each end
+sets `deleted_at` on grants that ended more than 90 days ago and on audit
+events older than 90 days, in both modes. Every read hides those rows; nothing
+is purged. A physical purge would be a separate, approved retention job.
+
+An automatic expiry records no user as its actor: `ended_by` stays empty and
+the end event carries the reason `expired`.
 
 Live sessions of a borrower use the lender's account key with the borrower's
 user ID, so the PostgreSQL foreign key holds and both users count in the

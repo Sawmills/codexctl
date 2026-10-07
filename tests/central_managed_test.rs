@@ -11012,6 +11012,7 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         ended_at: None,
         ended_by: None,
         end_reason: None,
+        deleted_at: None,
     };
     let seed = |grant: &central::loans::Grant| {
         tokio::runtime::Runtime::new().unwrap().block_on(async {

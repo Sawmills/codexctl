@@ -17,6 +17,7 @@ fn grant(id: &str, account: &str, ends_at: i64) -> Grant {
         ended_at: None,
         ended_by: None,
         end_reason: None,
+        deleted_at: None,
     }
 }
 
@@ -123,7 +124,7 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         "each transition stores its event; token issue events coalesce per machine and hour"
     );
 
-    store.prune_loans(3_000 + RETENTION_SECONDS).await.unwrap();
+    store.retire_loans(3_000 + RETENTION_SECONDS).await.unwrap();
     let audit = store.loan_audit(&[id("two")], None, 100).await.unwrap();
     assert_eq!(audit.iter().map(|e| e.at).collect::<Vec<_>>(), vec![5_000]);
     assert!(
@@ -144,6 +145,17 @@ async fn file_store_keeps_loans_in_the_encrypted_state() {
     let store = CentralStore::file(root.path(), &key);
     store.migrate().await.unwrap();
     scenario(&store, "file").await;
+    let raw = FileStore {
+        state: root.path().into(),
+        key: key.clone(),
+    }
+    .read_state()
+    .unwrap();
+    assert!(
+        raw.loans["file-one"].deleted_at.is_some(),
+        "retention marks a grant deleted and keeps it"
+    );
+    assert!(raw.loan_audit.iter().any(|e| e.deleted_at.is_some()));
     let raw = std::fs::read(root.path().join("central-storage.enc")).unwrap();
     assert!(
         !String::from_utf8_lossy(&raw).contains("alice@sawmills.ai"),
@@ -163,7 +175,7 @@ fn a_delayed_mirror_never_reopens_an_ended_grant() {
     };
     let active = grant("race", "account", 5_000);
     let mut ended = active.clone();
-    ended.end(2_000, "lender", EndReason::Revoked);
+    ended.end(2_000, Some("lender"), EndReason::Revoked);
     file.mirror_loan(&ended, &AuditEvent::ended(&ended))
         .unwrap();
     file.mirror_loan(&active, &AuditEvent::granted(&active))

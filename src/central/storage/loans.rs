@@ -1,17 +1,146 @@
 //! Loan grants and their audit log (ADR 0004).
 //!
 //! File mode keeps both in the encrypted `FileState`. PostgreSQL keeps them in
-//! `account_loans` and `account_loan_audit`. Dual mode writes PostgreSQL first
-//! and mirrors the authoritative grant to the file; an ended grant always wins,
-//! so a delayed mirror can never reopen a loan.
+//! typed columns of `account_loans` and `account_loan_audit`. Dual mode writes
+//! PostgreSQL first and mirrors the authoritative grant to the file; an ended
+//! grant always wins, so a delayed mirror can never reopen a loan.
 //!
 //! Every grant, end, and expiry is written together with its audit event.
+//! Retention never deletes a row: it sets `deleted_at`, and reads hide it.
 use super::{CentralStore, FileStore, PostgresStore, bounded_db};
-use crate::central::loans::{AuditEvent, EndReason, Grant, RETENTION_SECONDS};
+use crate::central::loans::{
+    AuditEvent, AuditKind, CredentialSubject, EndReason, Grant, RETENTION_SECONDS,
+};
 use anyhow::Result;
 
-/// Bound on rows read for one caller.
+/// Bound on history rows read for one caller.
 const READ_LIMIT: usize = 10_000;
+
+// Table and column names shared by the DDL and every query.
+macro_rules! loans_table {
+    () => {
+        "account_loans"
+    };
+}
+macro_rules! audit_table {
+    () => {
+        "account_loan_audit"
+    };
+}
+macro_rules! grant_columns {
+    () => {
+        "id,account_id,lender_id,borrower_id,lender_email,borrower_email,alias,reference,subject_workspace,subject_uid,subject_sub,created_at,ends_at,ended_at,ended_by,end_reason,deleted_at"
+    };
+}
+macro_rules! audit_columns {
+    () => {
+        "grant_id,at,kind,actor,machine,reason,coalesce_key,deleted_at"
+    };
+}
+
+pub(super) const SCHEMA: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS ",
+    loans_table!(),
+    " (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    lender_id TEXT NOT NULL,
+    borrower_id TEXT NOT NULL,
+    lender_email TEXT NOT NULL,
+    borrower_email TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    reference TEXT NOT NULL,
+    subject_workspace TEXT NOT NULL,
+    subject_uid TEXT,
+    subject_sub TEXT,
+    created_at BIGINT NOT NULL,
+    ends_at BIGINT NOT NULL,
+    ended_at BIGINT,
+    ended_by TEXT,
+    end_reason TEXT CHECK (end_reason IN ('revoked','returned','expired','account_removed')),
+    deleted_at BIGINT,
+    CHECK ((ended_at IS NULL) = (end_reason IS NULL)),
+    CHECK (deleted_at IS NULL OR ended_at IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS account_loans_one_active ON ",
+    loans_table!(),
+    " (account_id) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loans_lender_idx ON ",
+    loans_table!(),
+    " (lender_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loans_borrower_idx ON ",
+    loans_table!(),
+    " (borrower_id) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loans_expiry_idx ON ",
+    loans_table!(),
+    " (ends_at) WHERE ended_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loans_retire_idx ON ",
+    loans_table!(),
+    " (ended_at) WHERE ended_at IS NOT NULL AND deleted_at IS NULL;
+CREATE TABLE IF NOT EXISTS ",
+    audit_table!(),
+    " (
+    id BIGSERIAL PRIMARY KEY,
+    grant_id TEXT NOT NULL REFERENCES ",
+    loans_table!(),
+    "(id),
+    at BIGINT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('granted','token_issued','ended','paused')),
+    actor TEXT,
+    machine TEXT,
+    reason TEXT,
+    coalesce_key TEXT UNIQUE,
+    deleted_at BIGINT
+);
+CREATE INDEX IF NOT EXISTS account_loan_audit_grant_idx ON ",
+    audit_table!(),
+    " (grant_id, at) WHERE deleted_at IS NULL;
+CREATE INDEX IF NOT EXISTS account_loan_audit_retire_idx ON ",
+    audit_table!(),
+    " (at) WHERE deleted_at IS NULL;
+"
+);
+
+fn grant_from_row(row: &tokio_postgres::Row) -> Result<Grant> {
+    Ok(Grant {
+        id: row.try_get("id")?,
+        account_id: row.try_get("account_id")?,
+        lender: row.try_get("lender_id")?,
+        borrower: row.try_get("borrower_id")?,
+        lender_email: row.try_get("lender_email")?,
+        borrower_email: row.try_get("borrower_email")?,
+        alias: row.try_get("alias")?,
+        reference: row.try_get("reference")?,
+        subject: CredentialSubject {
+            workspace: row.try_get("subject_workspace")?,
+            uid: row.try_get("subject_uid")?,
+            sub: row.try_get("subject_sub")?,
+        },
+        created_at: row.try_get("created_at")?,
+        ends_at: row.try_get("ends_at")?,
+        ended_at: row.try_get("ended_at")?,
+        ended_by: row.try_get("ended_by")?,
+        end_reason: row
+            .try_get::<_, Option<String>>("end_reason")?
+            .as_deref()
+            .map(EndReason::parse)
+            .transpose()?,
+        deleted_at: row.try_get("deleted_at")?,
+    })
+}
+
+fn audit_from_row(row: &tokio_postgres::Row) -> Result<AuditEvent> {
+    Ok(AuditEvent {
+        grant_id: row.try_get("grant_id")?,
+        at: row.try_get("at")?,
+        kind: AuditKind::parse(row.try_get("kind")?)?,
+        actor: row.try_get("actor")?,
+        machine: row.try_get("machine")?,
+        reason: row.try_get("reason")?,
+        coalesce_key: row.try_get("coalesce_key")?,
+        deleted_at: row.try_get("deleted_at")?,
+    })
+}
 
 fn mirror_failure(store: &CentralStore, stage: &str, error: &anyhow::Error) {
     if let CentralStore::Dual {
@@ -93,23 +222,29 @@ impl CentralStore {
         }
     }
 
+    /// A grant that retention has not retired.
     pub async fn load_loan(&self, id: &str) -> Result<Option<Grant>> {
         match self {
-            Self::File(file) => Ok(file.read_state()?.loans.get(id).cloned()),
+            Self::File(file) => Ok(file
+                .read_state()?
+                .loans
+                .get(id)
+                .filter(|grant| grant.deleted_at.is_none())
+                .cloned()),
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
                 bounded_db(db.load_loan(id)).await
             }
         }
     }
 
-    /// Grants where the user is the lender or the borrower.
+    /// Unretired grants where the user is the lender or the borrower.
     pub async fn loans_for_user(&self, user: &str) -> Result<Vec<Grant>> {
         match self {
             Self::File(file) => Ok(file
                 .read_state()?
                 .loans
                 .into_values()
-                .filter(|grant| grant.involves(user))
+                .filter(|grant| grant.involves(user) && grant.deleted_at.is_none())
                 .take(READ_LIMIT)
                 .collect()),
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
@@ -149,8 +284,8 @@ impl CentralStore {
         }
     }
 
-    /// Audit events of the grants, newest first, recorded before `before`
-    /// (when set), at most `limit` of them.
+    /// Unretired audit events of the grants, newest first, recorded before
+    /// `before` (when set), at most `limit` of them.
     pub async fn loan_audit(
         &self,
         grant_ids: &[String],
@@ -163,6 +298,7 @@ impl CentralStore {
                     .read_state()?
                     .loan_audit
                     .into_iter()
+                    .filter(|event| event.deleted_at.is_none())
                     .filter(|event| grant_ids.contains(&event.grant_id))
                     .filter(|event| before.is_none_or(|before| event.at < before))
                     .collect();
@@ -179,17 +315,17 @@ impl CentralStore {
         }
     }
 
-    /// Delete grants that ended, and audit events recorded, before the
-    /// retention window.
-    pub async fn prune_loans(&self, now: i64) -> Result<()> {
+    /// Retire grants that ended, and audit events recorded, before the
+    /// retention window. Rows stay stored with `deleted_at` set.
+    pub async fn retire_loans(&self, now: i64) -> Result<()> {
         let cutoff = now.saturating_sub(RETENTION_SECONDS);
         match self {
-            Self::File(file) => file.prune_loans(cutoff),
-            Self::Postgres(db) => bounded_db(db.prune_loans(cutoff)).await,
+            Self::File(file) => file.retire_loans(cutoff, now),
+            Self::Postgres(db) => bounded_db(db.retire_loans(cutoff, now)).await,
             Self::Dual { file, postgres, .. } => {
-                bounded_db(postgres.prune_loans(cutoff)).await?;
-                if let Err(error) = file.prune_loans(cutoff) {
-                    mirror_failure(self, "prune_loans", &error);
+                bounded_db(postgres.retire_loans(cutoff, now)).await?;
+                if let Err(error) = file.retire_loans(cutoff, now) {
+                    mirror_failure(self, "retire_loans", &error);
                 }
                 Ok(())
             }
@@ -212,7 +348,7 @@ impl FileStore {
             let mut expired = Vec::new();
             for grant in state.loans.values_mut() {
                 if grant.ended_at.is_none() && grant.ends_at <= now {
-                    grant.end(grant.ends_at, &grant.lender.clone(), EndReason::Expired);
+                    grant.end(grant.ends_at, None, EndReason::Expired);
                     expired.push(grant.clone());
                 }
             }
@@ -277,7 +413,7 @@ impl FileStore {
                 .get_mut(id)
                 .filter(|grant| grant.ended_at.is_none())
                 .map(|grant| {
-                    grant.end(at, by, reason);
+                    grant.end(at, Some(by), reason);
                     grant.clone()
                 });
             state.loan_audit.extend(ended.iter().map(AuditEvent::ended));
@@ -298,24 +434,37 @@ impl FileStore {
             return Ok(());
         }
         self.with_lock(|state| {
-            if event.coalesce_key.is_none()
-                || !state
-                    .loan_audit
-                    .iter()
-                    .any(|existing| existing.coalesce_key == event.coalesce_key)
-            {
+            if !duplicate(state) {
                 state.loan_audit.push(event.clone());
             }
             Ok(())
         })
     }
 
-    fn prune_loans(&self, cutoff: i64) -> Result<()> {
+    fn retire_loans(&self, cutoff: i64, now: i64) -> Result<()> {
+        let due = |state: &super::FileState| {
+            state.loans.values().any(|grant| {
+                grant.deleted_at.is_none() && grant.ended_at.is_some_and(|ended| ended < cutoff)
+            }) || state
+                .loan_audit
+                .iter()
+                .any(|event| event.deleted_at.is_none() && event.at < cutoff)
+        };
+        if !due(&self.read_state()?) {
+            return Ok(());
+        }
         self.with_lock(|state| {
-            state
-                .loans
-                .retain(|_, grant| grant.ended_at.is_none_or(|ended| ended >= cutoff));
-            state.loan_audit.retain(|event| event.at >= cutoff);
+            for grant in state.loans.values_mut() {
+                if grant.deleted_at.is_none() && grant.ended_at.is_some_and(|ended| ended < cutoff)
+                {
+                    grant.deleted_at = Some(now);
+                }
+            }
+            for event in &mut state.loan_audit {
+                if event.deleted_at.is_none() && event.at < cutoff {
+                    event.deleted_at = Some(now);
+                }
+            }
             Ok(())
         })
     }
@@ -326,14 +475,20 @@ impl PostgresStore {
         let client = self.client().await?;
         let rows = client
             .query(
-                "SELECT grant_json FROM account_loans WHERE ended_at IS NULL AND ends_at <= $1 LIMIT 1000",
+                concat!(
+                    "SELECT ",
+                    grant_columns!(),
+                    " FROM ",
+                    loans_table!(),
+                    " WHERE ended_at IS NULL AND ends_at <= $1 LIMIT 1000"
+                ),
                 &[&now],
             )
             .await?;
         let mut expired = Vec::new();
         for row in rows {
-            let mut grant: Grant = serde_json::from_str(row.get(0))?;
-            grant.end(grant.ends_at, &grant.lender.clone(), EndReason::Expired);
+            let mut grant = grant_from_row(&row)?;
+            grant.end(grant.ends_at, None, EndReason::Expired);
             if self.store_end(&grant).await? {
                 expired.push(grant);
             }
@@ -348,13 +503,24 @@ impl PostgresStore {
         let client = self.client().await?;
         let changed = client
             .execute(
-                "WITH ended AS (UPDATE account_loans SET ended_at=$2, grant_json=$3 WHERE id=$1 AND ended_at IS NULL RETURNING id) INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT id,$4,NULL,$5 FROM ended",
+                concat!(
+                    "WITH ended AS (UPDATE ",
+                    loans_table!(),
+                    " SET ended_at=$2, ended_by=$3, end_reason=$4 WHERE id=$1 AND ended_at IS NULL RETURNING id) INSERT INTO ",
+                    audit_table!(),
+                    "(",
+                    audit_columns!(),
+                    ") SELECT id,$5,$6,$7,NULL,$8,NULL,NULL FROM ended"
+                ),
                 &[
                     &grant.id,
                     &grant.ended_at,
-                    &serde_json::to_string(grant)?,
+                    &grant.ended_by,
+                    &grant.end_reason.map(EndReason::as_str),
                     &event.at,
-                    &serde_json::to_string(&event)?,
+                    &event.kind.as_str(),
+                    &event.actor,
+                    &event.reason,
                 ],
             )
             .await?;
@@ -367,16 +533,34 @@ impl PostgresStore {
         let client = self.client().await?;
         let changed = client
             .execute(
-                "WITH created AS (INSERT INTO account_loans(id,account_id,lender_id,borrower_id,ends_at,ended_at,grant_json) VALUES($1,$2,$3,$4,$5,NULL,$6) ON CONFLICT DO NOTHING RETURNING id) INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT id,$7,NULL,$8 FROM created",
+                concat!(
+                    "WITH created AS (INSERT INTO ",
+                    loans_table!(),
+                    "(",
+                    grant_columns!(),
+                    ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULL,NULL,NULL,NULL) ON CONFLICT DO NOTHING RETURNING id) INSERT INTO ",
+                    audit_table!(),
+                    "(",
+                    audit_columns!(),
+                    ") SELECT id,$14,$15,$16,NULL,NULL,NULL,NULL FROM created"
+                ),
                 &[
                     &grant.id,
                     &grant.account_id,
                     &grant.lender,
                     &grant.borrower,
+                    &grant.lender_email,
+                    &grant.borrower_email,
+                    &grant.alias,
+                    &grant.reference,
+                    &grant.subject.workspace,
+                    &grant.subject.uid,
+                    &grant.subject.sub,
+                    &grant.created_at,
                     &grant.ends_at,
-                    &serde_json::to_string(grant)?,
                     &event.at,
-                    &serde_json::to_string(&event)?,
+                    &event.kind.as_str(),
+                    &event.actor,
                 ],
             )
             .await?;
@@ -396,16 +580,25 @@ impl PostgresStore {
         if grant.ended_at.is_some() {
             return Ok(None);
         }
-        grant.end(at, by, reason);
+        grant.end(at, Some(by), reason);
         Ok(self.store_end(&grant).await?.then_some(grant))
     }
 
     async fn load_loan(&self, id: &str) -> Result<Option<Grant>> {
         let client = self.client().await?;
         client
-            .query_opt("SELECT grant_json FROM account_loans WHERE id=$1", &[&id])
+            .query_opt(
+                concat!(
+                    "SELECT ",
+                    grant_columns!(),
+                    " FROM ",
+                    loans_table!(),
+                    " WHERE id=$1 AND deleted_at IS NULL"
+                ),
+                &[&id],
+            )
             .await?
-            .map(|row| Ok(serde_json::from_str(row.get(0))?))
+            .map(|row| grant_from_row(&row))
             .transpose()
     }
 
@@ -413,12 +606,18 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .query(
-                "SELECT grant_json FROM account_loans WHERE lender_id=$1 OR borrower_id=$1 ORDER BY id LIMIT 10000",
+                concat!(
+                    "SELECT ",
+                    grant_columns!(),
+                    " FROM ",
+                    loans_table!(),
+                    " WHERE (lender_id=$1 OR borrower_id=$1) AND deleted_at IS NULL ORDER BY id LIMIT 10000"
+                ),
                 &[&user],
             )
             .await?
-            .into_iter()
-            .map(|row| Ok(serde_json::from_str(row.get(0))?))
+            .iter()
+            .map(grant_from_row)
             .collect()
     }
 
@@ -426,12 +625,18 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .query(
-                "SELECT grant_json FROM account_loans WHERE borrower_id=$1 AND ended_at IS NULL",
+                concat!(
+                    "SELECT ",
+                    grant_columns!(),
+                    " FROM ",
+                    loans_table!(),
+                    " WHERE borrower_id=$1 AND ended_at IS NULL"
+                ),
                 &[&borrower],
             )
             .await?
-            .into_iter()
-            .map(|row| Ok(serde_json::from_str(row.get(0))?))
+            .iter()
+            .map(grant_from_row)
             .collect()
     }
 
@@ -439,12 +644,21 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .execute(
-                "INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+                concat!(
+                    "INSERT INTO ",
+                    audit_table!(),
+                    "(",
+                    audit_columns!(),
+                    ") VALUES($1,$2,$3,$4,$5,$6,$7,NULL) ON CONFLICT DO NOTHING"
+                ),
                 &[
                     &event.grant_id,
                     &event.at,
+                    &event.kind.as_str(),
+                    &event.actor,
+                    &event.machine,
+                    &event.reason,
                     &event.coalesce_key,
-                    &serde_json::to_string(event)?,
                 ],
             )
             .await?;
@@ -460,12 +674,18 @@ impl PostgresStore {
         let client = self.client().await?;
         client
             .query(
-                "SELECT event_json FROM account_loan_audit WHERE grant_id = ANY($1) AND ($2::bigint IS NULL OR at < $2) ORDER BY at DESC, id DESC LIMIT $3",
+                concat!(
+                    "SELECT ",
+                    audit_columns!(),
+                    " FROM ",
+                    audit_table!(),
+                    " WHERE grant_id = ANY($1) AND deleted_at IS NULL AND ($2::bigint IS NULL OR at < $2) ORDER BY at DESC, id DESC LIMIT $3"
+                ),
                 &[&grant_ids, &before, &i64::try_from(limit)?],
             )
             .await?
-            .into_iter()
-            .map(|row| Ok(serde_json::from_str(row.get(0))?))
+            .iter()
+            .map(audit_from_row)
             .collect()
     }
 
@@ -482,25 +702,50 @@ impl PostgresStore {
         for grant in grants.values() {
             let events: Vec<_> = audit.iter().filter(|e| e.grant_id == grant.id).collect();
             let at: Vec<i64> = events.iter().map(|e| e.at).collect();
-            let keys: Vec<Option<String>> = events.iter().map(|e| e.coalesce_key.clone()).collect();
-            let json = events
-                .iter()
-                .map(serde_json::to_string)
-                .collect::<Result<Vec<_>, _>>()?;
+            let kind: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+            let actor: Vec<Option<String>> = events.iter().map(|e| e.actor.clone()).collect();
+            let machine: Vec<Option<String>> = events.iter().map(|e| e.machine.clone()).collect();
+            let reason: Vec<Option<String>> = events.iter().map(|e| e.reason.clone()).collect();
+            let key: Vec<Option<String>> = events.iter().map(|e| e.coalesce_key.clone()).collect();
+            let deleted: Vec<Option<i64>> = events.iter().map(|e| e.deleted_at).collect();
             let row = client
                 .query_one(
-                    "WITH created AS (INSERT INTO account_loans(id,account_id,lender_id,borrower_id,ends_at,ended_at,grant_json) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING RETURNING id), copied AS (INSERT INTO account_loan_audit(grant_id,at,coalesce_key,event_json) SELECT created.id, e.at, e.key, e.json FROM created, unnest($8::bigint[], $9::text[], $10::text[]) AS e(at, key, json) ON CONFLICT DO NOTHING) SELECT count(*)::BIGINT FROM created",
+                    concat!(
+                        "WITH created AS (INSERT INTO ",
+                        loans_table!(),
+                        "(",
+                        grant_columns!(),
+                        ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) ON CONFLICT DO NOTHING RETURNING id), copied AS (INSERT INTO ",
+                        audit_table!(),
+                        "(",
+                        audit_columns!(),
+                        ") SELECT created.id, e.at, e.kind, e.actor, e.machine, e.reason, e.key, e.deleted FROM created, unnest($18::bigint[], $19::text[], $20::text[], $21::text[], $22::text[], $23::text[], $24::bigint[]) AS e(at, kind, actor, machine, reason, key, deleted) ON CONFLICT DO NOTHING) SELECT count(*)::BIGINT FROM created"
+                    ),
                     &[
                         &grant.id,
                         &grant.account_id,
                         &grant.lender,
                         &grant.borrower,
+                        &grant.lender_email,
+                        &grant.borrower_email,
+                        &grant.alias,
+                        &grant.reference,
+                        &grant.subject.workspace,
+                        &grant.subject.uid,
+                        &grant.subject.sub,
+                        &grant.created_at,
                         &grant.ends_at,
                         &grant.ended_at,
-                        &serde_json::to_string(grant)?,
+                        &grant.ended_by,
+                        &grant.end_reason.map(EndReason::as_str),
+                        &grant.deleted_at,
                         &at,
-                        &keys,
-                        &json,
+                        &kind,
+                        &actor,
+                        &machine,
+                        &reason,
+                        &key,
+                        &deleted,
                     ],
                 )
                 .await?;
@@ -510,16 +755,27 @@ impl PostgresStore {
         Ok(copied)
     }
 
-    async fn prune_loans(&self, cutoff: i64) -> Result<()> {
+    async fn retire_loans(&self, cutoff: i64, now: i64) -> Result<()> {
         let client = self.client().await?;
         client
             .execute(
-                "DELETE FROM account_loans WHERE ended_at IS NOT NULL AND ended_at < $1",
-                &[&cutoff],
+                concat!(
+                    "UPDATE ",
+                    loans_table!(),
+                    " SET deleted_at=$2 WHERE ended_at IS NOT NULL AND ended_at < $1 AND deleted_at IS NULL"
+                ),
+                &[&cutoff, &now],
             )
             .await?;
         client
-            .execute("DELETE FROM account_loan_audit WHERE at < $1", &[&cutoff])
+            .execute(
+                concat!(
+                    "UPDATE ",
+                    audit_table!(),
+                    " SET deleted_at=$2 WHERE at < $1 AND deleted_at IS NULL"
+                ),
+                &[&cutoff, &now],
+            )
             .await?;
         Ok(())
     }

@@ -234,28 +234,6 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
-CREATE TABLE IF NOT EXISTS account_loans (
-    id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    lender_id TEXT NOT NULL,
-    borrower_id TEXT NOT NULL,
-    ends_at BIGINT NOT NULL,
-    ended_at BIGINT,
-    grant_json TEXT NOT NULL
-);
-CREATE UNIQUE INDEX IF NOT EXISTS account_loans_one_active
-    ON account_loans (account_id) WHERE ended_at IS NULL;
-CREATE INDEX IF NOT EXISTS account_loans_lender_idx ON account_loans (lender_id);
-CREATE INDEX IF NOT EXISTS account_loans_borrower_idx ON account_loans (borrower_id);
-CREATE TABLE IF NOT EXISTS account_loan_audit (
-    id BIGSERIAL PRIMARY KEY,
-    grant_id TEXT NOT NULL,
-    at BIGINT NOT NULL,
-    coalesce_key TEXT UNIQUE,
-    event_json TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS account_loan_audit_grant_idx ON account_loan_audit (grant_id, at);
-CREATE INDEX IF NOT EXISTS account_loan_audit_at_idx ON account_loan_audit (at);
 "#;
 
 impl CentralStore {
@@ -1341,6 +1319,10 @@ impl PostgresStore {
             .batch_execute(SCHEMA)
             .await
             .context("migrate central PostgreSQL schema")?;
+        client
+            .batch_execute(loans::SCHEMA)
+            .await
+            .context("migrate central PostgreSQL loan schema")?;
         client
             .execute(
                 "INSERT INTO central_schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING",

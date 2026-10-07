@@ -476,7 +476,7 @@ async fn an_expired_loan_ends_itself_at_the_next_token_request() {
         .end_loan(id, 0, "test", crate::central::loans::EndReason::Revoked)
         .await
         .unwrap();
-    store.prune_loans(i64::MAX / 2).await.unwrap();
+    stored.id = "past-end".into();
     stored.ends_at = now() - 1;
     assert!(store.create_loan(&stored).await.unwrap());
     let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
@@ -484,12 +484,21 @@ async fn an_expired_loan_ends_itself_at_the_next_token_request() {
         (status, body["error"].clone()),
         (StatusCode::FORBIDDEN, json!("loan_ended"))
     );
-    let expired = store.load_loan(id).await.unwrap().unwrap();
+    let expired = store.load_loan("past-end").await.unwrap().unwrap();
     assert_eq!(
-        expired.end_reason,
-        Some(crate::central::loans::EndReason::Expired)
+        (expired.end_reason, expired.ended_by),
+        (Some(crate::central::loans::EndReason::Expired), None),
+        "an automatic expiry has no user actor"
     );
-    assert!(kinds(&fixture.audit(&fixture.lender).await).contains(&"ended".to_owned()));
+    let audit = fixture.audit(&fixture.lender).await;
+    let expiry = audit
+        .iter()
+        .find(|e| e["grantId"] == "past-end" && e["kind"] == "ended")
+        .unwrap();
+    assert_eq!(
+        (expiry["actor"].clone(), expiry["reason"].clone()),
+        (Value::Null, json!("expired"))
+    );
 }
 
 #[tokio::test]
@@ -884,5 +893,25 @@ async fn an_email_shared_by_two_company_users_refuses_the_grant() {
     assert_eq!(
         (status, answer["error"].clone()),
         (StatusCode::CONFLICT, json!("borrower_ambiguous"))
+    );
+}
+
+#[tokio::test]
+async fn a_loan_store_failure_keeps_owned_accounts_listed_and_refuses_borrowed_tokens() {
+    let fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    std::fs::write(
+        fixture.state.join("central-storage.enc"),
+        b"not encrypted state",
+    )
+    .unwrap();
+    let listed = fixture.catalog(&fixture.lender).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0]["alias"], "main");
+    assert!(fixture.catalog(&fixture.borrower).await.is_empty());
+    let (status, body) = fixture.token(&fixture.borrower, "alice/main").await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!("loan_store_failed"))
     );
 }

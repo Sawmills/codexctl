@@ -161,7 +161,7 @@ fn references_resolve_only_through_the_borrowers_active_grants() {
     let grant = plan_grant(request(&lender, Some(&borrower)), "one".into()).unwrap();
     let mut ended = grant.clone();
     ended.id = "old".into();
-    ended.end(1_500, "lender", EndReason::Revoked);
+    ended.end(1_500, Some("lender"), EndReason::Revoked);
     let grants = vec![ended, grant.clone()];
     assert_eq!(
         match_reference(&grants, "borrower", "ALICE/main", 2_000).unwrap(),
@@ -367,4 +367,17 @@ fn usage_keeps_the_highest_use_of_every_window() {
         crate::statusline::Usage::from_usage(&usage).max_used_percent,
         Some(96.0)
     );
+}
+
+#[test]
+fn stored_names_round_trip_and_match_the_json_names() {
+    for reason in EndReason::ALL {
+        assert_eq!(EndReason::parse(reason.as_str()).unwrap(), reason);
+        assert_eq!(serde_json::to_value(reason).unwrap(), reason.as_str());
+    }
+    for kind in AuditKind::ALL {
+        assert_eq!(AuditKind::parse(kind.as_str()).unwrap(), kind);
+        assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+    }
+    assert!(EndReason::parse("other").is_err());
 }

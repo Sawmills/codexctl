@@ -128,6 +128,13 @@ pub enum EndReason {
 }
 
 impl EndReason {
+    pub const ALL: [Self; 4] = [
+        Self::Revoked,
+        Self::Returned,
+        Self::Expired,
+        Self::AccountRemoved,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Revoked => "revoked",
@@ -135,6 +142,13 @@ impl EndReason {
             Self::Expired => "expired",
             Self::AccountRemoved => "account_removed",
         }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|reason| reason.as_str() == value)
+            .ok_or_else(|| anyhow::anyhow!("unknown loan end reason {value:?}"))
     }
 }
 
@@ -162,6 +176,9 @@ pub struct Grant {
     pub ended_by: Option<String>,
     #[serde(default)]
     pub end_reason: Option<EndReason>,
+    /// Set when retention retires the grant; reads then hide it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<i64>,
 }
 
 impl Grant {
@@ -174,9 +191,11 @@ impl Grant {
         self.lender == user || self.borrower == user
     }
 
-    pub(super) fn end(&mut self, at: i64, by: &str, reason: EndReason) {
+    /// End the grant. `by` is the company user who ended it; an automatic
+    /// expiry has none.
+    pub(super) fn end(&mut self, at: i64, by: Option<&str>, reason: EndReason) {
         self.ended_at = Some(at);
-        self.ended_by = Some(by.to_owned());
+        self.ended_by = by.map(str::to_owned);
         self.end_reason = Some(reason);
     }
 }
@@ -188,6 +207,26 @@ pub enum AuditKind {
     TokenIssued,
     Ended,
     Paused,
+}
+
+impl AuditKind {
+    pub const ALL: [Self; 4] = [Self::Granted, Self::TokenIssued, Self::Ended, Self::Paused];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            Self::TokenIssued => "token_issued",
+            Self::Ended => "ended",
+            Self::Paused => "paused",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == value)
+            .ok_or_else(|| anyhow::anyhow!("unknown loan audit kind {value:?}"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +246,9 @@ pub struct AuditEvent {
     /// Events with the same key are recorded once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coalesce_key: Option<String>,
+    /// Set when retention retires the event; reads then hide it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<i64>,
 }
 
 impl AuditEvent {
@@ -219,6 +261,7 @@ impl AuditEvent {
             machine: None,
             reason: None,
             coalesce_key: None,
+            deleted_at: None,
         }
     }
 
@@ -314,6 +357,7 @@ pub(super) fn plan_grant(request: GrantRequest<'_>, id: String) -> Result<Grant,
         ended_at: None,
         ended_by: None,
         end_reason: None,
+        deleted_at: None,
     })
 }
 

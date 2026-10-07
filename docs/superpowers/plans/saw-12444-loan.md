@@ -83,8 +83,9 @@ storage in `src/central/storage/loans.rs`):
   `FileState` under `central-storage.lock`. PostgreSQL adds `account_loans`
   and `account_loan_audit`. Dual mode writes PostgreSQL first, then the file.
   Loans do not use `reject_unshared_workflow`.
-- **Retention (L4):** every grant and every end prunes grants that ended more
-  than 90 days ago and audit events older than 90 days, in both modes. Token issue
+- **Retention (L4, HQ Q3):** every grant and every end marks grants that
+  ended more than 90 days ago and audit events older than 90 days deleted
+  (`deleted_at`), in both modes; reads hide them and nothing is purged. Token issue
   events coalesce on (grant, machine, UTC hour): a unique index in
   PostgreSQL, a key check before the append in file mode.
 - **Failures:** loan handlers record failures with `record_failure` and

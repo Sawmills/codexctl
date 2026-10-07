@@ -124,19 +124,23 @@ impl Broker {
             .await
             .map_err(|error| self.loan_failure("expire", error))?;
         if !expired.is_empty() {
-            self.prune_loans().await;
+            self.retire_loans().await;
         }
         Ok(())
     }
 
     /// Apply the 90-day retention after a grant or an end. The grant or end
-    /// is already committed, so a failed prune is recorded, not returned.
-    async fn prune_loans(&self) {
-        if let Err(error) = self.loan_store().prune_loans(now()).await {
-            self.record_failure("loan_prune_failed", "loan", StatusCode::SERVICE_UNAVAILABLE);
+    /// is already committed, so a failed retirement is recorded, not returned.
+    async fn retire_loans(&self) {
+        if let Err(error) = self.loan_store().retire_loans(now()).await {
+            self.record_failure(
+                "loan_retire_failed",
+                "loan",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             eprintln!(
                 "{}",
-                serde_json::json!({"operation":"loan","stage":"prune","error":error.to_string()})
+                serde_json::json!({"operation":"loan","stage":"retire","error":error.to_string()})
             );
         }
     }
@@ -153,7 +157,7 @@ impl Broker {
             .await
             .map_err(|error| self.loan_failure("end", error))?;
         if ended.is_some() {
-            self.prune_loans().await;
+            self.retire_loans().await;
         }
         Ok(ended)
     }
@@ -425,7 +429,7 @@ async fn lend(
     {
         return Err(broker.error(StatusCode::CONFLICT, "loan_exists"));
     }
-    broker.prune_loans().await;
+    broker.retire_loans().await;
     Ok((StatusCode::CREATED, Json(grant)).into_response())
 }
 
