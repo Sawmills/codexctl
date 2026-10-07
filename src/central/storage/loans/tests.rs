@@ -126,10 +126,8 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         .append_loan_audit(&AuditEvent::token_issued(2_600, &id("two"), "machine"))
         .await
         .unwrap();
-    let mut audit = store
-        .loan_audit(&[id("one"), id("two")], None, 100)
-        .await
-        .unwrap();
+    let mut audit = store.loan_audit("borrower", None, None, 100).await.unwrap();
+    audit.retain(|e| e.grant_id == id("one") || e.grant_id == id("two"));
     audit.sort_by_key(|event| (event.at, event.grant_id.clone()));
     assert_eq!(
         audit
@@ -147,7 +145,10 @@ async fn scenario(store: &CentralStore, prefix: &str) {
     );
 
     store.retire_loans(3_000 + RETENTION_SECONDS).await.unwrap();
-    let audit = store.loan_audit(&[id("two")], None, 100).await.unwrap();
+    let audit = store
+        .loan_audit("borrower", Some(&id("two")), None, 100)
+        .await
+        .unwrap();
     assert_eq!(audit.iter().map(|e| e.at).collect::<Vec<_>>(), vec![5_000]);
     assert!(
         store.load_loan(&id("one")).await.unwrap().is_none(),
@@ -297,7 +298,7 @@ async fn backfill_copies_file_loans_with_their_audit_once() {
         Some(EndReason::Revoked)
     );
     let kinds: Vec<_> = db
-        .loan_audit(&["ended".into()], None, 100)
+        .loan_audit("borrower", Some("ended"), None, 100)
         .await
         .unwrap()
         .into_iter()

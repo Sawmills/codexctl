@@ -639,20 +639,19 @@ async fn audit(
         query.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     broker.expire_and_retire().await?;
     let store = broker.loan_store();
-    let ids: Vec<String> = store
-        .loans_for_user(&device.user)
-        .await
-        .map_err(|error| broker.loan_failure("load", error))?
-        .into_iter()
-        .map(|grant| grant.id)
-        .filter(|id| query.id.as_ref().is_none_or(|wanted| wanted == id))
-        .collect();
-    if query.id.is_some() && ids.is_empty() {
+    if let Some(id) = query.id.as_deref()
+        && !store
+            .load_loan(id)
+            .await
+            .map_err(|error| broker.loan_failure("load", error))?
+            .is_some_and(|grant| grant.involves(&device.user))
+    {
         return Err(broker.error(StatusCode::NOT_FOUND, "loan_not_found"));
     }
+    let wanted = query.id.as_deref();
     let limit = query.limit.unwrap_or(AUDIT_PAGE).clamp(1, AUDIT_PAGE_MAX);
     let events = store
-        .loan_audit(&ids, query.before, limit + 1)
+        .loan_audit(&device.user, wanted, query.before, limit + 1)
         .await
         .map_err(|error| broker.loan_failure("audit", error))?;
     let newest = events.first().map(|event| event.at);
@@ -661,7 +660,12 @@ async fn audit(
         // More than one page in one second: return that whole second.
         (None, Some(newest)) => AuditPage {
             events: store
-                .loan_audit(&ids, Some(newest.saturating_add(1)), AUDIT_PAGE_MAX)
+                .loan_audit(
+                    &device.user,
+                    wanted,
+                    Some(newest.saturating_add(1)),
+                    AUDIT_PAGE_MAX,
+                )
                 .await
                 .map_err(|error| broker.loan_failure("audit", error))?
                 .into_iter()

@@ -37,6 +37,11 @@ macro_rules! audit_columns {
         "grant_id,at,kind,actor,machine,reason,coalesce_key,deleted_at"
     };
 }
+macro_rules! audit_columns_as_a {
+    () => {
+        "a.grant_id,a.at,a.kind,a.actor,a.machine,a.reason,a.coalesce_key,a.deleted_at"
+    };
+}
 
 // Servers can start together. The transaction-scoped advisory lock makes
 // concurrent `CREATE ... IF NOT EXISTS` runs wait instead of racing.
@@ -303,22 +308,31 @@ impl CentralStore {
         }
     }
 
-    /// Unretired audit events of the grants, newest first, recorded before
-    /// `before` (when set), at most `limit` of them.
+    /// Unretired audit events of the user's unretired grants (or of one of
+    /// them), newest first, recorded before `before` (when set), at most
+    /// `limit` of them. The user filter is applied in the query itself.
     pub async fn loan_audit(
         &self,
-        grant_ids: &[String],
+        user: &str,
+        grant_id: Option<&str>,
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<AuditEvent>> {
         match self {
             Self::File(file) => {
-                let mut events: Vec<_> = file
-                    .read_state()?
+                let state = file.read_state()?;
+                let visible: std::collections::BTreeSet<_> = state
+                    .loans
+                    .values()
+                    .filter(|grant| grant.involves(user) && grant.deleted_at.is_none())
+                    .filter(|grant| grant_id.is_none_or(|id| id == grant.id))
+                    .map(|grant| grant.id.clone())
+                    .collect();
+                let mut events: Vec<_> = state
                     .loan_audit
                     .into_iter()
                     .filter(|event| event.deleted_at.is_none())
-                    .filter(|event| grant_ids.contains(&event.grant_id))
+                    .filter(|event| visible.contains(&event.grant_id))
                     .filter(|event| before.is_none_or(|before| event.at < before))
                     .collect();
                 // Newest first; within one timestamp, the latest append first,
@@ -329,7 +343,7 @@ impl CentralStore {
                 Ok(events)
             }
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
-                bounded_db(db.loan_audit(grant_ids, before, limit)).await
+                bounded_db(db.loan_audit(user, grant_id, before, limit)).await
             }
         }
     }
@@ -687,7 +701,8 @@ impl PostgresStore {
 
     async fn loan_audit(
         &self,
-        grant_ids: &[String],
+        user: &str,
+        grant_id: Option<&str>,
         before: Option<i64>,
         limit: usize,
     ) -> Result<Vec<AuditEvent>> {
@@ -696,12 +711,14 @@ impl PostgresStore {
             .query(
                 concat!(
                     "SELECT ",
-                    audit_columns!(),
+                    audit_columns_as_a!(),
                     " FROM ",
                     audit_table!(),
-                    " WHERE grant_id = ANY($1) AND deleted_at IS NULL AND ($2::bigint IS NULL OR at < $2) ORDER BY at DESC, id DESC LIMIT $3"
+                    " a JOIN ",
+                    loans_table!(),
+                    " l ON l.id = a.grant_id WHERE (l.lender_id=$1 OR l.borrower_id=$1) AND l.deleted_at IS NULL AND a.deleted_at IS NULL AND ($2::text IS NULL OR a.grant_id=$2) AND ($3::bigint IS NULL OR a.at < $3) ORDER BY a.at DESC, a.id DESC LIMIT $4"
                 ),
-                &[&grant_ids, &before, &i64::try_from(limit)?],
+                &[&user, &grant_id, &before, &i64::try_from(limit)?],
             )
             .await?
             .iter()
