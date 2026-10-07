@@ -99,7 +99,10 @@ impl Broker {
             let verification = async {
                 let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
                     .clear_for_launch(&owner, relogin::AdmissionKind::Renewal, &imports)?;
-                launch_owner(&mut owner, &self.binary, proof).await?;
+                spawn_owner(&mut owner, &self.binary, proof)?;
+                // Account authority and durable spawn evidence now cover initialization.
+                drop(imports);
+                initialize_owner(&mut owner).await?;
                 let revision = owner.snapshot()?.revision;
                 owner
                     .tokens(TokenRequest {

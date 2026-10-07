@@ -314,7 +314,11 @@ not repeat verification. Wrong-account candidates reserve the selected account
 and the matching known account across replicas. After a stopped login is rejected
 for the wrong identity, each account can be repaired by an explicit renewal with
 a new request ID. Only verified completion clears that account's reservation.
-An unresolved verification cannot use this repair path.
+An unresolved verification cannot use this repair path. If shared publication fails,
+the isolated login home retains the issued grant and its operation/holder/epoch
+record under `state/shared-logins/`. Preserve this evidence. Automated replay and
+cleanup of interrupted operations belong to PR3; local evidence alone does not
+make another replica safe to take over.
 
 Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel

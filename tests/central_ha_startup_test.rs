@@ -1301,6 +1301,18 @@ async fn postgres_verification_loss_fences_the_candidate_across_replica_restart(
     })
     .await
     .unwrap();
+    let unrelated = timeout(
+        Duration::from_secs(5),
+        f.http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"other","billing":true}))
+            .send(),
+    )
+    .await
+    .expect("slow renewal initialization blocked an unrelated account")
+    .unwrap();
+    assert_eq!(unrelated.status(), 200);
     let pid: Value = serde_json::from_slice(
         &std::fs::read(
             f.first
@@ -1484,5 +1496,40 @@ async fn postgres_renewal_waiting_for_refresh_does_not_block_other_accounts() {
     })
     .await
     .expect("renewal must proceed after the previous refresh settles");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_unpublished_login_grant_survives_worker_exit() {
+    let mut f = login_fixture().await;
+    f.control.batch_execute(&format!("CREATE FUNCTION {0}.reject_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase IN ('candidate','unresolved') THEN RAISE EXCEPTION 'synthetic persistent publication failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_capture BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.reject_capture()",f.schema)).await.unwrap();
+    let id = "5".repeat(64);
+    login_request(&f, &f.first, "start", &id).await;
+    let pid = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let grant = renewal_grant();
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    wait_dead(pid).await;
+    // Graceful shutdown drains the worker, including its failed fallback write.
+    f.first.stop().await;
+    let saved = std::fs::read_dir(f.first.root.path().join("state/shared-logins").join(&id))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|home| home.join("auth.json").is_file())
+        .expect("an unpublished issued grant must remain on disk after worker exit");
+    let retained: Value =
+        serde_json::from_slice(&std::fs::read(saved.join("auth.json")).unwrap()).unwrap();
+    assert_eq!(retained, grant);
+    let operation: Value =
+        serde_json::from_slice(&std::fs::read(saved.join("operation.json")).unwrap()).unwrap();
+    assert_eq!(operation["id"], id);
+    assert_eq!(operation["accountId"], account_key("test", "seat"));
+    assert_eq!(operation["epoch"], 1);
     stop_fixture(f).await;
 }

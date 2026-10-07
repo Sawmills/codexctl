@@ -213,8 +213,18 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     store::ensure_private_dir(&root)?;
     let home = tempfile::Builder::new()
         .prefix("login-")
-        .tempdir_in(&root)?;
-    store::ensure_private_dir(home.path())?;
+        .tempdir_in(&root)?
+        .keep();
+    // Keep local evidence on every uncertain exit. Shared publication, not task
+    // lifetime, determines when this isolated credential home can be removed.
+    store::ensure_private_dir(&home)?;
+    store::atomic_write(
+        &home.join("operation.json"),
+        &serde_json::to_vec(&json!({
+            "user":op.user,"id":op.id,"accountId":op.account_id,
+            "holder":op.holder,"epoch":op.epoch,
+        }))?,
+    )?;
     let binary = process::owner_binary(&broker.binary)?;
     let mut command = Command::new(binary);
     command
@@ -228,11 +238,11 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             "-c",
             "features.daemon_auto_start=false",
         ])
-        .env("CODEX_HOME", home.path())
+        .env("CODEX_HOME", &home)
         .env_remove("CODEXCTL_PINNED_ALIAS")
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("OPENAI_API_KEY")
-        .current_dir(home.path())
+        .current_dir(&home)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -240,6 +250,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     process::isolate(&mut command);
     if db.login_heartbeat(op).await? {
         db.login_save(op, LoginPhase::Canceled).await?;
+        std::fs::remove_dir_all(&home)?;
         return Ok(());
     }
     let mut child = command.spawn()?;
@@ -281,7 +292,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     }
     // A child can save an issued grant and then fail or be canceled. Capture it
     // after confirmed exit before classifying the process outcome.
-    let path = home.path().join("auth.json");
+    let path = home.join("auth.json");
     if path.try_exists()? {
         let auth: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
         vault::validate_auth(&auth)?;
@@ -296,6 +307,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             LoginPhase::Canceled
         };
         db.login_save(op, phase).await?;
+        std::fs::remove_dir_all(&home)?;
         return Ok(());
     }
     if op.payload.candidate.is_none() {
@@ -303,5 +315,6 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     }
     op.payload.code = None;
     db.login_save(op, LoginPhase::Candidate).await?;
+    std::fs::remove_dir_all(&home)?;
     broker.verify_shared_renewal(headers, op).await
 }
