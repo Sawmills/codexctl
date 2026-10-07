@@ -312,11 +312,15 @@ Known gaps tracked by SAW-12484: add-account still returns HTTP 503 with
 This intermediate release is not sufficient for the B33 cutover. A lost polling
 replica can leave a pending operation until recovery is delivered. A verifier
 that loses its lease leaves a durable unresolved marker: another replica must
-not repeat verification. Wrong-account candidates reserve the selected account
+not repeat verification. Renewal waits when an expired foreign refresh lease
+has no explicit release; expiry alone is not proof that its child stopped.
+Wrong-account candidates reserve the selected account
 and the matching known account across replicas. After a stopped device login is rejected
 for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
 a new request ID. Only verified completion clears that account's reservation, and only for evidence
 recorded before verification started. A newer quarantine remains fenced.
+Confirmed native rejection also permits a fresh renewal after child exit and
+an unchanged final journal. Unknown verification outcomes remain fenced.
 An unresolved verification cannot use this repair path. An unreadable saved grant
 keeps all accounts reserved because its identity is unknown. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch

@@ -200,18 +200,32 @@ impl Broker {
             }
             let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
             if op.phase == LoginPhase::Verifying || owner.rpc.is_some() {
-                // Settlement and verification both retain native work until exit is confirmed.
-                // An interruption remains fenced for PR3 recovery.
+                let rejected = op.phase == LoginPhase::Verifying
+                    && !owner.vault.verified
+                    && owner.vault.import_rejected;
                 terminate_lost_import(owner).await;
+                // Only a completed rejection with an unchanged final journal is
+                // repairable. An interrupted provider call remains unresolved.
+                let rejected = rejected
+                    && owner.verification_input.as_ref().is_some_and(|input| {
+                        retained_auth(&owner.home).is_ok_and(|auth| &auth == input)
+                    });
                 op.payload.error = Some(
-                    if op.phase == LoginPhase::Verifying {
+                    if rejected {
+                        "relogin_verification_rejected"
+                    } else if op.phase == LoginPhase::Verifying {
                         "relogin_verification_unresolved"
                     } else {
                         "relogin_settlement_unresolved"
                     }
                     .into(),
                 );
-                let _ = central.login_save(op, LoginPhase::Unresolved).await;
+                let phase = if rejected {
+                    LoginPhase::Rejected
+                } else {
+                    LoginPhase::Unresolved
+                };
+                let _ = central.login_save(op, phase).await;
             }
         }
         central.release_lease(&lease).await?;

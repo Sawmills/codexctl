@@ -2,6 +2,7 @@
 use super::*;
 
 pub(in crate::central) const LOGIN_SCHEMA: &str = r#"
+ALTER TABLE account_refresh_leases ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS central_login_operations (
     user_id TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -222,6 +223,7 @@ impl CentralStore {
             &holder,
             Duration::from_secs(120),
             Some(&op.id),
+            Some(&op.holder),
         ))
         .await
     }

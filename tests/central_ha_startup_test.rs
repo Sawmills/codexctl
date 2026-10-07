@@ -1568,7 +1568,7 @@ async fn postgres_renewal_waiting_for_refresh_does_not_block_other_accounts() {
     .expect("waiting renewal blocked an unrelated account")
     .unwrap();
     assert_eq!(other.status(), 200);
-    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET expires_at=clock_timestamp() WHERE account_id=$1",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET expires_at=clock_timestamp(),released=true WHERE account_id=$1",f.schema), &[&account_key("test","seat")]).await.unwrap();
     timeout(Duration::from_secs(10), async {
         while login_request(&f, &f.second, "status", &id).await["status"] != "completed" {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -2063,7 +2063,7 @@ async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool, restart:
         .await
         .expect("background publication must enter its retry delay");
     }
-    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET holder_id='lost',epoch=epoch+1,expires_at=clock_timestamp() WHERE account_id=$1", f.schema), &[&account_key("test","seat")]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET holder_id='lost',epoch=epoch+1,expires_at=clock_timestamp(),released=true WHERE account_id=$1", f.schema), &[&account_key("test","seat")]).await.unwrap();
     if overlap {
         store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
     } else {
@@ -2119,6 +2119,90 @@ async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool, restart:
         generation(&served) >= 10,
         "replica must serve the renewed grant, not unpublished old credentials"
     );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_waits_for_foreign_refresh_settlement_after_lease_expiry() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let token = f.token.clone();
+    let pending = tokio::spawn(async move {
+        http.post(format!("{url}/v1/token"))
+            .bearer_auth(token)
+            .json(&json!({"alias":"seat","billing":true}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET expires_at=clock_timestamp() WHERE account_id=$1", f.schema), &[&account_key("test","seat")]).await.unwrap();
+    let id = "b4".repeat(32);
+    login_request(&f, &f.second, "start", &id).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "expired foreign lease does not prove its native child stopped"
+    );
+    login_request(&f, &f.second, "cancel", &id).await;
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(pending.await.unwrap().status(), 503);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_confirmed_native_rejection_allows_fresh_renewal() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    let id = "b5".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::remove_file(f.first.root.path().join("login-release")).unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup").unwrap();
+    let repair = "b6".repeat(32);
+    let resumed = login_request(&f, &f.first, "start", &repair).await;
+    assert_eq!(
+        resumed["id"], repair,
+        "confirmed rejection must allow another device login"
+    );
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &repair).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }
