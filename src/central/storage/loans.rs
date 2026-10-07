@@ -485,7 +485,7 @@ impl FileStore {
                 && !state
                     .loans
                     .get(&event.grant_id)
-                    .is_some_and(|grant| grant.ended_at.is_none() && grant.deleted_at.is_none());
+                    .is_some_and(|grant| grant.active(event.at) && grant.deleted_at.is_none());
             if !duplicate(state) && !ended {
                 state.loan_audit.push(event.clone());
             }
@@ -718,7 +718,7 @@ impl PostgresStore {
                     audit_columns!(),
                     ") SELECT $1,$2,$3,$4,$5,$6,$7,NULL WHERE $3 <> 'token_issued' OR EXISTS (SELECT 1 FROM ",
                     loans_table!(),
-                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL) ON CONFLICT DO NOTHING"
+                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL AND ends_at > $2) ON CONFLICT DO NOTHING"
                 ),
                 &[
                     &event.grant_id,
