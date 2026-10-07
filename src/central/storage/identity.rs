@@ -316,7 +316,7 @@ impl CentralStore {
             let _admission_timing = lock_admission(&tx).await?;
             let authorized=tx.query_opt("SELECT d.id FROM central_devices d JOIN central_users u ON u.id=d.user_id WHERE d.id=$1 AND d.user_id=$2 AND d.tenant='sawmills' AND NOT d.revoked AND d.deleted_at IS NULL AND u.enabled AND u.deleted_at IS NULL FOR SHARE OF d,u",&[&op.device,&op.user]).await?;
             if authorized.is_none() {return Ok(Err("login_canceled"));}
-            tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='add' AND account_id IS NULL AND NOT cancel_requested AND expires_at>clock_timestamp() FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.context("add admission fenced")?;
+            tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='add' AND account_id IS NULL AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.context("add admission fenced")?;
             if tx.query_opt("SELECT target FROM central_alias_tombstones WHERE deleted_at IS NULL AND user_id=$1 AND alias=lower($2)",&[&op.user,&op.alias]).await?.is_some() {return Ok(Err("alias_renamed"));}
             // An active login may have learned a claim that the saved account
             // does not yet declare. Refuse its reservation before comparing vaults.
@@ -377,7 +377,7 @@ impl CentralStore {
             };
             record_claims(&tx,&account,&claims).await?;
             if !reserve_claims(&tx,op,&account,&claims).await? {return Ok(Err("relogin_reserved"));}
-            let changed=tx.execute("UPDATE central_login_operations SET account_id=$6,landed_alias=$7,sequence=sequence+1 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp()",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&account,&landed]).await?;
+            let changed=tx.execute("UPDATE central_login_operations SET account_id=$6,landed_alias=$7,sequence=sequence+1 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp())",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&account,&landed]).await?;
             if changed!=1 {bail!("add admission fenced");}
             tx.commit().await?;
             Ok(Ok((account,landed)))
@@ -481,12 +481,12 @@ impl CentralStore {
             let mut connection=db.admission_client().await?;
             let tx=connection.transaction().await?;
             let _admission_timing = lock_admission(&tx).await?;
-            tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='renewal' AND account_id=$6 AND NOT cancel_requested AND expires_at>clock_timestamp() FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&op.account()?]).await?.context("renewal reservation fenced")?;
+            tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='renewal' AND account_id=$6 AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&op.account()?]).await?.context("renewal reservation fenced")?;
             let tags=claims.tags();
             let claimed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_account_identity_claims WHERE deleted_at IS NULL AND workspace=$1 AND namespace||':'||claim=ANY($2) AND account_id<>$3)",&[&claims.workspace,&tags,&op.account()?]).await?.get(0);
             if claimed {return Ok(false);}
             if !reserve_claims(&tx,op,op.account()?,&claims).await? {return Ok(false);}
-            let fresh:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp())",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.get(0);
+            let fresh:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.get(0);
             if !fresh {bail!("renewal reservation fenced");}
             tx.commit().await?;
             Ok(true)

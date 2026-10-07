@@ -152,12 +152,36 @@ existing staging workload gates to measure admission cost before a lock or
 connection-pool redesign. Local tests verify that stalled native verification
 does not hold this lock; they do not establish production throughput.
 
-Expired device-polling receipts now report `expired` and permit a new request
-ID. Expiry retains a company-user fence when child exit and grant absence are
-not proven, including failed grant publication. Candidates and verification
-markers stay fenced after lease expiry.
-Automatic replay, killed-replica retry, and takeover acceptance remain in PR3.
-An unidentified grant fences its company user's accounts. Use the operator
+PostgreSQL schema v7 registers a unique holder for each replica boot. Its
+30-second lease renews every five seconds and cannot renew after expiry. An
+expired holder disables new shared login work. Operation writes and
+refresh-capable verification also require that holder's live lease.
+
+After authorization, status and start requests recover retained login receipts.
+On Linux, expired device polling and an expired registered holder with
+parent-bound children permit `replica_lost` cleanup. The old receipt reports
+`expired`; a fresh request ID can complete on another replica without first
+polling the abandoned ID. Missing holder records, retired holders, and holders without the Linux
+parent-death guarantee keep the company-user fence. Never inspect a foreign PID
+to infer exit.
+
+A durable candidate can transfer to a new holder and epoch before verification
+starts. Recovery preserves the candidate, identity reservations, and account
+lease fences, then resumes admission and verification without another device
+login. An unreleased foreign refresh lease still requires explicit settlement.
+If the old login worker already acquired the account lease, its pre-verification
+settlement can be uncertain; recovery reports `relogin_settlement_unresolved`
+and keeps that evidence. A durable in-flight verification marker reports
+`relogin_verification_unresolved`; no replica repeats verification.
+
+Changed polling-cleanup and unresolved transitions each count once under
+`relogin_failed`, with bounded recovery-stage logs. Repeated receipt reads do
+not count another failure. The existing staging
+`CodexctlCredentialOperationFailed` alert selects that reason for 300 seconds
+after its failure timestamp. Local tests prove failure counts and fences;
+notification delivery and live takeover acceptance require a separate rollout.
+
+An unidentified grant still fences its company user's accounts. Use the operator
 resolution steps in [the server guide](central-server.md) and preserve its
 private execution home. Linux supplies a parent-death signal; macOS process
 groups do not supply that signal or verified forced-parent-death recovery.
@@ -558,9 +582,9 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
 
    The HA service accepts token, registry, add, and login renewal operations.
    Login status and cancellation use shared PostgreSQL journals and identity
-   reservations. Enrollment and reset redemption remain unavailable. Automatic
-   crash/takeover recovery is still pending in SAW-12484 PR3; this intermediate
-   release does not authorize the B33 cutover.
+   reservations. Enrollment and reset redemption remain unavailable. PR3 adds
+   Linux login recovery, but live crash/takeover acceptance and rollout approval
+   remain required before the B33 cutover.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
    `/ready` database health, one upstream refresh for a simultaneous forced
@@ -603,8 +627,10 @@ instance, then repeat the destructive cases in staging.
    Multi-Attach event is possible because broker pods have no shared RWO claim.
 5. **Enrollment and renewal.** Assert that enrollment returns `503`. For renewal, assert cross-pod
    status/cancel, completed-request retries, continued token service during
-   device polling, and one refresh owner during verification. Keep crash
-   takeover acceptance pending until SAW-12484 PR3.
+   device polling, and one refresh owner during verification. On Linux, kill the
+   device-login replica and retry with a fresh ID on another replica. Also check
+   candidate takeover and unresolved verification without another refresh.
+   Keep these live acceptance results separate from PR3's local tests.
 6. **Reset idempotency.** In phase three, assert that reset redemption returns
    `503` on every pod. Move the one-spend and terminal-receipt assertions to
    phase four, after the shared journal is delivered

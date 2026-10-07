@@ -156,6 +156,7 @@ pub(super) struct Broker {
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     pub(super) central: Option<CentralStore>,
     pub(super) holder_id: String,
+    pub(super) login_holder_live: Arc<AtomicBool>,
     pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
 }
 #[derive(Clone)]
@@ -3772,6 +3773,7 @@ pub async fn serve(
         background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         holder_id: instance_holder_id(),
+        login_holder_live: Arc::new(AtomicBool::new(true)),
         registry,
         central,
         metrics_hash: metrics_token_file
@@ -3786,6 +3788,34 @@ pub async fn serve(
                 Ok(vault::digest(token.as_bytes()))
             })
             .transpose()?,
+    };
+    let (holder_stop, mut holder_stop_rx) = tokio::sync::oneshot::channel();
+    let holder_task = if let Some(shared) = broker.central.as_ref() {
+        shared.login_register_holder(&broker.holder_id).await?;
+        let holder_store = shared.clone();
+        let holder_broker = broker.clone();
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut holder_stop_rx => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        let renewed = holder_store.login_renew_holder(&holder_broker.holder_id).await;
+                        if !matches!(renewed, Ok(true)) {
+                            holder_broker.login_holder_live.store(false, Ordering::Release);
+                            let error = match renewed {
+                                Err(error) => format!("{error:#}"),
+                                _ => "login holder incarnation expired".into(),
+                            };
+                            eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_lost","error":error}));
+                            holder_broker.record_failure("relogin_failed", "login_holder", StatusCode::SERVICE_UNAVAILABLE);
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
     };
     for _ in 0..recovery_failures {
         broker.record_failure(
@@ -3864,6 +3894,13 @@ pub async fn serve(
     for result in futures::future::join_all(tasks).await {
         result?;
     }
+    if let Some(task) = holder_task {
+        let _ = holder_stop.send(());
+        task.await.context("login holder heartbeat task failed")?;
+        if let Some(shared) = broker.central.as_ref() {
+            shared.login_release_holder(&broker.holder_id).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3914,6 +3951,7 @@ impl Broker {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: None,
             holder_id: "test-holder".into(),
+            login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         }
     }
@@ -4022,6 +4060,7 @@ mod tests {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             central: Some(central),
             holder_id: "test-holder".into(),
+            login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

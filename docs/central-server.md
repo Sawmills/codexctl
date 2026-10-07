@@ -330,22 +330,37 @@ evidence.
 
 A database failure before the refresh child starts reports
 `relogin_interrupted_retry` and keeps a failed receipt and its captured grant.
-Start a new login to retry. Resuming captured candidates remains part of PR3.
-Automatic crash/takeover recovery remains in SAW-12484 PR3.
-This intermediate release is not sufficient for the B33 cutover. Status and
-start retire expired `starting` or `pending` device-login receipts as
-`replica_lost`, report `expired`, and allow a new request ID. They do not adopt the
-old worker or replay a saved grant. The CLI clears its local receipt when either
-login or `--cancel` receives `expired`, so the next login uses a new request ID.
-Receipt expiry frees the alias for device polling. Without a durable receipt that
-the old child exited and saved no grant, the expired operation still fences that
-company user's refreshes and verification. The CLI reports retained unresolved
-evidence. A saved grant whose publication failed must be reconciled before that
-fence clears. The killed-replica retry test and automatic
-crash/takeover recovery remain in PR3. A verifier
-that loses its lease leaves a durable unresolved marker: another replica must
-not repeat verification. Renewal waits when an expired foreign refresh lease
-has no explicit release; expiry alone is not proof that its child stopped.
+Start a new login to retry a failed receipt. In PostgreSQL schema v7, each replica
+boot registers a holder with a 30-second lease that renews every five seconds.
+An expired holder cannot renew or publish further shared login transitions.
+
+After machine authorization, status and start check the original request ID
+before availability or alias checks. On Linux, an expired operation lease plus
+an expired registered holder with parent-bound polling children allows
+`replica_lost` cleanup. The old receipt reports `expired`; a fresh request ID can
+run on another replica without first reading the old receipt. The CLI clears its
+local receipt when either login or `--cancel` receives `expired`. A missing
+holder record, a retired holder, or a holder without the Linux parent-death
+guarantee cannot prove exit and keeps the fence. Do not infer exit from a foreign PID.
+
+A captured candidate that is durable in PostgreSQL can transfer to a new holder
+and epoch before the verification marker. The authorized receipt retry or
+status request resumes admission and verification when work capacity is
+available, preserving the request ID, candidate, label, landed alias, and
+identity reservations. It never starts another device login. A foreign refresh
+lease still needs its original owner's explicit settlement; expiry alone is
+not proof that its child stopped. If the old login worker held an unreleased
+account lease, recovery reports `relogin_settlement_unresolved` and retains its
+candidate and reservations because the previous refresh journal may be ahead
+of PostgreSQL.
+
+An expired in-flight verification marker reports
+`relogin_verification_unresolved` and retains the candidate, account lease,
+identity claims, and local uncertain journals. Another replica must not repeat
+verification, even if the child died before returning its initialize response.
+Repeated receipt reads count one `relogin_failed` recovery transition. The
+existing `CodexctlCredentialOperationFailed` alert selects this reason. These
+local checks do not prove notification delivery or authorize the B33 cutover.
 The 900-second device-polling deadline does not bound the later account-lease
 wait or verification. Those stages still require the live operation and account
 leases, machine authorization, cancellation monitoring, and bounded native RPCs.
@@ -364,9 +379,9 @@ that reason. Registry read failures stop device polling and report failure;
 a durable cancel intent, confirmed machine revocation, or graceful shutdown
 reports canceled. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch
-record under `state/shared-logins/`. Preserve this evidence. Automated replay and
-cleanup of interrupted operations belong to PR3; local evidence alone does not
-make another replica safe to take over.
+record under `state/shared-logins/`. Preserve this evidence. Local evidence alone
+does not make another replica safe to take over. A grant that never reached the
+shared candidate journal cannot be replayed by another replica.
 
 Linux credential children use `PR_SET_PDEATHSIG` and a parent-PID check to stop
 when their parent exits. The running worker also stops polling after an operation
@@ -382,7 +397,7 @@ printing credentials. Compare every declared login claim in its own namespace
 against the saved account. A conflicting or undecidable identity keeps the fence.
 If the grant cannot be identified, retain the fence.
 If any refresh-capable verification may have started, retain `unresolved` for
-PR3 settlement; do not change it to a repairable rejection or repeat verification.
+operator settlement; do not change it to a repairable rejection or repeat verification.
 
 When the intact private execution home proves child exit with no saved grant,
 an operator can record the same absence receipt the original worker records.
