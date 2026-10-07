@@ -128,17 +128,24 @@ impl Broker {
     /// ends or skips each row it selected.
     async fn expire_loans(&self) -> Result<(), HttpError> {
         let now = now();
+        let store = self.loan_store();
         let mut any = false;
         loop {
-            let expired = self
-                .loan_store()
+            let expired = store
                 .expire_loans(now)
                 .await
                 .map_err(|error| self.loan_failure("expire", error))?;
-            if expired.is_empty() {
+            any |= !expired.is_empty();
+            // A concurrent request can win every row of a batch, so an empty
+            // result alone does not prove that no due grant is left.
+            if expired.is_empty()
+                && !store
+                    .has_due_loans(now)
+                    .await
+                    .map_err(|error| self.loan_failure("expire", error))?
+            {
                 break;
             }
-            any = true;
         }
         if any {
             self.retire_loans().await;
@@ -365,6 +372,18 @@ impl Broker {
             &token.chatgpt_account_id,
             &token.access_token,
         )) {
+            return Err(self.pause(grant, "subject_changed").await);
+        }
+        // The lender's account may have been removed or replaced while the
+        // token was prepared; the account as it is now must still match.
+        let Some(found) = self.grant_owner(grant).await? else {
+            return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
+        };
+        let now_subject = match found.shared_subject {
+            Some(subject) => Some(subject),
+            None => owner_subject(&*found.owner.lock().await),
+        };
+        if !now_subject.is_some_and(|subject| grant.subject.same_login(&subject)) {
             return Err(self.pause(grant, "subject_changed").await);
         }
         self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))

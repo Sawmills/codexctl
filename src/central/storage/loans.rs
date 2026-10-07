@@ -172,6 +172,18 @@ impl CentralStore {
         self.expire(None, now).await
     }
 
+    /// Whether any unended, unretired grant is past its end time.
+    pub async fn has_due_loans(&self, now: i64) -> Result<bool> {
+        match self {
+            Self::File(file) => Ok(file.read_state()?.loans.values().any(|grant| {
+                grant.ended_at.is_none() && grant.deleted_at.is_none() && grant.ends_at <= now
+            })),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
+                bounded_db(db.has_due_loans(now)).await
+            }
+        }
+    }
+
     /// Expire one account's past grant, independent of the bounded sweep, so
     /// a new grant for that account is never refused by a stale one.
     pub async fn expire_account_loans(&self, account_id: &str, now: i64) -> Result<Vec<Grant>> {
@@ -528,6 +540,21 @@ impl PostgresStore {
             }
         }
         Ok(expired)
+    }
+
+    async fn has_due_loans(&self, now: i64) -> Result<bool> {
+        let client = self.client().await?;
+        Ok(client
+            .query_one(
+                concat!(
+                    "SELECT EXISTS(SELECT 1 FROM ",
+                    loans_table!(),
+                    " WHERE ended_at IS NULL AND deleted_at IS NULL AND ends_at <= $1)"
+                ),
+                &[&now],
+            )
+            .await?
+            .get(0))
     }
 
     /// Persist an ended grant and its event in one statement. A concurrent
