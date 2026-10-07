@@ -1433,7 +1433,7 @@ async fn token(
     })
     .await
     .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
-    refresh_legacy_usage(&broker, &mut token).await;
+    refresh_legacy_usage(&broker, &mut token, borrowed.is_some()).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
     // A loan that ended or paused during the refresh delivers no token either.
@@ -1505,11 +1505,16 @@ async fn token(
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
 }
 
-async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse) {
+/// `need_all_windows`: a borrowed token's placement checks need the
+/// all-window maximum, which native usage cannot give.
+async fn refresh_legacy_usage(broker: &Broker, token: &mut TokenResponse, need_all_windows: bool) {
     let Some(usage) = token.statusline_usage.as_ref() else {
         return;
     };
-    if usage.allowed.is_some() && usage.limit_reached.is_some() {
+    if usage.allowed.is_some()
+        && usage.limit_reached.is_some()
+        && (!need_all_windows || usage.max_used_percent.is_some())
+    {
         return;
     }
     let authoritative = match broker

@@ -7835,7 +7835,13 @@ fn selection_ranks_owned_accounts_first_and_backs_off_borrowed_ones() {
             usage_age_seconds: Some(1),
             usage_stale: false,
             usage_error: None,
-            statusline_usage: None,
+            statusline_usage: serde_json::from_value(json!({
+                "weekly_used_percent": null,
+                "weekly_resets_at": null,
+                "five_hour_used_percent": used,
+                "max_used_percent": used
+            }))
+            .ok(),
             live_sessions: Some(0),
             recent_429_rate: None,
             credits: None,

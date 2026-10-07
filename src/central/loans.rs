@@ -393,7 +393,8 @@ pub fn below_borrower_backoff(account: &super::managed::Account) -> bool {
 }
 
 /// Rank owned accounts before borrowed ones. A borrowed account enters only
-/// when no owned account qualifies, and only below the borrower backoff.
+/// when no owned account qualifies, and only when eligible for automatic
+/// placement (fresh all-window usage below the borrower backoff).
 pub fn owned_then_borrowed<T>(
     accounts: &[super::managed::Account],
     pick: impl Fn(&[super::managed::Account]) -> Result<T>,
@@ -408,7 +409,7 @@ pub fn owned_then_borrowed<T>(
     pick(&owned).or_else(|error| {
         let roomy: Vec<_> = borrowed
             .into_iter()
-            .filter(below_borrower_backoff)
+            .filter(borrowed_auto_eligible)
             .collect();
         pick(&roomy).map_err(|_| error)
     })

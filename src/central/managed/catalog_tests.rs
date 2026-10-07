@@ -978,7 +978,7 @@ async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
         user_id: None,
         label: None,
     };
-    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed, false).await;
     assert_eq!(
         refreshed.billing_class,
         Some(api::BillingClass::RateLimited)
@@ -1006,7 +1006,7 @@ async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
     );
     fixture.fail.store(true, Ordering::SeqCst);
     let before = refreshed.clone();
-    super::refresh_legacy_usage(&fixture.broker, &mut refreshed).await;
+    super::refresh_legacy_usage(&fixture.broker, &mut refreshed, false).await;
     assert_eq!(refreshed.billing_class, before.billing_class);
 }
 
