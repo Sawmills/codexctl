@@ -260,7 +260,11 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
             "/accounts/data",
             get(move |state, headers| data(state, headers, elapsed)),
         )
-        .route("/accounts/sign-in", get(enrollment::accounts_sign_in))
+        .route(
+            "/accounts/sign-in",
+            get(enrollment::accounts_sign_in)
+                .layer(axum::middleware::from_fn(enrollment::browser_errors)),
+        )
         .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
 }
 

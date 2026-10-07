@@ -9192,6 +9192,53 @@ fn dashboard_v3_enrollment_and_landing_render_for_browser_checks() {
 }
 
 #[test]
+fn dashboard_sign_in_errors_get_a_page_in_a_browser_and_json_elsewhere() {
+    let accept = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    // A server without company SSO refuses to start a sign-in.
+    let server = Server::start();
+    let page = http
+        .get(format!("{}/accounts/sign-in", server.url))
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(page.status(), 503);
+    assert!(page.text().unwrap().contains("Something went wrong"));
+    let api = http
+        .get(format!("{}/accounts/sign-in", server.url))
+        .send()
+        .unwrap();
+    assert_eq!(api.status(), 503);
+    assert_eq!(api.text().unwrap(), r#"{"error":"sso_unavailable"}"#);
+    // A callback without this browser's login cookie offers a new dashboard sign-in.
+    let issuer = EnrollmentServer::start(company_identity());
+    let start = http
+        .get(format!("{}/accounts/sign-in", issuer.server.url))
+        .send()
+        .unwrap();
+    let authorize = http
+        .get(start.headers()["location"].to_str().unwrap())
+        .send()
+        .unwrap();
+    let callback = http
+        .get(authorize.headers()["location"].to_str().unwrap())
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(callback.status(), 401);
+    let html = callback.text().unwrap();
+    assert!(
+        html.contains("This browser did not start this sign-in"),
+        "{html}"
+    );
+    assert!(html.contains("href=\"/accounts/sign-in\""));
+}
+
+#[test]
 fn dashboard_sign_in_refuses_a_callback_from_another_browser() {
     let issuer = EnrollmentServer::start(company_identity());
     let http = reqwest::blocking::Client::builder()

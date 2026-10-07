@@ -280,7 +280,7 @@ fn page(html: String) -> Response {
         .into_response()
 }
 /// Browser steps show a page for an error; API clients keep the JSON body and status.
-async fn browser_errors(request: Request, next: Next) -> Response {
+pub(super) async fn browser_errors(request: Request, next: Next) -> Response {
     let html = request
         .headers()
         .get(header::ACCEPT)
