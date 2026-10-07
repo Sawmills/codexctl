@@ -2,6 +2,16 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+pub(super) const LOGIN_ARGS: [&str; 8] = [
+    "login",
+    "--device-auth",
+    "-c",
+    "cli_auth_credentials_store=\"file\"",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "features.daemon_auto_start=false",
+];
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Process {
     pid: u32,

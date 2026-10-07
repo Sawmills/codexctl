@@ -7,7 +7,12 @@ pub mod enrollment;
 pub mod loans;
 pub mod managed;
 pub mod native;
+#[cfg(target_os = "linux")]
+mod polling;
 mod process;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use polling::supervise_login;
 mod relogin;
 pub mod remote;
 mod rename;

@@ -2783,6 +2783,23 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
             .unwrap()
             .parse()
             .unwrap();
+        // Model an old or unsupported holder with no durable supervisor receipt.
+        // Kill the supervisor too, while its parent cannot record local evidence.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let supervisor: i32 = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(f.first.child.id().unwrap() as i32, libc::SIGSTOP) },
+            0
+        );
+        assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
         f.first.child.kill().await.unwrap();
         wait_parent_bound_exit(pid).await;
         let query = if missing {
@@ -2813,6 +2830,529 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
         login_request(&f, &f.second, "cancel", &fresh).await;
         stop_fixture(f).await;
     }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_stopped_parent_has_an_independent_polling_watchdog() {
+    let f = login_fixture().await;
+    let id = "fb".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        !central_child_dead(pid),
+        "the polling child must be live before the parent stops"
+    );
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    let stopped = timeout(Duration::from_secs(15), async {
+        loop {
+            if central_child_dead(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGCONT) }, 0);
+    assert!(
+        stopped.is_ok(),
+        "a paused parent must not leave polling alive beyond the independent watchdog"
+    );
+    stop_fixture(f).await;
+}
+#[cfg(target_os = "linux")]
+fn central_child_dead(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Ok(stat) => stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z"),
+        Err(error) => panic!("child liveness: {error}"),
+    }
+}
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_killed_parent_after_local_grant_does_not_clear_unknown_evidence() {
+    let mut f = login_fixture().await;
+    let id = "fc".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("other-seat", Some("other-seat"), None)).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("login-saved").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.first.child.kill().await.unwrap();
+    wait_parent_bound_exit(pid).await;
+    f.control.execute(&format!("UPDATE {}.central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",f.schema,f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    login_request(&f, &f.second, "status", &id).await;
+    for alias in ["seat", "other"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias,"billing":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "a locally saved grant must remain fenced after abrupt parent death: {alias}"
+        );
+    }
+    assert_eq!(f.second.launches(), 0);
+    for _ in 0..2 {
+        login_request(&f, &f.second, "status", &id).await;
+    }
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_failed_requests_total{reason=\"relogin_failed\"} 1"),
+        "supervisor failure must be reported once: {metrics}"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cancel_expired_candidate_records_intent_without_waiting_for_admission() {
+    let mut f = login_fixture().await;
+    let account = account_key("test", "seat");
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) VALUES($1,'foreign-settling',41,clock_timestamp()-interval '1 second',false) ON CONFLICT(account_id) DO UPDATE SET holder_id='foreign-settling',epoch=41,expires_at=clock_timestamp()-interval '1 second',released=false",f.schema), &[&account]).await.unwrap();
+    let id = "fd".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.first.child.kill().await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",f.schema,f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    // Block admission only. Cancel intent has its own authorized write.
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let canceled = timeout(
+        Duration::from_secs(1),
+        login_request(&f, &f.second, "cancel", &id),
+    )
+    .await;
+    f.control.batch_execute("COMMIT").await.unwrap();
+    assert!(
+        canceled.is_ok(),
+        "cancellation must not wait for candidate takeover admission"
+    );
+    assert_eq!(f.second.launches(), 0);
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "cancellation must precede any verifier launch"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_another_machine_retries_an_expired_polling_alias_without_old_receipt_access() {
+    let mut f = login_fixture().await;
+    let id = "fe".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    let token_file = f._seed.root.path().join("takeover-machine-token");
+    let output = command(
+        &f.database,
+        &f._seed.root.path().join("state"),
+        &f.key,
+        "register",
+    )
+    .args([
+        "--device",
+        "takeover-machine",
+        "--tenant",
+        "sawmills",
+        "--user",
+        "test",
+        "--token-file",
+    ])
+    .arg(&token_file)
+    .output()
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "synthetic machine registration failed"
+    );
+    f.first.child.kill().await.unwrap();
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_parent_bound_exit(pid).await;
+    f.control.execute(&format!("UPDATE {}.central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",f.schema,f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    f.token = std::fs::read_to_string(token_file).unwrap();
+    let forbidden = f
+        .http
+        .post(format!("{}/v1/relogin/status", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        forbidden.status(),
+        409,
+        "the initiating machine still owns its receipt"
+    );
+    let fresh = "ff".repeat(32);
+    let started = login_request(&f, &f.second, "start", &fresh).await;
+    assert_eq!(started["id"], fresh);
+    assert_eq!(started["status"], "pending");
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &fresh).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.second.launches(), 1);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_login_commits_before_parent_reads_its_challenge() {
+    let f = login_fixture().await;
+    let id = "10".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"login-prompt-gate").unwrap();
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let token = f.token.clone();
+    let request_id = id.clone();
+    let start = tokio::spawn(async move {
+        http.post(format!("{url}/v1/relogin/start"))
+            .bearer_auth(token)
+            .json(&json!({"alias":"seat","id":request_id}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("login-pid").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("login-prompt-release"), b"go").unwrap();
+    // The supervisor can reach publication while the parent cannot read output.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGCONT) }, 0);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    f.control.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(start.await.unwrap().status(), 200);
+    timeout(Duration::from_secs(12),async {
+        loop {
+            let receipt=login_request(&f,&f.second,"status",&id).await;
+            assert_ne!(receipt["status"],"failed","a successful native grant must not become rejected by challenge publication: {receipt}");
+            if receipt["status"]=="completed" {break;}
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(f.first.launches(), 1);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_supervised_login_resolves_a_relative_key_from_server_cwd() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    let root = f.first.root;
+    store::atomic_write(
+        &root.path().join("relative-key"),
+        &std::fs::read(&f.key).unwrap(),
+    )
+    .unwrap();
+    store::atomic_write(&root.path().join("mode"), b"").unwrap();
+    let mut child = command(
+        &f.database,
+        &root.path().join("state"),
+        Path::new("relative-key"),
+        "serve",
+    )
+    .current_dir(root.path())
+    .args([
+        "--listen",
+        "127.0.0.1:0",
+        "--public-url",
+        "http://127.0.0.1:8787",
+        "--codex-bin",
+    ])
+    .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"))
+    .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+    .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
+    .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
+    .env(
+        "CENTRAL_TEST_LAUNCH_COUNTER",
+        root.path().join("launch-count"),
+    )
+    .stdout(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(20),
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    f.first = Pod {
+        child,
+        root,
+        url: format!("http://{}", ready["listening"].as_str().unwrap()),
+    };
+    let id = "11".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cancel_before_supervisor_launch_preserves_grant_absence() {
+    let f = login_fixture().await;
+    f.control.batch_execute(&format!("CREATE SEQUENCE {0}.starting_tick; CREATE FUNCTION {0}.pause_first_tick() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase='starting' AND OLD.phase='starting' AND NOT NEW.cancel_requested AND nextval('{0}.starting_tick')=1 THEN PERFORM pg_sleep(0.5); END IF; RETURN NEW; END $$; CREATE TRIGGER pause_tick BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.pause_first_tick()",f.schema)).await.unwrap();
+    let id = "12".repeat(32);
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let token = f.token.clone();
+    let request_id = id.clone();
+    let start = tokio::spawn(async move {
+        http.post(format!("{url}/v1/relogin/start"))
+            .bearer_auth(token)
+            .json(&json!({"alias":"seat","id":request_id}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let exists: bool = f
+                .control
+                .query_one(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM {}.central_login_operations WHERE id=$1)",
+                        f.schema
+                    ),
+                    &[&id],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if exists {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    login_request(&f, &f.second, "cancel", &id).await;
+    assert_eq!(start.await.unwrap().status(), 200);
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(
+                receipt["status"], "failed",
+                "a pre-launch cancellation has no unknown grant: {receipt}"
+            );
+            if receipt["status"] == "canceled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!f.first.root.path().join("login-pid").exists());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cancel_on_b_stops_polling_while_a_is_stopped() {
+    let f = login_fixture().await;
+    let id = "13".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    login_request(&f, &f.second, "cancel", &id).await;
+    let stopped = timeout(Duration::from_secs(4), async {
+        while !central_child_dead(pid) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGCONT) }, 0);
+    assert!(
+        stopped.is_ok(),
+        "durable cancellation must not wait for the parent's watchdog timeout"
+    );
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "canceled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_lost_polling_home_cannot_prove_grant_absence() {
+    let mut f = login_fixture().await;
+    let id = "14".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("other-seat", Some("other-seat"), None)).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("login-saved").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    let home = std::fs::read_dir(f.first.root.path().join("state/shared-logins").join(&id))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Delete only this fixture's synthetic home to model a lost execution volume.
+    std::fs::remove_dir_all(home).unwrap();
+    f.first.child.kill().await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",f.schema,f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    login_request(&f, &f.second, "status", &id).await;
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "a deleted home is unknown evidence, not proof that no grant was saved"
+    );
+    assert_eq!(f.second.launches(), 0);
+    stop_fixture(f).await;
 }
 
 #[tokio::test]

@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
     PRIMARY KEY (user_id, id)
 );
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS polling_clear BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS failure_reported BOOLEAN NOT NULL DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_account
     ON central_login_operations(account_id)
     WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
@@ -209,6 +210,7 @@ pub(in crate::central) struct LoginOperation {
     pub payload: LoginPayload,
     pub polling_clear: bool,
     pub lease_expired: bool,
+    pub failure_reported: bool,
 }
 impl LoginOperation {
     pub fn account(&self) -> Result<&str> {
@@ -254,6 +256,7 @@ impl PostgresStore {
             },
             polling_clear: row.get("polling_clear"),
             lease_expired: row.get("lease_expired"),
+            failure_reported: row.get("failure_reported"),
         })
     }
 }
@@ -295,7 +298,7 @@ impl CentralStore {
         op: &mut LoginOperation,
         holder: &str,
     ) -> Result<bool> {
-        if op.phase != LoginPhase::ReplicaLost || op.polling_clear {
+        if op.phase != LoginPhase::ReplicaLost {
             return Ok(false);
         }
         let db = self.login_db()?;
@@ -304,7 +307,7 @@ impl CentralStore {
             let tx = connection.transaction().await?;
             let _timing = super::identity::lock_admission(&tx).await?;
             let row = tx.query_opt(
-                "UPDATE central_login_operations o SET polling_clear=true,selected_reserved=false,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='replica_lost' AND NOT o.polling_clear AND o.candidate_workspace IS NULL AND o.expires_at<=clock_timestamp() AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND h.expires_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                "UPDATE central_login_operations o SET polling_clear=true,selected_reserved=false,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='replica_lost' AND o.polling_clear AND o.selected_reserved AND o.candidate_workspace IS NULL AND o.expires_at<=clock_timestamp() AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND h.expires_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder],
             ).await?;
             if row.is_some() {
@@ -389,6 +392,76 @@ impl CentralStore {
         Ok(false)
     }
 
+    /// A supervisor's awaited native exit and private home prove grant absence.
+    pub(in crate::central) async fn login_record_polling_absence(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<()> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "UPDATE central_login_operations SET polling_clear=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase IN ('starting','pending','replica_lost') AND candidate_workspace IS NULL",
+                &[&op.user,&op.id,&op.holder,&op.epoch],
+            ).await?;
+            if changed != 1 {bail!("polling settlement fenced");}
+            Ok(())
+        }).await
+    }
+
+    /// Late capture retains evidence without restoring authority or verifying.
+    pub(in crate::central) async fn login_record_unpublished_grant(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<()> {
+        let db = self.login_db()?;
+        let mut payload = op.payload.clone();
+        payload.code = None;
+        payload.error = Some("relogin_grant_unpublished".into());
+        let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&payload)?)?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "UPDATE central_login_operations SET phase='unresolved',sequence=sequence+1,encrypted_payload=$6 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase IN ('starting','pending','replica_lost') AND candidate_workspace IS NULL",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&encrypted],
+            ).await?;
+            if changed != 1 {bail!("late grant settlement fenced");}
+            Ok(())
+        }).await
+    }
+
+    /// One serving replica reports each durable supervisor/unknown-exit failure.
+    pub(in crate::central) async fn login_take_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+    ) -> Result<bool> {
+        let db = self.login_db()?;
+        let changed = bounded_db(async {
+            Ok(db.client().await?.execute(
+                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND NOT failure_reported AND (holder_id=$5 OR NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&reporter],
+            ).await? == 1)
+        }).await?;
+        if changed {
+            op.failure_reported = true;
+        }
+        Ok(changed)
+    }
+
+    /// The supervisor reads durable cancellation without extending parent authority.
+    pub(in crate::central) async fn login_polling_authority(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<(bool, bool)> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let row=db.client().await?.query_opt(
+                "SELECT cancel_requested,phase IN ('starting','pending') AND expires_at>clock_timestamp() AND deadline>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4",
+                &[&op.user,&op.id,&op.holder,&op.epoch],
+            ).await?.context("polling incarnation fenced")?;
+            Ok((row.get(0),row.get(1)))
+        }).await
+    }
+
     pub(super) fn login_db(&self) -> Result<&PostgresStore> {
         match self {
             Self::Postgres(db) => Ok(db),
@@ -471,7 +544,7 @@ impl CentralStore {
         let db = self.login_db()?;
         bounded_db(async {
             db.expire_polling_login(user,None,Some(alias)).await?;
-            db.client().await?.query_opt("SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND lower(alias)=lower($2) AND (phase NOT IN ('completed','failed','canceled','rejected','replica_lost') OR (phase='replica_lost' AND NOT polling_clear)) ORDER BY (phase='replica_lost'), id LIMIT 1", &[&user,&alias]).await?
+            db.client().await?.query_opt("SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND lower(alias)=lower($2) AND (phase NOT IN ('completed','failed','canceled','rejected','replica_lost') OR (phase='replica_lost' AND selected_reserved)) ORDER BY (phase='replica_lost'), id LIMIT 1", &[&user,&alias]).await?
                 .map(|row| db.login_row(row)).transpose()
         }).await
     }
@@ -689,6 +762,7 @@ mod tests {
             payload: LoginPayload::default(),
             polling_clear: false,
             lease_expired: false,
+            failure_reported: false,
         };
         shared.login_register_holder(&op.holder).await.unwrap();
         assert!(shared.login_create(&op).await.unwrap());
@@ -753,6 +827,7 @@ mod tests {
             payload: LoginPayload::default(),
             polling_clear: false,
             lease_expired: false,
+            failure_reported: false,
         };
         shared.login_register_holder(&op.holder).await.unwrap();
         assert!(shared.login_create(&op).await.unwrap());
@@ -815,6 +890,7 @@ mod tests {
             payload: LoginPayload::default(),
             polling_clear: false,
             lease_expired: false,
+            failure_reported: false,
         };
         shared.login_register_holder(&op.holder).await.unwrap();
         assert!(shared.login_create(&op).await.unwrap());

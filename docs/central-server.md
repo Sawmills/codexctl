@@ -335,13 +335,27 @@ boot registers a holder with a 30-second lease that renews every five seconds.
 An expired holder cannot renew or publish further shared login transitions.
 
 After machine authorization, status and start check the original request ID
-before availability or alias checks. On Linux, an expired operation lease plus
-an expired registered holder with parent-bound polling children allows
-`replica_lost` cleanup. The old receipt reports `expired`; a fresh request ID can
-run on another replica without first reading the old receipt. The CLI clears its
-local receipt when either login or `--cancel` receives `expired`. A missing
-holder record, a retired holder, or a holder without the Linux parent-death
-guarantee cannot prove exit and keeps the fence. Do not infer exit from a foreign PID.
+before availability or alias checks. On Linux, an independent polling
+supervisor stops and awaits the native child after parent pipe closure or ten
+seconds without an authorized operation heartbeat. The native child is bound
+to the supervisor's death. The supervisor owns challenge and candidate publication and reads durable
+cancellation every second without renewing parent authority. Before completion,
+it publishes the captured grant, or confirms exit with no grant in an intact
+private home through a durable absence receipt.
+
+Only that absence receipt permits polling fence cleanup after operation and
+holder expiry. The old request reports `expired`; a fresh ID can run on B
+without first reading the old receipt. A fresh request can come from another
+machine of the same company user. It does not expose the initiating machine's
+receipt or code. The CLI clears its local receipt when login or `--cancel`
+receives `expired`. Cancellation stores its authorized intent independently
+of admission and never launches recovery work in the cancel handler.
+
+Expiry alone cannot prove exit or grant absence. If the supervisor also dies
+before publishing evidence, retain the fence and private home for operator
+settlement. A saved grant whose publication failed remains reserved. Missing
+or retired holders and unsupported platforms do not authorize automatic
+cleanup. Do not infer exit from a foreign PID.
 
 A captured candidate that is durable in PostgreSQL can transfer to a new holder
 and epoch before the verification marker. The authorized receipt retry or
@@ -358,8 +372,11 @@ An expired in-flight verification marker reports
 `relogin_verification_unresolved` and retains the candidate, account lease,
 identity claims, and local uncertain journals. Another replica must not repeat
 verification, even if the child died before returning its initialize response.
-Repeated receipt reads count one `relogin_failed` recovery transition. The
-existing `CodexctlCredentialOperationFailed` alert selects this reason. These
+A durable `failure_reported` marker prevents repeated receipt reads from
+counting another failure. The live holder reports its own failure; after its
+lease expires a serving replica reports it. Known failed grants use
+`relogin_failed`; unidentified evidence uses `relogin_identity_unresolved`.
+The existing `CodexctlCredentialOperationFailed` alert selects both reasons. These
 local checks do not prove notification delivery or authorize the B33 cutover.
 The 900-second device-polling deadline does not bound the later account-lease
 wait or verification. Those stages still require the live operation and account

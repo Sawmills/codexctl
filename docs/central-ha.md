@@ -158,12 +158,24 @@ expired holder disables new shared login work. Operation writes and
 refresh-capable verification also require that holder's live lease.
 
 After authorization, status and start requests recover retained login receipts.
-On Linux, expired device polling and an expired registered holder with
-parent-bound children permit `replica_lost` cleanup. The old receipt reports
-`expired`; a fresh request ID can complete on another replica without first
-polling the abandoned ID. Missing holder records, retired holders, and holders without the Linux
-parent-death guarantee keep the company-user fence. Never inspect a foreign PID
-to infer exit.
+On Linux, an independent polling supervisor receives a heartbeat only after
+its parent confirms operation authority. Pipe closure or ten seconds without a
+heartbeat stops and awaits the native child. The child is also bound to the
+supervisor's death. The supervisor owns both challenge and candidate publication. It reads durable
+cancellation every second without renewing parent authority. It publishes the
+captured grant before normal completion, or a durable absence receipt after
+confirmed exit with no grant in an intact private home.
+An expired polling operation and holder can release reservations only with
+that absence receipt. The old receipt reports `expired`; a fresh request ID
+can complete on another replica without first polling the abandoned ID.
+Another authorized machine can start the fresh request while the original
+machine retains exclusive access to its old receipt.
+
+Lease expiry and parent-death capability alone never prove grant absence. If
+both parent and supervisor die before a durable receipt, or grant publication
+fails, retain the company-user fence and private home for operator settlement.
+Missing holder records, retired holders, and unsupported holders cannot supply
+automatic cleanup proof. Never inspect a foreign PID to infer exit.
 
 A durable candidate can transfer to a new holder and epoch before verification
 starts. Recovery preserves the candidate, identity reservations, and account
@@ -174,9 +186,11 @@ settlement can be uncertain; recovery reports `relogin_settlement_unresolved`
 and keeps that evidence. A durable in-flight verification marker reports
 `relogin_verification_unresolved`; no replica repeats verification.
 
-Changed polling-cleanup and unresolved transitions each count once under
-`relogin_failed`, with bounded recovery-stage logs. Repeated receipt reads do
-not count another failure. The existing staging
+A durable `failure_reported` marker gives each failed login one reporting
+replica. The live holder reports its own failure; after holder loss a serving
+replica claims the marker. Known failed grants count under `relogin_failed` and
+unidentified evidence under `relogin_identity_unresolved`, with bounded
+settlement-stage logs. Repeated receipt reads do not count another failure. The existing staging
 `CodexctlCredentialOperationFailed` alert selects that reason for 300 seconds
 after its failure timestamp. Local tests prove failure counts and fences;
 notification delivery and live takeover acceptance require a separate rollout.

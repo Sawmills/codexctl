@@ -2,7 +2,7 @@ use super::*;
 use std::{process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
 // Native CLI output is not a transport API. Accept only the pinned, bounded prompt.
-pub(super) fn challenge(bytes: &[u8]) -> Result<Option<String>> {
+pub(in crate::central) fn challenge(bytes: &[u8]) -> Result<Option<String>> {
     let text = std::str::from_utf8(bytes)?;
     let mut clean = String::new();
     let mut chars = text.chars().peekable();

@@ -41,6 +41,8 @@ pub(super) use recover::{
     needs_verification, recover, retire_reservations, verifier_parent_exited, verify_replacement,
 };
 use state::*;
+#[cfg(target_os = "linux")]
+pub(super) use worker::challenge;
 use worker::*;
 #[cfg(test)]
 mod tests;
