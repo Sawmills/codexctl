@@ -491,6 +491,12 @@ impl Broker {
         };
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         if let Some(record) = central.load_account(&account_id).await? {
+            if central.mode() == super::storage::StoreMode::Postgres {
+                reconcile_owner_from_central(self, owner, &account_id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("cannot reconcile shared account"))?;
+                return Ok(());
+            }
             if record.revision > owner.vault.revision {
                 let committed: Vault = serde_json::from_value(record.vault)?;
                 vault::validate_auth(&committed.auth)?;
