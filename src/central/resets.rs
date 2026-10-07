@@ -333,7 +333,7 @@ async fn redeem(
 
 // Owner errors can carry a dependency's diagnostics. Keep stored credentials out
 // of those logs and bound the payload while retaining the useful cause chain.
-fn redact_auth_strings(value: &serde_json::Value, detail: &mut String) {
+pub(super) fn redact_auth_strings(value: &serde_json::Value, detail: &mut String) {
     match value {
         serde_json::Value::String(secret) if !secret.is_empty() => {
             *detail = detail.replace(secret, "[redacted]");

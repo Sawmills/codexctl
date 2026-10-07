@@ -1,4 +1,6 @@
 //! Multi-user broker. One process and one persistent disk own every refresh token.
+mod renewal;
+
 use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,

@@ -240,7 +240,10 @@ An enrolled machine uses `codexctl login <alias>` to renew an existing server ac
 The command prints an OpenAI device code and opens the OpenAI sign-in page.
 Use `--no-browser` to open that page on another machine.
 Approve the same OpenAI login and workspace as the selected alias.
-The server stops that account's previous refresh owner before sign-in.
+In file mode, the server stops that account's previous refresh owner before sign-in.
+In PostgreSQL mode, the account keeps serving tokens during browser approval.
+After the server stores the candidate in PostgreSQL, it takes the account lease
+and verifies the replacement under both the login and refresh leases.
 It retains the replacement credentials in a private server home and checks the account identity before replacement.
 It then verifies the replacement owner before reporting success.
 Your machine's OpenAI credentials and active account do not change.
@@ -249,7 +252,9 @@ Your other enrolled machines keep their registration and aliases.
 If your terminal disconnects, run the same login command to resume.
 Resume from the machine that started the login. Other machines cannot resume or cancel its pending login.
 To stop a pending login, run `codexctl login <alias> --cancel`.
-A canceled or failed login leaves that account unavailable until you retry.
+In file mode, a canceled or failed login leaves that account unavailable until you retry.
+In PostgreSQL mode, cancellation before candidate publication keeps the existing
+account usable. A candidate whose verification is unresolved remains fenced.
 Cancellation does not undo an authorization that OpenAI already issued.
 Approving a different OpenAI account can invalidate that other account's previous grant.
 The server retains a wrong-account grant without replacing the selected alias.
@@ -292,12 +297,27 @@ already left the account on the server unverified, cancel ends the add with
 To save a local profile on a connected machine instead, add `--local`:
 `codexctl login <alias> --local`. A server alias still renews on the server.
 
-Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
-the server answers HTTP 503 with `account_login_unavailable`, because login records are
-local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
-A server refuses to start in PostgreSQL mode while any add or renewal login is pending
+PostgreSQL supports renewal of an existing server account. Login receipts,
+candidates, status, and cancel intents are shared across replicas. Retrying a
+completed request returns its receipt before checking account availability.
+The initiating machine must still authenticate; other machines cannot read its
+code or cancel its operation. The holder checks cancellation every second and
+stops its child if its bounded database check fails. The database call limit is
+two seconds; authorization checks and process exit add to the cancellation time.
+
+Known gaps tracked by SAW-12484: add-account still returns HTTP 503 with
+`account_login_unavailable` (PR2); automatic crash/takeover recovery is PR3.
+This intermediate release is not sufficient for the B33 cutover. A lost polling
+replica can leave a pending operation until recovery is delivered. A verifier
+that loses its lease leaves a durable unresolved marker: another replica must
+not repeat verification. Wrong-account candidates reserve the selected account
+and the matching known account across replicas.
+
+Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel
-those logins in file mode first.
+those logins in file mode first. File journals are never imported into the shared
+login table. Apply the explicit schema migration before running this version in
+PostgreSQL mode.
 
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine

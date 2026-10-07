@@ -443,9 +443,11 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
    ```
 
-   The HA service accepts token and registry operations only. Enrollment,
-   reset redemption, and relogin return `503` until their shared workflow
-   state is delivered in phase 4.
+   The HA service accepts token, registry, and existing-account login renewal
+   operations. Renewal status and cancellation use shared PostgreSQL journals.
+   Enrollment, reset redemption, and add-account remain unavailable. Renewal
+   crash/takeover recovery is still pending in SAW-12484 PR3; this intermediate
+   release does not authorize the B33 cutover.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
    `/ready` database health, one upstream refresh for a simultaneous forced
@@ -486,9 +488,10 @@ instance, then repeat the destructive cases in staging.
    keeps one ready pod, topology rules place replacements on another node and
    zone, and token requests recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
-5. **Enrollment and renewal.** In phase three, assert that enrollment and
-   relogin return `503` on every pod because their workflow state remains
-   local. Move the cross-pod success and one-operation assertions to phase four.
+5. **Enrollment and renewal.** Assert that enrollment returns `503`. For renewal, assert cross-pod
+   status/cancel, completed-request retries, continued token service during
+   device polling, and one refresh owner during verification. Keep crash
+   takeover acceptance pending until SAW-12484 PR3.
 6. **Reset idempotency.** In phase three, assert that reset redemption returns
    `503` on every pod. Move the one-spend and terminal-receipt assertions to
    phase four, after the shared journal is delivered

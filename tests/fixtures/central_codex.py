@@ -16,6 +16,7 @@ definitive_rejection = False
 billing_rotated = False
 
 if "login" in sys.argv:
+    pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-pid").write_text(str(os.getpid()))
     # Login writes a grant, but never reads accounts or refreshes credentials.
     mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
     if mode == "login-invalid-prompt":

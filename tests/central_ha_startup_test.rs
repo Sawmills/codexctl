@@ -891,3 +891,470 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
     drop(control);
     connection.await.unwrap();
 }
+
+#[tokio::test]
+async fn postgres_renewal_shares_pending_status_and_cancel_without_stopping_token_service() {
+    let LoginFixture {
+        mut first,
+        mut second,
+        http,
+        token,
+        control,
+        connection,
+        schema,
+        _seed,
+        ..
+    } = login_fixture().await;
+    let operation = json!({"alias":"seat","id":"b".repeat(64)});
+    let response = http
+        .post(format!("{}/v1/relogin/start", first.url))
+        .bearer_auth(&token)
+        .json(&operation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "PostgreSQL must support renewal");
+    let started: Value = response.json().await.unwrap();
+    assert_eq!(started["status"], "pending");
+    let pending: Value = http
+        .post(format!("{}/v1/relogin/status", second.url))
+        .bearer_auth(&token)
+        .json(&operation)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pending["userCode"], "TEST-LOGIN");
+    assert_eq!(
+        request(&http, &second, &token).await.status(),
+        200,
+        "browser approval must not stop the existing account"
+    );
+    let canceled = http
+        .post(format!("{}/v1/relogin/cancel", second.url))
+        .bearer_auth(&token)
+        .json(&operation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(canceled.status(), 200);
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let record: Value = http
+                .post(format!("{}/v1/relogin/status", second.url))
+                .bearer_auth(&token)
+                .json(&operation)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if record["status"] == "canceled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cross-replica cancellation deadline");
+    let renewed = json!({"alias":"seat","id":"c".repeat(64)});
+    let response = http
+        .post(format!("{}/v1/relogin/start", first.url))
+        .bearer_auth(&token)
+        .json(&renewed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let claims = json!({"sub":"synthetic-seat","iat":2000001000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+    let fresh = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
+        "refresh_token":"synthetic-renewal","account_id":"synthetic-seat"}});
+    store::atomic_write(
+        &first.root.path().join("login-release"),
+        &serde_json::to_vec(&fresh).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let result: Value = http
+                .post(format!("{}/v1/relogin/status", second.url))
+                .bearer_auth(&token)
+                .json(&renewed)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_ne!(result["status"], "failed", "{result}");
+            if result["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("renewal must verify and complete");
+    let result = request(&http, &second, &token).await;
+    assert_eq!(result.status(), 200);
+    // The client can lose completion and retry through another replica.
+    let receipt: Value = http
+        .post(format!("{}/v1/relogin/start", second.url))
+        .bearer_auth(&token)
+        .json(&renewed)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(receipt["status"], "completed");
+    first.stop().await;
+    second.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    connection.abort();
+}
+
+#[tokio::test]
+async fn postgres_backfill_refuses_legacy_device_login_journals() {
+    let database = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    central::managed::setup(&state, &key).unwrap();
+    let operation = "a".repeat(64);
+    let journal = state
+        .join("account-logins")
+        .join(account_key("test", "new"))
+        .join("relogin")
+        .join(&operation);
+    store::ensure_private_dir(&journal).unwrap();
+    store::atomic_write(
+        &journal.join("record.json"),
+        &serde_json::to_vec(&json!({
+            "sequence":1,"id":operation,"user":"test","device":"test-machine","alias":"new",
+            "broker":{"pid":1,"incarnation":"synthetic"},"child":{"status":"not_started"},
+            "original_revision":"","candidate_revision":null,"candidate":null,"phase":"starting",
+            "code":null,"error":null,"retired":false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let result = command(&database, &state, &key, "backfill")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !result.status.success(),
+        "backfill must refuse pending legacy logins"
+    );
+    assert!(String::from_utf8_lossy(&result.stderr).contains("finish pending logins in file mode"));
+}
+
+struct LoginFixture {
+    first: Pod,
+    second: Pod,
+    http: reqwest::Client,
+    token: String,
+    control: tokio_postgres::Client,
+    connection: tokio::task::JoinHandle<()>,
+    schema: String,
+    database: String,
+    key: std::path::PathBuf,
+    _seed: Pod,
+}
+async fn login_fixture() -> LoginFixture {
+    let Ok(database) = std::env::var("DATABASE_URL") else {
+        assert_ne!(
+            std::env::var("CI").ok().as_deref(),
+            Some("true"),
+            "DATABASE_URL required in CI"
+        );
+        eprintln!("skipping real PostgreSQL startup test: DATABASE_URL unset");
+        panic!("DATABASE_URL required for HA renewal test");
+    };
+    let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let schema = format!(
+        "startup_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    control
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let mut database = reqwest::Url::parse(&database).unwrap();
+    database
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+
+    let state = root.path().join("state");
+    let key = root.path().join("key");
+    central::managed::setup(&state, &key).unwrap();
+    store::atomic_write(
+        &state.join("users.json"),
+        &serde_json::to_vec(&json!([
+            {"id":"test","email":"test@example.invalid","enabled":true}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let token_file = root.path().join("machine-token");
+    central::register(&state, "test-machine", "sawmills", "test", &token_file).unwrap();
+    let token = std::fs::read_to_string(&token_file).unwrap();
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(75))
+        .build()
+        .unwrap();
+    let mut seed = Pod::spawn(database.as_str(), &key, root, "file").await;
+    store::atomic_write(&seed.root.path().join("mode"), b"").unwrap();
+    for (alias, account) in [("seat", "synthetic-seat"), ("other", "other-seat")] {
+        let claims = json!({"sub":account,"iat":2000000000_u64,"exp":4102444800_u64,
+            "https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_plan_type":"pro"}});
+        let auth = json!({"tokens":{
+            "access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),
+            "refresh_token":"synthetic-refresh","account_id":account}});
+        let response = http
+            .post(format!("{}/v1/accounts", seed.url))
+            .bearer_auth(&token)
+            .json(&json!({"alias":alias,"auth":auth}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "file-mode seed import");
+    }
+    let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
+    assert_eq!(generation(&seed_token), 1);
+    seed.stop().await;
+    for operation in ["migrate", "backfill"] {
+        let output = command(database.as_str(), &state, &key, operation)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let first = Pod::start(database.as_str(), &key).await;
+    let second = Pod::start(database.as_str(), &key).await;
+    LoginFixture {
+        first,
+        second,
+        http,
+        token,
+        control,
+        connection,
+        schema,
+        database: database.to_string(),
+        key,
+        _seed: seed,
+    }
+}
+
+async fn login_request(f: &LoginFixture, pod: &Pod, action: &str, id: &str) -> Value {
+    let response = f
+        .http
+        .post(format!("{}/v1/relogin/{action}", pod.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "{action}");
+    response.json().await.unwrap()
+}
+async fn stop_fixture(mut f: LoginFixture) {
+    f.first.stop().await;
+    f.second.stop().await;
+    f.control
+        .batch_execute(&format!("DROP SCHEMA {} CASCADE", f.schema))
+        .await
+        .unwrap();
+    f.connection.abort();
+}
+async fn wait_dead(pid: u32) {
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if unsafe { libc::kill(pid as i32, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("login child must stop after lease loss");
+}
+#[tokio::test]
+async fn postgres_renewal_stops_polling_when_its_operation_epoch_is_replaced() {
+    let f = login_fixture().await;
+    let id = "d".repeat(64);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET epoch=epoch+1,holder_id='replacement' WHERE id=$1",f.schema),&[&id]).await.unwrap();
+    wait_dead(pid).await;
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        200,
+        "polling lease loss leaves existing account usable"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_cancel_stops_a_login_holder_cut_off_from_the_database() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut database = reqwest::Url::parse(&f.database).unwrap();
+    let upstream = format!(
+        "{}:{}",
+        database.host_str().unwrap(),
+        database.port().unwrap_or(5432)
+    );
+    let proxy = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (mut incoming, _) = listener.accept().await.unwrap();
+            let upstream = upstream.clone();
+            connections.spawn(async move {
+                let mut outgoing = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+            });
+        }
+    });
+    database.set_host(Some("127.0.0.1")).unwrap();
+    database.set_port(Some(address.port())).unwrap();
+    f.first = Pod::start(database.as_str(), &f.key).await;
+    let id = "e".repeat(64);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    let pid = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    proxy.abort();
+    let _ = proxy.await;
+    login_request(&f, &f.second, "cancel", &id).await;
+    wait_dead(pid).await;
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+fn renewal_grant() -> Value {
+    let claims = json!({"sub":"synthetic-seat","iat":2000001000_u64,"exp":4102444800_u64,"generation":10,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+    json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-renewal","account_id":"synthetic-seat"}})
+}
+#[tokio::test]
+async fn postgres_verification_loss_fences_the_candidate_across_replica_restart() {
+    let mut f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let id = "f".repeat(64);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pid: Value = serde_json::from_slice(
+        &std::fs::read(
+            f.first
+                .root
+                .path()
+                .join("state/accounts")
+                .join(account_key("test", "seat"))
+                .join("runtime/pid"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET epoch=epoch+1,holder_id='replacement',expires_at=clock_timestamp() WHERE account_id=$1",f.schema),&[&account_key("test","seat")]).await.unwrap();
+    wait_dead(pid["pid"].as_u64().unwrap() as u32).await;
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "failed"
+    );
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "unresolved verification must block normal refresh"
+    );
+    f.first.stop().await;
+    f.first = Pod::start(&f.database, &f.key).await;
+    assert_eq!(
+        f.first.launches(),
+        0,
+        "startup must not verify an in-flight candidate again"
+    );
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_wrong_account_candidate_keeps_both_accounts_reserved() {
+    let f = login_fixture().await;
+    let id = "1".repeat(64);
+    login_request(&f, &f.first, "start", &id).await;
+    let claims = json!({"sub":"other-seat","iat":2000001000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"other-seat","chatgpt_plan_type":"pro"}});
+    let wrong = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-wrong","account_id":"other-seat"}});
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&wrong).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let other = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"other","billing":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        other.status(),
+        503,
+        "wrong-account grant must reserve the affected identity across replicas"
+    );
+    stop_fixture(f).await;
+}

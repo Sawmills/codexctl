@@ -27,6 +27,7 @@ use tokio::sync::Mutex;
 pub(super) mod add;
 mod http;
 mod inventory;
+mod shared;
 pub(super) use inventory::{
     AdmissionDenied, AdmissionKind, ClearedIdentity, ProcessState, clear_registry,
     identity_inventory,
