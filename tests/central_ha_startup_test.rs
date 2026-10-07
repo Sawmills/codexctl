@@ -1999,15 +1999,20 @@ async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
 
 #[tokio::test]
 async fn postgres_renewal_uses_committed_revision_after_unpublished_refresh() {
-    renewal_after_unpublished_refresh(false).await;
+    renewal_after_unpublished_refresh(false, false).await;
 }
 
 #[tokio::test]
 async fn postgres_obsolete_settlement_cannot_fence_a_completed_renewal() {
-    renewal_after_unpublished_refresh(true).await;
+    renewal_after_unpublished_refresh(true, false).await;
 }
 
-async fn renewal_after_unpublished_refresh(overlap: bool) {
+#[tokio::test]
+async fn postgres_remote_renewal_recovers_an_unpublished_local_revision() {
+    renewal_after_unpublished_refresh(false, true).await;
+}
+
+async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool) {
     let f = login_fixture().await;
     f.control
         .batch_execute(&format!(
@@ -2057,9 +2062,10 @@ async fn renewal_after_unpublished_refresh(overlap: bool) {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     let id = "b3".repeat(32);
-    login_request(&f, &f.first, "start", &id).await;
+    let renewer = if remote { &f.second } else { &f.first };
+    login_request(&f, renewer, "start", &id).await;
     store::atomic_write(
-        &f.first.root.path().join("login-release"),
+        &renewer.root.path().join("login-release"),
         &serde_json::to_vec(&renewal_grant()).unwrap(),
     )
     .unwrap();

@@ -462,11 +462,13 @@ impl Broker {
         Ok(())
     }
 
-    async fn save_owner_record(&self, owner: &Owner) -> Result<()> {
+    async fn save_owner_record(&self, owner: &mut Owner) -> Result<()> {
         let Some(central) = self.central.as_ref() else {
             return Ok(());
         };
-        central.save_account(&Self::owner_record(owner)?).await
+        central.save_account(&Self::owner_record(owner)?).await?;
+        owner.shared_revision = Some(owner.vault.revision.max(1));
+        Ok(())
     }
 
     fn owner_record(owner: &Owner) -> Result<CredentialRecord> {
@@ -505,6 +507,7 @@ impl Broker {
                 owner.rpc = None;
                 owner.refresh_enabled = false;
             }
+            owner.shared_revision = Some(record.revision);
             return Ok(());
         }
         owner.vault.revision = owner.vault.revision.max(1);
@@ -725,15 +728,9 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
-    // Verification saves its settled vault before the shared commit responds.
-    // Retained verification input distinguishes an ambiguous completion from a
-    // later rejection of credentials that were already served successfully.
-    let pending_completion = owner.vault.verified && owner.verification_input.is_some();
-    if record.revision < owner.vault.revision
-        || (record.revision == owner.vault.revision && !pending_completion)
-    {
-        return Ok(false);
-    }
+    // Local snapshots can advance without publication. Renewal evidence must
+    // be newer than the last shared revision, not the unpublished local one.
+    let shared_revision = owner.shared_revision.unwrap_or(owner.vault.revision);
     let committed: vault::Vault = serde_json::from_value(record.vault)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     vault::validate_auth(&committed.auth)
@@ -745,17 +742,11 @@ async fn reconcile_owner_from_central(
         && !committed.import_rejected
         && (!owner.available || owner.routing_refused || !owner.vault.verified)
         && central
-            .login_completed_after(
-                account_id,
-                owner
-                    .vault
-                    .revision
-                    .saturating_sub(i64::from(pending_completion)),
-                record.revision,
-            )
+            .login_completed_after(account_id, shared_revision, record.revision)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-    if record.revision == owner.vault.revision && !renewed {
+    if record.revision <= owner.vault.revision && !renewed {
+        owner.shared_revision = Some(record.revision);
         return Ok(false);
     }
     vault::save(&owner.state, &owner.key, &committed)
@@ -788,6 +779,7 @@ async fn reconcile_owner_from_central(
         owner.retry_started = None;
         owner.retry_failures = 0;
     }
+    owner.shared_revision = Some(record.revision);
     Ok(true)
 }
 
@@ -1096,6 +1088,9 @@ async fn settle_background_recovery(
         }
         {
             let mut owner = owner_ref.lock().await;
+            if owner.recovery_generation == recovery_generation && central.is_some() {
+                owner.shared_revision = Some(record.revision);
+            }
             if owner.recovery_generation == recovery_generation
                 && matches!(recovery, SettlementRecovery::Available)
             {
@@ -1447,6 +1442,9 @@ async fn token(
                 owner.routing_refused = true;
                 owner.refresh_enabled = false;
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            }
+            if worker.central.is_some() {
+                owner.shared_revision = Some(record.revision);
             }
             if auth_changed {
                 vault::save(&owner.state, &owner.key, &owner.vault).map_err(|_| {
@@ -2290,9 +2288,10 @@ impl Broker {
                 if !written {
                     return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
                 }
+                owner.shared_revision = Some(owner.vault.revision.max(1));
                 central_published = true;
             } else {
-                self.save_owner_record(&owner).await.map_err(|_| {
+                self.save_owner_record(&mut owner).await.map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
@@ -2651,6 +2650,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         retry_started: None,
         retry_failures: 0,
         recovery_generation: 0,
+        shared_revision: None,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
@@ -3009,6 +3009,9 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 } else {
                     true
                 };
+                if written && central.is_some() {
+                    owner.shared_revision = Some(owner.vault.revision.max(1));
+                }
                 match (probe, local_saved, written) {
                     (Ok(_), true, true) => {
                         owner.available = true;
@@ -3282,6 +3285,7 @@ pub async fn serve(
                     retry_started: None,
                     retry_failures: 0,
                     recovery_generation: 0,
+                    shared_revision: None,
                     routing_refused: false,
                     refresh_enabled: false,
                     limits: None,

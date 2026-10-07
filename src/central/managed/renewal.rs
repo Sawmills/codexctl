@@ -186,6 +186,7 @@ impl Broker {
             central
                 .login_complete(op, &lease, &record, committed_revision)
                 .await?;
+            owner.shared_revision = Some(record.revision);
             owner.verification_input = None;
             Ok(())
         };

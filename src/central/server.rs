@@ -123,6 +123,8 @@ pub(super) struct Owner {
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
     pub(super) recovery_generation: u64,
+    /// Last observed or successfully published shared revision, excluding local journals.
+    pub(super) shared_revision: Option<i64>,
     pub(super) routing_refused: bool,
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
@@ -713,6 +715,7 @@ pub async fn serve(
         retry_started: None,
         retry_failures: 0,
         recovery_generation: 0,
+        shared_revision: None,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
