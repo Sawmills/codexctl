@@ -1693,26 +1693,11 @@ pub(super) async fn account_catalog(
                         .as_ref()
                         .is_some_and(|usage| usage.max_used_percent.is_none())
                     && let Some(access) = access.as_deref()
-                {
-                    match broker
-                        .catalog
-                        .fetch_direct(access, &summary.account_id)
+                    && let Some(snapshot) = broker
+                        .complete_usage(&key, access, &summary.account_id)
                         .await
-                    {
-                        Ok(usage) => {
-                            let age = summary.usage_age_seconds;
-                            let mut snapshot = crate::statusline::Usage::from_usage(&usage);
-                            snapshot.age_seconds = age.unwrap_or_default();
-                            summary.statusline_usage = Some(snapshot);
-                        }
-                        Err(reason) => {
-                            broker.record_failure(
-                                reason,
-                                "borrowed_usage",
-                                StatusCode::SERVICE_UNAVAILABLE,
-                            );
-                        }
-                    }
+                {
+                    summary.statusline_usage = Some(snapshot);
                 }
                 summary.alias = grant.reference;
                 summary.user_id = user;

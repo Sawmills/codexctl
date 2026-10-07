@@ -64,7 +64,41 @@ pub(in crate::central) struct BorrowedEntry {
     pub paused: Option<&'static str>,
 }
 
+/// Complete usage for borrowed catalog entries, per server state and account.
+type UsageCache = tokio::sync::Mutex<
+    std::collections::HashMap<String, (std::time::Instant, Option<crate::statusline::Usage>)>,
+>;
+static COMPLETE_USAGE: std::sync::OnceLock<UsageCache> = std::sync::OnceLock::new();
+const COMPLETE_USAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Broker {
+    /// A complete (all-window) usage snapshot for a borrowed entry. Results
+    /// and failures are kept for 60 seconds, and one lock around the fetch
+    /// lets concurrent polls share a single upstream request.
+    pub(in crate::central) async fn complete_usage(
+        &self,
+        key: &str,
+        access: &str,
+        account_id: &str,
+    ) -> Option<crate::statusline::Usage> {
+        let mut cache = COMPLETE_USAGE.get_or_init(Default::default).lock().await;
+        let id = format!("{}\0{key}", self.state.display());
+        if let Some((at, usage)) = cache.get(&id)
+            && at.elapsed() < COMPLETE_USAGE_TTL
+        {
+            return usage.clone();
+        }
+        let usage = match self.catalog.fetch_direct(access, account_id).await {
+            Ok(usage) => Some(crate::statusline::Usage::from_usage(&usage)),
+            Err(reason) => {
+                self.record_failure(reason, "borrowed_usage", StatusCode::SERVICE_UNAVAILABLE);
+                None
+            }
+        };
+        cache.insert(id, (std::time::Instant::now(), usage.clone()));
+        usage
+    }
+
     /// Loans use the configured store, or the state directory's file store.
     pub(in crate::central) fn loan_store(&self) -> CentralStore {
         self.central
