@@ -71,6 +71,15 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         .map(|g| g.id)
         .collect();
     assert_eq!(active, [id("two")], "an ended grant is not active");
+    // Token issue events are recorded only while the grant is active.
+    store
+        .append_loan_audit(&AuditEvent::token_issued(2_500, &id("two"), "machine"))
+        .await
+        .unwrap();
+    store
+        .append_loan_audit(&AuditEvent::token_issued(2_600, &id("two"), "machine"))
+        .await
+        .unwrap();
     let other = id("other-account");
     assert!(
         store
@@ -118,14 +127,6 @@ async fn scenario(store: &CentralStore, prefix: &str) {
             .all(|g| !g.id.starts_with(prefix))
     );
 
-    store
-        .append_loan_audit(&AuditEvent::token_issued(2_500, &id("two"), "machine"))
-        .await
-        .unwrap();
-    store
-        .append_loan_audit(&AuditEvent::token_issued(2_600, &id("two"), "machine"))
-        .await
-        .unwrap();
     let mut audit = store.loan_audit("borrower", None, None, 100).await.unwrap();
     audit.retain(|e| e.grant_id == id("one") || e.grant_id == id("two"));
     audit.sort_by_key(|event| (event.at, event.grant_id.clone()));

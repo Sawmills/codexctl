@@ -632,6 +632,10 @@ async fn a_loan_that_ends_during_the_refresh_delivers_no_token() {
         response.json::<Value>().await.unwrap()["error"],
         "loan_ended"
     );
+    assert!(
+        !kinds(&fixture.audit(&fixture.lender).await).contains(&"token_issued".to_owned()),
+        "a refused request records no token issue"
+    );
 }
 
 #[tokio::test]

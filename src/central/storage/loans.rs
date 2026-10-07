@@ -305,7 +305,8 @@ impl CentralStore {
         }
     }
 
-    /// Append an audit event. An event whose coalescing key exists is skipped.
+    /// Append an audit event. An event whose coalescing key exists is skipped,
+    /// and a token issue event is written only while its grant is active.
     pub async fn append_loan_audit(&self, event: &AuditEvent) -> Result<()> {
         match self {
             Self::File(file) => file.append_loan_audit(event),
@@ -480,7 +481,12 @@ impl FileStore {
             return Ok(());
         }
         self.with_lock(|state| {
-            if !duplicate(state) {
+            let ended = event.kind == AuditKind::TokenIssued
+                && !state
+                    .loans
+                    .get(&event.grant_id)
+                    .is_some_and(|grant| grant.ended_at.is_none() && grant.deleted_at.is_none());
+            if !duplicate(state) && !ended {
                 state.loan_audit.push(event.clone());
             }
             Ok(())
@@ -710,7 +716,9 @@ impl PostgresStore {
                     audit_table!(),
                     "(",
                     audit_columns!(),
-                    ") VALUES($1,$2,$3,$4,$5,$6,$7,NULL) ON CONFLICT DO NOTHING"
+                    ") SELECT $1,$2,$3,$4,$5,$6,$7,NULL WHERE $3 <> 'token_issued' OR EXISTS (SELECT 1 FROM ",
+                    loans_table!(),
+                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL) ON CONFLICT DO NOTHING"
                 ),
                 &[
                     &event.grant_id,

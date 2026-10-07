@@ -1669,6 +1669,35 @@ pub(super) async fn account_catalog(
                 }
             }
             if let Some((grant, paused)) = loan {
+                // A native seed has no all-window maximum, which borrowed
+                // placement needs; fetch complete usage for this entry only.
+                if !summary.usage_stale
+                    && summary
+                        .statusline_usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.max_used_percent.is_none())
+                    && let Some(access) = access.as_deref()
+                {
+                    match broker
+                        .catalog
+                        .fetch_direct(access, &summary.account_id)
+                        .await
+                    {
+                        Ok(usage) => {
+                            let age = summary.usage_age_seconds;
+                            let mut snapshot = crate::statusline::Usage::from_usage(&usage);
+                            snapshot.age_seconds = age.unwrap_or_default();
+                            summary.statusline_usage = Some(snapshot);
+                        }
+                        Err(reason) => {
+                            broker.record_failure(
+                                reason,
+                                "borrowed_usage",
+                                StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                    }
+                }
                 summary.alias = grant.reference;
                 summary.user_id = user;
                 if paused.is_some() {
