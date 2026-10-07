@@ -1083,6 +1083,10 @@ async fn token(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
     let owner_ref = owner.clone();
+    // A borrowed request names the lender's alias through its grant.
+    let lender_alias = borrowed
+        .as_ref()
+        .map(|borrowed| borrowed.grant.alias.clone());
     let (mut token, alias, account_id) = tokio::spawn(async move {
         let (import_guard, mut owner) = if worker
             .central.as_ref()
@@ -1109,11 +1113,21 @@ async fn token(
         // A rename can re-key this owner while the request waits for its lock.
         // The old alias must never be served once the rename committed.
         let requested = request.alias.as_deref().unwrap_or_default().trim();
-        if !owner.vault.alias.trim().eq_ignore_ascii_case(requested) {
-            return Err(
-                super::rename::renamed_error(&worker, &owner.vault.user, requested)
-                    .unwrap_or_else(|| worker.error(StatusCode::NOT_FOUND, "account_not_found")),
-            );
+        match lender_alias.as_deref() {
+            // A rename of a lent account ends the borrower's access here.
+            Some(expected) if !owner.vault.alias.trim().eq_ignore_ascii_case(expected) => {
+                return Err(worker.error(StatusCode::FORBIDDEN, "loan_ended"));
+            }
+            Some(_) => {}
+            None if !owner.vault.alias.trim().eq_ignore_ascii_case(requested) => {
+                return Err(
+                    super::rename::renamed_error(&worker, &owner.vault.user, requested)
+                        .unwrap_or_else(|| {
+                            worker.error(StatusCode::NOT_FOUND, "account_not_found")
+                        }),
+                );
+            }
+            None => {}
         }
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));

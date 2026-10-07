@@ -1007,3 +1007,49 @@ async fn a_history_read_fails_when_the_retention_cannot_be_applied() {
         (StatusCode::SERVICE_UNAVAILABLE, json!("loan_store_failed"))
     );
 }
+
+#[tokio::test]
+async fn a_rename_is_refused_while_the_account_is_lent() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    // Renames need a writable server.
+    let mut broker = fixture.broker.clone();
+    broker.read_only = false;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/v1/accounts/rename",
+        listener.local_addr().unwrap()
+    );
+    let app = crate::central::managed::api_routes().with_state(broker);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let rename = || async {
+        let response = reqwest::Client::new()
+            .post(&url)
+            .headers(fixture.lender.clone())
+            .json(&json!({"alias":"main","newAlias":"renamed"}))
+            .send()
+            .await
+            .unwrap();
+        (
+            response.status(),
+            response.json::<Value>().await.unwrap_or(Value::Null),
+        )
+    };
+    let (status, body) = rename().await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("rename_blocked_by_loan"))
+    );
+    assert_eq!(
+        fixture.token(&fixture.borrower, "alice/main").await.0,
+        StatusCode::OK
+    );
+    fixture
+        .end(&fixture.lender, grant["id"].as_str().unwrap())
+        .await;
+    let (status, body) = rename().await;
+    server.abort();
+    assert_ne!(body["error"], "rename_blocked_by_loan", "{status} {body}");
+}
