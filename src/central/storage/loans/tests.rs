@@ -390,29 +390,90 @@ async fn a_token_issue_succeeds_only_while_the_grant_is_active() {
     crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
     let store = CentralStore::file(root.path(), &key);
     store.migrate().await.unwrap();
-    assert!(store.create_loan(&grant("g", "a", 5_000)).await.unwrap());
+    let now = chrono::Utc::now().timestamp();
     assert!(
         store
-            .issue_token(&AuditEvent::token_issued(2_000, "g", "m"))
+            .create_loan(&grant("g", "a", now + 3_600))
             .await
             .unwrap()
     );
     assert!(
-        !store
-            .issue_token(&AuditEvent::token_issued(5_000, "g", "m"))
+        store
+            .create_loan(&grant("past", "b", now - 1))
             .await
-            .unwrap(),
-        "at the end time"
+            .unwrap()
+    );
+    assert!(store.issue_token("g", "m").await.unwrap());
+    assert!(
+        !store.issue_token("past", "m").await.unwrap(),
+        "after the end time"
     );
     store
-        .end_loan("g", 3_000, "lender", EndReason::Revoked)
+        .end_loan("g", now, "lender", EndReason::Revoked)
         .await
         .unwrap();
     assert!(
-        !store
-            .issue_token(&AuditEvent::token_issued(3_500, "g", "other"))
-            .await
-            .unwrap(),
+        !store.issue_token("g", "other").await.unwrap(),
         "after an end"
     );
+}
+
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn postgres_token_issue_succeeds_only_while_the_grant_is_active() {
+    if std::env::var("DATABASE_URL").is_err() {
+        if std::env::var("CI").ok().as_deref() == Some("true") {
+            panic!("DATABASE_URL must be set for PostgreSQL scenarios in CI");
+        }
+        return;
+    }
+    for mode in [
+        super::super::StoreMode::Postgres,
+        super::super::StoreMode::Dual,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(mode, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = shared.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            store
+                .create_loan(&grant("g", "a", now + 3_600))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .create_loan(&grant("past", "b", now - 1))
+                .await
+                .unwrap()
+        );
+        assert!(store.issue_token("g", "m").await.unwrap());
+        assert!(
+            store.issue_token("g", "m").await.unwrap(),
+            "a coalesced repeat"
+        );
+        assert!(!store.issue_token("past", "m").await.unwrap());
+        let issued = store
+            .loan_audit("borrower", Some("g"), None, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == AuditKind::TokenIssued)
+            .count();
+        assert_eq!(issued, 1, "{mode}");
+        store
+            .end_loan("g", now, "lender", EndReason::Revoked)
+            .await
+            .unwrap();
+        assert!(!store.issue_token("g", "other").await.unwrap());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
 }

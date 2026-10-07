@@ -435,7 +435,7 @@ impl Broker {
     ) -> Result<(), HttpError> {
         let issued = self
             .loan_store()
-            .issue_token(&AuditEvent::token_issued(now(), &grant.id, &device.id))
+            .issue_token(&grant.id, &device.id)
             .await
             .map_err(|error| self.loan_failure("issue", error))?;
         if !issued {

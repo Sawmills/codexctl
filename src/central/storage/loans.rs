@@ -176,16 +176,23 @@ impl CentralStore {
     /// whether it was. One atomic step: PostgreSQL locks the grant row for
     /// the statement and file mode holds the store lock, so an end commits
     /// either before (no token) or after (the token was issued first).
-    pub async fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+    pub async fn issue_token(&self, grant_id: &str, machine: &str) -> Result<bool> {
         match self {
-            Self::File(file) => file.issue_token(event),
-            Self::Postgres(db) => bounded_db(db.issue_token(event)).await,
+            Self::File(file) => file.issue_token(grant_id, machine),
+            Self::Postgres(db) => Ok(bounded_db(db.issue_token(grant_id, machine))
+                .await?
+                .is_some()),
             Self::Dual { file, postgres, .. } => {
-                let active = bounded_db(postgres.issue_token(event)).await?;
-                if active && let Err(error) = file.append_loan_audit(event) {
+                let issued = bounded_db(postgres.issue_token(grant_id, machine)).await?;
+                // Mirror the committed event as is; the grant may already
+                // show as ended in the file by now.
+                if let Some(at) = issued
+                    && let Err(error) =
+                        file.mirror_audit(&AuditEvent::token_issued(at, grant_id, machine))
+                {
                     mirror_failure(self, "issue_token", &error);
                 }
-                Ok(active)
+                Ok(issued.is_some())
             }
         }
     }
@@ -524,20 +531,38 @@ impl FileStore {
         })
     }
 
-    fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+    fn issue_token(&self, grant_id: &str, machine: &str) -> Result<bool> {
         self.with_lock(|state| {
+            // The time is read under the lock, after any wait for it.
+            let event = AuditEvent::token_issued(chrono::Utc::now().timestamp(), grant_id, machine);
             let active = state
                 .loans
-                .get(&event.grant_id)
+                .get(grant_id)
                 .is_some_and(|grant| grant.active(event.at) && grant.deleted_at.is_none());
             let duplicate = state
                 .loan_audit
                 .iter()
                 .any(|existing| existing.coalesce_key == event.coalesce_key);
             if active && !duplicate {
-                state.loan_audit.push(event.clone());
+                state.loan_audit.push(event);
             }
             Ok(active)
+        })
+    }
+
+    /// Copy an event another store already committed, coalesced, with no
+    /// grant-state check.
+    fn mirror_audit(&self, event: &AuditEvent) -> Result<()> {
+        self.with_lock(|state| {
+            if event.coalesce_key.is_none()
+                || !state
+                    .loan_audit
+                    .iter()
+                    .any(|existing| existing.coalesce_key == event.coalesce_key)
+            {
+                state.loan_audit.push(event.clone());
+            }
+            Ok(())
         })
     }
 
@@ -599,26 +624,23 @@ impl PostgresStore {
             .collect()
     }
 
-    async fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+    /// Returns the issue time when the grant was active. The time comes
+    /// from `clock_timestamp()`, which PostgreSQL re-evaluates after any wait
+    /// for the grant row lock.
+    async fn issue_token(&self, grant_id: &str, machine: &str) -> Result<Option<i64>> {
         let client = self.client().await?;
         Ok(client
             .query_one(
                 concat!(
-                    "WITH grant_row AS (SELECT id FROM ",
+                    "WITH grant_row AS (SELECT id, extract(epoch FROM clock_timestamp())::bigint AS at FROM ",
                     loans_table!(),
-                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL AND ends_at > $2 FOR SHARE), issued AS (INSERT INTO ",
+                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL AND ends_at > extract(epoch FROM clock_timestamp())::bigint FOR SHARE), issued AS (INSERT INTO ",
                     audit_table!(),
                     "(",
                     audit_columns!(),
-                    ") SELECT id,$2,$3,NULL,$4,NULL,$5,NULL FROM grant_row ON CONFLICT DO NOTHING) SELECT EXISTS(SELECT 1 FROM grant_row)"
+                    ") SELECT id, at, 'token_issued', NULL, $2, NULL, 'token:' || id || ':' || $2 || ':' || (at / 3600), NULL FROM grant_row ON CONFLICT DO NOTHING) SELECT (SELECT at FROM grant_row)"
                 ),
-                &[
-                    &event.grant_id,
-                    &event.at,
-                    &event.kind.as_str(),
-                    &event.machine,
-                    &event.coalesce_key,
-                ],
+                &[&grant_id, &machine],
             )
             .await?
             .get(0))
