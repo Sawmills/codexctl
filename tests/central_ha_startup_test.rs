@@ -2980,6 +2980,22 @@ async fn postgres_add_refuses_an_account_owned_by_another_company_user_before_ve
         200,
         "rightful owner's credentials remain usable"
     );
+    // Polling an already failed receipt must not count another failed attempt.
+    add_request(&f, &f.second, "status", &operation).await;
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_failed_requests_total{reason=\"relogin_failed\"} 1"),
+        "count the refused admission once: {metrics}"
+    );
     stop_fixture(f).await;
 }
 
@@ -3990,5 +4006,110 @@ async fn identity_database_failure(query_pattern: &str, request_prefix: &str) {
         "a database failure before provider contact is neither a wrong account nor unresolved verification"
     );
     assert_eq!(f.first.launches(), 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_foreign_account_keeps_serving_while_add_admission_waits() {
+    let f = login_fixture_with_accounts(false, true).await;
+    // Queue a control session behind candidate publication's admission lock,
+    // then hold that lock so admission cannot reject the foreign grant yet.
+    f.control
+        .batch_execute(&format!(
+            r#"
+        CREATE SEQUENCE {0}.candidate_barrier;
+        CREATE FUNCTION {0}.pause_candidate() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='candidate' AND OLD.phase<>'candidate' THEN
+                PERFORM nextval('{0}.candidate_barrier');
+                PERFORM pg_sleep(0.5);
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER pause_candidate AFTER UPDATE ON {0}.central_login_operations
+        FOR EACH ROW EXECUTE FUNCTION {0}.pause_candidate();
+    "#,
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let operation = json!({"alias":"foreign-copy","id":"a9".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&foreign_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let called: bool = f
+                .control
+                .query_one(
+                    &format!("SELECT is_called FROM {}.candidate_barrier", f.schema),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if called {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.control
+        .query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        add_request(&f, &f.second, "status", &operation).await["status"],
+        "verifying"
+    );
+    let foreign_token =
+        std::fs::read_to_string(f._seed.root.path().join("foreign-machine-token")).unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&foreign_token)
+        .json(&json!({"alias":"foreign-seat"}))
+        .send();
+    tokio::pin!(response);
+    // Once the foreign refresh lease is admitted, its fenced credential write
+    // also needs the lock. Release it then, before either bounded DB call expires.
+    let early = tokio::select! {
+        result = &mut response => Some(result.unwrap()),
+        _ = timeout(Duration::from_secs(1), async {
+            loop {
+                let waiting: i64 = f.control.query_one(
+                    "SELECT count(*) FROM pg_locks w JOIN pg_locks h ON w.locktype=h.locktype AND w.database=h.database AND w.classid=h.classid AND w.objid=h.objid AND w.objsubid=h.objsubid WHERE h.pid=pg_backend_pid() AND h.granted AND h.locktype='advisory' AND NOT w.granted", &[]).await.unwrap().get(0);
+                if waiting >= 2 { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }) => None,
+    };
+    f.control
+        .query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    let status = match early {
+        Some(response) => response.status(),
+        None => response.await.unwrap().status(),
+    };
+    assert_eq!(
+        status, 200,
+        "an unadmitted add must not fence another company user's account"
+    );
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["error"],
+        "account_already_owned"
+    );
     stop_fixture(f).await;
 }

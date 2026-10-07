@@ -322,6 +322,9 @@ different namespaces proves no agreement. An undecidable add reports
 `account_identity_unresolved` and retains its issued grant as a quarantine.
 Machine authorization is checked again inside add admission after lock waits.
 
+A database failure before the refresh child starts reports
+`relogin_interrupted_retry` and keeps a failed receipt and its captured grant.
+Start a new login to retry. Resuming captured candidates remains part of PR3.
 Automatic crash/takeover recovery remains in SAW-12484 PR3.
 This intermediate release is not sufficient for the B33 cutover. Status and
 start retire expired `starting` or `pending` device-login receipts as

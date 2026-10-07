@@ -332,11 +332,11 @@ impl CentralStore {
             let mut client = db.admission_client().await?;
             let tx = client.transaction().await?;
             lock_admission(&tx).await?;
-            let row = tx.query_opt("SELECT encrypted_vault FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND workspace=$3 AND deleted_at IS NULL", &[&op.account()?,&op.user,&candidate.workspace]).await?.ok_or(CandidateIdentityMismatch)?;
+            let row = tx.query_opt("SELECT encrypted_vault FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL", &[&op.account()?,&op.user]).await?.context("login account missing")?;
             let bytes: Vec<u8> = row.get(0);
             let saved: vault::Vault = serde_json::from_slice(&vault::decrypt_with_cipher(&cipher,&bytes)?)?;
             let current = Claims::from_auth(&saved.auth)?;
-            if !matches!(known_claims(&tx,op.account()?,&current).await?.compare(&candidate.logins),IdentityDecision::Same) { return Err(CandidateIdentityMismatch.into()); }
+            if current.workspace != candidate.workspace || !matches!(known_claims(&tx,op.account()?,&current).await?.compare(&candidate.logins),IdentityDecision::Same) { return Err(CandidateIdentityMismatch.into()); }
             Ok(())
         }).await
     }

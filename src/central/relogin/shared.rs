@@ -459,6 +459,15 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         } else {
             op.payload.candidate = None;
             db.login_save(op, LoginPhase::Failed).await?;
+            eprintln!(
+                "{}",
+                json!({"operation":"login_add","stage":"admission","reason":reason})
+            );
+            broker.record_failure(
+                "relogin_failed",
+                "relogin_add_admission",
+                StatusCode::CONFLICT,
+            );
         }
         return Ok(());
     }
