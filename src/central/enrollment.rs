@@ -7,8 +7,9 @@ use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use anyhow::{Result, bail};
 use axum::{
     Form, Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -255,7 +256,7 @@ fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
 }
 fn page(html: String) -> Response {
-    let styles = include_str!("dashboard/style.css");
+    let styles = include_str!("enrollment/style.css");
     let script = include_str!("dashboard/copy.js");
     let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
     let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
@@ -277,6 +278,62 @@ fn page(html: String) -> Response {
         Html(document),
     )
         .into_response()
+}
+/// Browser steps show a page for an error; API clients keep the JSON body and status.
+async fn browser_errors(request: Request, next: Next) -> Response {
+    let html = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/html"));
+    let response = next.run(request).await;
+    if !html || !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let reason = axum::body::to_bytes(body, 4096)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_default();
+    let mut page = error_page(&reason);
+    *page.status_mut() = parts.status;
+    // Keep the already-recorded failure marker for the HTTP observer.
+    page.extensions_mut().extend(parts.extensions);
+    page
+}
+fn error_page(reason: &str) -> Response {
+    let (title, detail) = match reason {
+        "company_identity_required" => (
+            "Use your company account",
+            "This sign-in is not a verified company account. Start again and pick your work account.",
+        ),
+        "user_disabled" | "user_unavailable" | "identity_link_refused" => (
+            "No access to this server",
+            "Your account cannot use this server. Ask your admin for access.",
+        ),
+        "sso_denied" => (
+            "Sign-in did not finish",
+            "Your company sign-in did not confirm who you are. Start again from your terminal.",
+        ),
+        "enrollment_expired"
+        | "invalid_sso_state"
+        | "invalid_approval"
+        | "invalid_browser_login" => (
+            "This link has expired",
+            "Each link works once and only for five minutes. Run <code>codexctl connect</code> again for a new link.",
+        ),
+        _ => (
+            "Something went wrong",
+            "The server could not finish this step. Wait a minute, then start again from your terminal.",
+        ),
+    };
+    page(format!(
+        include_str!("enrollment/error.html"),
+        title = title,
+        detail = detail
+    ))
 }
 pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -734,9 +791,13 @@ pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
     router
         .route("/v1/enrollment/start", post(start))
         .route("/v1/enrollment/poll", post(poll))
-        .route("/enroll", get(verify))
-        .route("/auth/callback", get(callback))
-        .route("/auth/approve", post(approve))
+        .merge(
+            Router::new()
+                .route("/enroll", get(verify))
+                .route("/auth/callback", get(callback))
+                .route("/auth/approve", post(approve))
+                .route_layer(middleware::from_fn(browser_errors)),
+        )
 }
 
 impl Sso {

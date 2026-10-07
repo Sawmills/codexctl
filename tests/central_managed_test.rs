@@ -2900,6 +2900,59 @@ fn google_workspace_refuses_a_consumer_with_a_verified_company_email() {
     );
 }
 #[test]
+fn a_browser_gets_an_error_page_with_the_same_status() {
+    let identity = json!({"sub": "consumer", "email": "consumer@sawmills.ai"});
+    let issuer = EnrollmentServer::with_sso(
+        identity,
+        json!({
+            "allowed_hosted_domains": ["sawmills.ai"]
+        }),
+    );
+    let browser = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let accept = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let challenge = issuer.challenge();
+    let response = browser
+        .get(challenge["verificationUrl"].as_str().unwrap())
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(response.headers().contains_key("content-security-policy"));
+    let html = response.text().unwrap();
+    assert!(html.contains("Use your company account"), "{html}");
+    assert!(!html.contains("name=\"approval\""));
+    let expired = browser
+        .get(format!("{}/enroll?code=UNKNOWN", issuer.server.url))
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(expired.status(), 410);
+    assert!(expired.text().unwrap().contains("This link has expired"));
+    // CLI and API clients keep the exact JSON body and status.
+    for accept in [None, Some("application/json")] {
+        let mut request = browser.get(format!("{}/enroll?code=UNKNOWN", issuer.server.url));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = request.send().unwrap();
+        assert_eq!(response.status(), 410);
+        assert_eq!(
+            response.text().unwrap(),
+            r#"{"error":"enrollment_expired"}"#
+        );
+    }
+}
+#[test]
 fn google_workspace_checks_the_signed_domain_and_verified_email() {
     // A personal Google account signs a token with no hd claim at all.
     for (hd, verified, status) in [
