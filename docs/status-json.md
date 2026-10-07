@@ -131,7 +131,7 @@ Unknown row values display `-`. Known values round to whole percentage points:
 `+12 ahead`, `-8 behind`, or `0 on pace`. Ahead carries a yellow warning color.
 JSON keeps the unrounded numbers. Focused status includes both the selected account
 and other accounts in its fleet footer.
-Small nonzero values can round to `+0 ahead` or `-0 behind`; their direction and warning remain.
+Values that round to zero display `0 on pace` without color.
 
 Version 2 adds `pace_points`, `elapsed_percent`, and `fleet_pace_points`.
 Other version 1 fields retain their types and meanings.
