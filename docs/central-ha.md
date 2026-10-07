@@ -203,6 +203,8 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
+For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/b33-attempt-3-cutover.md): it delivers these steps through GitOps PRs and a Claude operator that uses no codexctl token.
+
 The commands below require operator execution approval. Stop if the database,
 role, secret, or row counts do not match the reviewed plan.
 
