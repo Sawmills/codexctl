@@ -417,7 +417,12 @@ pub fn owned_then_borrowed<T>(
 /// True when a borrowed catalog entry may receive automatic placement:
 /// fresh, verified included usage with a reported window below the backoff.
 pub fn borrowed_auto_eligible(account: &super::managed::Account) -> bool {
-    account.available
+    // Placement needs an all-window maximum, not only the main windows.
+    account
+        .statusline_usage
+        .as_ref()
+        .is_some_and(|usage| usage.max_used_percent.is_some())
+        && account.available
         && !account.usage_stale
         && account.billing_class == crate::api::BillingClass::RateLimited
         && (account.primary_used.is_some() || account.secondary_used.is_some())
@@ -428,6 +433,9 @@ pub fn borrowed_auto_eligible(account: &super::managed::Account) -> bool {
 /// there is no proof of room, so the answer is no.
 pub fn token_below_borrower_backoff(usage: Option<&crate::statusline::Usage>) -> bool {
     usage.is_some_and(|usage| {
+        if usage.max_used_percent.is_none() {
+            return false;
+        }
         let used: Vec<_> = [
             usage.five_hour_used_percent,
             usage.weekly_used_percent,

@@ -497,7 +497,10 @@ pub(super) fn usage(response: &Value) -> Result<api::RateLimitResponse> {
         },
         "credits":credits
     });
-    Ok(serde_json::from_value::<api::RateLimitResponse>(usage)?)
+    let mut usage = serde_json::from_value::<api::RateLimitResponse>(usage)?;
+    // The native response carries only the primary and secondary windows.
+    usage.windows_partial = true;
+    Ok(usage)
 }
 
 pub(super) fn billing_class(response: &Value) -> api::BillingClass {

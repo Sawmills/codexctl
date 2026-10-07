@@ -743,6 +743,7 @@ mod tests {
             }),
             additional_rate_limits: Vec::new(),
             rate_limit_reset_credits: None,
+            windows_partial: false,
         }
     }
 
@@ -775,6 +776,7 @@ mod tests {
             spend_control: Some(api::SpendControl { reached: false }),
             additional_rate_limits: Vec::new(),
             rate_limit_reset_credits: None,
+            windows_partial: false,
         }
     }
 
@@ -786,6 +788,7 @@ mod tests {
             spend_control: None,
             additional_rate_limits: Vec::new(),
             rate_limit_reset_credits: None,
+            windows_partial: false,
         }
     }
 

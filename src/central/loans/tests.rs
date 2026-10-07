@@ -212,6 +212,7 @@ fn account(alias: &str, used: f64, loan: bool) -> Account {
         "resetsAt": null,
         "available": true,
         "usageScore": used,
+        "statuslineUsage": {"weekly_used_percent": null, "weekly_resets_at": null, "five_hour_used_percent": used, "max_used_percent": used},
         "loan": loan.then(|| serde_json::json!({"id":"g","lenderEmail":"alice@sawmills.ai","endsAt":1})),
     }))
     .unwrap()
@@ -308,8 +309,16 @@ fn fresh_token_usage_rechecks_the_backoff() {
         five_hour_resets_at: None,
         allowed: Some(true),
         limit_reached: Some(false),
-        max_used_percent: None,
+        max_used_percent: [five, weekly].into_iter().flatten().reduce(f64::max),
     };
+    let partial = crate::statusline::Usage {
+        max_used_percent: None,
+        ..usage(Some(10.0), Some(10.0))
+    };
+    assert!(
+        !token_below_borrower_backoff(Some(&partial)),
+        "without an all-window maximum there is no proof of room"
+    );
     let unprojected = crate::statusline::Usage {
         max_used_percent: Some(96.0),
         ..usage(None, Some(20.0))
@@ -394,5 +403,17 @@ fn a_model_specific_window_counts_for_the_backoff() {
     assert_eq!(
         crate::statusline::Usage::from_usage(&usage).max_used_percent,
         Some(96.0)
+    );
+}
+
+#[test]
+fn native_usage_claims_no_all_window_maximum() {
+    let usage = crate::central::server::usage(&serde_json::json!({
+        "rateLimits": {"primary": {"usedPercent": 20.0, "windowDurationMins": 300}}
+    }))
+    .unwrap();
+    assert_eq!(
+        crate::statusline::Usage::from_usage(&usage).max_used_percent,
+        None
     );
 }

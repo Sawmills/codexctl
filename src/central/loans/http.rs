@@ -376,8 +376,13 @@ impl Broker {
         if !now_subject.is_some_and(|subject| grant.subject.same_login(&subject)) {
             return Err(self.pause(grant, "subject_changed").await);
         }
-        // Last, with no further waits: the grant is active and the lender
-        // enabled. The caller re-authorizes the machine after this.
+        if !self.lender_enabled(&grant.lender).await? {
+            return Err(self.pause(grant, "lender_disabled").await);
+        }
+        self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))
+            .await?;
+        // The grant check is the last store read before delivery; only the
+        // caller's machine re-authorization follows it.
         let current = self
             .loan_store()
             .load_loan(&grant.id)
@@ -387,11 +392,7 @@ impl Broker {
             self.expire_loans().await?;
             return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
         }
-        if !self.lender_enabled(&grant.lender).await? {
-            return Err(self.pause(grant, "lender_disabled").await);
-        }
-        self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))
-            .await
+        Ok(())
     }
 
     /// Borrowed accounts for the borrower's catalog. Ended or removed grants
