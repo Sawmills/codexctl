@@ -304,6 +304,7 @@ async fn browser_errors(request: Request, next: Next) -> Response {
     page
 }
 fn error_page(reason: &str) -> Response {
+    // The callback serves both machine enrollment and dashboard sign-in, so advice covers both.
     let (title, detail) = match reason {
         "company_identity_required" => (
             "Use your company account",
@@ -315,18 +316,19 @@ fn error_page(reason: &str) -> Response {
         ),
         "sso_denied" => (
             "Sign-in did not finish",
-            "Your company sign-in did not confirm who you are. Start again from your terminal.",
+            "Your company sign-in did not confirm who you are. Start again from your terminal or <a href=\"/accounts/sign-in\">sign in again</a>.",
         ),
-        "enrollment_expired"
-        | "invalid_sso_state"
-        | "invalid_approval"
-        | "invalid_browser_login" => (
+        "invalid_browser_login" => (
+            "Sign-in did not finish",
+            "This browser did not start this sign-in. <a href=\"/accounts/sign-in\">Sign in again</a>.",
+        ),
+        "enrollment_expired" | "invalid_sso_state" | "invalid_approval" => (
             "This link has expired",
-            "Each link works once and only for five minutes. Run <code>codexctl connect</code> again for a new link.",
+            "Each link works once and only for five minutes. Run <code>codexctl connect</code> again, or <a href=\"/accounts/sign-in\">sign in again</a>.",
         ),
         _ => (
             "Something went wrong",
-            "The server could not finish this step. Wait a minute, then start again from your terminal.",
+            "The server could not finish this step. Wait a minute, then start again.",
         ),
     };
     page(format!(
