@@ -1098,7 +1098,6 @@ async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixtur
             Some("true"),
             "DATABASE_URL required in CI"
         );
-        eprintln!("skipping real PostgreSQL startup test: DATABASE_URL unset");
         panic!("DATABASE_URL required for HA renewal test");
     };
     let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
@@ -2647,4 +2646,61 @@ async fn postgres_login_client_retires_expired_receipts_for_retry_and_cancel() {
 fn account_key_for_alias(alias: &str) -> String {
     use sha2::{Digest, Sha256};
     format!("{:x}", Sha256::digest(alias.as_bytes()))
+}
+
+#[tokio::test]
+async fn postgres_polling_deadline_does_not_abort_lease_wait_or_verification() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) VALUES($1,'foreign-settling',41,clock_timestamp()-interval '1 second',false) ON CONFLICT(account_id) DO UPDATE SET holder_id='foreign-settling',epoch=41,expires_at=clock_timestamp()-interval '1 second',released=false",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    let id = "ca".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET deadline=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "verifying",
+        "a published candidate must retain authority past the polling deadline"
+    );
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET released=true,expires_at=clock_timestamp()-interval '1 second' WHERE account_id=$1",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "verifying",
+        "the polling deadline must not interrupt a running verifier"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("late polling approval must finish verification");
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
 }

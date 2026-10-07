@@ -228,7 +228,7 @@ impl CentralStore {
     pub(in crate::central) async fn login_heartbeat(&self, op: &LoginOperation) -> Result<bool> {
         let db = self.login_db()?;
         bounded_db(async {
-            let row = db.client().await?.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND expires_at>clock_timestamp() AND deadline>clock_timestamp() RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
+            let row = db.client().await?.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND expires_at>clock_timestamp() AND (deadline>clock_timestamp() OR phase IN ('candidate','verifying')) RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
             Ok(row.context("login lease lost")?.get(0))
         }).await
     }

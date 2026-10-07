@@ -323,6 +323,9 @@ crash/takeover recovery remain in PR3. A verifier
 that loses its lease leaves a durable unresolved marker: another replica must
 not repeat verification. Renewal waits when an expired foreign refresh lease
 has no explicit release; expiry alone is not proof that its child stopped.
+The 900-second device-polling deadline does not bound the later account-lease
+wait or verification. Those stages still require the live operation and account
+leases, machine authorization, cancellation monitoring, and bounded native RPCs.
 Wrong-account candidates reserve the selected account
 and the matching known account across replicas. After a stopped device login is rejected
 for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
@@ -425,8 +428,8 @@ never reused: adding, importing, or renaming onto it returns `alias_renamed`, so
 machine that still names it can never reach a different account. A retried rename
 after a lost response returns the renamed account. `codexctl list` drops another
 machine's record for a renamed alias once that alias is no longer active there. An interrupted
-rename finishes when the server restarts. Like renewal and adding an account, rename
-needs the file store; in PostgreSQL mode it answers HTTP 503 with
+rename finishes when the server restarts. Like adding an account, rename needs the
+file store; in PostgreSQL mode it answers HTTP 503 with
 `account_rename_unavailable`.
 
 Without server registration, `codexctl login` keeps its local behavior.
