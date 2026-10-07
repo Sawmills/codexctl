@@ -991,6 +991,19 @@ pub(in crate::central) fn pending_logins(broker_state: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// True when an add for this user's alias is unfinished.
+pub(in crate::central) fn pending_for(
+    broker_state: &Path,
+    user: &str,
+    alias: &str,
+) -> Result<bool> {
+    let state = add_state(broker_state, user, alias);
+    if !state.try_exists()? {
+        return Ok(false);
+    }
+    Ok(current(&state)?.is_some_and(|r| !terminal(&r.phase)))
+}
+
 /// Reservations held by new-account logins, for the shared registry admission.
 pub(in crate::central) fn reservations(accounts: &Path) -> Result<Vec<Reservation>> {
     let mut result = Vec::new();

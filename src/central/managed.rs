@@ -142,10 +142,16 @@ pub(super) struct RegistryState {
 pub(super) struct HttpError {
     pub(super) status: StatusCode,
     pub(super) reason: &'static str,
+    /// The current alias, for `account_renamed`.
+    pub(super) alias: Option<String>,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(json!({"error":self.reason}))).into_response();
+        let body = match self.alias {
+            Some(alias) => json!({"error":self.reason,"alias":alias}),
+            None => json!({"error":self.reason}),
+        };
+        let mut response = (self.status, Json(body)).into_response();
         response.extensions_mut().insert(FailureReason);
         response
     }
@@ -248,7 +254,7 @@ fn instance_holder_id() -> String {
     vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
 }
 
-fn account_summary(owner: &Owner) -> Account {
+pub(super) fn account_summary(owner: &Owner) -> Account {
     let limits = owner.limits.as_ref().map(|v| &v["rateLimits"]);
     let usage = owner
         .limits
@@ -521,7 +527,11 @@ impl Broker {
     }
     pub fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
         self.record_failure(reason, "broker", status);
-        HttpError { status, reason }
+        HttpError {
+            status,
+            reason,
+            alias: None,
+        }
     }
     pub async fn authorize(&self, headers: &HeaderMap) -> Result<vault::Device, HttpError> {
         let bearer = headers
@@ -599,7 +609,8 @@ impl Broker {
                 if self.ownership_unresolved.load(Ordering::Acquire) {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed")
                 } else {
-                    self.error(StatusCode::NOT_FOUND, "account_not_found")
+                    super::rename::renamed_error(self, &device.user, alias)
+                        .unwrap_or_else(|| self.error(StatusCode::NOT_FOUND, "account_not_found"))
                 }
             })
     }
@@ -802,6 +813,7 @@ where
             Err(HttpError {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 reason: "refresh_fenced",
+                alias: None,
             })
         }
     }
@@ -3057,6 +3069,12 @@ pub async fn serve(
     let mut replacements_blocked = false;
     let mut conflicting_journals = Vec::new();
     let mut repairing = std::collections::BTreeSet::new();
+    // Finish interrupted renames first: the inventory below requires each
+    // directory name to match its vault alias.
+    if super::rename::recover(state, key).is_err() {
+        replacements_blocked = true;
+        ownership_unresolved = true;
+    }
     // Resolve all durable commits before inventorying quarantines from other accounts.
     for entry in std::fs::read_dir(state.join("accounts"))? {
         if relogin::recover(&entry?.path(), key).is_err() {
@@ -3340,6 +3358,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
+        .route("/v1/accounts/rename", post(super::rename::rename))
         .merge(super::resets::routes())
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))
