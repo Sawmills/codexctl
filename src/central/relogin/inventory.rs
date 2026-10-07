@@ -217,6 +217,16 @@ impl IdentityInventory {
         }
         let journal = self.journal?.context("refresh journal is absent")?;
         super::super::server::validate_owned_identity(&saved.auth, &journal)?;
+        if let Some(identities) = identities {
+            let identity = self
+                .state
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|id| identities.get(id))
+                .context("shared launch identity missing")?;
+            identity.validate(&saved.auth)?;
+            identity.validate(&journal)?;
+        }
         for candidate in self.candidates? {
             if candidate.process != ProcessState::Stopped {
                 bail!("login renewal process has not exited");

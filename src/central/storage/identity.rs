@@ -474,6 +474,17 @@ impl RetainedIdentity {
         other: &Self,
         arriving: &Value,
     ) -> Result<bool> {
+        let local_workspace = vault::account(auth)?;
+        let arriving_workspace = vault::account(arriving)?;
+        // A conflicting stopped credential still names bounded workspace scopes.
+        // Preserve both scopes, without fencing a workspace neither source names.
+        if self.workspace != other.workspace
+            && self.workspace != arriving_workspace
+            && local_workspace != other.workspace
+            && local_workspace != arriving_workspace
+        {
+            return Ok(false);
+        }
         let left = self.with_auth(auth)?;
         let right = other.with_auth(arriving)?;
         if self.workspace != other.workspace {

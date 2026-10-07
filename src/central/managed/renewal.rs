@@ -169,6 +169,19 @@ impl Broker {
                 .context("renewal account missing")?
                 .revision;
             let identities = central.retained_identities().await?;
+            let agreement = (|| -> Result<()> {
+                let identity = identities
+                    .get(op.account()?)
+                    .context("shared verification identity missing")?;
+                identity.validate(&owner.vault.auth)?;
+                identity.validate(&retained_auth(&owner.home)?)
+            })();
+            if let Err(error) = agreement {
+                owner.available = false;
+                owner.routing_refused = true;
+                owner.shared_revision = None;
+                return Err(error);
+            }
             // This is durable before initialize, which can itself rotate credentials.
             central.login_begin_verification(op, &lease).await?;
             owner.vault.auth = candidate.clone();

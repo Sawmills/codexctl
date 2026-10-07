@@ -802,6 +802,30 @@ async fn reconcile_owner_from_central(
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
         return Ok(false);
     }
+    if central.mode() == super::storage::StoreMode::Postgres {
+        let identities = central
+            .retained_identities()
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        let agreement = (|| -> Result<()> {
+            let identity = identities
+                .get(account_id)
+                .context("completed login identity missing")?;
+            identity.validate(&owner.vault.auth)?;
+            identity.validate(&committed.auth)?;
+            if owner.home.try_exists()? {
+                previous_owner_exited(&owner.home)?;
+                identity.validate(&retained_auth(&owner.home)?)?;
+            }
+            Ok(())
+        })();
+        if agreement.is_err() {
+            owner.available = false;
+            owner.routing_refused = true;
+            owner.shared_revision = None;
+            return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        }
+    }
     vault::save(&owner.state, &owner.key, &committed)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     store::atomic_write(
@@ -2780,7 +2804,12 @@ pub(super) fn readiness(broker: &Broker) -> StatusCode {
     }
 }
 
-async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> Result<()> {
+async fn hydrate_accounts(
+    state: &Path,
+    key: &Path,
+    central: &CentralStore,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut quarantined = std::collections::BTreeSet::new();
     let identities = if central.mode() == super::storage::StoreMode::Postgres {
         Some(central.retained_identities().await?)
     } else {
@@ -2789,14 +2818,14 @@ async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> R
     for record in central.list_accounts().await? {
         let account_vault: Vault = serde_json::from_value(record.vault.clone())?;
         vault::validate_auth(&account_vault.auth)?;
-        let account_state = state
-            .join("accounts")
-            .join(account_key(&account_vault.user, &account_vault.alias));
+        let id = account_key(&account_vault.user, &account_vault.alias);
+        let account_state = state.join("accounts").join(&id);
         let replace = if account_state.join("vault.enc").exists() {
             let local = vault::load(&account_state, key)?;
             let baseline = match Owner::read_shared_revision(&account_state) {
                 Ok(revision) => Some(revision.unwrap_or(local.revision)),
                 Err(_) => {
+                    quarantined.insert(id.clone());
                     eprintln!(
                         "{}",
                         json!({"operation":"account_reconcile","stage":"startup","reason":"shared_revision_unreadable"})
@@ -2816,31 +2845,43 @@ async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> R
                 false
             };
             let home = account_state.join("runtime");
-            if renewed && home.try_exists()? && previous_owner_exited(&home).is_ok() {
+            let advance = local.revision < record.revision || renewed;
+            if let Some(identities) = identities.as_ref() {
                 let agreement = (|| -> Result<()> {
                     let identity = identities
-                        .as_ref()
-                        .and_then(|all| all.get(&record.account_id))
-                        .context("completed login identity missing")?;
+                        .get(&record.account_id)
+                        .context("shared identity missing")?;
                     identity.validate(&local.auth)?;
-                    identity.validate(&retained_auth(&home)?)?;
-                    identity.validate(&account_vault.auth)
+                    identity.validate(&account_vault.auth)?;
+                    if home.try_exists()? {
+                        identity.validate(&retained_auth(&home)?)?;
+                        if advance {
+                            previous_owner_exited(&home)?;
+                        }
+                    }
+                    Ok(())
                 })();
-                if agreement.is_ok() {
-                    store::atomic_write(
-                        &home.join("auth.json"),
-                        &serde_json::to_vec(&account_vault.auth)?,
-                    )?;
-                } else {
-                    // Startup inventory retains this journal and records the
-                    // account's recovery failure without disabling other seats.
+                if agreement.is_err() {
+                    quarantined.insert(id.clone());
                     eprintln!(
                         "{}",
                         json!({"operation":"account_reconcile","stage":"startup","reason":"journal_identity_unresolved"})
                     );
+                    false
+                } else if quarantined.contains(&id) || !advance {
+                    false
+                } else {
+                    if renewed && home.try_exists()? {
+                        store::atomic_write(
+                            &home.join("auth.json"),
+                            &serde_json::to_vec(&account_vault.auth)?,
+                        )?;
+                    }
+                    true
                 }
+            } else {
+                !quarantined.contains(&id) && advance
             }
-            local.revision < record.revision || renewed
         } else {
             true
         };
@@ -2849,7 +2890,7 @@ async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> R
             vault::save(&account_state, key, &account_vault)?;
         }
     }
-    Ok(())
+    Ok(quarantined)
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
@@ -3464,9 +3505,11 @@ pub async fn serve(
         CentralStore::File(_) => None,
         store => Some(store),
     };
-    if let Some(central) = central.as_ref() {
-        hydrate_accounts(state, key, central).await?;
-    }
+    let hydration_quarantines = if let Some(central) = central.as_ref() {
+        hydrate_accounts(state, key, central).await?
+    } else {
+        Default::default()
+    };
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -3549,8 +3592,9 @@ pub async fn serve(
         if repair.verify {
             repairing.insert(id.clone());
         }
-        let prepared = if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false))
-        {
+        let prepared = if hydration_quarantines.contains(&id) {
+            Err(anyhow::anyhow!("shared hydration identity unresolved"))
+        } else if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false)) {
             Err(anyhow::anyhow!("candidate has not started"))
         } else {
             // Shared-store replicas hydrate credentials without starting a native

@@ -4407,3 +4407,146 @@ async fn postgres_restart_isolates_unreadable_shared_revision_evidence() {
     );
     stop_fixture(f).await;
 }
+
+#[tokio::test]
+async fn postgres_restart_preserves_a_conflicting_newer_local_vault_after_landing() {
+    conflicting_local_vault(false, false, true).await;
+}
+
+#[tokio::test]
+async fn postgres_restart_quarantines_agreeing_local_credentials_that_conflict_with_shared_identity()
+ {
+    conflicting_local_vault(true, false, true).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_preserves_local_credentials_with_a_proven_identity_conflict() {
+    conflicting_local_vault(true, true, true).await;
+}
+
+#[tokio::test]
+async fn postgres_refresh_hydration_preserves_conflicting_local_credentials() {
+    conflicting_local_vault(true, false, false).await;
+}
+
+async fn conflicting_local_vault(
+    matching_journal: bool,
+    attempt_renewal: bool,
+    shared_landing: bool,
+) {
+    use aes_gcm::{
+        Aes256Gcm,
+        aead::{Aead, KeyInit},
+    };
+    let mut f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"be".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    if !shared_landing {
+        // A public token read records knowledge of the completed receipt before
+        // another replica advances credentials through an ordinary refresh.
+        let known = f
+            .http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"retained"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(known.status(), 200);
+    }
+    f.first.stop().await;
+    let second = json!({"alias":"copy","id":"bf".repeat(32)});
+    let arriving = add_grant("new-workspace", None, Some("retained-uid"));
+    if shared_landing {
+        add_request(&f, &f.second, "start", &second).await;
+        complete_add(&f, &f.second, &second, &arriving).await;
+    } else {
+        let refreshed = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"retained","billing":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), 200);
+    }
+    let account = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "retained"));
+    let path = account.join("vault.enc");
+    let original = std::fs::read(&path).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&std::fs::read(&f.key).unwrap()).unwrap();
+    let plain = cipher
+        .decrypt((&original[..12]).into(), &original[12..])
+        .unwrap();
+    let mut local: Value = serde_json::from_slice(&plain).unwrap();
+    local["auth"] = add_grant("unrelated-local-vault", Some("conflicting-login"), None);
+    local["revision"] = json!(if shared_landing { 100 } else { 1 });
+    // One synthetic corruption with a fresh fixture key. Preserve its bytes as evidence.
+    let nonce = [124_u8; 12];
+    let encrypted = cipher
+        .encrypt((&nonce).into(), &serde_json::to_vec(&local).unwrap()[..])
+        .unwrap();
+    let mut evidence = nonce.to_vec();
+    evidence.extend(encrypted);
+    store::atomic_write(&path, &evidence).unwrap();
+    let journal = account.join("runtime/auth.json");
+    let journal_evidence = serde_json::to_vec(if matching_journal {
+        &local["auth"]
+    } else {
+        &arriving
+    })
+    .unwrap();
+    store::atomic_write(&journal, &journal_evidence).unwrap();
+    f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    for (alias, expected) in [("other", 200), ("retained", 503)] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{alias}");
+    }
+    if attempt_renewal {
+        std::fs::remove_file(f.first.root.path().join("login-release")).unwrap();
+        let launches = f.first.launches();
+        let id = "ca".repeat(32);
+        login_alias_request(&f, &f.first, "retained", "start", &id).await;
+        store::atomic_write(
+            &f.first.root.path().join("login-release"),
+            &serde_json::to_vec(&arriving).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_renewal_terminal(&f, "retained", &id).await["status"],
+            "failed",
+            "a new grant cannot override a proven local identity conflict"
+        );
+        assert_eq!(
+            f.first.launches(),
+            launches,
+            "no verifier may start before old evidence is identified"
+        );
+    }
+    assert!(
+        std::fs::read(path).unwrap() == evidence,
+        "shared advancement cannot overwrite unproven local vault ownership"
+    );
+    assert_eq!(std::fs::read(journal).unwrap(), journal_evidence);
+    stop_fixture(f).await;
+}
