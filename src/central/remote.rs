@@ -448,9 +448,13 @@ fn server_login(
                 }
                 return Ok(true);
             }
-            Some("failed" | "canceled") => {
+            Some("failed" | "canceled" | "expired") => {
                 clear_receipt()?;
                 let reason = match status["error"].as_str() {
+                    Some("login_expired_requires_recovery") => {
+                        "server login expired; the account server retains unresolved login evidence"
+                    }
+                    _ if status["status"] == "expired" => "server login expired",
                     Some("wrong_account") => {
                         "OpenAI returned a different account; its grant is retained on the server"
                     }

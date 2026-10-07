@@ -1285,7 +1285,7 @@ impl PostgresStore {
     async fn release_lease(&self, lease: &Lease) -> Result<bool> {
         let client = self.client().await?;
         let changed = client.execute(
-            "UPDATE account_refresh_leases SET expires_at=now(),released=true WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
+            "UPDATE account_refresh_leases SET expires_at=now(),released=true,legacy_handoff=false WHERE account_id=$1 AND holder_id=$2 AND epoch=$3",
             &[&lease.account_id, &lease.holder_id, &lease.epoch],
         ).await?;
         Ok(changed == 1)
@@ -1684,7 +1684,7 @@ impl PostgresStore {
         // Expiry alone cannot prove a foreign refresh child stopped. A renewal
         // can replace its own local holder because its worker settles that child.
         let row = client.query_opt(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ((phase='unresolved' AND candidate_workspace IS NULL) OR (account_id=$1 AND selected_reserved) OR (candidate_workspace=(SELECT workspace FROM central_accounts WHERE account_id=$1) AND (candidate_login IS NULL OR (SELECT login FROM central_accounts WHERE account_id=$1) IS NULL OR candidate_login=(SELECT login FROM central_accounts WHERE account_id=$1)))) AND phase IN ('candidate','verifying','unresolved','rejected') AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR (candidate_workspace=(SELECT workspace FROM central_accounts WHERE account_id=$1) AND (candidate_login IS NULL OR (SELECT login FROM central_accounts WHERE account_id=$1) IS NULL OR candidate_login=(SELECT login FROM central_accounts WHERE account_id=$1)))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
             &[&account_id, &holder_id, &(ttl.as_secs() as i64), &login_id, &local_holder],
         ).await?;
         Ok(row.map(|row| Lease {

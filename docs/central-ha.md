@@ -73,6 +73,38 @@ Complete the CA reconciliation gate in section 5 before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
 
+Expired device-polling receipts now report `expired` and permit a new request
+ID. Expiry retains a company-user fence when child exit and grant absence are
+not proven, including failed grant publication. Candidates and verification
+markers stay fenced after lease expiry.
+Automatic replay, killed-replica retry, and takeover acceptance remain in PR3.
+An unidentified grant fences its company user's accounts. Use the operator
+resolution steps in [the server guide](central-server.md) and preserve its
+private execution home. Linux supplies a parent-death signal; macOS process
+groups do not supply that signal or verified forced-parent-death recovery.
+
+For an upgrade from a PostgreSQL schema without the `released` lease marker,
+migration records a `legacy_handoff` marker on the old lease rows. It leaves
+`released=false`. An expired old row is not proof of settlement. Before starting
+new replicas, stop every old refresh owner, confirm child exit, reconcile its
+credential journal to PostgreSQL, and confirm that no provider request has an
+unknown result. Preserve those receipts. If settlement is unknown, retain the
+fence and stop the upgrade.
+
+After those checks, run the migration handoff with the existing private database
+and vault-key environment:
+
+```sh
+codexctl-central migrate --state /data/state --key-file /keys/vault-key \
+  --confirm-legacy-owners-settled
+```
+
+Retain its `legacyLeasesReleased` JSON receipt before starting replicas. The flag
+releases only rows marked by the legacy migration. Every new acquisition or
+normal release consumes that marker, so repeating this command cannot release a
+current refresh owner. Ordinary `migrate` does not assert settlement or release
+these leases. This procedure does not resolve unfinished login verification.
+
 ## 1. State inventory
 
 The following inventory distinguishes durable source state from caches and

@@ -3,6 +3,25 @@ use super::*;
 use crate::central::storage::login::{LoginOperation, LoginPhase};
 
 impl Broker {
+    /// Revocation is a decision; a failed registry read is an unavailable authority.
+    pub(in crate::central) async fn login_machine_revoked(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<bool> {
+        match self.authorize(headers).await {
+            Ok(_) => Ok(false),
+            Err(error)
+                if matches!(
+                    error.status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+                ) =>
+            {
+                Ok(true)
+            }
+            Err(_) => bail!("machine authorization unavailable"),
+        }
+    }
+
     async fn check_login_authority(&self, headers: &HeaderMap, op: &LoginOperation) -> Result<()> {
         let central = self
             .central
@@ -11,9 +30,9 @@ impl Broker {
         if central.login_heartbeat(op).await? || self.stopping.load(Ordering::Acquire) {
             bail!("login canceled");
         }
-        self.authorize(headers)
-            .await
-            .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+        if self.login_machine_revoked(headers).await? {
+            bail!("machine revoked");
+        }
         Ok(())
     }
 
@@ -26,10 +45,13 @@ impl Broker {
             .central
             .as_ref()
             .context("shared renewal needs PostgreSQL")?;
-        let device = self
-            .authorize(headers)
-            .await
-            .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+        let device = self.authorize(headers).await.map_err(|error| {
+            anyhow::anyhow!(if error.status.is_server_error() {
+                "machine authorization unavailable"
+            } else {
+                "machine revoked"
+            })
+        })?;
         // Reject a wrong login before waiting on reservations that it may itself
         // have created for another renewal's selected account.
         let shared = central
@@ -90,9 +112,9 @@ impl Broker {
                 if !central.renew(&lease, IMPORT_LEASE_TTL).await? {
                     bail!("renewal refresh lease lost");
                 }
-                self.authorize(headers)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+                if self.login_machine_revoked(headers).await? {
+                    bail!("machine revoked");
+                }
             }
         };
         let work = async {
@@ -180,9 +202,13 @@ impl Broker {
                 Ok::<_, anyhow::Error>(record)
             };
             let record = verification.await?;
-            self.authorize(headers)
-                .await
-                .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+            self.authorize(headers).await.map_err(|error| {
+                anyhow::anyhow!(if error.status.is_server_error() {
+                    "machine authorization unavailable"
+                } else {
+                    "machine revoked"
+                })
+            })?;
             central
                 .login_complete(op, &lease, &record, committed_revision)
                 .await?;

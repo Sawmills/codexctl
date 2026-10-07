@@ -18,6 +18,7 @@ fn view(op: &LoginOperation) -> Response {
     let status = match op.phase {
         LoginPhase::Candidate | LoginPhase::Verifying => "verifying",
         LoginPhase::Unresolved | LoginPhase::Rejected => "failed",
+        LoginPhase::ReplicaLost => "expired",
         phase => phase.as_str(),
     };
     (
@@ -26,7 +27,9 @@ fn view(op: &LoginOperation) -> Response {
             "id":op.id,"alias":op.alias,"userId":op.user,"status":status,
             "verificationUrl":if op.phase == LoginPhase::Pending {Some(URL)} else {None},
             "userCode":if op.phase == LoginPhase::Pending {op.payload.code.as_deref()} else {None},
-            "error":op.payload.error,
+            "error":if op.phase == LoginPhase::ReplicaLost && !op.polling_clear {
+                Some("login_expired_requires_recovery")
+            } else {op.payload.error.as_deref()},
         })),
     )
         .into_response()
@@ -148,6 +151,7 @@ pub(super) async fn start(
         holder: broker.holder_id.clone(),
         epoch: 1,
         payload: LoginPayload::default(),
+        polling_clear: false,
     };
     if !db.login_create(&op).await.map_err(|_| failure(&broker))? {
         let existing = db
@@ -180,10 +184,23 @@ pub(super) async fn start(
                 "{}",
                 json!({"operation":"login_renewal","stage":worker_op.phase.as_str(),"error":detail})
             );
-            worker.record_failure("relogin_failed", "relogin", StatusCode::SERVICE_UNAVAILABLE);
+            worker.record_failure(
+                if worker_op.phase == LoginPhase::Unresolved
+                    && worker_op.payload.candidate.is_none()
+                {
+                    "relogin_identity_unresolved"
+                } else {
+                    "relogin_failed"
+                },
+                "relogin",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
             if matches!(
                 worker_op.phase,
-                LoginPhase::Completed | LoginPhase::Canceled | LoginPhase::Rejected
+                LoginPhase::Completed
+                    | LoginPhase::Canceled
+                    | LoginPhase::Rejected
+                    | LoginPhase::ReplicaLost
             ) {
                 return;
             }
@@ -277,7 +294,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let canceled = db.login_heartbeat(op).await? || broker.stopping.load(Ordering::Acquire) || broker.authorize(headers).await.is_err();
+                    let canceled = db.login_heartbeat(op).await? || broker.stopping.load(Ordering::Acquire) || broker.login_machine_revoked(headers).await?;
                     if canceled { return Ok(false); }
                     if started.elapsed() > DEADLINE || (op.phase == LoginPhase::Starting && started.elapsed() > Duration::from_secs(30)) { bail!("login deadline expired"); }
                 }
@@ -326,6 +343,9 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         // An unreadable grant is not evidence that no grant was issued.
         op.phase = LoginPhase::Unresolved;
     })?;
+    if op.payload.candidate.is_none() {
+        db.login_polling_clear(op).await?;
+    }
     if !result? {
         op.payload.code = None;
         let phase = if op.payload.candidate.is_some() {

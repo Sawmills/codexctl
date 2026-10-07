@@ -1089,6 +1089,9 @@ async fn login_fixture() -> LoginFixture {
     login_fixture_with_legacy_alias(false).await
 }
 async fn login_fixture_with_legacy_alias(legacy: bool) -> LoginFixture {
+    login_fixture_with_accounts(legacy, false).await
+}
+async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixture {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(
             std::env::var("CI").ok().as_deref(),
@@ -1125,7 +1128,8 @@ async fn login_fixture_with_legacy_alias(legacy: bool) -> LoginFixture {
     store::atomic_write(
         &state.join("users.json"),
         &serde_json::to_vec(&json!([
-            {"id":"test","email":"test@example.invalid","enabled":true}
+            {"id":"test","email":"test@example.invalid","enabled":true},
+            {"id":"foreign","email":"foreign@example.invalid","enabled":true}
         ]))
         .unwrap(),
     )
@@ -1155,8 +1159,32 @@ async fn login_fixture_with_legacy_alias(legacy: bool) -> LoginFixture {
             .unwrap();
         assert_eq!(response.status(), 200, "file-mode seed import");
     }
+    if foreign {
+        let foreign_file = seed.root.path().join("foreign-machine-token");
+        central::register(
+            &state,
+            "foreign-machine",
+            "sawmills",
+            "foreign",
+            &foreign_file,
+        )
+        .unwrap();
+        let foreign_token = std::fs::read_to_string(&foreign_file).unwrap();
+        // File-mode registry snapshots need the newly registered machine.
+        seed.stop().await;
+        seed = Pod::spawn(database.as_str(), &key, seed.root, "file").await;
+        store::atomic_write(&seed.root.path().join("mode"), b"").unwrap();
+        let response = http
+            .post(format!("{}/v1/accounts", seed.url))
+            .bearer_auth(&foreign_token)
+            .json(&json!({"alias":"foreign-seat","auth":foreign_grant()}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "foreign company user import");
+    }
     let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
-    assert_eq!(generation(&seed_token), 1);
+    assert_eq!(generation(&seed_token), if foreign { 2 } else { 1 });
     seed.stop().await;
     if legacy {
         use aes_gcm::{
@@ -1276,6 +1304,13 @@ async fn postgres_renewal_stops_polling_when_its_operation_epoch_is_replaced() {
         200,
         "polling lease loss leaves existing account usable"
     );
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    let expired = login_request(&f, &f.second, "status", &id).await;
+    assert_eq!(
+        expired["error"], "login_expired_requires_recovery",
+        "a superseded holder cannot clear the replacement's reservation"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
     stop_fixture(f).await;
 }
 
@@ -1589,7 +1624,9 @@ async fn postgres_unpublished_login_grant_survives_worker_exit() {
         .unwrap()
         .parse()
         .unwrap();
-    let grant = renewal_grant();
+    let claims = json!({"sub":"other-seat","iat":2000001000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"other-seat","chatgpt_plan_type":"pro"}});
+    let grant = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-wrong","account_id":"other-seat"}});
     store::atomic_write(
         &f.first.root.path().join("login-release"),
         &serde_json::to_vec(&grant).unwrap(),
@@ -1611,6 +1648,32 @@ async fn postgres_unpublished_login_grant_survives_worker_exit() {
     assert_eq!(operation["id"], id);
     assert_eq!(operation["accountId"], account_key("test", "seat"));
     assert_eq!(operation["epoch"], 1);
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "expired"
+    );
+    let retry = login_request(&f, &f.second, "start", &"c9".repeat(32)).await;
+    assert_eq!(
+        retry["status"], "pending",
+        "expiry must permit a new device login"
+    );
+    for alias in ["seat", "other"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias,"billing":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "an unpublished grant must remain fenced through expiry and retry: {alias}"
+        );
+    }
+    login_request(&f, &f.second, "cancel", &"c9".repeat(32)).await;
     stop_fixture(f).await;
 }
 
@@ -2251,4 +2314,337 @@ async fn postgres_rejection_with_unknown_exit_evidence_stays_unresolved() {
     );
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
     stop_fixture(f).await;
+}
+
+fn foreign_grant() -> Value {
+    let claims = json!({"sub":"foreign-login","iat":2000000000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"foreign-workspace","chatgpt_plan_type":"pro"}});
+    json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
+        "refresh_token":"synthetic-refresh","account_id":"foreign-workspace"}})
+}
+
+#[tokio::test]
+async fn postgres_unidentified_login_does_not_fence_another_company_user() {
+    let f = login_fixture_with_accounts(false, true).await;
+    let id = "c0".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(&f.first.root.path().join("login-release"), b"{truncated").unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let foreign_token =
+        std::fs::read_to_string(f._seed.root.path().join("foreign-machine-token")).unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(foreign_token)
+        .json(&json!({"alias":"foreign-seat","billing":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "an unidentified grant must fence only its company user"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_failed_requests_total{reason=\"relogin_identity_unresolved\"} 1"
+        ),
+        "{metrics}"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_expired_device_login_receipt_allows_a_fresh_request() {
+    let f = login_fixture().await;
+    let id = "c1".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE user_id='test' AND id=$1",f.schema), &[&id]).await.unwrap();
+    // This slice checks expiry admission after the lease watchdog stops polling.
+    // Killing the replica and takeover remain in PR3.
+    wait_dead(pid).await;
+    let fresh = login_request(&f, &f.second, "start", &"c2".repeat(32)).await;
+    assert_eq!(fresh["status"], "pending");
+    assert_eq!(fresh["id"], "c2".repeat(32));
+    let expired = login_request(&f, &f.second, "status", &id).await;
+    assert_eq!(expired["status"], "expired");
+    assert_eq!(
+        login_request(&f, &f.second, "start", &id).await["status"],
+        "expired"
+    );
+    login_request(&f, &f.second, "cancel", &"c2".repeat(32)).await;
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_login_authorization_outage_is_failed_instead_of_canceled() {
+    let f = login_fixture().await;
+    let id = "c3".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control
+        .batch_execute(&format!(
+            "ALTER TABLE {}.central_devices RENAME TO unavailable_devices",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    wait_dead(pid).await;
+    f.control
+        .batch_execute(&format!(
+            "ALTER TABLE {}.unavailable_devices RENAME TO central_devices",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let terminal = timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            if receipt["status"] != "pending" {
+                break receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal["status"], "failed",
+        "a registry read failure is not a cancel request"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_expired_verification_keeps_its_reservation_and_request_id() {
+    let f = login_fixture().await;
+    let id = "c4".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE user_id='test' AND id=$1",f.schema), &[&id]).await.unwrap();
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "verifying"
+    );
+    assert_eq!(
+        login_request(&f, &f.second, "start", &"c5".repeat(32)).await["id"],
+        id
+    );
+    assert!(!f.second.root.path().join("login-pid").exists());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_legacy_lease_upgrade_requires_settled_owner_handoff_before_renewal() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    f.second.stop().await;
+    // Seed the schema and clean-release row written by the pre-PR1 server.
+    f.control
+        .batch_execute(&format!(
+            "ALTER TABLE {}.account_refresh_leases DROP COLUMN released",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,'legacy-holder',41,clock_timestamp()-interval '1 second') ON CONFLICT(account_id) DO UPDATE SET holder_id='legacy-holder',epoch=41,expires_at=clock_timestamp()-interval '1 second'",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    let output = command(
+        &f.database,
+        f._seed.root.path().join("state").as_path(),
+        &f.key,
+        "migrate",
+    )
+    .output()
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "plain migration: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let row = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT released FROM {}.account_refresh_leases WHERE account_id=$1",
+                f.schema
+            ),
+            &[&account_key("test", "seat")],
+        )
+        .await
+        .unwrap();
+    assert!(
+        !row.get::<_, bool>(0),
+        "expiry alone must not prove old owner settlement"
+    );
+    let output = command(
+        &f.database,
+        f._seed.root.path().join("state").as_path(),
+        &f.key,
+        "migrate",
+    )
+    .arg("--confirm-legacy-owners-settled")
+    .output()
+    .await
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "confirmed legacy handoff: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["legacyLeasesReleased"], 1);
+    f.first = Pod::start(&f.database, &f.key).await;
+    f.second = Pod::start(&f.database, &f.key).await;
+    let id = "c6".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("first renewal after the legacy handoff must complete");
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_login_client_retires_expired_receipts_for_retry_and_cancel() {
+    for cancel in [false, true] {
+        let f = login_fixture().await;
+        let id = "c7".repeat(32);
+        login_request(&f, &f.first, "start", &id).await;
+        let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+        wait_dead(pid).await;
+        // The client keeps this ID after a lost response and retries on replica B.
+        let home = tempfile::tempdir().unwrap();
+        let directory = home.path().join(".codexctl/central");
+        store::ensure_private_dir(&directory).unwrap();
+        let token_file = directory.join(".device.token");
+        store::atomic_write(&token_file, f.token.as_bytes()).unwrap();
+        store::atomic_write(
+            &directory.join(".server.json"),
+            &serde_json::to_vec(&json!({
+                "server":f.second.url,"token_file":token_file,"user_id":"test"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let receipt = directory.join(format!(".login-{}.json", account_key_for_alias("seat")));
+        store::atomic_write(&receipt,&serde_json::to_vec(&json!({
+            "server":f.second.url,"userId":"test","alias":"seat","id":id,"kind":"renewal","label":null
+        })).unwrap()).unwrap();
+        let mut client = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        client
+            .args(["login", "seat", "--no-browser"])
+            .env("HOME", home.path())
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS");
+        if cancel {
+            client.arg("--cancel");
+        }
+        let output = client.output().await.unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("server login expired"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Observe a fresh operation through the same CLI, not through its receipt file.
+        let mut fresh = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        fresh
+            .args(["login", "seat", "--no-browser"])
+            .env("HOME", home.path())
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut fresh = fresh.spawn().unwrap();
+        let mut output = BufReader::new(fresh.stdout.take().unwrap());
+        let mut line = String::new();
+        timeout(Duration::from_secs(8), async {
+            while !line.contains("TEST-LOGIN") {
+                assert!(output.read_line(&mut line).await.unwrap() > 0, "{line}");
+            }
+        })
+        .await
+        .expect("expired receipt must permit a new CLI login");
+        let current = login_request(&f, &f.second, "status", "").await;
+        assert_ne!(current["id"], id);
+        store::atomic_write(
+            &f.second.root.path().join("login-release"),
+            &serde_json::to_vec(&renewal_grant()).unwrap(),
+        )
+        .unwrap();
+        let completed = timeout(Duration::from_secs(8), fresh.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            completed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&completed.stderr)
+        );
+        stop_fixture(f).await;
+    }
+}
+
+fn account_key_for_alias(alias: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(alias.as_bytes()))
 }

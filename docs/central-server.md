@@ -309,8 +309,17 @@ two seconds; authorization checks and process exit add to the cancellation time.
 
 Known gaps tracked by SAW-12484: add-account still returns HTTP 503 with
 `account_login_unavailable` (PR2); automatic crash/takeover recovery is PR3.
-This intermediate release is not sufficient for the B33 cutover. A lost polling
-replica can leave a pending operation until recovery is delivered. A verifier
+This intermediate release is not sufficient for the B33 cutover. Status and
+start retire expired `starting` or `pending` device-login receipts as
+`replica_lost`, report `expired`, and allow a new request ID. They do not adopt the
+old worker or replay a saved grant. The CLI clears its local receipt when either
+login or `--cancel` receives `expired`, so the next login uses a new request ID.
+Receipt expiry frees the alias for device polling. Without a durable receipt that
+the old child exited and saved no grant, the expired operation still fences that
+company user's refreshes and verification. The CLI reports retained unresolved
+evidence. A saved grant whose publication failed must be reconciled before that
+fence clears. The killed-replica retry test and automatic
+crash/takeover recovery remain in PR3. A verifier
 that loses its lease leaves a durable unresolved marker: another replica must
 not repeat verification. Renewal waits when an expired foreign refresh lease
 has no explicit release; expiry alone is not proof that its child stopped.
@@ -322,11 +331,71 @@ recorded before verification started. A newer quarantine remains fenced.
 Confirmed native rejection also permits a fresh renewal after child exit and
 an unchanged final journal. Unknown verification outcomes remain fenced.
 An unresolved verification cannot use this repair path. An unreadable saved grant
-keeps all accounts reserved because its identity is unknown. If shared publication fails,
+keeps that company user's accounts reserved because its identity is unknown.
+Other company users can still refresh. The worker counts this failure once with
+reason `relogin_identity_unresolved`; `CodexctlCredentialOperationFailed` selects
+that reason. Registry read failures stop device polling and report failure;
+a durable cancel intent, confirmed machine revocation, or graceful shutdown
+reports canceled. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch
 record under `state/shared-logins/`. Preserve this evidence. Automated replay and
 cleanup of interrupted operations belong to PR3; local evidence alone does not
 make another replica safe to take over.
+
+Linux credential children use `PR_SET_PDEATHSIG` and a parent-PID check to stop
+when their parent exits. The running worker also stops polling after an operation
+heartbeat fails. macOS uses a separate process group but has no equivalent
+parent-death signal here; forced-parent-death recovery on macOS is not verified.
+A process group alone does not prove child exit. Do not use receipt expiry as
+proof that a verifier or refresh owner stopped.
+
+To resolve an unidentified grant, preserve its private login home, shared row,
+and logs. Stop its holder and confirm that every child exited. Restore a complete
+grant from trusted private evidence and identify its workspace and login without
+printing credentials. Compare every declared login claim in its own namespace
+against the saved account. A conflicting or undecidable identity keeps the fence.
+If the grant cannot be identified, retain the fence.
+If any refresh-capable verification may have started, retain `unresolved` for
+PR3 settlement; do not change it to a repairable rejection or repeat verification.
+
+When the intact private execution home proves child exit with no saved grant,
+an operator can record the same absence receipt the original worker records.
+Match the original holder and epoch, and use the current sequence. Do not use a
+missing or deleted execution home as absence evidence. Require one returned row:
+
+```sql
+UPDATE central_login_operations SET polling_clear = true
+WHERE user_id = :'company_user' AND id = :'operation_id'
+  AND holder_id = :'holder' AND epoch = :expected_epoch
+  AND sequence = :expected_sequence AND phase = 'replica_lost'
+  AND NOT polling_clear AND candidate_workspace IS NULL
+RETURNING id, sequence;
+```
+
+For a device login proven to have stopped before verification, an operator can
+record the identified grant as a rejection. Use a private database session and
+set the `psql` variables below from the retained operation and grant. `login` is
+the token's `sub` claim. The sequence check prevents a concurrent transition from
+being overwritten. Require exactly one returned row; otherwise stop and re-read
+the evidence. This step records identity only and does not promote credentials:
+
+```sql
+UPDATE central_login_operations
+SET phase = 'rejected', sequence = sequence + 1,
+    candidate_workspace = :'workspace', candidate_login = :'login'
+WHERE user_id = :'company_user' AND id = :'operation_id'
+  AND sequence = :expected_sequence
+  AND (phase = 'unresolved' OR (phase = 'replica_lost' AND NOT polling_clear))
+  AND candidate_workspace IS NULL
+  AND expires_at <= clock_timestamp()
+RETURNING id, sequence;
+```
+
+Then use a new explicit login renewal for the selected alias and, when different,
+for the known alias holding the grant. Verified completion releases each
+reservation through the normal repair path. Preserve the original receipt and
+private evidence until both repairs complete. No live alert delivery or operator
+resolution is implied by local tests.
 
 Each account keeps shared revision evidence in `shared-revision.json` beside its
 vault. Preserve it with the local state. It lets a restarted replica distinguish

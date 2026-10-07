@@ -2,6 +2,12 @@
 use super::*;
 
 pub(in crate::central) const LOGIN_SCHEMA: &str = r#"
+ALTER TABLE account_refresh_leases ADD COLUMN IF NOT EXISTS legacy_handoff BOOLEAN NOT NULL DEFAULT false;
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='account_refresh_leases'::regclass AND attname='released' AND NOT attisdropped) THEN
+        UPDATE account_refresh_leases SET legacy_handoff=true;
+    END IF;
+END $$;
 ALTER TABLE account_refresh_leases ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS central_login_operations (
     user_id TEXT NOT NULL,
@@ -24,11 +30,13 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
     candidate_login TEXT,
     PRIMARY KEY (user_id, id)
 );
+ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS polling_clear BOOLEAN NOT NULL DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_account
     ON central_login_operations(account_id)
     WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
 CREATE INDEX IF NOT EXISTS central_login_completed_revision
     ON central_login_operations(account_id, completed_revision) WHERE phase='completed';
+INSERT INTO central_schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING;
 INSERT INTO central_schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;
 "#;
 
@@ -44,6 +52,7 @@ pub(in crate::central) enum LoginPhase {
     Canceled,
     Unresolved,
     Rejected,
+    ReplicaLost,
 }
 impl LoginPhase {
     pub fn as_str(self) -> &'static str {
@@ -57,6 +66,7 @@ impl LoginPhase {
             Self::Canceled => "canceled",
             Self::Unresolved => "unresolved",
             Self::Rejected => "rejected",
+            Self::ReplicaLost => "replica_lost",
         }
     }
 }
@@ -78,8 +88,23 @@ pub(in crate::central) struct LoginOperation {
     pub holder: String,
     pub epoch: i64,
     pub payload: LoginPayload,
+    pub polling_clear: bool,
 }
 impl PostgresStore {
+    /// Only device polling can expire into a terminal receipt. A candidate or
+    /// verification marker stays reserved, even after its operation lease expires.
+    async fn expire_polling_login(
+        &self,
+        user: Option<&str>,
+        id: Option<&str>,
+        account: Option<&str>,
+    ) -> Result<()> {
+        self.client().await?.execute(
+            "UPDATE central_login_operations SET phase='replica_lost',sequence=sequence+1 WHERE ((user_id=$1 AND id=$2) OR account_id=$3) AND phase IN ('starting','pending') AND expires_at<=clock_timestamp()",
+            &[&user,&id,&account],
+        ).await?;
+        Ok(())
+    }
     fn login_row(&self, row: tokio_postgres::Row) -> Result<LoginOperation> {
         let phase: String = row.get("phase");
         let encrypted: Vec<u8> = row.get("encrypted_payload");
@@ -94,6 +119,7 @@ impl PostgresStore {
             holder: row.get("holder_id"),
             epoch: row.get("epoch"),
             payload: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
+            polling_clear: row.get("polling_clear"),
         })
     }
 }
@@ -104,6 +130,39 @@ impl CentralStore {
             _ => bail!("shared login requires PostgreSQL"),
         }
     }
+    /// The caller confirms exit and durable settlement of all pre-migration
+    /// refresh owners. New lease acquisitions consume the legacy marker, so
+    /// repeating this handoff cannot release a current owner's lease.
+    pub async fn confirm_legacy_owners_settled(&self) -> Result<u64> {
+        let db = match self {
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+            Self::File(_) => bail!("legacy lease handoff requires PostgreSQL"),
+        };
+        bounded_db(async {
+            Ok(db.client().await?.execute(
+                "UPDATE account_refresh_leases SET released=true,legacy_handoff=false,expires_at=clock_timestamp() WHERE legacy_handoff AND NOT released",
+                &[],
+            ).await?)
+        }).await
+    }
+    /// A late settlement receipt proves exit and absence of a saved grant, not
+    /// permission to promote credentials. Bind it to the original incarnation.
+    pub(in crate::central) async fn login_polling_clear(&self, op: &LoginOperation) -> Result<()> {
+        if op.payload.candidate.is_some()
+            || !matches!(op.phase, LoginPhase::Starting | LoginPhase::Pending)
+        {
+            bail!("login polling clearance requires confirmed grant absence");
+        }
+        let db = self.login_db()?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "UPDATE central_login_operations SET polling_clear=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND (sequence=$5 OR (sequence=$5+1 AND phase='replica_lost')) AND phase IN ('starting','pending','replica_lost') AND candidate_workspace IS NULL",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence],
+            ).await?;
+            if changed!=1 {bail!("login polling clearance fenced");}
+            Ok(())
+        }).await
+    }
     pub(in crate::central) async fn login_get(
         &self,
         user: &str,
@@ -111,6 +170,7 @@ impl CentralStore {
     ) -> Result<Option<LoginOperation>> {
         let db = self.login_db()?;
         bounded_db(async {
+            db.expire_polling_login(Some(user), Some(id), None).await?;
             db.client()
                 .await?
                 .query_opt(
@@ -144,6 +204,7 @@ impl CentralStore {
     ) -> Result<Option<LoginOperation>> {
         let db = self.login_db()?;
         bounded_db(async {
+            db.expire_polling_login(None, None, Some(account)).await?;
             db.client().await?.query_opt("SELECT * FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost')", &[&account]).await?
                 .map(|row| db.login_row(row)).transpose()
         }).await
@@ -182,8 +243,14 @@ impl CentralStore {
                 | LoginPhase::Failed
                 | LoginPhase::Canceled
                 | LoginPhase::Rejected
+                | LoginPhase::ReplicaLost
         ) {
             bail!("terminal login receipt is immutable");
+        }
+        // Losing publication of an unresolved marker must not make the worker
+        // classify the same attempt as a stopped, repairable candidate.
+        if phase == LoginPhase::Unresolved {
+            op.phase = phase;
         }
         let db = self.login_db()?;
         let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&op.payload)?)?;
@@ -200,7 +267,7 @@ impl CentralStore {
             .and_then(|auth| vault::token(auth).ok())
             .and_then(crate::api::token_subject);
         bounded_db(async {
-            let changed = db.client().await?.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login]).await?;
+            let changed = db.client().await?.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login]).await?;
             if changed != 1 { bail!("login transition fenced"); }
             Ok(())
         }).await?;
@@ -275,5 +342,114 @@ impl CentralStore {
         op.sequence += 1;
         op.payload = LoginPayload::default();
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "central-real-db-tests"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_unresolved_transition_preserves_its_intended_phase() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let mut op = LoginOperation {
+            user: "user".into(),
+            id: "a".repeat(64),
+            account_id: "seat".into(),
+            alias: "seat".into(),
+            device: "machine".into(),
+            phase: LoginPhase::Starting,
+            sequence: 0,
+            holder: "replica".into(),
+            epoch: 1,
+            payload: LoginPayload::default(),
+            polling_clear: false,
+        };
+        assert!(shared.login_create(&op).await.unwrap());
+        op.payload.candidate = Some(
+            serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
+        );
+        shared
+            .login_save(&mut op, LoginPhase::Candidate)
+            .await
+            .unwrap();
+        control.batch_execute("CREATE FUNCTION reject_unresolved() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase='unresolved' THEN RAISE EXCEPTION 'synthetic journal failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_unresolved BEFORE UPDATE ON central_login_operations FOR EACH ROW EXECUTE FUNCTION reject_unresolved();").await.unwrap();
+        assert!(
+            shared
+                .login_save(&mut op, LoginPhase::Unresolved)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            op.phase,
+            LoginPhase::Unresolved,
+            "failure classification must preserve unresolved intent"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_handoff_cannot_release_a_new_refresh_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[10; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        control.batch_execute("ALTER TABLE account_refresh_leases DROP COLUMN released, DROP COLUMN legacy_handoff; INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES('seat','legacy',41,clock_timestamp()-interval '1 second');").await.unwrap();
+        shared.migrate().await.unwrap();
+        shared.migrate().await.unwrap();
+        let lease = shared
+            .acquire_lease("seat", "new-owner", Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(shared.confirm_legacy_owners_settled().await.unwrap(), 0);
+        assert!(shared.renew(&lease, Duration::from_secs(60)).await.unwrap());
+        assert!(
+            shared
+                .acquire_lease("seat", "foreign", Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }
