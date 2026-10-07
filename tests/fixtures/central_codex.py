@@ -199,6 +199,11 @@ for line in sys.stdin:
                     continue
                 print("{invalid", flush=True)
                 sys.exit(1)
+        if mode == "billing-hold":
+            marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            marker.with_name("billing-started").write_text("started")
+            while not marker.with_name("release-billing").exists():
+                time.sleep(0.01)
         if mode == "billing-slow":
             pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("billing-started").write_text("started")
             time.sleep(6)

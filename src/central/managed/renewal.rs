@@ -30,6 +30,24 @@ impl Broker {
             .authorize(headers)
             .await
             .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+        // Reject a wrong login before waiting on reservations that it may itself
+        // have created for another renewal's selected account.
+        let shared = central
+            .load_account(&op.account_id)
+            .await?
+            .context("renewal account missing")?;
+        let saved: Vault = serde_json::from_value(shared.vault)?;
+        let candidate = op
+            .payload
+            .candidate
+            .as_ref()
+            .context("missing shared candidate")?;
+        if let Err(error) = crate::central::server::validate_owned_identity(&saved.auth, candidate)
+        {
+            op.payload.error = Some("wrong_account".into());
+            central.login_save(op, LoginPhase::Rejected).await?;
+            return Err(error);
+        }
         let owner_ref = self
             .owner(&device, &op.alias)
             .await

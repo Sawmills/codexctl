@@ -1558,3 +1558,105 @@ async fn postgres_unpublished_login_grant_survives_worker_exit() {
     assert_eq!(operation["epoch"], 1);
     stop_fixture(f).await;
 }
+
+#[tokio::test]
+async fn postgres_swapped_login_candidates_are_rejected_without_waiting_for_refresh() {
+    let f = login_fixture().await;
+    for alias in ["seat", "other"] {
+        f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,'settling-owner',1,clock_timestamp()+interval '120 seconds') ON CONFLICT(account_id) DO UPDATE SET holder_id='settling-owner',expires_at=clock_timestamp()+interval '120 seconds'",f.schema), &[&account_key("test", alias)]).await.unwrap();
+    }
+    let a = "6".repeat(64);
+    let b = "7".repeat(64);
+    login_request(&f, &f.first, "start", &a).await;
+    login_alias_request(&f, &f.second, "other", "start", &b).await;
+    let claims = json!({"sub":"other-seat","iat":2000001000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"other-seat","chatgpt_plan_type":"pro"}});
+    let wrong = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-wrong","account_id":"other-seat"}});
+    for (pod, grant) in [(&f.first, wrong), (&f.second, renewal_grant())] {
+        store::atomic_write(
+            &pod.root.path().join("login-release"),
+            &serde_json::to_vec(&grant).unwrap(),
+        )
+        .unwrap();
+    }
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let a = login_request(&f, &f.second, "status", &a).await;
+            let b = login_alias_request(&f, &f.first, "other", "status", &b).await;
+            if a["error"] == "wrong_account" && b["error"] == "wrong_account" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("wrong identities must be rejected before either refresh lease becomes available");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_does_not_retire_a_quarantine_issued_after_its_verification() {
+    let f = login_fixture().await;
+    let a = "8".repeat(64);
+    let b = "9".repeat(64);
+    store::atomic_write(&f.first.root.path().join("mode"), b"billing-hold").unwrap();
+    login_request(&f, &f.first, "start", &a).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("billing-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("verification must reach billing after its forced refresh");
+    login_alias_request(&f, &f.second, "other", "start", &b).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_alias_request(&f, &f.second, "other", "status", &b).await["error"]
+            != "wrong_account"
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    store::atomic_write(&f.first.root.path().join("release-billing"), b"release").unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &a).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "completion must not erase a newer grant's quarantine"
+    );
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup").unwrap();
+    std::fs::remove_file(f.first.root.path().join("login-release")).unwrap();
+    let repair = "a0".repeat(32);
+    login_request(&f, &f.first, "start", &repair).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &repair).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("a fresh verified renewal must repair the newer quarantine");
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}

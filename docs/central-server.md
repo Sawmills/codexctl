@@ -315,7 +315,8 @@ that loses its lease leaves a durable unresolved marker: another replica must
 not repeat verification. Wrong-account candidates reserve the selected account
 and the matching known account across replicas. After a stopped device login is rejected
 for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
-a new request ID. Only verified completion clears that account's reservation.
+a new request ID. Only verified completion clears that account's reservation, and only for evidence
+recorded before verification started. A newer quarantine remains fenced.
 An unresolved verification cannot use this repair path. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch
 record under `state/shared-logins/`. Preserve this evidence. Automated replay and
