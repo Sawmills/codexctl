@@ -44,6 +44,7 @@ struct RateLimitedAccount {
     plan: String,
     credits: Option<api::Credits>,
     error_msg: String,
+    pace: Option<codexctl::status_pace::Pace>,
 }
 
 struct LimitStatus {
@@ -175,6 +176,7 @@ impl RateLimitedAccount {
             .collect(),
             credits: usage.credits.clone(),
             error_msg: String::new(),
+            pace: codexctl::status_pace::Pace::from_usage(usage, chrono::Utc::now().timestamp()),
         }
     }
 
@@ -387,6 +389,11 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     }
 
     println!("{title}");
+    println!("{}", rate_limited_table(accounts));
+    true
+}
+
+fn rate_limited_table(accounts: &[&RateLimitedAccount]) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     let columns = RateLimitColumns::for_accounts(accounts);
@@ -394,8 +401,20 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     for account in accounts {
         table.add_row(render_rate_limited_row(account, &columns));
     }
-    println!("{table}");
-    true
+    if columns.pace {
+        let mut row = vec![Cell::new(""); columns.headers().len()];
+        row[0] = Cell::new("Fleet");
+        let pace_index = columns.headers().iter().position(|header| header == "Pace");
+        if let Some(index) = pace_index {
+            row[index] = codexctl::status_format::pace_cell(codexctl::status_pace::fleet_points(
+                accounts
+                    .iter()
+                    .map(|account| account.pace.map(|pace| pace.points)),
+            ));
+        }
+        table.add_row(row);
+    }
+    table
 }
 
 struct RateLimitColumns {
@@ -405,6 +424,7 @@ struct RateLimitColumns {
     plan: bool,
     credits: bool,
     resets: bool,
+    pace: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -499,6 +519,7 @@ impl RateLimitColumns {
             billing: accounts.iter().any(|account| account.billing_unknown),
             credits: accounts.iter().any(|account| account.credits.is_some()),
             resets: accounts.iter().any(|account| account.reset_credits > 0),
+            pace: healthy.iter().any(|account| account.pace.is_some()),
             plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
             // An error row still carries its label, so consider every account
@@ -525,6 +546,9 @@ impl RateLimitColumns {
         }
         if self.resets {
             headers.push("Resets".to_string());
+        }
+        if self.pace {
+            headers.push("Pace".to_string());
         }
         if self.credits {
             headers.push("Credits".to_string());
@@ -694,6 +718,7 @@ async fn fetch_and_split(
                         billing_unknown: false,
                         plan: String::new(),
                         credits: None,
+                        pace: None,
                         error_msg: "bad auth.json".to_string(),
                     });
                 }
@@ -739,6 +764,7 @@ async fn fetch_and_split(
                         billing_unknown: false,
                         plan: String::new(),
                         credits: None,
+                        pace: None,
                         error_msg: msg.to_string(),
                     });
                 }
@@ -936,6 +962,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         if columns.resets {
             row.push(Cell::new("-"));
         }
+        if columns.pace {
+            row.push(Cell::new("-"));
+        }
         if columns.credits {
             row.push(Cell::new("-"));
         }
@@ -994,6 +1023,11 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
     }
     if columns.resets {
         row.push(resets_cell(account));
+    }
+    if columns.pace {
+        row.push(codexctl::status_format::pace_cell(
+            account.pace.map(|pace| pace.points),
+        ));
     }
     if columns.credits {
         row.push(credits_cell(account.credits.as_ref()));
@@ -1214,7 +1248,44 @@ mod tests {
             plan: String::new(),
             credits: None,
             error_msg: String::new(),
+            pace: None,
         }
+    }
+
+    #[test]
+    fn rate_limited_status_snapshot_shows_pace_and_fleet_mean() {
+        let usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 12, "limit_window_seconds": 604800,
+                "reset_at": 4102444800_i64
+            }}
+        }))
+        .unwrap();
+        let mut ahead = RateLimitedAccount::from_usage("ahead".into(), None, false, None, &usage);
+        let behind_usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 12, "limit_window_seconds": 604800,
+                "reset_at": chrono::Utc::now().timestamp() + 302400
+            }}
+        }))
+        .unwrap();
+        let mut behind =
+            RateLimitedAccount::from_usage("behind".into(), None, false, None, &behind_usage);
+        let mut missing = rate_limited_account();
+        missing.alias = "missing".into();
+        for account in [&mut ahead, &mut behind, &mut missing] {
+            for limit in &mut account.limits {
+                for window in &mut limit.windows {
+                    window.reset = "-".into();
+                }
+            }
+        }
+        let accounts = [&ahead, &behind, &missing];
+        let table = rate_limited_table(&accounts);
+        assert_eq!(
+            table.to_string(),
+            include_str!("../../tests/fixtures/status_pace.txt").trim_end()
+        );
     }
 
     #[test]

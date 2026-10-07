@@ -11,11 +11,12 @@ codexctl status --json --rate-limited
 codexctl list --json
 ```
 
-## Schema Version 1
+## Schema Version 2
 
 ```json
 {
-  "version": 1,
+  "version": 2,
+  "fleet_pace_points": -13.0,
   "accounts": [
     {
       "alias": "personal",
@@ -25,6 +26,8 @@ codexctl list --json
       "state": "server",
       "primary_used_percent": 12.5,
       "secondary_used_percent": 37.0,
+      "pace_points": -13.0,
+      "elapsed_percent": 50.0,
       "primary_window_seconds": 18000,
       "secondary_window_seconds": 604800,
       "primary_resets_at": "2099-12-25T05:00:00Z",
@@ -51,7 +54,7 @@ codexctl list --json
 Every listed field except `credits` is present in every account row.
 Unknown values are `null`, except `billing_class`, which uses `unknown`.
 The optional `credits` object is omitted when upstream credits data is absent or null.
-An empty result is `{"version":1,"accounts":[]}`.
+An empty result is `{"version":2,"accounts":[],"fleet_pace_points":null}`.
 
 - `alias`: The profile or server account alias.
 - `label`: The display label, or `null`.
@@ -65,6 +68,16 @@ An empty result is `{"version":1,"accounts":[]}`.
 - `secondary_used_percent`: The main Codex long-window usage percentage, or `null`.
   This window is normally weekly.
   Window duration determines short and long placement, including a weekly-only primary window.
+- `pace_points`: Weekly used percentage minus elapsed percentage, or `null` when pace is unknown.
+  Positive points mean ahead of pace: usage is faster than a straight line through the window.
+  Negative points mean behind pace.
+- `elapsed_percent`: Percentage of the weekly window that has elapsed, or `null` when pace is unknown.
+  It is `(window_seconds - seconds_until_reset) / window_seconds * 100`, bounded to 0 through 100.
+  A reported reset more than one window away gives 0 elapsed; the reset instant gives 100.
+  After that instant, the observation is expired and both pace fields are `null`.
+  Only a declared seven-day (604800-second) main Codex long window qualifies.
+  Missing usage, duration, or reset time, invalid usage percentages, stale usage, and failed usage give `null` for both fields.
+  Pace uses the current CLI clock and adds no requests.
 - `primary_window_seconds`, `secondary_window_seconds`: Declared duration in seconds of the corresponding short or long window, or `null` when unknown.
   Durations use the same upstream evidence as the statusline; they are never inferred from plan, position, or reset time.
   Upstream minutes are converted to seconds. A weekly-only primary window is placed in the secondary fields, alongside its percentage and reset time.
@@ -98,8 +111,28 @@ Upgrade the account server as well as the CLI to expose durations for server acc
 An alias can occur twice when a profile and a server account share it.
 Use `source` with `alias` to distinguish those rows.
 Array order is not a ranking contract.
-Consumers must accept new fields within version 1.
+Consumers must accept new fields within version 2.
 Changes to existing field types or meanings require a new version.
+
+## Fleet Pace and Table Output
+
+The top-level `fleet_pace_points` is the unweighted mean of known `pace_points`
+in the emitted account rows. Each qualifying account has equal weight.
+This equals mean weekly usage minus mean elapsed percentage over the same accounts.
+Plan names do not give a reliable capacity weight, so the calculation does not use them.
+Accounts with unknown pace are excluded. An empty qualifying fleet gives `null`.
+Filters apply before the mean is calculated. Profiles and server accounts are separate rows.
+
+Status tables show a `Pace` column and a `Fleet` row when at least one displayed
+account has known pace. They hide both when all pace is unknown.
+Unknown row values display `-`. Known values round to whole percentage points:
+`+12 ahead`, `-8 behind`, or `0 on pace`. Ahead carries a yellow warning color.
+JSON keeps the unrounded numbers. A focused table computes its fleet mean over
+the accounts displayed in that table.
+Small nonzero values can round to `+0 ahead` or `-0 behind`; their direction and warning remain.
+
+Version 2 adds `pace_points`, `elapsed_percent`, and `fleet_pace_points`.
+Other version 1 fields retain their types and meanings.
 
 ## Fetch and Failure Behavior
 

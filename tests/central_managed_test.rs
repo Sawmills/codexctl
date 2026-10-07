@@ -7639,13 +7639,13 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
     assert_eq!(
         document,
         json!({
-        "version":1,"accounts":[
+        "version":2,"fleet_pace_points":37.0,"accounts":[
             {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
-             "primary_used_percent":0.0,"secondary_used_percent":37.0,
+             "primary_used_percent":0.0,"secondary_used_percent":37.0,"pace_points":37.0,"elapsed_percent":0.0,
              "primary_window_seconds":18000,"secondary_window_seconds":604800,
              "primary_resets_at":"2100-01-01T00:00:00Z","secondary_resets_at":"2100-01-01T00:00:00Z",
              "resets_at":"2100-01-01T00:00:00Z","resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"rate_limited","credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},"error":null,"usage_age_seconds":age,"usage_stale":false},
-            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
+            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local","pace_points":null,"elapsed_percent":null,
              "primary_used_percent":null,"secondary_used_percent":null,
              "primary_window_seconds":null,"secondary_window_seconds":null,
              "primary_resets_at":null,"secondary_resets_at":null,
@@ -7668,6 +7668,41 @@ fn status_json_from_an_old_server_keeps_window_durations_unknown() {
     assert_eq!(row["resets_at"], row["secondary_resets_at"]);
     assert_eq!(row["primary_used_percent"], 25.0);
     assert_eq!(row["secondary_used_percent"], 10.0);
+    assert_eq!(row.get("pace_points"), Some(&Value::Null));
+    assert_eq!(row.get("elapsed_percent"), Some(&Value::Null));
+    assert_eq!(document.get("fleet_pace_points"), Some(&Value::Null));
+}
+
+#[test]
+fn connected_status_table_reports_pace_and_fleet_and_hides_empty_pace() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "broken");
+
+    let output = server.cli(home.path(), &["status"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Pace") && stdout.contains("Fleet"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("+37 ahead").count(), 2, "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("broken") && !line.contains("ahead")),
+        "{stdout}"
+    );
+
+    let (_, output) = automatic_reset_attempt(&["status"], "pro", 25.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("Pace") && !stdout.contains("Fleet"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -7680,7 +7715,7 @@ fn connected_list_json_returns_empty_catalog_without_prose() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"version":1,"accounts":[]})
+        json!({"version":2,"accounts":[],"fleet_pace_points":null})
     );
 }
 
@@ -7722,7 +7757,7 @@ fn connected_status_json_filter_matches_the_table() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"version":1,"accounts":[]})
+        json!({"version":2,"accounts":[],"fleet_pace_points":null})
     );
 }
 
@@ -7747,6 +7782,8 @@ fn b8_status_json_reports_stale_usage_without_disabling_the_account() {
         (json!("server"), json!(true), Value::Null)
     );
     assert_eq!(row["error"], "catalog_usage_failed");
+    assert_eq!(row.get("pace_points"), Some(&Value::Null));
+    assert_eq!(row.get("elapsed_percent"), Some(&Value::Null));
 }
 
 #[test]

@@ -1089,6 +1089,8 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     },
                     primary_used_percent: account.primary_used,
                     secondary_used_percent: account.secondary_used,
+                    pace_points: None,
+                    elapsed_percent: None,
                     primary_window_seconds: account.primary_window_seconds,
                     secondary_window_seconds: account.secondary_window_seconds,
                     primary_resets_at: status_json::timestamp(account.primary_resets_at),
@@ -1106,7 +1108,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                                 .unwrap_or_else(|| "usage stale".into()),
                         )
                     } else {
-                        None
+                        account.usage_error.clone()
                     },
                     usage_age_seconds: account.usage_age_seconds,
                     usage_stale: Some(account.usage_stale),
@@ -1120,6 +1122,12 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
         .collect();
     server_rows.append(&mut rows);
     server_rows.retain(|row| filter.is_none_or(|f| row.billing == f));
+    let now = chrono::Utc::now().timestamp();
+    for row in &mut server_rows {
+        row.account.set_pace_at(now);
+        row.cells
+            .push(crate::status_format::pace_cell(row.account.pace_points).content());
+    }
     if json {
         let accounts: Vec<_> = server_rows.into_iter().map(|row| row.account).collect();
         status_json::print(&accounts)?;
@@ -1137,12 +1145,13 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
             "Credits",
             "State",
             "Error",
+            "Pace",
         ];
         let columns = status_columns(&server_rows, show_usage);
         let mut table = comfy_table::Table::new();
         table.load_preset(comfy_table::presets::UTF8_FULL_CONDENSED);
         table.set_header(columns.iter().map(|&i| headers[i]));
-        for row in server_rows {
+        for row in &server_rows {
             table.add_row(columns.iter().map(|&i| {
                 let value = row.cells[i]
                     .chars()
@@ -1150,12 +1159,22 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                     .take(160)
                     .collect::<String>();
                 let cell = comfy_table::Cell::new(value);
-                if i == 6 && row.resets_redeemable {
+                if i == 10 {
+                    crate::status_format::pace_cell(row.account.pace_points)
+                } else if i == 6 && row.resets_redeemable {
                     cell.fg(comfy_table::Color::Green)
                 } else {
                     cell
                 }
             }));
+        }
+        if let Some(index) = columns.iter().position(|&index| index == 10) {
+            let mut row = vec![comfy_table::Cell::new(""); columns.len()];
+            row[0] = comfy_table::Cell::new("Fleet");
+            row[index] = crate::status_format::pace_cell(crate::status_pace::fleet_points(
+                server_rows.iter().map(|row| row.account.pace_points),
+            ));
+            table.add_row(row);
         }
         println!("{table}");
     } else if !accounts.is_empty() {
@@ -1168,9 +1187,9 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
 }
 
 fn status_columns(rows: &[DisplayRow], show_usage: bool) -> Vec<usize> {
-    (0..10)
+    (0..11)
         .filter(|&i| {
-            (show_usage || !(3..=7).contains(&i))
+            (show_usage || (!(3..=7).contains(&i) && i != 10))
                 && (i == 0
                     || i == 8
                     || rows
@@ -1901,6 +1920,7 @@ mod tests {
                 "-".into(),
                 credit.into(),
                 "server".into(),
+                "-".into(),
                 "-".into(),
             ],
             billing: api::BillingClass::RateLimited,
