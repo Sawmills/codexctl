@@ -362,7 +362,11 @@ fn prepare_pinned_codex(
         .accounts
         .iter()
         .find(|a| a.alias.eq_ignore_ascii_case(alias))
-        .context("server account alias not found")?;
+        .with_context(|| {
+            format!(
+                "server account {alias} not found; run codexctl list (it may have been renamed)"
+            )
+        })?;
     if !account.available {
         bail!("server account {} is unavailable", account.alias);
     }

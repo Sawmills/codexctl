@@ -240,6 +240,18 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         add.json::<Value>().await.unwrap()["error"],
         "account_login_unavailable"
     );
+    let rename = http
+        .post(format!("{}/v1/accounts/rename", pods[0].url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"seat","newAlias":"renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), 503);
+    assert_eq!(
+        rename.json::<Value>().await.unwrap()["error"],
+        "account_rename_unavailable"
+    );
 
     let token = std::fs::read_to_string(token_file).unwrap();
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold").unwrap();

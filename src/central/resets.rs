@@ -306,6 +306,19 @@ async fn redeem(
         if owner.vault.user != device.user {
             return Err(worker.error(StatusCode::NOT_FOUND, "account_not_found"));
         }
+        // A rename can re-key this owner while the request waits; never spend
+        // a credit for an alias that no longer names it.
+        if !owner
+            .vault
+            .alias
+            .trim()
+            .eq_ignore_ascii_case(request.alias.trim())
+        {
+            return Err(
+                super::rename::renamed_error(&worker, &device.user, &request.alias)
+                    .unwrap_or_else(|| worker.error(StatusCode::NOT_FOUND, "account_not_found")),
+            );
+        }
         worker
             .reset_reader
             .redeem(&mut owner, &request)

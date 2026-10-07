@@ -320,6 +320,12 @@ async fn start_owned(
     if broker.resolve_alias(&device.user, &alias).await?.is_some() {
         return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
     }
+    if super::super::rename::renamed_to(&broker.state, &device.user, &alias)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+        .is_some()
+    {
+        return Err(broker.error(StatusCode::CONFLICT, "alias_renamed"));
+    }
     let mut latest = current(&state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
     if let Some(record) = latest.take() {
@@ -989,6 +995,19 @@ pub(in crate::central) fn pending_logins(broker_state: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// True when an add for this user's alias is unfinished.
+pub(in crate::central) fn pending_for(
+    broker_state: &Path,
+    user: &str,
+    alias: &str,
+) -> Result<bool> {
+    let state = add_state(broker_state, user, alias);
+    if !state.try_exists()? {
+        return Ok(false);
+    }
+    Ok(current(&state)?.is_some_and(|r| !terminal(&r.phase)))
 }
 
 /// Reservations held by new-account logins, for the shared registry admission.

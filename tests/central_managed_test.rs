@@ -1231,6 +1231,326 @@ fn shared_mode_refusal_keeps_the_add_receipt_until_file_mode_returns_the_result(
     assert!(!receipt.exists());
 }
 
+impl Server {
+    fn rename(&self, token: &str, alias: &str, new_alias: &str) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/accounts/rename", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias,"newAlias":new_alias}))
+            .send()
+            .unwrap()
+    }
+    fn aliases(&self, token: &str) -> Vec<String> {
+        let mut aliases: Vec<String> = self
+            .accounts(token)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["alias"].as_str().unwrap().to_owned())
+            .collect();
+        aliases.sort();
+        aliases
+    }
+}
+
+#[test]
+fn server_rename_moves_the_account_and_tombstones_the_old_alias() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let desktop = server.register("amir-desktop", "amir");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let renamed = server.rename(&server.amir, "personal", "work");
+    assert_eq!(renamed.status(), 200);
+    assert_eq!(renamed.json::<Value>().unwrap()["alias"], "work");
+    assert_eq!(server.aliases(&desktop), vec!["work"]);
+    assert_eq!(server.accounts(&desktop)[0]["label"], "Personal");
+    assert_eq!(server.token(&server.amir, "work", None).status(), 200);
+    let old = server.token(&server.amir, "personal", None);
+    assert_eq!(old.status(), 404);
+    let old: Value = old.json().unwrap();
+    assert_eq!(old["error"], "account_renamed");
+    assert_eq!(old["alias"], "work");
+
+    server.stop();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "work", None).status(), 200);
+    assert_eq!(
+        server
+            .token(&server.amir, "personal", None)
+            .json::<Value>()
+            .unwrap()["error"],
+        "account_renamed"
+    );
+}
+
+#[test]
+fn server_rename_refuses_a_taken_alias_and_a_pending_login() {
+    let server = Server::start();
+    for (alias, login) in [("one", "one-login"), ("two", "two-login")] {
+        assert!(
+            server
+                .import(&server.amir, alias, login, &format!("{login}-seat"))
+                .status()
+                .is_success()
+        );
+    }
+    assert!(
+        server
+            .import(&server.alex, "three", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let taken = server.rename(&server.amir, "one", "TWO");
+    assert_eq!(taken.status(), 409);
+    assert_eq!(taken.json::<Value>().unwrap()["error"], "alias_exists");
+    assert_eq!(server.rename(&server.amir, "missing", "four").status(), 404);
+    // Aliases are per user: alex's "three" does not block amir.
+    assert_eq!(server.rename(&server.amir, "one", "three").status(), 200);
+    assert_eq!(server.aliases(&server.amir), vec!["three", "two"]);
+    // A case-only rename keeps the account.
+    assert_eq!(server.rename(&server.amir, "two", "Two").status(), 200);
+    assert_eq!(server.aliases(&server.amir), vec!["Two", "three"]);
+
+    let id = "9".repeat(64);
+    server.login_request(&server.amir, "start", "three", &id);
+    let pending = server.rename(&server.amir, "three", "five");
+    assert_eq!(pending.status(), 409);
+    assert_eq!(pending.json::<Value>().unwrap()["error"], "login_pending");
+    server.login_request(&server.amir, "cancel", "three", &id);
+    server.await_login(&server.amir, "three", &id, "canceled");
+}
+
+#[test]
+fn server_rename_interrupted_after_its_intent_finishes_at_startup() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    server.stop();
+    let key = digest(&format!("amir\0{}", "personal"));
+    let account = server.root.path().join("state/accounts").join(key);
+    store::atomic_write(
+        &account.join("rename.json"),
+        &serde_json::to_vec(&json!({"user":"amir","from":"personal","to":"work"})).unwrap(),
+    )
+    .unwrap();
+    server.restart();
+    assert_eq!(server.aliases(&server.amir), vec!["work"]);
+    assert_eq!(server.token(&server.amir, "work", None).status(), 200);
+    assert!(!account.exists());
+}
+
+#[test]
+fn rename_follows_on_this_machine_and_fails_clearly_on_another() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let here = server.connected_home();
+    let there = server.connected_home();
+    for home in [&here, &there] {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    let renamed = server.cli(here.path(), &["rename", "personal", "work"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let central = here.path().join(".codexctl/central");
+    assert_eq!(
+        std::fs::read_to_string(central.join(".active-account")).unwrap(),
+        "work\n"
+    );
+    assert!(central.join("work.json").exists());
+    assert!(!central.join("personal.json").exists());
+    let token = server.cli(here.path(), &["central-token", "--active"]);
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+
+    // The other machine still names the old alias: a clear error, no switch.
+    let stale = server.cli(there.path(), &["central-token", "--active"]);
+    assert!(!stale.status.success());
+    let error = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        error.contains("personal was renamed to work") && error.contains("codexctl use work"),
+        "{error}"
+    );
+    let taken = server.cli(here.path(), &["rename", "work", "work"]);
+    assert!(taken.status.success(), "a no-op rename keeps the account");
+}
+
+#[test]
+fn rename_case_only_keeps_one_record_and_preflight_refuses_a_local_conflict() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let home = server.connected_home();
+    let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let central = home.path().join(".codexctl/central");
+    let records = || {
+        std::fs::read_dir(&central)
+            .unwrap()
+            .filter_map(|e| e.unwrap().file_name().into_string().ok())
+            .filter(|name| name.eq_ignore_ascii_case("personal.json"))
+            .count()
+    };
+    let renamed = server.cli(home.path(), &["rename", "personal", "Personal"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert_eq!(
+        records(),
+        1,
+        "a case-only rename keeps one connection record"
+    );
+    assert_eq!(server.aliases(&server.amir), vec!["Personal"]);
+
+    // A stray local record under the new name stops the rename before the server.
+    store::atomic_write(&central.join("work.json"), b"{}").unwrap();
+    let refused = server.cli(home.path(), &["rename", "Personal", "work"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("already has a server connection named work"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(server.aliases(&server.amir), vec!["Personal"]);
+}
+
+#[test]
+fn renamed_alias_is_never_reused_and_a_lost_rename_response_retries_cleanly() {
+    let mut server = Server::start();
+    for (alias, login) in [("personal", "amir-login"), ("spare", "spare-login")] {
+        assert!(
+            server
+                .import(&server.amir, alias, login, &format!("{login}-seat"))
+                .status()
+                .is_success()
+        );
+    }
+    assert_eq!(
+        server.rename(&server.amir, "personal", "work").status(),
+        200
+    );
+    // The response was lost: the same request again returns the renamed account.
+    let retried = server.rename(&server.amir, "personal", "work");
+    assert_eq!(retried.status(), 200);
+    assert_eq!(retried.json::<Value>().unwrap()["alias"], "work");
+    for refused in [
+        server.rename(&server.amir, "spare", "personal"),
+        server.import(&server.amir, "personal", "other-login", "other-seat"),
+        server.add_request(&server.amir, "start", "personal", &"a1".repeat(32), None),
+    ] {
+        assert_eq!(refused.status(), 409);
+        assert_eq!(refused.json::<Value>().unwrap()["error"], "alias_renamed");
+    }
+
+    // A crash after the directory move but before the tombstone: startup
+    // finishes the tombstone from the intent left in the new directory.
+    server.stop();
+    std::fs::remove_file(server.root.path().join("state/renames.json")).unwrap();
+    let moved = server
+        .root
+        .path()
+        .join("state/accounts")
+        .join(digest(&format!("amir\0{}", "work")));
+    store::atomic_write(
+        &moved.join("rename.json"),
+        &serde_json::to_vec(&json!({"user":"amir","from":"personal","to":"work"})).unwrap(),
+    )
+    .unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "work", None).status(), 200);
+    assert_eq!(
+        server
+            .token(&server.amir, "personal", None)
+            .json::<Value>()
+            .unwrap()["alias"],
+        "work"
+    );
+    assert!(!moved.join("rename.json").exists());
+}
+
+#[test]
+fn rename_preflight_refuses_a_profile_directory_and_other_machines_drop_stale_records() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let here = server.connected_home();
+    let there = server.connected_home();
+    for home in [&here, &there] {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    // An incomplete local profile directory still blocks the new name.
+    std::fs::create_dir_all(here.path().join(".codexctl/profiles/work")).unwrap();
+    let refused = server.cli(here.path(), &["rename", "personal", "work"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("local profile named work"));
+    std::fs::remove_dir(here.path().join(".codexctl/profiles/work")).unwrap();
+    assert!(
+        server
+            .cli(here.path(), &["rename", "personal", "work"])
+            .status
+            .success()
+    );
+
+    // The other machine moves to the new alias; its stale record goes away.
+    let stale = there.path().join(".codexctl/central/personal.json");
+    assert!(stale.exists());
+    let moved = server.cli(there.path(), &["use", "work", "--allow-billing"]);
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(server.cli(there.path(), &["list"]).status.success());
+    assert!(
+        !stale.exists(),
+        "a renamed alias's record is dropped once inactive"
+    );
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

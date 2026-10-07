@@ -120,6 +120,14 @@ enum Commands {
         #[arg(long)]
         allow_adopt: bool,
     },
+    /// Rename a server account alias; credentials and label stay
+    #[cfg(feature = "central-prototype")]
+    Rename {
+        /// Current server account alias
+        old: String,
+        /// New alias
+        new: String,
+    },
     /// Set or clear a profile's display label
     Label {
         /// Profile alias to label
@@ -328,6 +336,8 @@ fn main() {
             ref alias,
             ref text,
         } => commands::label::run(alias, text.as_deref()),
+        #[cfg(feature = "central-prototype")]
+        Commands::Rename { ref old, ref new } => codexctl::central::remote::rename(old, new),
         #[cfg(feature = "central-prototype")]
         Commands::CentralToken {
             ref connection,
