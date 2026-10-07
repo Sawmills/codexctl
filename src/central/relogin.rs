@@ -24,6 +24,7 @@ use std::{
     },
 };
 use tokio::sync::Mutex;
+pub(super) mod add;
 mod http;
 mod inventory;
 pub(super) use inventory::{

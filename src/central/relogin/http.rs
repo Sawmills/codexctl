@@ -270,6 +270,8 @@ async fn start_owned(
         code: None,
         error: None,
         retired: false,
+        label: None,
+        landed: None,
     };
     publish(&state, &record)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;

@@ -258,13 +258,55 @@ Other accounts remain available.
 A migration whose login identity conflicts with retained credentials returns HTTP 409 with `alias_identity_conflict`.
 The account stays fenced. This refusal does not record a recovery failure or trigger the credential-operation alert.
 
+To add a new account while the machine is connected, run the same command with an
+alias that is absent from the server catalog. `--label` sets its label:
+
+```sh
+codexctl login new-account --label "Team"
+```
+
+The server runs the OpenAI device login in a private server home, the same as renewal.
+The command prints the code and opens the sign-in page; `--no-browser` only prints it.
+The refresh token stays on the server. After sign-in, the server verifies the account
+and starts its refresh owner. Your machine's credentials and active account do not change,
+and the account is not installed as a local profile.
+
+If the approved OpenAI account is already a server account of yours under another alias,
+the server renews that alias instead and adds nothing. The command names that alias.
+An OpenAI account that belongs to another company user is refused with
+`account_already_owned`; the server deletes the new grant and that user's account keeps working.
+
+If your terminal disconnects, run the same command again. The machine keeps a private
+receipt of the operation and resumes it, even after the alias appears in the catalog,
+so it never starts a second OpenAI login. If the server restarts after OpenAI issued
+the grant, the server keeps that grant reserved and fences any account it overlaps
+until the same command resumes it. One alias has one pending add at a time; another
+machine cannot start, resume, or cancel it, unless the machine that started it was
+revoked, in which case the server deletes its grant and the new machine starts over. `codexctl login <alias> --cancel` stops a
+pending add, and the server deletes its login home and any grant. Once OpenAI approval
+returns and the server has started admitting the grant, cancel no longer stops it. If an earlier attempt
+already left the account on the server unverified, cancel ends the add with
+`account_import_retained` and the server keeps that unverified account. Run
+`codexctl login <alias>` again to renew and verify it through the ordinary server login.
+
+To save a local profile on a connected machine instead, add `--local`:
+`codexctl login <alias> --local`. A server alias still renews on the server.
+
+Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
+the server answers HTTP 503 with `account_login_unavailable`, because login records are
+local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
+A server refuses to start in PostgreSQL mode while any add or renewal login is pending
+("finish pending logins in file mode before switching storage"). Finish or cancel
+those logins in file mode first.
+
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine
 can renew without a prior `list` or `status` command, even while a server provider is active.
 If discovery fails, the machine uses its last successful catalog and retained migration
 or connection records to distinguish known server aliases from local aliases.
 Known server aliases require the account server; an outage never starts local login for them.
-Other aliases can still start local login when the server is unavailable.
+When the server is unavailable, a new alias needs `--local` to start a local login;
+without it the command fails instead of storing a refresh token on the machine.
 Local login keeps the existing migration and active-provider checks.
 `whoami` reports the active account. Retiring live credentials also clears the local active marker.
 After disconnect, it reports a local profile only when local credentials remain active.

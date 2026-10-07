@@ -63,6 +63,81 @@ impl Server {
             .send()
             .unwrap()
     }
+    fn add_request(
+        &self,
+        token: &str,
+        operation: &str,
+        alias: &str,
+        id: &str,
+        label: Option<&str>,
+    ) -> reqwest::blocking::Response {
+        self.http
+            .post(format!("{}/v1/accounts/login/{operation}", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias,"id":id,"label":label}))
+            .send()
+            .unwrap()
+    }
+    fn await_add(&self, token: &str, alias: &str, id: &str, terminal: &str) -> Value {
+        for _ in 0..500 {
+            let status: Value = self
+                .add_request(token, "status", alias, id, None)
+                .json()
+                .unwrap();
+            if status["status"] == terminal {
+                return status;
+            }
+            if matches!(
+                status["status"].as_str(),
+                Some("completed" | "failed" | "canceled")
+            ) {
+                panic!("unexpected add result: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("add did not finish");
+    }
+    fn add_state(&self, user: &str, alias: &str) -> PathBuf {
+        let key = digest(&format!("{user}\0{}", alias.to_ascii_lowercase()));
+        self.root.path().join("state/account-logins").join(key)
+    }
+    fn user_of(&self, token: &str) -> &'static str {
+        if token == self.alex { "alex" } else { "amir" }
+    }
+    fn add_home(&self, token: &str, alias: &str, id: &str) -> PathBuf {
+        self.add_state(self.user_of(token), alias)
+            .join(format!("relogin/{id}/home"))
+    }
+    fn add_record(&self, token: &str, alias: &str, id: &str) -> Value {
+        let path = self
+            .add_state(self.user_of(token), alias)
+            .join(format!("relogin/{id}/record.json"));
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    fn add_operations(&self, token: &str, alias: &str) -> usize {
+        std::fs::read_dir(self.add_state(self.user_of(token), alias).join("relogin"))
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+    fn release_login(&self, subject: &str, account: &str) {
+        store::atomic_write(
+            &self.root.path().join("login-release"),
+            &serde_json::to_vec(&auth(subject, account)).unwrap(),
+        )
+        .unwrap();
+    }
+    fn register(&self, device: &str, user: &str) -> String {
+        let path = self.root.path().join(format!("{device}.token"));
+        central::register(
+            &self.root.path().join("state"),
+            device,
+            "sawmills",
+            user,
+            &path,
+        )
+        .unwrap();
+        std::fs::read_to_string(path).unwrap()
+    }
     fn await_login(&self, token: &str, alias: &str, id: &str, terminal: &str) -> Value {
         for _ in 0..200 {
             let status: Value = self
@@ -463,6 +538,728 @@ fn server_login_discovers_an_alias_without_a_cached_catalog() {
     server_login_cli_scenario(false, false);
 }
 
+#[test]
+fn server_adds_a_new_account_through_a_server_managed_login() {
+    let server = Server::start();
+    let desktop = server.register("amir-desktop", "amir");
+    let id = "a1".repeat(32);
+    let started: Value = server
+        .add_request(&server.amir, "start", "new-account", &id, Some("Team"))
+        .json()
+        .unwrap();
+    assert_eq!(started["status"], "pending");
+    assert_eq!(started["userCode"], "TEST-LOGIN");
+    server.release_login("new-login", "new-seat");
+    let done = server.await_add(&server.amir, "new-account", &id, "completed");
+    assert!(done["landedAlias"].is_null());
+    let catalog = server.accounts(&desktop);
+    let added = catalog
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["alias"] == "new-account")
+        .expect("second device lists the new account");
+    assert_eq!(added["label"], "Team");
+    assert_eq!(server.token(&desktop, "new-account", None).status(), 200);
+    assert!(!server.add_home(&server.amir, "new-account", &id).exists());
+
+    // A lost completion is retried with the same operation and never logs in again.
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let again: Value = server
+        .add_request(&server.amir, "start", "new-account", &id, Some("Team"))
+        .json()
+        .unwrap();
+    assert_eq!(again["status"], "completed");
+    assert_eq!(server.add_operations(&server.amir, "new-account"), 1);
+
+    let existing = server.add_request(&server.amir, "start", "new-account", &"a2".repeat(32), None);
+    assert_eq!(existing.status(), 409);
+    assert_eq!(existing.json::<Value>().unwrap()["error"], "alias_exists");
+}
+
+#[test]
+fn server_add_refuses_an_identity_owned_by_another_user_without_fencing_it() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.alex, "work", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    assert!(
+        server
+            .import(&server.alex, "shared-name", "alex-other", "alex-other-seat")
+            .status()
+            .is_success()
+    );
+    let id = "b1".repeat(32);
+    server.add_request(&server.amir, "start", "stolen", &id, None);
+    server.release_login("alex-login", "alex-seat");
+    let failed = server.await_add(&server.amir, "stolen", &id, "failed");
+    assert_eq!(failed["error"], "account_already_owned");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+    assert!(server.accounts(&server.amir).as_array().unwrap().is_empty());
+    assert!(server.add_record(&server.amir, "stolen", &id)["candidate"].is_null());
+    assert!(!server.add_home(&server.amir, "stolen", &id).exists());
+
+    // Aliases are per user: another user's identical alias name does not interfere.
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let id = "b2".repeat(32);
+    server.add_request(&server.amir, "start", "shared-name", &id, None);
+    server.release_login("amir-login", "amir-seat");
+    server.await_add(&server.amir, "shared-name", &id, "completed");
+    assert_eq!(
+        server.token(&server.amir, "shared-name", None).status(),
+        200
+    );
+    assert_eq!(
+        server.token(&server.alex, "shared-name", None).status(),
+        200
+    );
+}
+
+#[test]
+fn server_add_cancel_and_revocation_leave_no_candidate() {
+    let server = Server::start();
+    let id = "c1".repeat(32);
+    server.add_request(&server.amir, "start", "canceled", &id, None);
+    assert_eq!(
+        server
+            .add_request(&server.amir, "cancel", "canceled", &id, None)
+            .status(),
+        200
+    );
+    server.await_add(&server.amir, "canceled", &id, "canceled");
+    assert!(server.add_record(&server.amir, "canceled", &id)["candidate"].is_null());
+    assert!(!server.add_home(&server.amir, "canceled", &id).exists());
+    assert!(server.accounts(&server.amir).as_array().unwrap().is_empty());
+
+    let id = "c2".repeat(32);
+    server.add_request(&server.amir, "start", "revoked", &id, None);
+    let response = server
+        .http
+        .post(format!("{}/v1/devices/revoke", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"id":"amir-laptop"}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let record = server.add_record(&server.amir, "revoked", &id);
+        if record["phase"] == "canceled" {
+            assert_eq!(record["child"]["status"], "exited");
+            assert!(record["candidate"].is_null());
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!server.add_home(&server.amir, "revoked", &id).exists());
+}
+
+#[test]
+fn server_add_of_a_held_identity_lands_on_the_existing_alias() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let id = "d1".repeat(32);
+    server.add_request(&server.amir, "start", "duplicate", &id, Some("Ignored"));
+    server.release_login("amir-login", "amir-seat");
+    let done = server.await_add(&server.amir, "duplicate", &id, "completed");
+    assert_eq!(done["landedAlias"], "personal");
+    let catalog = server.accounts(&server.amir);
+    let aliases: Vec<_> = catalog
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["alias"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(aliases, vec!["personal"]);
+    assert_eq!(catalog[0]["label"], "Personal");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn server_add_grant_saved_before_a_crash_is_fenced_and_resumes_without_a_second_login() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    let id = "e1".repeat(32);
+    server.add_request(&server.amir, "start", "duplicate", &id, None);
+    server.release_login("amir-login", "amir-seat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.root.path().join("login-saved").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = server.add_record(&server.amir, "duplicate", &id);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    // macOS has no parent-death signal. Stop this test's recorded native child explicitly.
+    unsafe {
+        libc::kill(
+            record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let status: Value = server
+        .add_request(&server.amir, "status", "duplicate", &id, None)
+        .json()
+        .unwrap();
+    assert_eq!(status["status"], "verifying");
+    server.add_request(&server.amir, "start", "duplicate", &id, None);
+    let done = server.await_add(&server.amir, "duplicate", &id, "completed");
+    assert_eq!(done["landedAlias"], "personal");
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    assert_eq!(server.add_operations(&server.amir, "duplicate"), 1);
+}
+
+#[test]
+fn server_add_keeps_one_operation_per_alias() {
+    let server = Server::start();
+    let desktop = server.register("amir-desktop", "amir");
+    let first: Value = server
+        .add_request(&server.amir, "start", "single", &"f1".repeat(32), None)
+        .json()
+        .unwrap();
+    let second: Value = server
+        .add_request(&server.amir, "start", "single", &"f2".repeat(32), None)
+        .json()
+        .unwrap();
+    assert_eq!(first["id"], second["id"]);
+    let other = server.add_request(&desktop, "start", "single", &"f3".repeat(32), None);
+    assert_eq!(other.status(), 409);
+    assert_eq!(
+        other.json::<Value>().unwrap()["error"],
+        "login_belongs_to_another_device"
+    );
+    assert_eq!(server.add_operations(&server.amir, "single"), 1);
+    server.add_request(&server.amir, "cancel", "single", &"f1".repeat(32), None);
+    server.await_add(&server.amir, "single", &"f1".repeat(32), "canceled");
+}
+
+#[test]
+fn server_login_adds_an_unknown_alias_without_a_client_credential() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args(["login", "new-account", "--no-browser", "--label", "Team"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = String::new();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    // Approve only after the code is shown, as a person would.
+    while !stdout.contains("TEST-LOGIN") {
+        assert!(lines.read_line(&mut stdout).unwrap() > 0, "{stdout}");
+    }
+    server.release_login("new-login", "new-seat");
+    std::io::Read::read_to_string(&mut lines, &mut stdout).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Server account added"), "{stdout}");
+    assert_eq!(server.accounts(&server.amir)[0]["alias"], "new-account");
+    assert_eq!(server.accounts(&server.amir)[0]["label"], "Team");
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+    assert_no_refresh_token(home.path());
+
+    // A receipt for a completed add resumes that operation before catalog routing.
+    let id = "a3".repeat(32);
+    server.release_login("second-login", "second-seat");
+    server.add_request(&server.amir, "start", "second", &id, None);
+    server.await_add(&server.amir, "second", &id, "completed");
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let directory = home.path().join(".codexctl/central");
+    store::atomic_write(
+        &directory.join(format!(".login-{}.json", digest("second"))),
+        &serde_json::to_vec(&json!({
+            "server":server.url,"userId":"amir","alias":"second","id":id,"kind":"add","label":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(server.cli(home.path(), &["list"]).status.success());
+    let resumed = server.cli(home.path(), &["login", "second", "--no-browser"]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("Server account added"));
+    assert_eq!(server.add_operations(&server.amir, "second"), 1);
+    assert!(
+        !directory
+            .join(format!(".login-{}.json", digest("second")))
+            .exists()
+    );
+}
+
+#[test]
+fn server_add_retry_after_failed_verification_imports_the_same_alias() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let id = "a4".repeat(32);
+    server.add_request(&server.amir, "start", "routed", &id, None);
+    server.release_login("routed-login", "routed-seat");
+    let mut status = Value::Null;
+    for _ in 0..500 {
+        status = server
+            .add_request(&server.amir, "status", "routed", &id, None)
+            .json()
+            .unwrap();
+        if status["status"] == "verifying" && status["error"].is_string() {
+            break;
+        }
+        assert!(
+            !matches!(
+                status["status"].as_str(),
+                Some("completed" | "failed" | "canceled")
+            ),
+            "{status}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(status["error"].is_string(), "{status}");
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    server.add_request(&server.amir, "start", "routed", &id, None);
+    let done = server.await_add(&server.amir, "routed", &id, "completed");
+    assert!(done["landedAlias"].is_null(), "{done}");
+    assert_eq!(server.token(&server.amir, "routed", None).status(), 200);
+
+    // A retained import that cannot verify ends on cancel; its alias then
+    // renews through the ordinary server login.
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let id = "a0".repeat(32);
+    server.add_request(&server.amir, "start", "stuck", &id, None);
+    server.release_login("stuck-login", "stuck-seat");
+    for _ in 0..500 {
+        let status: Value = server
+            .add_request(&server.amir, "status", "stuck", &id, None)
+            .json()
+            .unwrap();
+        if status["error"].is_string() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let canceled: Value = server
+        .add_request(&server.amir, "cancel", "stuck", &id, None)
+        .json()
+        .unwrap();
+    assert_eq!(canceled["status"], "canceled");
+    assert_eq!(canceled["error"], "account_import_retained");
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let renewal = "d0".repeat(32);
+    server.login_request(&server.amir, "start", "stuck", &renewal);
+    server.await_login(&server.amir, "stuck", &renewal, "completed");
+    assert_eq!(server.token(&server.amir, "stuck", None).status(), 200);
+}
+
+#[test]
+fn server_add_refusals_clear_the_client_receipt_and_never_fall_back_to_local_login() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "taken", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let home = server.connected_home();
+    let directory = home.path().join(".codexctl/central");
+    let receipt = directory.join(format!(".login-{}.json", digest("taken")));
+    store::atomic_write(
+        &receipt,
+        &serde_json::to_vec(&json!({
+            "server":server.url,"userId":"amir","alias":"taken","id":"a5".repeat(32),
+            "kind":"add","label":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = server.cli(home.path(), &["login", "taken", "--no-browser"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("already exists"));
+    assert!(
+        !receipt.exists(),
+        "a refused start must not wedge the alias"
+    );
+
+    server.stop();
+    let offline = server.cli(home.path(), &["login", "new-account", "--no-browser"]);
+    assert!(!offline.status.success());
+    assert!(
+        String::from_utf8_lossy(&offline.stderr).contains("--local"),
+        "{}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    assert!(!home.path().join(".codexctl/login-homes").exists());
+    assert!(!home.path().join(".codexctl/profiles/new-account").exists());
+    server.restart();
+}
+
+#[test]
+fn server_add_cli_rerun_after_failed_verification_succeeds() {
+    let server = Server::start();
+    let home = server.connected_home();
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    server.release_login("routed-login", "routed-seat");
+    let failed = server.cli(home.path(), &["login", "routed", "--no-browser"]);
+    assert!(!failed.status.success());
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    // The documented remedy: rerun the same command to retry verification.
+    let retried = server.cli(home.path(), &["login", "routed", "--no-browser"]);
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    assert!(String::from_utf8_lossy(&retried.stdout).contains("Server account added"));
+    assert_eq!(server.token(&server.amir, "routed", None).status(), 200);
+}
+
+#[test]
+fn server_add_saved_grant_releases_on_refusal_and_on_device_revocation() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.alex, "work", "alex-login", "alex-seat")
+            .status()
+            .is_success()
+    );
+    let desktop = server.register("amir-desktop", "amir");
+    let crash = |server: &mut Server, alias: &str, id: &str, subject: &str, account: &str| {
+        store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+        server.add_request(&server.amir, "start", alias, id, None);
+        server.release_login(subject, account);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !server.root.path().join("login-saved").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let record = server.add_record(&server.amir, alias, id);
+        server.child.kill().unwrap();
+        server.child.wait().unwrap();
+        unsafe {
+            libc::kill(
+                record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+                libc::SIGKILL,
+            );
+        }
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        for file in ["login-release", "login-saved"] {
+            let _ = std::fs::remove_file(server.root.path().join(file));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        server.restart();
+    };
+    // A saved grant for alex's seat fences alex's account until it is refused.
+    let id = "a6".repeat(32);
+    crash(&mut server, "stolen", &id, "alex-login", "alex-seat");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 503);
+    server.add_request(&server.amir, "start", "stolen", &id, None);
+    let failed = server.await_add(&server.amir, "stolen", &id, "failed");
+    assert_eq!(failed["error"], "account_already_owned");
+    assert_eq!(server.token(&server.alex, "work", None).status(), 200);
+
+    // A saved grant from a revoked device no longer blocks the alias.
+    let id = "a7".repeat(32);
+    crash(&mut server, "orphan", &id, "orphan-login", "orphan-seat");
+    let response = server
+        .http
+        .post(format!("{}/v1/devices/revoke", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"id":"amir-laptop"}))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let next = "a8".repeat(32);
+    let started: Value = server
+        .add_request(&desktop, "start", "orphan", &next, None)
+        .json()
+        .unwrap();
+    assert_eq!(started["id"], next, "{started}");
+    let orphan = server.add_record(&server.amir, "orphan", &id);
+    assert_eq!(orphan["error"], "device_revoked");
+    assert!(!server.add_home(&server.amir, "orphan", &id).exists());
+    server.add_request(&desktop, "cancel", "orphan", &next, None);
+    server.await_add(&desktop, "orphan", &next, "canceled");
+}
+
+#[test]
+fn server_add_landing_that_fails_verification_names_the_alias_to_renew() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
+    let id = "a9".repeat(32);
+    server.add_request(&server.amir, "start", "duplicate", &id, None);
+    server.release_login("amir-login", "amir-seat");
+    let failed = server.await_add(&server.amir, "duplicate", &id, "failed");
+    assert_eq!(failed["error"], "landed_renewal_failed");
+    assert_eq!(failed["landedAlias"], "personal");
+    // The landed alias retries through its own renewal.
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let retry = "b9".repeat(32);
+    server.login_request(&server.amir, "start", "personal", &retry);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while server.token(&server.amir, "personal", None).status() != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "personal never recovered"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn server_add_receipt_from_an_earlier_registration_does_not_block_the_alias() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let receipt = home
+        .path()
+        .join(format!(".codexctl/central/.login-{}.json", digest("team")));
+    store::atomic_write(
+        &receipt,
+        &serde_json::to_vec(&json!({
+            "server":"https://old.example.invalid","userId":"amir","alias":"team",
+            "id":"c9".repeat(32),"kind":"add","label":null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    server.release_login("team-login", "team-seat");
+    let added = server.cli(home.path(), &["login", "team", "--no-browser"]);
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(String::from_utf8_lossy(&added.stdout).contains("Server account added"));
+    assert!(!receipt.exists());
+}
+
+#[test]
+fn server_add_unreadable_saved_grant_fails_only_its_own_record_at_startup() {
+    let mut server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    let id = "e2".repeat(32);
+    server.add_request(&server.amir, "start", "garbled", &id, None);
+    server.release_login("garbled-login", "garbled-seat");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !server.root.path().join("login-saved").exists() {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let record = server.add_record(&server.amir, "garbled", &id);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    unsafe {
+        libc::kill(
+            record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    store::atomic_write(
+        &server
+            .add_home(&server.amir, "garbled", &id)
+            .join("auth.json"),
+        b"{not json",
+    )
+    .unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    server.restart();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let failed = server.add_record(&server.amir, "garbled", &id);
+    assert_eq!(failed["phase"], "failed");
+    assert_eq!(failed["error"], "unsupported_login_output");
+}
+
+#[test]
+fn shared_storage_refuses_to_start_beside_a_pending_login() {
+    let mut server = Server::start();
+    let id = "f9".repeat(32);
+    server.add_request(&server.amir, "start", "pending", &id, None);
+    let record = server.add_record(&server.amir, "pending", &id);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    unsafe {
+        libc::kill(
+            record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CODEXCTL_CENTRAL_STORE", "postgres")
+        .env_remove("DATABASE_URL")
+        .args(["serve", "--state"])
+        .arg(server.root.path().join("state"))
+        .arg("--key-file")
+        .arg(server.root.path().join("key"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:8787",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("finish pending logins in file mode before switching storage"),
+        "{error}"
+    );
+    // The pending record is untouched for file mode to finish.
+    assert_eq!(
+        server.add_record(&server.amir, "pending", &id)["phase"],
+        "pending"
+    );
+    server.restart();
+}
+
+#[test]
+fn shared_mode_refusal_keeps_the_add_receipt_until_file_mode_returns_the_result() {
+    let mut server = Server::start();
+    let home = server.connected_home();
+    let directory = home.path().join(".codexctl/central");
+    let receipt = directory.join(format!(".login-{}.json", digest("lost")));
+    // The add completes, but the client never sees the response.
+    let id = "e3".repeat(32);
+    server.add_request(&server.amir, "start", "lost", &id, None);
+    server.release_login("lost-login", "lost-seat");
+    server.await_add(&server.amir, "lost", &id, "completed");
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let write_receipt = |url: &str| {
+        store::atomic_write(
+            &receipt,
+            &serde_json::to_vec(&json!({
+                "server":url,"userId":"amir","alias":"lost","id":id,"kind":"add","label":null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    write_receipt(&server.url);
+
+    // Shared mode refuses every add request with 503 before any id lookup.
+    server.stop();
+    let listener =
+        std::net::TcpListener::bind(server.url.strip_prefix("http://").unwrap()).unwrap();
+    let shared = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request);
+        let body = br#"{"error":"account_login_unavailable"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let refused = server.cli(home.path(), &["login", "lost", "--no-browser"]);
+    shared.join().unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("shared mode"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        receipt.exists(),
+        "a shared-mode 503 proves nothing about the id"
+    );
+
+    // Back in file mode, the same receipt returns the completed add.
+    server.restart();
+    let token = directory.join(".device.token");
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(&json!({"server":server.url,"token_file":token,"user_id":"amir"}))
+            .unwrap(),
+    )
+    .unwrap();
+    write_receipt(&server.url);
+    let resumed = server.cli(home.path(), &["login", "lost", "--no-browser"]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("Server account added"));
+    assert_eq!(server.add_operations(&server.amir, "lost"), 1);
+    assert!(!receipt.exists());
+}
+
+fn digest(alias: &str) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))
+}
+
+fn assert_no_refresh_token(root: &std::path::Path) {
+    for entry in walk(root) {
+        let bytes = std::fs::read(&entry).unwrap_or_default();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("synthetic-refresh"),
+            "client file holds a refresh token: {}",
+            entry.display()
+        );
+    }
+}
+
+fn walk(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_type().unwrap().is_dir() {
+            files.extend(walk(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
 fn server_login_cli_scenario(active: bool, cached: bool) {
     let server = Server::start();
     assert!(
@@ -519,7 +1316,7 @@ fn server_login_cli_scenario(active: bool, cached: bool) {
     assert_eq!(std::fs::read(auth_file).unwrap(), b"local-auth-sentinel");
     assert!(!home.path().join(".codexctl/login-homes").exists());
     if active {
-        let local = server.cli(home.path(), &["login", "new-local-profile"]);
+        let local = server.cli(home.path(), &["login", "new-local-profile", "--local"]);
         assert!(!local.status.success());
         assert!(String::from_utf8_lossy(&local.stderr).contains("remote provider is active"));
         assert!(!home.path().join(".codexctl/login-homes").exists());
@@ -5111,7 +5908,7 @@ fn pending_local_login_scenario(kill_parent: bool) {
     let start = |alias: &str, gate: &std::path::Path| {
         Command::new(env!("CARGO_BIN_EXE_codexctl"))
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
-            .args(["login", alias])
+            .args(["login", alias, "--local"])
             .env("HOME", home.path())
             .env(
                 "PATH",
@@ -6402,14 +7199,29 @@ fn p3_new_local_login_survives_failed_discovery_but_known_server_aliases_stay_fe
     let result = run("new-profile");
     done.store(true, std::sync::atomic::Ordering::Release);
     let contacted_server = probe.join().unwrap();
+    // A new alias on a connected machine is a server add; failed discovery
+    // never stores a local refresh token unless --local asks for one.
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(!error.contains("LOCAL_LOGIN_REACHED"), "{error}");
+    assert!(error.contains("--local"), "{error}");
+    assert!(
+        contacted_server,
+        "login must try fresh discovery before refusing"
+    );
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["login", "new-profile", "--local"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("LOCAL_LOGIN_REACHED"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
-    );
-    assert!(
-        contacted_server,
-        "login must try fresh discovery before falling back to local login"
     );
     let collision = home.path().join(".codexctl/profiles/personal");
     store::ensure_private_dir(&collision).unwrap();
@@ -6447,8 +7259,17 @@ fn p3_new_local_login_survives_failed_discovery_but_known_server_aliases_stay_fe
         "aliases cached for another registration cannot route this login"
     );
     std::fs::remove_file(&cache).unwrap();
+    let local = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["login", "new-profile", "--local"])
+        .env("HOME", home.path())
+        .env("PATH", &bin)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
     assert!(
-        String::from_utf8_lossy(&run("new-profile").stderr).contains("LOCAL_LOGIN_REACHED"),
+        String::from_utf8_lossy(&local.stderr).contains("LOCAL_LOGIN_REACHED"),
         "a new machine does not need a cached catalog to start local login"
     );
     store::atomic_write(&cache, b"{").unwrap();

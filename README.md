@@ -563,4 +563,7 @@ for setup, SSH tunnels, tests, and the remaining compatibility limits.
 Connect your machines with company SSO and keep OpenAI refresh credentials on a private server.
 Use `codexctl connect --server https://YOUR-SERVER`, then `codexctl use` and `codexctl codex`.
 Resume a session from before migration with `codexctl codex resume <session-id>`.
+On a connected machine, `codexctl login <new-alias>` adds an account to the server; the server
+runs the OpenAI device login, so the refresh token never reaches your machine. Use `--local` for
+a local profile instead.
 See [server setup, migration, and staging deployment](docs/central-server.md).

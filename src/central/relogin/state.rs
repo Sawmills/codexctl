@@ -47,6 +47,12 @@ pub(super) struct Record {
     pub code: Option<String>,
     pub error: Option<String>,
     pub retired: bool,
+    // New-account login only: the requested label, and the existing alias
+    // whose renewal received this grant because it already held the identity.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub landed: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -213,6 +219,7 @@ pub(super) fn response(record: &Record) -> Response {
             "verificationUrl":if record.phase == Phase::Pending { Some(URL) } else { None },
             "userCode":if record.phase == Phase::Pending { record.code.as_deref() } else { None },
             "error":record.error,
+            "landedAlias":record.landed,
         })),
     )
         .into_response()

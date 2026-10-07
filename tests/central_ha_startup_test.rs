@@ -227,6 +227,19 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         [0, 0, 0],
         "startup must not create refresh children on any replica"
     );
+    // Login records are replica-local, so shared mode refuses new-account login.
+    let add = http
+        .post(format!("{}/v1/accounts/login/start", pods[0].url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"new-account","id":"a".repeat(64)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add.status(), 503);
+    assert_eq!(
+        add.json::<Value>().await.unwrap()["error"],
+        "account_login_unavailable"
+    );
 
     let token = std::fs::read_to_string(token_file).unwrap();
     store::atomic_write(&pods[0].root.path().join("mode"), b"startup-hold").unwrap();
@@ -521,9 +534,9 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     for pod in &mut pods {
         pod.stop().await;
     }
-    // A migrated, verified vault can retain a promoted relogin journal.
-    // Shared-store startup must expose a fence instead of serving it through
-    // the ordinary restore path without replacement verification.
+    // A migrated, verified vault can retain a promoted relogin journal. A
+    // shared store cannot finish that replica-local journal, so startup must
+    // refuse before it launches or serves anything for that account.
     let [first, _, _] = pods;
     let account = std::fs::read_dir(first.root.path().join("state/accounts"))
         .unwrap()
@@ -549,23 +562,29 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         .unwrap(),
     )
     .unwrap();
-    let mut promoted = Pod::spawn(database.as_str(), &key, first.root, "postgres").await;
-    let response = request(&http, &promoted, &token).await;
-    assert_eq!(
-        response.status(),
-        503,
-        "unfinished shared relogin must stay fenced"
+    let state = first.root.path().join("state");
+    let refused = command(database.as_str(), &state, &key, "serve")
+        .env("CODEXCTL_CENTRAL_STORE", "postgres")
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:8787",
+        ])
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        !refused.status.success(),
+        "unfinished shared relogin must refuse startup"
     );
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["error"],
-        "owner_unavailable"
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("finish pending logins in file mode before switching storage"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
     );
-    assert_eq!(
-        promoted.launches(),
-        0,
-        "relogin fence must precede child launch"
-    );
-    promoted.stop().await;
     control
         .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
         .await
