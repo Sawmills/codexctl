@@ -464,7 +464,13 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         .env_remove("CODEXCTL_PINNED_ALIAS")
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("OPENAI_API_KEY")
-        .current_dir(&home)
+        // The supervisor opens relative connection configuration from the
+        // server cwd. Its native child still runs inside the private home.
+        .current_dir(if cfg!(target_os = "linux") {
+            std::env::current_dir()?
+        } else {
+            home.clone()
+        })
         .stdin(if cfg!(target_os = "linux") {
             Stdio::piped()
         } else {
@@ -552,7 +558,10 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(current) = db.login_get(&op.user, &op.id).await?
+        if let Some(current) = db
+            .login_get(&op.user, &op.id)
+            .await
+            .inspect_err(|_| op.phase = LoginPhase::Unresolved)?
             && current.holder == op.holder
             && current.epoch == op.epoch
         {

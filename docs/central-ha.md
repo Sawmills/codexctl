@@ -167,7 +167,10 @@ captured grant before normal completion, or a durable absence receipt after
 confirmed exit with no grant in an intact private home. A failed native spawn
 also records absence only when that original home contains no grant. If the
 native child exits before its process identity is recorded, the supervisor
-reaps it and settles its grant evidence.
+reaps it and settles its grant evidence. The supervisor keeps the server working
+directory for relative database CA paths; its native child runs in the private
+login home. A failed settlement receipt read retains an unresolved fence and
+the local grant evidence.
 An expired polling operation and holder can release reservations only with
 that absence receipt. The old receipt reports `expired`; a fresh request ID
 can complete on another replica without first polling the abandoned ID.

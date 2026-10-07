@@ -3305,6 +3305,87 @@ async fn postgres_supervised_login_resolves_a_relative_key_from_server_cwd() {
 }
 
 #[tokio::test]
+#[ignore = "requires TLS-enabled PostgreSQL and CODEXCTL_TEST_DB_CA_FILE"]
+#[cfg(target_os = "linux")]
+async fn postgres_supervised_login_resolves_a_relative_database_ca_from_server_cwd() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    let root = f.first.root;
+    let ca = std::env::var("CODEXCTL_TEST_DB_CA_FILE").expect("test CA bundle required");
+    store::atomic_write(
+        &root.path().join("relative-ca.crt"),
+        &std::fs::read(ca).unwrap(),
+    )
+    .unwrap();
+    store::atomic_write(&root.path().join("mode"), b"").unwrap();
+    let mut child = command(
+        &f.database.replace("sslmode=disable", "sslmode=require"),
+        &root.path().join("state"),
+        &f.key,
+        "serve",
+    )
+    .current_dir(root.path())
+    .env("CODEXCTL_CENTRAL_DB_TLS", "1")
+    .env("CODEXCTL_CENTRAL_DB_CA_FILE", "relative-ca.crt")
+    .args([
+        "--listen",
+        "127.0.0.1:0",
+        "--public-url",
+        "http://127.0.0.1:8787",
+        "--codex-bin",
+    ])
+    .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"))
+    .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+    .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
+    .env("CENTRAL_TEST_REFRESH_COUNTER", root.path().join("count"))
+    .env(
+        "CENTRAL_TEST_LAUNCH_COUNTER",
+        root.path().join("launch-count"),
+    )
+    .stdout(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(20),
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    f.first = Pod {
+        child,
+        root,
+        url: format!("http://{}", ready["listening"].as_str().unwrap()),
+    };
+    let id = "25".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_cancel_before_supervisor_launch_preserves_grant_absence() {
     let f = login_fixture().await;
@@ -3405,6 +3486,82 @@ async fn postgres_cancel_on_b_stops_polling_while_a_is_stopped() {
     })
     .await
     .unwrap();
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_unreadable_settlement_receipt_keeps_an_unpublished_grant_fenced() {
+    let f = login_fixture().await;
+    let id = "24".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("other-seat", Some("other-login"), None)).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("login-saved").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow the parent's normal tick to observe the published challenge before
+    // failing its later settlement read at the same operation sequence.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    // Make the shared receipt unreadable at the settlement boundary. Updates
+    // remain available, so the worker must not mistake failed reads for absence.
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET encrypted_payload='\\x00'::bytea WHERE id=$1", f.schema), &[&id]).await.unwrap();
+    store::atomic_write(&f.first.root.path().join("login-exit"), b"go").unwrap();
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    wait_parent_bound_exit(pid).await;
+    // Let the independent supervisor attempt to read the damaged receipt.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGCONT) }, 0);
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let response = f
+                .http
+                .post(format!("{}/v1/relogin/status", f.second.url))
+                .bearer_auth(&f.token)
+                .json(&json!({"alias":"seat","id":id}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 200 {
+                let receipt: Value = response.json().await.unwrap();
+                if receipt["status"] == "failed" {
+                    break;
+                }
+            } else {
+                assert_eq!(
+                    response.status(),
+                    503,
+                    "receipt read failure stays explicit"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "an unreadable receipt cannot clear the unpublished grant's company-user fence"
+    );
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "unknown grant evidence forbids refresh"
+    );
     stop_fixture(f).await;
 }
 
