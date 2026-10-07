@@ -172,6 +172,19 @@ impl CentralStore {
         self.expire(None, now).await
     }
 
+    /// Whether the account has an active grant. Account-scoped and uncapped,
+    /// for guards such as the alias rename.
+    pub async fn has_active_loan(&self, account_id: &str, now: i64) -> Result<bool> {
+        match self {
+            Self::File(file) => Ok(file.read_state()?.loans.values().any(|grant| {
+                grant.account_id == account_id && grant.active(now) && grant.deleted_at.is_none()
+            })),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
+                bounded_db(db.has_active_loan(account_id, now)).await
+            }
+        }
+    }
+
     /// Whether any unended, unretired grant is past its end time.
     pub async fn has_due_loans(&self, now: i64) -> Result<bool> {
         match self {
@@ -523,29 +536,47 @@ impl FileStore {
 }
 
 impl PostgresStore {
+    /// Expire up to 1,000 due grants and audit each end, in one statement.
     async fn expire_loans(&self, account: Option<&str>, now: i64) -> Result<Vec<Grant>> {
         let client = self.client().await?;
-        let rows = client
+        client
             .query(
                 concat!(
-                    "SELECT ",
-                    grant_columns!(),
-                    " FROM ",
+                    "WITH due AS (SELECT id AS due_id FROM ",
                     loans_table!(),
-                    " WHERE ended_at IS NULL AND deleted_at IS NULL AND ends_at <= $1 AND ($2::text IS NULL OR account_id = $2) LIMIT 1000"
+                    " WHERE ended_at IS NULL AND deleted_at IS NULL AND ends_at <= $1 AND ($2::text IS NULL OR account_id = $2) LIMIT 1000 FOR UPDATE SKIP LOCKED), ended AS (UPDATE ",
+                    loans_table!(),
+                    " SET ended_at=ends_at, ended_by=NULL, end_reason='expired' FROM due WHERE id = due.due_id AND ended_at IS NULL RETURNING ",
+                    grant_columns!(),
+                    "), audit AS (INSERT INTO ",
+                    audit_table!(),
+                    "(",
+                    audit_columns!(),
+                    ") SELECT id, ended_at, 'ended', NULL, NULL, 'expired', NULL, NULL FROM ended) SELECT ",
+                    grant_columns!(),
+                    " FROM ended"
                 ),
                 &[&now, &account],
             )
-            .await?;
-        let mut expired = Vec::new();
-        for row in rows {
-            let mut grant = grant_from_row(&row)?;
-            grant.end(grant.ends_at, None, EndReason::Expired);
-            if self.store_end(&grant).await? {
-                expired.push(grant);
-            }
-        }
-        Ok(expired)
+            .await?
+            .iter()
+            .map(grant_from_row)
+            .collect()
+    }
+
+    async fn has_active_loan(&self, account_id: &str, now: i64) -> Result<bool> {
+        let client = self.client().await?;
+        Ok(client
+            .query_one(
+                concat!(
+                    "SELECT EXISTS(SELECT 1 FROM ",
+                    loans_table!(),
+                    " WHERE account_id=$1 AND ended_at IS NULL AND deleted_at IS NULL AND ends_at > $2)"
+                ),
+                &[&account_id, &now],
+            )
+            .await?
+            .get(0))
     }
 
     async fn has_due_loans(&self, now: i64) -> Result<bool> {

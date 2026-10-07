@@ -182,17 +182,13 @@ pub(super) async fn rename(
             .unwrap_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found")));
     };
     // An active loan names this alias (ADR 0004); the lender ends it first.
+    // `lend` creates grants under the same import lock, so none can start
+    // between this check and the rename.
     let lent = broker
         .loan_store()
-        .loans_for_user(&device.user)
+        .has_active_loan(&old_key, chrono::Utc::now().timestamp())
         .await
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
-        .iter()
-        .any(|grant| {
-            grant.lender == device.user
-                && grant.account_id == old_key
-                && grant.active(chrono::Utc::now().timestamp())
-        });
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     if lent {
         return Err(broker.error(StatusCode::CONFLICT, "rename_blocked_by_loan"));
     }

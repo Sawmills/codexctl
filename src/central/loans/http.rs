@@ -543,6 +543,19 @@ async fn lend(
         vault::digest(&crate::central::enrollment::random_bytes()),
     )
     .map_err(|reason| broker.error(grant_status(reason), reason))?;
+    // Renames hold the import lock; take it so a rename cannot slip between
+    // this alias check and the grant insert.
+    let _renames = broker.imports.lock().await;
+    if !owner
+        .lock()
+        .await
+        .vault
+        .alias
+        .trim()
+        .eq_ignore_ascii_case(&grant.alias)
+    {
+        return Err(broker.error(StatusCode::CONFLICT, "account_changed"));
+    }
     let store = broker.loan_store();
     if !store
         .create_loan(&grant)
