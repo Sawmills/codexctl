@@ -1454,10 +1454,14 @@ async fn token(
     let alias = match borrowed.as_ref() {
         Some(borrowed) => {
             broker
-                .confirm_borrowed_token(&borrowed.grant, &device, &token)
+                .confirm_borrowed_token(&borrowed.grant, &token)
                 .await?;
-            // The recheck can wait; a machine revoked meanwhile gets nothing.
+            // The checks above can wait; a machine revoked meanwhile gets
+            // nothing. The atomic issue step is last before the response.
             broker.authorize(&headers).await?;
+            broker
+                .issue_borrowed_token(&borrowed.grant, &device)
+                .await?;
             borrowed.grant.reference.clone()
         }
         None => alias,

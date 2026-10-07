@@ -382,3 +382,37 @@ async fn a_retried_end_repairs_a_missed_dual_mirror() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_token_issue_succeeds_only_while_the_grant_is_active() {
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
+    let store = CentralStore::file(root.path(), &key);
+    store.migrate().await.unwrap();
+    assert!(store.create_loan(&grant("g", "a", 5_000)).await.unwrap());
+    assert!(
+        store
+            .issue_token(&AuditEvent::token_issued(2_000, "g", "m"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .issue_token(&AuditEvent::token_issued(5_000, "g", "m"))
+            .await
+            .unwrap(),
+        "at the end time"
+    );
+    store
+        .end_loan("g", 3_000, "lender", EndReason::Revoked)
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .issue_token(&AuditEvent::token_issued(3_500, "g", "other"))
+            .await
+            .unwrap(),
+        "after an end"
+    );
+}

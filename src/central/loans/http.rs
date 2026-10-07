@@ -397,7 +397,6 @@ impl Broker {
     pub(in crate::central) async fn confirm_borrowed_token(
         &self,
         grant: &Grant,
-        device: &vault::Device,
         token: &TokenResponse,
     ) -> Result<(), HttpError> {
         // The token must be the lender's current login.
@@ -423,16 +422,23 @@ impl Broker {
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(grant, "lender_disabled").await);
         }
-        self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))
-            .await?;
-        // The grant check is the last store read before delivery; only the
-        // caller's machine re-authorization follows it.
-        let current = self
+        Ok(())
+    }
+
+    /// The last step before a borrowed token is returned: record the issue
+    /// only if the grant is still active, atomically with any end. Nothing
+    /// awaits between this and the response.
+    pub(in crate::central) async fn issue_borrowed_token(
+        &self,
+        grant: &Grant,
+        device: &vault::Device,
+    ) -> Result<(), HttpError> {
+        let issued = self
             .loan_store()
-            .load_loan(&grant.id)
+            .issue_token(&AuditEvent::token_issued(now(), &grant.id, &device.id))
             .await
-            .map_err(|error| self.loan_failure("recheck", error))?;
-        if !current.is_some_and(|current| current.active(now())) {
+            .map_err(|error| self.loan_failure("issue", error))?;
+        if !issued {
             self.expire_loans().await?;
             return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
         }

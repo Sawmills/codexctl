@@ -172,6 +172,24 @@ impl CentralStore {
         self.expire(None, now).await
     }
 
+    /// Record a token issue only if its grant is still active, and report
+    /// whether it was. One atomic step: PostgreSQL locks the grant row for
+    /// the statement and file mode holds the store lock, so an end commits
+    /// either before (no token) or after (the token was issued first).
+    pub async fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+        match self {
+            Self::File(file) => file.issue_token(event),
+            Self::Postgres(db) => bounded_db(db.issue_token(event)).await,
+            Self::Dual { file, postgres, .. } => {
+                let active = bounded_db(postgres.issue_token(event)).await?;
+                if active && let Err(error) = file.append_loan_audit(event) {
+                    mirror_failure(self, "issue_token", &error);
+                }
+                Ok(active)
+            }
+        }
+    }
+
     /// Whether the account has an active grant. Account-scoped and uncapped,
     /// for guards such as the alias rename.
     pub async fn has_active_loan(&self, account_id: &str, now: i64) -> Result<bool> {
@@ -506,6 +524,23 @@ impl FileStore {
         })
     }
 
+    fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+        self.with_lock(|state| {
+            let active = state
+                .loans
+                .get(&event.grant_id)
+                .is_some_and(|grant| grant.active(event.at) && grant.deleted_at.is_none());
+            let duplicate = state
+                .loan_audit
+                .iter()
+                .any(|existing| existing.coalesce_key == event.coalesce_key);
+            if active && !duplicate {
+                state.loan_audit.push(event.clone());
+            }
+            Ok(active)
+        })
+    }
+
     fn retire_loans(&self, cutoff: i64, now: i64) -> Result<()> {
         let due = |state: &super::FileState| {
             state.loans.values().any(|grant| {
@@ -562,6 +597,31 @@ impl PostgresStore {
             .iter()
             .map(grant_from_row)
             .collect()
+    }
+
+    async fn issue_token(&self, event: &AuditEvent) -> Result<bool> {
+        let client = self.client().await?;
+        Ok(client
+            .query_one(
+                concat!(
+                    "WITH grant_row AS (SELECT id FROM ",
+                    loans_table!(),
+                    " WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL AND ends_at > $2 FOR SHARE), issued AS (INSERT INTO ",
+                    audit_table!(),
+                    "(",
+                    audit_columns!(),
+                    ") SELECT id,$2,$3,NULL,$4,NULL,$5,NULL FROM grant_row ON CONFLICT DO NOTHING) SELECT EXISTS(SELECT 1 FROM grant_row)"
+                ),
+                &[
+                    &event.grant_id,
+                    &event.at,
+                    &event.kind.as_str(),
+                    &event.machine,
+                    &event.coalesce_key,
+                ],
+            )
+            .await?
+            .get(0))
     }
 
     async fn has_active_loan(&self, account_id: &str, now: i64) -> Result<bool> {
