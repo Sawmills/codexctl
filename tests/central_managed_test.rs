@@ -1155,6 +1155,82 @@ fn shared_storage_refuses_to_start_beside_a_pending_login() {
     server.restart();
 }
 
+#[test]
+fn shared_mode_refusal_keeps_the_add_receipt_until_file_mode_returns_the_result() {
+    let mut server = Server::start();
+    let home = server.connected_home();
+    let directory = home.path().join(".codexctl/central");
+    let receipt = directory.join(format!(".login-{}.json", digest("lost")));
+    // The add completes, but the client never sees the response.
+    let id = "e3".repeat(32);
+    server.add_request(&server.amir, "start", "lost", &id, None);
+    server.release_login("lost-login", "lost-seat");
+    server.await_add(&server.amir, "lost", &id, "completed");
+    std::fs::remove_file(server.root.path().join("login-release")).unwrap();
+    let write_receipt = |url: &str| {
+        store::atomic_write(
+            &receipt,
+            &serde_json::to_vec(&json!({
+                "server":url,"userId":"amir","alias":"lost","id":id,"kind":"add","label":null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    write_receipt(&server.url);
+
+    // Shared mode refuses every add request with 503 before any id lookup.
+    server.stop();
+    let listener =
+        std::net::TcpListener::bind(server.url.strip_prefix("http://").unwrap()).unwrap();
+    let shared = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request);
+        let body = br#"{"error":"account_login_unavailable"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let refused = server.cli(home.path(), &["login", "lost", "--no-browser"]);
+    shared.join().unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("shared mode"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        receipt.exists(),
+        "a shared-mode 503 proves nothing about the id"
+    );
+
+    // Back in file mode, the same receipt returns the completed add.
+    server.restart();
+    let token = directory.join(".device.token");
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(&json!({"server":server.url,"token_file":token,"user_id":"amir"}))
+            .unwrap(),
+    )
+    .unwrap();
+    write_receipt(&server.url);
+    let resumed = server.cli(home.path(), &["login", "lost", "--no-browser"]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resumed.stdout).contains("Server account added"));
+    assert_eq!(server.add_operations(&server.amir, "lost"), 1);
+    assert!(!receipt.exists());
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

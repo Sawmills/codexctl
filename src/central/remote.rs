@@ -321,17 +321,16 @@ fn server_login(
             // These refusals prove the server never published this add
             // operation, so its receipt must not block later commands.
             // A known id is answered before these checks, so each one proves
-            // this id was never published. Shared mode refuses with HTTP 503.
+            // this id was never published. Shared mode refuses every add
+            // request before it looks up an id, so its 503 proves nothing and
+            // the receipt stays for a retry after the server returns to file mode.
             let shared_mode = status == reqwest::StatusCode::SERVICE_UNAVAILABLE
                 && reason.as_deref() == Some("account_login_unavailable");
             let unpublished = match operation {
-                "start" => {
-                    shared_mode
-                        || matches!(
-                            reason.as_deref(),
-                            Some("alias_exists" | "login_belongs_to_another_device")
-                        )
-                }
+                "start" => matches!(
+                    reason.as_deref(),
+                    Some("alias_exists" | "login_belongs_to_another_device")
+                ),
                 _ => reason.as_deref() == Some("relogin_not_found"),
             };
             if add.is_some() && unpublished && !id.is_empty() {
@@ -339,7 +338,7 @@ fn server_login(
             }
             match reason.as_deref() {
                 Some("account_login_unavailable") if shared_mode => bail!(
-                    "the server cannot add accounts; adding accounts is unavailable while the server runs in shared mode"
+                    "the server cannot add accounts while it runs in shared mode; the pending login for {alias} is kept, rerun codexctl login {alias} after the server returns to file mode"
                 ),
                 Some("account_login_unavailable") => bail!(
                     "the server cannot start a login now; the operation is retained, rerun codexctl login {alias} later"
