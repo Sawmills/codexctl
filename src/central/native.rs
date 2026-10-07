@@ -38,6 +38,7 @@ enum PointerCause {
     Recovery,
     Rollback,
     Deactivate,
+    Rename,
 }
 
 impl PointerCause {
@@ -48,6 +49,7 @@ impl PointerCause {
             Self::Recovery => "recovery",
             Self::Rollback => "rollback",
             Self::Deactivate => "deactivate",
+            Self::Rename => "rename",
         }
     }
 }
@@ -786,15 +788,27 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     let response = request.send().context("central token request failed")?;
     let status = response.status();
     if !status.is_success() {
+        let body = response.json::<serde_json::Value>().ok();
+        let reason = body.as_ref().and_then(|v| v["error"].as_str());
         if status == reqwest::StatusCode::CONFLICT
-            && response
-                .json::<serde_json::Value>()
-                .ok()
-                .is_some_and(|v| v["error"] == "unsupported_workspace_routing")
+            && reason == Some("unsupported_workspace_routing")
         {
             bail!(
                 "this account requires workspace routing that the central native provider does not yet support"
             );
+        }
+        if status == reqwest::StatusCode::NOT_FOUND
+            && reason == Some("account_renamed")
+            && let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str())
+        {
+            // Never follow a rename silently: the operator picks the account.
+            let old = connection.alias.as_deref().unwrap_or("this account");
+            if connection.launch_pinned {
+                bail!(
+                    "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
+                );
+            }
+            bail!("server account {old} was renamed to {renamed}; run codexctl use {renamed}");
         }
         bail!("central token request rejected (HTTP {})", status);
     }
@@ -854,6 +868,195 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     save_connection(&path, &connection)?;
     println!("registered remote account {alias}; run codexctl use {alias}");
     Ok(())
+}
+
+/// After a server rename, move this machine's connection record and active
+/// pointer to the new alias. Other machines learn the rename at their next
+/// catalog read or token refresh.
+pub(super) fn follow_rename(old: &str, new: &str) -> Result<()> {
+    let directory = root()?;
+    if !directory.try_exists()? {
+        return Ok(());
+    }
+    let _lock = native_lock(&directory)?;
+    // The server matches aliases without case, so the local record may be
+    // spelled differently from the request.
+    let Some(old_path) = find_connection(&directory, old)? else {
+        return Ok(());
+    };
+    let new_path = connection_path(new)?;
+    if new_path.try_exists()? && !same_file(&old_path, &new_path)? {
+        bail!(
+            "the server renamed {old} to {new}, but this machine has another connection named {new}; remove it, then run codexctl use {new}"
+        );
+    }
+    let mut connection = read_connection(&old_path)?;
+    connection.alias = Some(new.to_owned());
+    // Order for crash recovery: the new record first, then the pointer,
+    // then the old record. Every prefix leaves a usable record, and a stale
+    // one fails with the server's renamed message.
+    store::atomic_write(&new_path, &serde_json::to_vec(&connection)?)?;
+    store::sync_directory(&directory)?;
+    move_active_pointer(&directory, old, new)?;
+    if !same_file(&old_path, &new_path)? {
+        std::fs::remove_file(&old_path)?;
+        store::sync_directory(&directory)?;
+    }
+    Ok(())
+}
+
+/// The connection record whose alias matches `alias` without case.
+fn find_connection(directory: &Path, alias: &str) -> Result<Option<PathBuf>> {
+    let exact = connection_path(alias)?;
+    if exact.try_exists()? {
+        return Ok(Some(exact));
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let matches = path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(alias));
+        if matches && read_connection(&path).is_ok() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// The workspace this machine's record names for `alias`, to bind a rename.
+pub(super) fn connection_account_id(alias: &str) -> Result<Option<String>> {
+    let directory = root()?;
+    if !directory.try_exists()? {
+        return Ok(None);
+    }
+    Ok(find_connection(&directory, alias)?
+        .map(|path| read_connection(&path))
+        .transpose()?
+        .map(|connection| connection.account_id))
+}
+
+/// Refuse a rename whose new name already holds an unrelated local record,
+/// before the server commits it.
+pub(super) fn rename_preflight(old: &str, new: &str) -> Result<()> {
+    let directory = root()?;
+    if directory.try_exists()?
+        && let Some(existing) = find_connection(&directory, new)?
+        && find_connection(&directory, old)?
+            .map(|source| same_file(&source, &existing))
+            .transpose()?
+            != Some(true)
+    {
+        bail!(
+            "this machine already has a server connection named {new}; disconnect or remove it before renaming"
+        );
+    }
+    let profile = store::profile_dir(&config::default_paths()?, new)?;
+    // A confirmed transfer marker is the server account's own local trace.
+    if profile.try_exists()? && !profile.join(".central-transfer.json").try_exists()? {
+        bail!(
+            "a local profile named {new} exists; remove or rename it before renaming the server account"
+        );
+    }
+    Ok(())
+}
+
+/// Drop this registration's records for aliases the server renamed, except
+/// the active one, which keeps reporting the server's renamed message. The
+/// rename list is fetched only when a record is missing from the catalog.
+/// Call under the native lock.
+pub(super) fn drop_renamed_connections(
+    server: &str,
+    user_id: &str,
+    live: &[String],
+    renamed: impl FnOnce() -> Option<Vec<String>>,
+) -> Result<()> {
+    let directory = root()?;
+    if !directory.try_exists()? {
+        return Ok(());
+    }
+    let active = read_active_alias().ok();
+    let mut candidates = Vec::new();
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(connection) = read_connection(&path) else {
+            continue;
+        };
+        let alias = connection_alias(&path, &connection);
+        if connection.server == server
+            && connection.user_id.as_deref() == Some(user_id)
+            && !connection.launch_pinned
+            && !live.iter().any(|a| a.eq_ignore_ascii_case(&alias))
+            && !active
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&alias))
+        {
+            candidates.push((path, alias));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let Some(renamed) = renamed() else {
+        return Ok(());
+    };
+    let mut removed = false;
+    for (path, alias) in candidates {
+        if renamed.iter().any(|a| a.eq_ignore_ascii_case(&alias)) {
+            std::fs::remove_file(&path)?;
+            removed = true;
+        }
+    }
+    if removed {
+        store::sync_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn move_active_pointer(history_root: &Path, old: &str, new: &str) -> Result<()> {
+    let pointer = active_pointer_path()?;
+    if !(pointer.try_exists()?
+        && read_active_alias().is_ok_and(|active| active.eq_ignore_ascii_case(old)))
+    {
+        return Ok(());
+    }
+    let previous = vault::private_read(&pointer)?;
+    store::atomic_write(&pointer, format!("{new}\n").as_bytes())?;
+    if let Err(error) = append_active_history(
+        history_root,
+        Some(old.to_owned()),
+        Some(new.to_owned()),
+        PointerCause::Rename,
+    ) {
+        store::atomic_write(&pointer, &previous)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// True when both paths name one file, as a case-only rename does on a
+/// case-insensitive filesystem.
+fn same_file(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(left), std::fs::metadata(right)) {
+            (Ok(a), Ok(b)) => Ok(a.dev() == b.dev() && a.ino() == b.ino()),
+            _ => Ok(false),
+        }
+    }
+    #[cfg(not(unix))]
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => Ok(a == b),
+        _ => Ok(false),
+    }
 }
 
 fn active_pointer_path() -> Result<PathBuf> {
