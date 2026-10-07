@@ -4,10 +4,10 @@
 
 ## Preconditions (each with its owner)
 
-1. Google OAuth client `codexctl-staging` (Internal, Web application, redirect `https://codexctl.ue1.staging.plat.sm-svc.com/auth/callback`) exists; ID and secret in 1Password only. Owner: lane t5A (SAW-12454 A15), computer use in Dia.
+1. Google OAuth client `codexctl-staging` (External per A26, Web application, redirect `https://codexctl.ue1.staging.plat.sm-svc.com/auth/callback`) exists; ID and secret in 1Password only. Owner: lane t5A (SAW-12454 A15), computer use in Dia.
 2. Plaintext secret at Secrets Manager `/app/codexctl/oidc-client-secret`, and `ClusterSecretStore/aws-secrets-manager` can read it. The Clerk secret stays in SSM for rollback. Owner: platform admin.
 3. The image pin that ships #137 and #139 has rolled out and passed its checks. The window then changes configuration only.
-4. The broker image has `flock` and `jq` for the surgical rollback (G3). If either is missing, the operator uses the full restore path, and the plan says so before the window.
+4. Surgical rollback tooling (G3). The deployed broker image (`sha256:b55a6a99…`, checked 2026-10-07) has `flock` but no `jq`. Before the window, the operator writes and dry-runs, on a copy of `users.json`, the one edit that clears `oidc_identity` for one user ID without `jq`. If that edit is not ready, the after-link rollback is the full `/data/state` restore only, and the plan says so in the notice.
 5. Operator (G6): one Claude Code session named by HQ before the window. Its credentials: AWS SSO (`aws-sso-login`) for `kubie`/`kubectl`, the repository `gh` identity for merges, `op read` of one field for the hash check. It never uses codexctl tokens, so a server outage cannot block it. Revert merger (G2): HQ w5C:t41; the operator merges if HQ does not answer in 5 minutes.
 
 ## PRs
@@ -27,8 +27,9 @@ Argo Application `codexctl` auto-syncs with prune and selfHeal, so a merge is a 
 3. Merge the precursor. Wait for its gate (G1).
 4. Merge PR A. Watch the Application `status.sync.revision` reach the merge commit, a new pod UID, and `/ready` 200.
 5. Amir signs in at the dashboard with Google, only as `amir@sawmills.ai` (G4). Expected: one `SSO_IDENTITY_LINKED company_user=6334462f…` line, the same user in `codexctl devices`. Then `codexctl-central users` must list no new company-user ID. If one appears: `codexctl-central users --state /data/state --user <id> --disable`, stop, and decide rollback.
-6. A lane runs `codexctl codex --account <alias> exec "say ok"`; machine credentials still work.
-7. Merge PR B. Watch the sync, the new pod UID, `/ready` 200, and one more lane test call. No second browser sign-in (G8).
+6. Domain refusal (A26: the Google client is External, so any Google account reaches the consent screen). Amir signs in once with a personal Google account, which carries no `hd` claim. Expected: HTTP 403 `company_identity_required` (`src/central/enrollment.rs`, hosted-domain check) and no new company-user ID in `codexctl-central users`. A wrong domain (`hd=other.example`) is already covered by `google_workspace_checks_the_signed_domain_and_verified_email`; the missing-`hd` case has no test, so this staging check is its proof.
+7. A lane runs `codexctl codex --account <alias> exec "say ok"`; machine credentials still work.
+8. Merge PR B. Watch the sync, the new pod UID, `/ready` 200, and one more lane test call. No second browser sign-in (G8).
 
 ## Rollback
 
