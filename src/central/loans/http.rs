@@ -138,10 +138,13 @@ impl Broker {
 
     /// Expire due grants and apply the retention before a history read, so
     /// rows past 90 days are hidden even when no loan changed meanwhile.
+    /// A failed retirement fails the read, so no row past the window shows.
     async fn expire_and_retire(&self) -> Result<(), HttpError> {
         self.expire_loans().await?;
-        self.retire_loans().await;
-        Ok(())
+        self.loan_store()
+            .retire_loans(now())
+            .await
+            .map_err(|error| self.loan_failure("retire", error))
     }
 
     /// Apply the 90-day retention after a grant or an end. The grant or end

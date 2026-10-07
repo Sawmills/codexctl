@@ -975,3 +975,31 @@ async fn a_read_hides_a_loan_that_ended_more_than_90_days_ago() {
     assert_eq!(status, StatusCode::OK);
     assert!(loans.as_array().unwrap().is_empty(), "{loans}");
 }
+
+#[tokio::test]
+async fn a_history_read_fails_when_the_retention_cannot_be_applied() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let old = now() - crate::central::loans::RETENTION_SECONDS - 60;
+    fixture
+        .broker
+        .loan_store()
+        .end_loan(
+            grant["id"].as_str().unwrap(),
+            old,
+            "test",
+            crate::central::loans::EndReason::Revoked,
+        )
+        .await
+        .unwrap();
+    // Hold the store lock so the retirement write cannot run.
+    let held = vault::registry_lock(&fixture.state, "central-storage.lock").unwrap();
+    let (status, body) = fixture
+        .call("GET", "/v1/loans", &fixture.lender, Value::Null)
+        .await;
+    drop(held);
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::SERVICE_UNAVAILABLE, json!("loan_store_failed"))
+    );
+}
