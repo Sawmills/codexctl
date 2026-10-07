@@ -80,6 +80,21 @@ A conflict rolls back the migration. Resolve the stored inventory before retryin
 Backfill copies file-mode rename tombstones into PostgreSQL. Every replica
 refuses add or import under a retired alias.
 
+Migration 5 adds logical release markers, reservation history, and typed
+candidate UID and subject columns. It copies migration-4 claims into
+`central_account_identity_claims`, an independent ownership ledger without an
+account foreign key. An old account cascade cannot erase this proof. The old
+claim table remains a compatibility projection. Both tables retain the full
+workspace/namespace/claim key. Active reads require `deleted_at IS NULL`;
+archiving a claim does not permit another account to take its historical key.
+Alias tombstones remain active permanent fences. Completed reservations retain
+release timestamps. A released full-key slot can be reused, while
+`central_login_identity_reservation_history` keeps one row per claim and login
+operation. Completion releases slots and history in the same transaction.
+Migration copies surviving rows only; it cannot recover previously deleted
+history. Drain migration-4 writers before migration and deploy this version to
+all replicas before resuming writes. Mixed writer versions are not supported.
+
 Add, renewal candidate publication, credential writes, and migration take one
 transaction advisory lock for their PostgreSQL schema. Lock order starts with
 that admission lock, then the operation or account rows and refresh lease as
@@ -90,7 +105,20 @@ matching login with `relogin_reserved`. Add creates the unverified account and
 transfers its reservation together, then uses the fenced renewal verifier.
 Same-user landing keeps the existing alias and label. Completion publishes
 credentials, revision, receipt, and reservation release together. The machine
-must remain authorized at admission.
+must remain authorized at admission. A fresh add can repair a rejected add
+when its retained identity agrees with the existing account. A timed-out
+admission reads the settled transaction before verification, so a committed
+account does not leave its operation stuck at the old sequence.
+
+The `/metrics` endpoint reports process-wide
+`codexctl_central_admission_lock_seconds_sum` and
+`codexctl_central_admission_lock_seconds_count`. These count client-observed
+transaction hold time after acquiring the lock, including failed attempts.
+They exclude connection and advisory-lock waits. A timed-out commit can keep
+running after the client observation ends. Use the sum/count rates and the
+existing staging workload gates to measure admission cost before a lock or
+connection-pool redesign. Local tests verify that stalled native verification
+does not hold this lock; they do not establish production throughput.
 
 Expired device-polling receipts now report `expired` and permit a new request
 ID. Expiry retains a company-user fence when child exit and grant absence are

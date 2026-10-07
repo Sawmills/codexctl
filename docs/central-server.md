@@ -313,6 +313,9 @@ keeps its label. It transfers the operation reservation before taking that
 account's refresh lease. The server records the verification marker before it
 starts the native refresh child. Credentials and the completed receipt commit
 together; a retry on another replica returns that receipt without another login.
+If admission commits but its response times out, the worker reads its settled
+operation before verification. A fresh add can repair a rejected add with the
+same proven identity and land on the existing alias.
 
 Identity claims use a unique database key: workspace, namespace, and claim.
 Both `uid` and `sub` remain recorded when a later token omits either claim.
@@ -408,7 +411,9 @@ UPDATE central_login_operations
 SET phase = 'rejected', sequence = sequence + 1,
     candidate_workspace = :'workspace',
     candidate_login = (:'login_claims'::jsonb)->>'sub',
-    candidate_claims = :'login_claims'::jsonb
+    candidate_claims = :'login_claims'::jsonb,
+    candidate_uid = (:'login_claims'::jsonb)->>'uid',
+    candidate_sub = (:'login_claims'::jsonb)->>'sub'
 WHERE user_id = :'company_user' AND id = :'operation_id'
   AND sequence = :expected_sequence
   AND (phase = 'unresolved' OR (phase = 'replica_lost' AND NOT polling_clear))
@@ -438,6 +443,16 @@ replica refuses reuse of an old alias for add or import. Conflicting stored
 claims stop the migration and roll
 back its changes. Resolve the inventory conflict before retrying; do not delete
 credential evidence to force the migration.
+
+Migration 5 adds an independent ownership ledger, logical reservation release,
+and per-operation reservation history. It retains the existing full unique
+keys and copies surviving migration-4 proof. Account deletion cannot erase the
+new ledger. Active reads require `deleted_at IS NULL`; historical claim keys
+remain reserved to their proven account. Retired aliases remain permanent
+fences. SQL identity decisions use typed `candidate_uid` and `candidate_sub`
+fields; the older JSON field is a compatibility projection. Drain older writers,
+apply migration 5 with the vault key, and update all replicas before resuming
+writes. The migration cannot restore history that was already physically deleted.
 
 To rename one of your server accounts, run:
 

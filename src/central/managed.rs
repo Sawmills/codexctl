@@ -2750,6 +2750,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
             format!("codexctl_central_failed_requests_total{{reason=\"{reason}\"}} {}\ncodexctl_central_last_failure_timestamp_seconds{{reason=\"{reason}\"}} {}\n", count.count, count.last)
         })
         .collect();
+    output.push_str(&super::storage::identity::admission_metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
@@ -3594,8 +3595,6 @@ pub async fn serve(
         }
         let prepared = if hydration_quarantines.contains(&id) {
             Err(anyhow::anyhow!("shared hydration identity unresolved"))
-        } else if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false)) {
-            Err(anyhow::anyhow!("candidate has not started"))
         } else {
             // Shared-store replicas hydrate credentials without starting a native
             // refresh owner. The token path acquires the account's database lease

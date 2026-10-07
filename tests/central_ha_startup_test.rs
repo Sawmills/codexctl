@@ -3968,12 +3968,16 @@ async fn postgres_import_refuses_claims_incomparable_with_an_existing_account() 
 
 #[tokio::test]
 async fn postgres_identity_read_failure_before_refresh_is_retryable() {
-    identity_database_failure("%LEFT JOIN central_account_claims%", "a7").await;
+    identity_database_failure("%LEFT JOIN central_account_identity_claims%", "a7").await;
 }
 
 #[tokio::test]
 async fn postgres_candidate_validation_database_failure_is_not_wrong_account() {
-    identity_database_failure("%SELECT namespace,claim FROM central_account_claims%", "a8").await;
+    identity_database_failure(
+        "%SELECT namespace,claim FROM central_account_identity_claims%",
+        "a8",
+    )
+    .await;
 }
 
 async fn identity_database_failure(query_pattern: &str, request_prefix: &str) {
@@ -3983,7 +3987,7 @@ async fn identity_database_failure(query_pattern: &str, request_prefix: &str) {
     f.control
         .batch_execute(&format!(
             r#"
-        ALTER TABLE {0}.central_account_claims RENAME TO retained_claims;
+        ALTER TABLE {0}.central_account_identity_claims RENAME TO retained_claims;
         CREATE FUNCTION {0}.unavailable_identity(value text) RETURNS text
         LANGUAGE plpgsql VOLATILE AS $$
         BEGIN
@@ -3992,7 +3996,7 @@ async fn identity_database_failure(query_pattern: &str, request_prefix: &str) {
             END IF;
             RETURN value;
         END $$;
-        CREATE VIEW {0}.central_account_claims AS SELECT account_id, workspace,
+        CREATE VIEW {0}.central_account_identity_claims AS SELECT account_id, workspace, deleted_at,
             namespace, {0}.unavailable_identity(claim) AS claim FROM {0}.retained_claims;
     "#,
             f.schema, query_pattern
@@ -4548,5 +4552,338 @@ async fn conflicting_local_vault(
         "shared advancement cannot overwrite unproven local vault ownership"
     );
     assert_eq!(std::fs::read(journal).unwrap(), journal_evidence);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_replica_cached_during_add_verification_serves_after_completion() {
+    let mut f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let operation = json!({"alias":"pending-cache","id":"cc".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant(
+            "pending-workspace",
+            Some("pending-sub"),
+            Some("pending-uid"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.second.stop().await;
+    f.second = Pod::spawn(&f.database, &f.key, f.second.root, "postgres").await;
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "the replica may cache pending data but must not verify it"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"pending-cache"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a completed receipt must promote the replica's safe pending cache"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_rejected_add_can_be_repaired_by_a_fresh_add_landing() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    let first = json!({"alias":"repair-original","id":"cd".repeat(32)});
+    let grant = add_grant("repair-workspace", Some("repair-sub"), Some("repair-uid"));
+    add_request(&f, &f.first, "start", &first).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wait_add_terminal(&f, &first).await["status"], "failed");
+    let second = json!({"alias":"repair-copy","id":"ce".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    let repaired = complete_add(&f, &f.second, &second, &grant).await;
+    assert_eq!(repaired["landedAlias"], "repair-original");
+    let token = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"repair-original"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        token.status(),
+        200,
+        "completed repair must release the old identity fence"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_continues_after_admission_commit_response_times_out() {
+    let f = login_fixture().await;
+    f.control.batch_execute(&format!(r#"
+        CREATE FUNCTION {0}.prepare_admission_delay() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.kind='add' AND OLD.account_id IS NULL AND NEW.account_id IS NOT NULL THEN
+                PERFORM set_config('statement_timeout','0',false);
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER prepare_admission_delay AFTER UPDATE ON {0}.central_login_operations
+        FOR EACH ROW EXECUTE FUNCTION {0}.prepare_admission_delay();
+        CREATE FUNCTION {0}.delay_admission_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.kind='add' AND OLD.account_id IS NULL AND NEW.account_id IS NOT NULL THEN
+                PERFORM pg_sleep(3);
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE CONSTRAINT TRIGGER delay_admission_commit AFTER UPDATE ON {0}.central_login_operations
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {0}.delay_admission_commit();
+    "#,f.schema)).await.unwrap();
+    let operation = json!({"alias":"commit-lost","id":"cf".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    complete_add(
+        &f,
+        &f.first,
+        &operation,
+        &add_grant("commit-workspace", Some("commit-sub"), Some("commit-uid")),
+    )
+    .await;
+    assert_eq!(
+        f.first.launches() + f.second.launches(),
+        1,
+        "one verification after admission"
+    );
+    let token = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"commit-lost"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        token.status(),
+        200,
+        "committed admission must proceed to verification"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_reports_lock_timing_and_releases_it_before_native_verification() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let operation = json!({"alias":"timing","id":"ca".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("timing-workspace", Some("timing-sub"), None)).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let count = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("codexctl_central_admission_lock_seconds_count "))
+        .expect("admission exposes lock hold count")
+        .parse::<u64>()
+        .unwrap();
+    assert!(count > 0);
+    let seconds = metrics
+        .lines()
+        .find_map(|line| line.strip_prefix("codexctl_central_admission_lock_seconds_sum "))
+        .expect("admission exposes cumulative hold time")
+        .parse::<f64>()
+        .unwrap();
+    assert!(seconds.is_finite() && seconds > 0.0);
+    let free: bool = f
+        .control
+        .query_one(
+            "SELECT pg_try_advisory_lock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(free, "native verification must not hold the admission lock");
+    f.control
+        .query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_completed_add_preserves_reservation_history_when_claim_is_reused() {
+    let f = login_fixture().await;
+    let grant = add_grant(
+        "history-workspace",
+        Some("history-sub"),
+        Some("history-uid"),
+    );
+    let first = json!({"alias":"history-original","id":"c8".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(&f, &f.first, &first, &grant).await;
+    let retained:i64=f.control.query_one(&format!("SELECT count(*) FROM {}.central_login_identity_reservations WHERE workspace='history-workspace'",f.schema),&[]).await.unwrap().get(0);
+    assert_eq!(retained, 2, "completed reservation rows must be retained");
+    let second = json!({"alias":"history-copy","id":"c9".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    assert_eq!(
+        complete_add(&f, &f.second, &second, &grant).await["landedAlias"],
+        "history-original"
+    );
+    let history=f.control.query_one(&format!("SELECT count(*),count(*) FILTER(WHERE deleted_at IS NULL) FROM {}.central_login_identity_reservation_history WHERE workspace='history-workspace'",f.schema),&[]).await.unwrap();
+    assert_eq!(
+        history.get::<_, i64>(0),
+        4,
+        "each operation retains both claim reservations"
+    );
+    assert_eq!(
+        history.get::<_, i64>(1),
+        0,
+        "both completed operations have released claims"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_persists_typed_candidate_claims_for_identity_queries() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let operation = json!({"alias":"typed","id":"c7".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant(
+            "typed-workspace",
+            Some("typed-sub"),
+            Some("typed-uid"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let row = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT candidate_uid,candidate_sub FROM {}.central_login_operations WHERE id=$1",
+                f.schema
+            ),
+            &[&operation["id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "typed-uid");
+    assert_eq!(row.get::<_, String>(1), "typed-sub");
+    // Compatibility JSON is no longer the identity-query authority.
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_login_operations SET candidate_claims='{{}}'::jsonb WHERE id=$1",
+                f.schema
+            ),
+            &[&operation["id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap();
+    f.control
+        .batch_execute(&format!("SET search_path TO {}", f.schema))
+        .await
+        .unwrap();
+    let agrees:bool=f.control.query_one(&format!("SELECT {}.central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,account_id) FROM {}.central_login_operations WHERE id=$1",f.schema,f.schema),&[&operation["id"].as_str().unwrap()]).await.unwrap().get(0);
+    assert!(
+        agrees,
+        "typed identity comparison must retain both namespaced facts"
+    );
+    // Simulate an installed migration-4 database. Upgrade uses the encrypted
+    // candidate even when the compatibility metadata has lost its UID.
+    f.control.batch_execute("ALTER TABLE central_login_operations DROP COLUMN candidate_uid; ALTER TABLE central_login_operations DROP COLUMN candidate_sub; DROP TABLE central_login_identity_reservation_history").await.unwrap();
+    for _ in 0..2 {
+        let upgraded = command(
+            &f.database,
+            &f.second.root.path().join("state"),
+            &f.key,
+            "migrate",
+        )
+        .output()
+        .await
+        .unwrap();
+        assert!(
+            upgraded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&upgraded.stderr)
+        );
+    }
+    let restored = f
+        .control
+        .query_one(
+            "SELECT candidate_uid,candidate_sub FROM central_login_operations WHERE id=$1",
+            &[&operation["id"].as_str().unwrap()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(restored.get::<_, String>(0), "typed-uid");
+    assert_eq!(restored.get::<_, String>(1), "typed-sub");
+    let reserved:i64=f.control.query_one("SELECT count(*) FROM central_login_identity_reservation_history WHERE workspace='typed-workspace' AND deleted_at IS NULL",&[]).await.unwrap().get(0);
+    assert_eq!(reserved, 2, "upgrade retains both active reservations");
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
     stop_fixture(f).await;
 }

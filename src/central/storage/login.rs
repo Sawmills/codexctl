@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS central_account_claims (
     workspace TEXT NOT NULL,
     namespace TEXT NOT NULL CHECK(namespace IN ('uid','sub')),
     claim TEXT NOT NULL,
-    account_id TEXT NOT NULL REFERENCES central_accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
     PRIMARY KEY(workspace,namespace,claim)
 );
 CREATE INDEX IF NOT EXISTS central_account_claims_owner ON central_account_claims(account_id);
@@ -69,31 +69,80 @@ CREATE TABLE IF NOT EXISTS central_login_identity_reservations (
     FOREIGN KEY(user_id,id) REFERENCES central_login_operations(user_id,id)
 );
 CREATE INDEX IF NOT EXISTS central_login_identity_owner ON central_login_identity_reservations(user_id,id);
-CREATE OR REPLACE FUNCTION central_login_identity_agrees(p_workspace TEXT, p_claims JSONB, p_account TEXT)
+ALTER TABLE central_alias_tombstones ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE central_account_claims ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+ALTER TABLE central_login_identity_reservations ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS central_login_identity_reservation_history (
+    workspace TEXT NOT NULL,
+    namespace TEXT NOT NULL CHECK(namespace IN ('uid','sub')),
+    claim TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY(workspace,namespace,claim,user_id,id)
+);
+INSERT INTO central_login_identity_reservation_history(workspace,namespace,claim,user_id,id,deleted_at)
+    SELECT workspace,namespace,claim,user_id,id,deleted_at FROM central_login_identity_reservations
+    ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS central_account_identity_claims (
+    workspace TEXT NOT NULL,
+    namespace TEXT NOT NULL CHECK(namespace IN ('uid','sub')),
+    claim TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    deleted_at TIMESTAMPTZ,
+    PRIMARY KEY(workspace,namespace,claim)
+);
+CREATE INDEX IF NOT EXISTS central_account_identity_claims_owner ON central_account_identity_claims(account_id);
+INSERT INTO central_account_identity_claims(workspace,namespace,claim,account_id,deleted_at)
+    SELECT workspace,namespace,claim,account_id,deleted_at FROM central_account_claims
+    ON CONFLICT DO NOTHING;
+DO $$ BEGIN
+    IF EXISTS(SELECT 1 FROM central_account_identity_claims c JOIN central_account_claims l USING(workspace,namespace,claim) WHERE c.account_id<>l.account_id) THEN
+        RAISE EXCEPTION 'retained identity migration conflict';
+    END IF;
+END $$;
+ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_uid TEXT;
+ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_sub TEXT;
+UPDATE central_login_operations SET candidate_uid=COALESCE(candidate_uid,candidate_claims->>'uid'),
+    candidate_sub=COALESCE(candidate_sub,candidate_claims->>'sub',candidate_login)
+    WHERE candidate_workspace IS NOT NULL;
+CREATE OR REPLACE FUNCTION central_login_identity_agrees(p_workspace TEXT, p_uid TEXT, p_sub TEXT, p_account TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
     WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account),
     known AS (
-        SELECT namespace,claim FROM central_account_claims JOIN owned USING(account_id) WHERE central_account_claims.workspace=owned.workspace
+        SELECT namespace,claim FROM central_account_identity_claims JOIN owned USING(account_id)
+            WHERE central_account_identity_claims.workspace=owned.workspace AND central_account_identity_claims.deleted_at IS NULL
         UNION SELECT 'sub',login FROM owned WHERE login IS NOT NULL
     )
     SELECT EXISTS(SELECT 1 FROM owned WHERE workspace=p_workspace) AND CASE
-        WHEN p_claims ? 'uid' AND EXISTS(SELECT 1 FROM known WHERE namespace='uid')
-        THEN EXISTS(SELECT 1 FROM known WHERE namespace='uid' AND claim=p_claims->>'uid')
-        ELSE EXISTS(SELECT 1 FROM known WHERE namespace='sub' AND claim=p_claims->>'sub')
+        WHEN p_uid IS NOT NULL AND EXISTS(SELECT 1 FROM known WHERE namespace='uid')
+        THEN EXISTS(SELECT 1 FROM known WHERE namespace='uid' AND claim=p_uid)
+        ELSE EXISTS(SELECT 1 FROM known WHERE namespace='sub' AND claim=p_sub)
     END
 $$;
-CREATE OR REPLACE FUNCTION central_login_identity_matches(p_workspace TEXT, p_claims JSONB, p_account TEXT)
+CREATE OR REPLACE FUNCTION central_login_identity_matches(p_workspace TEXT, p_uid TEXT, p_sub TEXT, p_account TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
     WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account),
     known AS (
-        SELECT namespace,claim FROM central_account_claims JOIN owned USING(account_id) WHERE central_account_claims.workspace=owned.workspace
+        SELECT namespace,claim FROM central_account_identity_claims JOIN owned USING(account_id)
+            WHERE central_account_identity_claims.workspace=owned.workspace AND central_account_identity_claims.deleted_at IS NULL
         UNION SELECT 'sub',login FROM owned WHERE login IS NOT NULL
     )
     SELECT EXISTS(SELECT 1 FROM owned WHERE workspace=p_workspace) AND (
-        EXISTS(SELECT 1 FROM known WHERE p_claims->>namespace=claim)
-        OR NOT EXISTS(SELECT 1 FROM known WHERE p_claims ? namespace)
+        EXISTS(SELECT 1 FROM known WHERE (namespace='uid' AND claim=p_uid) OR (namespace='sub' AND claim=p_sub))
+        OR NOT EXISTS(SELECT 1 FROM known WHERE (namespace='uid' AND p_uid IS NOT NULL) OR (namespace='sub' AND p_sub IS NOT NULL))
     )
 $$;
+CREATE OR REPLACE FUNCTION central_login_identity_agrees(p_workspace TEXT, p_claims JSONB, p_account TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+    SELECT central_login_identity_agrees(p_workspace,p_claims->>'uid',p_claims->>'sub',p_account)
+$$;
+CREATE OR REPLACE FUNCTION central_login_identity_matches(p_workspace TEXT, p_claims JSONB, p_account TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
+    SELECT central_login_identity_matches(p_workspace,p_claims->>'uid',p_claims->>'sub',p_account)
+$$;
+INSERT INTO central_schema_migrations(version) VALUES (5) ON CONFLICT DO NOTHING;
 INSERT INTO central_schema_migrations(version) VALUES (4) ON CONFLICT DO NOTHING;
 INSERT INTO central_schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING;
 INSERT INTO central_schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;
@@ -373,6 +422,13 @@ impl CentralStore {
             .as_ref()
             .and_then(|auth| vault::token(auth).ok())
             .and_then(crate::api::token_subject);
+        let candidate_logins = op
+            .payload
+            .candidate
+            .as_ref()
+            .and_then(|auth| vault::token(auth).ok())
+            .map(crate::api::token_logins)
+            .unwrap_or_default();
         let claims = op
             .payload
             .candidate
@@ -385,8 +441,8 @@ impl CentralStore {
         bounded_db(async {
             let mut connection=db.admission_client().await?;
             let client=connection.transaction().await?;
-            identity::lock_admission(&client).await?;
-            let changed = client.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9,candidate_claims=$10::text::jsonb WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login,&claims]).await?;
+            let _admission_timing = identity::lock_admission(&client).await?;
+            let changed = client.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9,candidate_claims=$10::text::jsonb,candidate_uid=$11,candidate_sub=$12 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login,&claims,&candidate_logins.uid,&candidate_logins.sub]).await?;
             if changed != 1 { bail!("login transition fenced"); }
             client.commit().await?;
             Ok(())
@@ -424,7 +480,7 @@ impl CentralStore {
         let db = self.login_db()?;
         bounded_db(async {
             let changed = db.client().await?.execute(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE) UPDATE central_login_operations SET phase='verifying',sequence=sequence+1,repair_evidence=(SELECT COALESCE(jsonb_agg(jsonb_build_array(r.user_id,r.id,r.sequence)), '[]'::jsonb) FROM central_login_operations r JOIN central_accounts a ON a.account_id=$1 WHERE r.phase='rejected' AND (r.account_id=$1 OR central_login_identity_agrees(r.candidate_workspace,r.candidate_claims,$1))) WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence)",
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE) UPDATE central_login_operations SET phase='verifying',sequence=sequence+1,repair_evidence=(SELECT COALESCE(jsonb_agg(jsonb_build_array(r.user_id,r.id,r.sequence)), '[]'::jsonb) FROM central_login_operations r JOIN central_accounts a ON a.account_id=$1 WHERE r.phase='rejected' AND (r.account_id=$1 OR central_login_identity_agrees(r.candidate_workspace,r.candidate_uid,r.candidate_sub,$1))) WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence)",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?;
             if changed != 1 { bail!("login verification fenced"); }
             Ok(())
@@ -455,9 +511,9 @@ impl CentralStore {
         bounded_db(async {
             let mut connection = db.admission_client().await?;
             let client = connection.transaction().await?;
-            identity::lock_admission(&client).await?;
+            let _admission_timing = identity::lock_admission(&client).await?;
             let row = client.query_one(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,workspace=$13,login=$14,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_claims,$1) THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_claims,$1) THEN NULL ELSE candidate_login END,candidate_claims=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_claims,$1) THEN '{}'::jsonb ELSE candidate_claims END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (central_login_identity_agrees(candidate_workspace,candidate_claims,$1))) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence))) RETURNING user_id,id), released_claims AS (DELETE FROM central_login_identity_reservations WHERE EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))) SELECT count(*) FROM receipt",
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,workspace=$13,login=$14,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_login END,candidate_claims=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN '{}'::jsonb ELSE candidate_claims END,candidate_uid=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_uid END,candidate_sub=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_sub END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1))) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence))) RETURNING user_id,id), released_claims AS (UPDATE central_login_identity_reservations SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))), released_history AS (UPDATE central_login_identity_reservation_history SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))) SELECT count(*) FROM receipt",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload,&record.workspace,&record.login]).await?;
             if row.get::<_,i64>(0)!=1 { bail!("login completion fenced"); }
             if let Some(claims)=claims.as_ref() {identity::record_claims(&client,op.account()?,claims).await?;}

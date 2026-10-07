@@ -91,15 +91,15 @@ pub(super) async fn check_claims(
     claims: &Claims,
 ) -> Result<()> {
     let tags = claims.tags();
-    let reserved: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations WHERE workspace=$1 AND namespace||':'||claim=ANY($2))", &[&claims.workspace,&tags]).await?.get(0);
+    let reserved: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace||':'||r.claim=ANY($2) AND o.account_id IS DISTINCT FROM $3)", &[&claims.workspace,&tags,&account]).await?.get(0);
     if reserved {
         return Err(IdentityDenied::Reserved.into());
     }
-    let owned: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM central_account_claims WHERE workspace=$1 AND namespace||':'||claim=ANY($2) AND account_id<>$3)", &[&claims.workspace,&tags,&account]).await?.get(0);
+    let owned: bool = tx.query_one("SELECT EXISTS(SELECT 1 FROM central_account_identity_claims WHERE deleted_at IS NULL AND workspace=$1 AND namespace||':'||claim=ANY($2) AND account_id<>$3)", &[&claims.workspace,&tags,&account]).await?.get(0);
     if owned {
         return Err(IdentityDenied::Owned.into());
     }
-    let unknown:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_accounts a WHERE a.workspace=$1 AND a.account_id<>$2 AND a.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM central_account_claims c WHERE c.account_id=a.account_id AND c.workspace=$1 AND ((c.namespace='uid' AND $3::text IS NOT NULL) OR (c.namespace='sub' AND $4::text IS NOT NULL))))",&[&claims.workspace,&account,&claims.logins.uid,&claims.logins.sub]).await?.get(0);
+    let unknown:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_accounts a WHERE a.workspace=$1 AND a.account_id<>$2 AND a.deleted_at IS NULL AND NOT EXISTS(SELECT 1 FROM central_account_identity_claims c WHERE c.deleted_at IS NULL AND c.account_id=a.account_id AND c.workspace=$1 AND ((c.namespace='uid' AND $3::text IS NOT NULL) OR (c.namespace='sub' AND $4::text IS NOT NULL))))",&[&claims.workspace,&account,&claims.logins.uid,&claims.logins.sub]).await?.get(0);
     if unknown {
         return Err(IdentityDenied::Unknown.into());
     }
@@ -168,7 +168,7 @@ async fn known_claims(
             known.sub.insert(claim.into());
         }
     }
-    for row in tx.query("SELECT namespace,claim FROM central_account_claims WHERE account_id=$1 AND workspace=$2", &[&account,&current.workspace]).await? {
+    for row in tx.query("SELECT namespace,claim FROM central_account_identity_claims WHERE deleted_at IS NULL AND account_id=$1 AND workspace=$2", &[&account,&current.workspace]).await? {
         let namespace: String = row.get(0);
         let claim: String = row.get(1);
         if namespace == "uid" { known.uid.insert(claim); } else { known.sub.insert(claim); }
@@ -191,13 +191,37 @@ impl PostgresStore {
             .map_err(|_| anyhow::anyhow!("admission connection is absent"))
     }
 }
-pub(super) async fn lock_admission(tx: &tokio_postgres::Transaction<'_>) -> Result<()> {
+#[must_use]
+pub(super) struct AdmissionTiming(std::time::Instant);
+static ADMISSION_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ADMISSION_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+impl Drop for AdmissionTiming {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        ADMISSION_NANOS.fetch_add(
+            self.0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Relaxed,
+        );
+        ADMISSION_COUNT.fetch_add(1, Relaxed);
+    }
+}
+pub(in crate::central) fn admission_metrics() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "codexctl_central_admission_lock_seconds_sum {}\ncodexctl_central_admission_lock_seconds_count {}\n",
+        ADMISSION_NANOS.load(Relaxed) as f64 / 1_000_000_000.0,
+        ADMISSION_COUNT.load(Relaxed)
+    )
+}
+pub(super) async fn lock_admission(
+    tx: &tokio_postgres::Transaction<'_>,
+) -> Result<AdmissionTiming> {
     tx.query_one(
         "SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),12484))",
         &[],
     )
     .await?;
-    Ok(())
+    Ok(AdmissionTiming(std::time::Instant::now()))
 }
 pub(super) async fn record_claims(
     tx: &tokio_postgres::Transaction<'_>,
@@ -215,12 +239,45 @@ pub(super) async fn record_claims(
         return Err(IdentityDenied::Conflict.into());
     }
     for (namespace, claim) in claims.keys() {
-        let row=tx.query_opt("INSERT INTO central_account_claims(workspace,namespace,claim,account_id) VALUES($1,$2,$3,$4) ON CONFLICT(workspace,namespace,claim) DO UPDATE SET claim=EXCLUDED.claim WHERE central_account_claims.account_id=EXCLUDED.account_id RETURNING account_id",&[&claims.workspace,&namespace,&claim,&account]).await?;
+        let row=tx.query_opt("INSERT INTO central_account_identity_claims(workspace,namespace,claim,account_id) VALUES($1,$2,$3,$4) ON CONFLICT(workspace,namespace,claim) DO UPDATE SET claim=EXCLUDED.claim WHERE central_account_identity_claims.account_id=EXCLUDED.account_id AND central_account_identity_claims.deleted_at IS NULL RETURNING account_id",&[&claims.workspace,&namespace,&claim,&account]).await?;
         if row.is_none() {
+            return Err(IdentityDenied::Owned.into());
+        }
+        // Keep the legacy projection for readers of migration 4. The independent
+        // ledger above remains authoritative even if its old FK cascades.
+        let legacy=tx.query_opt("INSERT INTO central_account_claims(workspace,namespace,claim,account_id) VALUES($1,$2,$3,$4) ON CONFLICT(workspace,namespace,claim) DO UPDATE SET claim=EXCLUDED.claim WHERE central_account_claims.account_id=EXCLUDED.account_id AND central_account_claims.deleted_at IS NULL RETURNING account_id",&[&claims.workspace,&namespace,&claim,&account]).await?;
+        if legacy.is_none() {
             return Err(IdentityDenied::Owned.into());
         }
     }
     Ok(())
+}
+
+async fn reserve_claims(
+    tx: &tokio_postgres::Transaction<'_>,
+    op: &LoginOperation,
+    account: &str,
+    claims: &Claims,
+) -> Result<bool> {
+    for (namespace, claim) in claims.keys() {
+        let held=tx.query_opt("SELECT r.user_id,r.id,o.phase,central_login_identity_agrees(o.candidate_workspace,o.candidate_uid,o.candidate_sub,$4) FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace=$2 AND r.claim=$3",&[&claims.workspace,&namespace,&claim,&account]).await?;
+        if let Some(held) = held {
+            let user: String = held.get(0);
+            let id: String = held.get(1);
+            let phase: String = held.get(2);
+            let repair: bool = held.get(3);
+            if !((user == op.user && id == op.id) || (phase == "rejected" && repair)) {
+                return Ok(false);
+            }
+        } else {
+            let inserted=tx.execute("INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES($1,$2,$3,$4,$5) ON CONFLICT(workspace,namespace,claim) DO UPDATE SET user_id=EXCLUDED.user_id,id=EXCLUDED.id,deleted_at=NULL WHERE central_login_identity_reservations.deleted_at IS NOT NULL",&[&claims.workspace,&namespace,&claim,&op.user,&op.id]).await?;
+            if inserted != 1 {
+                return Ok(false);
+            }
+        }
+        tx.execute("INSERT INTO central_login_identity_reservation_history(workspace,namespace,claim,user_id,id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",&[&claims.workspace,&namespace,&claim,&op.user,&op.id]).await?;
+    }
+    Ok(true)
 }
 
 impl CentralStore {
@@ -257,13 +314,15 @@ impl CentralStore {
         let result=bounded_db(async {
             let mut client=db.admission_client().await?;
             let tx=client.transaction().await?;
-            lock_admission(&tx).await?;
+            let _admission_timing = lock_admission(&tx).await?;
             let authorized=tx.query_opt("SELECT d.id FROM central_devices d JOIN central_users u ON u.id=d.user_id WHERE d.id=$1 AND d.user_id=$2 AND d.tenant='sawmills' AND NOT d.revoked AND d.deleted_at IS NULL AND u.enabled AND u.deleted_at IS NULL FOR SHARE OF d,u",&[&op.device,&op.user]).await?;
             if authorized.is_none() {return Ok(Err("login_canceled"));}
             tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='add' AND account_id IS NULL AND NOT cancel_requested AND expires_at>clock_timestamp() FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.context("add admission fenced")?;
-            if tx.query_opt("SELECT target FROM central_alias_tombstones WHERE user_id=$1 AND alias=lower($2)",&[&op.user,&op.alias]).await?.is_some() {return Ok(Err("alias_renamed"));}
-            let reserved=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations WHERE workspace=$1 AND namespace||':'||claim=ANY($2) AND (user_id<>$3 OR id<>$4))",&[&claims.workspace,&tags,&op.user,&op.id]).await?.get::<_,bool>(0);
-            if reserved {return Ok(Err("relogin_reserved"));}
+            if tx.query_opt("SELECT target FROM central_alias_tombstones WHERE deleted_at IS NULL AND user_id=$1 AND alias=lower($2)",&[&op.user,&op.alias]).await?.is_some() {return Ok(Err("alias_renamed"));}
+            // An active login may have learned a claim that the saved account
+            // does not yet declare. Refuse its reservation before comparing vaults.
+            let active_reserved:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace||':'||r.claim=ANY($2) AND (r.user_id<>$3 OR r.id<>$4) AND o.phase<>'rejected')",&[&claims.workspace,&tags,&op.user,&op.id]).await?.get(0);
+            if active_reserved {return Ok(Err("relogin_reserved"));}
             let mut selected=None;
             for row in tx.query("SELECT account_id,user_id,alias,encrypted_vault FROM central_accounts WHERE workspace=$1 AND deleted_at IS NULL",&[&claims.workspace]).await? {
                 let bytes:Vec<u8>=row.get(3);
@@ -280,6 +339,9 @@ impl CentralStore {
                 if selected.is_some() {bail!("ambiguous account identity");}
                 selected=Some((row.get::<_,String>(0),row.get::<_,String>(2)));
             }
+            let selected_account=selected.as_ref().map(|(account,_)|account.as_str());
+            let reserved=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace||':'||r.claim=ANY($2) AND (r.user_id<>$3 OR r.id<>$4) AND NOT (o.phase='rejected' AND $5::text IS NOT NULL AND central_login_identity_agrees(o.candidate_workspace,o.candidate_uid,o.candidate_sub,$5)))",&[&claims.workspace,&tags,&op.user,&op.id,&selected_account]).await?.get::<_,bool>(0);
+            if reserved {return Ok(Err("relogin_reserved"));}
             let (account,landed)=match selected {
                 Some((account,alias))=>{
                     let active=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost'))",&[&account]).await?.get::<_,bool>(0);
@@ -293,15 +355,35 @@ impl CentralStore {
                 },
             };
             record_claims(&tx,&account,&claims).await?;
-            for (namespace,claim) in claims.keys() {
-                let inserted=tx.execute("INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",&[&claims.workspace,&namespace,&claim,&op.user,&op.id]).await?;
-                if inserted!=1 {return Ok(Err("relogin_reserved"));}
-            }
+            if !reserve_claims(&tx,op,&account,&claims).await? {return Ok(Err("relogin_reserved"));}
             let changed=tx.execute("UPDATE central_login_operations SET account_id=$6,landed_alias=$7,sequence=sequence+1 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp()",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&account,&landed]).await?;
             if changed!=1 {bail!("add admission fenced");}
             tx.commit().await?;
             Ok(Ok((account,landed)))
-        }).await?;
+        }).await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // COMMIT can succeed after its response times out. Queue the read
+                // on the same connection so it observes the settled transaction.
+                let admitted = bounded_db(async {
+                    let client = db.admission_client().await?;
+                    Ok(client.query_opt("SELECT account_id,landed_alias FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5::bigint+1 AND phase='candidate' AND kind='add' AND account_id IS NOT NULL AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?)
+                }).await?;
+                if let Some(row) = admitted {
+                    Ok((row.get::<_, String>(0), row.get::<_, Option<String>>(1)))
+                } else if error
+                    .downcast_ref::<tokio_postgres::Error>()
+                    .is_some_and(|e| {
+                        e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+                    })
+                {
+                    Err("relogin_reserved")
+                } else {
+                    return Err(error);
+                }
+            }
+        };
         match result {
             Ok((account, landed)) => {
                 op.account_id = Some(account);
@@ -331,7 +413,7 @@ impl CentralStore {
         bounded_db(async {
             let mut client = db.admission_client().await?;
             let tx = client.transaction().await?;
-            lock_admission(&tx).await?;
+            let _admission_timing = lock_admission(&tx).await?;
             let row = tx.query_opt("SELECT encrypted_vault FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL", &[&op.account()?,&op.user]).await?.context("login account missing")?;
             let bytes: Vec<u8> = row.get(0);
             let saved: vault::Vault = serde_json::from_slice(&vault::decrypt_with_cipher(&cipher,&bytes)?)?;
@@ -353,7 +435,7 @@ impl CentralStore {
         bounded_db(async {
             let mut client = db.admission_client().await?;
             let tx = client.transaction().await?;
-            lock_admission(&tx).await?;
+            let _admission_timing = lock_admission(&tx).await?;
             check_claims(&tx, account, &claims).await
         })
         .await
@@ -380,8 +462,9 @@ impl PostgresStore {
             let bytes:Vec<u8>=row.get(2);
             let payload: super::login::LoginPayload=serde_json::from_slice(&vault::decrypt_with_cipher(cipher,&bytes)?)?;
             if let Some(auth)=payload.candidate {
-                let claims=Claims::from_auth(&auth)?.json().to_string();
-                tx.execute("UPDATE central_login_operations SET candidate_claims=$3::text::jsonb WHERE user_id=$1 AND id=$2",&[&user,&id,&claims]).await?;
+                let claims=Claims::from_auth(&auth)?;
+                let json=claims.json().to_string();
+                tx.execute("UPDATE central_login_operations SET candidate_claims=$3::text::jsonb,candidate_uid=$4,candidate_sub=$5 WHERE user_id=$1 AND id=$2",&[&user,&id,&json,&claims.logins.uid,&claims.logins.sub]).await?;
             }
         }
         Ok(())
@@ -405,20 +488,12 @@ impl CentralStore {
         bounded_db(async {
             let mut connection=db.admission_client().await?;
             let tx=connection.transaction().await?;
-            lock_admission(&tx).await?;
+            let _admission_timing = lock_admission(&tx).await?;
             tx.query_opt("SELECT id FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND kind='renewal' AND account_id=$6 AND NOT cancel_requested AND expires_at>clock_timestamp() FOR UPDATE",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&op.account()?]).await?.context("renewal reservation fenced")?;
             let tags=claims.tags();
-            let claimed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_account_claims WHERE workspace=$1 AND namespace||':'||claim=ANY($2) AND account_id<>$3)",&[&claims.workspace,&tags,&op.account()?]).await?.get(0);
+            let claimed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_account_identity_claims WHERE deleted_at IS NULL AND workspace=$1 AND namespace||':'||claim=ANY($2) AND account_id<>$3)",&[&claims.workspace,&tags,&op.account()?]).await?.get(0);
             if claimed {return Ok(false);}
-            for (namespace,claim) in claims.keys() {
-                let held=tx.query_opt("SELECT r.user_id,r.id,o.phase,central_login_identity_agrees(o.candidate_workspace,o.candidate_claims,$4) FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.workspace=$1 AND r.namespace=$2 AND r.claim=$3",&[&claims.workspace,&namespace,&claim,&op.account()?]).await?;
-                if let Some(held)=held {
-                    let user:String=held.get(0);let id:String=held.get(1);let phase:String=held.get(2);let repair:bool=held.get(3);
-                    if (user==op.user && id==op.id) || (phase=="rejected" && repair) {continue;}
-                    return Ok(false);
-                }
-                tx.execute("INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES($1,$2,$3,$4,$5)",&[&claims.workspace,&namespace,&claim,&op.user,&op.id]).await?;
-            }
+            if !reserve_claims(&tx,op,op.account()?,&claims).await? {return Ok(false);}
             let fresh:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp())",&[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?.get(0);
             if !fresh {bail!("renewal reservation fenced");}
             tx.commit().await?;
@@ -502,7 +577,7 @@ impl CentralStore {
     ) -> Result<BTreeMap<String, RetainedIdentity>> {
         let db = self.login_db()?;
         bounded_db(async {
-            let rows=db.client().await?.query("SELECT a.account_id,a.workspace,c.namespace,c.claim FROM central_accounts a LEFT JOIN central_account_claims c ON c.account_id=a.account_id AND c.workspace=a.workspace WHERE a.deleted_at IS NULL ORDER BY a.account_id",&[]).await?;
+            let rows=db.client().await?.query("SELECT a.account_id,a.workspace,c.namespace,c.claim FROM central_accounts a LEFT JOIN central_account_identity_claims c ON c.account_id=a.account_id AND c.workspace=a.workspace AND c.deleted_at IS NULL WHERE a.deleted_at IS NULL ORDER BY a.account_id",&[]).await?;
             let mut identities=BTreeMap::new();
             for row in rows {
                 let Some(workspace)=row.get::<_,Option<String>>(1) else {continue;};
@@ -525,7 +600,7 @@ impl CentralStore {
     ) -> Result<Option<String>> {
         let db = self.login_db()?;
         bounded_db(async {
-            Ok(db.client().await?.query_opt("SELECT target FROM central_alias_tombstones WHERE user_id=$1 AND alias=lower($2)",&[&user,&alias]).await?.map(|row|row.get(0)))
+            Ok(db.client().await?.query_opt("SELECT target FROM central_alias_tombstones WHERE deleted_at IS NULL AND user_id=$1 AND alias=lower($2)",&[&user,&alias]).await?.map(|row|row.get(0)))
         }).await
     }
 }
@@ -537,7 +612,7 @@ impl PostgresStore {
         bounded_db(async {
             let mut connection=self.admission_client().await?;
             let tx=connection.transaction().await?;
-            lock_admission(&tx).await?;
+            let _admission_timing = lock_admission(&tx).await?;
             for (user,alias,target) in aliases {
                 tx.execute("INSERT INTO central_alias_tombstones(user_id,alias,target) VALUES($1,$2,$3) ON CONFLICT(user_id,alias) DO UPDATE SET target=EXCLUDED.target",&[&user,&alias,&target]).await?;
             }
