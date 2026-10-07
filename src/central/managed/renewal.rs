@@ -194,19 +194,23 @@ impl Broker {
             result = work => result,
             result = monitor => result,
         };
+        let mut release_proven = result.is_ok();
         if result.is_err() {
             if owner.is_none() {
                 owner = Some(owner_ref.lock().await);
             }
             let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
-            if op.phase == LoginPhase::Verifying || owner.rpc.is_some() {
+            release_proven = previous_owner_exited(&owner.home).is_ok();
+            if op.phase == LoginPhase::Verifying || owner.rpc.is_some() || !release_proven {
                 let rejected = op.phase == LoginPhase::Verifying
                     && !owner.vault.verified
                     && owner.vault.import_rejected;
                 terminate_lost_import(owner).await;
+                release_proven = previous_owner_exited(&owner.home).is_ok();
                 // Only a completed rejection with an unchanged final journal is
                 // repairable. An interrupted provider call remains unresolved.
                 let rejected = rejected
+                    && release_proven
                     && owner.verification_input.as_ref().is_some_and(|input| {
                         retained_auth(&owner.home).is_ok_and(|auth| &auth == input)
                     });
@@ -228,7 +232,9 @@ impl Broker {
                 let _ = central.login_save(op, phase).await;
             }
         }
-        central.release_lease(&lease).await?;
+        if release_proven {
+            central.release_lease(&lease).await?;
+        }
         result
     }
 }

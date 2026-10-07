@@ -2206,3 +2206,49 @@ async fn postgres_confirmed_native_rejection_allows_fresh_renewal() {
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }
+
+#[tokio::test]
+async fn postgres_rejection_with_unknown_exit_evidence_stays_unresolved() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let id = "b7".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Losing process evidence cannot become positive proof of exit merely
+    // because a termination attempt returned without an error to its caller.
+    let pid = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "seat"))
+        .join("runtime/pid");
+    store::atomic_write(&pid, b"unknown-process-evidence").unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let resumed = login_request(&f, &f.second, "start", &"b8".repeat(32)).await;
+    assert_eq!(
+        resumed["id"], id,
+        "unknown process exit must not permit replacement verification"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    stop_fixture(f).await;
+}
