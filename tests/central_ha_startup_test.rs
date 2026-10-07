@@ -1285,6 +1285,13 @@ fn renewal_grant() -> Value {
 }
 #[tokio::test]
 async fn postgres_verification_loss_fences_the_candidate_across_replica_restart() {
+    interrupted_verification(false).await;
+}
+#[tokio::test]
+async fn postgres_cancel_stops_verification_and_preserves_its_reservation() {
+    interrupted_verification(true).await;
+}
+async fn interrupted_verification(cancel: bool) {
     let mut f = login_fixture().await;
     store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
     let id = "f".repeat(64);
@@ -1325,7 +1332,11 @@ async fn postgres_verification_loss_fences_the_candidate_across_replica_restart(
         .unwrap(),
     )
     .unwrap();
-    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET epoch=epoch+1,holder_id='replacement',expires_at=clock_timestamp() WHERE account_id=$1",f.schema),&[&account_key("test","seat")]).await.unwrap();
+    if cancel {
+        login_request(&f, &f.second, "cancel", &id).await;
+    } else {
+        f.control.execute(&format!("UPDATE {}.account_refresh_leases SET epoch=epoch+1,holder_id='replacement',expires_at=clock_timestamp() WHERE account_id=$1",f.schema),&[&account_key("test","seat")]).await.unwrap();
+    }
     wait_dead(pid["pid"].as_u64().unwrap() as u32).await;
     assert_eq!(
         login_request(&f, &f.second, "status", &id).await["status"],
@@ -1349,20 +1360,24 @@ async fn postgres_verification_loss_fences_the_candidate_across_replica_restart(
 
 #[tokio::test]
 async fn postgres_wrong_account_candidate_keeps_both_accounts_reserved() {
-    wrong_candidate_reservation(false, false).await;
+    wrong_candidate_reservation(false, None).await;
 }
 #[tokio::test]
 async fn postgres_candidate_publication_failure_keeps_its_identity_reserved() {
-    wrong_candidate_reservation(true, false).await;
+    wrong_candidate_reservation(true, None).await;
 }
 #[tokio::test]
 async fn postgres_failed_native_login_preserves_a_saved_grant() {
-    wrong_candidate_reservation(false, true).await;
+    wrong_candidate_reservation(false, Some("login-error-after-save")).await;
 }
-async fn wrong_candidate_reservation(fail_publication: bool, fail_child: bool) {
+#[tokio::test]
+async fn postgres_canceled_native_login_preserves_a_saved_grant_and_allows_repair() {
+    wrong_candidate_reservation(false, Some("login-hold-after-save")).await;
+}
+async fn wrong_candidate_reservation(fail_publication: bool, mode: Option<&str>) {
     let f = login_fixture().await;
-    if fail_child {
-        store::atomic_write(&f.first.root.path().join("mode"), b"login-error-after-save").unwrap();
+    if let Some(mode) = mode {
+        store::atomic_write(&f.first.root.path().join("mode"), mode.as_bytes()).unwrap();
     }
     if fail_publication {
         f.control.batch_execute(&format!("CREATE SEQUENCE {0}.capture_attempt; CREATE FUNCTION {0}.reject_first_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase='candidate' AND nextval('{0}.capture_attempt')=1 THEN RAISE EXCEPTION 'synthetic candidate publication failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_capture BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.reject_first_capture()",f.schema)).await.unwrap();
@@ -1377,6 +1392,16 @@ async fn wrong_candidate_reservation(fail_publication: bool, fail_child: bool) {
         &serde_json::to_vec(&wrong).unwrap(),
     )
     .unwrap();
+    if mode == Some("login-hold-after-save") {
+        timeout(Duration::from_secs(8), async {
+            while !f.first.root.path().join("login-saved").exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        login_request(&f, &f.second, "cancel", &id).await;
+    }
     timeout(Duration::from_secs(8), async {
         while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1397,7 +1422,7 @@ async fn wrong_candidate_reservation(fail_publication: bool, fail_child: bool) {
         503,
         "wrong-account grant must reserve the affected identity across replicas"
     );
-    if !fail_publication && !fail_child {
+    if !fail_publication {
         // Only an explicit verified renewal may repair a stopped rejection.
         for (alias, grant, request_id) in [
             ("other", wrong, "3".repeat(64)),
@@ -1502,7 +1527,7 @@ async fn postgres_renewal_waiting_for_refresh_does_not_block_other_accounts() {
 #[tokio::test]
 async fn postgres_unpublished_login_grant_survives_worker_exit() {
     let mut f = login_fixture().await;
-    f.control.batch_execute(&format!("CREATE FUNCTION {0}.reject_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase IN ('candidate','unresolved') THEN RAISE EXCEPTION 'synthetic persistent publication failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_capture BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.reject_capture()",f.schema)).await.unwrap();
+    f.control.batch_execute(&format!("CREATE FUNCTION {0}.reject_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase IN ('candidate','unresolved','rejected') THEN RAISE EXCEPTION 'synthetic persistent publication failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_capture BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.reject_capture()",f.schema)).await.unwrap();
     let id = "5".repeat(64);
     login_request(&f, &f.first, "start", &id).await;
     let pid = std::fs::read_to_string(f.first.root.path().join("login-pid"))

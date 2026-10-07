@@ -125,7 +125,9 @@ impl Broker {
                     if self.stopping.load(Ordering::Acquire) {
                         bail!("server stopping");
                     }
-                    central.login_heartbeat(op).await?;
+                    if central.login_heartbeat(op).await? {
+                        bail!("login canceled");
+                    }
                     if !central.renew(&lease, IMPORT_LEASE_TTL).await? {
                         bail!("renewal refresh lease lost");
                     }

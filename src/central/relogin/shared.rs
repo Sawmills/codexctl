@@ -179,12 +179,14 @@ pub(super) async fn start(
                 .payload
                 .error
                 .get_or_insert_with(|| "relogin_interrupted_retry".into());
-            let phase = if worker_op.payload.candidate.is_some()
-                || matches!(
-                    worker_op.phase,
-                    LoginPhase::Candidate | LoginPhase::Verifying | LoginPhase::Unresolved
-                ) {
+            let phase = if matches!(
+                worker_op.phase,
+                LoginPhase::Verifying | LoginPhase::Unresolved
+            ) {
                 LoginPhase::Unresolved
+            } else if worker_op.payload.candidate.is_some() {
+                // Candidate capture proves device-login exit. No verifier started.
+                LoginPhase::Rejected
             } else {
                 LoginPhase::Failed
             };
@@ -302,7 +304,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         op.payload.code = None;
         let phase = if op.payload.candidate.is_some() {
             op.payload.error = Some("login_stopped_account_requires_relogin".into());
-            LoginPhase::Unresolved
+            LoginPhase::Rejected
         } else {
             LoginPhase::Canceled
         };

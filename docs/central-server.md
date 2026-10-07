@@ -254,7 +254,9 @@ Resume from the machine that started the login. Other machines cannot resume or 
 To stop a pending login, run `codexctl login <alias> --cancel`.
 In file mode, a canceled or failed login leaves that account unavailable until you retry.
 In PostgreSQL mode, cancellation before candidate publication keeps the existing
-account usable. A candidate whose verification is unresolved remains fenced.
+account usable unless the child already saved an issued grant. Cancellation during
+verification stops the child and leaves the account fenced for settlement.
+A candidate whose verification is unresolved remains fenced.
 Cancellation does not undo an authorization that OpenAI already issued.
 Approving a different OpenAI account can invalidate that other account's previous grant.
 The server retains a wrong-account grant without replacing the selected alias.
@@ -311,8 +313,8 @@ This intermediate release is not sufficient for the B33 cutover. A lost polling
 replica can leave a pending operation until recovery is delivered. A verifier
 that loses its lease leaves a durable unresolved marker: another replica must
 not repeat verification. Wrong-account candidates reserve the selected account
-and the matching known account across replicas. After a stopped login is rejected
-for the wrong identity, each account can be repaired by an explicit renewal with
+and the matching known account across replicas. After a stopped device login is rejected
+for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
 a new request ID. Only verified completion clears that account's reservation.
 An unresolved verification cannot use this repair path. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch
