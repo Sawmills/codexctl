@@ -915,3 +915,30 @@ async fn a_loan_store_failure_keeps_owned_accounts_listed_and_refuses_borrowed_t
         (StatusCode::SERVICE_UNAVAILABLE, json!("loan_store_failed"))
     );
 }
+
+#[tokio::test]
+async fn a_lender_credential_in_another_workspace_pauses_before_the_account_check() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    fixture
+        .add_owner_with(
+            LENDER,
+            "main",
+            "moved",
+            auth("synthetic-login", "another-seat"),
+        )
+        .await;
+    let (status, body) = fixture
+        .call(
+            "POST",
+            "/v1/token",
+            &fixture.borrower,
+            json!({"alias":"alice/main","accountId":"seat-lender-main","loanId":grant["id"]}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("loan_paused"))
+    );
+    assert!(kinds(&fixture.audit(&fixture.borrower).await).contains(&"paused".to_owned()));
+}

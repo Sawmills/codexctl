@@ -250,6 +250,15 @@ impl Broker {
         let Some((_, owner)) = self.grant_owner(&grant).await? else {
             return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
         };
+        // Pause before the owned-account checks when the lender's credential
+        // already names another login. A busy owner skips this early check;
+        // the check after the refresh still applies.
+        let changed = owner.try_lock().ok().is_some_and(|owner| {
+            !owner_subject(&owner).is_some_and(|subject| grant.subject.same_login(&subject))
+        });
+        if changed {
+            return Err(self.pause(&grant, "subject_changed").await);
+        }
         Ok(Borrowed { grant, owner })
     }
 
