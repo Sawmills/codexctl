@@ -32,6 +32,10 @@ const TOMBSTONES: &str = "renames.json";
 pub(super) struct RenameRequest {
     alias: String,
     new_alias: String,
+    /// The workspace the client expects under `alias`; binds a retry to the
+    /// account it meant, never to a later account that took the old name.
+    #[serde(default)]
+    account_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -69,12 +73,9 @@ pub(super) fn renamed_to(state: &Path, user: &str, alias: &str) -> Result<Option
 
 fn record_tombstone(state: &Path, rename: &Rename) -> Result<()> {
     let mut renames = tombstones(state)?;
-    // The new alias is live again; an older tombstone for it no longer applies.
-    renames.retain(|r| {
-        !(r.user == rename.user
-            && (r.from.eq_ignore_ascii_case(&rename.to)
-                || r.from.eq_ignore_ascii_case(&rename.from)))
-    });
+    // A tombstoned alias is never reused (add and rename refuse it), so only a
+    // repeat of this same rename replaces an entry.
+    renames.retain(|r| !(r.user == rename.user && r.from.eq_ignore_ascii_case(&rename.from)));
     if !rename.from.eq_ignore_ascii_case(&rename.to) {
         renames.push(rename.clone());
     }
@@ -108,6 +109,20 @@ pub(super) fn finish(state: &Path, key: &Path, directory: &Path) -> Result<PathB
     std::fs::remove_file(target.join(INTENT))?;
     store::sync_directory(&target)?;
     Ok(target)
+}
+
+/// True when an interrupted rename waits for file-mode startup to finish it.
+pub(super) fn pending(state: &Path) -> Result<bool> {
+    let accounts = state.join("accounts");
+    if !accounts.try_exists()? {
+        return Ok(false);
+    }
+    for entry in std::fs::read_dir(&accounts)? {
+        if entry?.path().join(INTENT).try_exists()? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Startup: complete every interrupted rename before the account inventory.
@@ -149,21 +164,46 @@ pub(super) async fn rename(
     {
         return Err(broker.error(StatusCode::CONFLICT, "account_rename_unavailable"));
     }
-    let (old_key, owner) = broker
-        .resolve_alias(&device.user, &alias)
-        .await?
-        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?;
-    if !new_alias.eq_ignore_ascii_case(&alias)
-        && broker
+    let expected = request.account_id.as_deref().filter(|id| !id.is_empty());
+    let Some((old_key, owner)) = broker.resolve_alias(&device.user, &alias).await? else {
+        // A retry after a lost response: the rename already committed.
+        let committed = renamed_to(&broker.state, &device.user, &alias)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        if let Some(current) = committed.filter(|to| to.eq_ignore_ascii_case(&new_alias))
+            && let Some((_, renamed)) = broker.resolve_alias(&device.user, &current).await?
+        {
+            let renamed = renamed.lock().await;
+            let summary = super::managed::account_summary(&renamed);
+            if expected.is_none_or(|id| id == summary.account_id) {
+                return Ok(Json(summary).into_response());
+            }
+        }
+        return Err(renamed_error(&broker, &device.user, &alias)
+            .unwrap_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found")));
+    };
+    if !new_alias.eq_ignore_ascii_case(&alias) {
+        if broker
             .resolve_alias(&device.user, &new_alias)
             .await?
             .is_some()
-    {
-        return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
+        {
+            return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
+        }
+        // A stale client still names a renamed alias; reusing it would let
+        // that client reach a different account.
+        if renamed_to(&broker.state, &device.user, &new_alias)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+            .is_some()
+        {
+            return Err(broker.error(StatusCode::CONFLICT, "alias_renamed"));
+        }
     }
     let failed =
         |_: anyhow::Error| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed");
     let mut held = owner.lock().await;
+    if expected.is_some_and(|id| vault::account(&held.vault.auth).ok().as_deref() != Some(id)) {
+        return Err(broker.error(StatusCode::CONFLICT, "account_changed"));
+    }
     let pending_add = [&alias, &new_alias]
         .into_iter()
         .try_fold(false, |pending, name| {
@@ -186,8 +226,8 @@ pub(super) async fn rename(
     {
         return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
     }
-    // Stop the refresh owner before its directory moves, as renewal does.
-    held.fence(false);
+    // Stop the refresh owner before its directory moves. Fence only after the
+    // stop is proven, so a failed stop leaves the account serving as before.
     if let Some(rpc) = held.rpc.as_mut() {
         rpc.settle_and_stop()
             .await
@@ -197,6 +237,7 @@ pub(super) async fn rename(
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
     }
     held.rpc = None;
+    held.fence(false);
     held.snapshot().map_err(failed)?;
     let intent = Rename {
         user: device.user.clone(),
@@ -233,10 +274,45 @@ pub(super) async fn rename(
         launch_owner(&mut held, &broker.binary, proof).await
     }
     .await;
-    if relaunched.is_ok() {
-        held.available = true;
+    eprintln!(
+        "ACCOUNT_RENAMED company_user={} device={} from={old_key} to={}",
+        device.user,
+        device.id,
+        account_key(&device.user, &new_alias)
+    );
+    match relaunched {
+        Ok(()) => held.available = true,
+        Err(_) => {
+            // The rename committed; report the owner state instead of hiding it.
+            eprintln!(
+                "ACCOUNT_RENAME_RELAUNCH_FAILED company_user={} to={}",
+                device.user,
+                account_key(&device.user, &new_alias)
+            );
+            broker.record_failure(
+                "rename_relaunch_failed",
+                "rename",
+                StatusCode::SERVICE_UNAVAILABLE,
+            );
+        }
     }
     Ok(Json(super::managed::account_summary(&held)).into_response())
+}
+
+/// This user's renamed aliases, so a machine can drop its stale records.
+pub(super) async fn renamed_aliases(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+) -> Result<Response, HttpError> {
+    let device = broker.authorize(&headers).await?;
+    let renames = tombstones(&broker.state)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    let aliases: Vec<String> = renames
+        .into_iter()
+        .filter(|r| r.user == device.user)
+        .map(|r| r.from)
+        .collect();
+    Ok(Json(aliases).into_response())
 }
 
 /// 404 for an alias that was renamed, naming the alias that replaced it.
@@ -266,8 +342,8 @@ mod tests {
             Some("c")
         );
         assert_eq!(renamed_to(root.path(), "alex", "a").unwrap(), None);
-        // Reusing "a" for a live account drops its tombstone.
-        record_tombstone(root.path(), &rename("x", "a")).unwrap();
-        assert_eq!(renamed_to(root.path(), "amir", "a").unwrap(), None);
+        // Repeating a rename replaces its entry instead of adding a second one.
+        record_tombstone(root.path(), &rename("a", "b")).unwrap();
+        assert_eq!(tombstones(root.path()).unwrap().len(), 2);
     }
 }

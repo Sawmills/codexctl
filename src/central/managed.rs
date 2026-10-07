@@ -1700,11 +1700,18 @@ impl Broker {
         input.alias = normalize_alias(&input.alias)
             .map_err(|_| self.error(StatusCode::BAD_REQUEST, "invalid_alias"))?
             .to_owned();
-        let id = self
+        let resolved = self
             .resolve_alias(user, &input.alias)
             .await?
-            .map(|(key, _)| key)
-            .unwrap_or_else(|| account_key(user, &input.alias));
+            .map(|(key, _)| key);
+        if resolved.is_none()
+            && super::rename::renamed_to(&self.state, user, &input.alias)
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+                .is_some()
+        {
+            return Err(self.error(StatusCode::CONFLICT, "alias_renamed"));
+        }
+        let id = resolved.unwrap_or_else(|| account_key(user, &input.alias));
         let selected = self.state.join("accounts").join(&id);
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -3046,10 +3053,10 @@ pub async fn serve(
     // Login records are replica-local; a shared store cannot resume or retire
     // them, so it refuses to start beside one rather than strand its account.
     if super::storage::StoreMode::from_env()? != super::storage::StoreMode::File
-        && relogin::add::pending_logins(state)?
+        && (relogin::add::pending_logins(state)? || super::rename::pending(state)?)
     {
         bail!(
-            "pending server login operations exist; finish pending logins in file mode before switching storage"
+            "pending server login or rename operations exist; finish pending logins in file mode before switching storage"
         );
     }
     let configured = super::storage::runtime_store(state, key).await?;
@@ -3368,6 +3375,7 @@ pub async fn serve(
         .route("/v1/token", post(token))
         .route("/v1/accounts", get(accounts).post(import))
         .route("/v1/accounts/rename", post(super::rename::rename))
+        .route("/v1/accounts/renamed", get(super::rename::renamed_aliases))
         .merge(super::resets::routes())
         .route("/v1/me", get(me))
         .route("/v1/devices", get(devices))

@@ -38,6 +38,7 @@ enum PointerCause {
     Recovery,
     Rollback,
     Deactivate,
+    Rename,
 }
 
 impl PointerCause {
@@ -48,6 +49,7 @@ impl PointerCause {
             Self::Recovery => "recovery",
             Self::Rollback => "rollback",
             Self::Deactivate => "deactivate",
+            Self::Rename => "rename",
         }
     }
 }
@@ -877,38 +879,82 @@ pub(super) fn follow_rename(old: &str, new: &str) -> Result<()> {
         return Ok(());
     }
     let _lock = native_lock(&directory)?;
-    let old_path = connection_path(old)?;
+    // The server matches aliases without case, so the local record may be
+    // spelled differently from the request.
+    let Some(old_path) = find_connection(&directory, old)? else {
+        return Ok(());
+    };
     let new_path = connection_path(new)?;
-    if old_path.try_exists()? {
-        let mut connection = read_connection(&old_path)?;
-        connection.alias = Some(new.to_owned());
-        // Order for crash recovery: the new record first, then the pointer,
-        // then the old record. Every prefix leaves a usable record, and a
-        // stale one fails with the server's renamed message.
-        store::atomic_write(&new_path, &serde_json::to_vec(&connection)?)?;
+    if new_path.try_exists()? && !same_file(&old_path, &new_path)? {
+        bail!(
+            "the server renamed {old} to {new}, but this machine has another connection named {new}; remove it, then run codexctl use {new}"
+        );
+    }
+    let mut connection = read_connection(&old_path)?;
+    connection.alias = Some(new.to_owned());
+    // Order for crash recovery: the new record first, then the pointer,
+    // then the old record. Every prefix leaves a usable record, and a stale
+    // one fails with the server's renamed message.
+    store::atomic_write(&new_path, &serde_json::to_vec(&connection)?)?;
+    store::sync_directory(&directory)?;
+    move_active_pointer(&directory, old, new)?;
+    if !same_file(&old_path, &new_path)? {
+        std::fs::remove_file(&old_path)?;
         store::sync_directory(&directory)?;
-        move_active_pointer(old, new)?;
-        if !same_file(&old_path, &new_path)? {
-            std::fs::remove_file(&old_path)?;
-            store::sync_directory(&directory)?;
-        }
-    } else {
-        move_active_pointer(old, new)?;
     }
     Ok(())
+}
+
+/// The connection record whose alias matches `alias` without case.
+fn find_connection(directory: &Path, alias: &str) -> Result<Option<PathBuf>> {
+    let exact = connection_path(alias)?;
+    if exact.try_exists()? {
+        return Ok(Some(exact));
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let matches = path.extension().is_some_and(|e| e == "json")
+            && path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case(alias));
+        if matches && read_connection(&path).is_ok() {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// The workspace this machine's record names for `alias`, to bind a rename.
+pub(super) fn connection_account_id(alias: &str) -> Result<Option<String>> {
+    let directory = root()?;
+    if !directory.try_exists()? {
+        return Ok(None);
+    }
+    Ok(find_connection(&directory, alias)?
+        .map(|path| read_connection(&path))
+        .transpose()?
+        .map(|connection| connection.account_id))
 }
 
 /// Refuse a rename whose new name already holds an unrelated local record,
 /// before the server commits it.
 pub(super) fn rename_preflight(old: &str, new: &str) -> Result<()> {
-    let new_path = connection_path(new)?;
-    if new_path.try_exists()? && !same_file(&connection_path(old)?, &new_path)? {
+    let directory = root()?;
+    if directory.try_exists()?
+        && let Some(existing) = find_connection(&directory, new)?
+        && find_connection(&directory, old)?
+            .map(|source| same_file(&source, &existing))
+            .transpose()?
+            != Some(true)
+    {
         bail!(
             "this machine already has a server connection named {new}; disconnect or remove it before renaming"
         );
     }
     let profile = store::profile_dir(&config::default_paths()?, new)?;
-    if profile.join("auth.json").try_exists()? {
+    // A confirmed transfer marker is the server account's own local trace.
+    if profile.try_exists()? && !profile.join(".central-transfer.json").try_exists()? {
         bail!(
             "a local profile named {new} exists; remove or rename it before renaming the server account"
         );
@@ -916,11 +962,64 @@ pub(super) fn rename_preflight(old: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-fn move_active_pointer(old: &str, new: &str) -> Result<()> {
-    if active_pointer_path()?.try_exists()?
-        && read_active_alias().is_ok_and(|active| active.eq_ignore_ascii_case(old))
+/// Drop this registration's records for aliases the server renamed, except
+/// the active one, which keeps reporting the server's renamed message.
+/// Call under the native lock.
+pub(super) fn drop_renamed_connections(
+    server: &str,
+    user_id: &str,
+    renamed: &[String],
+) -> Result<()> {
+    let directory = root()?;
+    if renamed.is_empty() || !directory.try_exists()? {
+        return Ok(());
+    }
+    let active = read_active_alias().ok();
+    let mut removed = false;
+    for entry in std::fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let Ok(connection) = read_connection(&path) else {
+            continue;
+        };
+        let alias = connection_alias(&path, &connection);
+        if connection.server == server
+            && connection.user_id.as_deref() == Some(user_id)
+            && !connection.launch_pinned
+            && renamed.iter().any(|a| a.eq_ignore_ascii_case(&alias))
+            && !active
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(&alias))
+        {
+            std::fs::remove_file(&path)?;
+            removed = true;
+        }
+    }
+    if removed {
+        store::sync_directory(&directory)?;
+    }
+    Ok(())
+}
+
+fn move_active_pointer(history_root: &Path, old: &str, new: &str) -> Result<()> {
+    let pointer = active_pointer_path()?;
+    if !(pointer.try_exists()?
+        && read_active_alias().is_ok_and(|active| active.eq_ignore_ascii_case(old)))
     {
-        store::atomic_write(&active_pointer_path()?, format!("{new}\n").as_bytes())?;
+        return Ok(());
+    }
+    let previous = vault::private_read(&pointer)?;
+    store::atomic_write(&pointer, format!("{new}\n").as_bytes())?;
+    if let Err(error) = append_active_history(
+        history_root,
+        Some(old.to_owned()),
+        Some(new.to_owned()),
+        PointerCause::Rename,
+    ) {
+        store::atomic_write(&pointer, &previous)?;
+        return Err(error);
     }
     Ok(())
 }

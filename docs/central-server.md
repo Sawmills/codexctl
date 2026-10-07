@@ -312,7 +312,11 @@ account pointer follow the new alias. Other machines see the new alias at their 
 alias fails at its next token refresh with "server account <old> was renamed to <new>",
 and never switches to another account; run `codexctl use <new>` or relaunch with
 `--account <new>`. The server refuses a new alias you already use (`alias_exists`) and
-a rename while a login for that account is pending (`login_pending`). An interrupted
+a rename while a login for that account is pending (`login_pending`). A renamed alias is
+never reused: adding, importing, or renaming onto it returns `alias_renamed`, so a
+machine that still names it can never reach a different account. A retried rename
+after a lost response returns the renamed account. `codexctl list` drops another
+machine's record for a renamed alias once that alias is no longer active there. An interrupted
 rename finishes when the server restarts. Like renewal and adding an account, rename
 needs the file store; in PostgreSQL mode it answers HTTP 503 with
 `account_rename_unavailable`.

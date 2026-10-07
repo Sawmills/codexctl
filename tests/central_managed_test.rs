@@ -1449,6 +1449,108 @@ fn rename_case_only_keeps_one_record_and_preflight_refuses_a_local_conflict() {
     assert_eq!(server.aliases(&server.amir), vec!["Personal"]);
 }
 
+#[test]
+fn renamed_alias_is_never_reused_and_a_lost_rename_response_retries_cleanly() {
+    let mut server = Server::start();
+    for (alias, login) in [("personal", "amir-login"), ("spare", "spare-login")] {
+        assert!(
+            server
+                .import(&server.amir, alias, login, &format!("{login}-seat"))
+                .status()
+                .is_success()
+        );
+    }
+    assert_eq!(
+        server.rename(&server.amir, "personal", "work").status(),
+        200
+    );
+    // The response was lost: the same request again returns the renamed account.
+    let retried = server.rename(&server.amir, "personal", "work");
+    assert_eq!(retried.status(), 200);
+    assert_eq!(retried.json::<Value>().unwrap()["alias"], "work");
+    for refused in [
+        server.rename(&server.amir, "spare", "personal"),
+        server.import(&server.amir, "personal", "other-login", "other-seat"),
+        server.add_request(&server.amir, "start", "personal", &"a1".repeat(32), None),
+    ] {
+        assert_eq!(refused.status(), 409);
+        assert_eq!(refused.json::<Value>().unwrap()["error"], "alias_renamed");
+    }
+
+    // A crash after the directory move but before the tombstone: startup
+    // finishes the tombstone from the intent left in the new directory.
+    server.stop();
+    std::fs::remove_file(server.root.path().join("state/renames.json")).unwrap();
+    let moved = server
+        .root
+        .path()
+        .join("state/accounts")
+        .join(digest(&format!("amir\0{}", "work")));
+    store::atomic_write(
+        &moved.join("rename.json"),
+        &serde_json::to_vec(&json!({"user":"amir","from":"personal","to":"work"})).unwrap(),
+    )
+    .unwrap();
+    server.restart();
+    assert_eq!(server.token(&server.amir, "work", None).status(), 200);
+    assert_eq!(
+        server
+            .token(&server.amir, "personal", None)
+            .json::<Value>()
+            .unwrap()["alias"],
+        "work"
+    );
+    assert!(!moved.join("rename.json").exists());
+}
+
+#[test]
+fn rename_preflight_refuses_a_profile_directory_and_other_machines_drop_stale_records() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let here = server.connected_home();
+    let there = server.connected_home();
+    for home in [&here, &there] {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    // An incomplete local profile directory still blocks the new name.
+    std::fs::create_dir_all(here.path().join(".codexctl/profiles/work")).unwrap();
+    let refused = server.cli(here.path(), &["rename", "personal", "work"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("local profile named work"));
+    std::fs::remove_dir(here.path().join(".codexctl/profiles/work")).unwrap();
+    assert!(
+        server
+            .cli(here.path(), &["rename", "personal", "work"])
+            .status
+            .success()
+    );
+
+    // The other machine moves to the new alias; its stale record goes away.
+    let stale = there.path().join(".codexctl/central/personal.json");
+    assert!(stale.exists());
+    let moved = server.cli(there.path(), &["use", "work", "--allow-billing"]);
+    assert!(
+        moved.status.success(),
+        "{}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(server.cli(there.path(), &["list"]).status.success());
+    assert!(
+        !stale.exists(),
+        "a renamed alias's record is dropped once inactive"
+    );
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

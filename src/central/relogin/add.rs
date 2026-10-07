@@ -320,6 +320,12 @@ async fn start_owned(
     if broker.resolve_alias(&device.user, &alias).await?.is_some() {
         return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
     }
+    if super::super::rename::renamed_to(&broker.state, &device.user, &alias)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+        .is_some()
+    {
+        return Err(broker.error(StatusCode::CONFLICT, "alias_renamed"));
+    }
     let mut latest = current(&state)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?;
     if let Some(record) = latest.take() {

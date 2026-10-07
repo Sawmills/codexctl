@@ -533,6 +533,7 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
         }
     }
     native::rename_preflight(old, new)?;
+    let expected = native::connection_account_id(old)?;
     require_current_connection(&connection)?;
     let response = transport::blocking()?
         .post(format!(
@@ -540,7 +541,7 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
             connection.server.trim_end_matches('/')
         ))
         .bearer_auth(secret(&connection)?)
-        .json(&json!({"alias":old,"newAlias":new}))
+        .json(&json!({"alias":old,"newAlias":new,"accountId":expected}))
         .send()
         .context("server rename outcome unknown; run codexctl list before retrying")?;
     if !response.status().is_success() {
@@ -551,6 +552,18 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
             .and_then(|v| v["error"].as_str().map(str::to_owned));
         match reason.as_deref() {
             Some("alias_exists") => bail!("server account {new} already exists"),
+            Some("alias_renamed") => bail!(
+                "{new} is the former name of a renamed account and cannot be reused; choose another alias"
+            ),
+            Some("account_changed") => bail!(
+                "server account {old} is no longer the account this machine knows; run codexctl list"
+            ),
+            Some("account_renamed") => bail!(
+                "server account {old} was already renamed to another alias; run codexctl list"
+            ),
+            Some("persistence_failed") => {
+                bail!("server rename outcome unknown; run codexctl list before retrying")
+            }
             Some("account_not_found") => bail!("server account {old} not found"),
             Some("login_pending") => {
                 bail!("a server login for {old} is pending; finish or cancel it before renaming")
@@ -564,8 +577,18 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
     let account: Account = response
         .json()
         .context("server rename outcome unknown; run codexctl list before retrying")?;
-    if account.user_id != connection.user_id || account.alias != new {
+    if account.user_id != connection.user_id
+        || !account.alias.eq_ignore_ascii_case(new)
+        || expected
+            .as_deref()
+            .is_some_and(|id| id != account.account_id)
+    {
         bail!("server rename returned another account; run codexctl list");
+    }
+    if !account.available {
+        eprintln!(
+            "warning: {new} is renamed, but its refresh owner did not restart; run codexctl login {new}"
+        );
     }
     native::follow_rename(old, new)?;
     if let Err(error) = catalog() {
@@ -900,6 +923,14 @@ fn catalog_with_timeout(timeout: Option<Duration>) -> Result<Option<Catalog>> {
                 .collect(),
         })?,
     )?;
+    // Best effort: an older server has no rename list, and a stale record
+    // only costs a clear renamed error at its next use.
+    if let Ok(response) = self::request(&connection, "/v1/accounts/renamed")?.send()
+        && response.status().is_success()
+        && let Ok(renamed) = response.json::<Vec<String>>()
+    {
+        native::drop_renamed_connections(&connection.server, &connection.user_id, &renamed)?;
+    }
     Ok(Some(Catalog {
         connection,
         accounts,
