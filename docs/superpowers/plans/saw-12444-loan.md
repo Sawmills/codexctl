@@ -11,12 +11,12 @@ this plan with changes L1 to L8 on 2026-10-06; this version includes them.
 CLI (new `codexctl loans` command group; client code in a new module, not in
 `src/central/remote.rs`, which another lane edits now):
 
-| Command | Who | Effect |
-|---|---|---|
+| Command                                                         | Who    | Effect                                                        |
+| --------------------------------------------------------------- | ------ | ------------------------------------------------------------- |
 | `codexctl loans lend <alias> --to <email> [--until <RFC 3339>]` | lender | Creates the grant; prints the borrowed reference and end time |
-| `codexctl loans list` | both | Lists active and recent loans, lent and borrowed |
-| `codexctl loans end <id>` | both | Ends the loan (`revoked` by lender, `returned` by borrower) |
-| `codexctl loans audit [<id>]` | both | Shows the audit events for loans the caller is part of |
+| `codexctl loans list`                                           | both   | Lists active and recent loans, lent and borrowed              |
+| `codexctl loans end <id>`                                       | both   | Ends the loan (`revoked` by lender, `returned` by borrower)   |
+| `codexctl loans audit [<id>]`                                   | both   | Shows the audit events for loans the caller is part of        |
 
 No accept step: the lender's grant is the approval (Q2). The borrower selects
 the account by its borrowed reference `<lender>/<alias>`.
@@ -24,12 +24,12 @@ the account by its borrowed reference `<lender>/<alias>`.
 Account server (handlers and grant rules in a new `src/central/loans.rs`;
 storage in `src/central/storage/loans.rs`):
 
-| Route | Purpose |
-|---|---|
-| `POST /v1/loans` | Grant. Lender only. Refuses a self-loan, an unknown or disabled borrower, a second active grant, and stale usage or a past weekly reset |
-| `GET /v1/loans` | Grants where the caller is lender or borrower |
-| `POST /v1/loans/end` | End by lender or borrower; idempotent for an ended grant |
-| `GET /v1/loans/audit` | Audit events, filtered to the caller's grants |
+| Route                 | Purpose                                                                                                                                 |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST /v1/loans`      | Grant. Lender only. Refuses a self-loan, an unknown or disabled borrower, a second active grant, and stale usage or a past weekly reset |
+| `GET /v1/loans`       | Grants where the caller is lender or borrower                                                                                           |
+| `POST /v1/loans/end`  | End by lender or borrower; idempotent for an ended grant                                                                                |
+| `GET /v1/loans/audit` | Audit events, filtered to the caller's grants                                                                                           |
 
 ## Seams (L1, L5, L6, L7)
 
@@ -52,7 +52,7 @@ storage in `src/central/storage/loans.rs`):
 - Client names (L6): a typed `AccountRef { Owned, Borrowed }` parses a name;
   `store::validate_alias` stays strict. The touched commands are `codexctl use`
   (`native::activate`, connection file and active pointer), `codexctl codex
-  --account` (`prepare_pinned_codex`), and the status line (active pointer
+--account` (`prepare_pinned_codex`), and the status line (active pointer
   read).
 
 ## Rules

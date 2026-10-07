@@ -33,15 +33,15 @@ caller's accounts, so a borrower has no path to a loaned account.
 
 A grant has these fields:
 
-| Field | Meaning |
-|---|---|
-| `id` | Random grant ID |
-| `account_key` | The lender's existing account key |
-| `lender`, `borrower` | Company-user IDs |
-| `alias` | The lender's alias at grant time |
-| `subject` | Digests of the credential workspace and of each login claim (`uid`, `sub`) at grant time |
-| `created_at`, `ends_at` | Start and end; `ends_at` is at or before the account's next weekly reset |
-| `ended_at`, `ended_by`, `end_reason` | Set once, when the loan ends (`revoked`, `returned`, `expired`) |
+| Field                                | Meaning                                                                                  |
+| ------------------------------------ | ---------------------------------------------------------------------------------------- |
+| `id`                                 | Random grant ID                                                                          |
+| `account_key`                        | The lender's existing account key                                                        |
+| `lender`, `borrower`                 | Company-user IDs                                                                         |
+| `alias`                              | The lender's alias at grant time                                                         |
+| `subject`                            | Digests of the credential workspace and of each login claim (`uid`, `sub`) at grant time |
+| `created_at`, `ends_at`              | Start and end; `ends_at` is at or before the account's next weekly reset                 |
+| `ended_at`, `ended_by`, `end_reason` | Set once, when the loan ends (`revoked`, `returned`, `expired`)                          |
 
 Rules for grants:
 
@@ -84,16 +84,16 @@ only while the login claims agree; a different login pauses it.
 
 ## Who May Do What
 
-| Action | Lender | Borrower |
-|---|---|---|
-| Get an access token (`/v1/token`) | yes | yes, while the grant is active |
-| See the account in the catalog | yes | yes, marked as loaned, with lender and end time |
-| Select it with `codexctl use` or auto-select | yes | yes, same rules as an owned account |
-| Spend credits | with `--allow-billing` | with `--allow-billing` |
-| Redeem a banked reset | yes | no |
-| Login renewal, import, or `codexctl devices --revoke` | yes | no |
-| End the loan | yes | yes |
-| Read the loan audit log | yes | yes |
+| Action                                                | Lender                 | Borrower                                        |
+| ----------------------------------------------------- | ---------------------- | ----------------------------------------------- |
+| Get an access token (`/v1/token`)                     | yes                    | yes, while the grant is active                  |
+| See the account in the catalog                        | yes                    | yes, marked as loaned, with lender and end time |
+| Select it with `codexctl use` or auto-select          | yes                    | yes, same rules as an owned account             |
+| Spend credits                                         | with `--allow-billing` | with `--allow-billing`                          |
+| Redeem a banked reset                                 | yes                    | no                                              |
+| Login renewal, import, or `codexctl devices --revoke` | yes                    | no                                              |
+| End the loan                                          | yes                    | yes                                             |
+| Read the loan audit log                               | yes                    | yes                                             |
 
 A borrowed account follows the same selection rules as an owned account.
 Recovery and auto-select pick it only with verified included usage and never
