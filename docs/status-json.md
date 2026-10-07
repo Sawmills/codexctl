@@ -123,12 +123,13 @@ Plan names do not give a reliable capacity weight, so the calculation does not u
 Accounts with unknown pace are excluded. An empty qualifying fleet gives `null`.
 Filters apply before the mean is calculated. Profiles and server accounts are separate rows.
 
-Status tables show a `Pace` column and a `Fleet` row when at least one displayed
-account has known pace. They hide both when all pace is unknown.
+Status tables show a `Pace` column when at least one account in that table has known pace.
+A `Fleet` row or footer summarizes all displayed accounts, including both billing groups.
+They hide the pace column and summary when all pace is unknown.
 Unknown row values display `-`. Known values round to whole percentage points:
 `+12 ahead`, `-8 behind`, or `0 on pace`. Ahead carries a yellow warning color.
-JSON keeps the unrounded numbers. A focused table computes its fleet mean over
-the accounts displayed in that table.
+JSON keeps the unrounded numbers. Focused status includes both the selected account
+and other accounts in its fleet footer.
 Small nonzero values can round to `+0 ahead` or `-0 behind`; their direction and warning remain.
 
 Version 2 adds `pace_points`, `elapsed_percent`, and `fleet_pace_points`.
