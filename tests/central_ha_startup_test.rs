@@ -1996,3 +1996,104 @@ async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
     );
     stop_fixture(f).await;
 }
+
+#[tokio::test]
+async fn postgres_renewal_uses_committed_revision_after_unpublished_refresh() {
+    renewal_after_unpublished_refresh(false).await;
+}
+
+#[tokio::test]
+async fn postgres_obsolete_settlement_cannot_fence_a_completed_renewal() {
+    renewal_after_unpublished_refresh(true).await;
+}
+
+async fn renewal_after_unpublished_refresh(overlap: bool) {
+    let f = login_fixture().await;
+    f.control
+        .batch_execute(&format!(
+            r#"
+        CREATE SEQUENCE {0}.publication_attempt;
+        CREATE FUNCTION {0}.reject_refresh_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM {0}.central_login_operations WHERE phase='verifying') THEN
+                PERFORM nextval('{0}.publication_attempt');
+                RAISE EXCEPTION 'synthetic refresh publication failure';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER reject_refresh_publication BEFORE UPDATE ON {0}.central_accounts
+        FOR EACH ROW EXECUTE FUNCTION {0}.reject_refresh_publication();
+    "#,
+            f.schema
+        ))
+        .await
+        .unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    if overlap {
+        timeout(Duration::from_secs(8), async {
+            loop {
+                let row = f
+                    .control
+                    .query_one(
+                        &format!("SELECT last_value FROM {}.publication_attempt", f.schema),
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                if row.get::<_, i64>(0) >= 4 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background publication must enter its retry delay");
+    }
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET holder_id='lost',epoch=epoch+1,expires_at=clock_timestamp() WHERE account_id=$1", f.schema), &[&account_key("test","seat")]).await.unwrap();
+    if overlap {
+        store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    } else {
+        // Allow the old settlement retry to observe its lost epoch before this renewal.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let id = "b3".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    if overlap {
+        timeout(Duration::from_secs(8), async {
+            while !f.first.root.path().join("initialize-started").exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Keep the new verifier's mutex held across the old settlement retry.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    }
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("renewal must commit even when a previous refresh advanced only local state");
+    if overlap {
+        // The obsolete callback can now acquire the renewed owner.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    f.control
+        .batch_execute(&format!(
+            "DROP TRIGGER reject_refresh_publication ON {}.central_accounts",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}

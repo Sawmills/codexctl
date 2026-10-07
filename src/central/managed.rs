@@ -777,6 +777,8 @@ async fn reconcile_owner_from_central(
     }
     owner.rpc = None;
     owner.refresh_enabled = false;
+    // A retained settlement callback belongs to the preceding credential state.
+    owner.recovery_generation = owner.recovery_generation.wrapping_add(1);
     if renewed {
         owner.verification_input = None;
         owner.available = true;
@@ -868,12 +870,15 @@ async fn terminate_lost_import(owner: &mut Owner) {
 
 async fn abandon_background_recovery(
     owner_ref: Arc<Mutex<Owner>>,
+    recovery_generation: u64,
     renew_done: Arc<AtomicBool>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let mut owner = owner_ref.lock().await;
-    fence_background_owner(&mut owner);
+    if owner.recovery_generation == recovery_generation {
+        fence_background_owner(&mut owner);
+    }
     drop(owner);
     renew_done.store(true, Ordering::Release);
     if let Some(task) = renew_task {
@@ -917,7 +922,14 @@ async fn settle_background_recovery(
         // Shared-store shutdown must drain the child's final rotation to the
         // database before releasing its lease and the shutdown work permit.
         if central.is_none() && stopping.load(Ordering::Acquire) {
-            abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+            abandon_background_recovery(
+                owner_ref,
+                recovery_generation,
+                renew_done,
+                renew_task,
+                permit,
+            )
+            .await;
             return;
         }
         if let Some(window) = lease_window.as_ref() {
@@ -928,16 +940,28 @@ async fn settle_background_recovery(
                 .saturating_duration_since(std::time::Instant::now());
             if window.lost.load(Ordering::Acquire) || remaining <= IMPORT_LEASE_SAFETY_MARGIN {
                 let mut owner = owner_ref.lock().await;
-                terminate_lost_import(&mut owner).await;
+                if owner.recovery_generation == recovery_generation {
+                    terminate_lost_import(&mut owner).await;
+                }
                 drop(owner);
-                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
                 return;
             }
         }
         let record = {
             let settle = async {
                 let mut owner = owner_ref.lock().await;
-                settled_owner_record(&mut owner, &before).await
+                if owner.recovery_generation != recovery_generation {
+                    return Ok(None);
+                }
+                settled_owner_record(&mut owner, &before).await.map(Some)
             };
             if let Some(window) = lease_window.as_ref() {
                 let mut settle = Box::pin(settle);
@@ -950,10 +974,18 @@ async fn settle_background_recovery(
                     if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
                         drop(settle);
                         let mut owner = owner_ref.lock().await;
-                        terminate_lost_import(&mut owner).await;
+                        if owner.recovery_generation == recovery_generation {
+                            terminate_lost_import(&mut owner).await;
+                        }
                         drop(owner);
-                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
-                            .await;
+                        abandon_background_recovery(
+                            owner_ref,
+                            recovery_generation,
+                            renew_done,
+                            renew_task,
+                            permit,
+                        )
+                        .await;
                         return;
                     }
                     let check_after = IMPORT_LEASE_RENEW_INTERVAL
@@ -963,9 +995,11 @@ async fn settle_background_recovery(
                         _ = wait_for_lease_loss(window.lost.clone(), window.signal.clone()) => {
                             drop(settle);
                             let mut owner = owner_ref.lock().await;
-                            terminate_lost_import(&mut owner).await;
+                            if owner.recovery_generation == recovery_generation {
+                                terminate_lost_import(&mut owner).await;
+                            }
                             drop(owner);
-                            abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                            abandon_background_recovery(owner_ref, recovery_generation, renew_done, renew_task, permit)
                                 .await;
                             return;
                         }
@@ -977,7 +1011,18 @@ async fn settle_background_recovery(
             }
         };
         let record = match record {
-            Ok(record) => record,
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 eprintln!("central child settlement retry: {error:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -996,8 +1041,14 @@ async fn settle_background_recovery(
                         // not an uncertain query. Stop renewing and let shutdown
                         // drain without ever reopening this owner.
                         let _ = central.release_lease(lease).await;
-                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
-                            .await;
+                        abandon_background_recovery(
+                            owner_ref,
+                            recovery_generation,
+                            renew_done,
+                            renew_task,
+                            permit,
+                        )
+                        .await;
                         return;
                     }
                     Err(error) => {
@@ -1006,7 +1057,14 @@ async fn settle_background_recovery(
                     }
                 },
                 Ok(false) => {
-                    abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                    abandon_background_recovery(
+                        owner_ref,
+                        recovery_generation,
+                        renew_done,
+                        renew_task,
+                        permit,
+                    )
+                    .await;
                     return;
                 }
                 Err(error) => {
@@ -1020,7 +1078,14 @@ async fn settle_background_recovery(
         };
         if !durable {
             if central.is_none() && stopping.load(Ordering::Acquire) {
-                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;

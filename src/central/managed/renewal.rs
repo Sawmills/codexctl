@@ -52,7 +52,7 @@ impl Broker {
             .owner(&device, &op.alias)
             .await
             .map_err(|_| anyhow::anyhow!("renewal account missing"))?;
-        let (imports, held_owner, lease) = loop {
+        let (imports, mut held_owner, lease) = loop {
             self.check_login_authority(headers, op).await?;
             let Ok(imports) =
                 tokio::time::timeout(std::time::Duration::from_secs(1), self.imports.lock()).await
@@ -73,6 +73,9 @@ impl Broker {
             drop(imports);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
+        // The renewed lease transfers settlement responsibility to this worker.
+        // Older callbacks must not mutate or stop the replacement owner.
+        held_owner.recovery_generation = held_owner.recovery_generation.wrapping_add(1);
         let mut owner = Some(held_owner);
         let authority = op.clone();
         let monitor = async {
@@ -127,6 +130,14 @@ impl Broker {
                 return Err(error);
             }
             let before = owner.vault.clone();
+            // A failed refresh publication can leave local evidence ahead of
+            // PostgreSQL. Keep that evidence for settlement, but compare the
+            // final commit against the shared revision read under this lease.
+            let committed_revision = central
+                .load_account(&op.account_id)
+                .await?
+                .context("renewal account missing")?
+                .revision;
             // This is durable before initialize, which can itself rotate credentials.
             central.login_begin_verification(op, &lease).await?;
             owner.vault.auth = candidate.clone();
@@ -173,7 +184,7 @@ impl Broker {
                 .await
                 .map_err(|_| anyhow::anyhow!("machine revoked"))?;
             central
-                .login_complete(op, &lease, &record, before.revision)
+                .login_complete(op, &lease, &record, committed_revision)
                 .await?;
             owner.verification_input = None;
             Ok(())
