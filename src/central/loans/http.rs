@@ -65,25 +65,35 @@ pub(in crate::central) struct BorrowedEntry {
 }
 
 /// Complete usage for borrowed catalog entries, per server state and account.
-type UsageCache = tokio::sync::Mutex<
-    std::collections::HashMap<String, (std::time::Instant, Option<crate::statusline::Usage>)>,
+type UsageEntry = std::sync::Arc<
+    tokio::sync::Mutex<Option<(std::time::Instant, Option<crate::statusline::Usage>)>>,
 >;
-static COMPLETE_USAGE: std::sync::OnceLock<UsageCache> = std::sync::OnceLock::new();
+static COMPLETE_USAGE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, UsageEntry>>,
+> = std::sync::OnceLock::new();
 const COMPLETE_USAGE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Broker {
     /// A complete (all-window) usage snapshot for a borrowed entry. Results
-    /// and failures are kept for 60 seconds, and one lock around the fetch
-    /// lets concurrent polls share a single upstream request.
+    /// and failures are kept for 60 seconds. A per-account lock lets
+    /// concurrent polls of one account share a single upstream request,
+    /// while other accounts never wait behind it.
     pub(in crate::central) async fn complete_usage(
         &self,
         key: &str,
         access: &str,
         account_id: &str,
     ) -> Option<crate::statusline::Usage> {
-        let mut cache = COMPLETE_USAGE.get_or_init(Default::default).lock().await;
         let id = format!("{}\0{key}", self.state.display());
-        if let Some((at, usage)) = cache.get(&id)
+        let entry = COMPLETE_USAGE
+            .get_or_init(Default::default)
+            .lock()
+            .expect("complete usage map")
+            .entry(id)
+            .or_default()
+            .clone();
+        let mut entry = entry.lock().await;
+        if let Some((at, usage)) = entry.as_ref()
             && at.elapsed() < COMPLETE_USAGE_TTL
         {
             return usage.clone();
@@ -95,7 +105,7 @@ impl Broker {
                 None
             }
         };
-        cache.insert(id, (std::time::Instant::now(), usage.clone()));
+        *entry = Some((std::time::Instant::now(), usage.clone()));
         usage
     }
 
