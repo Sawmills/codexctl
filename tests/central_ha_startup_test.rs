@@ -1887,3 +1887,112 @@ async fn postgres_renewal_preserves_the_legacy_alias_account_key() {
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }
+
+#[tokio::test]
+async fn postgres_unreadable_saved_grant_preserves_shared_reservations() {
+    let f = login_fixture().await;
+    let id = "b0".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(&f.first.root.path().join("login-release"), b"{truncated").unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for alias in ["seat", "other"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias,"billing":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            503,
+            "unknown grant identity must fence {alias}"
+        );
+    }
+    assert_eq!(
+        login_request(&f, &f.second, "start", &"b1".repeat(32)).await["id"],
+        id
+    );
+    let retained = f.first.root.path().join("state/shared-logins").join(&id);
+    assert!(
+        std::fs::read_dir(retained).unwrap().any(|entry| entry
+            .unwrap()
+            .path()
+            .join("auth.json")
+            .exists())
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
+    let f = login_fixture().await;
+    // PostgreSQL finishes the statement after the client's bounded wait expires.
+    f.control
+        .batch_execute(&format!(
+            r#"
+        CREATE FUNCTION {0}.delay_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='verifying' THEN
+                PERFORM set_config('statement_timeout', '0', false);
+            END IF;
+            IF NEW.phase='completed' THEN PERFORM pg_sleep(3); END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER delay_completion AFTER UPDATE ON {0}.central_login_operations
+        FOR EACH ROW EXECUTE FUNCTION {0}.delay_completion();
+    "#,
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let id = "b2".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(10), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        login_request(&f, &f.second, "start", &id).await["status"],
+        "completed"
+    );
+    let response = request(&f.http, &f.first, &f.token).await;
+    assert_eq!(
+        response.status(),
+        200,
+        "durable completion must restore the initiating replica"
+    );
+    let before: Value = response.json().await.unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    let failed = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":before["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 503);
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup").unwrap();
+    assert_eq!(
+        request(&f.http, &f.first, &f.token).await.status(),
+        503,
+        "a later rejection must not reuse the old completion proof"
+    );
+    stop_fixture(f).await;
+}

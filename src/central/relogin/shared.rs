@@ -300,18 +300,32 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         }
     }.await;
     // Await exit even on DB loss. A dropped RPC future alone is not settlement.
-    if !matches!(result, Ok(true)) {
-        child.start_kill()?;
-        child.wait().await?;
+    if !matches!(result, Ok(true))
+        && let Err(error) = async {
+            child.start_kill()?;
+            child.wait().await?;
+            Ok::<_, std::io::Error>(())
+        }
+        .await
+    {
+        op.phase = LoginPhase::Unresolved;
+        return Err(error.into());
     }
     // A child can save an issued grant and then fail or be canceled. Capture it
     // after confirmed exit before classifying the process outcome.
     let path = home.join("auth.json");
-    if path.try_exists()? {
+    let captured = (|| -> Result<Option<Value>> {
+        if !path.try_exists()? {
+            return Ok(None);
+        }
         let auth: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
         vault::validate_auth(&auth)?;
-        op.payload.candidate = Some(auth);
-    }
+        Ok(Some(auth))
+    })();
+    op.payload.candidate = captured.inspect_err(|_| {
+        // An unreadable grant is not evidence that no grant was issued.
+        op.phase = LoginPhase::Unresolved;
+    })?;
     if !result? {
         op.payload.code = None;
         let phase = if op.payload.candidate.is_some() {

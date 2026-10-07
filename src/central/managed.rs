@@ -725,7 +725,13 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
-    if record.revision <= owner.vault.revision {
+    // Verification saves its settled vault before the shared commit responds.
+    // Retained verification input distinguishes an ambiguous completion from a
+    // later rejection of credentials that were already served successfully.
+    let pending_completion = owner.vault.verified && owner.verification_input.is_some();
+    if record.revision < owner.vault.revision
+        || (record.revision == owner.vault.revision && !pending_completion)
+    {
         return Ok(false);
     }
     let committed: vault::Vault = serde_json::from_value(record.vault)
@@ -739,9 +745,19 @@ async fn reconcile_owner_from_central(
         && !committed.import_rejected
         && (!owner.available || owner.routing_refused || !owner.vault.verified)
         && central
-            .login_completed_after(account_id, owner.vault.revision, record.revision)
+            .login_completed_after(
+                account_id,
+                owner
+                    .vault
+                    .revision
+                    .saturating_sub(i64::from(pending_completion)),
+                record.revision,
+            )
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    if record.revision == owner.vault.revision && !renewed {
+        return Ok(false);
+    }
     vault::save(&owner.state, &owner.key, &committed)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     store::atomic_write(
@@ -762,6 +778,7 @@ async fn reconcile_owner_from_central(
     owner.rpc = None;
     owner.refresh_enabled = false;
     if renewed {
+        owner.verification_input = None;
         owner.available = true;
         owner.routing_refused = false;
         owner.retryable_unavailable = false;

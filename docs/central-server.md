@@ -317,7 +317,8 @@ and the matching known account across replicas. After a stopped device login is 
 for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
 a new request ID. Only verified completion clears that account's reservation, and only for evidence
 recorded before verification started. A newer quarantine remains fenced.
-An unresolved verification cannot use this repair path. If shared publication fails,
+An unresolved verification cannot use this repair path. An unreadable saved grant
+keeps all accounts reserved because its identity is unknown. If shared publication fails,
 the isolated login home retains the issued grant and its operation/holder/epoch
 record under `state/shared-logins/`. Preserve this evidence. Automated replay and
 cleanup of interrupted operations belong to PR3; local evidence alone does not
