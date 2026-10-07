@@ -3410,6 +3410,76 @@ async fn postgres_cancel_on_b_stops_polling_while_a_is_stopped() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_published_candidate_survives_local_login_home_loss() {
+    let f = login_fixture().await;
+    let id = "23".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"login-hold-after-save").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("login-saved").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let parent = f.first.child.id().unwrap();
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGSTOP) }, 0);
+    store::atomic_write(&f.first.root.path().join("login-exit"), b"go").unwrap();
+    let published = timeout(Duration::from_secs(5), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            if receipt["status"] == "verifying" {
+                break;
+            }
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let home = std::fs::read_dir(f.first.root.path().join("state/shared-logins").join(&id))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    if published.is_ok() {
+        // The grant is already durable in PostgreSQL. Lose only this fixture's
+        // synthetic execution home before the parent reads that grant back.
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    assert_eq!(unsafe { libc::kill(parent as i32, libc::SIGCONT) }, 0);
+    published.expect("the independent supervisor must publish before parent recovery");
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(
+                receipt["status"], "failed",
+                "local home loss must retain the durable candidate: {receipt}"
+            );
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.first.launches(),
+        1,
+        "verify the saved candidate exactly once"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_lost_polling_home_cannot_prove_grant_absence() {
     let mut f = login_fixture().await;
     let id = "14".repeat(32);

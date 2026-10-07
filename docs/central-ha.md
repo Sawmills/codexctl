@@ -181,8 +181,9 @@ Missing holder records, retired holders, and unsupported holders cannot supply
 automatic cleanup proof. Never inspect a foreign PID to infer exit.
 
 A durable candidate can transfer to a new holder and epoch before verification
-starts. Recovery preserves the candidate, identity reservations, and account
-lease fences, then resumes admission and verification without another device
+starts. The shared candidate remains authoritative if its local execution home
+is lost after publication. Recovery preserves the candidate, identity reservations,
+and account lease fences, then resumes admission and verification without another device
 login. An unreleased foreign refresh lease still requires explicit settlement.
 If the old login worker already acquired the account lease, its pre-verification
 settlement can be uncertain; recovery reports `relogin_settlement_unresolved`

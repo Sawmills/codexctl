@@ -562,13 +562,23 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             std::fs::remove_dir_all(&home)?;
             return Ok(());
         }
-        let settled: Result<()> = async {
-            // Durable supervisor settlement also covers spawn failure and exit
-            // before a live process identity could be recorded.
-            if op.polling_clear
-                || (matches!(op.phase, LoginPhase::Candidate | LoginPhase::Rejected)
-                    && op.payload.candidate.is_some())
+        // Once published, PostgreSQL owns the grant. Loss or damage of the
+        // local copy must never erase its identity or remove its refresh fence.
+        if op.payload.candidate.is_some() {
+            if op.phase != LoginPhase::Candidate || !matches!(result, Ok(true)) {
+                bail!("polling grant retained after interruption");
+            }
+            if let Err(error) = std::fs::remove_dir_all(&home)
+                && error.kind() != std::io::ErrorKind::NotFound
             {
+                return Err(error.into());
+            }
+            return continue_candidate(broker, headers, op).await;
+        }
+        let settled: Result<()> = async {
+            // A durable absence receipt also covers spawn failure and exit
+            // before a live process identity could be recorded.
+            if op.polling_clear {
                 return Ok(());
             }
             let native: process::Process =
