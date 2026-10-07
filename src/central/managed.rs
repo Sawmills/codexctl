@@ -1442,6 +1442,8 @@ async fn token(
             broker
                 .confirm_borrowed_token(&borrowed.grant, &device, &token)
                 .await?;
+            // The recheck can wait; a machine revoked meanwhile gets nothing.
+            broker.authorize(&headers).await?;
             borrowed.grant.reference.clone()
         }
         None => alias,

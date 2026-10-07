@@ -381,3 +381,18 @@ fn stored_names_round_trip_and_match_the_json_names() {
     }
     assert!(EndReason::parse("other").is_err());
 }
+
+#[test]
+fn a_model_specific_window_counts_for_the_backoff() {
+    let usage: crate::api::RateLimitResponse = serde_json::from_value(serde_json::json!({
+        "rate_limit": {"primary_window": {"used_percent": 20.0, "limit_window_seconds": 604800}},
+        "additional_rate_limits": [{"limit_name": "spark", "rate_limit": {
+            "primary_window": {"used_percent": 96.0, "limit_window_seconds": 18000}
+        }}]
+    }))
+    .unwrap();
+    assert_eq!(
+        crate::statusline::Usage::from_usage(&usage).max_used_percent,
+        Some(96.0)
+    );
+}

@@ -356,6 +356,28 @@ impl Broker {
         device: &vault::Device,
         token: &TokenResponse,
     ) -> Result<(), HttpError> {
+        // The token must be the lender's current login.
+        if !grant.subject.same_login(&super::credential_subject(
+            &token.chatgpt_account_id,
+            &token.access_token,
+        )) {
+            return Err(self.pause(grant, "subject_changed").await);
+        }
+        // The lender's account may have been removed or replaced while the
+        // token was prepared. This can wait for the owner, so it runs before
+        // the grant and lender checks below.
+        let Some(found) = self.grant_owner(grant).await? else {
+            return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
+        };
+        let now_subject = match found.shared_subject {
+            Some(subject) => Some(subject),
+            None => owner_subject(&*found.owner.lock().await),
+        };
+        if !now_subject.is_some_and(|subject| grant.subject.same_login(&subject)) {
+            return Err(self.pause(grant, "subject_changed").await);
+        }
+        // Last, with no further waits: the grant is active and the lender
+        // enabled. The caller re-authorizes the machine after this.
         let current = self
             .loan_store()
             .load_loan(&grant.id)
@@ -367,24 +389,6 @@ impl Broker {
         }
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(grant, "lender_disabled").await);
-        }
-        if !grant.subject.same_login(&super::credential_subject(
-            &token.chatgpt_account_id,
-            &token.access_token,
-        )) {
-            return Err(self.pause(grant, "subject_changed").await);
-        }
-        // The lender's account may have been removed or replaced while the
-        // token was prepared; the account as it is now must still match.
-        let Some(found) = self.grant_owner(grant).await? else {
-            return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
-        };
-        let now_subject = match found.shared_subject {
-            Some(subject) => Some(subject),
-            None => owner_subject(&*found.owner.lock().await),
-        };
-        if !now_subject.is_some_and(|subject| grant.subject.same_login(&subject)) {
-            return Err(self.pause(grant, "subject_changed").await);
         }
         self.audit_event(AuditEvent::token_issued(now(), &grant.id, &device.id))
             .await
