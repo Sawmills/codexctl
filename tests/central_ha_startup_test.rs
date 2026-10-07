@@ -2917,6 +2917,48 @@ async fn postgres_add_creates_verified_account_and_replays_completed_receipt_on_
 }
 
 #[tokio::test]
+async fn postgres_add_uses_typed_proof_without_decrypting_unrelated_workspace_accounts() {
+    let f = login_fixture().await;
+    f.control.batch_execute(&format!(r#"
+        INSERT INTO {0}.central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision)
+        SELECT 'unrelated-'||i,'test','unrelated-'||i,'proof-workspace','unrelated-sub-'||i,'\x00',1
+        FROM generate_series(1,128) i;
+        INSERT INTO {0}.central_account_identity_claims(workspace,namespace,claim,account_id)
+        SELECT 'proof-workspace','sub','unrelated-sub-'||i,'unrelated-'||i FROM generate_series(1,128) i;
+        INSERT INTO {0}.central_account_identity_claims(workspace,namespace,claim,account_id)
+        SELECT 'proof-workspace','uid','unrelated-uid-'||i,'unrelated-'||i FROM generate_series(1,128) i;
+    "#, f.schema)).await.unwrap();
+    let operation = json!({"alias":"proved-new-seat","id":"f0".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    let receipt = complete_add(
+        &f,
+        &f.first,
+        &operation,
+        &add_grant(
+            "proof-workspace",
+            Some("arriving-sub"),
+            Some("arriving-uid"),
+        ),
+    )
+    .await;
+    assert_eq!(receipt["status"], "completed");
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"proved-new-seat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "unrelated ciphertext does not block a proved different account"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
 async fn postgres_add_lands_on_existing_alias_and_preserves_its_label() {
     let f = login_fixture().await;
     let operation = json!({"alias":"typo","id":"d1".repeat(32),"label":"Replacement label"});

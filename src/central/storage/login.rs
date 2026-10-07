@@ -93,7 +93,7 @@ ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_uid TEXT
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_sub TEXT;
 CREATE OR REPLACE FUNCTION central_login_identity_agrees(p_workspace TEXT, p_uid TEXT, p_sub TEXT, p_account TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
-    WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account),
+    WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account AND deleted_at IS NULL),
     known AS (
         SELECT namespace,claim FROM central_account_identity_claims JOIN owned USING(account_id)
             WHERE central_account_identity_claims.workspace=owned.workspace AND central_account_identity_claims.deleted_at IS NULL
@@ -107,7 +107,7 @@ RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
 $$;
 CREATE OR REPLACE FUNCTION central_login_identity_matches(p_workspace TEXT, p_uid TEXT, p_sub TEXT, p_account TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
-    WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account),
+    WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account AND deleted_at IS NULL),
     known AS (
         SELECT namespace,claim FROM central_account_identity_claims JOIN owned USING(account_id)
             WHERE central_account_identity_claims.workspace=owned.workspace AND central_account_identity_claims.deleted_at IS NULL

@@ -2189,6 +2189,48 @@ mod tests {
 
     #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
+    async fn postgres_current_identity_helpers_exclude_deleted_accounts_but_retain_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[30; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut saved = record("deleted-seat", 1);
+        saved.workspace = Some("claim-workspace".into());
+        saved.login = Some("stable-sub".into());
+        saved.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("stable-uid"))});
+        shared.save_account(&saved).await.unwrap();
+        let sql = "SELECT central_login_identity_agrees('claim-workspace','stable-uid','stable-sub','deleted-seat'),central_login_identity_matches('claim-workspace','stable-uid','stable-sub','deleted-seat'),central_login_identity_agrees('claim-workspace','{\"uid\":\"stable-uid\",\"sub\":\"stable-sub\"}'::jsonb,'deleted-seat'),central_login_identity_matches('claim-workspace','{\"uid\":\"stable-uid\",\"sub\":\"stable-sub\"}'::jsonb,'deleted-seat')";
+        let live = control.query_one(sql, &[]).await.unwrap();
+        for column in 0..4 {
+            assert!(live.get::<_, bool>(column));
+        }
+        control.execute("UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='deleted-seat'", &[]).await.unwrap();
+        let deleted = control.query_one(sql, &[]).await.unwrap();
+        for column in 0..4 {
+            assert!(
+                !deleted.get::<_, bool>(column),
+                "deleted accounts cannot match current operations"
+            );
+        }
+        saved.account_id = "copy".into();
+        saved.alias = "copy".into();
+        assert!(
+            shared.save_account(&saved).await.is_err(),
+            "deletion must not free retained proof"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
     async fn postgres_migration_rolls_back_layout_when_schema_version_recording_fails() {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");

@@ -309,7 +309,6 @@ impl CentralStore {
             revision: 1,
         };
         let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&saved)?)?;
-        let cipher = vault::cipher(&db.key)?;
         let tags = claims.tags();
         let result=bounded_db(async {
             let mut client=db.admission_client().await?;
@@ -324,20 +323,42 @@ impl CentralStore {
             let active_reserved:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace||':'||r.claim=ANY($2) AND (r.user_id<>$3 OR r.id<>$4) AND o.phase<>'rejected')",&[&claims.workspace,&tags,&op.user,&op.id]).await?.get(0);
             if active_reserved {return Ok(Err("relogin_reserved"));}
             let mut selected=None;
-            for row in tx.query("SELECT account_id,user_id,alias,encrypted_vault FROM central_accounts WHERE workspace=$1 AND deleted_at IS NULL",&[&claims.workspace]).await? {
-                let bytes:Vec<u8>=row.get(3);
-                let stored: vault::Vault=serde_json::from_slice(&vault::decrypt_with_cipher(&cipher,&bytes)?)?;
-                let existing=Claims::from_auth(&stored.auth)?;
-                let account: String = row.get(0);
-                match known_claims(&tx,&account,&existing).await?.compare(&claims.logins) {
-                    IdentityDecision::Same => {},
-                    IdentityDecision::Different => continue,
-                    IdentityDecision::Unknown => return Ok(Err("account_identity_unresolved")),
-                    IdentityDecision::Conflict => return Ok(Err("alias_identity_conflict")),
-                }
+            // Read at most two owners from the unique namespaced claim keys.
+            // Incomparable workspace accounts still refuse admission.
+            let owners=tx.query(r#"
+                WITH candidate_owners AS MATERIALIZED (
+                    SELECT account_id FROM central_account_identity_claims
+                    WHERE workspace=$1 AND namespace='uid' AND claim=$2 AND deleted_at IS NULL
+                    UNION
+                    SELECT account_id FROM central_account_identity_claims
+                    WHERE workspace=$1 AND namespace='sub' AND claim=$3 AND deleted_at IS NULL
+                ), candidates AS MATERIALIZED (
+                    SELECT a.account_id,a.user_id,a.alias
+                    FROM candidate_owners c JOIN central_accounts a USING(account_id)
+                    WHERE a.workspace=$1 AND a.deleted_at IS NULL
+                ), uncertainty AS (
+                    SELECT EXISTS(
+                        SELECT 1 FROM central_accounts a
+                        WHERE a.workspace=$1 AND a.deleted_at IS NULL
+                        AND NOT EXISTS(
+                            SELECT 1 FROM central_account_identity_claims c
+                            WHERE c.account_id=a.account_id AND c.workspace=$1 AND c.deleted_at IS NULL
+                            AND ((c.namespace='uid' AND $2::text IS NOT NULL)
+                              OR (c.namespace='sub' AND $3::text IS NOT NULL))
+                        )
+                    ) AS unresolved
+                )
+                SELECT a.account_id,a.user_id,a.alias,
+                       central_login_identity_agrees($1,$2,$3,a.account_id),u.unresolved
+                FROM uncertainty u LEFT JOIN candidates a ON true LIMIT 2
+            "#,&[&claims.workspace,&claims.logins.uid,&claims.logins.sub]).await?;
+            for row in owners {
+                if row.get::<_,bool>(4) {return Ok(Err("account_identity_unresolved"));}
+                let Some(account)=row.get::<_,Option<String>>(0) else {continue;};
+                if !row.get::<_,bool>(3) {return Ok(Err("alias_identity_conflict"));}
                 if row.get::<_,Option<String>>(1).as_deref()!=Some(op.user.as_str()) {return Ok(Err("account_already_owned"));}
                 if selected.is_some() {bail!("ambiguous account identity");}
-                selected=Some((row.get::<_,String>(0),row.get::<_,String>(2)));
+                selected=Some((account,row.get::<_,String>(2)));
             }
             let selected_account=selected.as_ref().map(|(account,_)|account.as_str());
             let reserved=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_login_identity_reservations r JOIN central_login_operations o USING(user_id,id) WHERE r.deleted_at IS NULL AND r.workspace=$1 AND r.namespace||':'||r.claim=ANY($2) AND (r.user_id<>$3 OR r.id<>$4) AND NOT (o.phase='rejected' AND $5::text IS NOT NULL AND central_login_identity_agrees(o.candidate_workspace,o.candidate_uid,o.candidate_sub,$5)))",&[&claims.workspace,&tags,&op.user,&op.id,&selected_account]).await?.get::<_,bool>(0);
