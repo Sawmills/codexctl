@@ -44,6 +44,7 @@ struct RateLimitedAccount {
     plan: String,
     credits: Option<api::Credits>,
     error_msg: String,
+    pace: Option<codexctl::status_pace::Pace>,
 }
 
 struct LimitStatus {
@@ -133,6 +134,7 @@ struct UsageBasedAccount {
     is_active: bool,
     is_error: bool,
     error_msg: String,
+    pace: Option<codexctl::status_pace::Pace>,
 }
 
 impl RateLimitedAccount {
@@ -175,6 +177,7 @@ impl RateLimitedAccount {
             .collect(),
             credits: usage.credits.clone(),
             error_msg: String::new(),
+            pace: codexctl::status_pace::Pace::from_usage(usage, chrono::Utc::now().timestamp()),
         }
     }
 
@@ -193,6 +196,34 @@ impl RateLimitedAccount {
 }
 
 impl UsageBasedAccount {
+    fn from_usage(
+        alias: String,
+        label: Option<String>,
+        is_active: bool,
+        token_expiry: Option<i64>,
+        usage: &api::RateLimitResponse,
+    ) -> Self {
+        let credits_status = match &usage.credits {
+            Some(c) if c.unlimited => CreditsStatus::Unlimited,
+            Some(c) if c.overage_limit_reached => CreditsStatus::Overage,
+            Some(c) if c.has_credits => CreditsStatus::Ok,
+            _ => CreditsStatus::None,
+        };
+        Self {
+            alias,
+            label,
+            credit_balance: usage.credits.as_ref().and_then(|c| c.balance.clone()),
+            seat_limit_cents: None,
+            credits_status,
+            spend_control_reached: usage.spend_control.as_ref().is_some_and(|sc| sc.reached),
+            token_expiry,
+            is_active,
+            is_error: false,
+            error_msg: String::new(),
+            pace: codexctl::status_pace::Pace::from_usage(usage, chrono::Utc::now().timestamp()),
+        }
+    }
+
     fn health_score(&self) -> f64 {
         if self.is_error {
             return 1000.0;
@@ -225,19 +256,20 @@ pub fn run(filter: Filter, json: bool) -> Result<()> {
         fetched_at,
         accounts,
     } = load_sorted_statuses()?;
+    let no_profiles = accounts.is_empty();
+    let accounts: Vec<_> = accounts
+        .into_iter()
+        .filter(|account| match filter {
+            Filter::All => true,
+            Filter::RateLimited => rate_limited.iter().any(|row| row.alias == account.alias),
+            Filter::UsageBased => usage_based.iter().any(|row| row.alias == account.alias),
+        })
+        .collect();
     if json {
-        let accounts: Vec<_> = accounts
-            .into_iter()
-            .filter(|account| match filter {
-                Filter::All => true,
-                Filter::RateLimited => rate_limited.iter().any(|row| row.alias == account.alias),
-                Filter::UsageBased => usage_based.iter().any(|row| row.alias == account.alias),
-            })
-            .collect();
         return codexctl::status_json::print(&accounts);
     }
 
-    if accounts.is_empty() {
+    if no_profiles {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");
     }
     let show_rl = matches!(filter, Filter::All | Filter::RateLimited);
@@ -267,6 +299,10 @@ pub fn run(filter: Filter, json: bool) -> Result<()> {
         || (rate_limited.is_empty() && usage_based.is_empty())
     {
         println!("no matching accounts found.");
+    }
+
+    if let Some(table) = fleet_pace_table(&accounts) {
+        println!("\n{table}");
     }
 
     Ok(())
@@ -325,6 +361,10 @@ pub fn run_focused(focused_alias: &str) -> Result<()> {
             println!();
         }
         print_usage_based_table("Usage-Based Accounts", &other_usage_based);
+    }
+
+    if let Some(table) = fleet_pace_table(&accounts) {
+        println!("\n{table}");
     }
 
     Ok(())
@@ -387,6 +427,11 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     }
 
     println!("{title}");
+    println!("{}", rate_limited_table(accounts));
+    true
+}
+
+fn rate_limited_table(accounts: &[&RateLimitedAccount]) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     let columns = RateLimitColumns::for_accounts(accounts);
@@ -394,8 +439,8 @@ fn print_rate_limited_table(title: &str, accounts: &[&RateLimitedAccount]) -> bo
     for account in accounts {
         table.add_row(render_rate_limited_row(account, &columns));
     }
-    println!("{table}");
-    true
+
+    table
 }
 
 struct RateLimitColumns {
@@ -405,6 +450,7 @@ struct RateLimitColumns {
     plan: bool,
     credits: bool,
     resets: bool,
+    pace: bool,
     windows: Vec<WindowColumn>,
 }
 
@@ -499,6 +545,7 @@ impl RateLimitColumns {
             billing: accounts.iter().any(|account| account.billing_unknown),
             credits: accounts.iter().any(|account| account.credits.is_some()),
             resets: accounts.iter().any(|account| account.reset_credits > 0),
+            pace: healthy.iter().any(|account| account.pace.is_some()),
             plan: healthy.iter().any(|account| !account.plan.is_empty()),
             named_limits: healthy.iter().any(|account| account.limits.len() > 1),
             // An error row still carries its label, so consider every account
@@ -526,6 +573,9 @@ impl RateLimitColumns {
         if self.resets {
             headers.push("Resets".to_string());
         }
+        if self.pace {
+            headers.push("Pace".to_string());
+        }
         if self.credits {
             headers.push("Credits".to_string());
         }
@@ -543,16 +593,21 @@ fn print_usage_based_table(title: &str, accounts: &[&UsageBasedAccount]) -> bool
     }
 
     println!("{title}");
+    println!("{}", usage_based_table(accounts));
+    true
+}
+
+fn usage_based_table(accounts: &[&UsageBasedAccount]) -> Table {
     let mut table = Table::new();
     table.load_preset(UTF8_FULL_CONDENSED);
     let headers = usage_based_headers(accounts);
     let labeled = headers.get(1).is_some_and(|header| header == "Label");
+    let pace = headers.iter().any(|header| header == "Pace");
     table.set_header(headers);
     for account in accounts {
-        table.add_row(render_usage_based_row(account, labeled));
+        table.add_row(render_usage_based_row(account, labeled, pace));
     }
-    println!("{table}");
-    true
+    table
 }
 
 fn usage_based_headers(accounts: &[&UsageBasedAccount]) -> Vec<String> {
@@ -565,7 +620,25 @@ fn usage_based_headers(accounts: &[&UsageBasedAccount]) -> Vec<String> {
             .into_iter()
             .map(str::to_string),
     );
+    if accounts
+        .iter()
+        .any(|account| !account.is_error && account.pace.is_some())
+    {
+        headers.push("Pace".into());
+    }
     headers
+}
+
+fn fleet_pace_table(accounts: &[codexctl::status_json::AccountStatus]) -> Option<Table> {
+    let points = codexctl::status_pace::fleet_points(accounts.iter().map(|row| row.pace_points))?;
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL_CONDENSED);
+    table.set_header(["Summary", "Pace"]);
+    table.add_row([
+        Cell::new("Fleet"),
+        codexctl::status_format::pace_cell(Some(points)),
+    ]);
+    Some(table)
 }
 
 /// Cyan marks the cell that answers "which account is this". It is the same
@@ -679,6 +752,7 @@ async fn fetch_and_split(
                         is_active: *is_active,
                         is_error: true,
                         error_msg: "bad auth.json".to_string(),
+                        pace: None,
                     });
                 } else {
                     rate_limited.push(RateLimitedAccount {
@@ -694,6 +768,7 @@ async fn fetch_and_split(
                         billing_unknown: false,
                         plan: String::new(),
                         credits: None,
+                        pace: None,
                         error_msg: "bad auth.json".to_string(),
                     });
                 }
@@ -724,6 +799,7 @@ async fn fetch_and_split(
                         is_active: *is_active,
                         is_error: true,
                         error_msg: msg.to_string(),
+                        pace: None,
                     });
                 } else {
                     rate_limited.push(RateLimitedAccount {
@@ -739,6 +815,7 @@ async fn fetch_and_split(
                         billing_unknown: false,
                         plan: String::new(),
                         credits: None,
+                        pace: None,
                         error_msg: msg.to_string(),
                     });
                 }
@@ -754,29 +831,14 @@ async fn fetch_and_split(
         let billing_class = usage.billing_class();
 
         if billing_class == api::BillingClass::UsageBased {
-            let credits = &usage.credits;
-            let credits_status = match credits {
-                Some(c) if c.unlimited => CreditsStatus::Unlimited,
-                Some(c) if c.overage_limit_reached => CreditsStatus::Overage,
-                Some(c) if c.has_credits => CreditsStatus::Ok,
-                _ => CreditsStatus::None,
-            };
-            let credit_balance = credits.as_ref().and_then(|c| c.balance.clone());
-            let spend_control_reached = usage.spend_control.as_ref().is_some_and(|sc| sc.reached);
-
             let idx = usage_based.len();
-            usage_based.push(UsageBasedAccount {
-                alias: alias.clone(),
-                label: label.clone(),
-                credit_balance,
-                seat_limit_cents: None,
-                credits_status,
-                spend_control_reached,
+            usage_based.push(UsageBasedAccount::from_usage(
+                alias.clone(),
+                label.clone(),
+                *is_active,
                 token_expiry,
-                is_active: *is_active,
-                is_error: false,
-                error_msg: String::new(),
-            });
+                usage,
+            ));
 
             if let Some(account_id) =
                 account_id.or_else(|| api::extract_account_id(&auth.access_token))
@@ -936,6 +998,9 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
         if columns.resets {
             row.push(Cell::new("-"));
         }
+        if columns.pace {
+            row.push(Cell::new("-"));
+        }
         if columns.credits {
             row.push(Cell::new("-"));
         }
@@ -995,6 +1060,11 @@ fn render_rate_limited_row(account: &RateLimitedAccount, columns: &RateLimitColu
     if columns.resets {
         row.push(resets_cell(account));
     }
+    if columns.pace {
+        row.push(codexctl::status_format::pace_cell(
+            account.pace.map(|pace| pace.points),
+        ));
+    }
     if columns.credits {
         row.push(credits_cell(account.credits.as_ref()));
     }
@@ -1037,7 +1107,7 @@ fn resets_cell(s: &RateLimitedAccount) -> Cell {
     }
 }
 
-fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool) -> Vec<Cell> {
+fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool, pace: bool) -> Vec<Cell> {
     let alias = display_alias(&s.alias, s.is_active);
     let mut row = vec![Cell::new(alias)];
     if labeled {
@@ -1052,6 +1122,9 @@ fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool) -> Vec<Cell> {
             Cell::new("-"),
             token_cell(s.token_expiry, true, &s.error_msg),
         ]);
+        if pace {
+            row.push(Cell::new("-"));
+        }
         return row;
     }
 
@@ -1086,6 +1159,11 @@ fn render_usage_based_row(s: &UsageBasedAccount, labeled: bool) -> Vec<Cell> {
         Cell::new(spend_str).fg(spend_color),
         token_cell(s.token_expiry, false, &s.error_msg),
     ]);
+    if pace {
+        row.push(codexctl::status_format::pace_cell(
+            s.pace.map(|pace| pace.points),
+        ));
+    }
     row
 }
 
@@ -1214,7 +1292,65 @@ mod tests {
             plan: String::new(),
             credits: None,
             error_msg: String::new(),
+            pace: None,
         }
+    }
+
+    #[test]
+    fn rate_limited_status_snapshot_shows_pace_and_fleet_mean() {
+        let now = chrono::Utc::now().timestamp();
+        let usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 12, "limit_window_seconds": 604800,
+                "reset_at": now + 604800
+            }}
+        }))
+        .unwrap();
+        let mut ahead = RateLimitedAccount::from_usage("ahead".into(), None, false, None, &usage);
+        let behind_usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 12, "limit_window_seconds": 604800,
+                "reset_at": now + 302400
+            }}
+        }))
+        .unwrap();
+        let mut behind =
+            RateLimitedAccount::from_usage("behind".into(), None, false, None, &behind_usage);
+        let midway_usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 50, "limit_window_seconds": 604800,
+                "reset_at": now + 302400
+            }}
+        }))
+        .unwrap();
+        let mut midway =
+            RateLimitedAccount::from_usage("midway".into(), None, false, None, &midway_usage);
+        let mut missing = rate_limited_account();
+        missing.alias = "missing".into();
+        for account in [&mut ahead, &mut behind, &mut midway, &mut missing] {
+            for limit in &mut account.limits {
+                for window in &mut limit.windows {
+                    window.reset = "-".into();
+                }
+            }
+        }
+        let accounts = [&ahead, &behind, &midway, &missing];
+        let table = rate_limited_table(&accounts);
+        let rows: Vec<_> = accounts
+            .iter()
+            .map(|account| {
+                let mut row =
+                    codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+                row.pace_points = account.pace.map(|pace| pace.points);
+                row
+            })
+            .collect();
+        assert_eq!(
+            format!("{table}\n{}", fleet_pace_table(&rows).unwrap()),
+            include_str!("../../tests/fixtures/status_pace.txt")
+                .replace("\r\n", "\n")
+                .trim_end()
+        );
     }
 
     #[test]
@@ -1568,7 +1704,10 @@ mod tests {
         let headers = usage_based_headers(&[&labeled]);
 
         assert_eq!(headers[1], "Label");
-        assert_eq!(render_usage_based_row(&labeled, true).len(), headers.len());
+        assert_eq!(
+            render_usage_based_row(&labeled, true, false).len(),
+            headers.len()
+        );
     }
 
     /// The error row must line up with the normal row or the table breaks.
@@ -2010,6 +2149,7 @@ mod tests {
             is_active: false,
             is_error: false,
             error_msg: String::new(),
+            pace: None,
         }
     }
 
@@ -2017,10 +2157,39 @@ mod tests {
     fn render_usage_based_row_has_expected_column_count() {
         let account = usage_based_account(None);
 
-        let row = render_usage_based_row(&account, false);
+        let row = render_usage_based_row(&account, false, false);
         assert_eq!(row.len(), 6);
         assert_eq!(row[1].content(), "10.00 credits");
         assert_eq!(row[2].content(), "$20");
         assert_eq!(usage_based_headers(&[&account])[1], "Credit balance");
+    }
+
+    #[test]
+    fn usage_based_weekly_status_shows_pace_and_contributes_to_fleet() {
+        let usage = serde_json::from_value(serde_json::json!({
+            "plan_type": "self_serve_business_usage_based",
+            "rate_limit": {"primary_window": {
+                "used_percent": 28, "limit_window_seconds": 604800,
+                "reset_at": chrono::Utc::now().timestamp() + 604800
+            }}
+        }))
+        .unwrap();
+        let account = UsageBasedAccount::from_usage("metered".into(), None, false, None, &usage);
+        let table = usage_based_table(&[&account]);
+        assert!(table.to_string().contains("Pace") && table.to_string().contains("+28 ahead"));
+        let mut known =
+            codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+        known.set_usage(&usage);
+        let mut subscription =
+            codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+        subscription.pace_points = Some(12.0);
+        let missing = codexctl::status_json::AccountStatus::local(&profile::Meta::default(), false);
+        let table = fleet_pace_table(&[subscription, known, missing]).unwrap();
+        assert!(table.to_string().contains("Fleet") && table.to_string().contains("+20 ahead"));
+        assert!(
+            !usage_based_table(&[&usage_based_account(None)])
+                .to_string()
+                .contains("Pace")
+        );
     }
 }

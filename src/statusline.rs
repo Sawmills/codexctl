@@ -153,6 +153,8 @@ pub(crate) fn record(
             state: crate::status_json::State::Active,
             primary_used_percent: usage.five_hour_used_percent,
             secondary_used_percent: usage.weekly_used_percent,
+            pace_points: None,
+            elapsed_percent: None,
             // Usage carries only windows whose exact durations were confirmed upstream.
             primary_window_seconds: usage.five_hour_used_percent.map(|_| 18_000),
             secondary_window_seconds: usage.weekly_used_percent.map(|_| 604_800),

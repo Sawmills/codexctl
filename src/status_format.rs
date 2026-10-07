@@ -1,5 +1,20 @@
 //! Display formatting shared by connected and unconnected status tables.
 
+/// Display signed percentage points. Ahead of pace carries a warning color.
+pub fn pace_cell(points: Option<f64>) -> comfy_table::Cell {
+    let Some(points) = points else {
+        return comfy_table::Cell::new("-");
+    };
+    let rounded = points.round();
+    if rounded > 0.0 {
+        comfy_table::Cell::new(format!("+{rounded:.0} ahead")).fg(comfy_table::Color::Yellow)
+    } else if rounded < 0.0 {
+        comfy_table::Cell::new(format!("{rounded:.0} behind"))
+    } else {
+        comfy_table::Cell::new("0 on pace")
+    }
+}
+
 /// Format an OpenAI credit balance for display, without changing its raw value.
 pub fn format_credit_balance(balance: &str) -> String {
     let display = match balance.parse::<f64>() {

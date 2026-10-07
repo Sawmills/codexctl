@@ -849,7 +849,7 @@ fn status_json_returns_one_empty_document_without_messages() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({"version": 1, "accounts": []})
+        serde_json::json!({"version": 2, "accounts": [], "fleet_pace_points": null})
     );
 }
 
@@ -876,9 +876,9 @@ fn status_json_keeps_failed_profiles_and_unknown_billing() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({"version":1,"accounts":[{
+        serde_json::json!({"version":2,"fleet_pace_points":null,"accounts":[{
             "alias":"broken","label":"Personal","plan":"pro","source":"local",
-            "state":"unavailable","primary_used_percent":null,"secondary_used_percent":null,
+            "state":"unavailable","pace_points":null,"elapsed_percent":null,"primary_used_percent":null,"secondary_used_percent":null,
             "primary_window_seconds":null,"secondary_window_seconds":null,
             "primary_resets_at":null,"secondary_resets_at":null,
             "resets_at":null,"resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"unknown","error":"bad auth.json","usage_age_seconds":null,"usage_stale":null
@@ -908,9 +908,9 @@ fn list_json_keeps_local_metadata_without_reading_credentials() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({"version":1,"accounts":[{
+        serde_json::json!({"version":2,"fleet_pace_points":null,"accounts":[{
             "alias":"offline","label":null,"plan":null,"source":"local",
-            "state":"local","primary_used_percent":null,"secondary_used_percent":null,
+            "state":"local","pace_points":null,"elapsed_percent":null,"primary_used_percent":null,"secondary_used_percent":null,
             "primary_window_seconds":null,"secondary_window_seconds":null,
             "primary_resets_at":null,"secondary_resets_at":null,
             "resets_at":null,"resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"unknown","error":null,"usage_age_seconds":null,"usage_stale":null

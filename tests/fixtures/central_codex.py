@@ -217,6 +217,8 @@ for line in sys.stdin:
             result["rateLimits"]["primary"] = {"usedPercent":15}
         if mode in ["status-reset", "rate-distinct-reset"]:
             result["rateLimits"]["secondary"] = {"usedPercent":37,"windowDurationMins":10080,"resetsAt":4102444800}
+        if mode == "status-weekly":
+            result["rateLimits"]["secondary"] = {"usedPercent":37,"windowDurationMins":10080,"resetsAt":int(time.time()) + 302400}
         if mode == "rate-distinct-reset":
             result["rateLimits"]["primary"]["resetsAt"] = 4102440000
         if mode == "billing-late-change":

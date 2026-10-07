@@ -29,6 +29,10 @@ pub struct AccountStatus {
     pub state: State,
     pub primary_used_percent: Option<f64>,
     pub secondary_used_percent: Option<f64>,
+    #[serde(default)]
+    pub pace_points: Option<f64>,
+    #[serde(default)]
+    pub elapsed_percent: Option<f64>,
     pub primary_window_seconds: Option<u64>,
     pub secondary_window_seconds: Option<u64>,
     pub primary_resets_at: Option<String>,
@@ -55,6 +59,8 @@ impl AccountStatus {
             state: if active { State::Active } else { State::Local },
             primary_used_percent: None,
             secondary_used_percent: None,
+            pace_points: None,
+            elapsed_percent: None,
             primary_window_seconds: None,
             secondary_window_seconds: None,
             primary_resets_at: None,
@@ -99,6 +105,25 @@ impl AccountStatus {
                 .and_then(api::RateLimitWindow::reset_timestamp),
         );
         self.resets_at = self.secondary_resets_at.clone();
+        self.set_pace_at(chrono::Utc::now().timestamp());
+    }
+
+    /// Recalculate pace at one observation time, excluding failed or stale usage.
+    pub fn set_pace_at(&mut self, now: i64) {
+        let reset = self.secondary_resets_at.as_deref().and_then(|reset| {
+            chrono::DateTime::parse_from_rfc3339(reset)
+                .ok()
+                .map(|time| time.timestamp())
+        });
+        let pace = crate::status_pace::Pace::weekly(
+            self.secondary_used_percent,
+            self.secondary_window_seconds,
+            reset,
+            self.error.is_none() && self.usage_stale != Some(true),
+            now,
+        );
+        self.pace_points = pace.map(|pace| pace.points);
+        self.elapsed_percent = pace.map(|pace| pace.elapsed_percent);
     }
 }
 
@@ -136,10 +161,14 @@ pub fn print(accounts: &[AccountStatus]) -> Result<()> {
     struct Document<'a> {
         version: u32,
         accounts: &'a [AccountStatus],
+        fleet_pace_points: Option<f64>,
     }
     let document = serde_json::to_vec(&Document {
-        version: 1,
+        version: 2,
         accounts,
+        fleet_pace_points: crate::status_pace::fleet_points(
+            accounts.iter().map(|row| row.pace_points),
+        ),
     })?;
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(&document)?;

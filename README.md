@@ -41,18 +41,20 @@ the credential-store namespace identical on default macOS and Linux filesystems.
 codexctl status
 ```
 
+Example:
+
 ```
-Live status fetched at Tue Apr 28 22:20:56
+Live status fetched at Fri Jul 31 16:31:00
 
 Rate-Limited Accounts
-┌──────────────────────┬───────────────────────┬─────┬──────────────────────────────┬────────┬────────┐
-│ Account              ┆ Limit                 ┆ 7d  ┆ 7d Reset                     ┆ Resets ┆ Token  │
-╞══════════════════════╪═══════════════════════╪═════╪══════════════════════════════╪════════╪════════╡
-│ * amir@sawmills.ai   ┆ Codex                 ┆ 13% ┆ in 6d 23h (Fri Aug 07 15:31) ┆ -      ┆ 4d 19h │
-│                      ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆        │
-│ amir+2@sawmills.ai   ┆ Codex                 ┆ 100%┆ in 6d 17h (Fri Aug 07 09:29) ┆ 1      ┆ 4d 19h │
-│                      ┆ GPT-5.3-Codex-Spark  ┆ 0%  ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆        │
-└──────────────────────┴───────────────────────┴─────┴──────────────────────────────┴────────┴────────┘
+┌────────────────────┬─────────────────────┬──────┬──────────────────────────────┬────────┬───────────┬────────┐
+│ Account            ┆ Limit               ┆ 7d   ┆ 7d Reset                     ┆ Resets ┆ Pace      ┆ Token  │
+╞════════════════════╪═════════════════════╪══════╪══════════════════════════════╪════════╪═══════════╪════════╡
+│ * amir@sawmills.ai ┆ Codex               ┆ 13%  ┆ in 6d 23h (Fri Aug 07 15:31) ┆ -      ┆ +12 ahead ┆ 4d 19h │
+│                    ┆ GPT-5.3-Codex-Spark ┆ 0%   ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆           ┆        │
+│ amir+2@sawmills.ai ┆ Codex               ┆ 100% ┆ in 6d 17h (Fri Aug 07 09:29) ┆ 1      ┆ +96 ahead ┆ 4d 19h │
+│                    ┆ GPT-5.3-Codex-Spark ┆ 0%   ┆ in 6d 23h (Fri Aug 07 16:28) ┆        ┆           ┆        │
+└────────────────────┴─────────────────────┴──────┴──────────────────────────────┴────────┴───────────┴────────┘
 
 Usage-Based Accounts
 ┌───────────────────────────┬────────────────┬──────┬─────────┬───────┬─────────┐
@@ -61,10 +63,24 @@ Usage-Based Accounts
 │ amir+ezra@sawmills.ai     ┆ -              ┆ -    ┆ ok      ┆ ok    ┆ 9d 1h   │
 │ amir+reviewer@sawmills.ai ┆ -              ┆ -    ┆ ok      ┆ ok    ┆ expired │
 └───────────────────────────┴────────────────┴──────┴─────────┴───────┴─────────┘
+
+┌─────────┬───────────┐
+│ Summary ┆ Pace      │
+╞═════════╪═══════════╡
+│ Fleet   ┆ +54 ahead │
+└─────────┴───────────┘
 ```
 
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
 The account column is the saved profile alias, with `*` marking the active account.
+
+Status shows a `Pace` column when fresh weekly window data is available.
+`+12 ahead` means usage is faster than the straight line through that window;
+`-8 behind` means usage is slower. Values that round to zero show `0 on pace`
+without color. The `Fleet` row or footer shows the mean of known
+pace across the displayed accounts. `-` marks unknown pace, and empty pace columns
+are hidden. See [Account Status JSON](docs/status-json.md) for the calculation and
+version 2 fields.
 
 Rate-limit windows are matched and labeled by their server-declared duration. For example, the
 table can show `15m`, `1h`, `5h`, or `7d` columns. A column appears only when at least one returned

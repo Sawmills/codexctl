@@ -7959,19 +7959,35 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
     assert_eq!(
         document,
         json!({
-        "version":1,"accounts":[
+        "version":2,"fleet_pace_points":null,"accounts":[
             {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
-             "primary_used_percent":0.0,"secondary_used_percent":37.0,
+             "primary_used_percent":0.0,"secondary_used_percent":37.0,"pace_points":null,"elapsed_percent":null,
              "primary_window_seconds":18000,"secondary_window_seconds":604800,
              "primary_resets_at":"2100-01-01T00:00:00Z","secondary_resets_at":"2100-01-01T00:00:00Z",
              "resets_at":"2100-01-01T00:00:00Z","resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"rate_limited","credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},"error":null,"usage_age_seconds":age,"usage_stale":false},
-            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local",
+            {"alias":"personal","label":null,"plan":null,"source":"local","state":"local","pace_points":null,"elapsed_percent":null,
              "primary_used_percent":null,"secondary_used_percent":null,
              "primary_window_seconds":null,"secondary_window_seconds":null,
              "primary_resets_at":null,"secondary_resets_at":null,
              "resets_at":null,"resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
         ]})
     );
+}
+
+#[test]
+fn connected_status_json_keeps_fresh_usage_error_field_null() {
+    let (_, output) = automatic_reset_attempt(
+        &["status", "--json"],
+        "pro",
+        25.0,
+        Some("fresh-usage-error"),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &document["accounts"][0];
+    assert_eq!(row["usage_stale"], false);
+    assert_eq!(row.get("error"), Some(&Value::Null));
+    assert!((row["pace_points"].as_f64().unwrap() + 40.0).abs() < 0.01);
 }
 
 #[test]
@@ -7988,6 +8004,41 @@ fn status_json_from_an_old_server_keeps_window_durations_unknown() {
     assert_eq!(row["resets_at"], row["secondary_resets_at"]);
     assert_eq!(row["primary_used_percent"], 25.0);
     assert_eq!(row["secondary_used_percent"], 10.0);
+    assert_eq!(row.get("pace_points"), Some(&Value::Null));
+    assert_eq!(row.get("elapsed_percent"), Some(&Value::Null));
+    assert_eq!(document.get("fleet_pace_points"), Some(&Value::Null));
+}
+
+#[test]
+fn connected_status_table_reports_pace_and_fleet_and_hides_empty_pace() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"status-weekly").unwrap();
+    server.import(&server.amir, "personal", "server-login", "server-seat");
+    let home = server.connected_home();
+    local_profile(home.path(), "broken");
+
+    let output = server.cli(home.path(), &["status"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("Pace") && stdout.contains("Fleet"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("-13 behind").count(), 2, "{stdout}");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("broken") && !line.contains("ahead")),
+        "{stdout}"
+    );
+
+    let (_, output) = automatic_reset_attempt(&["status"], "pro", 25.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("Pace") && !stdout.contains("Fleet"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -8000,7 +8051,7 @@ fn connected_list_json_returns_empty_catalog_without_prose() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"version":1,"accounts":[]})
+        json!({"version":2,"accounts":[],"fleet_pace_points":null})
     );
 }
 
@@ -8042,7 +8093,7 @@ fn connected_status_json_filter_matches_the_table() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"version":1,"accounts":[]})
+        json!({"version":2,"accounts":[],"fleet_pace_points":null})
     );
 }
 
@@ -8067,6 +8118,8 @@ fn b8_status_json_reports_stale_usage_without_disabling_the_account() {
         (json!("server"), json!(true), Value::Null)
     );
     assert_eq!(row["error"], "catalog_usage_failed");
+    assert_eq!(row.get("pace_points"), Some(&Value::Null));
+    assert_eq!(row.get("elapsed_percent"), Some(&Value::Null));
 }
 
 #[test]
@@ -8355,7 +8408,12 @@ fn automatic_reset_attempt(
         .unwrap(),
     )
     .unwrap();
-    let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":fence == Some("codex-stale")});
+    let mut account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":fence == Some("codex-stale")});
+    if fence == Some("fresh-usage-error") {
+        account["usageError"] = json!("previous refresh failed");
+        account["secondaryWindowSeconds"] = json!(604800);
+        account["resetsAt"] = json!(chrono::Utc::now().timestamp() + 302400);
+    }
     let token_auth = auth("synthetic-login", "synthetic-seat");
     let token = json!({"userId":"synthetic-user","accessToken":token_auth["tokens"]["access_token"],"chatgptAccountId":"synthetic-seat","chatgptPlanType":plan,"revision":"synthetic-revision","billingClass":"unknown","nativeRoutingSupported":true});
     let token_calls = Arc::new(Mutex::new(0));
