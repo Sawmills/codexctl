@@ -362,11 +362,11 @@ async fn lend(
         .into_iter()
         .find(|account| account.loan.is_none() && account.alias.eq_ignore_ascii_case(alias))
         .filter(|account| !account.usage_stale)
-        // `resets_at` belongs to the longest window; only a weekly one counts.
+        // `resets_at` belongs to the longest window; only an exact week counts.
         .filter(|account| {
             account
                 .secondary_window_seconds
-                .is_some_and(|seconds| seconds >= WEEK_SECONDS)
+                .is_some_and(|seconds| seconds == WEEK_SECONDS)
         })
         .and_then(|account| account.resets_at);
     let (lender_alias, account_id, subject) = {

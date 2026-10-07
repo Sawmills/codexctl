@@ -338,7 +338,11 @@ pub(super) fn match_reference<'a>(
 
 /// True when a borrowed account has room for the borrower's auto-placement.
 pub fn below_borrower_backoff(account: &super::managed::Account) -> bool {
-    [account.primary_used, account.secondary_used]
+    let unprojected = account
+        .statusline_usage
+        .as_ref()
+        .and_then(|usage| usage.max_used_percent);
+    [account.primary_used, account.secondary_used, unprojected]
         .into_iter()
         .flatten()
         .all(|used| used.is_finite() && used < BORROWER_BACKOFF_PERCENT)
@@ -380,10 +384,14 @@ pub fn borrowed_auto_eligible(account: &super::managed::Account) -> bool {
 /// there is no proof of room, so the answer is no.
 pub fn token_below_borrower_backoff(usage: Option<&crate::statusline::Usage>) -> bool {
     usage.is_some_and(|usage| {
-        let used: Vec<_> = [usage.five_hour_used_percent, usage.weekly_used_percent]
-            .into_iter()
-            .flatten()
-            .collect();
+        let used: Vec<_> = [
+            usage.five_hour_used_percent,
+            usage.weekly_used_percent,
+            usage.max_used_percent,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         !used.is_empty()
             && used
                 .iter()

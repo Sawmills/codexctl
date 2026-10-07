@@ -973,6 +973,7 @@ async fn legacy_usage_refresh_replaces_fields_and_failure_preserves_delivery() {
             five_hour_resets_at: None,
             allowed: None,
             limit_reached: None,
+            max_used_percent: None,
         }),
         user_id: None,
         label: None,

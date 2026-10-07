@@ -642,6 +642,7 @@ mod tests {
                 five_hour_resets_at: None,
                 allowed,
                 limit_reached,
+                max_used_percent: None,
             }),
             label: None,
         }

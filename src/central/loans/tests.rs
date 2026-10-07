@@ -308,7 +308,16 @@ fn fresh_token_usage_rechecks_the_backoff() {
         five_hour_resets_at: None,
         allowed: Some(true),
         limit_reached: Some(false),
+        max_used_percent: None,
     };
+    let unprojected = crate::statusline::Usage {
+        max_used_percent: Some(96.0),
+        ..usage(None, Some(20.0))
+    };
+    assert!(
+        !token_below_borrower_backoff(Some(&unprojected)),
+        "a window outside the weekly and five-hour projection still counts"
+    );
     assert!(token_below_borrower_backoff(Some(&usage(
         Some(94.0),
         Some(10.0)
@@ -326,4 +335,36 @@ fn fresh_token_usage_rechecks_the_backoff() {
         "no window, no proof"
     );
     assert!(!token_below_borrower_backoff(None));
+}
+
+#[test]
+fn a_catalog_window_outside_the_projection_counts_for_the_backoff() {
+    let mut entry = account("alice/main", 20.0, true);
+    entry.statusline_usage = Some(crate::statusline::Usage {
+        age_seconds: 0,
+        weekly_used_percent: Some(20.0),
+        weekly_resets_at: None,
+        five_hour_used_percent: None,
+        five_hour_resets_at: None,
+        allowed: Some(true),
+        limit_reached: Some(false),
+        max_used_percent: Some(96.0),
+    });
+    assert!(!below_borrower_backoff(&entry));
+    assert!(!borrowed_auto_eligible(&entry));
+}
+
+#[test]
+fn usage_keeps_the_highest_use_of_every_window() {
+    let usage: crate::api::RateLimitResponse = serde_json::from_value(serde_json::json!({
+        "rate_limit": {
+            "primary_window": {"used_percent": 20.0, "limit_window_seconds": 604800},
+            "secondary_window": {"used_percent": 96.0}
+        }
+    }))
+    .unwrap();
+    assert_eq!(
+        crate::statusline::Usage::from_usage(&usage).max_used_percent,
+        Some(96.0)
+    );
 }

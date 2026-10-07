@@ -449,16 +449,19 @@ async fn a_past_weekly_reset_refuses_the_grant() {
 }
 
 #[tokio::test]
-async fn a_long_window_shorter_than_a_week_refuses_the_grant() {
+async fn a_long_window_other_than_a_week_refuses_the_grant() {
     let fixture = Fixture::new().await;
-    fixture.long_window_seconds.store(86_400, Ordering::SeqCst);
-    let (status, answer) = fixture
-        .lend(json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}))
-        .await;
-    assert_eq!(
-        (status, answer["error"].clone()),
-        (StatusCode::CONFLICT, json!("weekly_reset_unknown"))
-    );
+    for seconds in [86_400, 30 * 86_400] {
+        fixture.long_window_seconds.store(seconds, Ordering::SeqCst);
+        let (status, answer) = fixture
+            .lend(json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}))
+            .await;
+        assert_eq!(
+            (status, answer["error"].clone()),
+            (StatusCode::CONFLICT, json!("weekly_reset_unknown")),
+            "{seconds}"
+        );
+    }
 }
 
 #[tokio::test]
