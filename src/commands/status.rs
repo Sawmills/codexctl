@@ -1337,7 +1337,9 @@ mod tests {
             .collect();
         assert_eq!(
             format!("{table}\n{}", fleet_pace_table(&rows).unwrap()),
-            include_str!("../../tests/fixtures/status_pace.txt").trim_end()
+            include_str!("../../tests/fixtures/status_pace.txt")
+                .replace("\r\n", "\n")
+                .trim_end()
         );
     }
 
