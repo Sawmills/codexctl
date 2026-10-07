@@ -792,11 +792,10 @@ configuration file has this shape:
 Company SSO uses Google Workspace directly. In the Google Cloud
 project owned by `sawmills.ai`:
 
-1. Open **Google Auth platform** (or **APIs & Services → OAuth consent screen**)
-   and configure the application name, support email and developer contact.
-   Staging uses **Audience / User type: External** (Amir, SAW-12467 A26), so any
-   Google account can reach the consent screen. The server, not Google, limits
-   sign-in to the company: it refuses a token without `hd=sawmills.ai` (see below).
+1. Open **Google Auth platform** (or **APIs & Services → OAuth consent screen**),
+   configure the application name, support email and developer contact, and set
+   **Audience / User type** to **Internal**. This requires a project within the
+   Workspace organization. Do not select External as a workaround.
 2. Under **Clients → Create client** (or **Credentials → Create credentials →
    OAuth client ID**), choose **Web application**, named `codexctl-staging`.
 3. Add exactly
@@ -804,19 +803,26 @@ project owned by `sawmills.ai`:
    as an **Authorized redirect URI**. No JavaScript origin is required for this
    server-side authorization-code flow. It requests only `openid email` and uses
    PKCE. Do not request offline access or an OpenAI scope.
-4. Put the client ID in `deploy/k8s/overlays/staging/sso.yaml` (and the
-   staging-ha copy). Store the client secret as a plaintext SSM SecureString at
-   `/app/codexctl/google-oidc-client-secret`, piped from `op read` through stdin.
-   Never commit the secret. `ExternalSecret/codexctl-secrets` reads it through
-   `ClusterSecretStore/aws-parameter-store` into the `google-oidc-client-secret`
-   key, and the staging init container copies that key to
-   `/keys/oidc-client-secret` as a private real file (patch in
-   `codexctl-restart-patch.yaml`). The Clerk key `oidc-client-secret` stays
-   synced from `/app/codexctl/oidc-client-secret` for rollback.
-5. Restart the account server after a change to `sso.yaml` or the secret: bump
-   `restarted-at` in `codexctl-restart-patch.yaml`, because a ConfigMap change alone
-   does not restart the StatefulSet. The cutover steps and rollback are in
-   [the SAW-12467 plan](superpowers/plans/saw-12467-google-sso-cutover.md).
+4. Copy the client ID into `deploy/k8s/cutovers/google-workspace/sso.yaml`. Store the client
+   secret as a **plaintext secret value** in AWS Secrets Manager under
+   `/app/codexctl/oidc-client-secret`; do not store a JSON object around the value.
+   Never commit the secret. The planned cutover ExternalSecret entry reads this name through
+   `ClusterSecretStore/aws-secrets-manager` into `codexctl-secrets`, and the init
+   container copies it to `/keys/oidc-client-secret` as a private real file.
+   The platform administrator must provision/verify that ClusterSecretStore with
+   provider service `SecretsManager` and permission to read this secret before
+   cutover. The existing `aws-parameter-store` store continues serving the vault
+   key and metrics token; it cannot read the new Secrets Manager value.
+5. Schedule the switch and prepare the explicit Clerk links below. Confirm the
+   Google client, matching secret, secret store and reviewed image are ready
+   before manually registering or syncing the Application for cutover. Restart
+   the account server after that planned sync.
+   The files under `deploy/k8s/cutovers/google-workspace/` are unreferenced
+   preparation templates, with a placeholder client ID and Amir's company-user ID/email
+   allowlist. Fill the client ID and verify that allowlist, then promote the manifests into
+   `deploy/k8s/overlays/staging/` in a separate reviewed cutover change. Until then,
+   staging keeps its Clerk client and SSM secret source. See the
+   [cutover checklist](../deploy/k8s/cutovers/google-workspace/README.md).
 
 OIDC verification covers the signature, issuer, audience, expiry, nonce and
 `email_verified == true`. The email must have an allowed company domain. For
