@@ -963,19 +963,21 @@ pub(super) fn rename_preflight(old: &str, new: &str) -> Result<()> {
 }
 
 /// Drop this registration's records for aliases the server renamed, except
-/// the active one, which keeps reporting the server's renamed message.
+/// the active one, which keeps reporting the server's renamed message. The
+/// rename list is fetched only when a record is missing from the catalog.
 /// Call under the native lock.
 pub(super) fn drop_renamed_connections(
     server: &str,
     user_id: &str,
-    renamed: &[String],
+    live: &[String],
+    renamed: impl FnOnce() -> Option<Vec<String>>,
 ) -> Result<()> {
     let directory = root()?;
-    if renamed.is_empty() || !directory.try_exists()? {
+    if !directory.try_exists()? {
         return Ok(());
     }
     let active = read_active_alias().ok();
-    let mut removed = false;
+    let mut candidates = Vec::new();
     for entry in std::fs::read_dir(&directory)? {
         let path = entry?.path();
         if path.extension().is_none_or(|e| e != "json") {
@@ -988,11 +990,23 @@ pub(super) fn drop_renamed_connections(
         if connection.server == server
             && connection.user_id.as_deref() == Some(user_id)
             && !connection.launch_pinned
-            && renamed.iter().any(|a| a.eq_ignore_ascii_case(&alias))
+            && !live.iter().any(|a| a.eq_ignore_ascii_case(&alias))
             && !active
                 .as_deref()
                 .is_some_and(|a| a.eq_ignore_ascii_case(&alias))
         {
+            candidates.push((path, alias));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let Some(renamed) = renamed() else {
+        return Ok(());
+    };
+    let mut removed = false;
+    for (path, alias) in candidates {
+        if renamed.iter().any(|a| a.eq_ignore_ascii_case(&alias)) {
             std::fs::remove_file(&path)?;
             removed = true;
         }

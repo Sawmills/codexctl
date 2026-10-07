@@ -925,12 +925,19 @@ fn catalog_with_timeout(timeout: Option<Duration>) -> Result<Option<Catalog>> {
     )?;
     // Best effort: an older server has no rename list, and a stale record
     // only costs a clear renamed error at its next use.
-    if let Ok(response) = self::request(&connection, "/v1/accounts/renamed")?.send()
-        && response.status().is_success()
-        && let Ok(renamed) = response.json::<Vec<String>>()
-    {
-        native::drop_renamed_connections(&connection.server, &connection.user_id, &renamed)?;
-    }
+    let live: Vec<String> = accounts.iter().map(|a| a.alias.clone()).collect();
+    native::drop_renamed_connections(&connection.server, &connection.user_id, &live, || {
+        let response = self::request(&connection, "/v1/accounts/renamed")
+            .ok()?
+            .timeout(Duration::from_secs(5))
+            .send()
+            .ok()?;
+        response
+            .status()
+            .is_success()
+            .then(|| response.json::<Vec<String>>().ok())
+            .flatten()
+    })?;
     Ok(Some(Catalog {
         connection,
         accounts,
