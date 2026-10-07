@@ -115,11 +115,16 @@ pub(super) async fn start(
     }
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-    let owner = broker.owner(&device, alias).await?;
-    let account = {
-        let owner = owner.lock().await;
-        managed::account_key(&owner.vault.user, &owner.vault.alias)
-    };
+    let account = managed::account_key(&device.user, alias);
+    if let Some(active) = db
+        .login_active(&account)
+        .await
+        .map_err(|_| failure(&broker))?
+    {
+        owned(&broker, &device, &request, &active)?;
+        return Ok(view(&active));
+    }
+    broker.owner(&device, alias).await?;
     let permit = broker
         .work
         .clone()

@@ -1308,6 +1308,13 @@ async fn interrupted_verification(cancel: bool) {
     })
     .await
     .unwrap();
+    let resumed = timeout(
+        Duration::from_secs(3),
+        login_request(&f, &f.first, "start", &"ab".repeat(32)),
+    )
+    .await
+    .expect("resume must consult the shared operation without waiting for its verifier");
+    assert_eq!(resumed["id"], id);
     let unrelated = timeout(
         Duration::from_secs(5),
         f.http
@@ -1658,5 +1665,100 @@ async fn postgres_renewal_does_not_retire_a_quarantine_issued_after_its_verifica
     .await
     .expect("a fresh verified renewal must repair the newer quarantine");
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_cancel_monitors_previous_owner_settlement_after_lease_expiry() {
+    let f = login_fixture().await;
+    let id = "ac".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("mode"),
+        b"billing-error-held-exit",
+    )
+    .unwrap();
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let token = f.token.clone();
+    let token_request = tokio::spawn(async move {
+        http.post(format!("{url}/v1/token"))
+            .bearer_auth(token)
+            .json(&json!({"alias":"seat","billing":true}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("exited").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("token failure must reach child settlement");
+    let process: Value = serde_json::from_slice(
+        &std::fs::read(
+            f.first
+                .root
+                .path()
+                .join("state/accounts")
+                .join(account_key("test", "seat"))
+                .join("runtime/pid"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Model an outage lasting past lease expiry while the native child cannot settle.
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET expires_at=clock_timestamp() WHERE account_id=$1",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(45), async {
+        loop {
+            let row = f
+                .control
+                .query_one(
+                    &format!(
+                        "SELECT holder_id FROM {}.account_refresh_leases WHERE account_id=$1",
+                        f.schema
+                    ),
+                    &[&account_key("test", "seat")],
+                )
+                .await
+                .unwrap();
+            if row.get::<_, String>(0).ends_with(&id) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("renewal must take the expired lease during a deferred settlement retry");
+    let other = timeout(
+        Duration::from_secs(5),
+        f.http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"other","billing":true}))
+            .send(),
+    )
+    .await
+    .expect("old-owner settlement must not block unrelated accounts")
+    .unwrap();
+    assert_eq!(other.status(), 200);
+    login_request(&f, &f.second, "cancel", &id).await;
+    wait_dead(process["pid"].as_u64().unwrap() as u32).await;
+    assert_eq!(
+        login_request(&f, &f.second, "status", &id).await["status"],
+        "failed"
+    );
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "interrupted native settlement must retain its reservation"
+    );
+    assert_eq!(token_request.await.unwrap().status(), 503);
     stop_fixture(f).await;
 }

@@ -52,7 +52,7 @@ impl Broker {
             .owner(&device, &op.alias)
             .await
             .map_err(|_| anyhow::anyhow!("renewal account missing"))?;
-        let (imports, mut owner, lease) = loop {
+        let (imports, held_owner, lease) = loop {
             self.check_login_authority(headers, op).await?;
             let Ok(imports) =
                 tokio::time::timeout(std::time::Duration::from_secs(1), self.imports.lock()).await
@@ -73,8 +73,48 @@ impl Broker {
             drop(imports);
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
-        let result = async {
-            reconcile_owner_from_central(self, &mut owner, &op.account_id)
+        let mut owner = Some(held_owner);
+        let authority = op.clone();
+        let monitor = async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if self.stopping.load(Ordering::Acquire) {
+                    bail!("server stopping");
+                }
+                if central.login_heartbeat(&authority).await? {
+                    bail!("login canceled");
+                }
+                if !central.renew(&lease, IMPORT_LEASE_TTL).await? {
+                    bail!("renewal refresh lease lost");
+                }
+                self.authorize(headers)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("machine revoked"))?;
+            }
+        };
+        let work = async {
+            // Settlement holds only this account's mutex. Retain that guard in
+            // the outer scope so cancellation can terminate the child directly.
+            drop(imports);
+            {
+                let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
+                reconcile_owner_from_central(self, owner, &op.account_id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("cannot reconcile renewal account"))?;
+                if let Some(rpc) = owner.rpc.as_mut() {
+                    rpc.settle_and_stop().await?;
+                } else {
+                    previous_owner_exited(&owner.home)?;
+                }
+                owner.rpc = None;
+            }
+            // Release the stopped owner before reacquiring imports, preserving
+            // the common imports-before-owner order without blocking other seats.
+            drop(owner.take());
+            let imports = self.imports.lock().await;
+            owner = Some(owner_ref.lock().await);
+            let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
+            reconcile_owner_from_central(self, owner, &op.account_id)
                 .await
                 .map_err(|_| anyhow::anyhow!("cannot reconcile renewal account"))?;
             let candidate = op
@@ -84,17 +124,8 @@ impl Broker {
                 .context("missing shared candidate")?;
             if let Err(error) = owner.validate_owned_auth(&candidate) {
                 op.payload.error = Some("wrong_account".into());
-                // Device login has exited and no refresh-capable child has started.
-                // Keep both reservations, but permit a fresh explicit renewal to repair them.
-                central.login_save(op, LoginPhase::Rejected).await?;
                 return Err(error);
             }
-            if let Some(rpc) = owner.rpc.as_mut() {
-                rpc.settle_and_stop().await?;
-            } else {
-                previous_owner_exited(&owner.home)?;
-            }
-            owner.rpc = None;
             let before = owner.vault.clone();
             // This is durable before initialize, which can itself rotate credentials.
             central.login_begin_verification(op, &lease).await?;
@@ -116,11 +147,11 @@ impl Broker {
             )?;
             let verification = async {
                 let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                    .clear_for_launch(&owner, relogin::AdmissionKind::Renewal, &imports)?;
-                spawn_owner(&mut owner, &self.binary, proof)?;
+                    .clear_for_launch(owner, relogin::AdmissionKind::Renewal, &imports)?;
+                spawn_owner(owner, &self.binary, proof)?;
                 // Account authority and durable spawn evidence now cover initialization.
                 drop(imports);
-                initialize_owner(&mut owner).await?;
+                initialize_owner(owner).await?;
                 let revision = owner.snapshot()?.revision;
                 owner
                     .tokens(TokenRequest {
@@ -134,30 +165,10 @@ impl Broker {
                     bail!("renewal login not verified");
                 }
                 owner.vault.verified = true;
-                let record = settled_owner_record(&mut owner, &before).await?;
+                let record = settled_owner_record(owner, &before).await?;
                 Ok::<_, anyhow::Error>(record)
             };
-            let monitor = async {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    if self.stopping.load(Ordering::Acquire) {
-                        bail!("server stopping");
-                    }
-                    if central.login_heartbeat(op).await? {
-                        bail!("login canceled");
-                    }
-                    if !central.renew(&lease, IMPORT_LEASE_TTL).await? {
-                        bail!("renewal refresh lease lost");
-                    }
-                    self.authorize(headers)
-                        .await
-                        .map_err(|_| anyhow::anyhow!("machine revoked"))?;
-                }
-            };
-            let record = tokio::select! {
-                result=verification => result,
-                result=monitor => result,
-            }?;
+            let record = verification.await?;
             self.authorize(headers)
                 .await
                 .map_err(|_| anyhow::anyhow!("machine revoked"))?;
@@ -166,13 +177,30 @@ impl Broker {
                 .await?;
             owner.verification_input = None;
             Ok(())
-        }
-        .await;
-        if result.is_err() && op.phase == LoginPhase::Verifying {
-            // A partial verification remains fenced in the shared journal. PR3 owns recovery.
-            terminate_lost_import(&mut owner).await;
-            op.payload.error = Some("relogin_verification_unresolved".into());
-            let _ = central.login_save(op, LoginPhase::Unresolved).await;
+        };
+        let result = tokio::select! {
+            result = work => result,
+            result = monitor => result,
+        };
+        if result.is_err() {
+            if owner.is_none() {
+                owner = Some(owner_ref.lock().await);
+            }
+            let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
+            if op.phase == LoginPhase::Verifying || owner.rpc.is_some() {
+                // Settlement and verification both retain native work until exit is confirmed.
+                // An interruption remains fenced for PR3 recovery.
+                terminate_lost_import(owner).await;
+                op.payload.error = Some(
+                    if op.phase == LoginPhase::Verifying {
+                        "relogin_verification_unresolved"
+                    } else {
+                        "relogin_settlement_unresolved"
+                    }
+                    .into(),
+                );
+                let _ = central.login_save(op, LoginPhase::Unresolved).await;
+            }
         }
         central.release_lease(&lease).await?;
         result

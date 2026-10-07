@@ -181,7 +181,7 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode in ["billing-error-marked", "billing-error-slow-exit"]:
+        if mode in ["billing-error-marked", "billing-error-slow-exit"] or (mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat"):
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
             continue
         if mode == "rpc-unhealthy":
@@ -269,3 +269,7 @@ if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
 
 if mode == "billing-error-slow-exit":
     time.sleep(31)
+
+if mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
+    while not pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release-exit").exists():
+        time.sleep(0.01)
