@@ -2900,6 +2900,63 @@ fn google_workspace_refuses_a_consumer_with_a_verified_company_email() {
     );
 }
 #[test]
+fn a_browser_gets_an_error_page_with_the_same_status() {
+    let identity = json!({"sub": "consumer", "email": "consumer@sawmills.ai"});
+    let issuer = EnrollmentServer::with_sso(
+        identity,
+        json!({
+            "allowed_hosted_domains": ["sawmills.ai"]
+        }),
+    );
+    let browser = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let accept = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let challenge = issuer.challenge();
+    let response = browser
+        .get(challenge["verificationUrl"].as_str().unwrap())
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 403);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    assert!(response.headers().contains_key("content-security-policy"));
+    let html = response.text().unwrap();
+    assert!(html.contains("Use your company account"), "{html}");
+    assert!(!html.contains("name=\"approval\""));
+    let expired = browser
+        .get(format!("{}/enroll?code=UNKNOWN", issuer.server.url))
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(expired.status(), 410);
+    assert!(expired.text().unwrap().contains("This link has expired"));
+    // CLI and API clients keep the exact JSON body and status.
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("application/json, text/html;q=0"),
+    ] {
+        let mut request = browser.get(format!("{}/enroll?code=UNKNOWN", issuer.server.url));
+        if let Some(accept) = accept {
+            request = request.header("accept", accept);
+        }
+        let response = request.send().unwrap();
+        assert_eq!(response.status(), 410);
+        assert_eq!(
+            response.text().unwrap(),
+            r#"{"error":"enrollment_expired"}"#
+        );
+    }
+}
+#[test]
 fn google_workspace_checks_the_signed_domain_and_verified_email() {
     // A personal Google account signs a token with no hd claim at all.
     for (hd, verified, status) in [
@@ -9136,6 +9193,53 @@ fn dashboard_v3_enrollment_and_landing_render_for_browser_checks() {
             .unwrap();
         }
     }
+}
+
+#[test]
+fn dashboard_sign_in_errors_get_a_page_in_a_browser_and_json_elsewhere() {
+    let accept = "text/html,application/xhtml+xml,*/*;q=0.8";
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    // A server without company SSO refuses to start a sign-in.
+    let server = Server::start();
+    let page = http
+        .get(format!("{}/accounts/sign-in", server.url))
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(page.status(), 503);
+    assert!(page.text().unwrap().contains("Something went wrong"));
+    let api = http
+        .get(format!("{}/accounts/sign-in", server.url))
+        .send()
+        .unwrap();
+    assert_eq!(api.status(), 503);
+    assert_eq!(api.text().unwrap(), r#"{"error":"sso_unavailable"}"#);
+    // A callback without this browser's login cookie offers a new dashboard sign-in.
+    let issuer = EnrollmentServer::start(company_identity());
+    let start = http
+        .get(format!("{}/accounts/sign-in", issuer.server.url))
+        .send()
+        .unwrap();
+    let authorize = http
+        .get(start.headers()["location"].to_str().unwrap())
+        .send()
+        .unwrap();
+    let callback = http
+        .get(authorize.headers()["location"].to_str().unwrap())
+        .header("accept", accept)
+        .send()
+        .unwrap();
+    assert_eq!(callback.status(), 401);
+    let html = callback.text().unwrap();
+    assert!(
+        html.contains("This browser did not start this sign-in"),
+        "{html}"
+    );
+    assert!(html.contains("href=\"/accounts/sign-in\""));
 }
 
 #[test]

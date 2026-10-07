@@ -7,8 +7,9 @@ use aes_gcm::aead::{OsRng, rand_core::RngCore};
 use anyhow::{Result, bail};
 use axum::{
     Form, Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Query, Request, State},
+    http::{HeaderMap, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
@@ -255,7 +256,7 @@ fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
 }
 fn page(html: String) -> Response {
-    let styles = include_str!("dashboard/style.css");
+    let styles = include_str!("enrollment/style.css");
     let script = include_str!("dashboard/copy.js");
     let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
     let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
@@ -277,6 +278,76 @@ fn page(html: String) -> Response {
         Html(document),
     )
         .into_response()
+}
+/// True when the Accept header lists `text/html` without rejecting it through `q=0`.
+fn accepts_html(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';').map(str::trim);
+        parts
+            .next()
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/html"))
+            && parts
+                .filter_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+                .all(|q| q.parse::<f32>().is_ok_and(|q| q > 0.0))
+    })
+}
+/// Browser steps show a page for an error; API clients keep the JSON body and status.
+pub(super) async fn browser_errors(request: Request, next: Next) -> Response {
+    let html = request
+        .headers()
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(accepts_html);
+    let response = next.run(request).await;
+    if !html || !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let reason = axum::body::to_bytes(body, 4096)
+        .await
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["error"].as_str().map(String::from))
+        .unwrap_or_default();
+    let mut page = error_page(&reason);
+    *page.status_mut() = parts.status;
+    // Keep the already-recorded failure marker for the HTTP observer.
+    page.extensions_mut().extend(parts.extensions);
+    page
+}
+fn error_page(reason: &str) -> Response {
+    // The callback serves both machine enrollment and dashboard sign-in, so advice covers both.
+    let (title, detail) = match reason {
+        "company_identity_required" => (
+            "Use your company account",
+            "This sign-in is not a verified company account. Start again and pick your work account.",
+        ),
+        "user_disabled" | "user_unavailable" | "identity_link_refused" => (
+            "No access to this server",
+            "Your account cannot use this server. Ask your admin for access.",
+        ),
+        "sso_denied" => (
+            "Sign-in did not finish",
+            "Your company sign-in did not confirm who you are. Start again from your terminal or <a href=\"/accounts/sign-in\">sign in again</a>.",
+        ),
+        "invalid_browser_login" => (
+            "Sign-in did not finish",
+            "This browser did not start this sign-in. <a href=\"/accounts/sign-in\">Sign in again</a>.",
+        ),
+        "enrollment_expired" | "invalid_sso_state" | "invalid_approval" => (
+            "This link has expired",
+            "Each link works once and only for five minutes. Run <code>codexctl connect</code> again, or <a href=\"/accounts/sign-in\">sign in again</a>.",
+        ),
+        _ => (
+            "Something went wrong",
+            "The server could not finish this step. Wait a minute, then start again.",
+        ),
+    };
+    page(format!(
+        include_str!("enrollment/error.html"),
+        title = title,
+        detail = detail
+    ))
 }
 pub(super) fn escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -734,9 +805,13 @@ pub(super) fn routes(router: Router<Broker>) -> Router<Broker> {
     router
         .route("/v1/enrollment/start", post(start))
         .route("/v1/enrollment/poll", post(poll))
-        .route("/enroll", get(verify))
-        .route("/auth/callback", get(callback))
-        .route("/auth/approve", post(approve))
+        .merge(
+            Router::new()
+                .route("/enroll", get(verify))
+                .route("/auth/callback", get(callback))
+                .route("/auth/approve", post(approve))
+                .route_layer(middleware::from_fn(browser_errors)),
+        )
 }
 
 impl Sso {

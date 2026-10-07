@@ -1,28 +1,22 @@
-<section class="panel" aria-labelledby="page-title">
-  <h1 id="page-title">Connect {name}?</h1>
-  <p class="lede">
-    It will get tokens for your server accounts until you revoke it.
-  </p>
-  <div class="code-check">
-    <p class="label">Code shown in your terminal</p>
-    <code translate="no">{code}</code>
-    <p class="label">Connect only if it matches your terminal exactly.</p>
+<h1 id="page-title">Connect {name}?</h1>
+<p class="lede">It gets tokens for your server accounts until you revoke it.</p>
+<div class="check">
+  <p class="muted">Code shown in your terminal</p>
+  <code class="code" translate="no">{code}</code>
+  <p class="muted">Connect only if it matches exactly.</p>
+</div>
+<dl>
+  <div>
+    <dt>Signed in as</dt>
+    <dd translate="no">{email}</dd>
   </div>
-  <dl class="facts-list">
-    <div>
-      <dt>Signed in as</dt>
-      <dd translate="no">{email}</dd>
-    </div>
-    <div>
-      <dt>Machine name</dt>
-      <dd>{name}</dd>
-    </div>
-  </dl>
-  <form method="post" action="/auth/approve">
-    <input type="hidden" name="approval" value="{approval}" />
-    <button class="button primary" type="submit">Connect machine</button>
-  </form>
-  <p class="footnote">
-    Not your machine? Close this page. Nothing connects until you approve.
-  </p>
-</section>
+  <div>
+    <dt>Machine</dt>
+    <dd>{name}</dd>
+  </div>
+</dl>
+<form class="form" method="post" action="/auth/approve">
+  <input type="hidden" name="approval" value="{approval}" />
+  <button type="submit">Connect machine</button>
+</form>
+<p class="muted">Not your machine? Close this page.</p>
