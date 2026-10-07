@@ -3022,6 +3022,15 @@ pub async fn serve(
         bail!("network listener requires an HTTPS ingress origin");
     }
     let _lock = vault::lock(state, "owner.lock")?;
+    // Login records are replica-local; a shared store cannot resume or retire
+    // them, so it refuses to start beside one rather than strand its account.
+    if super::storage::StoreMode::from_env()? != super::storage::StoreMode::File
+        && relogin::add::pending_logins(state)?
+    {
+        bail!(
+            "pending server login operations exist; finish pending logins in file mode before switching storage"
+        );
+    }
     let configured = super::storage::runtime_store(state, key).await?;
     // File mode deliberately keeps the central store detached: the existing
     // vault remains the authoritative local path with no token-request cost.
@@ -3056,9 +3065,8 @@ pub async fn serve(
         }
     }
     // A saved new-account grant fences every owner it overlaps until its
-    // admission resumes; shared startup ends such grants instead. An
-    // unidentified login child can hold any identity.
-    match relogin::add::recover(state, key, central.is_some()) {
+    // admission resumes. An unidentified login child can hold any identity.
+    match relogin::add::recover(state, key) {
         Ok(reserved) => conflicting_journals.extend(reserved),
         Err(_) => {
             replacements_blocked = true;

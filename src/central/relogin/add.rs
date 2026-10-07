@@ -763,7 +763,18 @@ async fn land(
     // The renewal record then reserves the grant before this record releases it.
     record.landed = Some(held.vault.alias.trim().into());
     save(state, record)?;
-    publish(&owner_state, &renewal)?;
+    if let Err(error) = publish(&owner_state, &renewal) {
+        // publish can fail after its rename; keep the link only when the
+        // renewal journal exists, so an unpublished grant stays resumable.
+        if !directory(&owner_state, &renewal.id)?
+            .join("record.json")
+            .try_exists()?
+        {
+            record.landed = None;
+            save(state, record)?;
+        }
+        return Err(error);
+    }
     record.retired = true;
     record.candidate = None;
     save(state, record)?;
@@ -817,15 +828,7 @@ fn import_holds(broker_state: &Path, key: &Path, record: &Record) -> Result<bool
 
 /// Startup audit of new-account logins. Returns every reserved grant so the
 /// caller fences overlapping owners. An unidentified login child is an error.
-///
-/// A shared store cannot manage these replica-local records: its routes refuse
-/// them. Shared startup therefore ends every outstanding add instead of letting
-/// an unmanageable grant fence an existing account.
-pub(in crate::central) fn recover(
-    broker_state: &Path,
-    key: &Path,
-    shared: bool,
-) -> Result<Vec<Value>> {
+pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec<Value>> {
     let root = root(broker_state);
     let mut reserved = Vec::new();
     if !root.try_exists()? {
@@ -852,11 +855,13 @@ pub(in crate::central) fn recover(
                     // The renewal never started: this record still owns the grant.
                     record.landed = None;
                     save(&state, &record)?;
-                } else if !record.retired {
+                } else {
                     // The renewal owns the grant now; release this copy.
-                    record.retired = true;
-                    record.candidate = None;
-                    save(&state, &record)?;
+                    if !record.retired {
+                        record.retired = true;
+                        record.candidate = None;
+                        save(&state, &record)?;
+                    }
                     let operation = directory(&state, &record.id)?;
                     if operation.join("home").try_exists()? {
                         std::fs::remove_dir_all(operation.join("home"))?;
@@ -870,23 +875,7 @@ pub(in crate::central) fn recover(
                     .any(|device| device.id == record.device && !device.revoked)
             });
             let interrupted_discard = record.retired && record.candidate.is_none();
-            if shared && record.landed.is_none() && !terminal(&record.phase) {
-                if import_holds(broker_state, key, &record)? {
-                    discard(
-                        &state,
-                        &mut record,
-                        Phase::Canceled,
-                        "account_import_retained",
-                    )?;
-                } else {
-                    discard(
-                        &state,
-                        &mut record,
-                        Phase::Failed,
-                        "account_login_unavailable",
-                    )?;
-                }
-            } else if record.landed.is_none()
+            if record.landed.is_none()
                 && !terminal(&record.phase)
                 && revoked
                 && !interrupted_discard
@@ -968,6 +957,30 @@ pub(in crate::central) fn recover(
     Ok(reserved)
 }
 
+/// True when any add or renewal login operation is unfinished. A shared store
+/// cannot manage these replica-local records, so it must not start beside one.
+/// An unreadable record counts as pending.
+pub(in crate::central) fn pending_logins(broker_state: &Path) -> Result<bool> {
+    for parent in [root(broker_state), broker_state.join("accounts")] {
+        if !parent.try_exists()? {
+            continue;
+        }
+        for entry in std::fs::read_dir(parent)? {
+            let state = entry?.path();
+            let Ok(records) = records(&state) else {
+                return Ok(true);
+            };
+            if records
+                .iter()
+                .any(|r| !terminal(&r.phase) && !(r.retired && r.landed.is_some()))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// Reservations held by new-account logins, for the shared registry admission.
 pub(in crate::central) fn reservations(accounts: &Path) -> Result<Vec<Reservation>> {
     let mut result = Vec::new();
@@ -1035,52 +1048,6 @@ mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
-    #[test]
-    fn shared_startup_ends_a_file_mode_add_grant_instead_of_fencing_with_it() {
-        let root = tempfile::tempdir().unwrap();
-        let key = root.path().join("key");
-        vault::create_secret(&key, &[7; 32]).unwrap();
-        let claims = json!({"sub":"login","iat":2000000000_u64,"exp":4102444800_u64,
-            "https://api.openai.com/auth":{"chatgpt_account_id":"seat"}});
-        let grant = json!({"tokens":{
-            "access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
-            "refresh_token":"synthetic","account_id":"seat"}});
-        let state = add_state(root.path(), "amir", "new-account");
-        store::ensure_private_dir(&root.path().join("account-logins")).unwrap();
-        store::ensure_private_dir(&state).unwrap();
-        let record = Record {
-            sequence: 1,
-            id: "a".repeat(64),
-            user: "amir".into(),
-            device: "laptop".into(),
-            alias: "new-account".into(),
-            broker: process::Process::capture(std::process::id()).unwrap(),
-            child: Child::Exited,
-            verifier_broker: None,
-            original_revision: String::new(),
-            candidate_revision: None,
-            candidate: Some(grant),
-            phase: Phase::Committing,
-            code: None,
-            error: None,
-            retired: false,
-            label: None,
-            landed: None,
-        };
-        publish(&state, &record).unwrap();
-
-        let file_mode = recover(root.path(), &key, false).unwrap();
-        assert_eq!(file_mode.len(), 1, "file mode keeps the grant reserved");
-
-        let shared = recover(root.path(), &key, true).unwrap();
-        assert!(shared.is_empty(), "shared mode must not fence with it");
-        let ended = load(&state, &record.id).unwrap();
-        assert_eq!(ended.phase, Phase::Failed);
-        assert_eq!(ended.error.as_deref(), Some("account_login_unavailable"));
-        assert!(ended.candidate.is_none() && ended.retired);
-        assert!(!directory(&state, &record.id).unwrap().join("home").exists());
-    }
-
     fn landed_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
@@ -1121,7 +1088,7 @@ mod tests {
     #[test]
     fn a_crash_before_the_landing_renewal_publish_keeps_the_add_resumable() {
         let (root, key, state, record) = landed_fixture();
-        let reserved = recover(root.path(), &key, false).unwrap();
+        let reserved = recover(root.path(), &key).unwrap();
         assert_eq!(reserved.len(), 1, "the add record still reserves the grant");
         let settled = load(&state, &record.id).unwrap();
         assert!(
@@ -1145,17 +1112,12 @@ mod tests {
         renewal.phase = Phase::Starting;
         publish(&owner_state, &renewal).unwrap();
 
-        for shared in [false, true] {
-            let reserved = recover(root.path(), &key, shared).unwrap();
-            assert!(
-                reserved.is_empty(),
-                "the renewal owns the grant (shared: {shared})"
-            );
-            let settled = load(&state, &record.id).unwrap();
-            assert_eq!(settled.landed.as_deref(), Some("personal"));
-            assert!(settled.retired && settled.candidate.is_none());
-            assert!(!directory(&state, &record.id).unwrap().join("home").exists());
-        }
+        let reserved = recover(root.path(), &key).unwrap();
+        assert!(reserved.is_empty(), "the renewal owns the grant");
+        let settled = load(&state, &record.id).unwrap();
+        assert_eq!(settled.landed.as_deref(), Some("personal"));
+        assert!(settled.retired && settled.candidate.is_none());
+        assert!(!directory(&state, &record.id).unwrap().join("home").exists());
         // The linked renewal keeps its grant for its own recovery.
         assert!(load(&owner_state, &record.id).unwrap().candidate.is_some());
     }

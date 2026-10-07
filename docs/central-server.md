@@ -295,8 +295,9 @@ To save a local profile on a connected machine instead, add `--local`:
 Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
 the server answers HTTP 503 with `account_login_unavailable`, because login records are
 local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
-A server that starts in PostgreSQL mode ends every add that file mode left pending
-and deletes its grant, so no unmanageable grant fences an existing account.
+A server refuses to start in PostgreSQL mode while any add or renewal login is pending
+("finish pending logins in file mode before switching storage"). Finish or cancel
+those logins in file mode first.
 
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine

@@ -1111,6 +1111,50 @@ fn server_add_unreadable_saved_grant_fails_only_its_own_record_at_startup() {
     assert_eq!(failed["error"], "unsupported_login_output");
 }
 
+#[test]
+fn shared_storage_refuses_to_start_beside_a_pending_login() {
+    let mut server = Server::start();
+    let id = "f9".repeat(32);
+    server.add_request(&server.amir, "start", "pending", &id, None);
+    let record = server.add_record(&server.amir, "pending", &id);
+    server.child.kill().unwrap();
+    server.child.wait().unwrap();
+    unsafe {
+        libc::kill(
+            record["child"]["process"]["pid"].as_i64().unwrap() as i32,
+            libc::SIGKILL,
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CODEXCTL_CENTRAL_STORE", "postgres")
+        .env_remove("DATABASE_URL")
+        .args(["serve", "--state"])
+        .arg(server.root.path().join("state"))
+        .arg("--key-file")
+        .arg(server.root.path().join("key"))
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:8787",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("finish pending logins in file mode before switching storage"),
+        "{error}"
+    );
+    // The pending record is untouched for file mode to finish.
+    assert_eq!(
+        server.add_record(&server.amir, "pending", &id)["phase"],
+        "pending"
+    );
+    server.restart();
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))
