@@ -324,6 +324,10 @@ record under `state/shared-logins/`. Preserve this evidence. Automated replay an
 cleanup of interrupted operations belong to PR3; local evidence alone does not
 make another replica safe to take over.
 
+Each account keeps shared revision evidence in `shared-revision.json` beside its
+vault. Preserve it with the local state. It lets a restarted replica distinguish
+an unpublished local snapshot from a completed renewal on another replica.
+
 Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel
 those logins in file mode first. File journals are never imported into the shared

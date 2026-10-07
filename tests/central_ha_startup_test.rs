@@ -2003,21 +2003,26 @@ async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
 
 #[tokio::test]
 async fn postgres_renewal_uses_committed_revision_after_unpublished_refresh() {
-    renewal_after_unpublished_refresh(false, false).await;
+    renewal_after_unpublished_refresh(false, false, false).await;
 }
 
 #[tokio::test]
 async fn postgres_obsolete_settlement_cannot_fence_a_completed_renewal() {
-    renewal_after_unpublished_refresh(true, false).await;
+    renewal_after_unpublished_refresh(true, false, false).await;
 }
 
 #[tokio::test]
 async fn postgres_remote_renewal_recovers_an_unpublished_local_revision() {
-    renewal_after_unpublished_refresh(false, true).await;
+    renewal_after_unpublished_refresh(false, true, false).await;
 }
 
-async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool) {
-    let f = login_fixture().await;
+#[tokio::test]
+async fn postgres_remote_renewal_reconciles_unpublished_credentials_after_restart() {
+    renewal_after_unpublished_refresh(false, true, true).await;
+}
+
+async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool, restart: bool) {
+    let mut f = login_fixture().await;
     f.control
         .batch_execute(&format!(
             r#"
@@ -2103,7 +2108,17 @@ async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool) {
         ))
         .await
         .unwrap();
-    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    if restart {
+        f.first.stop().await;
+        f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    }
+    let response = request(&f.http, &f.first, &f.token).await;
+    assert_eq!(response.status(), 200);
+    let served: Value = response.json().await.unwrap();
+    assert!(
+        generation(&served) >= 10,
+        "replica must serve the renewed grant, not unpublished old credentials"
+    );
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }

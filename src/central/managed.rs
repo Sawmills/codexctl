@@ -467,7 +467,7 @@ impl Broker {
             return Ok(());
         };
         central.save_account(&Self::owner_record(owner)?).await?;
-        owner.shared_revision = Some(owner.vault.revision.max(1));
+        owner.persist_shared_revision(owner.vault.revision.max(1))?;
         Ok(())
     }
 
@@ -507,7 +507,7 @@ impl Broker {
                 owner.rpc = None;
                 owner.refresh_enabled = false;
             }
-            owner.shared_revision = Some(record.revision);
+            owner.persist_shared_revision(record.revision)?;
             return Ok(());
         }
         owner.vault.revision = owner.vault.revision.max(1);
@@ -740,13 +740,15 @@ async fn reconcile_owner_from_central(
     let renewed = central.mode() == super::storage::StoreMode::Postgres
         && committed.verified
         && !committed.import_rejected
-        && (!owner.available || owner.routing_refused || !owner.vault.verified)
+        && record.revision > shared_revision
         && central
             .login_completed_after(account_id, shared_revision, record.revision)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     if record.revision <= owner.vault.revision && !renewed {
-        owner.shared_revision = Some(record.revision);
+        owner
+            .persist_shared_revision(record.revision)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
         return Ok(false);
     }
     vault::save(&owner.state, &owner.key, &committed)
@@ -779,7 +781,9 @@ async fn reconcile_owner_from_central(
         owner.retry_started = None;
         owner.retry_failures = 0;
     }
-    owner.shared_revision = Some(record.revision);
+    owner
+        .persist_shared_revision(record.revision)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(true)
 }
 
@@ -2650,7 +2654,7 @@ fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result<Owner> {
         retry_started: None,
         retry_failures: 0,
         recovery_generation: 0,
-        shared_revision: None,
+        shared_revision: Owner::read_shared_revision(state)?,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,

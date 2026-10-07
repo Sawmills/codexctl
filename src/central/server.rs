@@ -136,6 +136,25 @@ pub(super) struct Owner {
 }
 
 impl Owner {
+    // Shared refresh paths persist this baseline before native work. A later
+    // unpublished snapshot must not hide a completed renewal after restart.
+    pub(super) fn persist_shared_revision(&mut self, revision: i64) -> Result<()> {
+        store::atomic_write(
+            &self.state.join("shared-revision.json"),
+            &serde_json::to_vec(&revision)?,
+        )?;
+        self.shared_revision = Some(revision);
+        Ok(())
+    }
+
+    pub(super) fn read_shared_revision(state: &Path) -> Result<Option<i64>> {
+        let path = state.join("shared-revision.json");
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&vault::private_read(&path)?)?))
+    }
+
     pub(super) fn retry_clock_now(&self) -> u64 {
         #[cfg(test)]
         if let Some(clock) = self.retry_clock.as_ref() {
