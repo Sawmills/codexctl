@@ -57,8 +57,11 @@ async fn lookup(
     let op = if request.id.is_empty() {
         let alias = managed::normalize_alias(&request.alias)
             .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-        db.login_active(&managed::account_key(&device.user, alias))
-            .await
+        let (account, _) = broker
+            .resolve_alias(&device.user, alias)
+            .await?
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
+        db.login_active(&account).await
     } else {
         db.login_get(&device.user, &request.id).await
     }
@@ -115,7 +118,12 @@ pub(super) async fn start(
     }
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-    let account = managed::account_key(&device.user, alias);
+    // Resolve the physical key without locking the refresh owner. Historical
+    // aliases can retain a key derived from their original whitespace.
+    let (account, _) = broker
+        .resolve_alias(&device.user, alias)
+        .await?
+        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?;
     if let Some(active) = db
         .login_active(&account)
         .await
@@ -124,7 +132,6 @@ pub(super) async fn start(
         owned(&broker, &device, &request, &active)?;
         return Ok(view(&active));
     }
-    broker.owner(&device, alias).await?;
     let permit = broker
         .work
         .clone()

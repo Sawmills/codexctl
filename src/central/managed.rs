@@ -721,6 +721,16 @@ async fn reconcile_owner_from_central(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     vault::validate_auth(&committed.auth)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    // A committed renewal is positive evidence that a prior local rejection is
+    // obsolete, even if another replica has since advanced the credential revision.
+    let renewed = central.mode() == super::storage::StoreMode::Postgres
+        && committed.verified
+        && !committed.import_rejected
+        && (!owner.available || owner.routing_refused || !owner.vault.verified)
+        && central
+            .login_completed_after(account_id, owner.vault.revision, record.revision)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     vault::save(&owner.state, &owner.key, &committed)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     store::atomic_write(
@@ -740,6 +750,14 @@ async fn reconcile_owner_from_central(
     }
     owner.rpc = None;
     owner.refresh_enabled = false;
+    if renewed {
+        owner.available = true;
+        owner.routing_refused = false;
+        owner.retryable_unavailable = false;
+        owner.retry_requires_billing = false;
+        owner.retry_started = None;
+        owner.retry_failures = 0;
+    }
     Ok(true)
 }
 
@@ -1068,6 +1086,14 @@ async fn token(
         } else {
             (None, owner_ref.lock().await)
         };
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
+        if worker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+        {
+            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
+        }
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
@@ -1076,14 +1102,6 @@ async fn token(
             .map_err(|failure| worker.owner_failure(failure))?;
         if !owner.available {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-        }
-        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
-        if worker
-            .central
-            .as_ref()
-            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
-        {
-            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
         }
         // `account/read` may refresh even without a forced request. Every
         // PostgreSQL token path therefore takes the account lease before

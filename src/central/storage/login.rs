@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
     encrypted_payload BYTEA NOT NULL,
     selected_reserved BOOLEAN NOT NULL DEFAULT true,
     repair_evidence JSONB NOT NULL DEFAULT '[]'::jsonb,
+    completed_revision BIGINT,
     candidate_workspace TEXT,
     candidate_login TEXT,
     PRIMARY KEY (user_id, id)
@@ -25,6 +26,8 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_account
     ON central_login_operations(account_id)
     WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
+CREATE INDEX IF NOT EXISTS central_login_completed_revision
+    ON central_login_operations(account_id, completed_revision) WHERE phase='completed';
 INSERT INTO central_schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;
 "#;
 
@@ -118,6 +121,21 @@ impl CentralStore {
                 .transpose()
         })
         .await
+    }
+    pub(in crate::central) async fn login_completed_after(
+        &self,
+        account: &str,
+        previous: i64,
+        current: i64,
+    ) -> Result<bool> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let row = db.client().await?.query_one(
+                "SELECT EXISTS (SELECT 1 FROM central_login_operations WHERE account_id=$1 AND phase='completed' AND completed_revision>$2 AND completed_revision<=$3)",
+                &[&account,&previous,&current],
+            ).await?;
+            Ok(row.get(0))
+        }).await
     }
     pub(in crate::central) async fn login_active(
         &self,
@@ -246,7 +264,7 @@ impl CentralStore {
             vault::encrypt_bytes(&db.key, &serde_json::to_vec(&LoginPayload::default())?)?;
         bounded_db(async {
             let row = db.client().await?.query_one(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_login END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (candidate_workspace=$13 AND candidate_login=$14)) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence)))) SELECT count(*) FROM receipt",
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_login END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (candidate_workspace=$13 AND candidate_login=$14)) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence)))) SELECT count(*) FROM receipt",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload,&record.workspace,&record.login]).await?;
             if row.get::<_,i64>(0)!=1 { bail!("login completion fenced"); }
             Ok(())

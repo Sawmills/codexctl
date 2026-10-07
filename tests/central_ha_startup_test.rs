@@ -1074,6 +1074,9 @@ struct LoginFixture {
     _seed: Pod,
 }
 async fn login_fixture() -> LoginFixture {
+    login_fixture_with_legacy_alias(false).await
+}
+async fn login_fixture_with_legacy_alias(legacy: bool) -> LoginFixture {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(
             std::env::var("CI").ok().as_deref(),
@@ -1143,6 +1146,35 @@ async fn login_fixture() -> LoginFixture {
     let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
     assert_eq!(generation(&seed_token), 1);
     seed.stop().await;
+    if legacy {
+        use aes_gcm::{
+            Aes256Gcm,
+            aead::{Aead, KeyInit},
+        };
+        let original = state.join("accounts").join(account_key("test", "seat"));
+        let bytes = std::fs::read(original.join("vault.enc")).unwrap();
+        let cipher = Aes256Gcm::new_from_slice(&std::fs::read(&key).unwrap()).unwrap();
+        let plain = cipher.decrypt((&bytes[..12]).into(), &bytes[12..]).unwrap();
+        let mut saved: Value = serde_json::from_slice(&plain).unwrap();
+        saved["alias"] = json!(" seat ");
+        // Used once with this fixture's fresh random key, for a legacy on-disk account.
+        let nonce = [123_u8; 12];
+        let encrypted = cipher
+            .encrypt(
+                (&nonce).into(),
+                serde_json::to_vec(&saved).unwrap().as_slice(),
+            )
+            .unwrap();
+        let mut bytes = nonce.to_vec();
+        bytes.extend(encrypted);
+        store::atomic_write(&original.join("vault.enc"), &bytes).unwrap();
+        std::fs::rename(
+            &original,
+            state.join("accounts").join(account_key("test", " seat ")),
+        )
+        .unwrap();
+    }
+
     for operation in ["migrate", "backfill"] {
         let output = command(database.as_str(), &state, &key, operation)
             .output()
@@ -1760,5 +1792,86 @@ async fn postgres_cancel_monitors_previous_owner_settlement_after_lease_expiry()
         "interrupted native settlement must retain its reservation"
     );
     assert_eq!(token_request.await.unwrap().status(), 503);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_shared_renewal_restores_a_previously_fenced_replica() {
+    let f = login_fixture().await;
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    let failed = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":before["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 503);
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup").unwrap();
+    assert_eq!(
+        request(&f.http, &f.first, &f.token).await.status(),
+        503,
+        "a permanently fenced owner must not retry unchanged credentials"
+    );
+    let id = "ad".repeat(32);
+    login_request(&f, &f.second, "start", &id).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The committed renewal can advance through normal refresh before A observes it.
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    assert_eq!(
+        request(&f.http, &f.first, &f.token).await.status(),
+        200,
+        "completed shared renewal must restore a previously fenced replica"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_preserves_the_legacy_alias_account_key() {
+    let f = login_fixture_with_legacy_alias(true).await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let id = "ae".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    assert_eq!(login_request(&f, &f.second, "status", "").await["id"], id);
+    login_request(&f, &f.second, "cancel", "").await;
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "canceled" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let renewed = "af".repeat(32);
+    login_request(&f, &f.first, "start", &renewed).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &renewed).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("renewal must complete against the stored legacy key");
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }
