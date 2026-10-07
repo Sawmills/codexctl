@@ -34,7 +34,8 @@ impl Pace {
         let used = used_percent?;
         let reset = resets_at?;
         let remaining = reset.checked_sub(now)?;
-        if remaining < 0 || !used.is_finite() || !(0.0..=100.0).contains(&used) {
+        if !(0..=604800).contains(&remaining) || !used.is_finite() || !(0.0..=100.0).contains(&used)
+        {
             return None;
         }
         let elapsed_percent = (1.0 - remaining as f64 / 604800.0).clamp(0.0, 1.0) * 100.0;

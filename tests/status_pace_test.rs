@@ -14,6 +14,14 @@ fn weekly_pace_at_midpoint_is_used_minus_fifty_points() {
 }
 
 #[test]
+fn weekly_pace_is_unknown_when_clock_precedes_window_start() {
+    assert_eq!(
+        Pace::weekly(Some(37.0), Some(604800), Some(1604801), true, 1000000),
+        None
+    );
+}
+
+#[test]
 fn weekly_pace_at_reset_has_one_hundred_percent_elapsed() {
     let pace = Pace::weekly(Some(92.0), Some(604800), Some(1000000), true, 1000000).unwrap();
     assert_eq!((pace.elapsed_percent, pace.points), (100.0, -8.0));
@@ -105,17 +113,11 @@ fn fleet_pace_is_an_equal_weight_mean_of_known_accounts() {
 }
 
 #[test]
-fn rounded_pace_keeps_the_direction_of_small_nonzero_values() {
-    assert_eq!(
-        codexctl::status_format::pace_cell(Some(0.25)).content(),
-        "+0 ahead"
-    );
-    assert_eq!(
-        codexctl::status_format::pace_cell(Some(-0.25)).content(),
-        "-0 behind"
-    );
-    assert_eq!(
-        codexctl::status_format::pace_cell(Some(0.0)).content(),
-        "0 on pace"
-    );
+fn rounded_zero_pace_has_neutral_text_and_no_color() {
+    for points in [0.25, -0.25, 0.0] {
+        assert_eq!(
+            codexctl::status_format::pace_cell(Some(points)),
+            comfy_table::Cell::new("0 on pace")
+        );
+    }
 }

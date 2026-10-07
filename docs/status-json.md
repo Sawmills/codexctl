@@ -73,7 +73,8 @@ An empty result is `{"version":2,"accounts":[],"fleet_pace_points":null}`.
   Negative points mean behind pace.
 - `elapsed_percent`: Percentage of the weekly window that has elapsed, or `null` when pace is unknown.
   It is `(window_seconds - seconds_until_reset) / window_seconds * 100`, bounded to 0 through 100.
-  A reported reset more than one window away gives 0 elapsed; the reset instant gives 100.
+  A reported reset more than one window away gives `null` for both pace fields because the clock precedes the window start.
+  The reset instant gives 100 elapsed.
   After that instant, the observation is expired and both pace fields are `null`.
   Only a declared seven-day (604800-second) main Codex long window qualifies.
   Missing usage, duration, or reset time, invalid usage percentages, stale usage, and failed usage give `null` for both fields.

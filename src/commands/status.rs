@@ -1298,10 +1298,11 @@ mod tests {
 
     #[test]
     fn rate_limited_status_snapshot_shows_pace_and_fleet_mean() {
+        let now = chrono::Utc::now().timestamp();
         let usage = serde_json::from_value(serde_json::json!({
             "rate_limit": {"primary_window": {
                 "used_percent": 12, "limit_window_seconds": 604800,
-                "reset_at": 4102444800_i64
+                "reset_at": now + 604800
             }}
         }))
         .unwrap();
@@ -1309,22 +1310,31 @@ mod tests {
         let behind_usage = serde_json::from_value(serde_json::json!({
             "rate_limit": {"primary_window": {
                 "used_percent": 12, "limit_window_seconds": 604800,
-                "reset_at": chrono::Utc::now().timestamp() + 302400
+                "reset_at": now + 302400
             }}
         }))
         .unwrap();
         let mut behind =
             RateLimitedAccount::from_usage("behind".into(), None, false, None, &behind_usage);
+        let midway_usage = serde_json::from_value(serde_json::json!({
+            "rate_limit": {"primary_window": {
+                "used_percent": 50, "limit_window_seconds": 604800,
+                "reset_at": now + 302400
+            }}
+        }))
+        .unwrap();
+        let mut midway =
+            RateLimitedAccount::from_usage("midway".into(), None, false, None, &midway_usage);
         let mut missing = rate_limited_account();
         missing.alias = "missing".into();
-        for account in [&mut ahead, &mut behind, &mut missing] {
+        for account in [&mut ahead, &mut behind, &mut midway, &mut missing] {
             for limit in &mut account.limits {
                 for window in &mut limit.windows {
                     window.reset = "-".into();
                 }
             }
         }
-        let accounts = [&ahead, &behind, &missing];
+        let accounts = [&ahead, &behind, &midway, &missing];
         let table = rate_limited_table(&accounts);
         let rows: Vec<_> = accounts
             .iter()
@@ -2160,7 +2170,7 @@ mod tests {
             "plan_type": "self_serve_business_usage_based",
             "rate_limit": {"primary_window": {
                 "used_percent": 28, "limit_window_seconds": 604800,
-                "reset_at": 4102444800_i64
+                "reset_at": chrono::Utc::now().timestamp() + 604800
             }}
         }))
         .unwrap();

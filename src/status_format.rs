@@ -6,9 +6,9 @@ pub fn pace_cell(points: Option<f64>) -> comfy_table::Cell {
         return comfy_table::Cell::new("-");
     };
     let rounded = points.round();
-    if points > 0.0 {
+    if rounded > 0.0 {
         comfy_table::Cell::new(format!("+{rounded:.0} ahead")).fg(comfy_table::Color::Yellow)
-    } else if points < 0.0 {
+    } else if rounded < 0.0 {
         comfy_table::Cell::new(format!("{rounded:.0} behind"))
     } else {
         comfy_table::Cell::new("0 on pace")

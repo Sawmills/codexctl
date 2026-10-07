@@ -7639,9 +7639,9 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
     assert_eq!(
         document,
         json!({
-        "version":2,"fleet_pace_points":37.0,"accounts":[
+        "version":2,"fleet_pace_points":null,"accounts":[
             {"alias":"personal","label":"Personal","plan":"pro","source":"server","state":"server",
-             "primary_used_percent":0.0,"secondary_used_percent":37.0,"pace_points":37.0,"elapsed_percent":0.0,
+             "primary_used_percent":0.0,"secondary_used_percent":37.0,"pace_points":null,"elapsed_percent":null,
              "primary_window_seconds":18000,"secondary_window_seconds":604800,
              "primary_resets_at":"2100-01-01T00:00:00Z","secondary_resets_at":"2100-01-01T00:00:00Z",
              "resets_at":"2100-01-01T00:00:00Z","resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"rate_limited","credits":{"has_credits":false,"unlimited":false,"balance":"0","overage_limit_reached":false},"error":null,"usage_age_seconds":age,"usage_stale":false},
@@ -7652,6 +7652,22 @@ fn connected_status_json_preserves_server_usage_and_failed_local_duplicate() {
              "resets_at":null,"resets_banked":null,"resets_redeemable":null,"resets_next_expiry":null,"billing_class":"unknown","error":"credentials unavailable","usage_age_seconds":null,"usage_stale":null}
         ]})
     );
+}
+
+#[test]
+fn connected_status_json_keeps_fresh_usage_error_field_null() {
+    let (_, output) = automatic_reset_attempt(
+        &["status", "--json"],
+        "pro",
+        25.0,
+        Some("fresh-usage-error"),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let row = &document["accounts"][0];
+    assert_eq!(row["usage_stale"], false);
+    assert_eq!(row.get("error"), Some(&Value::Null));
+    assert!((row["pace_points"].as_f64().unwrap() + 40.0).abs() < 0.01);
 }
 
 #[test]
@@ -7676,7 +7692,7 @@ fn status_json_from_an_old_server_keeps_window_durations_unknown() {
 #[test]
 fn connected_status_table_reports_pace_and_fleet_and_hides_empty_pace() {
     let server = Server::start();
-    store::atomic_write(&server.root.path().join("mode"), b"status-reset").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"status-weekly").unwrap();
     server.import(&server.amir, "personal", "server-login", "server-seat");
     let home = server.connected_home();
     local_profile(home.path(), "broken");
@@ -7688,7 +7704,7 @@ fn connected_status_table_reports_pace_and_fleet_and_hides_empty_pace() {
         stdout.contains("Pace") && stdout.contains("Fleet"),
         "{stdout}"
     );
-    assert_eq!(stdout.matches("+37 ahead").count(), 2, "{stdout}");
+    assert_eq!(stdout.matches("-13 behind").count(), 2, "{stdout}");
     assert!(
         stdout
             .lines()
@@ -8072,7 +8088,12 @@ fn automatic_reset_attempt(
         .unwrap(),
     )
     .unwrap();
-    let account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":fence == Some("codex-stale")});
+    let mut account = json!({"userId":"synthetic-user","alias":"personal","label":null,"accountId":"synthetic-seat","plan":plan,"billingClass":if used < 100.0 { "rate_limited" } else { "unknown" },"primaryUsed":used,"secondaryUsed":10.0,"resetsAt":2000000000,"available":true,"usageScore":if used < 100.0 { 20.0 } else { 600.0 },"usageStale":fence == Some("codex-stale")});
+    if fence == Some("fresh-usage-error") {
+        account["usageError"] = json!("previous refresh failed");
+        account["secondaryWindowSeconds"] = json!(604800);
+        account["resetsAt"] = json!(chrono::Utc::now().timestamp() + 302400);
+    }
     let token_auth = auth("synthetic-login", "synthetic-seat");
     let token = json!({"userId":"synthetic-user","accessToken":token_auth["tokens"]["access_token"],"chatgptAccountId":"synthetic-seat","chatgptPlanType":plan,"revision":"synthetic-revision","billingClass":"unknown","nativeRoutingSupported":true});
     let token_calls = Arc::new(Mutex::new(0));

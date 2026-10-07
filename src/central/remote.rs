@@ -1108,7 +1108,7 @@ pub fn show(status: bool, filter: Option<api::BillingClass>, json: bool) -> Resu
                                 .unwrap_or_else(|| "usage stale".into()),
                         )
                     } else {
-                        account.usage_error.clone()
+                        None
                     },
                     usage_age_seconds: account.usage_age_seconds,
                     usage_stale: Some(account.usage_stale),
