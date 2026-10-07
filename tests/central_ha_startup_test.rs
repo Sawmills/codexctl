@@ -969,10 +969,7 @@ async fn postgres_renewal_shares_pending_status_and_cancel_without_stopping_toke
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    let claims = json!({"sub":"synthetic-seat","iat":2000001000_u64,"exp":4102444800_u64,
-        "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
-    let fresh = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
-        "refresh_token":"synthetic-renewal","account_id":"synthetic-seat"}});
+    let fresh = renewal_grant();
     store::atomic_write(
         &first.root.path().join("login-release"),
         &serde_json::to_vec(&fresh).unwrap(),
@@ -1001,6 +998,12 @@ async fn postgres_renewal_shares_pending_status_and_cancel_without_stopping_toke
     .expect("renewal must verify and complete");
     let result = request(&http, &second, &token).await;
     assert_eq!(result.status(), 200);
+    assert_eq!(
+        generation(&result.json::<Value>().await.unwrap()),
+        13,
+        "replica B must use the renewed grant"
+    );
+    assert!(!second.root.path().join("login-pid").exists());
     // The client can lose completion and retry through another replica.
     let receipt: Value = http
         .post(format!("{}/v1/relogin/start", second.url))
@@ -1169,11 +1172,20 @@ async fn login_fixture() -> LoginFixture {
 }
 
 async fn login_request(f: &LoginFixture, pod: &Pod, action: &str, id: &str) -> Value {
+    login_alias_request(f, pod, "seat", action, id).await
+}
+async fn login_alias_request(
+    f: &LoginFixture,
+    pod: &Pod,
+    alias: &str,
+    action: &str,
+    id: &str,
+) -> Value {
     let response = f
         .http
         .post(format!("{}/v1/relogin/{action}", pod.url))
         .bearer_auth(&f.token)
-        .json(&json!({"alias":"seat","id":id}))
+        .json(&json!({"alias":alias,"id":id}))
         .send()
         .await
         .unwrap();
@@ -1325,7 +1337,24 @@ async fn postgres_verification_loss_fences_the_candidate_across_replica_restart(
 
 #[tokio::test]
 async fn postgres_wrong_account_candidate_keeps_both_accounts_reserved() {
+    wrong_candidate_reservation(false, false).await;
+}
+#[tokio::test]
+async fn postgres_candidate_publication_failure_keeps_its_identity_reserved() {
+    wrong_candidate_reservation(true, false).await;
+}
+#[tokio::test]
+async fn postgres_failed_native_login_preserves_a_saved_grant() {
+    wrong_candidate_reservation(false, true).await;
+}
+async fn wrong_candidate_reservation(fail_publication: bool, fail_child: bool) {
     let f = login_fixture().await;
+    if fail_child {
+        store::atomic_write(&f.first.root.path().join("mode"), b"login-error-after-save").unwrap();
+    }
+    if fail_publication {
+        f.control.batch_execute(&format!("CREATE SEQUENCE {0}.capture_attempt; CREATE FUNCTION {0}.reject_first_capture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.phase='candidate' AND nextval('{0}.capture_attempt')=1 THEN RAISE EXCEPTION 'synthetic candidate publication failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_capture BEFORE UPDATE ON {0}.central_login_operations FOR EACH ROW EXECUTE FUNCTION {0}.reject_first_capture()",f.schema)).await.unwrap();
+    }
     let id = "1".repeat(64);
     login_request(&f, &f.first, "start", &id).await;
     let claims = json!({"sub":"other-seat","iat":2000001000_u64,"exp":4102444800_u64,
@@ -1356,5 +1385,104 @@ async fn postgres_wrong_account_candidate_keeps_both_accounts_reserved() {
         503,
         "wrong-account grant must reserve the affected identity across replicas"
     );
+    if !fail_publication && !fail_child {
+        // Only an explicit verified renewal may repair a stopped rejection.
+        for (alias, grant, request_id) in [
+            ("other", wrong, "3".repeat(64)),
+            ("seat", renewal_grant(), "4".repeat(64)),
+        ] {
+            let release = f.second.root.path().join("login-release");
+            if release.exists() {
+                std::fs::remove_file(&release).unwrap();
+            }
+            let started = login_alias_request(&f, &f.second, alias, "start", &request_id).await;
+            assert_eq!(
+                started["status"], "pending",
+                "explicit repair must get a new operation"
+            );
+            store::atomic_write(&release, &serde_json::to_vec(&grant).unwrap()).unwrap();
+            timeout(Duration::from_secs(10), async {
+                loop {
+                    let result =
+                        login_alias_request(&f, &f.first, alias, "status", &request_id).await;
+                    assert_ne!(result["status"], "failed", "{result}");
+                    if result["status"] == "completed" {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .expect("explicit renewal must repair a stopped wrong-account reservation");
+            let result = f
+                .http
+                .post(format!("{}/v1/token", f.first.url))
+                .bearer_auth(&f.token)
+                .json(&json!({"alias":alias,"billing":true}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                result.status(),
+                200,
+                "verified repair must retire only its matching reservation"
+            );
+            if alias == "other" {
+                assert_eq!(
+                    request(&f.http, &f.first, &f.token).await.status(),
+                    503,
+                    "repair of the candidate identity must not retire the selected account reservation"
+                );
+            }
+        }
+        assert_eq!(
+            login_request(&f, &f.first, "start", &id).await["status"],
+            "failed",
+            "old receipt stays immutable"
+        );
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_waiting_for_refresh_does_not_block_other_accounts() {
+    let f = login_fixture().await;
+    let id = "2".repeat(64);
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,'settling-owner',1,clock_timestamp()+interval '120 seconds') ON CONFLICT(account_id) DO UPDATE SET holder_id='settling-owner',expires_at=clock_timestamp()+interval '120 seconds'", f.schema), &[&account_key("test", "seat")]).await.unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Let the worker enter its lease wait. This holder represents an outstanding settlement.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let other = timeout(
+        Duration::from_secs(5),
+        f.http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"other","billing":true}))
+            .send(),
+    )
+    .await
+    .expect("waiting renewal blocked an unrelated account")
+    .unwrap();
+    assert_eq!(other.status(), 200);
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET expires_at=clock_timestamp() WHERE account_id=$1",f.schema), &[&account_key("test","seat")]).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "completed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("renewal must proceed after the previous refresh settles");
     stop_fixture(f).await;
 }

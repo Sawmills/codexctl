@@ -17,7 +17,7 @@ fn database(broker: &Broker) -> Result<&CentralStore, HttpError> {
 fn view(op: &LoginOperation) -> Response {
     let status = match op.phase {
         LoginPhase::Candidate | LoginPhase::Verifying => "verifying",
-        LoginPhase::Unresolved => "failed",
+        LoginPhase::Unresolved | LoginPhase::Rejected => "failed",
         phase => phase.as_str(),
     };
     (
@@ -171,7 +171,7 @@ pub(super) async fn start(
             worker.record_failure("relogin_failed", "relogin", StatusCode::SERVICE_UNAVAILABLE);
             if matches!(
                 worker_op.phase,
-                LoginPhase::Completed | LoginPhase::Canceled
+                LoginPhase::Completed | LoginPhase::Canceled | LoginPhase::Rejected
             ) {
                 return;
             }
@@ -179,10 +179,11 @@ pub(super) async fn start(
                 .payload
                 .error
                 .get_or_insert_with(|| "relogin_interrupted_retry".into());
-            let phase = if matches!(
-                worker_op.phase,
-                LoginPhase::Candidate | LoginPhase::Verifying | LoginPhase::Unresolved
-            ) {
+            let phase = if worker_op.payload.candidate.is_some()
+                || matches!(
+                    worker_op.phase,
+                    LoginPhase::Candidate | LoginPhase::Verifying | LoginPhase::Unresolved
+                ) {
                 LoginPhase::Unresolved
             } else {
                 LoginPhase::Failed
@@ -278,15 +279,28 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         child.start_kill()?;
         child.wait().await?;
     }
+    // A child can save an issued grant and then fail or be canceled. Capture it
+    // after confirmed exit before classifying the process outcome.
+    let path = home.path().join("auth.json");
+    if path.try_exists()? {
+        let auth: Value = serde_json::from_slice(&vault::private_read(&path)?)?;
+        vault::validate_auth(&auth)?;
+        op.payload.candidate = Some(auth);
+    }
     if !result? {
         op.payload.code = None;
-        db.login_save(op, LoginPhase::Canceled).await?;
+        let phase = if op.payload.candidate.is_some() {
+            op.payload.error = Some("login_stopped_account_requires_relogin".into());
+            LoginPhase::Unresolved
+        } else {
+            LoginPhase::Canceled
+        };
+        db.login_save(op, phase).await?;
         return Ok(());
     }
-    let auth: Value =
-        serde_json::from_slice(&vault::private_read(&home.path().join("auth.json"))?)?;
-    vault::validate_auth(&auth)?;
-    op.payload.candidate = Some(auth);
+    if op.payload.candidate.is_none() {
+        bail!("native login did not save credentials");
+    }
     op.payload.code = None;
     db.login_save(op, LoginPhase::Candidate).await?;
     broker.verify_shared_renewal(headers, op).await

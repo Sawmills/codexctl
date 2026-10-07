@@ -311,7 +311,10 @@ This intermediate release is not sufficient for the B33 cutover. A lost polling
 replica can leave a pending operation until recovery is delivered. A verifier
 that loses its lease leaves a durable unresolved marker: another replica must
 not repeat verification. Wrong-account candidates reserve the selected account
-and the matching known account across replicas.
+and the matching known account across replicas. After a stopped login is rejected
+for the wrong identity, each account can be repaired by an explicit renewal with
+a new request ID. Only verified completion clears that account's reservation.
+An unresolved verification cannot use this repair path.
 
 Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel

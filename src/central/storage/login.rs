@@ -16,13 +16,14 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
     deadline TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp() + interval '900 seconds',
     cancel_requested BOOLEAN NOT NULL DEFAULT false,
     encrypted_payload BYTEA NOT NULL,
+    selected_reserved BOOLEAN NOT NULL DEFAULT true,
     candidate_workspace TEXT,
     candidate_login TEXT,
     PRIMARY KEY (user_id, id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_account
     ON central_login_operations(account_id)
-    WHERE phase NOT IN ('completed','failed','canceled','replica_lost');
+    WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
 INSERT INTO central_schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;
 "#;
 
@@ -37,6 +38,7 @@ pub(in crate::central) enum LoginPhase {
     Failed,
     Canceled,
     Unresolved,
+    Rejected,
 }
 impl LoginPhase {
     pub fn as_str(self) -> &'static str {
@@ -49,6 +51,7 @@ impl LoginPhase {
             Self::Failed => "failed",
             Self::Canceled => "canceled",
             Self::Unresolved => "unresolved",
+            Self::Rejected => "rejected",
         }
     }
 }
@@ -121,7 +124,7 @@ impl CentralStore {
     ) -> Result<Option<LoginOperation>> {
         let db = self.login_db()?;
         bounded_db(async {
-            db.client().await?.query_opt("SELECT * FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','replica_lost')", &[&account]).await?
+            db.client().await?.query_opt("SELECT * FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost')", &[&account]).await?
                 .map(|row| db.login_row(row)).transpose()
         }).await
     }
@@ -155,7 +158,10 @@ impl CentralStore {
     ) -> Result<()> {
         if matches!(
             op.phase,
-            LoginPhase::Completed | LoginPhase::Failed | LoginPhase::Canceled
+            LoginPhase::Completed
+                | LoginPhase::Failed
+                | LoginPhase::Canceled
+                | LoginPhase::Rejected
         ) {
             bail!("terminal login receipt is immutable");
         }
@@ -174,7 +180,7 @@ impl CentralStore {
             .and_then(|auth| vault::token(auth).ok())
             .and_then(crate::api::token_subject);
         bounded_db(async {
-            let changed = db.client().await?.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login]).await?;
+            let changed = db.client().await?.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login]).await?;
             if changed != 1 { bail!("login transition fenced"); }
             Ok(())
         }).await?;
@@ -237,8 +243,8 @@ impl CentralStore {
             vault::encrypt_bytes(&db.key, &serde_json::to_vec(&LoginPayload::default())?)?;
         bounded_db(async {
             let row = db.client().await?.query_one(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id) SELECT count(*) FROM receipt",
-                &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload]).await?;
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN candidate_workspace=$13 AND candidate_login=$14 THEN NULL ELSE candidate_login END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (candidate_workspace=$13 AND candidate_login=$14))) SELECT count(*) FROM receipt",
+                &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload,&record.workspace,&record.login]).await?;
             if row.get::<_,i64>(0)!=1 { bail!("login completion fenced"); }
             Ok(())
         }).await?;

@@ -32,6 +32,8 @@ if "login" in sys.argv:
         time.sleep(0.02)
     auth_path.write_text(gate.read_text())
     auth_path.chmod(0o600)
+    if mode == "login-error-after-save":
+        sys.exit(1)
     if mode == "login-hold-after-save":
         gate.with_name("login-saved").write_text("saved")
         while not gate.with_name("login-exit").exists():

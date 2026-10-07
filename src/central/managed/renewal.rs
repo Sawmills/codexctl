@@ -30,32 +30,30 @@ impl Broker {
             .authorize(headers)
             .await
             .map_err(|_| anyhow::anyhow!("machine revoked"))?;
-        let imports = loop {
-            if let Ok(guard) =
-                tokio::time::timeout(std::time::Duration::from_secs(1), self.imports.lock()).await
-            {
-                break guard;
-            }
-            self.check_login_authority(headers, op).await?;
-        };
         let owner_ref = self
             .owner(&device, &op.alias)
             .await
             .map_err(|_| anyhow::anyhow!("renewal account missing"))?;
-        let mut owner = loop {
-            if let Ok(guard) =
+        let (imports, mut owner, lease) = loop {
+            self.check_login_authority(headers, op).await?;
+            let Ok(imports) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), self.imports.lock()).await
+            else {
+                continue;
+            };
+            let Ok(owner) =
                 tokio::time::timeout(std::time::Duration::from_secs(1), owner_ref.lock()).await
-            {
-                break guard;
+            else {
+                continue;
+            };
+            if let Some(lease) = central.login_account_lease(op).await? {
+                break (imports, owner, lease);
             }
-            self.check_login_authority(headers, op).await?;
-        };
-        let lease = loop {
-            self.check_login_authority(headers, op).await?;
-            match central.login_account_lease(op).await? {
-                Some(lease) => break lease,
-                None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
-            }
+            // Settlement needs the owner lock to publish and release its lease.
+            // Unrelated account work also needs the imports lock.
+            drop(owner);
+            drop(imports);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         };
         let result = async {
             reconcile_owner_from_central(self, &mut owner, &op.account_id)
@@ -68,6 +66,9 @@ impl Broker {
                 .context("missing shared candidate")?;
             if let Err(error) = owner.validate_owned_auth(&candidate) {
                 op.payload.error = Some("wrong_account".into());
+                // Device login has exited and no refresh-capable child has started.
+                // Keep both reservations, but permit a fresh explicit renewal to repair them.
+                central.login_save(op, LoginPhase::Rejected).await?;
                 return Err(error);
             }
             if let Some(rpc) = owner.rpc.as_mut() {
