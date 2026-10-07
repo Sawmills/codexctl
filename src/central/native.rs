@@ -1197,8 +1197,22 @@ fn finish_token(
     println!("{}", token.access_token);
     Ok(())
 }
+/// The directory whose native lock guards a connection file. Borrowed
+/// connections share the central root lock with activation; private launch
+/// connections keep their own directory's lock.
+fn connection_lock_directory(path: &Path, root: &Path) -> Result<PathBuf> {
+    if path.starts_with(root.join("borrowed")) {
+        return Ok(root.to_owned());
+    }
+    Ok(path
+        .parent()
+        .context("missing connection directory")?
+        .to_owned())
+}
+
 pub fn print_token(path: &Path) -> Result<()> {
-    let directory = path.parent().context("missing connection directory")?;
+    let directory = connection_lock_directory(path, &root()?)?;
+    let directory = directory.as_path();
     let connection = {
         let _lock = native_lock(directory)?;
         read_connection(path)?
@@ -1996,11 +2010,11 @@ mod tests {
     use super::{
         ACTIVE_HISTORY, ACTIVE_HISTORY_LIMIT, ACTIVE_HISTORY_ROTATED, ActivationRollback,
         ActiveHistoryEntry, BILLING_SWITCH_NOTICE, Connection, PointerCause, append_active_history,
-        billing_switch_prompt, finish_token, is_billing_approved, remove_active_pointer_audited,
-        remove_active_pointer_with, remove_pointer_then_marker_audited,
-        remove_pointer_then_marker_with, render_parent_cmd, restore_active_pointer,
-        rollback_or_context, save_connection, statusline_identity, validate_token_account,
-        write_pointer_after_connection, write_pointer_with_rollback,
+        billing_switch_prompt, connection_lock_directory, finish_token, is_billing_approved,
+        remove_active_pointer_audited, remove_active_pointer_with,
+        remove_pointer_then_marker_audited, remove_pointer_then_marker_with, render_parent_cmd,
+        restore_active_pointer, rollback_or_context, save_connection, statusline_identity,
+        validate_token_account, write_pointer_after_connection, write_pointer_with_rollback,
     };
     use crate::api;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -2062,6 +2076,23 @@ mod tests {
             loan_id: None,
         };
         assert!(is_billing_approved(&connection, &changed_billing_token()));
+    }
+
+    #[test]
+    fn borrowed_connections_share_the_activation_lock() {
+        let root = std::path::Path::new("/home/central");
+        assert_eq!(
+            connection_lock_directory(&root.join("borrowed/alice/main.json"), root).unwrap(),
+            root
+        );
+        assert_eq!(
+            connection_lock_directory(&root.join("main.json"), root).unwrap(),
+            root
+        );
+        assert_eq!(
+            connection_lock_directory(&root.join("lanes/launch-x/connection.json"), root).unwrap(),
+            root.join("lanes/launch-x")
+        );
     }
 
     #[test]
