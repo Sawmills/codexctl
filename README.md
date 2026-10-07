@@ -71,7 +71,7 @@ The account column is the saved profile alias, with `*` marking the active accou
 Current status adds a `Pace` column when fresh weekly window data is available.
 `+12 ahead` means usage is faster than the straight line through that window;
 `-8 behind` means usage is slower. The `Fleet` row or footer shows the mean of known
-pace across the displayed accounts. Unknown pace stays blank, and empty pace columns
+pace across the displayed accounts. `-` marks unknown pace, and empty pace columns
 are hidden. See [Account Status JSON](docs/status-json.md) for the calculation and
 version 2 fields.
 
