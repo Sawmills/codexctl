@@ -1,3 +1,12 @@
 - op: add
   path: /spec/template/metadata/annotations/codexctl.sawmills.ai~1restarted-at
-  value: 2026-10-04T14:00Z
+  value: 2026-10-07T21:00Z
+# SAW-12467: the Google client secret is staged under its own key; copy it to
+# the file sso.json reads. This changes in the same sync as sso.yaml.
+- op: replace
+  path: /spec/template/spec/initContainers/0/command/2
+  value: >-
+    cp /projected/vault-key /keys/vault-key;
+    cp /projected/google-oidc-client-secret /keys/oidc-client-secret;
+    cp /projected/metrics-token /keys/metrics-token;
+    chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token

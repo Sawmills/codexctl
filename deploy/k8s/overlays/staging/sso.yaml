@@ -6,8 +6,17 @@ metadata:
 data:
   sso.json: |
     {
-      "issuer": "https://clerk.sawmills.ai",
-      "client_id": "StnV91x99CEYVmSy",
+      "issuer": "https://accounts.google.com",
+      "client_id": "950651542168-9eaiuu6krdv74oua16nv9bvdg2lmq3f1.apps.googleusercontent.com",
       "client_secret_file": "/keys/oidc-client-secret",
-      "allowed_domains": ["sawmills.ai"]
+      "allowed_domains": ["sawmills.ai"],
+      "allowed_hosted_domains": ["sawmills.ai"],
+      "clerk_migration": {
+        "users": [
+          {
+            "user_id": "6334462fa3dac53bdd9836507666cdde920a73768c3b52b632297d08130e1fd4",
+            "email": "amir@sawmills.ai"
+          }
+        ]
+      }
     }
