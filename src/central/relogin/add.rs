@@ -961,20 +961,30 @@ pub(in crate::central) fn recover(broker_state: &Path, key: &Path) -> Result<Vec
 /// cannot manage these replica-local records, so it must not start beside one.
 /// An unreadable record counts as pending.
 pub(in crate::central) fn pending_logins(broker_state: &Path) -> Result<bool> {
-    for parent in [root(broker_state), broker_state.join("accounts")] {
-        if !parent.try_exists()? {
-            continue;
-        }
-        for entry in std::fs::read_dir(parent)? {
-            let state = entry?.path();
-            let Ok(records) = records(&state) else {
+    let adds = root(broker_state);
+    if adds.try_exists()? {
+        for entry in std::fs::read_dir(adds)? {
+            let Ok(records) = records(&entry?.path()) else {
                 return Ok(true);
             };
+            // A landed, retired add has handed its grant to a renewal journal.
             if records
                 .iter()
                 .any(|r| !terminal(&r.phase) && !(r.retired && r.landed.is_some()))
             {
                 return Ok(true);
+            }
+        }
+    }
+    let accounts = broker_state.join("accounts");
+    if accounts.try_exists()? {
+        for entry in std::fs::read_dir(accounts)? {
+            // Renewal recovery acts only on the latest record, and a retired
+            // record holds no grant; older or retired ones are history.
+            match current(&entry?.path()) {
+                Ok(Some(r)) if !terminal(&r.phase) && !r.retired => return Ok(true),
+                Ok(_) => {}
+                Err(_) => return Ok(true),
             }
         }
     }
@@ -1047,6 +1057,33 @@ pub(in crate::central) fn retire(accounts: &Path, auth: &Value, skip: &Path) -> 
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn retired_or_superseded_renewal_records_do_not_block_shared_startup() {
+        let (root, _key, _state, record) = landed_fixture();
+        let owner_state = root
+            .path()
+            .join("accounts")
+            .join(account_key("amir", "personal"));
+        store::ensure_private_dir(&owner_state).unwrap();
+        let mut renewal = record.clone();
+        renewal.alias = "personal".into();
+        renewal.landed = None;
+        renewal.phase = Phase::Committing;
+        renewal.retired = true;
+        publish(&owner_state, &renewal).unwrap();
+        // The landed add still holds its grant here, so it alone is pending.
+        assert!(pending_logins(root.path()).unwrap());
+        let adds = root.path().join("account-logins");
+        std::fs::remove_dir_all(&adds).unwrap();
+        assert!(
+            !pending_logins(root.path()).unwrap(),
+            "a retired Committing renewal holds no grant"
+        );
+        renewal.retired = false;
+        save(&owner_state, &renewal).unwrap();
+        assert!(pending_logins(root.path()).unwrap());
+    }
 
     fn landed_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
         let root = tempfile::tempdir().unwrap();
