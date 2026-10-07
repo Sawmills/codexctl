@@ -41,6 +41,8 @@ the credential-store namespace identical on default macOS and Linux filesystems.
 codexctl status
 ```
 
+Example from before weekly pace support:
+
 ```
 Live status fetched at Tue Apr 28 22:20:56
 
@@ -65,6 +67,13 @@ Usage-Based Accounts
 
 Sorted by availability — most available accounts first. All accounts are fetched live in parallel.
 The account column is the saved profile alias, with `*` marking the active account.
+
+Current status adds a `Pace` column when fresh weekly window data is available.
+`+12 ahead` means usage is faster than the straight line through that window;
+`-8 behind` means usage is slower. The `Fleet` row or footer shows the mean of known
+pace across the displayed accounts. Unknown pace stays blank, and empty pace columns
+are hidden. See [Account Status JSON](docs/status-json.md) for the calculation and
+version 2 fields.
 
 Rate-limit windows are matched and labeled by their server-declared duration. For example, the
 table can show `15m`, `1h`, `5h`, or `7d` columns. A column appears only when at least one returned
