@@ -532,6 +532,7 @@ pub fn rename(old: &str, new: &str) -> Result<()> {
             );
         }
     }
+    native::rename_preflight(old, new)?;
     require_current_connection(&connection)?;
     let response = transport::blocking()?
         .post(format!(

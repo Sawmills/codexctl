@@ -1078,6 +1078,15 @@ async fn token(
         } else {
             (None, owner_ref.lock().await)
         };
+        // A rename can re-key this owner while the request waits for its lock.
+        // The old alias must never be served once the rename committed.
+        let requested = request.alias.as_deref().unwrap_or_default().trim();
+        if !owner.vault.alias.trim().eq_ignore_ascii_case(requested) {
+            return Err(
+                super::rename::renamed_error(&worker, &owner.vault.user, requested)
+                    .unwrap_or_else(|| worker.error(StatusCode::NOT_FOUND, "account_not_found")),
+            );
+        }
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }

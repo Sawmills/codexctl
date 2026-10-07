@@ -878,21 +878,72 @@ pub(super) fn follow_rename(old: &str, new: &str) -> Result<()> {
     }
     let _lock = native_lock(&directory)?;
     let old_path = connection_path(old)?;
+    let new_path = connection_path(new)?;
     if old_path.try_exists()? {
         let mut connection = read_connection(&old_path)?;
         connection.alias = Some(new.to_owned());
-        store::atomic_write(&connection_path(new)?, &serde_json::to_vec(&connection)?)?;
-        if !old.eq_ignore_ascii_case(new) {
-            std::fs::remove_file(&old_path)?;
-        }
+        // Order for crash recovery: the new record first, then the pointer,
+        // then the old record. Every prefix leaves a usable record, and a
+        // stale one fails with the server's renamed message.
+        store::atomic_write(&new_path, &serde_json::to_vec(&connection)?)?;
         store::sync_directory(&directory)?;
+        move_active_pointer(old, new)?;
+        if !same_file(&old_path, &new_path)? {
+            std::fs::remove_file(&old_path)?;
+            store::sync_directory(&directory)?;
+        }
+    } else {
+        move_active_pointer(old, new)?;
     }
+    Ok(())
+}
+
+/// Refuse a rename whose new name already holds an unrelated local record,
+/// before the server commits it.
+pub(super) fn rename_preflight(old: &str, new: &str) -> Result<()> {
+    let new_path = connection_path(new)?;
+    if new_path.try_exists()? && !same_file(&connection_path(old)?, &new_path)? {
+        bail!(
+            "this machine already has a server connection named {new}; disconnect or remove it before renaming"
+        );
+    }
+    let profile = store::profile_dir(&config::default_paths()?, new)?;
+    if profile.join("auth.json").try_exists()? {
+        bail!(
+            "a local profile named {new} exists; remove or rename it before renaming the server account"
+        );
+    }
+    Ok(())
+}
+
+fn move_active_pointer(old: &str, new: &str) -> Result<()> {
     if active_pointer_path()?.try_exists()?
         && read_active_alias().is_ok_and(|active| active.eq_ignore_ascii_case(old))
     {
         store::atomic_write(&active_pointer_path()?, format!("{new}\n").as_bytes())?;
     }
     Ok(())
+}
+
+/// True when both paths name one file, as a case-only rename does on a
+/// case-insensitive filesystem.
+fn same_file(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::metadata(left), std::fs::metadata(right)) {
+            (Ok(a), Ok(b)) => Ok(a.dev() == b.dev() && a.ino() == b.ino()),
+            _ => Ok(false),
+        }
+    }
+    #[cfg(not(unix))]
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => Ok(a == b),
+        _ => Ok(false),
+    }
 }
 
 fn active_pointer_path() -> Result<PathBuf> {

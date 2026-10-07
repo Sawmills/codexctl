@@ -1399,6 +1399,56 @@ fn rename_follows_on_this_machine_and_fails_clearly_on_another() {
     assert!(taken.status.success(), "a no-op rename keeps the account");
 }
 
+#[test]
+fn rename_case_only_keeps_one_record_and_preflight_refuses_a_local_conflict() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let home = server.connected_home();
+    let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+    assert!(
+        selected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let central = home.path().join(".codexctl/central");
+    let records = || {
+        std::fs::read_dir(&central)
+            .unwrap()
+            .filter_map(|e| e.unwrap().file_name().into_string().ok())
+            .filter(|name| name.eq_ignore_ascii_case("personal.json"))
+            .count()
+    };
+    let renamed = server.cli(home.path(), &["rename", "personal", "Personal"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    assert_eq!(
+        records(),
+        1,
+        "a case-only rename keeps one connection record"
+    );
+    assert_eq!(server.aliases(&server.amir), vec!["Personal"]);
+
+    // A stray local record under the new name stops the rename before the server.
+    store::atomic_write(&central.join("work.json"), b"{}").unwrap();
+    let refused = server.cli(home.path(), &["rename", "Personal", "work"]);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("already has a server connection named work"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(server.aliases(&server.amir), vec!["Personal"]);
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))
