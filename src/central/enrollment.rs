@@ -279,13 +279,25 @@ fn page(html: String) -> Response {
     )
         .into_response()
 }
+/// True when the Accept header lists `text/html` without rejecting it through `q=0`.
+fn accepts_html(accept: &str) -> bool {
+    accept.split(',').any(|range| {
+        let mut parts = range.split(';').map(str::trim);
+        parts
+            .next()
+            .is_some_and(|media| media.eq_ignore_ascii_case("text/html"))
+            && parts
+                .filter_map(|p| p.strip_prefix("q=").or_else(|| p.strip_prefix("Q=")))
+                .all(|q| q.parse::<f32>().is_ok_and(|q| q > 0.0))
+    })
+}
 /// Browser steps show a page for an error; API clients keep the JSON body and status.
 pub(super) async fn browser_errors(request: Request, next: Next) -> Response {
     let html = request
         .headers()
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("text/html"));
+        .is_some_and(accepts_html);
     let response = next.run(request).await;
     if !html || !(response.status().is_client_error() || response.status().is_server_error()) {
         return response;

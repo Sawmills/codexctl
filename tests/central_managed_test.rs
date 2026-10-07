@@ -2939,7 +2939,11 @@ fn a_browser_gets_an_error_page_with_the_same_status() {
     assert_eq!(expired.status(), 410);
     assert!(expired.text().unwrap().contains("This link has expired"));
     // CLI and API clients keep the exact JSON body and status.
-    for accept in [None, Some("application/json")] {
+    for accept in [
+        None,
+        Some("application/json"),
+        Some("application/json, text/html;q=0"),
+    ] {
         let mut request = browser.get(format!("{}/enroll?code=UNKNOWN", issuer.server.url));
         if let Some(accept) = accept {
             request = request.header("accept", accept);
