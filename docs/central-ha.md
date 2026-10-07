@@ -76,7 +76,8 @@ ExternalSecret is supplied by infra#1513.
 Migration 4 adds add admission and unique identity claims. The mounted vault key
 lets migration populate those claims from existing encrypted credentials. It
 retains both UID and subject facts, including claims omitted by later tokens.
-A conflict rolls back the migration. Resolve the stored inventory before retrying.
+A conflict stops migration before readiness. Keep writers drained and preserve
+the source and partial results for operator reconciliation before retrying.
 Backfill copies file-mode rename tombstones into PostgreSQL. Every replica
 refuses add or import under a retired alias.
 
@@ -94,6 +95,37 @@ operation. Completion releases slots and history in the same transaction.
 Migration copies surviving rows only; it cannot recover previously deleted
 history. Drain migration-4 writers before migration and deploy this version to
 all replicas before resuming writes. Mixed writer versions are not supported.
+
+Schema 6 records the layout version in the schema transaction. Every binary
+checks the highest stored version when it opens a PostgreSQL backend. It refuses
+a newer version with `schema vN is newer than this binary; upgrade
+codexctl-central`. The PR1 schema from #143 was never deployed anywhere, so no
+pre-change PostgreSQL reader exists. Pending add receipts can therefore use a
+nullable account ID in the shared journal. Later binaries must keep the version
+gate; no flag bypasses it.
+
+Identity backfill commits at most 32 source rows and 8 MiB of encrypted payload
+per batch. It reads indexed high-water keys, decrypts outside admission, and
+commits proof and the last key together. Each database batch has a two-second
+limit; each migration invocation has a five-minute maintenance budget. Resume
+with the same `migrate` command and vault key after a failed batch or elapsed
+budget. Completed batches remain committed; the interrupted batch rolls back.
+
+A hard guard accepts at most 5,000 source rows in total: retained legacy claims,
+live accounts, all shared login operations, and identity-reservation slots. It
+counts at most one row beyond the bound before backfill and records that accepted
+inventory for restart. Above the bound, migration refuses with `identity
+migration inventory exceeds 5000 source rows; keep writers drained`. This bound
+covers PostgreSQL identity backfill, not the separate file-import command.
+
+Drain every writer, including device login and refresh children, before migration.
+A database fence refuses source writes while readiness is incomplete. The layout
+version alone does not enable serving. A separate final readiness checkpoint
+requires all four inventories to complete; cutover reads only those bounded
+checkpoints under admission. The server refuses startup before that checkpoint.
+Staging must record its source counts and elapsed maintenance time within these
+bounds before resuming writers. These local limits do not establish production
+throughput or approve the B33 cutover.
 
 Add, renewal candidate publication, credential writes, and migration take one
 transaction advisory lock for their PostgreSQL schema. Lock order starts with

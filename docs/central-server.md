@@ -440,9 +440,9 @@ PostgreSQL mode. Migration 4 adds the shared add workflow and unique identity
 claims. It reads existing encrypted credentials with the mounted vault key and
 keeps all available claims. Backfill also copies rename tombstones, so every
 replica refuses reuse of an old alias for add or import. Conflicting stored
-claims stop the migration and roll
-back its changes. Resolve the inventory conflict before retrying; do not delete
-credential evidence to force the migration.
+claims stop migration before readiness. Committed batches remain intact. Keep
+writers drained and preserve source and partial proof for operator reconciliation;
+do not delete credential evidence to force migration.
 
 Migration 5 adds an independent ownership ledger, logical reservation release,
 and per-operation reservation history. It retains the existing full unique
@@ -453,6 +453,24 @@ fences. SQL identity decisions use typed `candidate_uid` and `candidate_sub`
 fields; the older JSON field is a compatibility projection. Drain older writers,
 apply migration 5 with the vault key, and update all replicas before resuming
 writes. The migration cannot restore history that was already physically deleted.
+
+Schema 6 adds a version gate and bounded, restartable identity backfill. A binary
+refuses a schema newer than it supports with `schema vN is newer than this binary;
+upgrade codexctl-central`. The PR1 schema from #143 was never deployed anywhere;
+no pre-change PostgreSQL reader exists. Pending add receipts use a nullable
+account ID in the shared journal.
+
+Migration accepts at most 5,000 source rows across retained claims, live accounts,
+shared operations, and reservation slots. Each committed batch contains at most
+32 source rows and 8 MiB of payload. Database work is limited to two seconds per
+batch and each invocation to five minutes. A failed batch preserves its source
+and the last committed key; rerun `migrate` with the same vault key to resume.
+The database refuses source writes until the final readiness checkpoint, and
+server startup refuses an incomplete checkpoint. The schema version is recorded
+with the layout change, before any backfill. Drain all writers and login/refresh
+children before migration, and record staging counts and elapsed time within the
+bounds before restarting them. See [the HA rollout](central-ha.md) for the guard
+error and acceptance gates.
 
 To rename one of your server accounts, run:
 

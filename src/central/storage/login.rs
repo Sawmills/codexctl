@@ -40,8 +40,6 @@ ALTER TABLE central_login_operations ALTER COLUMN account_id DROP NOT NULL;
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'renewal';
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS landed_alias TEXT;
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_claims JSONB NOT NULL DEFAULT '{}'::jsonb;
-UPDATE central_login_operations SET candidate_claims=jsonb_build_object('sub',candidate_login)
-    WHERE candidate_claims='{}'::jsonb AND candidate_login IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_alias
     ON central_login_operations(user_id, lower(alias))
     WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
@@ -82,9 +80,6 @@ CREATE TABLE IF NOT EXISTS central_login_identity_reservation_history (
     deleted_at TIMESTAMPTZ,
     PRIMARY KEY(workspace,namespace,claim,user_id,id)
 );
-INSERT INTO central_login_identity_reservation_history(workspace,namespace,claim,user_id,id,deleted_at)
-    SELECT workspace,namespace,claim,user_id,id,deleted_at FROM central_login_identity_reservations
-    ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS central_account_identity_claims (
     workspace TEXT NOT NULL,
     namespace TEXT NOT NULL CHECK(namespace IN ('uid','sub')),
@@ -94,19 +89,8 @@ CREATE TABLE IF NOT EXISTS central_account_identity_claims (
     PRIMARY KEY(workspace,namespace,claim)
 );
 CREATE INDEX IF NOT EXISTS central_account_identity_claims_owner ON central_account_identity_claims(account_id);
-INSERT INTO central_account_identity_claims(workspace,namespace,claim,account_id,deleted_at)
-    SELECT workspace,namespace,claim,account_id,deleted_at FROM central_account_claims
-    ON CONFLICT DO NOTHING;
-DO $$ BEGIN
-    IF EXISTS(SELECT 1 FROM central_account_identity_claims c JOIN central_account_claims l USING(workspace,namespace,claim) WHERE c.account_id<>l.account_id) THEN
-        RAISE EXCEPTION 'retained identity migration conflict';
-    END IF;
-END $$;
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_uid TEXT;
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS candidate_sub TEXT;
-UPDATE central_login_operations SET candidate_uid=COALESCE(candidate_uid,candidate_claims->>'uid'),
-    candidate_sub=COALESCE(candidate_sub,candidate_claims->>'sub',candidate_login)
-    WHERE candidate_workspace IS NOT NULL;
 CREATE OR REPLACE FUNCTION central_login_identity_agrees(p_workspace TEXT, p_uid TEXT, p_sub TEXT, p_account TEXT)
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
     WITH owned AS (SELECT account_id,workspace,login FROM central_accounts WHERE account_id=p_account),
@@ -142,10 +126,6 @@ CREATE OR REPLACE FUNCTION central_login_identity_matches(p_workspace TEXT, p_cl
 RETURNS BOOLEAN LANGUAGE sql STABLE AS $$
     SELECT central_login_identity_matches(p_workspace,p_claims->>'uid',p_claims->>'sub',p_account)
 $$;
-INSERT INTO central_schema_migrations(version) VALUES (5) ON CONFLICT DO NOTHING;
-INSERT INTO central_schema_migrations(version) VALUES (4) ON CONFLICT DO NOTHING;
-INSERT INTO central_schema_migrations(version) VALUES (3) ON CONFLICT DO NOTHING;
-INSERT INTO central_schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING;
 "#;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

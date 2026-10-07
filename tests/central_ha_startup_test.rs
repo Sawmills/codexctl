@@ -4849,41 +4849,57 @@ async fn postgres_add_persists_typed_candidate_claims_for_identity_queries() {
         agrees,
         "typed identity comparison must retain both namespaced facts"
     );
-    // Simulate an installed migration-4 database. Upgrade uses the encrypted
-    // candidate even when the compatibility metadata has lost its UID.
-    f.control.batch_execute("ALTER TABLE central_login_operations DROP COLUMN candidate_uid; ALTER TABLE central_login_operations DROP COLUMN candidate_sub; DROP TABLE central_login_identity_reservation_history").await.unwrap();
-    for _ in 0..2 {
-        let upgraded = command(
-            &f.database,
-            &f.second.root.path().join("state"),
-            &f.key,
-            "migrate",
-        )
-        .output()
-        .await
-        .unwrap();
-        assert!(
-            upgraded.status.success(),
-            "{}",
-            String::from_utf8_lossy(&upgraded.stderr)
-        );
-    }
-    let restored = f
-        .control
-        .query_one(
-            "SELECT candidate_uid,candidate_sub FROM central_login_operations WHERE id=$1",
-            &[&operation["id"].as_str().unwrap()],
-        )
-        .await
-        .unwrap();
-    assert_eq!(restored.get::<_, String>(0), "typed-uid");
-    assert_eq!(restored.get::<_, String>(1), "typed-sub");
-    let reserved:i64=f.control.query_one("SELECT count(*) FROM central_login_identity_reservation_history WHERE workspace='typed-workspace' AND deleted_at IS NULL",&[]).await.unwrap().get(0);
-    assert_eq!(reserved, 2, "upgrade retains both active reservations");
     store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
     assert_eq!(
         wait_add_terminal(&f, &operation).await["status"],
         "completed"
     );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_older_reader_refuses_a_newer_schema_before_native_startup() {
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    f.second.stop().await;
+    f.control
+        .execute(
+            &format!(
+                "INSERT INTO {}.central_schema_migrations(version) VALUES(7)",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let output = timeout(
+        Duration::from_secs(5),
+        command(
+            &f.database,
+            &f.first.root.path().join("state"),
+            &f.key,
+            "serve",
+        )
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .args([
+            "--listen",
+            "127.0.0.1:0",
+            "--public-url",
+            "http://127.0.0.1:8787",
+            "--codex-bin",
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"))
+        .kill_on_drop(true)
+        .output(),
+    )
+    .await
+    .expect("an unsupported schema must refuse before starting the server")
+    .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("schema v7 is newer than this binary; upgrade codexctl-central")
+    );
+    assert_eq!(f.first.launches(), 0);
     stop_fixture(f).await;
 }

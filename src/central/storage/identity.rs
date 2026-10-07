@@ -442,35 +442,6 @@ impl CentralStore {
     }
 }
 
-impl PostgresStore {
-    pub(super) async fn backfill_identity_claims(
-        &self,
-        tx: &tokio_postgres::Transaction<'_>,
-        cipher: &aes_gcm::Aes256Gcm,
-    ) -> Result<()> {
-        for row in tx.query("SELECT account_id,user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE deleted_at IS NULL ORDER BY account_id",&[]).await? {
-            let bytes: Vec<u8>=row.get(5);
-            let record=CredentialRecord {
-                account_id:row.get(0),user_id:row.get(1),alias:row.get(2),workspace:row.get(3),login:row.get(4),
-                vault:serde_json::from_slice(&vault::decrypt_with_cipher(cipher,&bytes)?)?,revision:row.get(6),
-            };
-            if let Some(claims)=Claims::from_record(&record)? {record_claims(tx,&record.account_id,&claims).await?;}
-        }
-        for row in tx.query("SELECT user_id,id,encrypted_payload FROM central_login_operations WHERE candidate_workspace IS NOT NULL",&[]).await? {
-            let user:String=row.get(0);
-            let id:String=row.get(1);
-            let bytes:Vec<u8>=row.get(2);
-            let payload: super::login::LoginPayload=serde_json::from_slice(&vault::decrypt_with_cipher(cipher,&bytes)?)?;
-            if let Some(auth)=payload.candidate {
-                let claims=Claims::from_auth(&auth)?;
-                let json=claims.json().to_string();
-                tx.execute("UPDATE central_login_operations SET candidate_claims=$3::text::jsonb,candidate_uid=$4,candidate_sub=$5 WHERE user_id=$1 AND id=$2",&[&user,&id,&json,&claims.logins.uid,&claims.logins.sub]).await?;
-            }
-        }
-        Ok(())
-    }
-}
-
 impl CentralStore {
     /// A renewal reserves every candidate claim before its refresh-capable launch.
     /// Repair keeps the rejected holder until verified completion retires its receipt.

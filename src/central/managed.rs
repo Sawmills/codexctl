@@ -3507,6 +3507,7 @@ pub async fn serve(
         store => Some(store),
     };
     let hydration_quarantines = if let Some(central) = central.as_ref() {
+        central.require_identity_ready().await?;
         hydrate_accounts(state, key, central).await?
     } else {
         Default::default()
