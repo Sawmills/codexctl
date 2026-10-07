@@ -191,13 +191,28 @@ impl Broker {
         &self,
         grant: &Grant,
     ) -> Result<Option<(String, Arc<Mutex<Owner>>)>, HttpError> {
-        if let Some(found) = self.resolve_alias(&grant.lender, &grant.alias).await? {
+        // A cached owner can outlive a tombstoned shared-store account, so the
+        // shared store decides whether the lender's account still exists.
+        let removed = match self
+            .central
+            .as_ref()
+            .filter(|central| central.mode() != StoreMode::File)
+        {
+            Some(central) => central
+                .load_account_by_alias(&grant.lender, &grant.alias)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+                .is_none(),
+            None => false,
+        };
+        if !removed && let Some(found) = self.resolve_alias(&grant.lender, &grant.alias).await? {
             return Ok(Some(found));
         }
         // An unresolved recovery is not proof that the alias was removed.
-        if self
-            .ownership_unresolved
-            .load(std::sync::atomic::Ordering::Acquire)
+        if !removed
+            && self
+                .ownership_unresolved
+                .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
         }
