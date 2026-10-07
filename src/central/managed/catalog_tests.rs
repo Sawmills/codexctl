@@ -32,7 +32,7 @@ impl Fixture {
                 .parse()
                 .unwrap(),
         );
-        let account = state.join("accounts/fixture");
+        let account = state.join("accounts").join(account_key("test", "fixture"));
         store::ensure_private_dir(&account).unwrap();
         let auth = super::tests::recovery_auth(Some(2000000000), "synthetic-refresh");
         vault::save(
@@ -243,7 +243,12 @@ async fn import_account_fences_when_lease_is_lost_during_verification() {
     fixture
         .attach_refresh_store_using(central.clone(), "lease-loss-hold")
         .await;
-    let auth = fixture.broker.owners.read().await["fixture"]
+    {
+        let mut owners = fixture.broker.owners.write().await;
+        let owner = owners.remove("fixture").unwrap();
+        owners.insert(account_key("test", "fixture"), owner);
+    }
+    let auth = fixture.broker.owners.read().await[&account_key("test", "fixture")]
         .1
         .lock()
         .await
@@ -295,7 +300,9 @@ async fn import_account_fences_when_lease_is_lost_during_verification() {
         .await
         .unwrap();
     central.release_lease(&successor).await.unwrap();
-    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let owner_ref = fixture.broker.owners.read().await[&account_key("test", "fixture")]
+        .1
+        .clone();
     let owner = owner_ref.lock().await;
     assert!(
         owner.rpc.is_none(),
@@ -751,8 +758,13 @@ async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() 
     fixture
         .attach_refresh_store_using(central.clone(), "startup")
         .await;
+    {
+        let mut owners = fixture.broker.owners.write().await;
+        let owner = owners.remove("fixture").unwrap();
+        owners.insert(account_key("test", "fixture"), owner);
+    }
     let old_owners = fixture.broker.owners.read().await.clone();
-    let old_owner = old_owners["fixture"].1.clone();
+    let old_owner = old_owners[&account_key("test", "fixture")].1.clone();
     let auth = old_owner.lock().await.vault.auth.clone();
     fixture
         .broker
@@ -769,7 +781,7 @@ async fn shared_reimport_fences_the_owner_already_resolved_by_a_token_request() 
         .unwrap_or_else(|_| panic!("verified reimport must succeed"));
     assert!(!Arc::ptr_eq(
         &old_owner,
-        &fixture.broker.owners.read().await["fixture"].1
+        &fixture.broker.owners.read().await[&account_key("test", "fixture")].1
     ));
     let count = std::fs::read_to_string(fixture._root.path().join("count")).unwrap();
     // A request can resolve the old Arc before waiting for import admission.
@@ -831,7 +843,12 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
     fixture
         .attach_refresh_store_using(central, "billing-error-marked")
         .await;
-    let auth = fixture.broker.owners.read().await["fixture"]
+    {
+        let mut owners = fixture.broker.owners.write().await;
+        let owner = owners.remove("fixture").unwrap();
+        owners.insert(account_key("test", "fixture"), owner);
+    }
+    let auth = fixture.broker.owners.read().await[&account_key("test", "fixture")]
         .1
         .lock()
         .await
@@ -861,7 +878,9 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
     .unwrap()
     .unwrap();
     drop(drained);
-    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let owner_ref = fixture.broker.owners.read().await[&account_key("test", "fixture")]
+        .1
+        .clone();
     {
         let mut owner = owner_ref.lock().await;
         assert!(!owner.available, "probe must succeed before token delivery");

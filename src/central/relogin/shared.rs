@@ -2,7 +2,7 @@
 use super::*;
 use crate::central::storage::{
     CentralStore,
-    login::{LoginOperation, LoginPayload, LoginPhase},
+    login::{AddAdmission, LoginKind, LoginOperation, LoginPayload, LoginPhase},
 };
 use std::{process::Stdio, time::Duration};
 use tokio::{io::AsyncReadExt, process::Command};
@@ -30,6 +30,7 @@ fn view(op: &LoginOperation) -> Response {
             "error":if op.phase == LoginPhase::ReplicaLost && !op.polling_clear {
                 Some("login_expired_requires_recovery")
             } else {op.payload.error.as_deref()},
+            "landedAlias":op.payload.landed,
         })),
     )
         .into_response()
@@ -52,6 +53,7 @@ async fn lookup(
     broker: &Broker,
     headers: &HeaderMap,
     body: Body,
+    kind: LoginKind,
 ) -> Result<LoginOperation, HttpError> {
     let device = broker.authorize(headers).await?;
     let Json(request) =
@@ -60,16 +62,15 @@ async fn lookup(
     let op = if request.id.is_empty() {
         let alias = managed::normalize_alias(&request.alias)
             .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-        let (account, _) = broker
-            .resolve_alias(&device.user, alias)
-            .await?
-            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
-        db.login_active(&account).await
+        db.login_active_alias(&device.user, alias).await
     } else {
         db.login_get(&device.user, &request.id).await
     }
     .map_err(|_| failure(broker))?
     .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
+    if op.kind != kind {
+        return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+    }
     owned(broker, &device, &request, &op)?;
     Ok(op)
 }
@@ -78,7 +79,7 @@ pub(super) async fn status(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
-    let op = lookup(&broker, &headers, body).await?;
+    let op = lookup(&broker, &headers, body, LoginKind::Renewal).await?;
     Ok(view(&op))
 }
 pub(super) async fn cancel(
@@ -86,7 +87,7 @@ pub(super) async fn cancel(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
-    let op = lookup(&broker, &headers, body).await?;
+    let op = lookup(&broker, &headers, body, LoginKind::Renewal).await?;
     database(&broker)?
         .login_cancel(&op)
         .await
@@ -97,6 +98,36 @@ pub(super) async fn start(
     broker: Broker,
     headers: HeaderMap,
     body: Body,
+) -> Result<Response, HttpError> {
+    start_kind(broker, headers, body, LoginKind::Renewal, None).await
+}
+pub(super) async fn add_status(
+    broker: Broker,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, HttpError> {
+    Ok(view(
+        &lookup(&broker, &headers, body, LoginKind::Add).await?,
+    ))
+}
+pub(super) async fn add_cancel(
+    broker: Broker,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<Response, HttpError> {
+    let op = lookup(&broker, &headers, body, LoginKind::Add).await?;
+    database(&broker)?
+        .login_cancel(&op)
+        .await
+        .map_err(|_| failure(&broker))?;
+    Ok(view(&op))
+}
+pub(super) async fn start_kind(
+    broker: Broker,
+    headers: HeaderMap,
+    body: Body,
+    kind: LoginKind,
+    label: Option<String>,
 ) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers).await?;
     let Json(request) =
@@ -110,6 +141,9 @@ pub(super) async fn start(
         .await
         .map_err(|_| failure(&broker))?
     {
+        if op.kind != kind {
+            return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+        }
         owned(&broker, &device, &request, &op)?;
         return Ok(view(&op));
     }
@@ -121,19 +155,47 @@ pub(super) async fn start(
     }
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-    // Resolve the physical key without locking the refresh owner. Historical
-    // aliases can retain a key derived from their original whitespace.
-    let (account, _) = broker
-        .resolve_alias(&device.user, alias)
-        .await?
-        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?;
     if let Some(active) = db
-        .login_active(&account)
+        .login_active_alias(&device.user, alias)
         .await
         .map_err(|_| failure(&broker))?
     {
+        if active.kind != kind {
+            return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
+        }
         owned(&broker, &device, &request, &active)?;
         return Ok(view(&active));
+    }
+    if kind == LoginKind::Add
+        && db
+            .renamed_alias(&device.user, alias)
+            .await
+            .map_err(|_| failure(&broker))?
+            .is_some()
+    {
+        return Err(broker.error(StatusCode::CONFLICT, "alias_renamed"));
+    }
+    let resolved = broker.resolve_alias(&device.user, alias).await?;
+    let account = if kind == LoginKind::Add {
+        if resolved.is_some() {
+            return Err(broker.error(StatusCode::CONFLICT, "alias_exists"));
+        }
+        None
+    } else {
+        Some(
+            resolved
+                .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?
+                .0,
+        )
+    };
+    if let Some(account) = account.as_deref()
+        && db
+            .login_active_account(account)
+            .await
+            .map_err(|_| failure(&broker))?
+            .is_some()
+    {
+        return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
     }
     let permit = broker
         .work
@@ -141,6 +203,7 @@ pub(super) async fn start(
         .try_acquire_owned()
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_busy"))?;
     let op = LoginOperation {
+        kind,
         user: device.user.clone(),
         id: request.id.clone(),
         account_id: account.clone(),
@@ -150,7 +213,10 @@ pub(super) async fn start(
         sequence: 0,
         holder: broker.holder_id.clone(),
         epoch: 1,
-        payload: LoginPayload::default(),
+        payload: LoginPayload {
+            label,
+            ..Default::default()
+        },
         polling_clear: false,
     };
     if !db.login_create(&op).await.map_err(|_| failure(&broker))? {
@@ -161,11 +227,24 @@ pub(super) async fn start(
         let existing = match existing {
             Some(op) => Some(op),
             None => db
-                .login_active(&account)
+                .login_active_alias(&device.user, alias)
                 .await
                 .map_err(|_| failure(&broker))?,
         };
+        let existing = match existing {
+            Some(existing) => Some(existing),
+            None => match account.as_deref() {
+                Some(account) => db
+                    .login_active_account(account)
+                    .await
+                    .map_err(|_| failure(&broker))?,
+                None => None,
+            },
+        };
         let existing = existing.ok_or_else(|| failure(&broker))?;
+        if existing.kind != kind || !existing.alias.eq_ignore_ascii_case(alias) {
+            return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
+        }
         owned(&broker, &device, &request, &existing)?;
         return Ok(view(&existing));
     }
@@ -182,7 +261,7 @@ pub(super) async fn start(
             let detail: String = detail.chars().take(4096).collect();
             eprintln!(
                 "{}",
-                json!({"operation":"login_renewal","stage":worker_op.phase.as_str(),"error":detail})
+                json!({"operation":if worker_op.kind == LoginKind::Add {"login_add"} else {"login_renewal"},"stage":worker_op.phase.as_str(),"error":detail})
             );
             worker.record_failure(
                 if worker_op.phase == LoginPhase::Unresolved
@@ -364,5 +443,33 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     op.payload.code = None;
     db.login_save(op, LoginPhase::Candidate).await?;
     std::fs::remove_dir_all(&home)?;
+    if op.kind == LoginKind::Add
+        && let AddAdmission::Refused(reason) = db.login_admit_add(op).await?
+    {
+        op.payload.error = Some(reason.into());
+        if matches!(reason, "account_identity_unresolved" | "login_canceled") {
+            db.login_save(op, LoginPhase::Rejected).await?;
+            if reason == "account_identity_unresolved" {
+                broker.record_failure(
+                    "relogin_identity_unresolved",
+                    "relogin",
+                    StatusCode::SERVICE_UNAVAILABLE,
+                );
+            }
+        } else {
+            op.payload.candidate = None;
+            db.login_save(op, LoginPhase::Failed).await?;
+            eprintln!(
+                "{}",
+                json!({"operation":"login_add","stage":"admission","reason":reason})
+            );
+            broker.record_failure(
+                "relogin_failed",
+                "relogin_add_admission",
+                StatusCode::CONFLICT,
+            );
+        }
+        return Ok(());
+    }
     broker.verify_shared_renewal(headers, op).await
 }

@@ -30,7 +30,7 @@ mod inventory;
 mod shared;
 pub(super) use inventory::{
     AdmissionDenied, AdmissionKind, ClearedIdentity, ProcessState, clear_registry,
-    identity_inventory,
+    clear_shared_registry, identity_inventory,
 };
 mod recover;
 mod state;

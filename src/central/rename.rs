@@ -53,6 +53,18 @@ fn tombstones(state: &Path) -> Result<Vec<Rename>> {
     Ok(serde_json::from_slice(&vault::private_read(&path)?)?)
 }
 
+pub(in crate::central) fn alias_tombstones(state: &Path) -> Result<Vec<(String, String, String)>> {
+    tombstones(state)?
+        .into_iter()
+        .map(|r| {
+            store::validate_alias(&r.user)?;
+            let from = normalize_alias(&r.from)?.to_ascii_lowercase();
+            let to = normalize_alias(&r.to)?.to_owned();
+            Ok((r.user, from, to))
+        })
+        .collect()
+}
+
 /// The current alias for a renamed one, following any chain of renames.
 pub(super) fn renamed_to(state: &Path, user: &str, alias: &str) -> Result<Option<String>> {
     let renames = tombstones(state)?;

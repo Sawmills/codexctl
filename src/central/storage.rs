@@ -18,11 +18,13 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(in crate::central) mod identity;
 pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod loans;
+mod migration;
 
 async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(DB_TIMEOUT, future)
@@ -131,6 +133,7 @@ pub struct PostgresStore {
     tls_enabled: bool,
     client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     observation_client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
+    admission: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
     key: PathBuf,
 }
 
@@ -279,6 +282,7 @@ impl CentralStore {
         db.url = url.to_string();
         db.client = Arc::new(tokio::sync::Mutex::new(None));
         db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+        db.admission = Arc::new(tokio::sync::Mutex::new(None));
         let control = db.establish().await?;
         Ok((isolated, control, schema))
     }
@@ -314,6 +318,20 @@ impl CentralStore {
                 postgres.migrate().await
             }
         }
+    }
+
+    pub(in crate::central) async fn require_identity_ready(&self) -> Result<()> {
+        let ready = match self {
+            Self::File(_) => true,
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db
+                .identity_ready()
+                .await
+                .context("apply the supported identity migration before serving")?,
+        };
+        if !ready {
+            bail!("identity migration is incomplete; keep writers drained and resume migration");
+        }
+        Ok(())
     }
 
     pub fn mode(&self) -> StoreMode {
@@ -525,6 +543,9 @@ impl CentralStore {
             bail!("finish pending logins in file mode before switching storage");
         }
         target.migrate().await?;
+        target
+            .save_alias_tombstones(super::rename::alias_tombstones(state)?)
+            .await?;
         let mut counts = BackfillCounts {
             accounts: 0,
             users: 0,
@@ -1195,9 +1216,11 @@ impl PostgresStore {
             tls_enabled,
             client: Arc::new(tokio::sync::Mutex::new(None)),
             observation_client: Arc::new(tokio::sync::Mutex::new(None)),
+            admission: Arc::new(tokio::sync::Mutex::new(None)),
             key: key.into(),
         };
         let _ = store.client().await?;
+        store.check_schema_version(migration::READY_VERSION).await?;
         Ok(store)
     }
 
@@ -1319,28 +1342,40 @@ impl PostgresStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        let client = self.client().await?;
-        client
-            .batch_execute(&format!("{SCHEMA}{}", login::LOGIN_SCHEMA))
-            .await
-            .context("migrate central PostgreSQL schema")?;
-        client
-            .batch_execute(loans::SCHEMA)
-            .await
-            .context("migrate central PostgreSQL loan schema")?;
-        client
-            .execute(
-                "INSERT INTO central_schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING",
-                &[],
-            )
-            .await?;
-        Ok(())
+        bounded_db(async {
+            let mut connection = self.admission_client().await?;
+            let client = connection.transaction().await?;
+            let _admission_timing = identity::lock_admission(&client).await?;
+            client
+                .batch_execute("SET LOCAL codexctl.identity_migration='1'")
+                .await?;
+            client
+                .batch_execute(&format!(
+                    "{SCHEMA}{}{}{}",
+                    login::LOGIN_SCHEMA,
+                    loans::SCHEMA,
+                    migration::SCHEMA
+                ))
+                .await
+                .context("migrate central PostgreSQL schema")?;
+            client.execute("INSERT INTO central_schema_migrations(version) SELECT generate_series(1,$1) ON CONFLICT DO NOTHING",&[&migration::READY_VERSION]).await?;
+            client.commit().await?;
+            Ok(())
+        })
+        .await?;
+        self.migrate_identity().await
     }
 
     async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
         let serialized = serde_json::to_vec(&record.vault)?;
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
-        let client = self.client().await?;
+        let claims = identity::Claims::from_record(record)?;
+        let mut connection = self.admission_client().await?;
+        let client = connection.transaction().await?;
+        let _admission_timing = identity::lock_admission(&client).await?;
+        if let Some(claims) = claims.as_ref() {
+            identity::check_claims(&client, &record.account_id, claims).await?;
+        }
         let changed = client.execute(
             "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision AND central_accounts.deleted_at IS NULL",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision],
@@ -1361,10 +1396,15 @@ impl PostgresStore {
                     .ok()
                     .is_some_and(|plain| plain == serialized)
             }) {
+                client.commit().await?;
                 return Ok(());
             }
             bail!("central account write was fenced or tombstoned");
         }
+        if let Some(claims) = claims.as_ref() {
+            identity::record_claims(&client, &record.account_id, claims).await?;
+        }
+        client.commit().await?;
         Ok(())
     }
 
@@ -1715,7 +1755,7 @@ impl PostgresStore {
         // Expiry alone cannot prove a foreign refresh child stopped. A renewal
         // can replace its own local holder because its worker settles that child.
         let row = client.query_opt(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR (candidate_workspace=(SELECT workspace FROM central_accounts WHERE account_id=$1) AND (candidate_login IS NULL OR (SELECT login FROM central_accounts WHERE account_id=$1) IS NULL OR candidate_login=(SELECT login FROM central_accounts WHERE account_id=$1)))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
             &[&account_id, &holder_id, &(ttl.as_secs() as i64), &login_id, &local_holder],
         ).await?;
         Ok(row.map(|row| Lease {
@@ -1731,18 +1771,30 @@ impl PostgresStore {
         }
         let serialized = serde_json::to_vec(&record.vault)?;
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
-        let client = self.client().await?;
+        let claims = identity::Claims::from_record(record)?;
+        let cipher = vault::cipher(&self.key)?;
+        let mut connection = self.admission_client().await?;
+        let client = connection.transaction().await?;
+        let _admission_timing = identity::lock_admission(&client).await?;
         let changed = client.execute(
-            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > now() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
+            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
+            if let Some(claims) = claims.as_ref() {
+                match identity::record_claims(&client, &record.account_id, claims).await {
+                    Ok(()) => {}
+                    Err(error) if error.is::<identity::IdentityDenied>() => return Ok(false),
+                    Err(error) => return Err(error),
+                }
+            }
+            client.commit().await?;
             return Ok(true);
         }
-        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
+        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > clock_timestamp() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
         Ok(row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
-            vault::decrypt_bytes(&self.key, &stored)
+            vault::decrypt_with_cipher(&cipher, &stored)
                 .ok()
                 .is_some_and(|plain| plain == serialized)
         }))
@@ -1841,7 +1893,7 @@ mod tests {
             user_id: Some("user".into()),
             alias: "seat".into(),
             workspace: Some("workspace".into()),
-            login: Some("login".into()),
+            login: Some(id.into()),
             vault: serde_json::json!({"refresh":"secret"}),
             revision,
         }
@@ -1982,6 +2034,545 @@ mod tests {
     }
 
     #[cfg(feature = "central-real-db-tests")]
+    fn claims_auth(subject: Option<&str>, uid: Option<&str>) -> Value {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let mut claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"claim-workspace"}});
+        if let Some(sub) = subject {
+            claims["sub"] = serde_json::json!(sub);
+        }
+        if let Some(uid) = uid {
+            claims["https://api.openai.com/auth"]["chatgpt_user_id"] = serde_json::json!(uid);
+        }
+        serde_json::json!({"tokens":{"account_id":"claim-workspace","access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic"}})
+    }
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_migration_retains_login_claims_when_a_later_capture_omits_them() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[21; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("stable-uid"))});
+        shared.save_account(&original).await.unwrap();
+        // The prior schema stored the token, but had no namespaced claim table.
+        control
+            .batch_execute(
+                "DROP TABLE central_account_claims; DROP TABLE central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress",
+            )
+            .await
+            .unwrap();
+        shared.migrate().await.unwrap();
+        original.revision = 2;
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        let mut duplicate = record("duplicate", 1);
+        duplicate.workspace = Some("claim-workspace".into());
+        duplicate.login = None;
+        duplicate.vault = serde_json::json!({"auth":claims_auth(None,Some("stable-uid"))});
+        assert!(
+            shared.save_account(&duplicate).await.is_err(),
+            "migration must retain the UID proof after the current token omits it"
+        );
+        assert!(
+            shared.load_account("duplicate").await.unwrap().is_none(),
+            "refusal must roll back account creation"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_migration_preserves_claim_history_after_legacy_account_cascade() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[23; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("retained-uid"))});
+        shared.save_account(&original).await.unwrap();
+        original.revision = 2;
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        // An installed migration-4 FK must remain compatible. Its cascade may
+        // remove the legacy projection, but cannot erase authoritative history.
+        control.batch_execute("ALTER TABLE central_account_claims DROP CONSTRAINT IF EXISTS central_account_claims_account_id_fkey; ALTER TABLE central_account_claims ADD CONSTRAINT central_account_claims_account_id_fkey FOREIGN KEY(account_id) REFERENCES central_accounts(account_id) ON DELETE CASCADE").await.unwrap();
+        control
+            .batch_execute("DROP TABLE IF EXISTS central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress")
+            .await
+            .unwrap();
+        shared.migrate().await.unwrap();
+        shared.migrate().await.unwrap();
+        control
+            .execute(
+                "DELETE FROM central_accounts WHERE account_id='original'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let mut copy = record("copy", 1);
+        copy.workspace = Some("claim-workspace".into());
+        copy.login = None;
+        copy.vault = serde_json::json!({"auth":claims_auth(None,Some("retained-uid"))});
+        assert!(
+            shared.save_account(&copy).await.is_err(),
+            "a legacy cascade must not free a retained identity claim"
+        );
+        assert!(shared.load_account("copy").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_account_save_ignores_only_its_own_identity_reservation() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[24; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        control.batch_execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload) VALUES('user','own-reservation','original','original','machine','candidate','holder',clock_timestamp()+interval '30 seconds','\\x00'); INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES('claim-workspace','sub','stable-sub','user','own-reservation')").await.unwrap();
+        original.revision = 2;
+        shared
+            .save_account(&original)
+            .await
+            .expect("the selected account must not conflict with its own reservation");
+        assert_eq!(
+            shared
+                .load_account("original")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
+        let mut copy = original.clone();
+        copy.account_id = "copy".into();
+        copy.alias = "copy".into();
+        copy.revision = 1;
+        assert!(
+            shared.save_account(&copy).await.is_err(),
+            "another account remains fenced"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_current_identity_helpers_exclude_deleted_accounts_but_retain_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[30; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut saved = record("deleted-seat", 1);
+        saved.workspace = Some("claim-workspace".into());
+        saved.login = Some("stable-sub".into());
+        saved.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("stable-uid"))});
+        shared.save_account(&saved).await.unwrap();
+        let sql = "SELECT central_login_identity_agrees('claim-workspace','stable-uid','stable-sub','deleted-seat'),central_login_identity_matches('claim-workspace','stable-uid','stable-sub','deleted-seat'),central_login_identity_agrees('claim-workspace','{\"uid\":\"stable-uid\",\"sub\":\"stable-sub\"}'::jsonb,'deleted-seat'),central_login_identity_matches('claim-workspace','{\"uid\":\"stable-uid\",\"sub\":\"stable-sub\"}'::jsonb,'deleted-seat')";
+        let live = control.query_one(sql, &[]).await.unwrap();
+        for column in 0..4 {
+            assert!(live.get::<_, bool>(column));
+        }
+        control.execute("UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='deleted-seat'", &[]).await.unwrap();
+        let deleted = control.query_one(sql, &[]).await.unwrap();
+        for column in 0..4 {
+            assert!(
+                !deleted.get::<_, bool>(column),
+                "deleted accounts cannot match current operations"
+            );
+        }
+        saved.account_id = "copy".into();
+        saved.alias = "copy".into();
+        assert!(
+            shared.save_account(&saved).await.is_err(),
+            "deletion must not free retained proof"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_migration_rolls_back_layout_when_schema_version_recording_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[29; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        control.batch_execute("DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress; ALTER TABLE central_login_operations ALTER COLUMN account_id SET NOT NULL; CREATE FUNCTION fail_schema_version() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=6 THEN RAISE EXCEPTION 'synthetic schema version failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_schema_version BEFORE INSERT ON central_schema_migrations FOR EACH ROW EXECUTE FUNCTION fail_schema_version()").await.unwrap();
+        assert!(shared.migrate().await.is_err());
+        let unchanged = control.query_one("SELECT (SELECT max(version) FROM central_schema_migrations), (SELECT attnotnull FROM pg_attribute WHERE attrelid='central_login_operations'::regclass AND attname='account_id'), to_regclass('central_identity_migration_progress') IS NULL", &[]).await.unwrap();
+        assert_eq!(unchanged.get::<_, i32>(0), 3);
+        assert!(unchanged.get::<_, bool>(1), "failed layout must roll back");
+        assert!(
+            unchanged.get::<_, bool>(2),
+            "failed source fence must roll back"
+        );
+        control
+            .batch_execute("DROP TRIGGER fail_schema_version ON central_schema_migrations")
+            .await
+            .unwrap();
+        shared.migrate().await.unwrap();
+        shared.require_identity_ready().await.unwrap();
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_identity_migration_bounds_each_committed_backfill_batch() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[25; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        for index in 0..100 {
+            let mut saved = record(&format!("batch-{index:03}"), 1);
+            saved.workspace = Some("claim-workspace".into());
+            saved.login = Some(format!("batch-sub-{index:03}"));
+            saved.vault = serde_json::json!({"auth":claims_auth(saved.login.as_deref(),Some(&format!("batch-uid-{index:03}")))});
+            shared.save_account(&saved).await.unwrap();
+        }
+        // Simulate the supported legacy database before migration readiness.
+        control.batch_execute("TRUNCATE central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE IF EXISTS central_identity_migration_progress").await.unwrap();
+        control.batch_execute("CREATE TABLE batch_observations(xid BIGINT PRIMARY KEY,claim_writes INTEGER NOT NULL); CREATE FUNCTION check_batch_bound() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE writes INTEGER; BEGIN INSERT INTO batch_observations VALUES(txid_current(),1) ON CONFLICT(xid) DO UPDATE SET claim_writes=batch_observations.claim_writes+1 RETURNING claim_writes INTO writes; IF writes>64 THEN RAISE EXCEPTION 'migration transaction exceeded bounded claim work'; END IF; RETURN NEW; END $$; CREATE TRIGGER check_batch_bound BEFORE INSERT ON central_account_identity_claims FOR EACH ROW EXECUTE FUNCTION check_batch_bound()").await.unwrap();
+        shared
+            .migrate()
+            .await
+            .expect("migration must commit bounded batches rather than the entire inventory");
+        let observed = control
+            .query_one(
+                "SELECT count(*),max(claim_writes) FROM batch_observations",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            observed.get::<_, i64>(0) > 1,
+            "inventory must span several committed transactions"
+        );
+        assert!(observed.get::<_, i32>(1) <= 64);
+        let retained: i64 = control
+            .query_one(
+                "SELECT count(*) FROM central_account_identity_claims WHERE deleted_at IS NULL",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            retained, 200,
+            "all UID and subject facts survive the bounded copy"
+        );
+        shared.migrate().await.unwrap();
+        assert_eq!(
+            control
+                .query_one("SELECT count(*) FROM central_account_identity_claims", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            200
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_identity_migration_resumes_after_a_failed_batch_before_readiness() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[26; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        for index in 0..50 {
+            let mut saved = record(&format!("resume-{index:03}"), 1);
+            saved.workspace = Some("claim-workspace".into());
+            saved.login = Some(format!("resume-sub-{index:03}"));
+            saved.vault = serde_json::json!({"auth":claims_auth(saved.login.as_deref(),Some(&format!("resume-uid-{index:03}")))});
+            shared.save_account(&saved).await.unwrap();
+        }
+        control.batch_execute("TRUNCATE central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress; CREATE FUNCTION fail_second_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.claim='resume-sub-040' THEN RAISE EXCEPTION 'synthetic migration interruption'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_second_batch BEFORE INSERT ON central_account_identity_claims FOR EACH ROW EXECUTE FUNCTION fail_second_batch()").await.unwrap();
+        assert!(shared.migrate().await.is_err());
+        assert!(
+            shared.require_identity_ready().await.is_err(),
+            "a partial migration must not enable serving"
+        );
+        let partial: i64 = control
+            .query_one("SELECT count(*) FROM central_account_identity_claims", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            partial > 0 && partial < 100,
+            "the earlier batch commits while the interrupted one rolls back"
+        );
+        let checkpoint: i64 = control
+            .query_one(
+                "SELECT records FROM central_identity_migration_progress WHERE stage='claims'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(checkpoint, partial, "proof and progress commit together");
+        assert!(
+            control
+                .execute(
+                    "UPDATE central_accounts SET revision=revision+1 WHERE account_id='resume-000'",
+                    &[]
+                )
+                .await
+                .is_err(),
+            "source mutations must refuse while cutover is incomplete"
+        );
+        control
+            .batch_execute("DROP TRIGGER fail_second_batch ON central_account_identity_claims")
+            .await
+            .unwrap();
+        shared.migrate().await.unwrap();
+        shared.require_identity_ready().await.unwrap();
+        control
+            .batch_execute("SET search_path TO pg_catalog")
+            .await
+            .unwrap();
+        let allowed=control.execute(&format!("UPDATE {schema}.central_accounts SET revision=revision WHERE account_id='resume-000'"),&[]).await;
+        control
+            .batch_execute(&format!("SET search_path TO {schema}"))
+            .await
+            .unwrap();
+        allowed.expect("the schema-qualified trigger must use its own migration state");
+        assert_eq!(
+            control
+                .query_one("SELECT count(*) FROM central_account_identity_claims", &[])
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            100
+        );
+        assert_eq!(
+            shared
+                .load_account("resume-000")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_migration_preserves_legacy_candidate_proof_and_receipt_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[27; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut saved = record("legacy-seat", 1);
+        saved.workspace = Some("claim-workspace".into());
+        saved.login = Some("stable-sub".into());
+        saved.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&saved).await.unwrap();
+        let grant = claims_auth(Some("stable-sub"), Some("candidate-uid"));
+        let payload = vault::encrypt_bytes(
+            &key,
+            &serde_json::to_vec(&serde_json::json!({"candidate":grant})).unwrap(),
+        )
+        .unwrap();
+        control.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,sequence,holder_id,epoch,expires_at,encrypted_payload,candidate_workspace,candidate_login) VALUES('user','legacy-operation','legacy-seat','seat','machine','rejected',42,'old-holder',7,clock_timestamp()-interval '1 second',$1,'claim-workspace','stable-sub')",&[&payload]).await.unwrap();
+        control.batch_execute("INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES('claim-workspace','uid','candidate-uid','user','legacy-operation'),('claim-workspace','sub','stable-sub','user','legacy-operation'); DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress").await.unwrap();
+        shared.migrate().await.unwrap();
+        shared.migrate().await.unwrap();
+        let migrated = shared
+            .login_get("user", "legacy-operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.phase, login::LoginPhase::Rejected);
+        assert_eq!(migrated.sequence, 42);
+        assert_eq!(migrated.epoch, 7);
+        assert_eq!(migrated.payload.candidate, Some(grant));
+        let typed=control.query_one("SELECT candidate_uid,candidate_sub FROM central_login_operations WHERE id='legacy-operation'",&[]).await.unwrap();
+        assert_eq!(typed.get::<_, String>(0), "candidate-uid");
+        assert_eq!(typed.get::<_, String>(1), "stable-sub");
+        let legacy=control.query_one("SELECT account_id,encrypted_payload,sequence FROM central_login_operations WHERE id='legacy-operation'",&[]).await.unwrap();
+        assert_eq!(legacy.get::<_, String>(0), "legacy-seat");
+        assert_eq!(legacy.get::<_, Vec<u8>>(1), payload);
+        assert_eq!(legacy.get::<_, i64>(2), 42);
+        assert!(
+            shared
+                .acquire_lease("legacy-seat", "new-owner", Duration::from_secs(60))
+                .await
+                .is_err(),
+            "expired rejected evidence keeps refresh fenced"
+        );
+        assert_eq!(control.query_one("SELECT count(*) FROM central_login_identity_reservations WHERE deleted_at IS NULL",&[]).await.unwrap().get::<_,i64>(0),2);
+        assert_eq!(control.query_one("SELECT count(*) FROM central_login_identity_reservation_history WHERE deleted_at IS NULL",&[]).await.unwrap().get::<_,i64>(0),2);
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_identity_migration_refuses_inventory_above_the_row_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[28; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared.save_account(&record("guard-seat", 1)).await.unwrap();
+        let payload = vault::encrypt_bytes(&key, b"{}").unwrap();
+        control.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload) SELECT 'user',lpad(to_hex(i),64,'0'),'guard-seat','seat','machine','completed','old-holder',clock_timestamp(),$1 FROM generate_series(1,5001) i",&[&payload]).await.unwrap();
+        control.batch_execute("DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress").await.unwrap();
+        let error = shared
+            .migrate()
+            .await
+            .expect_err("over-budget source inventory must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("identity migration inventory exceeds 5000 source rows"),
+            "{error:#}"
+        );
+        assert!(shared.require_identity_ready().await.is_err());
+        assert_eq!(
+            control
+                .query_one(
+                    "SELECT count(*) FROM central_login_operations WHERE candidate_uid IS NOT NULL",
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            0
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_fenced_writes_preserve_each_learned_login_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[22; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        let lease = shared
+            .acquire_lease("original", "holder", Duration::from_secs(60))
+            .await
+            .unwrap();
+        for (revision, uid) in [(2, Some("learned-uid")), (3, None)] {
+            original.revision = revision;
+            original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),uid)});
+            assert!(shared.fenced_write(&lease, &original).await.unwrap());
+        }
+        original.revision = 4;
+        original.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("conflicting-uid"))});
+        assert!(
+            !shared.fenced_write(&lease, &original).await.unwrap(),
+            "a learned UID must not change even if the subject agrees"
+        );
+        assert_eq!(
+            shared
+                .load_account("original")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            3
+        );
+        let mut duplicate = record("duplicate", 1);
+        duplicate.workspace = Some("claim-workspace".into());
+        duplicate.login = None;
+        duplicate.vault = serde_json::json!({"auth":claims_auth(None,Some("learned-uid"))});
+        assert!(
+            shared.save_account(&duplicate).await.is_err(),
+            "fenced credential writes must retain learned UID proof"
+        );
+        assert!(shared.load_account("duplicate").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
     async fn postgres_real_store_scenarios() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1998,6 +2589,7 @@ mod tests {
         let first = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
             .await
             .unwrap();
+        let (first, control, schema) = first.isolated_test_schema().await.unwrap();
         first.migrate().await.unwrap();
         if let CentralStore::Postgres(db) = &first {
             let client = db.client().await.unwrap();
@@ -2032,9 +2624,12 @@ mod tests {
         assert_eq!(imported.vault["revision"], serde_json::json!(1));
         let repeated = first.backfill(root.path(), &key).await.unwrap();
         assert_eq!(repeated.accounts, 0);
-        let second = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
-            .await
-            .unwrap();
+        let mut second = first.clone();
+        if let CentralStore::Postgres(db) = &mut second {
+            db.client = Arc::new(tokio::sync::Mutex::new(None));
+            db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+            db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        }
         let id = format!(
             "test-{}",
             vault::digest(&crate::central::enrollment::random_bytes())
@@ -2337,5 +2932,9 @@ mod tests {
                 .await
                 .unwrap();
         }
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

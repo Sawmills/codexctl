@@ -121,10 +121,18 @@ type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
 pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
-    vault::account(left).ok() == vault::account(right).ok()
-        && api::token_subject(vault::token(left).unwrap_or(""))
-            == api::token_subject(vault::token(right).unwrap_or(""))
+    if vault::account(left).ok() != vault::account(right).ok() {
+        return false;
+    }
+    let left = api::token_logins(vault::token(left).unwrap_or(""));
+    let right = api::token_logins(vault::token(right).unwrap_or(""));
+    let uid = left.uid.as_ref().zip(right.uid.as_ref());
+    let sub = left.sub.as_ref().zip(right.sub.as_ref());
+    uid.is_some_and(|(a, b)| a == b)
+        || sub.is_some_and(|(a, b)| a == b)
+        || (uid.is_none() && sub.is_none())
 }
+
 #[derive(Clone)]
 pub(super) struct Broker {
     pub state: PathBuf,
@@ -381,9 +389,26 @@ impl Broker {
         {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
-        let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-            .clear_for_launch(owner, relogin::AdmissionKind::Restore, &imports)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        let inventory = relogin::identity_inventory(&owner.state, &self.key, &owner.home);
+        let proof = if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+        {
+            let identities = central
+                .retained_identities()
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            inventory.clear_for_shared_launch(
+                owner,
+                relogin::AdmissionKind::Restore,
+                &imports,
+                &identities,
+            )
+        } else {
+            inventory.clear_for_launch(owner, relogin::AdmissionKind::Restore, &imports)
+        }
+        .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         spawn_owner(owner, &self.binary, proof)
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         // Admission and PID evidence are complete. Initialization is covered by
@@ -749,6 +774,11 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
+    // Failed startup preparation has no trustworthy revision baseline. Keep
+    // its retained evidence quarantined instead of repairing it through a token request.
+    if owner.routing_refused && owner.shared_revision.is_none() {
+        return Ok(false);
+    }
     // Local snapshots can advance without publication. Renewal evidence must
     // be newer than the last shared revision, not the unpublished local one.
     let shared_revision = owner.shared_revision.unwrap_or(owner.vault.revision);
@@ -771,6 +801,30 @@ async fn reconcile_owner_from_central(
             .persist_shared_revision(record.revision)
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
         return Ok(false);
+    }
+    if central.mode() == super::storage::StoreMode::Postgres {
+        let identities = central
+            .retained_identities()
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        let agreement = (|| -> Result<()> {
+            let identity = identities
+                .get(account_id)
+                .context("completed login identity missing")?;
+            identity.validate(&owner.vault.auth)?;
+            identity.validate(&committed.auth)?;
+            if owner.home.try_exists()? {
+                previous_owner_exited(&owner.home)?;
+                identity.validate(&retained_auth(&owner.home)?)?;
+            }
+            Ok(())
+        })();
+        if agreement.is_err() {
+            owner.available = false;
+            owner.routing_refused = true;
+            owner.shared_revision = None;
+            return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        }
     }
     vault::save(&owner.state, &owner.key, &committed)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
@@ -1867,6 +1921,12 @@ async fn import(
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
+    fn storage_admission_failure(&self, error: anyhow::Error) -> HttpError {
+        match error.downcast_ref::<super::storage::identity::IdentityDenied>() {
+            Some(denied) => self.error(StatusCode::CONFLICT, denied.reason()),
+            None => self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"),
+        }
+    }
     async fn lock_import_owner<'a>(
         &self,
         owner: &'a Mutex<Owner>,
@@ -1928,7 +1988,29 @@ impl Broker {
         {
             return Err(self.error(StatusCode::CONFLICT, "alias_renamed"));
         }
+        if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            && central
+                .renamed_alias(user, &input.alias)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+                .is_some()
+        {
+            return Err(self.error(StatusCode::CONFLICT, "alias_renamed"));
+        }
         let id = resolved.unwrap_or_else(|| account_key(user, &input.alias));
+        if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+        {
+            central
+                .check_import_identity(&id, &input.auth)
+                .await
+                .map_err(|error| self.storage_admission_failure(error))?;
+        }
         let selected = self.state.join("accounts").join(&id);
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -2029,13 +2111,36 @@ impl Broker {
                 }
             }
         }
-        let admission = relogin::clear_registry(
-            &self.state.join("accounts"),
-            &self.key,
-            &selected,
-            &input.auth,
-            relogin::AdmissionKind::Migration,
-        )
+        let identities =
+            if let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            {
+                Some(central.retained_identities().await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?)
+            } else {
+                None
+            };
+        let admission = if let Some(identities) = identities.as_ref() {
+            relogin::clear_shared_registry(
+                &self.state.join("accounts"),
+                &self.key,
+                &selected,
+                &input.auth,
+                relogin::AdmissionKind::Migration,
+                identities,
+            )
+        } else {
+            relogin::clear_registry(
+                &self.state.join("accounts"),
+                &self.key,
+                &selected,
+                &input.auth,
+                relogin::AdmissionKind::Migration,
+            )
+        }
         .map_err(
             |error| match error.downcast_ref::<relogin::AdmissionDenied>() {
                 Some(relogin::AdmissionDenied::Reserved) => {
@@ -2183,9 +2288,10 @@ impl Broker {
                     revision: saved.revision.max(1),
                 };
                 if let Some(central) = self.central.as_ref() {
-                    central.save_account(&owner_record).await.map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                    })?;
+                    central
+                        .save_account(&owner_record)
+                        .await
+                        .map_err(|error| self.storage_admission_failure(error))?;
                 }
             }
         } else {
@@ -2218,9 +2324,10 @@ impl Broker {
                 revision: vault.revision.max(1),
             };
             if let Some(central) = self.central.as_ref() {
-                central.save_account(&owner_record).await.map_err(|_| {
-                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?;
+                central
+                    .save_account(&owner_record)
+                    .await
+                    .map_err(|error| self.storage_admission_failure(error))?;
             }
         }
         let owner = Arc::new(Mutex::new(
@@ -2345,9 +2452,25 @@ impl Broker {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
             // The imports guard was acquired before the new Owner guard.
-            let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, import_guard)
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            let inventory = relogin::identity_inventory(&owner.state, &self.key, &owner.home);
+            let proof = if let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            {
+                let identities = central.retained_identities().await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                inventory.clear_for_shared_launch(
+                    &owner,
+                    relogin::AdmissionKind::Migration,
+                    import_guard,
+                    &identities,
+                )
+            } else {
+                inventory.clear_for_launch(&owner, relogin::AdmissionKind::Migration, import_guard)
+            }
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut owner, &self.binary, proof)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
@@ -2627,6 +2750,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
             format!("codexctl_central_failed_requests_total{{reason=\"{reason}\"}} {}\ncodexctl_central_last_failure_timestamp_seconds{{reason=\"{reason}\"}} {}\n", count.count, count.last)
         })
         .collect();
+    output.push_str(&super::storage::identity::admission_metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
@@ -2681,16 +2805,84 @@ pub(super) fn readiness(broker: &Broker) -> StatusCode {
     }
 }
 
-async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> Result<()> {
+async fn hydrate_accounts(
+    state: &Path,
+    key: &Path,
+    central: &CentralStore,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut quarantined = std::collections::BTreeSet::new();
+    let identities = if central.mode() == super::storage::StoreMode::Postgres {
+        Some(central.retained_identities().await?)
+    } else {
+        None
+    };
     for record in central.list_accounts().await? {
         let account_vault: Vault = serde_json::from_value(record.vault.clone())?;
         vault::validate_auth(&account_vault.auth)?;
-        let account_state = state
-            .join("accounts")
-            .join(account_key(&account_vault.user, &account_vault.alias));
+        let id = account_key(&account_vault.user, &account_vault.alias);
+        let account_state = state.join("accounts").join(&id);
         let replace = if account_state.join("vault.enc").exists() {
             let local = vault::load(&account_state, key)?;
-            local.revision < record.revision
+            let baseline = match Owner::read_shared_revision(&account_state) {
+                Ok(revision) => Some(revision.unwrap_or(local.revision)),
+                Err(_) => {
+                    quarantined.insert(id.clone());
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"account_reconcile","stage":"startup","reason":"shared_revision_unreadable"})
+                    );
+                    None
+                }
+            };
+            let renewed = if let Some(baseline) = baseline {
+                identities.is_some()
+                    && account_vault.verified
+                    && !account_vault.import_rejected
+                    && record.revision > baseline
+                    && central
+                        .login_completed_after(&record.account_id, baseline, record.revision)
+                        .await?
+            } else {
+                false
+            };
+            let home = account_state.join("runtime");
+            let advance = local.revision < record.revision || renewed;
+            if let Some(identities) = identities.as_ref() {
+                let agreement = (|| -> Result<()> {
+                    let identity = identities
+                        .get(&record.account_id)
+                        .context("shared identity missing")?;
+                    identity.validate(&local.auth)?;
+                    identity.validate(&account_vault.auth)?;
+                    if home.try_exists()? {
+                        identity.validate(&retained_auth(&home)?)?;
+                        if advance {
+                            previous_owner_exited(&home)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                if agreement.is_err() {
+                    quarantined.insert(id.clone());
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"account_reconcile","stage":"startup","reason":"journal_identity_unresolved"})
+                    );
+                    false
+                } else if quarantined.contains(&id) || !advance {
+                    false
+                } else {
+                    if renewed && home.try_exists()? {
+                        store::atomic_write(
+                            &home.join("auth.json"),
+                            &serde_json::to_vec(&account_vault.auth)?,
+                        )?;
+                    }
+                    true
+                }
+            } else {
+                !quarantined.contains(&id) && advance
+            }
         } else {
             true
         };
@@ -2699,7 +2891,7 @@ async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> R
             vault::save(&account_state, key, &account_vault)?;
         }
     }
-    Ok(())
+    Ok(quarantined)
 }
 
 pub(super) fn retained_auth(home: &Path) -> Result<Value> {
@@ -2997,23 +3189,49 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             {
                 None
             } else {
-                let result =
-                    match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
-                        .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
-                    {
-                        Ok(proof) => {
-                            let spawned = spawn_owner(&mut owner, &broker.binary, proof);
-                            drop(imports);
-                            match spawned {
-                                Ok(()) => initialize_owner(&mut owner).await,
-                                Err(error) => Err(error),
+                let identities = if let Some(central) = central
+                    .as_ref()
+                    .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+                {
+                    central.retained_identities().await.map(Some)
+                } else {
+                    Ok(None)
+                };
+                let result = match identities {
+                    Err(error) => Err(error),
+                    Ok(identities) => {
+                        let inventory =
+                            relogin::identity_inventory(&owner.state, &owner.key, &owner.home);
+                        let clearance = if let Some(identities) = identities.as_ref() {
+                            inventory.clear_for_shared_launch(
+                                &owner,
+                                relogin::AdmissionKind::Restore,
+                                &imports,
+                                identities,
+                            )
+                        } else {
+                            inventory.clear_for_launch(
+                                &owner,
+                                relogin::AdmissionKind::Restore,
+                                &imports,
+                            )
+                        };
+                        match clearance {
+                            Ok(proof) => {
+                                let spawned = spawn_owner(&mut owner, &broker.binary, proof);
+                                drop(imports);
+                                match spawned {
+                                    Ok(()) => initialize_owner(&mut owner).await,
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => {
+                                owner.routing_refused = true;
+                                Err(error)
                             }
                         }
-                        Err(error) => {
-                            owner.routing_refused = true;
-                            Err(error)
-                        }
-                    };
+                    }
+                };
                 Some(result)
             }
         };
@@ -3288,9 +3506,12 @@ pub async fn serve(
         CentralStore::File(_) => None,
         store => Some(store),
     };
-    if let Some(central) = central.as_ref() {
-        hydrate_accounts(state, key, central).await?;
-    }
+    let hydration_quarantines = if let Some(central) = central.as_ref() {
+        central.require_identity_ready().await?;
+        hydrate_accounts(state, key, central).await?
+    } else {
+        Default::default()
+    };
     let listener = tokio::net::TcpListener::bind(address).await?;
     users(state)?;
     vault::devices(state)?;
@@ -3373,9 +3594,8 @@ pub async fn serve(
         if repair.verify {
             repairing.insert(id.clone());
         }
-        let prepared = if pending && matches!(entry.path().join("runtime").try_exists(), Ok(false))
-        {
-            Err(anyhow::anyhow!("candidate has not started"))
+        let prepared = if hydration_quarantines.contains(&id) {
+            Err(anyhow::anyhow!("shared hydration identity unresolved"))
         } else {
             // Shared-store replicas hydrate credentials without starting a native
             // refresh owner. The token path acquires the account's database lease
@@ -3403,7 +3623,7 @@ pub async fn serve(
                     retry_failures: 0,
                     recovery_generation: 0,
                     shared_revision: None,
-                    routing_refused: false,
+                    routing_refused: true,
                     refresh_enabled: false,
                     limits: None,
                     limits_observed: None,

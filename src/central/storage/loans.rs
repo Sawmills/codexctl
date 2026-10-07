@@ -43,11 +43,10 @@ macro_rules! audit_columns_as_a {
     };
 }
 
-// Servers can start together. The transaction-scoped advisory lock makes
-// concurrent `CREATE ... IF NOT EXISTS` runs wait instead of racing.
+// The caller owns the schema transaction. The transaction-scoped advisory lock
+// makes concurrent `CREATE ... IF NOT EXISTS` runs wait instead of racing.
 pub(super) const SCHEMA: &str = concat!(
-    "BEGIN;
-SELECT pg_advisory_xact_lock(hashtext('codexctl.account_loans.schema'));
+    "SELECT pg_advisory_xact_lock(hashtext('codexctl.account_loans.schema'));
 CREATE TABLE IF NOT EXISTS ",
     loans_table!(),
     " (
@@ -107,7 +106,6 @@ CREATE INDEX IF NOT EXISTS account_loan_audit_grant_idx ON ",
 CREATE INDEX IF NOT EXISTS account_loan_audit_retire_idx ON ",
     audit_table!(),
     " (at) WHERE deleted_at IS NULL;
-COMMIT;
 "
 );
 

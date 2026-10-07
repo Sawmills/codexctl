@@ -53,11 +53,11 @@ replace a concurrent revoke, enrollment, or re-enable. Dual mode is retained
 only for explicit migration commands and still requires
 `CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
-The phase-3 PostgreSQL server fails closed for enrollment, reset listing and redemption,
-and relogin endpoints. Their browser sessions, reset journals, and operation
-records remain file-backed, so they are not safe behind a multi-replica
-service. Keep those workflows on the single file-mode writer until phase 4
-adds shared TTL/one-time-consume and operation-record tables. Shared-store startup
+The PostgreSQL server supports shared add and renewal receipts, status, and
+cancellation. Enrollment and reset listing/redemption remain unavailable in
+shared mode. Their browser sessions and reset journals remain file-backed.
+Keep those workflows on the single file-mode writer until their shared storage
+is complete. Shared-store startup
 also fences retained relogin operations that still need replacement verification
 (`Promoted` or unfinished `Retiring`). Complete those operations on the file-mode
 writer before migration; shared mode does not verify them through ordinary token
@@ -72,6 +72,85 @@ hostname verification stay enabled; the image system bundle lacks the RDS root.
 Complete the CA reconciliation gate in section 5 before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
+
+Migration 4 adds add admission and unique identity claims. The mounted vault key
+lets migration populate those claims from existing encrypted credentials. It
+retains both UID and subject facts, including claims omitted by later tokens.
+A conflict stops migration before readiness. Keep writers drained and preserve
+the source and partial results for operator reconciliation before retrying.
+Backfill copies file-mode rename tombstones into PostgreSQL. Every replica
+refuses add or import under a retired alias.
+
+Migration 5 adds logical release markers, reservation history, and typed
+candidate UID and subject columns. It copies migration-4 claims into
+`central_account_identity_claims`, an independent ownership ledger without an
+account foreign key. An old account cascade cannot erase this proof. The old
+claim table remains a compatibility projection. Both tables retain the full
+workspace/namespace/claim key. Active reads require `deleted_at IS NULL`;
+archiving a claim does not permit another account to take its historical key.
+Alias tombstones remain active permanent fences. Completed reservations retain
+release timestamps. A released full-key slot can be reused, while
+`central_login_identity_reservation_history` keeps one row per claim and login
+operation. Completion releases slots and history in the same transaction.
+Migration copies surviving rows only; it cannot recover previously deleted
+history. Drain migration-4 writers before migration and deploy this version to
+all replicas before resuming writes. Mixed writer versions are not supported.
+
+Schema 6 records the layout version in the schema transaction. Every binary
+checks the highest stored version when it opens a PostgreSQL backend. It refuses
+a newer version with `schema vN is newer than this binary; upgrade
+codexctl-central`. The PR1 schema from #143 was never deployed anywhere, so no
+pre-change PostgreSQL reader exists. Pending add receipts can therefore use a
+nullable account ID in the shared journal. Later binaries must keep the version
+gate; no flag bypasses it.
+
+Identity backfill commits at most 32 source rows and 8 MiB of encrypted payload
+per batch. It reads indexed high-water keys, decrypts outside admission, and
+commits proof and the last key together. Each database batch has a two-second
+limit; each migration invocation has a five-minute maintenance budget. Resume
+with the same `migrate` command and vault key after a failed batch or elapsed
+budget. Completed batches remain committed; the interrupted batch rolls back.
+
+A hard guard accepts at most 5,000 source rows in total: retained legacy claims,
+live accounts, all shared login operations, and identity-reservation slots. It
+counts at most one row beyond the bound before backfill and records that accepted
+inventory for restart. Above the bound, migration refuses with `identity
+migration inventory exceeds 5000 source rows; keep writers drained`. This bound
+covers PostgreSQL identity backfill, not the separate file-import command.
+
+Drain every writer, including device login and refresh children, before migration.
+A database fence refuses source writes while readiness is incomplete. The layout
+version alone does not enable serving. A separate final readiness checkpoint
+requires all four inventories to complete; cutover reads only those bounded
+checkpoints under admission. The server refuses startup before that checkpoint.
+Staging must record its source counts and elapsed maintenance time within these
+bounds before resuming writers. These local limits do not establish production
+throughput or approve the B33 cutover.
+
+Add, renewal candidate publication, credential writes, and migration take one
+transaction advisory lock for their PostgreSQL schema. Lock order starts with
+that admission lock, then the operation or account rows and refresh lease as
+needed. No native child or provider call runs inside admission. Fresh database
+time fences writes after lock waits. A unique workspace/namespace/claim key
+prevents duplicate identity ownership; operation reservations refuse a second
+matching login with `relogin_reserved`. Add creates the unverified account and
+transfers its reservation together, then uses the fenced renewal verifier.
+Same-user landing keeps the existing alias and label. Completion publishes
+credentials, revision, receipt, and reservation release together. The machine
+must remain authorized at admission. A fresh add can repair a rejected add
+when its retained identity agrees with the existing account. A timed-out
+admission reads the settled transaction before verification, so a committed
+account does not leave its operation stuck at the old sequence.
+
+The `/metrics` endpoint reports process-wide
+`codexctl_central_admission_lock_seconds_sum` and
+`codexctl_central_admission_lock_seconds_count`. These count client-observed
+transaction hold time after acquiring the lock, including failed attempts.
+They exclude connection and advisory-lock waits. A timed-out commit can keep
+running after the client observation ends. Use the sum/count rates and the
+existing staging workload gates to measure admission cost before a lock or
+connection-pool redesign. Local tests verify that stalled native verification
+does not hold this lock; they do not establish production throughput.
 
 Expired device-polling receipts now report `expired` and permit a new request
 ID. Expiry retains a company-user fence when child exit and grant absence are
@@ -477,9 +556,9 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
    ```
 
-   The HA service accepts token, registry, and existing-account login renewal
-   operations. Renewal status and cancellation use shared PostgreSQL journals.
-   Enrollment, reset redemption, and add-account remain unavailable. Renewal
+   The HA service accepts token, registry, add, and login renewal operations.
+   Login status and cancellation use shared PostgreSQL journals and identity
+   reservations. Enrollment and reset redemption remain unavailable. Automatic
    crash/takeover recovery is still pending in SAW-12484 PR3; this intermediate
    release does not authorize the B33 cutover.
 

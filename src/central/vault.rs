@@ -150,7 +150,7 @@ fn open_lock(state: &Path, name: &str) -> Result<File> {
     Ok(options.open(path)?)
 }
 
-fn cipher(key: &Path) -> Result<Aes256Gcm> {
+pub(super) fn cipher(key: &Path) -> Result<Aes256Gcm> {
     let bytes = private_read(key)?;
     Aes256Gcm::new_from_slice(&bytes)
         .map_err(|_| anyhow::anyhow!("vault key must contain exactly 32 bytes"))
@@ -173,10 +173,14 @@ pub(super) fn encrypt_bytes(key: &Path, plaintext: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub(super) fn decrypt_bytes(key: &Path, bytes: &[u8]) -> Result<Vec<u8>> {
+    decrypt_with_cipher(&cipher(key)?, bytes)
+}
+
+pub(super) fn decrypt_with_cipher(cipher: &Aes256Gcm, bytes: &[u8]) -> Result<Vec<u8>> {
     if bytes.len() < 28 {
         bail!("encrypted value is truncated");
     }
-    cipher(key)?
+    cipher
         .decrypt(bytes[..12].into(), &bytes[12..])
         .map_err(|_| anyhow::anyhow!("vault authentication failed"))
 }
@@ -239,7 +243,7 @@ pub fn validate_auth(auth: &Value) -> Result<()> {
     {
         bail!("server auth must include a refresh token");
     }
-    if api::token_subject(token(auth)?).is_none() {
+    if api::token_logins(token(auth)?).is_empty() {
         bail!("server auth must identify its login");
     }
     Ok(())
