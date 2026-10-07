@@ -1389,10 +1389,14 @@ async fn interrupted_verification(cancel: bool) {
         f.control.execute(&format!("UPDATE {}.account_refresh_leases SET epoch=epoch+1,holder_id='replacement',expires_at=clock_timestamp() WHERE account_id=$1",f.schema),&[&account_key("test","seat")]).await.unwrap();
     }
     wait_dead(pid["pid"].as_u64().unwrap() as u32).await;
-    assert_eq!(
-        login_request(&f, &f.second, "status", &id).await["status"],
-        "failed"
-    );
+    // Native exit precedes the shared status write. Observe both boundaries.
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "failed" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("interrupted verification must publish its unresolved status");
     assert_eq!(
         request(&f.http, &f.second, &f.token).await.status(),
         503,
