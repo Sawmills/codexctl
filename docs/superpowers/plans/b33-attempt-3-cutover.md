@@ -12,7 +12,7 @@ Attempt 2 merged the writer stop (#130), and Argo scaled `codexctl-0` to zero. T
 
 1. **SAW-12484 merged and deployed in one image.** PR1 renewal (#143, merged `09ad744`), PR2 add-account in PostgreSQL mode, PR3 crash and takeover recovery. Section 4 of `central-ha.md` still says the intermediate release "does not authorize the B33 cutover"; PR3 must remove that line, or HQ records why it stands.
 2. **Image pin.** One `Central server image` run on a main commit that contains PR3. Its digest goes into the HA Deployment and both Jobs. The staging-ha overlay pins `sha256:ecf8c1db…` and the Jobs in `central-ha.md` pin `sha256:2dfcb874…`; both are stale.
-3. **Database.** `ExternalSecret/codexctl-postgres` is `Ready=True` (true on 2026-10-07) and the database holds no rows from an earlier attempt, or the operator records the counts before the backfill.
+3. **Database.** `ExternalSecret/codexctl-postgres` is `Ready=True` (true on 2026-10-07), and the target database is empty. A count receipt is not enough: `backfill` skips an account whose stored revision is at least the file revision and ignores user and device conflicts (`src/central/storage.rs`), so stale database rows survive it. The operator proves emptiness with the read-only [count query](#read-only-queries) before step 4. If any codexctl table holds a row, stop; resetting the database is a separate HQ decision with the infra owner.
 4. **Operator.** One Claude Code session named by HQ, not a Codex lane. Its credentials: AWS SSO (`plat-staging/AdministratorAccess` through `kubie`) for Kubernetes, the repository `gh` identity for merges, nothing from codexctl. Its claudectl account must not depend on the window. HQ checks this before the notice.
 5. **Amir reachable** for the whole window. Only he can approve device codes, and a late rollback needs them.
 6. **No other staging change in the window:** no image pin, no SSO cutover (SAW-12467), no loan or rename work.
@@ -35,7 +35,7 @@ PR H must not remove `PrometheusRule/codexctl` or `ScrapeConfig/codexctl`: the s
 1. **Notice.** Send the fleet notice through the guide `w9C:tC` at least 15 minutes before PR W. It states the start time, the token outage from PR W until PR I passes (plan for 45 minutes), and that HQs park their Codex lanes. A lane left running stalls: its `central-token` call times out after 210 seconds (`timeout_ms` in the provider config).
 2. **Backup.** With `codexctl-0` still serving, take the PVC archive and its SHA-256 as in `central-ha.md` step 1. Write the hash to the questions file.
 3. **Merge PR W.** Wait for the gate.
-4. **Migrate.** Apply the `codexctl-migrate` Job with the prerequisite digest and wait for completion. If `migrate` reports legacy lease rows, run it again with `--confirm-legacy-owners-settled` only after the operator confirms that no HA pod has ever run (`deploy/codexctl-ha` absent on 2026-10-07). Keep the log.
+4. **Migrate.** Apply the `codexctl-migrate` Job with the prerequisite digest and wait for completion. Keep the log. An empty database has no legacy lease rows; if `migrate` reports any, stop the window. Attempt 3 never passes `--confirm-legacy-owners-settled`, because that flag needs settlement receipts for each earlier owner (`central-ha.md`, legacy lease handoff) that this window cannot produce.
 5. **Backfill.** Apply `codexctl-backfill` and keep its JSON counts. Compare users, accounts, and devices with the file state from the backup. Stop on any mismatch; the rollback is still a clean revert of PR W.
 6. **Merge PR H.** This is the point of no clean return: a Ready HA pod starts refresh owners under the database lease, and a refresh can rotate that account's refresh token in PostgreSQL only.
 7. **Validate before traffic.** Through `kubectl port-forward svc/codexctl-ha`: `/ready` 200, one forced simultaneous token request per account yields one upstream refresh, and the logs show no `owner_unavailable`.
@@ -45,9 +45,32 @@ PR H must not remove `PrometheusRule/codexctl` or `ScrapeConfig/codexctl`: the s
 ## Rollback
 
 - **Before PR H (steps 3 to 5):** revert PR W. `codexctl-0` returns on the same PVC and the file state is still authoritative. This is the attempt-2 rollback.
-- **After PR H, before any HA refresh:** revert PR I if merged, then PR H, then PR W. The operator checks the HA logs for refreshes first; with none, the file state is still valid.
-- **After an HA refresh:** revert the same PRs, but the file state now holds a spent refresh token for every account the HA pods refreshed. Each such account needs `codexctl login <alias>` and Amir's device code before it serves again. Prefer a forward fix in HA when the fault allows it.
+- **After PR H:** fence the HA writers before the file writer returns, in this order:
+  1. Revert PR I if merged. `Service/codexctl` has no endpoints, so token traffic stops.
+  2. Revert PR H. Wait until no `codexctl-ha` pod exists (`kubectl -n codexctl get pods` shows none; the pods have a 60-second grace period).
+  3. Run the read-only [lease query](#read-only-queries). Every `account_refresh_leases` row must be released. An unreleased row, even an expired one, means the owner's settlement is unknown: stop, keep PR W merged, and forward-fix in HA.
+  4. Only then revert PR W.
+- **Spent tokens:** if the HA logs show any refresh, the file state holds a spent refresh token for each refreshed account. Each such account needs `codexctl login <alias>` and Amir's device code before it serves in file mode. Prefer a forward fix in HA when the fault allows it.
 - Never run the StatefulSet and the HA Deployment as refresh writers at the same time. Keep the PVC archive, both Job logs, and the database until HQ closes B33.
+
+## Read-Only Queries
+
+No `codexctl-central` command reports row counts or lease state, so the operator runs these as a one-shot Job with a `postgres:16` image, the `codexctl-migration` label (for the egress policy), the `codexctl-postgres` Secret as `PG*` environment variables, and `PGOPTIONS=-c default_transaction_read_only=on`. The Job is reviewed with PR W.
+
+```sql
+-- Emptiness (prerequisite 3): every count must be 0.
+SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname;
+SELECT 'central_users', count(*) FROM central_users
+UNION ALL SELECT 'central_devices', count(*) FROM central_devices
+UNION ALL SELECT 'central_accounts', count(*) FROM central_accounts
+UNION ALL SELECT 'central_login_operations', count(*) FROM central_login_operations
+UNION ALL SELECT 'account_refresh_leases', count(*) FROM account_refresh_leases;
+
+-- Lease fence (rollback step 3): must return 0.
+SELECT count(*) FROM account_refresh_leases WHERE NOT released;
+```
+
+Before migration 1 the tables do not exist; the first query then lists none, which also counts as empty. The `pg_stat_user_tables` list catches tables added later, such as the loan tables, and the operator counts each listed table exactly before trusting it.
 
 ## Done
 
