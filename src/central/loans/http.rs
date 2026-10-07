@@ -123,14 +123,24 @@ impl Broker {
             .map_err(|error| self.loan_failure("audit", error))
     }
 
-    /// End grants past their end time. The store audits each end.
+    /// End grants past their end time. The store audits each end. One store
+    /// sweep is bounded, so repeat it until no due grant is left; every round
+    /// ends or skips each row it selected.
     async fn expire_loans(&self) -> Result<(), HttpError> {
-        let expired = self
-            .loan_store()
-            .expire_loans(now())
-            .await
-            .map_err(|error| self.loan_failure("expire", error))?;
-        if !expired.is_empty() {
+        let now = now();
+        let mut any = false;
+        loop {
+            let expired = self
+                .loan_store()
+                .expire_loans(now)
+                .await
+                .map_err(|error| self.loan_failure("expire", error))?;
+            if expired.is_empty() {
+                break;
+            }
+            any = true;
+        }
+        if any {
             self.retire_loans().await;
         }
         Ok(())
