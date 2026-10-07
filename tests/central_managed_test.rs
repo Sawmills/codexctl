@@ -3820,14 +3820,22 @@ fn failed_respawn_is_retried_with_a_real_launch_attempt() {
     .unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        std::fs::read_to_string(server.root.path().join("launch-count"))
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let launches = loop {
+        let launches = std::fs::read_to_string(server.root.path().join("launch-count"))
             .unwrap()
             .parse::<u32>()
-            .unwrap(),
-        2
-    );
+            .unwrap();
+        if launches >= 2 {
+            break launches;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background retry did not launch"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(launches, 2);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"360000").unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

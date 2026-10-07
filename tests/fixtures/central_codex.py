@@ -16,6 +16,7 @@ definitive_rejection = False
 billing_rotated = False
 
 if "login" in sys.argv:
+    pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-pid").write_text(str(os.getpid()))
     # Login writes a grant, but never reads accounts or refreshes credentials.
     mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
     if mode == "login-invalid-prompt":
@@ -31,6 +32,8 @@ if "login" in sys.argv:
         time.sleep(0.02)
     auth_path.write_text(gate.read_text())
     auth_path.chmod(0o600)
+    if mode == "login-error-after-save":
+        sys.exit(1)
     if mode == "login-hold-after-save":
         gate.with_name("login-saved").write_text("saved")
         while not gate.with_name("login-exit").exists():
@@ -178,7 +181,7 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode in ["billing-error-marked", "billing-error-slow-exit"]:
+        if mode in ["billing-error-marked", "billing-error-slow-exit"] or (mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat"):
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
             continue
         if mode == "rpc-unhealthy":
@@ -196,6 +199,11 @@ for line in sys.stdin:
                     continue
                 print("{invalid", flush=True)
                 sys.exit(1)
+        if mode == "billing-hold":
+            marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            marker.with_name("billing-started").write_text("started")
+            while not marker.with_name("release-billing").exists():
+                time.sleep(0.01)
         if mode == "billing-slow":
             pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"]).with_name("billing-started").write_text("started")
             time.sleep(6)
@@ -263,3 +271,7 @@ if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
 
 if mode == "billing-error-slow-exit":
     time.sleep(31)
+
+if mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
+    while not pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release-exit").exists():
+        time.sleep(0.01)

@@ -1,4 +1,6 @@
 //! Multi-user broker. One process and one persistent disk own every refresh token.
+mod renewal;
+
 use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
@@ -475,11 +477,13 @@ impl Broker {
         Ok(())
     }
 
-    async fn save_owner_record(&self, owner: &Owner) -> Result<()> {
+    async fn save_owner_record(&self, owner: &mut Owner) -> Result<()> {
         let Some(central) = self.central.as_ref() else {
             return Ok(());
         };
-        central.save_account(&Self::owner_record(owner)?).await
+        central.save_account(&Self::owner_record(owner)?).await?;
+        owner.persist_shared_revision(owner.vault.revision.max(1))?;
+        Ok(())
     }
 
     fn owner_record(owner: &Owner) -> Result<CredentialRecord> {
@@ -502,6 +506,12 @@ impl Broker {
         };
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
         if let Some(record) = central.load_account(&account_id).await? {
+            if central.mode() == super::storage::StoreMode::Postgres {
+                reconcile_owner_from_central(self, owner, &account_id)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("cannot reconcile shared account"))?;
+                return Ok(());
+            }
             if record.revision > owner.vault.revision {
                 let committed: Vault = serde_json::from_value(record.vault)?;
                 vault::validate_auth(&committed.auth)?;
@@ -518,6 +528,7 @@ impl Broker {
                 owner.rpc = None;
                 owner.refresh_enabled = false;
             }
+            owner.persist_shared_revision(record.revision)?;
             return Ok(());
         }
         owner.vault.revision = owner.vault.revision.max(1);
@@ -738,13 +749,29 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
-    if record.revision <= owner.vault.revision {
-        return Ok(false);
-    }
+    // Local snapshots can advance without publication. Renewal evidence must
+    // be newer than the last shared revision, not the unpublished local one.
+    let shared_revision = owner.shared_revision.unwrap_or(owner.vault.revision);
     let committed: vault::Vault = serde_json::from_value(record.vault)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     vault::validate_auth(&committed.auth)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    // A committed renewal is positive evidence that a prior local rejection is
+    // obsolete, even if another replica has since advanced the credential revision.
+    let renewed = central.mode() == super::storage::StoreMode::Postgres
+        && committed.verified
+        && !committed.import_rejected
+        && record.revision > shared_revision
+        && central
+            .login_completed_after(account_id, shared_revision, record.revision)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    if record.revision <= owner.vault.revision && !renewed {
+        owner
+            .persist_shared_revision(record.revision)
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        return Ok(false);
+    }
     vault::save(&owner.state, &owner.key, &committed)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     store::atomic_write(
@@ -764,6 +791,20 @@ async fn reconcile_owner_from_central(
     }
     owner.rpc = None;
     owner.refresh_enabled = false;
+    // A retained settlement callback belongs to the preceding credential state.
+    owner.recovery_generation = owner.recovery_generation.wrapping_add(1);
+    if renewed {
+        owner.verification_input = None;
+        owner.available = true;
+        owner.routing_refused = false;
+        owner.retryable_unavailable = false;
+        owner.retry_requires_billing = false;
+        owner.retry_started = None;
+        owner.retry_failures = 0;
+    }
+    owner
+        .persist_shared_revision(record.revision)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(true)
 }
 
@@ -846,12 +887,15 @@ async fn terminate_lost_import(owner: &mut Owner) {
 
 async fn abandon_background_recovery(
     owner_ref: Arc<Mutex<Owner>>,
+    recovery_generation: u64,
     renew_done: Arc<AtomicBool>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let mut owner = owner_ref.lock().await;
-    fence_background_owner(&mut owner);
+    if owner.recovery_generation == recovery_generation {
+        fence_background_owner(&mut owner);
+    }
     drop(owner);
     renew_done.store(true, Ordering::Release);
     if let Some(task) = renew_task {
@@ -895,7 +939,14 @@ async fn settle_background_recovery(
         // Shared-store shutdown must drain the child's final rotation to the
         // database before releasing its lease and the shutdown work permit.
         if central.is_none() && stopping.load(Ordering::Acquire) {
-            abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+            abandon_background_recovery(
+                owner_ref,
+                recovery_generation,
+                renew_done,
+                renew_task,
+                permit,
+            )
+            .await;
             return;
         }
         if let Some(window) = lease_window.as_ref() {
@@ -906,16 +957,28 @@ async fn settle_background_recovery(
                 .saturating_duration_since(std::time::Instant::now());
             if window.lost.load(Ordering::Acquire) || remaining <= IMPORT_LEASE_SAFETY_MARGIN {
                 let mut owner = owner_ref.lock().await;
-                terminate_lost_import(&mut owner).await;
+                if owner.recovery_generation == recovery_generation {
+                    terminate_lost_import(&mut owner).await;
+                }
                 drop(owner);
-                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
                 return;
             }
         }
         let record = {
             let settle = async {
                 let mut owner = owner_ref.lock().await;
-                settled_owner_record(&mut owner, &before).await
+                if owner.recovery_generation != recovery_generation {
+                    return Ok(None);
+                }
+                settled_owner_record(&mut owner, &before).await.map(Some)
             };
             if let Some(window) = lease_window.as_ref() {
                 let mut settle = Box::pin(settle);
@@ -928,10 +991,18 @@ async fn settle_background_recovery(
                     if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
                         drop(settle);
                         let mut owner = owner_ref.lock().await;
-                        terminate_lost_import(&mut owner).await;
+                        if owner.recovery_generation == recovery_generation {
+                            terminate_lost_import(&mut owner).await;
+                        }
                         drop(owner);
-                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
-                            .await;
+                        abandon_background_recovery(
+                            owner_ref,
+                            recovery_generation,
+                            renew_done,
+                            renew_task,
+                            permit,
+                        )
+                        .await;
                         return;
                     }
                     let check_after = IMPORT_LEASE_RENEW_INTERVAL
@@ -941,9 +1012,11 @@ async fn settle_background_recovery(
                         _ = wait_for_lease_loss(window.lost.clone(), window.signal.clone()) => {
                             drop(settle);
                             let mut owner = owner_ref.lock().await;
-                            terminate_lost_import(&mut owner).await;
+                            if owner.recovery_generation == recovery_generation {
+                                terminate_lost_import(&mut owner).await;
+                            }
                             drop(owner);
-                            abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
+                            abandon_background_recovery(owner_ref, recovery_generation, renew_done, renew_task, permit)
                                 .await;
                             return;
                         }
@@ -955,7 +1028,18 @@ async fn settle_background_recovery(
             }
         };
         let record = match record {
-            Ok(record) => record,
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
+                return;
+            }
             Err(error) => {
                 eprintln!("central child settlement retry: {error:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -974,8 +1058,14 @@ async fn settle_background_recovery(
                         // not an uncertain query. Stop renewing and let shutdown
                         // drain without ever reopening this owner.
                         let _ = central.release_lease(lease).await;
-                        abandon_background_recovery(owner_ref, renew_done, renew_task, permit)
-                            .await;
+                        abandon_background_recovery(
+                            owner_ref,
+                            recovery_generation,
+                            renew_done,
+                            renew_task,
+                            permit,
+                        )
+                        .await;
                         return;
                     }
                     Err(error) => {
@@ -984,7 +1074,14 @@ async fn settle_background_recovery(
                     }
                 },
                 Ok(false) => {
-                    abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                    abandon_background_recovery(
+                        owner_ref,
+                        recovery_generation,
+                        renew_done,
+                        renew_task,
+                        permit,
+                    )
+                    .await;
                     return;
                 }
                 Err(error) => {
@@ -998,7 +1095,14 @@ async fn settle_background_recovery(
         };
         if !durable {
             if central.is_none() && stopping.load(Ordering::Acquire) {
-                abandon_background_recovery(owner_ref, renew_done, renew_task, permit).await;
+                abandon_background_recovery(
+                    owner_ref,
+                    recovery_generation,
+                    renew_done,
+                    renew_task,
+                    permit,
+                )
+                .await;
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1009,6 +1113,9 @@ async fn settle_background_recovery(
         }
         {
             let mut owner = owner_ref.lock().await;
+            if owner.recovery_generation == recovery_generation && central.is_some() {
+                owner.shared_revision = Some(record.revision);
+            }
             if owner.recovery_generation == recovery_generation
                 && matches!(recovery, SettlementRecovery::Available)
             {
@@ -1129,6 +1236,14 @@ async fn token(
             }
             None => {}
         }
+        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
+        if worker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
+        {
+            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
+        }
         if !owner.vault.verified {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
@@ -1137,14 +1252,6 @@ async fn token(
             .map_err(|failure| worker.owner_failure(failure))?;
         if !owner.available {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
-        }
-        let account_id = account_key(&owner.vault.user, &owner.vault.alias);
-        if worker
-            .central
-            .as_ref()
-            .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
-        {
-            reconcile_owner_from_central(&worker, &mut owner, &account_id).await?;
         }
         // `account/read` may refresh even without a forced request. Every
         // PostgreSQL token path therefore takes the account lease before
@@ -1387,6 +1494,9 @@ async fn token(
                 owner.routing_refused = true;
                 owner.refresh_enabled = false;
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            }
+            if worker.central.is_some() {
+                owner.shared_revision = Some(record.revision);
             }
             if auth_changed {
                 vault::save(&owner.state, &owner.key, &owner.vault).map_err(|_| {
@@ -2295,9 +2405,10 @@ impl Broker {
                 if !written {
                     return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
                 }
+                owner.shared_revision = Some(owner.vault.revision.max(1));
                 central_published = true;
             } else {
-                self.save_owner_record(&owner).await.map_err(|_| {
+                self.save_owner_record(&mut owner).await.map_err(|_| {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
                 })?;
             }
@@ -2656,6 +2767,7 @@ pub(super) fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result
         retry_started: None,
         retry_failures: 0,
         recovery_generation: 0,
+        shared_revision: Owner::read_shared_revision(state)?,
         routing_refused: false,
         refresh_enabled: !read_only,
         limits: None,
@@ -3014,6 +3126,9 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 } else {
                     true
                 };
+                if written && central.is_some() {
+                    owner.shared_revision = Some(owner.vault.revision.max(1));
+                }
                 match (probe, local_saved, written) {
                     (Ok(_), true, true) => {
                         owner.available = true;
@@ -3287,6 +3402,7 @@ pub async fn serve(
                     retry_started: None,
                     retry_failures: 0,
                     recovery_generation: 0,
+                    shared_revision: None,
                     routing_refused: false,
                     refresh_enabled: false,
                     limits: None,

@@ -240,7 +240,10 @@ An enrolled machine uses `codexctl login <alias>` to renew an existing server ac
 The command prints an OpenAI device code and opens the OpenAI sign-in page.
 Use `--no-browser` to open that page on another machine.
 Approve the same OpenAI login and workspace as the selected alias.
-The server stops that account's previous refresh owner before sign-in.
+In file mode, the server stops that account's previous refresh owner before sign-in.
+In PostgreSQL mode, the account keeps serving tokens during browser approval.
+After the server stores the candidate in PostgreSQL, it takes the account lease
+and verifies the replacement under both the login and refresh leases.
 It retains the replacement credentials in a private server home and checks the account identity before replacement.
 It then verifies the replacement owner before reporting success.
 Your machine's OpenAI credentials and active account do not change.
@@ -249,7 +252,11 @@ Your other enrolled machines keep their registration and aliases.
 If your terminal disconnects, run the same login command to resume.
 Resume from the machine that started the login. Other machines cannot resume or cancel its pending login.
 To stop a pending login, run `codexctl login <alias> --cancel`.
-A canceled or failed login leaves that account unavailable until you retry.
+In file mode, a canceled or failed login leaves that account unavailable until you retry.
+In PostgreSQL mode, cancellation before candidate publication keeps the existing
+account usable unless the child already saved an issued grant. Cancellation during
+verification stops the child and leaves the account fenced for settlement.
+A candidate whose verification is unresolved remains fenced.
 Cancellation does not undo an authorization that OpenAI already issued.
 Approving a different OpenAI account can invalidate that other account's previous grant.
 The server retains a wrong-account grant without replacing the selected alias.
@@ -292,12 +299,116 @@ already left the account on the server unverified, cancel ends the add with
 To save a local profile on a connected machine instead, add `--local`:
 `codexctl login <alias> --local`. A server alias still renews on the server.
 
-Known gap: adding an account, like renewal, needs the file store. In PostgreSQL mode
-the server answers HTTP 503 with `account_login_unavailable`, because login records are
-local to one replica. Both must work in PostgreSQL mode before the B33 cutover.
-A server refuses to start in PostgreSQL mode while any add or renewal login is pending
+PostgreSQL supports renewal of an existing server account. Login receipts,
+candidates, status, and cancel intents are shared across replicas. Retrying a
+completed request returns its receipt before checking account availability.
+The initiating machine must still authenticate; other machines cannot read its
+code or cancel its operation. The holder checks cancellation every second and
+stops its child if its bounded database check fails. The database call limit is
+two seconds; authorization checks and process exit add to the cancellation time.
+
+Known gaps tracked by SAW-12484: add-account still returns HTTP 503 with
+`account_login_unavailable` (PR2); automatic crash/takeover recovery is PR3.
+This intermediate release is not sufficient for the B33 cutover. Status and
+start retire expired `starting` or `pending` device-login receipts as
+`replica_lost`, report `expired`, and allow a new request ID. They do not adopt the
+old worker or replay a saved grant. The CLI clears its local receipt when either
+login or `--cancel` receives `expired`, so the next login uses a new request ID.
+Receipt expiry frees the alias for device polling. Without a durable receipt that
+the old child exited and saved no grant, the expired operation still fences that
+company user's refreshes and verification. The CLI reports retained unresolved
+evidence. A saved grant whose publication failed must be reconciled before that
+fence clears. The killed-replica retry test and automatic
+crash/takeover recovery remain in PR3. A verifier
+that loses its lease leaves a durable unresolved marker: another replica must
+not repeat verification. Renewal waits when an expired foreign refresh lease
+has no explicit release; expiry alone is not proof that its child stopped.
+The 900-second device-polling deadline does not bound the later account-lease
+wait or verification. Those stages still require the live operation and account
+leases, machine authorization, cancellation monitoring, and bounded native RPCs.
+Wrong-account candidates reserve the selected account
+and the matching known account across replicas. After a stopped device login is rejected
+for the wrong identity, cancellation, or native failure, each account can be repaired by an explicit renewal with
+a new request ID. Only verified completion clears that account's reservation, and only for evidence
+recorded before verification started. A newer quarantine remains fenced.
+Confirmed native rejection also permits a fresh renewal after child exit and
+an unchanged final journal. Unknown verification outcomes remain fenced.
+An unresolved verification cannot use this repair path. An unreadable saved grant
+keeps that company user's accounts reserved because its identity is unknown.
+Other company users can still refresh. The worker counts this failure once with
+reason `relogin_identity_unresolved`; `CodexctlCredentialOperationFailed` selects
+that reason. Registry read failures stop device polling and report failure;
+a durable cancel intent, confirmed machine revocation, or graceful shutdown
+reports canceled. If shared publication fails,
+the isolated login home retains the issued grant and its operation/holder/epoch
+record under `state/shared-logins/`. Preserve this evidence. Automated replay and
+cleanup of interrupted operations belong to PR3; local evidence alone does not
+make another replica safe to take over.
+
+Linux credential children use `PR_SET_PDEATHSIG` and a parent-PID check to stop
+when their parent exits. The running worker also stops polling after an operation
+heartbeat fails. macOS uses a separate process group but has no equivalent
+parent-death signal here; forced-parent-death recovery on macOS is not verified.
+A process group alone does not prove child exit. Do not use receipt expiry as
+proof that a verifier or refresh owner stopped.
+
+To resolve an unidentified grant, preserve its private login home, shared row,
+and logs. Stop its holder and confirm that every child exited. Restore a complete
+grant from trusted private evidence and identify its workspace and login without
+printing credentials. Compare every declared login claim in its own namespace
+against the saved account. A conflicting or undecidable identity keeps the fence.
+If the grant cannot be identified, retain the fence.
+If any refresh-capable verification may have started, retain `unresolved` for
+PR3 settlement; do not change it to a repairable rejection or repeat verification.
+
+When the intact private execution home proves child exit with no saved grant,
+an operator can record the same absence receipt the original worker records.
+Match the original holder and epoch, and use the current sequence. Do not use a
+missing or deleted execution home as absence evidence. Require one returned row:
+
+```sql
+UPDATE central_login_operations SET polling_clear = true
+WHERE user_id = :'company_user' AND id = :'operation_id'
+  AND holder_id = :'holder' AND epoch = :expected_epoch
+  AND sequence = :expected_sequence AND phase = 'replica_lost'
+  AND NOT polling_clear AND candidate_workspace IS NULL
+RETURNING id, sequence;
+```
+
+For a device login proven to have stopped before verification, an operator can
+record the identified grant as a rejection. Use a private database session and
+set the `psql` variables below from the retained operation and grant. `login` is
+the token's `sub` claim. The sequence check prevents a concurrent transition from
+being overwritten. Require exactly one returned row; otherwise stop and re-read
+the evidence. This step records identity only and does not promote credentials:
+
+```sql
+UPDATE central_login_operations
+SET phase = 'rejected', sequence = sequence + 1,
+    candidate_workspace = :'workspace', candidate_login = :'login'
+WHERE user_id = :'company_user' AND id = :'operation_id'
+  AND sequence = :expected_sequence
+  AND (phase = 'unresolved' OR (phase = 'replica_lost' AND NOT polling_clear))
+  AND candidate_workspace IS NULL
+  AND expires_at <= clock_timestamp()
+RETURNING id, sequence;
+```
+
+Then use a new explicit login renewal for the selected alias and, when different,
+for the known alias holding the grant. Verified completion releases each
+reservation through the normal repair path. Preserve the original receipt and
+private evidence until both repairs complete. No live alert delivery or operator
+resolution is implied by local tests.
+
+Each account keeps shared revision evidence in `shared-revision.json` beside its
+vault. Preserve it with the local state. It lets a restarted replica distinguish
+an unpublished local snapshot from a completed renewal on another replica.
+
+Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel
-those logins in file mode first.
+those logins in file mode first. File journals are never imported into the shared
+login table. Apply the explicit schema migration before running this version in
+PostgreSQL mode.
 
 To rename one of your server accounts, run:
 
@@ -317,8 +428,8 @@ never reused: adding, importing, or renaming onto it returns `alias_renamed`, so
 machine that still names it can never reach a different account. A retried rename
 after a lost response returns the renamed account. `codexctl list` drops another
 machine's record for a renamed alias once that alias is no longer active there. An interrupted
-rename finishes when the server restarts. Like renewal and adding an account, rename
-needs the file store; in PostgreSQL mode it answers HTTP 503 with
+rename finishes when the server restarts. Like adding an account, rename needs the
+file store; in PostgreSQL mode it answers HTTP 503 with
 `account_rename_unavailable`.
 
 Without server registration, `codexctl login` keeps its local behavior.

@@ -4,6 +4,13 @@ pub(in crate::central) async fn status(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        return super::shared::status(broker, headers, body).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
         return Err(error);
     }
@@ -38,6 +45,13 @@ pub(in crate::central) async fn cancel(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        return super::shared::cancel(broker, headers, body).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
         return Err(error);
     }
@@ -76,6 +90,13 @@ pub(in crate::central) async fn start(
     headers: HeaderMap,
     body: Result<Json<Request>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        return super::shared::start(broker, headers, body).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("relogin_unavailable") {
         return Err(error);
     }

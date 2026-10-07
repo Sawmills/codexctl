@@ -89,6 +89,9 @@ enum Commands {
         state: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
+        /// Confirm every pre-migration refresh owner exited and its credentials settled.
+        #[arg(long)]
+        confirm_legacy_owners_settled: bool,
     },
     /// Copy local file state into the configured PostgreSQL store once.
     Backfill {
@@ -277,8 +280,20 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                 central::revoke(&state, &device)?
             }
         }
-        Commands::Migrate { state, key_file } => {
-            central::storage::migrate(&state, &key_file).await?
+        Commands::Migrate {
+            state,
+            key_file,
+            confirm_legacy_owners_settled,
+        } => {
+            let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
+            if confirm_legacy_owners_settled && store.mode() == central::storage::StoreMode::File {
+                anyhow::bail!("legacy lease handoff requires PostgreSQL");
+            }
+            store.migrate().await?;
+            if confirm_legacy_owners_settled {
+                let released = store.confirm_legacy_owners_settled().await?;
+                println!("{}", serde_json::json!({"legacyLeasesReleased":released}));
+            }
         }
         Commands::Backfill { state, key_file } => {
             let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
