@@ -25,6 +25,16 @@ impl Pod {
     }
 
     async fn spawn(database: &str, key: &Path, root: tempfile::TempDir, mode: &str) -> Self {
+        Self::spawn_with_recovery(database, key, root, mode, false).await
+    }
+
+    async fn spawn_with_recovery(
+        database: &str,
+        key: &Path,
+        root: tempfile::TempDir,
+        mode: &str,
+        recovery: bool,
+    ) -> Self {
         let state = root.path().join("state");
         store::atomic_write(&root.path().join("mode"), b"startup").unwrap();
         for name in ["count", "launch-count"] {
@@ -32,6 +42,12 @@ impl Pod {
         }
         let mut child = command(database, &state, key, "serve")
             .env("CODEXCTL_CENTRAL_STORE", mode)
+            .env(
+                "CODEXCTL_CENTRAL_BACKGROUND_RECOVERY",
+                if recovery { "1" } else { "0" },
+            )
+            .env("CENTRAL_TEST_RETRY_CLOCK", root.path().join("retry-clock"))
+            .env("CENTRAL_TEST_RECOVERY_INTERVAL_MS", "20")
             .args([
                 "--listen",
                 "127.0.0.1:0",
@@ -4110,6 +4126,284 @@ async fn postgres_foreign_account_keeps_serving_while_add_admission_waits() {
     assert_eq!(
         wait_add_terminal(&f, &operation).await["error"],
         "account_already_owned"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_restart_reconciles_a_completed_uid_only_landing() {
+    let mut f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"aa".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    let second = json!({"alias":"copy","id":"ab".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    f.first.stop().await;
+    f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"retained"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a completed same-account landing must retire the stopped replica's old journal"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_import_uses_retained_subjects_beside_a_uid_only_account() {
+    let f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"ac".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    let second = json!({"alias":"copy","id":"ad".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    let response = f.http.post(format!("{}/v1/accounts", f.second.url)).bearer_auth(&f.token)
+        .json(&json!({"alias":"different","auth":add_grant("new-workspace",Some("different-sub"),None)}))
+        .send().await.unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(
+        status, 200,
+        "retained subjects prove the imported login is distinct: {body}"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_background_recovery_uses_retained_subjects_after_a_uid_only_landing() {
+    let mut f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"ae".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    let second = json!({"alias":"copy","id":"af".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    std::fs::remove_file(f.second.root.path().join("login-release")).unwrap();
+    let other = json!({"alias":"different","id":"ba".repeat(32)});
+    add_request(&f, &f.second, "start", &other).await;
+    complete_add(
+        &f,
+        &f.second,
+        &other,
+        &add_grant("new-workspace", Some("different-sub"), None),
+    )
+    .await;
+    f.second.stop().await;
+    store::atomic_write(&f.second.root.path().join("retry-clock"), b"100000").unwrap();
+    f.second = Pod::spawn_with_recovery(&f.database, &f.key, f.second.root, "postgres", true).await;
+    store::atomic_write(&f.second.root.path().join("mode"), b"billing-error-marked").unwrap();
+    let failed = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"retained","billing":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), 503);
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&f.second.root.path().join("retry-clock"), b"1000000").unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let accounts: Value = f
+                .http
+                .get(format!("{}/v1/accounts", f.second.url))
+                .bearer_auth(&f.token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if accounts
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["alias"] == "retained")
+                .unwrap()["available"]
+                == true
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("background recovery must distinguish the retained subject from the other account");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_restart_keeps_a_conflicting_journal_and_serves_unrelated_accounts() {
+    let mut f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"bb".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    f.first.stop().await;
+    let journal = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "retained"))
+        .join("runtime/auth.json");
+    let conflict = add_grant("unrelated-journal", Some("conflicting-login"), None);
+    store::atomic_write(&journal, &serde_json::to_vec(&conflict).unwrap()).unwrap();
+    let second = json!({"alias":"copy","id":"bc".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"other"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "a conflicting account journal must not stop unrelated token delivery"
+    );
+    let accounts: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        accounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["alias"] == "retained")
+            .unwrap()["available"],
+        false,
+        "the account with a conflicting journal must stay fenced"
+    );
+    let denied = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"retained"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status(),
+        503,
+        "a token request must not discard conflicting journal evidence"
+    );
+    let retained: Value = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+    assert_eq!(
+        retained, conflict,
+        "unproven journal ownership must preserve credential evidence"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_restart_isolates_unreadable_shared_revision_evidence() {
+    let mut f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"bd".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    f.first.stop().await;
+    let marker = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "retained"))
+        .join("shared-revision.json");
+    store::atomic_write(&marker, b"unreadable-revision-evidence").unwrap();
+    f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    for (alias, expected) in [("other", 200), ("retained", 503)] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{alias}");
+    }
+    assert_eq!(
+        std::fs::read(marker).unwrap(),
+        b"unreadable-revision-evidence",
+        "a token request must preserve the rejected revision evidence"
     );
     stop_fixture(f).await;
 }

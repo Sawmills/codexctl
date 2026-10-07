@@ -774,6 +774,11 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
+    // Failed startup preparation has no trustworthy revision baseline. Keep
+    // its retained evidence quarantined instead of repairing it through a token request.
+    if owner.routing_refused && owner.shared_revision.is_none() {
+        return Ok(false);
+    }
     // Local snapshots can advance without publication. Renewal evidence must
     // be newer than the last shared revision, not the unpublished local one.
     let shared_revision = owner.shared_revision.unwrap_or(owner.vault.revision);
@@ -2082,13 +2087,36 @@ impl Broker {
                 }
             }
         }
-        let admission = relogin::clear_registry(
-            &self.state.join("accounts"),
-            &self.key,
-            &selected,
-            &input.auth,
-            relogin::AdmissionKind::Migration,
-        )
+        let identities =
+            if let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            {
+                Some(central.retained_identities().await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?)
+            } else {
+                None
+            };
+        let admission = if let Some(identities) = identities.as_ref() {
+            relogin::clear_shared_registry(
+                &self.state.join("accounts"),
+                &self.key,
+                &selected,
+                &input.auth,
+                relogin::AdmissionKind::Migration,
+                identities,
+            )
+        } else {
+            relogin::clear_registry(
+                &self.state.join("accounts"),
+                &self.key,
+                &selected,
+                &input.auth,
+                relogin::AdmissionKind::Migration,
+            )
+        }
         .map_err(
             |error| match error.downcast_ref::<relogin::AdmissionDenied>() {
                 Some(relogin::AdmissionDenied::Reserved) => {
@@ -2400,9 +2428,25 @@ impl Broker {
                 return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
             }
             // The imports guard was acquired before the new Owner guard.
-            let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                .clear_for_launch(&owner, relogin::AdmissionKind::Migration, import_guard)
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            let inventory = relogin::identity_inventory(&owner.state, &self.key, &owner.home);
+            let proof = if let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            {
+                let identities = central.retained_identities().await.map_err(|_| {
+                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                })?;
+                inventory.clear_for_shared_launch(
+                    &owner,
+                    relogin::AdmissionKind::Migration,
+                    import_guard,
+                    &identities,
+                )
+            } else {
+                inventory.clear_for_launch(&owner, relogin::AdmissionKind::Migration, import_guard)
+            }
+            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
             launch_owner(&mut owner, &self.binary, proof)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
@@ -2737,6 +2781,11 @@ pub(super) fn readiness(broker: &Broker) -> StatusCode {
 }
 
 async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> Result<()> {
+    let identities = if central.mode() == super::storage::StoreMode::Postgres {
+        Some(central.retained_identities().await?)
+    } else {
+        None
+    };
     for record in central.list_accounts().await? {
         let account_vault: Vault = serde_json::from_value(record.vault.clone())?;
         vault::validate_auth(&account_vault.auth)?;
@@ -2745,7 +2794,53 @@ async fn hydrate_accounts(state: &Path, key: &Path, central: &CentralStore) -> R
             .join(account_key(&account_vault.user, &account_vault.alias));
         let replace = if account_state.join("vault.enc").exists() {
             let local = vault::load(&account_state, key)?;
-            local.revision < record.revision
+            let baseline = match Owner::read_shared_revision(&account_state) {
+                Ok(revision) => Some(revision.unwrap_or(local.revision)),
+                Err(_) => {
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"account_reconcile","stage":"startup","reason":"shared_revision_unreadable"})
+                    );
+                    None
+                }
+            };
+            let renewed = if let Some(baseline) = baseline {
+                identities.is_some()
+                    && account_vault.verified
+                    && !account_vault.import_rejected
+                    && record.revision > baseline
+                    && central
+                        .login_completed_after(&record.account_id, baseline, record.revision)
+                        .await?
+            } else {
+                false
+            };
+            let home = account_state.join("runtime");
+            if renewed && home.try_exists()? && previous_owner_exited(&home).is_ok() {
+                let agreement = (|| -> Result<()> {
+                    let identity = identities
+                        .as_ref()
+                        .and_then(|all| all.get(&record.account_id))
+                        .context("completed login identity missing")?;
+                    identity.validate(&local.auth)?;
+                    identity.validate(&retained_auth(&home)?)?;
+                    identity.validate(&account_vault.auth)
+                })();
+                if agreement.is_ok() {
+                    store::atomic_write(
+                        &home.join("auth.json"),
+                        &serde_json::to_vec(&account_vault.auth)?,
+                    )?;
+                } else {
+                    // Startup inventory retains this journal and records the
+                    // account's recovery failure without disabling other seats.
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"account_reconcile","stage":"startup","reason":"journal_identity_unresolved"})
+                    );
+                }
+            }
+            local.revision < record.revision || renewed
         } else {
             true
         };
@@ -3052,23 +3147,49 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             {
                 None
             } else {
-                let result =
-                    match relogin::identity_inventory(&owner.state, &owner.key, &owner.home)
-                        .clear_for_launch(&owner, relogin::AdmissionKind::Restore, &imports)
-                    {
-                        Ok(proof) => {
-                            let spawned = spawn_owner(&mut owner, &broker.binary, proof);
-                            drop(imports);
-                            match spawned {
-                                Ok(()) => initialize_owner(&mut owner).await,
-                                Err(error) => Err(error),
+                let identities = if let Some(central) = central
+                    .as_ref()
+                    .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+                {
+                    central.retained_identities().await.map(Some)
+                } else {
+                    Ok(None)
+                };
+                let result = match identities {
+                    Err(error) => Err(error),
+                    Ok(identities) => {
+                        let inventory =
+                            relogin::identity_inventory(&owner.state, &owner.key, &owner.home);
+                        let clearance = if let Some(identities) = identities.as_ref() {
+                            inventory.clear_for_shared_launch(
+                                &owner,
+                                relogin::AdmissionKind::Restore,
+                                &imports,
+                                identities,
+                            )
+                        } else {
+                            inventory.clear_for_launch(
+                                &owner,
+                                relogin::AdmissionKind::Restore,
+                                &imports,
+                            )
+                        };
+                        match clearance {
+                            Ok(proof) => {
+                                let spawned = spawn_owner(&mut owner, &broker.binary, proof);
+                                drop(imports);
+                                match spawned {
+                                    Ok(()) => initialize_owner(&mut owner).await,
+                                    Err(error) => Err(error),
+                                }
+                            }
+                            Err(error) => {
+                                owner.routing_refused = true;
+                                Err(error)
                             }
                         }
-                        Err(error) => {
-                            owner.routing_refused = true;
-                            Err(error)
-                        }
-                    };
+                    }
+                };
                 Some(result)
             }
         };
@@ -3458,7 +3579,7 @@ pub async fn serve(
                     retry_failures: 0,
                     recovery_generation: 0,
                     shared_revision: None,
-                    routing_refused: false,
+                    routing_refused: true,
                     refresh_enabled: false,
                     limits: None,
                     limits_observed: None,

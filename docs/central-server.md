@@ -321,6 +321,9 @@ reports `relogin_reserved`; imports use the same admission gate. Equal text in
 different namespaces proves no agreement. An undecidable add reports
 `account_identity_unresolved` and retains its issued grant as a quarantine.
 Machine authorization is checked again inside add admission after lock waits.
+A completed receipt reconciles a stopped replica's older journal when retained
+claims agree. Import and background refresh admission use the same retained
+evidence.
 
 A database failure before the refresh child starts reports
 `relogin_interrupted_retry` and keeps a failed receipt and its captured grant.

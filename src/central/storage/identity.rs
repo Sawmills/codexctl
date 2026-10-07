@@ -433,6 +433,19 @@ pub(in crate::central) struct RetainedIdentity {
     logins: KnownClaims,
 }
 impl RetainedIdentity {
+    pub(in crate::central) fn from_auth(auth: &Value) -> Result<Self> {
+        let claims = Claims::from_auth(auth)?;
+        Ok(Self {
+            workspace: claims.workspace,
+            logins: KnownClaims {
+                uid: claims.logins.uid.into_iter().collect(),
+                sub: claims.logins.sub.into_iter().collect(),
+            },
+        })
+    }
+    pub(in crate::central) fn validate(&self, auth: &Value) -> Result<()> {
+        self.with_auth(auth).map(|_| ())
+    }
     fn with_auth(&self, auth: &Value) -> Result<KnownClaims> {
         let current = Claims::from_auth(auth)?;
         if current.workspace != self.workspace {

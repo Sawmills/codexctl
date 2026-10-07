@@ -302,6 +302,19 @@ pub(in crate::central) fn clear_registry(
 ) -> Result<Admission> {
     clear_registry_inner(accounts, key, selected, auth, kind, None)
 }
+pub(in crate::central) fn clear_shared_registry(
+    accounts: &Path,
+    key: &Path,
+    selected: &Path,
+    auth: &Value,
+    kind: AdmissionKind,
+    identities: &std::collections::BTreeMap<
+        String,
+        crate::central::storage::identity::RetainedIdentity,
+    >,
+) -> Result<Admission> {
+    clear_registry_inner(accounts, key, selected, auth, kind, Some(identities))
+}
 fn clear_registry_inner(
     accounts: &Path,
     key: &Path,
@@ -312,11 +325,15 @@ fn clear_registry_inner(
         &std::collections::BTreeMap<String, crate::central::storage::identity::RetainedIdentity>,
     >,
 ) -> Result<Admission> {
+    let incoming_identity = identities
+        .map(|_| crate::central::storage::identity::RetainedIdentity::from_auth(auth))
+        .transpose()?;
     let saved_overlaps = |state: &Path, saved: &Value| -> Result<bool> {
         let retained = identities.and_then(|all| {
             Some((
                 all.get(state.file_name()?.to_str()?)?,
-                all.get(selected.file_name()?.to_str()?)?,
+                all.get(selected.file_name()?.to_str()?)
+                    .or(incoming_identity.as_ref())?,
             ))
         });
         match retained {
