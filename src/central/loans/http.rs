@@ -43,6 +43,13 @@ fn owner_subject(owner: &Owner) -> Option<super::CredentialSubject> {
     ))
 }
 
+/// The lender's owner for a grant, with the login the shared store holds now.
+struct GrantOwner {
+    key: String,
+    owner: Arc<Mutex<Owner>>,
+    shared_subject: Option<super::CredentialSubject>,
+}
+
 /// The record of a borrowed account that `/v1/token` serves.
 pub(in crate::central) struct Borrowed {
     pub grant: Grant,
@@ -187,26 +194,44 @@ impl Broker {
     }
 
     /// The lender's owner for a grant. A missing lender alias ends the grant.
-    async fn grant_owner(
-        &self,
-        grant: &Grant,
-    ) -> Result<Option<(String, Arc<Mutex<Owner>>)>, HttpError> {
-        // A cached owner can outlive a tombstoned shared-store account, so the
-        // shared store decides whether the lender's account still exists.
+    async fn grant_owner(&self, grant: &Grant) -> Result<Option<GrantOwner>, HttpError> {
+        // A cached owner can outlive a tombstoned or replaced shared-store
+        // account, so the shared store decides whether the lender's account
+        // still exists and which login it holds now.
+        let mut shared_subject = None;
         let removed = match self
             .central
             .as_ref()
             .filter(|central| central.mode() != StoreMode::File)
         {
-            Some(central) => central
+            Some(central) => match central
                 .load_account_by_alias(&grant.lender, &grant.alias)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
-                .is_none(),
+            {
+                Some(record) => {
+                    shared_subject = serde_json::from_value::<vault::Vault>(record.vault)
+                        .ok()
+                        .and_then(|vault| {
+                            Some(super::credential_subject(
+                                &vault::account(&vault.auth).ok()?,
+                                vault::token(&vault.auth).ok()?,
+                            ))
+                        });
+                    false
+                }
+                None => true,
+            },
             None => false,
         };
-        if !removed && let Some(found) = self.resolve_alias(&grant.lender, &grant.alias).await? {
-            return Ok(Some(found));
+        if !removed
+            && let Some((key, owner)) = self.resolve_alias(&grant.lender, &grant.alias).await?
+        {
+            return Ok(Some(GrantOwner {
+                key,
+                owner,
+                shared_subject,
+            }));
         }
         // An unresolved recovery is not proof that the alias was removed.
         if !removed
@@ -247,19 +272,31 @@ impl Broker {
         if !self.lender_enabled(&grant.lender).await? {
             return Err(self.pause(&grant, "lender_disabled").await);
         }
-        let Some((_, owner)) = self.grant_owner(&grant).await? else {
+        let Some(found) = self.grant_owner(&grant).await? else {
             return Err(self.error(StatusCode::FORBIDDEN, "loan_ended"));
         };
         // Pause before the owned-account checks when the lender's credential
-        // already names another login. A busy owner skips this early check;
-        // the check after the refresh still applies.
-        let changed = owner.try_lock().ok().is_some_and(|owner| {
-            !owner_subject(&owner).is_some_and(|subject| grant.subject.same_login(&subject))
-        });
-        if changed {
+        // already names another login. The shared store's credential decides
+        // when there is one; otherwise a busy owner skips this early check.
+        // The check after the refresh still applies.
+        // `None` means the owner is busy and the early check is skipped.
+        let current = match found.shared_subject.clone() {
+            Some(subject) => Some(Some(subject)),
+            None => found
+                .owner
+                .try_lock()
+                .ok()
+                .map(|owner| owner_subject(&owner)),
+        };
+        if let Some(subject) = current
+            && !subject.is_some_and(|subject| grant.subject.same_login(&subject))
+        {
             return Err(self.pause(&grant, "subject_changed").await);
         }
-        Ok(Borrowed { grant, owner })
+        Ok(Borrowed {
+            grant,
+            owner: found.owner,
+        })
     }
 
     async fn ended_or_missing(
@@ -322,7 +359,12 @@ impl Broker {
         let mut entries = Vec::new();
         let grants = self.borrowed_grants(borrower).await?;
         for grant in grants.iter().cloned() {
-            let Some((key, owner)) = self.grant_owner(&grant).await? else {
+            let Some(GrantOwner {
+                key,
+                owner,
+                shared_subject,
+            }) = self.grant_owner(&grant).await?
+            else {
                 continue;
             };
             let ambiguous = grants
@@ -335,8 +377,11 @@ impl Broker {
                 Some("ambiguous_loan")
             } else if !self.lender_enabled(&grant.lender).await? {
                 Some("lender_disabled")
-            } else if !owner_subject(&*owner.lock().await)
-                .is_some_and(|subject| grant.subject.same_login(&subject))
+            } else if !match shared_subject {
+                Some(subject) => Some(subject),
+                None => owner_subject(&*owner.lock().await),
+            }
+            .is_some_and(|subject| grant.subject.same_login(&subject))
             {
                 Some("subject_changed")
             } else {
@@ -431,6 +476,14 @@ async fn lend(
         return Err(broker.error(StatusCode::CONFLICT, "borrower_ambiguous"));
     }
     broker.expire_loans().await?;
+    let expired = broker
+        .loan_store()
+        .expire_account_loans(&account_id, now())
+        .await
+        .map_err(|error| broker.loan_failure("expire", error))?;
+    if !expired.is_empty() {
+        broker.retire_loans().await;
+    }
     let grant = super::plan_grant(
         GrantRequest {
             lender,

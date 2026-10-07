@@ -71,6 +71,28 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         .map(|g| g.id)
         .collect();
     assert_eq!(active, [id("two")], "an ended grant is not active");
+    let other = id("other-account");
+    assert!(
+        store
+            .create_loan(&grant(&id("past"), &other, 4_000))
+            .await
+            .unwrap()
+    );
+    let targeted = store.expire_account_loans(&other, 4_500).await.unwrap();
+    assert_eq!(
+        targeted.iter().map(|g| g.id.clone()).collect::<Vec<_>>(),
+        [id("past")],
+        "only the named account expires"
+    );
+    assert!(
+        store
+            .load_loan(&id("two"))
+            .await
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none()
+    );
     let expired = store.expire_loans(5_000).await.unwrap();
     assert!(
         expired

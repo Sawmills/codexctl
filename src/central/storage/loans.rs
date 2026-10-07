@@ -38,8 +38,12 @@ macro_rules! audit_columns {
     };
 }
 
+// Servers can start together. The transaction-scoped advisory lock makes
+// concurrent `CREATE ... IF NOT EXISTS` runs wait instead of racing.
 pub(super) const SCHEMA: &str = concat!(
-    "CREATE TABLE IF NOT EXISTS ",
+    "BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('codexctl.account_loans.schema'));
+CREATE TABLE IF NOT EXISTS ",
     loans_table!(),
     " (
     id TEXT PRIMARY KEY,
@@ -98,6 +102,7 @@ CREATE INDEX IF NOT EXISTS account_loan_audit_grant_idx ON ",
 CREATE INDEX IF NOT EXISTS account_loan_audit_retire_idx ON ",
     audit_table!(),
     " (at) WHERE deleted_at IS NULL;
+COMMIT;
 "
 );
 
@@ -159,11 +164,21 @@ impl CentralStore {
     /// End every active grant whose end time has passed, each with its audit
     /// event. Returns the grants this call ended.
     pub async fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
+        self.expire(None, now).await
+    }
+
+    /// Expire one account's past grant, independent of the bounded sweep, so
+    /// a new grant for that account is never refused by a stale one.
+    pub async fn expire_account_loans(&self, account_id: &str, now: i64) -> Result<Vec<Grant>> {
+        self.expire(Some(account_id), now).await
+    }
+
+    async fn expire(&self, account: Option<&str>, now: i64) -> Result<Vec<Grant>> {
         match self {
-            Self::File(file) => file.expire_loans(now),
-            Self::Postgres(db) => bounded_db(db.expire_loans(now)).await,
+            Self::File(file) => file.expire_loans(account, now),
+            Self::Postgres(db) => bounded_db(db.expire_loans(account, now)).await,
             Self::Dual { file, postgres, .. } => {
-                let expired = bounded_db(postgres.expire_loans(now)).await?;
+                let expired = bounded_db(postgres.expire_loans(account, now)).await?;
                 for grant in &expired {
                     if let Err(error) = file.mirror_loan(grant, &AuditEvent::ended(grant)) {
                         mirror_failure(self, "expire_loans", &error);
@@ -334,20 +349,20 @@ impl CentralStore {
 }
 
 impl FileStore {
-    fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
+    fn expire_loans(&self, account: Option<&str>, now: i64) -> Result<Vec<Grant>> {
+        let due = |grant: &Grant| {
+            grant.ended_at.is_none()
+                && grant.ends_at <= now
+                && account.is_none_or(|account| grant.account_id == account)
+        };
         // Token requests call this; rewrite the encrypted state only when needed.
-        if !self
-            .read_state()?
-            .loans
-            .values()
-            .any(|grant| grant.ended_at.is_none() && grant.ends_at <= now)
-        {
+        if !self.read_state()?.loans.values().any(due) {
             return Ok(Vec::new());
         }
         self.with_lock(|state| {
             let mut expired = Vec::new();
             for grant in state.loans.values_mut() {
-                if grant.ended_at.is_none() && grant.ends_at <= now {
+                if due(grant) {
                     grant.end(grant.ends_at, None, EndReason::Expired);
                     expired.push(grant.clone());
                 }
@@ -471,7 +486,7 @@ impl FileStore {
 }
 
 impl PostgresStore {
-    async fn expire_loans(&self, now: i64) -> Result<Vec<Grant>> {
+    async fn expire_loans(&self, account: Option<&str>, now: i64) -> Result<Vec<Grant>> {
         let client = self.client().await?;
         let rows = client
             .query(
@@ -480,9 +495,9 @@ impl PostgresStore {
                     grant_columns!(),
                     " FROM ",
                     loans_table!(),
-                    " WHERE ended_at IS NULL AND ends_at <= $1 LIMIT 1000"
+                    " WHERE ended_at IS NULL AND ends_at <= $1 AND ($2::text IS NULL OR account_id = $2) LIMIT 1000"
                 ),
-                &[&now],
+                &[&now, &account],
             )
             .await?;
         let mut expired = Vec::new();
