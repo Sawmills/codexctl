@@ -773,7 +773,10 @@ async fn the_audit_pages_by_time_without_losing_events_at_a_boundary() {
     let id = grant["id"].as_str().unwrap();
     let store = fixture.broker.loan_store();
     // Three machines at one time straddle the page boundary.
+    // Recent times, inside the retention window.
+    let base = now() - 1_000;
     for (at, machine) in [(100, "a"), (200, "b"), (200, "c"), (200, "d"), (300, "e")] {
+        let at = base + at;
         store
             .append_loan_audit(&crate::central::loans::AuditEvent::token_issued(
                 at, id, machine,
@@ -801,7 +804,17 @@ async fn the_audit_pages_by_time_without_losing_events_at_a_boundary() {
         }
     }
     let granted = grant["createdAt"].as_i64().unwrap();
-    assert_eq!(seen, [granted, 300, 200, 200, 200, 100]);
+    assert_eq!(
+        seen,
+        [
+            granted,
+            base + 300,
+            base + 200,
+            base + 200,
+            base + 200,
+            base + 100
+        ]
+    );
     let (status, _) = fixture
         .call(
             "GET",
@@ -941,4 +954,24 @@ async fn a_lender_credential_in_another_workspace_pauses_before_the_account_chec
         (StatusCode::CONFLICT, json!("loan_paused"))
     );
     assert!(kinds(&fixture.audit(&fixture.borrower).await).contains(&"paused".to_owned()));
+}
+
+#[tokio::test]
+async fn a_read_hides_a_loan_that_ended_more_than_90_days_ago() {
+    let fixture = Fixture::new().await;
+    let grant = fixture.lend_main().await;
+    let id = grant["id"].as_str().unwrap();
+    let old = now() - crate::central::loans::RETENTION_SECONDS - 60;
+    fixture
+        .broker
+        .loan_store()
+        .end_loan(id, old, "test", crate::central::loans::EndReason::Revoked)
+        .await
+        .unwrap();
+    // No lifecycle activity happens; the read itself applies the retention.
+    let (status, loans) = fixture
+        .call("GET", "/v1/loans", &fixture.lender, Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(loans.as_array().unwrap().is_empty(), "{loans}");
 }

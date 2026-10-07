@@ -136,6 +136,14 @@ impl Broker {
         Ok(())
     }
 
+    /// Expire due grants and apply the retention before a history read, so
+    /// rows past 90 days are hidden even when no loan changed meanwhile.
+    async fn expire_and_retire(&self) -> Result<(), HttpError> {
+        self.expire_loans().await?;
+        self.retire_loans().await;
+        Ok(())
+    }
+
     /// Apply the 90-day retention after a grant or an end. The grant or end
     /// is already committed, so a failed retirement is recorded, not returned.
     async fn retire_loans(&self) {
@@ -512,7 +520,7 @@ async fn lend(
 
 async fn list(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     let device = broker.authorize(&headers).await?;
-    broker.expire_loans().await?;
+    broker.expire_and_retire().await?;
     let mut grants = broker
         .loan_store()
         .loans_for_user(&device.user)
@@ -536,7 +544,7 @@ async fn end(
     let device = broker.authorize(&headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
-    broker.expire_loans().await?;
+    broker.expire_and_retire().await?;
     let store = broker.loan_store();
     let grant = store
         .load_loan(&request.id)
@@ -616,6 +624,7 @@ async fn audit(
     let device = broker.authorize(&headers).await?;
     let Query(query) =
         query.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    broker.expire_and_retire().await?;
     let store = broker.loan_store();
     let ids: Vec<String> = store
         .loans_for_user(&device.user)

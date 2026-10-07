@@ -276,7 +276,11 @@ impl CentralStore {
                 .read_state()?
                 .loans
                 .into_values()
-                .filter(|grant| grant.borrower == borrower && grant.ended_at.is_none())
+                .filter(|grant| {
+                    grant.borrower == borrower
+                        && grant.ended_at.is_none()
+                        && grant.deleted_at.is_none()
+                })
                 .collect()),
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => {
                 bounded_db(db.active_loans_for_borrower(borrower)).await
@@ -352,6 +356,7 @@ impl FileStore {
     fn expire_loans(&self, account: Option<&str>, now: i64) -> Result<Vec<Grant>> {
         let due = |grant: &Grant| {
             grant.ended_at.is_none()
+                && grant.deleted_at.is_none()
                 && grant.ends_at <= now
                 && account.is_none_or(|account| grant.account_id == account)
         };
@@ -426,7 +431,7 @@ impl FileStore {
             let ended = state
                 .loans
                 .get_mut(id)
-                .filter(|grant| grant.ended_at.is_none())
+                .filter(|grant| grant.ended_at.is_none() && grant.deleted_at.is_none())
                 .map(|grant| {
                     grant.end(at, Some(by), reason);
                     grant.clone()
@@ -495,7 +500,7 @@ impl PostgresStore {
                     grant_columns!(),
                     " FROM ",
                     loans_table!(),
-                    " WHERE ended_at IS NULL AND ends_at <= $1 AND ($2::text IS NULL OR account_id = $2) LIMIT 1000"
+                    " WHERE ended_at IS NULL AND deleted_at IS NULL AND ends_at <= $1 AND ($2::text IS NULL OR account_id = $2) LIMIT 1000"
                 ),
                 &[&now, &account],
             )
@@ -521,7 +526,7 @@ impl PostgresStore {
                 concat!(
                     "WITH ended AS (UPDATE ",
                     loans_table!(),
-                    " SET ended_at=$2, ended_by=$3, end_reason=$4 WHERE id=$1 AND ended_at IS NULL RETURNING id) INSERT INTO ",
+                    " SET ended_at=$2, ended_by=$3, end_reason=$4 WHERE id=$1 AND ended_at IS NULL AND deleted_at IS NULL RETURNING id) INSERT INTO ",
                     audit_table!(),
                     "(",
                     audit_columns!(),
@@ -645,7 +650,7 @@ impl PostgresStore {
                     grant_columns!(),
                     " FROM ",
                     loans_table!(),
-                    " WHERE borrower_id=$1 AND ended_at IS NULL"
+                    " WHERE borrower_id=$1 AND ended_at IS NULL AND deleted_at IS NULL"
                 ),
                 &[&borrower],
             )

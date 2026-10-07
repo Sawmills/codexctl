@@ -139,9 +139,10 @@ token issue event has a coalescing key of grant, machine, and UTC hour.
 PostgreSQL enforces the key with a unique index and `ON CONFLICT DO NOTHING`;
 file mode skips an append whose key is already in `loan_audit`.
 
-Retention is a logical deletion (HQ Q3, 2026-10-06). Each grant and each end
-sets `deleted_at` on grants that ended more than 90 days ago and on audit
-events older than 90 days, in both modes. Every read hides those rows; nothing
+Retention is a logical deletion (HQ Q3, 2026-10-06). Each grant, each end, and
+each history read (`list`, `end`, `audit`) sets `deleted_at` on grants that ended
+more than 90 days ago and on audit events older than 90 days, in both modes.
+Every read and every active-row update filters on `deleted_at IS NULL`; nothing
 is purged. A physical purge would be a separate, approved retention job.
 
 An automatic expiry records no user as its actor: `ended_by` stays empty and
