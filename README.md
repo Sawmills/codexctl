@@ -367,6 +367,7 @@ codexctl list                 # list saved profiles
 codexctl login <alias>        # isolated Codex login and save
 codexctl whoami               # show active account
 codexctl label <alias> [text] # name an account (omit text to clear)
+codexctl rename <old> <new>   # rename a server account alias
 codexctl codex -- ...         # run Codex with spend-cap recovery
 codexctl codex --account ALIAS resume SESSION # pin one server-account lane
 codexctl rate --json          # read per-account response/429 counts

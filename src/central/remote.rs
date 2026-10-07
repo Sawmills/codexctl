@@ -515,6 +515,65 @@ fn server_login(
     }
 }
 
+/// Rename one of this user's server accounts. The account, its credentials
+/// and its label stay; only the alias changes.
+pub fn rename(old: &str, new: &str) -> Result<()> {
+    let old = store::validate_alias(old)?;
+    let new = store::validate_alias(new)?;
+    let Some(connection) = connection()? else {
+        bail!(
+            "rename applies to server accounts; connect this machine to the account server first"
+        );
+    };
+    for alias in [old, new] {
+        if login_receipt(alias)?.is_some() {
+            bail!(
+                "a server login for {alias} is pending; finish it or run codexctl login {alias} --cancel"
+            );
+        }
+    }
+    require_current_connection(&connection)?;
+    let response = transport::blocking()?
+        .post(format!(
+            "{}/v1/accounts/rename",
+            connection.server.trim_end_matches('/')
+        ))
+        .bearer_auth(secret(&connection)?)
+        .json(&json!({"alias":old,"newAlias":new}))
+        .send()
+        .context("server rename outcome unknown; run codexctl list before retrying")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let reason = response
+            .json::<Value>()
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_owned));
+        match reason.as_deref() {
+            Some("alias_exists") => bail!("server account {new} already exists"),
+            Some("account_not_found") => bail!("server account {old} not found"),
+            Some("login_pending") => {
+                bail!("a server login for {old} is pending; finish or cancel it before renaming")
+            }
+            Some("account_rename_unavailable") => bail!(
+                "the server cannot rename accounts now (shared mode, read-only, or recovering)"
+            ),
+            _ => bail!("server rename rejected (HTTP {status})"),
+        }
+    }
+    let account: Account = response
+        .json()
+        .context("server rename outcome unknown; run codexctl list before retrying")?;
+    if account.user_id != connection.user_id || account.alias != new {
+        bail!("server rename returned another account; run codexctl list");
+    }
+    native::follow_rename(old, new)?;
+    if let Err(error) = catalog() {
+        eprintln!("warning: account catalog refresh failed: {error:#}");
+    }
+    println!("Renamed server account {old} to {new}. Its credentials and label are unchanged.");
+    Ok(())
+}
+
 pub fn connect(server: &str, name: Option<&str>, no_browser: bool) -> Result<()> {
     transport::origin(server)?;
     if connection()?.is_some() || registration(&pending_path()?)?.is_some() {

@@ -786,15 +786,27 @@ fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     let response = request.send().context("central token request failed")?;
     let status = response.status();
     if !status.is_success() {
+        let body = response.json::<serde_json::Value>().ok();
+        let reason = body.as_ref().and_then(|v| v["error"].as_str());
         if status == reqwest::StatusCode::CONFLICT
-            && response
-                .json::<serde_json::Value>()
-                .ok()
-                .is_some_and(|v| v["error"] == "unsupported_workspace_routing")
+            && reason == Some("unsupported_workspace_routing")
         {
             bail!(
                 "this account requires workspace routing that the central native provider does not yet support"
             );
+        }
+        if status == reqwest::StatusCode::NOT_FOUND
+            && reason == Some("account_renamed")
+            && let Some(renamed) = body.as_ref().and_then(|v| v["alias"].as_str())
+        {
+            // Never follow a rename silently: the operator picks the account.
+            let old = connection.alias.as_deref().unwrap_or("this account");
+            if connection.launch_pinned {
+                bail!(
+                    "server account {old} was renamed to {renamed}; relaunch with codexctl codex --account {renamed}"
+                );
+            }
+            bail!("server account {old} was renamed to {renamed}; run codexctl use {renamed}");
         }
         bail!("central token request rejected (HTTP {})", status);
     }
@@ -853,6 +865,33 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
     connection.revision = token.revision;
     save_connection(&path, &connection)?;
     println!("registered remote account {alias}; run codexctl use {alias}");
+    Ok(())
+}
+
+/// After a server rename, move this machine's connection record and active
+/// pointer to the new alias. Other machines learn the rename at their next
+/// catalog read or token refresh.
+pub(super) fn follow_rename(old: &str, new: &str) -> Result<()> {
+    let directory = root()?;
+    if !directory.try_exists()? {
+        return Ok(());
+    }
+    let _lock = native_lock(&directory)?;
+    let old_path = connection_path(old)?;
+    if old_path.try_exists()? {
+        let mut connection = read_connection(&old_path)?;
+        connection.alias = Some(new.to_owned());
+        store::atomic_write(&connection_path(new)?, &serde_json::to_vec(&connection)?)?;
+        if !old.eq_ignore_ascii_case(new) {
+            std::fs::remove_file(&old_path)?;
+        }
+        store::sync_directory(&directory)?;
+    }
+    if active_pointer_path()?.try_exists()?
+        && read_active_alias().is_ok_and(|active| active.eq_ignore_ascii_case(old))
+    {
+        store::atomic_write(&active_pointer_path()?, format!("{new}\n").as_bytes())?;
+    }
     Ok(())
 }
 

@@ -1348,6 +1348,57 @@ fn server_rename_interrupted_after_its_intent_finishes_at_startup() {
     assert!(!account.exists());
 }
 
+#[test]
+fn rename_follows_on_this_machine_and_fails_clearly_on_another() {
+    let server = Server::start();
+    assert!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status()
+            .is_success()
+    );
+    let here = server.connected_home();
+    let there = server.connected_home();
+    for home in [&here, &there] {
+        let selected = server.cli(home.path(), &["use", "personal", "--allow-billing"]);
+        assert!(
+            selected.status.success(),
+            "{}",
+            String::from_utf8_lossy(&selected.stderr)
+        );
+    }
+    let renamed = server.cli(here.path(), &["rename", "personal", "work"]);
+    assert!(
+        renamed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+    let central = here.path().join(".codexctl/central");
+    assert_eq!(
+        std::fs::read_to_string(central.join(".active-account")).unwrap(),
+        "work\n"
+    );
+    assert!(central.join("work.json").exists());
+    assert!(!central.join("personal.json").exists());
+    let token = server.cli(here.path(), &["central-token", "--active"]);
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+
+    // The other machine still names the old alias: a clear error, no switch.
+    let stale = server.cli(there.path(), &["central-token", "--active"]);
+    assert!(!stale.status.success());
+    let error = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        error.contains("personal was renamed to work") && error.contains("codexctl use work"),
+        "{error}"
+    );
+    let taken = server.cli(here.path(), &["rename", "work", "work"]);
+    assert!(taken.status.success(), "a no-op rename keeps the account");
+}
+
 fn digest(alias: &str) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(alias.as_bytes()))

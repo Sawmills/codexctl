@@ -24,7 +24,7 @@ Startup completes an interrupted rename before its inventory: a directory with `
 - `codexctl rename` requires a server connection and calls the endpoint, then refreshes the catalog.
 - On the renaming machine, `<old>.json` becomes `<new>.json` with the new alias, and `.active-account` follows when it named the old alias. A pending add or renewal receipt for either alias refuses the rename locally.
 - Other machines see the new name at their next catalog read. Their active session or pinned lane that still names the old alias fails at the next token refresh with "server account <old> was renamed to <new>; run codexctl use <new>" (or relaunch with `--account <new>`). Nothing switches accounts silently.
-- `codexctl codex --account <old>` fails with the same renamed message when the server reports the tombstone.
+- `codexctl codex --account <old>` fails at launch with "server account <old> not found; run codexctl list (it may have been renamed)"; the exact renamed message comes from the token route, which a running lane hits on refresh.
 
 ## PostgreSQL Mode
 

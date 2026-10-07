@@ -299,6 +299,24 @@ A server refuses to start in PostgreSQL mode while any add or renewal login is p
 ("finish pending logins in file mode before switching storage"). Finish or cancel
 those logins in file mode first.
 
+To rename one of your server accounts, run:
+
+```sh
+codexctl rename <old-alias> <new-alias>
+```
+
+The account keeps its credentials, label, and refresh owner; only the alias changes.
+On the machine that runs the command, the local connection record and the active
+account pointer follow the new alias. Other machines see the new alias at their next
+`codexctl list`. A session or pinned lane on another machine that still uses the old
+alias fails at its next token refresh with "server account <old> was renamed to <new>",
+and never switches to another account; run `codexctl use <new>` or relaunch with
+`--account <new>`. The server refuses a new alias you already use (`alias_exists`) and
+a rename while a login for that account is pending (`login_pending`). An interrupted
+rename finishes when the server restarts. Like renewal and adding an account, rename
+needs the file store; in PostgreSQL mode it answers HTTP 503 with
+`account_rename_unavailable`.
+
 Without server registration, `codexctl login` keeps its local behavior.
 Login first fetches the current account catalog, so accounts created on another machine
 can renew without a prior `list` or `status` command, even while a server provider is active.
