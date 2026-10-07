@@ -776,8 +776,8 @@ It saves the device registry before the user registry, which marks completed set
 An interrupted setup can reuse the key and complete both registries.
 Keep the key separate from encrypted storage and backup both.
 
-The active staging overlay remains on Clerk. For the planned Google Workspace
-cutover, prepare an OIDC configuration file:
+The active staging overlay signs in with Google Workspace (SAW-12467). Its OIDC
+configuration file has this shape:
 
 ```json
 {
@@ -789,7 +789,7 @@ cutover, prepare an OIDC configuration file:
 }
 ```
 
-The planned company SSO setup uses Google Workspace directly. In the Google Cloud
+Company SSO uses Google Workspace directly. In the Google Cloud
 project owned by `sawmills.ai`:
 
 1. Open **Google Auth platform** (or **APIs & Services → OAuth consent screen**)
@@ -917,7 +917,7 @@ and `deploy/k8s/overlays/staging`; its sync policy sets `CreateNamespace=true` b
 has no automated sync, prune, or self-heal. Review and manually register the
 Application if it is not installed; sync is also an explicit operator action.
 Verify the installed Application's policy and the Google client/secret readiness
-before the planned cutover sync.
+before an SSO change syncs.
 The internal ALB terminates HTTPS. The broker uses a ClusterIP service.
 
 One StatefulSet replica owns an encrypted `ReadWriteOncePod` volume.
@@ -929,21 +929,23 @@ Confirm CSI support for `ReadWriteOncePod` before deployment.
 Create these SSM SecureString values through the operator secret workflow:
 
 - `/app/codexctl/vault-key`: base64 of the 32-byte encryption key.
-- `/app/codexctl/oidc-client-secret`: the current Clerk client secret.
+- `/app/codexctl/google-oidc-client-secret`: the Google client secret that the broker uses.
+- `/app/codexctl/oidc-client-secret`: the Clerk client secret, kept only for rollback.
 - `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 visible ASCII characters. The server trims surrounding whitespace.
 
-For the later Google cutover, prepare a separate AWS Secrets Manager value at
-`/app/codexctl/oidc-client-secret`, as described above. The active ExternalSecret
-continues reading the Clerk secret from SSM until that reviewed cutover.
+The ExternalSecret reads all of them from SSM through
+`ClusterSecretStore/aws-parameter-store`; there is no AWS Secrets Manager store.
+The staging init container copies the Google key to `/keys/oidc-client-secret`.
 External Secrets supplies the pod secret.
 An init container copies the projected files into private real files for the broker.
 Key rotation needs a separate re-encryption procedure. Do not rotate the key independently of the stored vaults.
 
-The active SSO overlay uses `https://clerk.sawmills.ai`. The unreferenced Google
-cutover files target `https://accounts.google.com` and the `sawmills.ai` Workspace;
-they require the administrator-created Internal web client and verified migration
-allowlist described above. The [Clerk OIDC research](research/central-staging-oidc.md)
-describes the current provider, not the planned Google setup. Google documents
+The active SSO overlay uses `https://accounts.google.com` and the `sawmills.ai`
+Workspace, with the External web client and the migration allowlist described
+above. Clerk (`https://clerk.sawmills.ai`) remains only as the rollback in the
+[SAW-12467 plan](superpowers/plans/saw-12467-google-sso-cutover.md). The
+[Clerk OIDC research](research/central-staging-oidc.md) describes that former
+provider, not the Google setup. Google documents
 [Workspace `hd` verification](https://developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo)
 and [web client creation](https://developers.google.com/identity/protocols/oauth2/web-server#creatingcred).
 
