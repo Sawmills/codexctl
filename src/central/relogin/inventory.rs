@@ -176,6 +176,32 @@ impl IdentityInventory {
         kind: AdmissionKind,
         _lock: &'a tokio::sync::MutexGuard<'_, ()>,
     ) -> Result<ClearedIdentity<'a>> {
+        self.clear_for_launch_inner(refresh, kind, _lock, None)
+    }
+    pub(in crate::central) fn clear_for_shared_launch<'a>(
+        self,
+        refresh: &Owner,
+        kind: AdmissionKind,
+        lock: &'a tokio::sync::MutexGuard<'_, ()>,
+        identities: &std::collections::BTreeMap<
+            String,
+            crate::central::storage::identity::RetainedIdentity,
+        >,
+    ) -> Result<ClearedIdentity<'a>> {
+        self.clear_for_launch_inner(refresh, kind, lock, Some(identities))
+    }
+    fn clear_for_launch_inner<'a>(
+        self,
+        refresh: &Owner,
+        kind: AdmissionKind,
+        _lock: &'a tokio::sync::MutexGuard<'_, ()>,
+        identities: Option<
+            &std::collections::BTreeMap<
+                String,
+                crate::central::storage::identity::RetainedIdentity,
+            >,
+        >,
+    ) -> Result<ClearedIdentity<'a>> {
         if self.state != refresh.state || self.home != refresh.home || refresh.rpc.is_some() {
             bail!("refresh process already exists or inventory differs");
         }
@@ -202,12 +228,13 @@ impl IdentityInventory {
             .and_then(Path::file_name)
             .is_some_and(|n| n == "accounts")
         {
-            clear_registry(
+            clear_registry_inner(
                 self.state.parent().context("missing registry")?,
                 &refresh.key,
                 &self.state,
                 &saved.auth,
                 kind,
+                identities,
             )?;
         }
         Ok(ClearedIdentity {
@@ -273,6 +300,32 @@ pub(in crate::central) fn clear_registry(
     auth: &Value,
     kind: AdmissionKind,
 ) -> Result<Admission> {
+    clear_registry_inner(accounts, key, selected, auth, kind, None)
+}
+fn clear_registry_inner(
+    accounts: &Path,
+    key: &Path,
+    selected: &Path,
+    auth: &Value,
+    kind: AdmissionKind,
+    identities: Option<
+        &std::collections::BTreeMap<String, crate::central::storage::identity::RetainedIdentity>,
+    >,
+) -> Result<Admission> {
+    let saved_overlaps = |state: &Path, saved: &Value| -> Result<bool> {
+        let retained = identities.and_then(|all| {
+            Some((
+                all.get(state.file_name()?.to_str()?)?,
+                all.get(selected.file_name()?.to_str()?)?,
+            ))
+        });
+        match retained {
+            Some((saved_claims, target_claims)) => {
+                saved_claims.overlaps(saved, target_claims, auth)
+            }
+            None => Ok(overlaps(saved, auth)),
+        }
+    };
     if kind == AdmissionKind::Migration
         && current(selected)?.is_some_and(|r| r.phase != Phase::Completed)
     {
@@ -332,11 +385,13 @@ pub(in crate::central) fn clear_registry(
             if inventory.runtime != ProcessState::Stopped {
                 return Err(AdmissionDenied::Unsettled.into());
             }
-            if overlaps(&saved.auth, auth) || journal.as_ref().is_some_and(|a| overlaps(a, auth)) {
+            if saved_overlaps(&state, &saved.auth)?
+                || journal.as_ref().is_some_and(|a| overlaps(a, auth))
+            {
                 return Err(AdmissionDenied::Unsettled.into());
             }
         }
-        if !overlaps(&saved.auth, auth) {
+        if !saved_overlaps(&state, &saved.auth)? {
             continue;
         }
         if inventory.login_reserved {

@@ -299,7 +299,7 @@ already left the account on the server unverified, cancel ends the add with
 To save a local profile on a connected machine instead, add `--local`:
 `codexctl login <alias> --local`. A server alias still renews on the server.
 
-PostgreSQL supports renewal of an existing server account. Login receipts,
+PostgreSQL supports renewal and adding an account. Login receipts,
 candidates, status, and cancel intents are shared across replicas. Retrying a
 completed request returns its receipt before checking account availability.
 The initiating machine must still authenticate; other machines cannot read its
@@ -307,8 +307,22 @@ code or cancel its operation. The holder checks cancellation every second and
 stops its child if its bounded database check fails. The database call limit is
 two seconds; authorization checks and process exit add to the cancellation time.
 
-Known gaps tracked by SAW-12484: add-account still returns HTTP 503 with
-`account_login_unavailable` (PR2); automatic crash/takeover recovery is PR3.
+Add publishes the candidate before account admission. A short PostgreSQL
+transaction creates an unverified account or lands on your existing alias and
+keeps its label. It transfers the operation reservation before taking that
+account's refresh lease. The server records the verification marker before it
+starts the native refresh child. Credentials and the completed receipt commit
+together; a retry on another replica returns that receipt without another login.
+
+Identity claims use a unique database key: workspace, namespace, and claim.
+Both `uid` and `sub` remain recorded when a later token omits either claim.
+Renewal and add reserve new claims before verification. A second matching login
+reports `relogin_reserved`; imports use the same admission gate. Equal text in
+different namespaces proves no agreement. An undecidable add reports
+`account_identity_unresolved` and retains its issued grant as a quarantine.
+Machine authorization is checked again inside add admission after lock waits.
+
+Automatic crash/takeover recovery remains in SAW-12484 PR3.
 This intermediate release is not sufficient for the B33 cutover. Status and
 start retire expired `starting` or `pending` device-login receipts as
 `replica_lost`, report `expired`, and allow a new request ID. They do not adopt the
@@ -377,15 +391,18 @@ RETURNING id, sequence;
 
 For a device login proven to have stopped before verification, an operator can
 record the identified grant as a rejection. Use a private database session and
-set the `psql` variables below from the retained operation and grant. `login` is
-the token's `sub` claim. The sequence check prevents a concurrent transition from
+set the `psql` variables below from the retained operation and grant.
+`login_claims` is a JSON object containing every declared claim under `uid` and
+`sub`; omit absent keys. The sequence check prevents a concurrent transition from
 being overwritten. Require exactly one returned row; otherwise stop and re-read
 the evidence. This step records identity only and does not promote credentials:
 
 ```sql
 UPDATE central_login_operations
 SET phase = 'rejected', sequence = sequence + 1,
-    candidate_workspace = :'workspace', candidate_login = :'login'
+    candidate_workspace = :'workspace',
+    candidate_login = (:'login_claims'::jsonb)->>'sub',
+    candidate_claims = :'login_claims'::jsonb
 WHERE user_id = :'company_user' AND id = :'operation_id'
   AND sequence = :expected_sequence
   AND (phase = 'unresolved' OR (phase = 'replica_lost' AND NOT polling_clear))
@@ -408,7 +425,13 @@ Startup and backfill refuse pending legacy file-mode add or renewal journals
 ("finish pending logins in file mode before switching storage"). Finish or cancel
 those logins in file mode first. File journals are never imported into the shared
 login table. Apply the explicit schema migration before running this version in
-PostgreSQL mode.
+PostgreSQL mode. Migration 4 adds the shared add workflow and unique identity
+claims. It reads existing encrypted credentials with the mounted vault key and
+keeps all available claims. Backfill also copies rename tombstones, so every
+replica refuses reuse of an old alias for add or import. Conflicting stored
+claims stop the migration and roll
+back its changes. Resolve the inventory conflict before retrying; do not delete
+credential evidence to force the migration.
 
 To rename one of your server accounts, run:
 
@@ -428,8 +451,8 @@ never reused: adding, importing, or renaming onto it returns `alias_renamed`, so
 machine that still names it can never reach a different account. A retried rename
 after a lost response returns the renamed account. `codexctl list` drops another
 machine's record for a renamed alias once that alias is no longer active there. An interrupted
-rename finishes when the server restarts. Like adding an account, rename needs the
-file store; in PostgreSQL mode it answers HTTP 503 with
+rename finishes when the server restarts. Rename needs the file store; in
+PostgreSQL mode it answers HTTP 503 with
 `account_rename_unavailable`.
 
 Without server registration, `codexctl login` keeps its local behavior.

@@ -121,10 +121,18 @@ type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
 pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
-    vault::account(left).ok() == vault::account(right).ok()
-        && api::token_subject(vault::token(left).unwrap_or(""))
-            == api::token_subject(vault::token(right).unwrap_or(""))
+    if vault::account(left).ok() != vault::account(right).ok() {
+        return false;
+    }
+    let left = api::token_logins(vault::token(left).unwrap_or(""));
+    let right = api::token_logins(vault::token(right).unwrap_or(""));
+    let uid = left.uid.as_ref().zip(right.uid.as_ref());
+    let sub = left.sub.as_ref().zip(right.sub.as_ref());
+    uid.is_some_and(|(a, b)| a == b)
+        || sub.is_some_and(|(a, b)| a == b)
+        || (uid.is_none() && sub.is_none())
 }
+
 #[derive(Clone)]
 pub(super) struct Broker {
     pub state: PathBuf,
@@ -381,9 +389,26 @@ impl Broker {
         {
             return Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
         }
-        let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-            .clear_for_launch(owner, relogin::AdmissionKind::Restore, &imports)
-            .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        let inventory = relogin::identity_inventory(&owner.state, &self.key, &owner.home);
+        let proof = if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+        {
+            let identities = central
+                .retained_identities()
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            inventory.clear_for_shared_launch(
+                owner,
+                relogin::AdmissionKind::Restore,
+                &imports,
+                &identities,
+            )
+        } else {
+            inventory.clear_for_launch(owner, relogin::AdmissionKind::Restore, &imports)
+        }
+        .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         spawn_owner(owner, &self.binary, proof)
             .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         // Admission and PID evidence are complete. Initialization is covered by
@@ -1867,6 +1892,12 @@ async fn import(
     Ok(([("cache-control", "no-store")], Json(result)).into_response())
 }
 impl Broker {
+    fn storage_admission_failure(&self, error: anyhow::Error) -> HttpError {
+        match error.downcast_ref::<super::storage::identity::IdentityDenied>() {
+            Some(denied) => self.error(StatusCode::CONFLICT, denied.reason()),
+            None => self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"),
+        }
+    }
     async fn lock_import_owner<'a>(
         &self,
         owner: &'a Mutex<Owner>,
@@ -1928,7 +1959,29 @@ impl Broker {
         {
             return Err(self.error(StatusCode::CONFLICT, "alias_renamed"));
         }
+        if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+            && central
+                .renamed_alias(user, &input.alias)
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+                .is_some()
+        {
+            return Err(self.error(StatusCode::CONFLICT, "alias_renamed"));
+        }
         let id = resolved.unwrap_or_else(|| account_key(user, &input.alias));
+        if let Some(central) = self
+            .central
+            .as_ref()
+            .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+        {
+            central
+                .check_import_identity(&id, &input.auth)
+                .await
+                .map_err(|error| self.storage_admission_failure(error))?;
+        }
         let selected = self.state.join("accounts").join(&id);
         if self.read_only {
             return Err(self.error(StatusCode::CONFLICT, "verification_requires_refresh"));
@@ -2183,9 +2236,10 @@ impl Broker {
                     revision: saved.revision.max(1),
                 };
                 if let Some(central) = self.central.as_ref() {
-                    central.save_account(&owner_record).await.map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                    })?;
+                    central
+                        .save_account(&owner_record)
+                        .await
+                        .map_err(|error| self.storage_admission_failure(error))?;
                 }
             }
         } else {
@@ -2218,9 +2272,10 @@ impl Broker {
                 revision: vault.revision.max(1),
             };
             if let Some(central) = self.central.as_ref() {
-                central.save_account(&owner_record).await.map_err(|_| {
-                    self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?;
+                central
+                    .save_account(&owner_record)
+                    .await
+                    .map_err(|error| self.storage_admission_failure(error))?;
             }
         }
         let owner = Arc::new(Mutex::new(

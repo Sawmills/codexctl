@@ -18,6 +18,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub(in crate::central) mod identity;
 pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
@@ -131,6 +132,7 @@ pub struct PostgresStore {
     tls_enabled: bool,
     client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     observation_client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
+    admission: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
     key: PathBuf,
 }
 
@@ -279,6 +281,7 @@ impl CentralStore {
         db.url = url.to_string();
         db.client = Arc::new(tokio::sync::Mutex::new(None));
         db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+        db.admission = Arc::new(tokio::sync::Mutex::new(None));
         let control = db.establish().await?;
         Ok((isolated, control, schema))
     }
@@ -525,6 +528,9 @@ impl CentralStore {
             bail!("finish pending logins in file mode before switching storage");
         }
         target.migrate().await?;
+        target
+            .save_alias_tombstones(super::rename::alias_tombstones(state)?)
+            .await?;
         let mut counts = BackfillCounts {
             accounts: 0,
             users: 0,
@@ -1195,6 +1201,7 @@ impl PostgresStore {
             tls_enabled,
             client: Arc::new(tokio::sync::Mutex::new(None)),
             observation_client: Arc::new(tokio::sync::Mutex::new(None)),
+            admission: Arc::new(tokio::sync::Mutex::new(None)),
             key: key.into(),
         };
         let _ = store.client().await?;
@@ -1319,7 +1326,10 @@ impl PostgresStore {
     }
 
     async fn migrate(&self) -> Result<()> {
-        let client = self.client().await?;
+        let cipher = vault::cipher(&self.key)?;
+        let mut connection = self.admission_client().await?;
+        let client = connection.transaction().await?;
+        identity::lock_admission(&client).await?;
         client
             .batch_execute(&format!("{SCHEMA}{}", login::LOGIN_SCHEMA))
             .await
@@ -1328,19 +1338,27 @@ impl PostgresStore {
             .batch_execute(loans::SCHEMA)
             .await
             .context("migrate central PostgreSQL loan schema")?;
+        self.backfill_identity_claims(&client, &cipher).await?;
         client
             .execute(
                 "INSERT INTO central_schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING",
                 &[],
             )
             .await?;
+        client.commit().await?;
         Ok(())
     }
 
     async fn save_account(&self, record: &CredentialRecord) -> Result<()> {
         let serialized = serde_json::to_vec(&record.vault)?;
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
-        let client = self.client().await?;
+        let claims = identity::Claims::from_record(record)?;
+        let mut connection = self.admission_client().await?;
+        let client = connection.transaction().await?;
+        identity::lock_admission(&client).await?;
+        if let Some(claims) = claims.as_ref() {
+            identity::check_claims(&client, &record.account_id, claims).await?;
+        }
         let changed = client.execute(
             "INSERT INTO central_accounts(account_id,user_id,alias,workspace,login,encrypted_vault,revision) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(account_id) DO UPDATE SET user_id=EXCLUDED.user_id,alias=EXCLUDED.alias,workspace=EXCLUDED.workspace,login=EXCLUDED.login,encrypted_vault=EXCLUDED.encrypted_vault,revision=EXCLUDED.revision,updated_at=now() WHERE central_accounts.revision < EXCLUDED.revision AND central_accounts.deleted_at IS NULL",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision],
@@ -1361,10 +1379,15 @@ impl PostgresStore {
                     .ok()
                     .is_some_and(|plain| plain == serialized)
             }) {
+                client.commit().await?;
                 return Ok(());
             }
             bail!("central account write was fenced or tombstoned");
         }
+        if let Some(claims) = claims.as_ref() {
+            identity::record_claims(&client, &record.account_id, claims).await?;
+        }
+        client.commit().await?;
         Ok(())
     }
 
@@ -1715,7 +1738,7 @@ impl PostgresStore {
         // Expiry alone cannot prove a foreign refresh child stopped. A renewal
         // can replace its own local holder because its worker settles that child.
         let row = client.query_opt(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR (candidate_workspace=(SELECT workspace FROM central_accounts WHERE account_id=$1) AND (candidate_login IS NULL OR (SELECT login FROM central_accounts WHERE account_id=$1) IS NULL OR candidate_login=(SELECT login FROM central_accounts WHERE account_id=$1)))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR central_login_identity_matches(candidate_workspace,candidate_claims,$1)) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
             &[&account_id, &holder_id, &(ttl.as_secs() as i64), &login_id, &local_holder],
         ).await?;
         Ok(row.map(|row| Lease {
@@ -1731,18 +1754,26 @@ impl PostgresStore {
         }
         let serialized = serde_json::to_vec(&record.vault)?;
         let encrypted = vault::encrypt_bytes(&self.key, &serialized)?;
-        let client = self.client().await?;
+        let claims = identity::Claims::from_record(record)?;
+        let cipher = vault::cipher(&self.key)?;
+        let mut connection = self.admission_client().await?;
+        let client = connection.transaction().await?;
+        identity::lock_admission(&client).await?;
         let changed = client.execute(
-            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > now() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=now() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
+            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
+            if let Some(claims) = claims.as_ref() {
+                identity::record_claims(&client, &record.account_id, claims).await?;
+            }
+            client.commit().await?;
             return Ok(true);
         }
-        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > now() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
+        let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > clock_timestamp() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
         Ok(row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
-            vault::decrypt_bytes(&self.key, &stored)
+            vault::decrypt_with_cipher(&cipher, &stored)
                 .ok()
                 .is_some_and(|plain| plain == serialized)
         }))
@@ -1841,7 +1872,7 @@ mod tests {
             user_id: Some("user".into()),
             alias: "seat".into(),
             workspace: Some("workspace".into()),
-            login: Some("login".into()),
+            login: Some(id.into()),
             vault: serde_json::json!({"refresh":"secret"}),
             revision,
         }
@@ -1982,6 +2013,118 @@ mod tests {
     }
 
     #[cfg(feature = "central-real-db-tests")]
+    fn claims_auth(subject: Option<&str>, uid: Option<&str>) -> Value {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let mut claims = serde_json::json!({"https://api.openai.com/auth":{"chatgpt_account_id":"claim-workspace"}});
+        if let Some(sub) = subject {
+            claims["sub"] = serde_json::json!(sub);
+        }
+        if let Some(uid) = uid {
+            claims["https://api.openai.com/auth"]["chatgpt_user_id"] = serde_json::json!(uid);
+        }
+        serde_json::json!({"tokens":{"account_id":"claim-workspace","access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic"}})
+    }
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_migration_retains_login_claims_when_a_later_capture_omits_them() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[21; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("stable-uid"))});
+        shared.save_account(&original).await.unwrap();
+        // The prior schema stored the token, but had no namespaced claim table.
+        control
+            .batch_execute("DROP TABLE central_account_claims")
+            .await
+            .unwrap();
+        shared.migrate().await.unwrap();
+        original.revision = 2;
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        let mut duplicate = record("duplicate", 1);
+        duplicate.workspace = Some("claim-workspace".into());
+        duplicate.login = None;
+        duplicate.vault = serde_json::json!({"auth":claims_auth(None,Some("stable-uid"))});
+        assert!(
+            shared.save_account(&duplicate).await.is_err(),
+            "migration must retain the UID proof after the current token omits it"
+        );
+        assert!(
+            shared.load_account("duplicate").await.unwrap().is_none(),
+            "refusal must roll back account creation"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_fenced_writes_preserve_each_learned_login_claim() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[22; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        let mut original = record("original", 1);
+        original.workspace = Some("claim-workspace".into());
+        original.login = Some("stable-sub".into());
+        original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
+        shared.save_account(&original).await.unwrap();
+        let lease = shared
+            .acquire_lease("original", "holder", Duration::from_secs(60))
+            .await
+            .unwrap();
+        for (revision, uid) in [(2, Some("learned-uid")), (3, None)] {
+            original.revision = revision;
+            original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),uid)});
+            assert!(shared.fenced_write(&lease, &original).await.unwrap());
+        }
+        original.revision = 4;
+        original.vault =
+            serde_json::json!({"auth":claims_auth(Some("stable-sub"),Some("conflicting-uid"))});
+        assert!(
+            shared.fenced_write(&lease, &original).await.is_err(),
+            "a learned UID must not change even if the subject agrees"
+        );
+        assert_eq!(
+            shared
+                .load_account("original")
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            3
+        );
+        let mut duplicate = record("duplicate", 1);
+        duplicate.workspace = Some("claim-workspace".into());
+        duplicate.login = None;
+        duplicate.vault = serde_json::json!({"auth":claims_auth(None,Some("learned-uid"))});
+        assert!(
+            shared.save_account(&duplicate).await.is_err(),
+            "fenced credential writes must retain learned UID proof"
+        );
+        assert!(shared.load_account("duplicate").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
     async fn postgres_real_store_scenarios() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1998,6 +2141,7 @@ mod tests {
         let first = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
             .await
             .unwrap();
+        let (first, control, schema) = first.isolated_test_schema().await.unwrap();
         first.migrate().await.unwrap();
         if let CentralStore::Postgres(db) = &first {
             let client = db.client().await.unwrap();
@@ -2032,9 +2176,12 @@ mod tests {
         assert_eq!(imported.vault["revision"], serde_json::json!(1));
         let repeated = first.backfill(root.path(), &key).await.unwrap();
         assert_eq!(repeated.accounts, 0);
-        let second = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
-            .await
-            .unwrap();
+        let mut second = first.clone();
+        if let CentralStore::Postgres(db) = &mut second {
+            db.client = Arc::new(tokio::sync::Mutex::new(None));
+            db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+            db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        }
         let id = format!(
             "test-{}",
             vault::digest(&crate::central::enrollment::random_bytes())
@@ -2337,5 +2484,9 @@ mod tests {
                 .await
                 .unwrap();
         }
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 }

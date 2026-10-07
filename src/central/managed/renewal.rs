@@ -1,6 +1,9 @@
 //! Verification of a shared renewal after device-login candidate publication.
 use super::*;
-use crate::central::storage::login::{LoginOperation, LoginPhase};
+use crate::central::storage::{
+    identity::CandidateIdentityMismatch,
+    login::{LoginKind, LoginOperation, LoginPhase},
+};
 
 impl Broker {
     /// Revocation is a decision; a failed registry read is an unavailable authority.
@@ -55,23 +58,25 @@ impl Broker {
         // Reject a wrong login before waiting on reservations that it may itself
         // have created for another renewal's selected account.
         let shared = central
-            .load_account(&op.account_id)
+            .load_account(op.account()?)
             .await?
             .context("renewal account missing")?;
-        let saved: Vault = serde_json::from_value(shared.vault)?;
-        let candidate = op
-            .payload
-            .candidate
-            .as_ref()
-            .context("missing shared candidate")?;
-        if let Err(error) = crate::central::server::validate_owned_identity(&saved.auth, candidate)
-        {
-            op.payload.error = Some("wrong_account".into());
-            central.login_save(op, LoginPhase::Rejected).await?;
+        let _: Vault = serde_json::from_value(shared.vault)?;
+        let identity = central.validate_login_candidate(op).await;
+        if let Err(error) = identity {
+            if error.is::<CandidateIdentityMismatch>() {
+                op.payload.error = Some("wrong_account".into());
+                central.login_save(op, LoginPhase::Rejected).await?;
+            }
             return Err(error);
         }
+        if op.kind == LoginKind::Renewal && !central.login_reserve_renewal(op).await? {
+            op.payload.error = Some("relogin_reserved".into());
+            central.login_save(op, LoginPhase::Rejected).await?;
+            return Ok(());
+        }
         let owner_ref = self
-            .owner(&device, &op.alias)
+            .owner(&device, op.payload.landed.as_deref().unwrap_or(&op.alias))
             .await
             .map_err(|_| anyhow::anyhow!("renewal account missing"))?;
         let (imports, mut held_owner, lease) = loop {
@@ -123,7 +128,7 @@ impl Broker {
             drop(imports);
             {
                 let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
-                reconcile_owner_from_central(self, owner, &op.account_id)
+                reconcile_owner_from_central(self, owner, op.account()?)
                     .await
                     .map_err(|_| anyhow::anyhow!("cannot reconcile renewal account"))?;
                 if let Some(rpc) = owner.rpc.as_mut() {
@@ -139,7 +144,7 @@ impl Broker {
             let imports = self.imports.lock().await;
             owner = Some(owner_ref.lock().await);
             let owner = &mut **owner.as_mut().context("renewal owner lock missing")?;
-            reconcile_owner_from_central(self, owner, &op.account_id)
+            reconcile_owner_from_central(self, owner, op.account()?)
                 .await
                 .map_err(|_| anyhow::anyhow!("cannot reconcile renewal account"))?;
             let candidate = op
@@ -147,8 +152,11 @@ impl Broker {
                 .candidate
                 .clone()
                 .context("missing shared candidate")?;
-            if let Err(error) = owner.validate_owned_auth(&candidate) {
-                op.payload.error = Some("wrong_account".into());
+            let identity = central.validate_login_candidate(op).await;
+            if let Err(error) = identity {
+                if error.is::<CandidateIdentityMismatch>() {
+                    op.payload.error = Some("wrong_account".into());
+                }
                 return Err(error);
             }
             let before = owner.vault.clone();
@@ -156,10 +164,11 @@ impl Broker {
             // PostgreSQL. Keep that evidence for settlement, but compare the
             // final commit against the shared revision read under this lease.
             let committed_revision = central
-                .load_account(&op.account_id)
+                .load_account(op.account()?)
                 .await?
                 .context("renewal account missing")?
                 .revision;
+            let identities = central.retained_identities().await?;
             // This is durable before initialize, which can itself rotate credentials.
             central.login_begin_verification(op, &lease).await?;
             owner.vault.auth = candidate.clone();
@@ -180,7 +189,12 @@ impl Broker {
             )?;
             let verification = async {
                 let proof = relogin::identity_inventory(&owner.state, &self.key, &owner.home)
-                    .clear_for_launch(owner, relogin::AdmissionKind::Renewal, &imports)?;
+                    .clear_for_shared_launch(
+                        owner,
+                        relogin::AdmissionKind::Renewal,
+                        &imports,
+                        &identities,
+                    )?;
                 spawn_owner(owner, &self.binary, proof)?;
                 // Account authority and durable spawn evidence now cover initialization.
                 drop(imports);

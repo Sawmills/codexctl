@@ -190,6 +190,19 @@ pub(in crate::central) async fn status(
     headers: HeaderMap,
     body: Result<Json<AddRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        let Json(request) =
+            body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+        let body = Ok(Json(Request {
+            alias: request.alias,
+            id: request.id,
+        }));
+        return super::shared::add_status(broker, headers, body).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("account_login_unavailable") {
         return Err(error);
     }
@@ -205,6 +218,19 @@ pub(in crate::central) async fn cancel(
     headers: HeaderMap,
     body: Result<Json<AddRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        let Json(request) =
+            body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+        let body = Ok(Json(Request {
+            alias: request.alias,
+            id: request.id,
+        }));
+        return super::shared::add_cancel(broker, headers, body).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("account_login_unavailable") {
         return Err(error);
     }
@@ -247,6 +273,29 @@ pub(in crate::central) async fn start(
     headers: HeaderMap,
     body: Result<Json<AddRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+    {
+        let Json(request) =
+            body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+        let label = store::validate_label(request.label.as_deref().unwrap_or(""))
+            .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_label"))?
+            .map(str::to_owned);
+        let body = Ok(Json(Request {
+            alias: request.alias,
+            id: request.id,
+        }));
+        return super::shared::start_kind(
+            broker,
+            headers,
+            body,
+            crate::central::storage::login::LoginKind::Add,
+            label,
+        )
+        .await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("account_login_unavailable") {
         return Err(error);
     }

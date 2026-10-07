@@ -180,7 +180,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         let response = http
             .post(format!("{}/v1/accounts", seed.url))
             .bearer_auth(&token)
-            .json(&json!({"alias":alias,"auth":auth}))
+            .json(&json!({"alias":alias,"auth":auth,"label":"Original seat"}))
             .send()
             .await
             .unwrap();
@@ -227,7 +227,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         [0, 0, 0],
         "startup must not create refresh children on any replica"
     );
-    // Login records are replica-local, so shared mode refuses new-account login.
+    // Add polling now uses a shared receipt before the account exists.
     let add = http
         .post(format!("{}/v1/accounts/login/start", pods[0].url))
         .bearer_auth(&token)
@@ -235,11 +235,16 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         .send()
         .await
         .unwrap();
-    assert_eq!(add.status(), 503);
-    assert_eq!(
-        add.json::<Value>().await.unwrap()["error"],
-        "account_login_unavailable"
-    );
+    assert_eq!(add.status(), 200);
+    assert_eq!(add.json::<Value>().await.unwrap()["status"], "pending");
+    let cancel = http
+        .post(format!("{}/v1/accounts/login/cancel", pods[1].url))
+        .bearer_auth(&token)
+        .json(&json!({"alias":"new-account","id":"a".repeat(64)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), 200);
     let rename = http
         .post(format!("{}/v1/accounts/rename", pods[0].url))
         .bearer_auth(&token)
@@ -1092,6 +1097,9 @@ async fn login_fixture_with_legacy_alias(legacy: bool) -> LoginFixture {
     login_fixture_with_accounts(legacy, false).await
 }
 async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixture {
+    login_fixture_with_rename(legacy, foreign, false).await
+}
+async fn login_fixture_with_rename(legacy: bool, foreign: bool, renamed: bool) -> LoginFixture {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(
             std::env::var("CI").ok().as_deref(),
@@ -1152,7 +1160,7 @@ async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixtur
         let response = http
             .post(format!("{}/v1/accounts", seed.url))
             .bearer_auth(&token)
-            .json(&json!({"alias":alias,"auth":auth}))
+            .json(&json!({"alias":alias,"auth":auth,"label":"Original seat"}))
             .send()
             .await
             .unwrap();
@@ -1184,6 +1192,16 @@ async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixtur
     }
     let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
     assert_eq!(generation(&seed_token), if foreign { 2 } else { 1 });
+    if renamed {
+        let renamed = http
+            .post(format!("{}/v1/accounts/rename", seed.url))
+            .bearer_auth(&token)
+            .json(&json!({"alias":"seat","newAlias":"renamed-seat"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(renamed.status(), 200);
+    }
     seed.stop().await;
     if legacy {
         use aes_gcm::{
@@ -2000,20 +2018,26 @@ async fn postgres_unreadable_saved_grant_preserves_shared_reservations() {
 #[tokio::test]
 async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
     let f = login_fixture().await;
-    // PostgreSQL finishes the statement after the client's bounded wait expires.
+    // Delay COMMIT after its command is sent, so a lost response can still leave durable completion.
     f.control
         .batch_execute(&format!(
             r#"
         CREATE FUNCTION {0}.delay_completion() RETURNS trigger LANGUAGE plpgsql AS $$
         BEGIN
-            IF NEW.phase='verifying' THEN
+            IF NEW.phase IN ('verifying','completed') THEN
                 PERFORM set_config('statement_timeout', '0', false);
             END IF;
-            IF NEW.phase='completed' THEN PERFORM pg_sleep(3); END IF;
             RETURN NEW;
         END $$;
-        CREATE TRIGGER delay_completion AFTER UPDATE ON {0}.central_login_operations
+        CREATE TRIGGER prepare_completion_delay AFTER UPDATE ON {0}.central_login_operations
         FOR EACH ROW EXECUTE FUNCTION {0}.delay_completion();
+        CREATE FUNCTION {0}.delay_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='completed' AND OLD.phase<>'completed' THEN PERFORM pg_sleep(3); END IF;
+            RETURN NEW;
+        END $$;
+        CREATE CONSTRAINT TRIGGER delay_commit AFTER UPDATE ON {0}.central_login_operations
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {0}.delay_commit();
     "#,
             f.schema
         ))
@@ -2702,5 +2726,1269 @@ async fn postgres_polling_deadline_does_not_abort_lease_wait_or_verification() {
     .await
     .expect("late polling approval must finish verification");
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_shares_pending_receipt_and_cancel_across_replicas() {
+    let f = login_fixture().await;
+    let operation = json!({"alias":"new-account","id":"a".repeat(64),"label":"New seat"});
+    let response = f
+        .http
+        .post(format!("{}/v1/accounts/login/start", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&operation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200, "PostgreSQL must support add login");
+    let started: Value = response.json().await.unwrap();
+    assert_eq!(started["status"], "pending");
+    let adopted: Value = f
+        .http
+        .post(format!("{}/v1/accounts/login/start", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"new-account","id":"b".repeat(64)}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(adopted["id"], started["id"]);
+    for action in ["status", "cancel"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/accounts/login/{action}", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&operation)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["userCode"],
+            "TEST-LOGIN"
+        );
+    }
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let status: Value = f
+                .http
+                .post(format!("{}/v1/accounts/login/status", f.second.url))
+                .bearer_auth(&f.token)
+                .json(&operation)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if status["status"] == "canceled" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("cross-replica cancellation deadline");
+    assert!(!f.second.root.path().join("login-pid").exists());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+fn add_grant(workspace: &str, subject: Option<&str>, uid: Option<&str>) -> Value {
+    let mut claims = json!({"iat":2000000000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":workspace,"chatgpt_plan_type":"pro"}});
+    if let Some(subject) = subject {
+        claims["sub"] = json!(subject);
+    }
+    if let Some(uid) = uid {
+        claims["https://api.openai.com/auth"]["chatgpt_user_id"] = json!(uid);
+    }
+    json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),
+        "refresh_token":"synthetic-add-refresh","account_id":workspace}})
+}
+async fn add_request(f: &LoginFixture, pod: &Pod, action: &str, operation: &Value) -> Value {
+    let response = f
+        .http
+        .post(format!("{}/v1/accounts/login/{action}", pod.url))
+        .bearer_auth(&f.token)
+        .json(operation)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let receipt: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{action}: {receipt}");
+    receipt
+}
+async fn complete_add(f: &LoginFixture, pod: &Pod, operation: &Value, grant: &Value) -> Value {
+    store::atomic_write(
+        &pod.root.path().join("login-release"),
+        &serde_json::to_vec(grant).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = add_request(f, &f.second, "status", operation).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                return receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("add must finish")
+}
+#[tokio::test]
+async fn postgres_add_creates_verified_account_and_replays_completed_receipt_on_another_replica() {
+    let f = login_fixture().await;
+    let operation = json!({"alias":"new-account","id":"d0".repeat(32),"label":"New seat"});
+    assert_eq!(
+        add_request(&f, &f.first, "start", &operation).await["status"],
+        "pending"
+    );
+    complete_add(
+        &f,
+        &f.first,
+        &operation,
+        &add_grant("new-workspace", Some("new-login"), None),
+    )
+    .await;
+    let launches = f.first.launches() + f.second.launches();
+    let receipt = add_request(&f, &f.second, "start", &operation).await;
+    assert_eq!(receipt["status"], "completed");
+    assert!(
+        !f.second.root.path().join("login-pid").exists(),
+        "receipt retry must not run another login"
+    );
+    assert_eq!(f.first.launches() + f.second.launches(), launches);
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"new-account"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "new account must be verified and usable"
+    );
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = catalog.as_array().unwrap();
+    assert_eq!(
+        rows.iter().filter(|a| a["alias"] == "new-account").count(),
+        1
+    );
+    assert_eq!(
+        rows.iter().find(|a| a["alias"] == "new-account").unwrap()["label"],
+        "New seat"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_lands_on_existing_alias_and_preserves_its_label() {
+    let f = login_fixture().await;
+    let operation = json!({"alias":"typo","id":"d1".repeat(32),"label":"Replacement label"});
+    add_request(&f, &f.first, "start", &operation).await;
+    let receipt = complete_add(&f, &f.first, &operation, &renewal_grant()).await;
+    assert_eq!(receipt["landedAlias"], "seat");
+    assert_eq!(
+        add_request(&f, &f.second, "start", &operation).await["landedAlias"],
+        "seat"
+    );
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = catalog.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "landing must not add a duplicate account");
+    assert_eq!(
+        rows.iter().find(|a| a["alias"] == "seat").unwrap()["label"],
+        "Original seat"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+async fn wait_add_terminal(f: &LoginFixture, operation: &Value) -> Value {
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = add_request(f, &f.second, "status", operation).await;
+            if ["completed", "failed", "canceled", "expired"]
+                .iter()
+                .any(|s| receipt["status"] == *s)
+            {
+                return receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("add must settle or report failure")
+}
+#[tokio::test]
+async fn postgres_add_refuses_an_account_owned_by_another_company_user_before_verification() {
+    let f = login_fixture_with_accounts(false, true).await;
+    let operation = json!({"alias":"foreign-copy","id":"d2".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&foreign_grant()).unwrap(),
+    )
+    .unwrap();
+    let receipt = wait_add_terminal(&f, &operation).await;
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["error"], "account_already_owned");
+    assert_eq!(
+        f.first.launches(),
+        0,
+        "ownership refusal precedes any refresh child"
+    );
+    let foreign_token =
+        std::fs::read_to_string(f._seed.root.path().join("foreign-machine-token")).unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&foreign_token)
+        .json(&json!({"alias":"foreign-seat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "rightful owner's credentials remain usable"
+    );
+    stop_fixture(f).await;
+}
+
+async fn assert_in_flight_add_refusal(second_grant: Value) {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let first = json!({"alias":"new-one","id":"d3".repeat(32)});
+    let second = json!({"alias":"new-two","id":"d4".repeat(32)});
+    let grant = add_grant("new-workspace", Some("new-login"), Some("new-uid"));
+    add_request(&f, &f.first, "start", &first).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    add_request(&f, &f.second, "start", &second).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&second_grant).unwrap(),
+    )
+    .unwrap();
+    let refused = wait_add_terminal(&f, &second).await;
+    assert_eq!(refused["status"], "failed");
+    assert_eq!(refused["error"], "relogin_reserved");
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "matching in-flight add must not start a second verifier"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(wait_add_terminal(&f, &first).await["status"], "completed");
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog.as_array().unwrap().len(), 3, "one new seat only");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_second_login_refuses_an_in_flight_add_identity_reservation() {
+    assert_in_flight_add_refusal(add_grant(
+        "new-workspace",
+        Some("new-login"),
+        Some("new-uid"),
+    ))
+    .await;
+}
+#[tokio::test]
+async fn postgres_identity_reservation_matches_uid_when_the_second_grant_has_no_subject() {
+    assert_in_flight_add_refusal(add_grant("new-workspace", None, Some("new-uid"))).await;
+}
+
+#[tokio::test]
+async fn postgres_completed_add_releases_identity_reservation_for_a_later_landing() {
+    let f = login_fixture().await;
+    let first = json!({"alias":"new-one","id":"d5".repeat(32),"label":"First label"});
+    let second = json!({"alias":"new-two","id":"d6".repeat(32),"label":"Ignored label"});
+    let grant = add_grant("new-workspace", Some("new-login"), Some("new-uid"));
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(&f, &f.first, &first, &grant).await;
+    add_request(&f, &f.second, "start", &second).await;
+    let receipt = complete_add(&f, &f.second, &second, &grant).await;
+    assert_eq!(receipt["landedAlias"], "new-one");
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = catalog.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().find(|a| a["alias"] == "new-one").unwrap()["label"],
+        "First label"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_landing_preserves_all_namespaced_claims_across_token_transitions() {
+    let f = login_fixture().await;
+    let grants = [
+        add_grant("new-workspace", Some("stable-subject"), Some("stable-uid")),
+        add_grant("new-workspace", None, Some("stable-uid")),
+        add_grant("new-workspace", Some("stable-subject"), None),
+    ];
+    for (i, grant) in grants.iter().enumerate() {
+        let pod = if i == 1 { &f.second } else { &f.first };
+        let gate = pod.root.path().join("login-release");
+        if gate.exists() {
+            std::fs::remove_file(&gate).unwrap();
+        }
+        let operation = json!({"alias":format!("claim-{i}"),"id":format!("e{i}").repeat(32)});
+        add_request(&f, pod, "start", &operation).await;
+        let receipt = complete_add(&f, pod, &operation, grant).await;
+        if i > 0 {
+            assert_eq!(receipt["landedAlias"], "claim-0");
+        }
+    }
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        3,
+        "claim transitions must keep one account"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_import_refuses_a_matching_in_flight_add_before_creating_a_second_account() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let operation = json!({"alias":"new-one","id":"e3".repeat(32)});
+    let grant = add_grant("new-workspace", Some("new-login"), Some("new-uid"));
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = timeout(
+        Duration::from_secs(6),
+        f.http
+            .post(format!("{}/v1/accounts", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"import-copy","auth":grant}))
+            .send(),
+    )
+    .await
+    .expect("reserved import must refuse before waiting on a lease")
+    .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "relogin_reserved");
+    assert_eq!(f.second.launches(), 0);
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        3,
+        "refused import must not leave another account"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_distinct_uid_only_logins_in_one_workspace_do_not_share_a_reservation() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let first = json!({"alias":"uid-one","id":"e4".repeat(32)});
+    let second = json!({"alias":"uid-two","id":"e5".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("shared-workspace", None, Some("uid-one"))).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("shared-workspace", None, Some("uid-two")),
+    )
+    .await;
+    assert_eq!(
+        add_request(&f, &f.second, "status", &first).await["status"],
+        "verifying"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(wait_add_terminal(&f, &first).await["status"], "completed");
+    for alias in ["uid-one", "uid-two"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{alias} must stay usable");
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_login_adoption_keeps_the_add_and_renewal_receipts_separate() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"add-startup-hold").unwrap();
+    let operation = json!({"alias":"new-one","id":"e6".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("new-workspace", Some("new-login"), None)).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let renewal = f
+        .http
+        .post(format!("{}/v1/relogin/start", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"new-one","id":"e7".repeat(32)}))
+        .send()
+        .await
+        .unwrap();
+    let status = renewal.status();
+    let body: Value = renewal.json().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "relogin_reserved");
+    let adopted = add_request(
+        &f,
+        &f.second,
+        "start",
+        &json!({"alias":"new-one","id":"e8".repeat(32)}),
+    )
+    .await;
+    assert_eq!(
+        adopted["id"], operation["id"],
+        "same-device add retries retain the original operation after account creation"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_equal_text_in_different_login_namespaces_is_unresolved_and_keeps_the_grant_fenced()
+ {
+    let f = login_fixture().await;
+    let first = json!({"alias":"uid-owner","id":"e9".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", None, Some("same-text")),
+    )
+    .await;
+    let second = json!({"alias":"subject-copy","id":"ea".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("new-workspace", Some("same-text"), None)).unwrap(),
+    )
+    .unwrap();
+    let receipt = wait_add_terminal(&f, &second).await;
+    assert_eq!(receipt["status"], "failed");
+    assert_eq!(receipt["error"], "account_identity_unresolved");
+    let token = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"uid-owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        token.status(),
+        503,
+        "an incomparable issued grant remains quarantined"
+    );
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_failed_requests_total{reason=\"relogin_identity_unresolved\"} 1"
+        ),
+        "count the failed admission once: {metrics}"
+    );
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "incomparable claims cannot start verification"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_completion_keeps_claims_learned_during_verification() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"gain-uid").unwrap();
+    for (i, grant) in [
+        add_grant("new-workspace", Some("stable-subject"), None),
+        add_grant("new-workspace", Some("stable-subject"), None),
+        add_grant("new-workspace", None, Some("learned-uid")),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let pod = if i == 0 { &f.first } else { &f.second };
+        let gate = pod.root.path().join("login-release");
+        if gate.exists() {
+            std::fs::remove_file(&gate).unwrap();
+        }
+        let operation = json!({"alias":format!("learned-{i}"),"id":format!("f{i}").repeat(32)});
+        add_request(&f, pod, "start", &operation).await;
+        let receipt = complete_add(&f, pod, &operation, grant).await;
+        if i > 0 {
+            assert_eq!(receipt["landedAlias"], "learned-0");
+        }
+    }
+    stop_fixture(f).await;
+}
+
+async fn wait_renewal_terminal(f: &LoginFixture, alias: &str, id: &str) -> Value {
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_alias_request(f, &f.second, alias, "status", id).await;
+            if ["completed", "failed", "canceled", "expired"]
+                .iter()
+                .any(|s| receipt["status"] == *s)
+            {
+                return receipt;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("renewal must settle or report failure")
+}
+#[tokio::test]
+async fn postgres_repair_releases_a_wrong_grant_by_uid_without_releasing_its_selected_account() {
+    let f = login_fixture().await;
+    let grant = add_grant("new-workspace", None, Some("uid-owner"));
+    let add = json!({"alias":"uid-owner","id":"f3".repeat(32)});
+    add_request(&f, &f.first, "start", &add).await;
+    complete_add(&f, &f.first, &add, &grant).await;
+    std::fs::remove_file(f.first.root.path().join("login-release")).unwrap();
+    let wrong = "f4".repeat(32);
+    login_request(&f, &f.first, "start", &wrong).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wait_renewal_terminal(&f, "seat", &wrong).await["error"],
+        "wrong_account"
+    );
+    let token = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"uid-owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        token.status(),
+        503,
+        "wrong grant must quarantine the matching UID owner"
+    );
+    let repair = "f5".repeat(32);
+    login_alias_request(&f, &f.second, "uid-owner", "start", &repair).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&grant).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wait_renewal_terminal(&f, "uid-owner", &repair).await["status"],
+        "completed"
+    );
+    let token = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"uid-owner"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        token.status(),
+        200,
+        "verified UID agreement must release the matching quarantine"
+    );
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "the original selected seat stays reserved"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_refuses_identity_claimed_by_a_renewal_before_the_uid_is_promoted() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let renewal = "f6".repeat(32);
+    login_request(&f, &f.first, "start", &renewal).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant(
+            "synthetic-seat",
+            Some("synthetic-seat"),
+            Some("renewal-uid"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let operation = json!({"alias":"renewal-copy","id":"f7".repeat(32)});
+    add_request(&f, &f.second, "start", &operation).await;
+    store::atomic_write(
+        &f.second.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("synthetic-seat", None, Some("renewal-uid"))).unwrap(),
+    )
+    .unwrap();
+    let receipt = wait_add_terminal(&f, &operation).await;
+    assert_eq!(receipt["error"], "relogin_reserved");
+    assert_eq!(f.second.launches(), 0);
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_renewal_terminal(&f, "seat", &renewal).await["status"],
+        "completed"
+    );
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        2,
+        "a renewal's new UID cannot create another profile"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_rechecks_machine_authorization_after_admission_waits() {
+    let f = login_fixture().await;
+    let token_file = f._seed.root.path().join("observer-token");
+    let registered = command(
+        &f.database,
+        &f._seed.root.path().join("state"),
+        &f.key,
+        "register",
+    )
+    .args([
+        "--device",
+        "observer",
+        "--tenant",
+        "sawmills",
+        "--user",
+        "test",
+        "--token-file",
+    ])
+    .arg(&token_file)
+    .output()
+    .await
+    .unwrap();
+    assert!(
+        registered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
+    let observer = std::fs::read_to_string(token_file).unwrap();
+    let operation = json!({"alias":"revoked-add","id":"f8".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control
+        .query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("new-workspace", Some("new-login"), None)).unwrap(),
+    )
+    .unwrap();
+    wait_dead(pid).await;
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_devices SET revoked=true WHERE id='test-machine'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    f.control
+        .query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let response = f
+                .http
+                .post(format!("{}/v1/accounts/login/status", f.second.url))
+                .bearer_auth(&observer)
+                .json(&json!({"alias":"revoked-add","id":""}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 404 {
+                break;
+            }
+            assert_eq!(
+                response.status(),
+                409,
+                "the original device still owns the active operation"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&observer)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        catalog.as_array().unwrap().len(),
+        2,
+        "revoked authorization cannot create an account after a lock wait"
+    );
+    assert_eq!(f.first.launches(), 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_concurrent_add_claims_create_one_account_and_one_verifier() {
+    let f = login_fixture().await;
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("mode"), b"add-startup-hold").unwrap();
+    }
+    let first = json!({"alias":"race-one","id":"fa".repeat(32)});
+    let second = json!({"alias":"race-two","id":"fb".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    add_request(&f, &f.second, "start", &second).await;
+    let grant = serde_json::to_vec(&add_grant(
+        "race-workspace",
+        Some("race-login"),
+        Some("race-uid"),
+    ))
+    .unwrap();
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("login-release"), &grant).unwrap();
+    }
+    let winner = timeout(Duration::from_secs(8), async {
+        loop {
+            let a = add_request(&f, &f.second, "status", &first).await;
+            let b = add_request(&f, &f.second, "status", &second).await;
+            if f.first.launches() + f.second.launches() == 1
+                && (a["status"] == "failed" || b["status"] == "failed")
+            {
+                let (held, refused) = if a["status"] == "failed" {
+                    (&second, a)
+                } else {
+                    (&first, b)
+                };
+                assert_eq!(refused["error"], "relogin_reserved");
+                return held.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("one claim holder and one refused duplicate");
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("release-initialize"), b"ready").unwrap();
+    }
+    assert_eq!(wait_add_terminal(&f, &winner).await["status"], "completed");
+    assert_eq!(f.first.launches() + f.second.launches(), 1);
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog.as_array().unwrap().len(), 3);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_cli_resumes_on_another_replica_without_a_second_device_login() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let f = login_fixture().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let route_second = Arc::new(AtomicBool::new(false));
+    let route = route_second.clone();
+    let first_address = f.first.url.trim_start_matches("http://").to_owned();
+    let second_address = f.second.url.trim_start_matches("http://").to_owned();
+    let proxy = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            let (mut incoming, _) = listener.accept().await.unwrap();
+            let target = if route.load(Ordering::Acquire) {
+                second_address.clone()
+            } else {
+                first_address.clone()
+            };
+            connections.spawn(async move {
+                let mut outgoing = tokio::net::TcpStream::connect(target).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+            });
+        }
+    });
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/central");
+    store::ensure_private_dir(&directory).unwrap();
+    let token_file = directory.join(".device.token");
+    store::atomic_write(&token_file, f.token.as_bytes()).unwrap();
+    store::atomic_write(
+        &directory.join(".server.json"),
+        &serde_json::to_vec(
+            &json!({"server":format!("http://{address}"),"token_file":token_file,"user_id":"test"}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+    cli.args(["login", "cli-new", "--no-browser", "--label", "CLI label"])
+        .env("HOME", home.path())
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut interrupted = cli.spawn().unwrap();
+    let mut output = BufReader::new(interrupted.stdout.take().unwrap());
+    let mut line = String::new();
+    timeout(Duration::from_secs(10), async {
+        while !line.contains("TEST-LOGIN") {
+            assert!(output.read_line(&mut line).await.unwrap() > 0, "{line}");
+        }
+    })
+    .await
+    .unwrap();
+    interrupted.kill().await.unwrap();
+    interrupted.wait().await.unwrap();
+    route_second.store(true, Ordering::Release);
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&add_grant("cli-workspace", Some("cli-login"), None)).unwrap(),
+    )
+    .unwrap();
+    let resumed = timeout(Duration::from_secs(12), cli.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert!(
+        !f.second.root.path().join("login-pid").exists(),
+        "CLI receipt retry must not start a second device login"
+    );
+    let catalog: Value = f
+        .http
+        .get(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = catalog.as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter().find(|a| a["alias"] == "cli-new").unwrap()["label"],
+        "CLI label"
+    );
+    proxy.abort();
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_accepts_retained_claims_after_a_uid_only_add_landing() {
+    let f = login_fixture().await;
+    let both = add_grant("new-workspace", Some("retained-sub"), Some("retained-uid"));
+    let first = json!({"alias":"retained","id":"fc".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(&f, &f.first, &first, &both).await;
+    let second = json!({"alias":"copy","id":"fd".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    std::fs::remove_file(f.first.root.path().join("login-release")).unwrap();
+    let id = "fe".repeat(32);
+    login_alias_request(&f, &f.first, "retained", "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&both).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        wait_renewal_terminal(&f, "retained", &id).await["status"],
+        "completed"
+    );
+    stop_fixture(f).await;
+}
+#[tokio::test]
+async fn postgres_add_uses_retained_subjects_to_distinguish_logins_during_launch() {
+    let f = login_fixture().await;
+    let first = json!({"alias":"retained","id":"a0".repeat(32)});
+    add_request(&f, &f.first, "start", &first).await;
+    complete_add(
+        &f,
+        &f.first,
+        &first,
+        &add_grant("new-workspace", Some("retained-sub"), Some("retained-uid")),
+    )
+    .await;
+    let second = json!({"alias":"copy","id":"a1".repeat(32)});
+    add_request(&f, &f.second, "start", &second).await;
+    complete_add(
+        &f,
+        &f.second,
+        &second,
+        &add_grant("new-workspace", None, Some("retained-uid")),
+    )
+    .await;
+    std::fs::remove_file(f.second.root.path().join("login-release")).unwrap();
+    let other = json!({"alias":"different","id":"a2".repeat(32)});
+    add_request(&f, &f.second, "start", &other).await;
+    complete_add(
+        &f,
+        &f.second,
+        &other,
+        &add_grant("new-workspace", Some("different-sub"), None),
+    )
+    .await;
+    for alias in ["retained", "different"] {
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.second.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{alias}");
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_add_preserves_file_rename_tombstones_across_backfill_and_replicas() {
+    let f = login_fixture_with_rename(false, false, true).await;
+    let response = f
+        .http
+        .post(format!("{}/v1/accounts/login/start", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":"a3".repeat(32)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        409,
+        "a renamed alias must never identify another account"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "alias_renamed"
+    );
+    let imported = f
+        .http
+        .post(format!("{}/v1/accounts", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","auth":add_grant("fresh-workspace",Some("fresh-login"),None)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        imported.status(),
+        409,
+        "import must preserve the same tombstone"
+    );
+    assert_eq!(
+        imported.json::<Value>().await.unwrap()["error"],
+        "alias_renamed"
+    );
+    assert!(!f.second.root.path().join("login-pid").exists());
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_renewal_reports_reservation_for_an_add_landed_from_another_alias() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let operation = json!({"alias":"typo","id":"a4".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/relogin/start", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":"a5".repeat(32)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 409);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "relogin_reserved"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"ready").unwrap();
+    assert_eq!(
+        wait_add_terminal(&f, &operation).await["status"],
+        "completed"
+    );
+    stop_fixture(f).await;
+}
+#[tokio::test]
+async fn postgres_import_refuses_claims_incomparable_with_an_existing_account() {
+    let f = login_fixture().await;
+    let operation = json!({"alias":"uid-owner","id":"a6".repeat(32)});
+    add_request(&f, &f.first, "start", &operation).await;
+    complete_add(
+        &f,
+        &f.first,
+        &operation,
+        &add_grant("new-workspace", None, Some("same-text")),
+    )
+    .await;
+    let response=f.http.post(format!("{}/v1/accounts",f.second.url)).bearer_auth(&f.token)
+        .json(&json!({"alias":"different-namespace","auth":add_grant("new-workspace",Some("same-text"),None)})).send().await.unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(body["error"], "account_identity_unresolved");
+    assert_eq!(f.second.launches(), 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_identity_read_failure_before_refresh_is_retryable() {
+    identity_database_failure("%LEFT JOIN central_account_claims%", "a7").await;
+}
+
+#[tokio::test]
+async fn postgres_candidate_validation_database_failure_is_not_wrong_account() {
+    identity_database_failure("%SELECT namespace,claim FROM central_account_claims%", "a8").await;
+}
+
+async fn identity_database_failure(query_pattern: &str, request_prefix: &str) {
+    let f = login_fixture().await;
+    // Fail one database read boundary while receipts remain available. This view
+    // is fault injection only; assertions use the public HTTP operation status.
+    f.control
+        .batch_execute(&format!(
+            r#"
+        ALTER TABLE {0}.central_account_claims RENAME TO retained_claims;
+        CREATE FUNCTION {0}.unavailable_identity(value text) RETURNS text
+        LANGUAGE plpgsql VOLATILE AS $$
+        BEGIN
+            IF current_query() LIKE '{1}' THEN
+                RAISE EXCEPTION 'synthetic identity read unavailable';
+            END IF;
+            RETURN value;
+        END $$;
+        CREATE VIEW {0}.central_account_claims AS SELECT account_id, workspace,
+            namespace, {0}.unavailable_identity(claim) AS claim FROM {0}.retained_claims;
+    "#,
+            f.schema, query_pattern
+        ))
+        .await
+        .unwrap();
+    let id = request_prefix.repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    let terminal = timeout(Duration::from_secs(8), async {
+        loop {
+            let status = login_request(&f, &f.second, "status", &id).await;
+            if status["status"] == "failed" {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal["error"], "relogin_interrupted_retry",
+        "a database failure before provider contact is neither a wrong account nor unresolved verification"
+    );
+    assert_eq!(f.first.launches(), 0);
     stop_fixture(f).await;
 }

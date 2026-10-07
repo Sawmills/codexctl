@@ -53,11 +53,11 @@ replace a concurrent revoke, enrollment, or re-enable. Dual mode is retained
 only for explicit migration commands and still requires
 `CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
-The phase-3 PostgreSQL server fails closed for enrollment, reset listing and redemption,
-and relogin endpoints. Their browser sessions, reset journals, and operation
-records remain file-backed, so they are not safe behind a multi-replica
-service. Keep those workflows on the single file-mode writer until phase 4
-adds shared TTL/one-time-consume and operation-record tables. Shared-store startup
+The PostgreSQL server supports shared add and renewal receipts, status, and
+cancellation. Enrollment and reset listing/redemption remain unavailable in
+shared mode. Their browser sessions and reset journals remain file-backed.
+Keep those workflows on the single file-mode writer until their shared storage
+is complete. Shared-store startup
 also fences retained relogin operations that still need replacement verification
 (`Promoted` or unfinished `Retiring`). Complete those operations on the file-mode
 writer before migration; shared mode does not verify them through ordinary token
@@ -72,6 +72,25 @@ hostname verification stay enabled; the image system bundle lacks the RDS root.
 Complete the CA reconciliation gate in section 5 before submitting either Job.
 The database role owns only `codexctl` and is non-superuser; the live
 ExternalSecret is supplied by infra#1513.
+
+Migration 4 adds add admission and unique identity claims. The mounted vault key
+lets migration populate those claims from existing encrypted credentials. It
+retains both UID and subject facts, including claims omitted by later tokens.
+A conflict rolls back the migration. Resolve the stored inventory before retrying.
+Backfill copies file-mode rename tombstones into PostgreSQL. Every replica
+refuses add or import under a retired alias.
+
+Add, renewal candidate publication, credential writes, and migration take one
+transaction advisory lock for their PostgreSQL schema. Lock order starts with
+that admission lock, then the operation or account rows and refresh lease as
+needed. No native child or provider call runs inside admission. Fresh database
+time fences writes after lock waits. A unique workspace/namespace/claim key
+prevents duplicate identity ownership; operation reservations refuse a second
+matching login with `relogin_reserved`. Add creates the unverified account and
+transfers its reservation together, then uses the fenced renewal verifier.
+Same-user landing keeps the existing alias and label. Completion publishes
+credentials, revision, receipt, and reservation release together. The machine
+must remain authorized at admission.
 
 Expired device-polling receipts now report `expired` and permit a new request
 ID. Expiry retains a company-user fence when child exit and grant absence are
@@ -475,9 +494,9 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
    ```
 
-   The HA service accepts token, registry, and existing-account login renewal
-   operations. Renewal status and cancellation use shared PostgreSQL journals.
-   Enrollment, reset redemption, and add-account remain unavailable. Renewal
+   The HA service accepts token, registry, add, and login renewal operations.
+   Login status and cancellation use shared PostgreSQL journals and identity
+   reservations. Enrollment and reset redemption remain unavailable. Automatic
    crash/takeover recovery is still pending in SAW-12484 PR3; this intermediate
    release does not authorize the B33 cutover.
 
