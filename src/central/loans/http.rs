@@ -368,7 +368,13 @@ async fn lend(
                 .secondary_window_seconds
                 .is_some_and(|seconds| seconds == WEEK_SECONDS)
         })
-        .and_then(|account| account.resets_at);
+        .and_then(|account| {
+            // A relative reset is re-anchored to now on every read of a cached
+            // sample. Taking off the sample's age never ends a loan late; an
+            // absolute reset ends at most one cache period early.
+            let age = i64::try_from(account.usage_age_seconds?).ok()?;
+            Some(account.resets_at?.saturating_sub(age))
+        });
     let (lender_alias, account_id, subject) = {
         let owner = owner.lock().await;
         (
