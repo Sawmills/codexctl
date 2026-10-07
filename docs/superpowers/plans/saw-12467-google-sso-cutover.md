@@ -7,7 +7,7 @@
 1. Google OAuth client `codexctl-staging` (External per A26, Web application, redirect `https://codexctl.ue1.staging.plat.sm-svc.com/auth/callback`) exists; ID and secret in 1Password only. Owner: lane t5A (SAW-12454 A15), computer use in Dia.
 2. Secret: SSM SecureString `/app/codexctl/google-oidc-client-secret` through the existing `ClusterSecretStore/aws-parameter-store` (HQ Q-SSO-STORE: `aws-secrets-manager` does not exist). Written 2026-10-07 as version 1 from `op read` through stdin; its SHA-256 matches 1Password. The Clerk secret stays at `/app/codexctl/oidc-client-secret` for rollback.
 3. The image pin that ships #137 and #139 has rolled out and passed its checks. The window then changes configuration only.
-4. Surgical rollback tooling (G3). The deployed broker image (`sha256:b55a6a99…`, checked 2026-10-07) has `flock` but no `jq`. Before the window, the operator writes and dry-runs, on a copy of `users.json`, the one edit that clears `oidc_identity` for one user ID without `jq`. If that edit is not ready, the after-link rollback is the full `/data/state` restore only, and the plan says so in the notice.
+4. Surgical rollback tooling (G3): ready. The broker image has `flock`, `sed`, `grep`, and `mv` (no `jq`, `python3`, or Perl JSON module). `users.json` is compact serde JSON that omits an empty `oidc_identity`, so the link adds exactly `,"oidc_identity":"<digest>"` to Amir's record. The clear below removes that string; dry-run in the pod on sample text passed on 2026-10-07, and `flock` on `users.lock` was taken.
 5. Operator (G6): one Claude Code session named by HQ before the window. Its credentials: AWS SSO (`aws-sso-login`) for `kubie`/`kubectl`, the repository `gh` identity for merges, `op read` of one field for the hash check. It never uses codexctl tokens, so a server outage cannot block it. Revert merger (G2): HQ w5C:t41; the operator merges if HQ does not answer in 5 minutes.
 
 ## PRs
@@ -34,7 +34,19 @@ Argo Application `codexctl` auto-syncs with prune and selfHeal, so a merge is a 
 ## Rollback
 
 - **Before the link (step 5):** merge the revert PR; Clerk works as before.
-- **After the link (G3):** a Clerk sign-in for the linked user stays refused by design (ADR 0003). First record which files under `/data/state` changed since the step-2 marker (`find /data/state -newer <marker>`). Then the surgical clear: hold `flock /data/state/users.lock` (the server's `registry_lock` uses `flock(2)`, so it waits and fails safe), set Amir's `oidc_identity` to null in `users.json` with an atomic rename, release the lock, and merge the revert PR. Amir's user ID is the Clerk-derived ID, so Clerk resolves him again. Full `/data/state` restore from the step-2 backup is the last resort only, because it discards every write since the marker. Never deploy a binary older than identity links against linked state.
+- **After the link (G3):** a Clerk sign-in for the linked user stays refused by design (ADR 0003). First record which files under `/data/state` changed since the step-2 marker (`find /data/state -newer <marker>`). Then the surgical clear, with `DIGEST` from the `SSO_IDENTITY_LINKED ... oidc_identity=<digest>` log line:
+
+  ```sh
+  kubie exec plat-staging codexctl kubectl exec codexctl-0 -c broker -- env DIGEST=<digest> \
+    flock -w 10 /data/state/users.lock sh -ec '
+      F=/data/state/users.json; P=",\"oidc_identity\":\"$DIGEST\""
+      [ "$(grep -o -F "$P" "$F" | wc -l)" -eq 1 ] || { echo "expected one link"; exit 3; }
+      umask 077; sed "s/$P//" "$F" > "$F.clear"
+      [ "$(grep -c -F oidc_identity "$F.clear")" -eq 0 ] || exit 4
+      mv "$F.clear" "$F"'
+  ```
+
+  The server's `registry_lock` uses `flock(2)`, so it waits and fails safe; `mv` within one directory is an atomic rename. Then merge the revert PR (#149). Amir's user ID is the Clerk-derived ID, so Clerk resolves him again. Full `/data/state` restore from the step-2 backup is the last resort only, because it discards every write since the marker. Never deploy a binary older than identity links against linked state.
 
 ## Done
 
