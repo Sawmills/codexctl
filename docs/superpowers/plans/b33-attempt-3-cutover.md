@@ -58,19 +58,21 @@ PR H must not remove `PrometheusRule/codexctl` or `ScrapeConfig/codexctl`: the s
 No `codexctl-central` command reports row counts or lease state, so the operator runs these as a one-shot Job with a `postgres:16` image, the `codexctl-migration` label (for the egress policy), the `codexctl-postgres` Secret as `PG*` environment variables, and `PGOPTIONS=-c default_transaction_read_only=on`. The Job is reviewed with PR W.
 
 ```sql
--- Emptiness (prerequisite 3): every count must be 0.
-SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY relname;
-SELECT 'central_users', count(*) FROM central_users
-UNION ALL SELECT 'central_devices', count(*) FROM central_devices
-UNION ALL SELECT 'central_accounts', count(*) FROM central_accounts
-UNION ALL SELECT 'central_login_operations', count(*) FROM central_login_operations
-UNION ALL SELECT 'account_refresh_leases', count(*) FROM account_refresh_leases;
+-- Emptiness (prerequisite 3): exact row count of every table that exists.
+-- No output row, or 0 in every row, means empty.
+SELECT table_name,
+       (xpath('/row/c/text()',
+              query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
+                           false, true, '')))[1]::text::bigint AS row_count
+FROM information_schema.tables
+WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+ORDER BY table_name;
 
 -- Lease fence (rollback step 3): must return 0.
 SELECT count(*) FROM account_refresh_leases WHERE NOT released;
 ```
 
-Before migration 1 the tables do not exist; the first query then lists none, which also counts as empty. The `pg_stat_user_tables` list catches tables added later, such as the loan tables, and the operator counts each listed table exactly before trusting it.
+The emptiness query names no table, so it also works before migration 1, when no table exists, and it counts tables added later, such as the loan tables. The lease query runs only after migration, when `account_refresh_leases` exists.
 
 ## Done
 
