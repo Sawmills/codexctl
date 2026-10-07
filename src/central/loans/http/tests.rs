@@ -870,3 +870,16 @@ async fn a_conflicting_login_uid_pauses_and_a_gained_uid_does_not() {
         (StatusCode::CONFLICT, json!("loan_paused"))
     );
 }
+
+#[tokio::test]
+async fn an_email_shared_by_two_company_users_refuses_the_grant() {
+    let fixture = Fixture::new().await;
+    record_user(&fixture.state, "previous-holder", "Bob@sawmills.ai").unwrap();
+    let (status, answer) = fixture
+        .lend(json!({"alias":"main","borrowerEmail":"bob@sawmills.ai"}))
+        .await;
+    assert_eq!(
+        (status, answer["error"].clone()),
+        (StatusCode::CONFLICT, json!("borrower_ambiguous"))
+    );
+}

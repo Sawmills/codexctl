@@ -387,10 +387,15 @@ async fn lend(
         .iter()
         .find(|user| user.id == device.user)
         .ok_or_else(|| broker.error(StatusCode::FORBIDDEN, "user_disabled"))?;
-    let borrower = users.iter().find(|user| {
+    // An email held by two company-user records names no one for certain.
+    let mut matches = users.iter().filter(|user| {
         user.email
             .eq_ignore_ascii_case(request.borrower_email.trim())
     });
+    let borrower = matches.next();
+    if matches.next().is_some() {
+        return Err(broker.error(StatusCode::CONFLICT, "borrower_ambiguous"));
+    }
     broker.expire_loans().await?;
     let grant = super::plan_grant(
         GrantRequest {
