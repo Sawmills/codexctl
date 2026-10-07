@@ -1569,9 +1569,6 @@ pub(super) async fn account_catalog(
         .filter(|(_, (identity, _))| identity.user == user)
         .map(|(key, (_, owner))| (key.clone(), owner.clone(), None))
         .collect();
-    if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
-        return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
-    }
     // A loan-store fault hides borrowed entries only; owned accounts stay
     // listed. The failure is already counted, and token issue stays strict.
     match broker.borrowed_catalog(user).await {
@@ -1584,6 +1581,11 @@ pub(super) async fn account_catalog(
             "{}",
             json!({"operation":"account_catalog","stage":"borrowed","error":error.reason})
         ),
+    }
+    // Borrowed entries count too: a borrower with no owned account can still
+    // list a healthy loan while an unrelated account awaits recovery.
+    if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
+        return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
     let user = user.to_owned();
     let tasks = owners.into_iter().map(|(key, owner, loan)| {
