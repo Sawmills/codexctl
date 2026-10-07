@@ -2901,14 +2901,18 @@ fn google_workspace_refuses_a_consumer_with_a_verified_company_email() {
 }
 #[test]
 fn google_workspace_checks_the_signed_domain_and_verified_email() {
+    // A personal Google account signs a token with no hd claim at all.
     for (hd, verified, status) in [
-        ("other.example", true, 403),
-        ("sawmills.ai", false, 403),
-        ("sawmills.ai", true, 200),
+        (Some("other.example"), true, 403),
+        (None, true, 403),
+        (Some("sawmills.ai"), false, 403),
+        (Some("sawmills.ai"), true, 200),
     ] {
         let mut identity = company_identity();
         identity["email"] = json!("workspace-member@sawmills.ai");
-        identity["hd"] = json!(hd);
+        if let Some(hd) = hd {
+            identity["hd"] = json!(hd);
+        }
         identity["verified"] = json!(verified);
         let issuer = EnrollmentServer::with_sso(
             identity,
