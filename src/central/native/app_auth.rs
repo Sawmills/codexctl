@@ -72,6 +72,10 @@ struct State {
     allow_codex_version: bool,
     #[serde(default)]
     backup_account: Option<String>,
+    /// Digest of the exact bytes app-auth last wrote; any other content in
+    /// auth.json is another login, even in the same mode and workspace.
+    #[serde(default)]
+    written: Option<String>,
     #[serde(default)]
     last: Option<Outcome>,
 }
@@ -171,7 +175,9 @@ fn enable(
     let paths = Paths::new()?;
     let _lock = lock(&paths)?;
     let preconditions = || -> Result<()> {
-        if paths.state().try_exists()? && file_state(&paths, None)? == FileState::Foreign {
+        if paths.state().try_exists()?
+            && file_state(&paths, Some(&read_state(&paths)?))? == FileState::Foreign
+        {
             bail!(
                 "~/.codex/auth.json changed since app-auth enable; run codexctl app-auth disable first"
             );
@@ -223,6 +229,7 @@ fn enable(
         approved_class: allow_billing.then_some(token.billing_class).flatten(),
         allow_codex_version,
         backup_account,
+        written: None,
         last: None,
     };
     // Journal first: if the write below never lands, the marker still exists,
@@ -233,7 +240,7 @@ fn enable(
         false,
         "enable started; auth.json not yet written",
     )?;
-    write_auth(&paths, &account_id, &token.access_token)?;
+    state.written = Some(write_auth(&paths, &account_id, &token.access_token)?);
     record(&paths, &mut state, true, "written by enable")?;
     if !no_agent {
         install_agent()?;
@@ -250,7 +257,7 @@ fn refresh() -> Result<()> {
     let paths = Paths::new()?;
     let _lock = lock(&paths)?;
     let mut state = read_state(&paths)?;
-    let result = refresh_locked(&paths, &state);
+    let result = refresh_locked(&paths, &mut state);
     match &result {
         Ok(detail) => {
             record(&paths, &mut state, true, detail)?;
@@ -261,8 +268,8 @@ fn refresh() -> Result<()> {
     result.map(|_| ())
 }
 
-fn refresh_locked(paths: &Paths, state: &State) -> Result<&'static str> {
-    match file_state(paths, Some(&state.connection.account_id))? {
+fn refresh_locked(paths: &Paths, state: &mut State) -> Result<&'static str> {
+    match file_state(paths, Some(state))? {
         FileState::Missing => bail!(
             "~/.codex/auth.json is missing (signed out in the app?); refresh stopped; run codexctl app-auth enable again"
         ),
@@ -290,14 +297,18 @@ fn refresh_locked(paths: &Paths, state: &State) -> Result<&'static str> {
             state.alias
         );
     }
-    write_auth(paths, &state.connection.account_id, &token.access_token)?;
+    state.written = Some(write_auth(
+        paths,
+        &state.connection.account_id,
+        &token.access_token,
+    )?);
     Ok("token rewritten")
 }
 
 fn status() -> Result<()> {
     let paths = Paths::new()?;
     let state = read_state(&paths)?;
-    let file = match file_state(&paths, Some(&state.connection.account_id))? {
+    let file = match file_state(&paths, Some(&state))? {
         FileState::Ours => match current_access_token(&paths)?.and_then(|t| claims(&t).ok()) {
             Some(claims) => format!(
                 "written by app-auth, token expires in {} min",
@@ -335,7 +346,7 @@ fn disable(restore_login: bool) -> Result<()> {
     let _lock = lock(&paths)?;
     let state = read_state(&paths)?;
     remove_agent()?;
-    match file_state(&paths, Some(&state.connection.account_id))? {
+    match file_state(&paths, Some(&state))? {
         FileState::Ours => std::fs::remove_file(paths.auth())?,
         FileState::Foreign => {
             eprintln!("codexctl: ~/.codex/auth.json holds another login; left in place")
@@ -378,9 +389,9 @@ enum FileState {
     Missing,
 }
 
-/// Whether `~/.codex/auth.json` is this feature's file for `account`; with no
-/// account, any app-auth file counts.
-fn file_state(paths: &Paths, account: Option<&str>) -> Result<FileState> {
+/// Whether `~/.codex/auth.json` is the exact file app-auth last wrote for
+/// `state`; with no state, any file in app-auth's mode counts.
+fn file_state(paths: &Paths, state: Option<&State>) -> Result<FileState> {
     let bytes = match std::fs::read(paths.auth()) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -392,7 +403,10 @@ fn file_state(paths: &Paths, account: Option<&str>) -> Result<FileState> {
         return Ok(FileState::Foreign);
     };
     let ours = document["auth_mode"] == MODE
-        && account.is_none_or(|account| document["tokens"]["account_id"] == account);
+        && state.is_none_or(|state| {
+            document["tokens"]["account_id"] == state.connection.account_id.as_str()
+                && state.written.as_deref() == Some(vault::digest(&bytes).as_str())
+        });
     Ok(if ours {
         FileState::Ours
     } else {
@@ -588,11 +602,11 @@ fn auth_document(account_id: &str, access_token: &str) -> serde_json::Value {
     })
 }
 
-fn write_auth(paths: &Paths, account_id: &str, access_token: &str) -> Result<()> {
-    store::atomic_write(
-        &paths.auth(),
-        &serde_json::to_vec_pretty(&auth_document(account_id, access_token))?,
-    )
+/// Write the file and return the digest that later proves it is ours.
+fn write_auth(paths: &Paths, account_id: &str, access_token: &str) -> Result<String> {
+    let bytes = serde_json::to_vec_pretty(&auth_document(account_id, access_token))?;
+    store::atomic_write(&paths.auth(), &bytes)?;
+    Ok(vault::digest(&bytes))
 }
 
 /// Keep the login enable replaces and return the workspace of the backup.
@@ -686,8 +700,13 @@ fn remove_agent() -> Result<()> {
     if !plist.try_exists()? {
         return Ok(());
     }
-    let domain = format!("gui/{}", unsafe { libc::getuid() });
-    let _ = launchctl(&["bootout", &format!("{domain}/{AGENT_LABEL}")]);
+    let service = format!("gui/{}/{AGENT_LABEL}", unsafe { libc::getuid() });
+    // bootout fails when the agent is not loaded, which is the goal; only a
+    // service launchd still knows about is a failure.
+    let _ = launchctl(&["bootout", &service]);
+    if launchctl(&["print", &service])?.status.success() {
+        bail!("launchctl bootout left {service} loaded; app-auth stays enabled; retry disable");
+    }
     std::fs::remove_file(plist)?;
     Ok(())
 }

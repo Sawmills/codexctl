@@ -11624,6 +11624,16 @@ fn app_auth_refresh_skips_an_unchanged_token_and_stops_on_a_missing_or_foreign_f
     assert!(String::from_utf8_lossy(&refreshed.stderr).contains("unchanged"));
     assert_eq!(std::fs::read(&path).unwrap(), written);
 
+    // Same mode and workspace, other bytes: still another login.
+    let mut edited = read_auth(home.path());
+    edited["tokens"]["refresh_token"] = json!("user-refresh");
+    let edited = serde_json::to_vec(&edited).unwrap();
+    std::fs::write(&path, &edited).unwrap();
+    refused(
+        &app_auth_cli(home.path(), &["refresh"]),
+        "not written by app-auth",
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), edited);
     let foreign = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"r","account_id":"team-seat","id_token":"x"}}"#;
     std::fs::write(&path, foreign).unwrap();
     refused(
