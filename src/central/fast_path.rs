@@ -1,12 +1,13 @@
 //! Valid-token fast path. In PostgreSQL mode a pod can serve a committed
 //! credential without the account lease or a native child, when fresh evidence
 //! for that exact credential revision proves billing and routing.
-// Removed when the token handler calls the fast path.
-#![allow(dead_code)]
 use super::server::{TokenRequest, TokenResponse};
 use crate::api;
 use serde_json::Value;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 /// Keep this much token life, so an OpenAI auth outage still leaves time for
 /// the lease path to refresh early.
@@ -66,6 +67,146 @@ pub(super) struct Candidate<'a> {
     pub evidence: Option<&'a Evidence>,
 }
 
+/// `CODEXCTL_CENTRAL_TOKEN_FAST_PATH=1` turns the fast path on. Turn it on
+/// only after every replica runs layout 8, so all writers publish evidence.
+pub(super) fn enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("CODEXCTL_CENTRAL_TOKEN_FAST_PATH").is_ok_and(|value| value == "1")
+    })
+}
+
+const RESULTS: [&str; 11] = [
+    "served",
+    "disabled",
+    "expiring",
+    "forced",
+    "evidence_missing",
+    "evidence_stale",
+    "routing",
+    "usage_high",
+    "fenced",
+    "identity",
+    "read_failed",
+];
+static RESULT_COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Count one fast-path decision by its bounded result label.
+pub(super) fn record(result: Result<(), Miss>) {
+    let label = match result {
+        Ok(()) => "served",
+        Err(miss) => miss.label(),
+    };
+    if let Some(index) = RESULTS.iter().position(|known| *known == label) {
+        RESULT_COUNTS[index].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// How a request that met another holder's lease ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Wait {
+    /// The holder committed a new revision; the request served it.
+    Committed,
+    /// The holder released without a new revision; the request took the lease.
+    Acquired,
+    /// The wait ran out; the request failed with refresh_in_progress.
+    Timeout,
+    /// After the wait, the lease path refused for another reason.
+    Refused,
+}
+const WAITS: [&str; 4] = ["committed", "acquired", "timeout", "refused"];
+static WAIT_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+impl Wait {
+    pub(super) fn record(self, waited: Duration) {
+        WAIT_COUNTS[self as usize].fetch_add(1, Ordering::Relaxed);
+        WAIT_NANOS.fetch_add(
+            waited.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Fast-path results and lease waits, for `/metrics`.
+pub(super) fn metrics() -> String {
+    let mut output = String::new();
+    for (label, count) in RESULTS.iter().zip(&RESULT_COUNTS) {
+        output.push_str(&format!(
+            "codexctl_central_token_fast_path_total{{result=\"{label}\"}} {}\n",
+            count.load(Ordering::Relaxed)
+        ));
+    }
+    let mut waits = 0;
+    for (label, count) in WAITS.iter().zip(&WAIT_COUNTS) {
+        let count = count.load(Ordering::Relaxed);
+        waits += count;
+        output.push_str(&format!(
+            "codexctl_central_lease_waits_total{{outcome=\"{label}\"}} {count}\n"
+        ));
+    }
+    output.push_str(&format!(
+        "codexctl_central_lease_wait_seconds_sum {}\ncodexctl_central_lease_wait_seconds_count {waits}\n",
+        WAIT_NANOS.load(Ordering::Relaxed) as f64 / 1_000_000_000.0
+    ));
+    output
+}
+
+/// A lease loser waits this long for the holder.
+pub(super) const LEASE_WAIT: Duration = Duration::from_secs(15);
+
+/// What a lease loser saw while it waited, holding no lock or permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Seen {
+    Committed,
+    Released,
+    Timeout,
+}
+
+/// Poll the account revision with jittered backoff until the holder commits,
+/// releases its lease, or the deadline passes.
+pub(super) async fn wait_for_holder(
+    central: &super::storage::CentralStore,
+    account_id: &str,
+    holder_id: &str,
+    revision: i64,
+    deadline: tokio::time::Instant,
+) -> Seen {
+    let mut backoff = Duration::from_millis(50);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Seen::Timeout;
+        }
+        tokio::time::sleep(jittered(backoff).min(deadline - now)).await;
+        backoff = (backoff * 2).min(Duration::from_secs(1));
+        if central
+            .account_revision(account_id)
+            .await
+            .is_ok_and(|current| current.is_some_and(|current| current != revision))
+        {
+            return Seen::Committed;
+        }
+        if !central
+            .lease_held_elsewhere(account_id, holder_id)
+            .await
+            .unwrap_or(true)
+        {
+            return Seen::Released;
+        }
+    }
+}
+
+/// Half to one and a half times `base`, so losers do not poll in step.
+fn jittered(base: Duration) -> Duration {
+    use std::hash::{BuildHasher, Hasher};
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let base = base.as_millis().max(1) as u64;
+    Duration::from_millis(base / 2 + random % base)
+}
+
 /// Why a request took the lease path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Miss {
@@ -78,6 +219,7 @@ pub(super) enum Miss {
     UsageHigh,
     Fenced,
     Identity,
+    ReadFailed,
 }
 
 impl Miss {
@@ -92,6 +234,7 @@ impl Miss {
             Self::UsageHigh => "usage_high",
             Self::Fenced => "fenced",
             Self::Identity => "identity",
+            Self::ReadFailed => "read_failed",
         }
     }
 }

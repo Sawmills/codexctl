@@ -2,7 +2,7 @@
 mod renewal;
 
 use super::{
-    catalog, enrollment, relogin,
+    catalog, enrollment, fast_path, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest, TokenResponse},
     storage::{CentralStore, CredentialRecord},
@@ -1254,7 +1254,7 @@ async fn token(
     } else {
         session_id
     };
-    let Json(mut request) =
+    let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let alias = request
         .alias
@@ -1274,19 +1274,64 @@ async fn token(
         Some(borrowed) => borrowed.owner.clone(),
         None => broker.owner(&device, alias).await?,
     };
-    let permit = broker
-        .work
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
-    let worker = broker.clone();
-    let owner_ref = owner.clone();
-    // A borrowed request names the lender's alias through its grant.
-    let lender_alias = borrowed
-        .as_ref()
-        .map(|borrowed| borrowed.grant.alias.clone());
-    let (mut token, alias, account_id) = tokio::spawn(async move {
+    // The fast path and the lease wait run only behind the flag, in
+    // PostgreSQL mode. Dual and file mode keep today's path.
+    let fast_on = fast_path::enabled()
+        && broker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() == super::storage::StoreMode::Postgres);
+    // The account, user, and alias the committed row must carry.
+    let (fast_account, fast_user, fast_alias) = match borrowed.as_ref() {
+        Some(borrowed) => (
+            borrowed.grant.account_id.clone(),
+            borrowed.grant.lender.clone(),
+            borrowed.grant.alias.clone(),
+        ),
+        None => (
+            account_key(&device.user, alias.trim()),
+            device.user.clone(),
+            alias.trim().to_owned(),
+        ),
+    };
+    let template = request;
+    let mut try_fast = fast_on;
+    let mut wait: Option<(tokio::time::Instant, tokio::time::Instant)> = None;
+    let (mut token, alias, account_id) = loop {
+        if try_fast {
+            let result = fast_token(
+                &broker,
+                &owner,
+                &fast_account,
+                &fast_user,
+                &fast_alias,
+                &template,
+            )
+            .await;
+            fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
+            if let Ok((token, alias)) = result {
+                if let Some((started, _)) = wait {
+                    fast_path::Wait::Committed.record(started.elapsed());
+                }
+                break (token, alias, fast_account.clone());
+            }
+        }
+        let permit = broker
+            .work
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
+        let worker = broker.clone();
+        let owner_ref = owner.clone();
+        // A borrowed request names the lender's alias through its grant.
+        let lender_alias = borrowed
+            .as_ref()
+            .map(|borrowed| borrowed.grant.alias.clone());
+        let mut request = template.clone();
+        let busy = Arc::new(StdMutex::new(None::<(String, i64)>));
+        let busy_slot = busy.clone();
+        let attempt = tokio::spawn(async move {
         let (import_guard, mut owner) = if worker
             .central.as_ref()
             .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
@@ -1355,18 +1400,36 @@ async fn token(
                 .ensure_owner_record(&mut owner)
                 .await
                 .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-            Some(
-                central
-                    .acquire_lease(
-                        &account_id,
-                        &worker.holder_id,
-                        std::time::Duration::from_secs(120),
-                    )
-                    .await
-                    .map_err(|_| {
-                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
-                    })?,
-            )
+            match central
+                .acquire_lease(
+                    &account_id,
+                    &worker.holder_id,
+                    std::time::Duration::from_secs(120),
+                )
+                .await
+            {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    // A lease loser drops its locks and permit and waits for
+                    // the holder outside this task. It counts no failure yet.
+                    if fast_path::enabled()
+                        && central.mode() == super::storage::StoreMode::Postgres
+                        && central
+                            .lease_held_elsewhere(&account_id, &worker.holder_id)
+                            .await
+                            .unwrap_or(false)
+                        && let Ok(mut slot) = busy_slot.lock()
+                    {
+                        *slot = Some((account_id.clone(), owner.vault.revision));
+                        return Err(HttpError {
+                            status: StatusCode::SERVICE_UNAVAILABLE,
+                            reason: "refresh_in_progress",
+                            alias: None,
+                        });
+                    }
+                    return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress"));
+                }
+            }
         } else {
             None
         };
@@ -1430,6 +1493,7 @@ async fn token(
                 restore_after_settlement = owner.available && !owner.routing_refused;
                 return Err(error);
             }
+            let observed_from = std::time::Instant::now();
             let token_result = owner.tokens(request).await;
             if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
@@ -1540,11 +1604,15 @@ async fn token(
                 })?,
                 revision: owner.vault.revision.max(1),
             };
+            let observation = observation(&owner, &token_result, observed_from);
             let written = if let Some(central) = worker.central.as_ref() {
                 if let Some(lease) = lease.as_ref() {
                     let mut result = None;
                     for attempt in 0..3 {
-                        match central.fenced_write(lease, &record).await {
+                        match central
+                            .fenced_write_with_evidence(lease, &record, observation.as_ref())
+                            .await
+                        {
                             Ok(written) => {
                                 result = Some(written);
                                 break;
@@ -1646,9 +1714,46 @@ async fn token(
             }
         }
         result
-    })
-    .await
-    .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
+        })
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+        let error = match attempt {
+            Ok(value) => {
+                if let Some((started, _)) = wait {
+                    fast_path::Wait::Acquired.record(started.elapsed());
+                }
+                break value;
+            }
+            Err(error) => error,
+        };
+        let loser = busy.lock().ok().and_then(|mut slot| slot.take());
+        let (Some((account_id, revision)), Some(central)) = (loser, broker.central.as_ref()) else {
+            if let Some((started, _)) = wait {
+                fast_path::Wait::Refused.record(started.elapsed());
+            }
+            return Err(error);
+        };
+        let (started, deadline) = *wait.get_or_insert_with(|| {
+            let now = tokio::time::Instant::now();
+            (now, now + fast_path::LEASE_WAIT)
+        });
+        match fast_path::wait_for_holder(
+            central,
+            &account_id,
+            &broker.holder_id,
+            revision,
+            deadline,
+        )
+        .await
+        {
+            fast_path::Seen::Committed => try_fast = true,
+            fast_path::Seen::Released => try_fast = false,
+            fast_path::Seen::Timeout => {
+                fast_path::Wait::Timeout.record(started.elapsed());
+                return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress"));
+            }
+        }
+    };
     refresh_legacy_usage(&broker, &mut token, borrowed.is_some()).await;
     // Revocation during a slow refresh must prevent delivery of a new access token.
     broker.authorize(&headers).await?;
@@ -1723,6 +1828,85 @@ async fn token(
     }
     token.user_id = Some(device.user);
     Ok(([("cache-control", "no-store")], Json(token)).into_response())
+}
+
+/// Serve a committed token from PostgreSQL without the lease or a child. The
+/// row must carry the expected user and alias, and no fence may cover it.
+async fn fast_token(
+    broker: &Broker,
+    owner: &Arc<Mutex<Owner>>,
+    account_id: &str,
+    user: &str,
+    alias: &str,
+    request: &TokenRequest,
+) -> Result<(TokenResponse, String), fast_path::Miss> {
+    use fast_path::Miss;
+    let central = broker.central.as_ref().ok_or(Miss::Disabled)?;
+    let read = central
+        .fast_token_read(account_id)
+        .await
+        .map_err(|_| Miss::ReadFailed)?
+        .ok_or(Miss::Identity)?;
+    if read.fenced {
+        return Err(Miss::Fenced);
+    }
+    if read.user_id.as_deref() != Some(user) || !read.alias.trim().eq_ignore_ascii_case(alias) {
+        return Err(Miss::Identity);
+    }
+    let vault: Vault = serde_json::from_value(read.vault).map_err(|_| Miss::Identity)?;
+    if !vault.verified {
+        return Err(Miss::Fenced);
+    }
+    if let Some(requested) = request.account_id.as_deref()
+        && vault::account(&vault.auth).ok().as_deref() != Some(requested)
+    {
+        return Err(Miss::Identity);
+    }
+    // A busy local owner is not a fence; a fenced one is.
+    if let Ok(local) = owner.try_lock()
+        && (!local.available || local.routing_refused)
+    {
+        return Err(Miss::Fenced);
+    }
+    let token = fast_path::decide(
+        &fast_path::Candidate {
+            auth: &vault.auth,
+            account_revision: read.revision,
+            label: vault.label.clone(),
+            now: read.now,
+            evidence: read.evidence.as_ref(),
+        },
+        request,
+    )?;
+    Ok((token, read.alias))
+}
+
+/// Evidence for the credential this request is about to publish. Only a
+/// completed routing check on that exact revision counts.
+fn observation(
+    owner: &Owner,
+    token: &Result<TokenResponse, TokenFailure>,
+    observed_from: std::time::Instant,
+) -> Option<fast_path::Observation> {
+    let Ok(token) = token else { return None };
+    let published = vault::digest(&serde_json::to_vec(&owner.vault.auth).ok()?);
+    if !token.native_routing_supported || token.revision != published {
+        return None;
+    }
+    let billing = token.billing_class.and_then(|class| {
+        let (at, revision) = owner.limits_observed.as_ref()?;
+        (revision == &token.revision).then(|| fast_path::Billing {
+            class,
+            plan_type: token.chatgpt_plan_type.clone(),
+            limits: owner.limits.clone(),
+            age: at.elapsed(),
+        })
+    });
+    Some(fast_path::Observation {
+        auth_revision: token.revision.clone(),
+        routing_age: observed_from.elapsed(),
+        billing,
+    })
 }
 
 /// `need_all_windows`: a borrowed token's placement checks need the
@@ -2789,6 +2973,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         })
         .collect();
     output.push_str(&super::storage::identity::admission_metrics());
+    output.push_str(&fast_path::metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))

@@ -816,7 +816,6 @@ impl CentralStore {
 
     /// Publish a credential, and with it the evidence the lease path observed
     /// on it, under the same lease fence.
-    #[allow(dead_code)] // Removed when the token handler uses it.
     pub(in crate::central) async fn fenced_write_with_evidence(
         &self,
         lease: &Lease,
@@ -833,7 +832,6 @@ impl CentralStore {
 
     /// The committed record and its evidence, for the lease-free path.
     /// PostgreSQL mode only: dual mode keeps today's path.
-    #[allow(dead_code)] // Removed when the token handler uses it.
     pub(in crate::central) async fn fast_token_read(
         &self,
         account_id: &str,
@@ -842,6 +840,53 @@ impl CentralStore {
             Self::Postgres(db) => bounded_db(db.fast_token_read(account_id)).await,
             _ => Ok(None),
         }
+    }
+
+    /// The committed integer revision of an account, for a lease loser.
+    pub(in crate::central) async fn account_revision(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<i64>> {
+        let db = match self {
+            Self::File(_) => return Ok(None),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            Ok(db
+                .client()
+                .await?
+                .query_opt(
+                    "SELECT revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL",
+                    &[&account_id],
+                )
+                .await?
+                .map(|row| row.get(0)))
+        })
+        .await
+    }
+
+    /// Another holder's live, unreleased lease blocks this account.
+    pub(in crate::central) async fn lease_held_elsewhere(
+        &self,
+        account_id: &str,
+        holder_id: &str,
+    ) -> Result<bool> {
+        let db = match self {
+            Self::File(_) => return Ok(false),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            Ok(db
+                .client()
+                .await?
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id<>$2 AND NOT released AND expires_at>clock_timestamp())",
+                    &[&account_id, &holder_id],
+                )
+                .await?
+                .get(0))
+        })
+        .await
     }
 
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
