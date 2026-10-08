@@ -137,6 +137,7 @@ async fn harness_with(
     };
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(upstream.clone());
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_url = format!("http://{}", upstream_listener.local_addr().unwrap());
@@ -605,4 +606,47 @@ async fn metadata_before_output_does_not_end_the_head() {
     );
     let metrics = h.metrics().await;
     assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0, "{metrics}");
+}
+
+#[tokio::test]
+async fn upstream_advice_beyond_the_budget_lets_codex_stop() {
+    let h = harness(vec![Scripted::Status(
+        429,
+        vec![("retry-after", "200".into())],
+        RATE_429.into(),
+    )])
+    .await;
+    assert_eq!(
+        retry_after(&h.post("t1").await),
+        None,
+        "200 s does not fit the 180 s rate budget"
+    );
+}
+
+#[tokio::test]
+async fn large_requests_stream_through_and_keep_the_model_label() {
+    let h = harness(vec![Scripted::Status(429, vec![], RATE_429.into())]).await;
+    let big = format!(
+        r#"{{"model":"gpt-6.1-sol","stream":true,"input":"{}"}}"#,
+        "x".repeat(3 * 1024 * 1024)
+    );
+    h.client
+        .post(format!("{}/backend-api/codex/responses", h.relay_url))
+        .header("thread-id", "t1")
+        .body(big.clone())
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        h.upstream.seen.lock().unwrap().bodies[0].as_ref(),
+        big.as_bytes()
+    );
+    assert_eq!(
+        metric(&h.metrics().await, "model=\"gpt-6.1-sol\""),
+        1,
+        "model read from the first bytes"
+    );
 }

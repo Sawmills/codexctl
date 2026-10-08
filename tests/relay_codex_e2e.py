@@ -42,6 +42,7 @@ def free_port():
 
 def mock_upstream(script):
     calls = []
+    thread_ids = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -50,6 +51,8 @@ def mock_upstream(script):
             self.rfile.read(int(self.headers.get("content-length", 0)))
             step = script.pop(0) if script else "ok"
             calls.append(step)
+            # The relay keys failure streaks on this header (per conversation).
+            thread_ids.append(self.headers.get("thread-id"))
             if step == "rate":
                 self.send_response(429)
                 body = RATE
@@ -68,11 +71,11 @@ def mock_upstream(script):
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    return server, calls
+    return server, calls, thread_ids
 
 
 def scenario(args, home, script, overloaded_budget, expect_ok, expect_calls):
-    upstream, calls = mock_upstream(list(script))
+    upstream, calls, thread_ids = mock_upstream(list(script))
     relay_port = free_port()
     relay = subprocess.Popen(
         [str(args.codexctl), "relay", "serve", "--listen", f"127.0.0.1:{relay_port}",
@@ -92,6 +95,8 @@ def scenario(args, home, script, overloaded_budget, expect_ok, expect_calls):
         log = relay.communicate(timeout=40)[1]
         upstream.shutdown()
     ok = "RELAY-E2E-OK" in result.stdout
+    if not thread_ids or None in thread_ids or len(set(thread_ids)) != 1:
+        raise SystemExit(f"FAIL {script}: Codex thread-id headers {thread_ids}")
     if ok != expect_ok or calls != expect_calls:
         raise SystemExit(f"FAIL {script}: ok={ok} calls={calls}\n{result.stderr[-800:]}\n{log}")
     outcomes = [json.loads(line)["outcome"] for line in log.splitlines() if line.startswith("{")]

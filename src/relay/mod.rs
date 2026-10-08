@@ -39,6 +39,8 @@ const FORWARDED_PREFIX: &str = "/backend-api/codex/";
 const ACCOUNT_CLASS_HEADER: &str = "x-codexctl-account-class";
 /// A 429 body larger than this is not classified; it passes through without advice.
 const MAX_429_BODY: usize = 64 * 1024;
+/// Request bytes kept to read the model label. Codex writes `model` first.
+const MODEL_PREFIX: usize = 4 * 1024;
 /// Default listen address used by `codexctl relay` and the lane override.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:47631";
 /// Rate limits stop after this so the board can move the account (M5).
@@ -158,16 +160,27 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (parts, body) = request.into_parts();
-    let body = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(body) => body,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
+    // Stream the request; keep only a bounded prefix for the model label.
+    let mut body = body.into_data_stream();
+    let mut head: Vec<Bytes> = Vec::new();
+    let mut head_len = 0;
+    while head_len < MODEL_PREFIX {
+        match body.next().await {
+            Some(Ok(chunk)) => {
+                head_len += chunk.len();
+                head.push(chunk);
+            }
+            Some(Err(_)) => return StatusCode::BAD_REQUEST.into_response(),
+            None => break,
+        }
+    }
+    let prefix = head.concat();
     let labels = Labels {
         thread: header_str(&parts.headers, "thread-id")
             .or_else(|| header_str(&parts.headers, "session-id"))
             .unwrap_or("unknown")
             .to_owned(),
-        model: relay.model_label(&parts.headers, &body),
+        model: relay.model_label(&parts.headers, &prefix[..prefix.len().min(MODEL_PREFIX)]),
         account_class: match header_str(&parts.headers, ACCOUNT_CLASS_HEADER) {
             Some("included") => "included",
             Some("credit") => "credit",
@@ -175,10 +188,10 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         },
     };
     let mut headers = parts.headers;
+    // Content-Length stays: the streamed body is byte for byte the same.
     for name in [
         "host",
         "connection",
-        "content-length",
         "transfer-encoding",
         ACCOUNT_CLASS_HEADER,
     ] {
@@ -190,7 +203,9 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         .client
         .request(parts.method.clone(), format!("{}{path}", relay.upstream))
         .headers(headers)
-        .body(body)
+        .body(reqwest::Body::wrap_stream(
+            futures::stream::iter(head.into_iter().map(Ok)).chain(body),
+        ))
         .send()
         .await;
     let upstream = match upstream {
@@ -235,16 +250,28 @@ impl Relay {
         labels: Labels,
         request_id: Option<String>,
     ) -> Response {
-        let body = match upstream.bytes().await {
-            Ok(body) => body,
-            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-        };
+        // Read at most MAX_429_BODY; a longer body streams on unread.
+        let mut rest = upstream.bytes_stream();
+        let mut head: Vec<Bytes> = Vec::new();
+        let mut head_len = 0;
+        let mut oversized = false;
+        while let Some(chunk) = rest.next().await {
+            let Ok(chunk) = chunk else {
+                return StatusCode::BAD_GATEWAY.into_response();
+            };
+            head_len += chunk.len();
+            head.push(chunk);
+            if head_len > MAX_429_BODY {
+                oversized = true;
+                break;
+            }
+        }
         // An unclassified body may be a usage or billing stop, so it gets no
         // advice and reaches Codex unchanged.
-        let class = if body.len() > MAX_429_BODY {
+        let class = if oversized {
             Http429::Terminal
         } else {
-            policy::classify_429(&body)
+            policy::classify_429(&head.concat())
         };
         match class {
             Http429::Terminal => {
@@ -261,32 +288,44 @@ impl Relay {
                     request_id.as_deref(),
                 );
             }
-            Http429::Rate => match self.failure(Kind::Rate429, &labels, request_id.as_deref()) {
-                Some(secs) => {
-                    if !headers.contains_key("retry-after") {
+            Http429::Rate => {
+                // Numeric upstream advice is the delay Codex will use, so it
+                // counts against the budget. Other forms are replaced.
+                let upstream_secs = header_str(&headers, "retry-after")
+                    .and_then(|value| value.trim().parse::<u64>().ok());
+                match self.failure(Kind::Rate429, &labels, request_id.as_deref(), upstream_secs) {
+                    Some(secs) => {
                         headers.insert("retry-after", HeaderValue::from(secs));
                     }
+                    None => {
+                        headers.remove("retry-after");
+                    }
                 }
-                None => {
-                    headers.remove("retry-after");
-                }
-            },
+            }
         }
         let mut response = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
         *response.headers_mut().expect("fresh builder") = headers;
+        let body = futures::stream::iter(head.into_iter().map(Ok)).chain(rest);
         response
-            .body(Body::from(body))
+            .body(Body::from_stream(body))
             .expect("valid response parts")
     }
 
     /// Records one failure. Returns the advised delay, or `None` when the
     /// streak is exhausted and Codex must stop.
-    fn failure(&self, kind: Kind, labels: &Labels, request_id: Option<&str>) -> Option<u64> {
-        let advice =
-            self.streaks
-                .lock()
-                .expect("streak lock")
-                .failure(&labels.thread, kind, Instant::now());
+    fn failure(
+        &self,
+        kind: Kind,
+        labels: &Labels,
+        request_id: Option<&str>,
+        upstream_secs: Option<u64>,
+    ) -> Option<u64> {
+        let advice = self.streaks.lock().expect("streak lock").failure(
+            &labels.thread,
+            kind,
+            Instant::now(),
+            upstream_secs,
+        );
         match advice {
             Advice::RetryAfter { secs, attempt } => {
                 self.event(
@@ -357,15 +396,15 @@ impl Relay {
     }
 
     /// A bounded model label: one of at most 16 `gpt-` names seen, else `other`.
-    fn model_label(&self, headers: &HeaderMap, body: &Bytes) -> String {
-        #[derive(serde::Deserialize)]
-        struct Model {
-            model: Option<String>,
-        }
+    fn model_label(&self, headers: &HeaderMap, prefix: &[u8]) -> String {
+        static MODEL: std::sync::OnceLock<regex::bytes::Regex> = std::sync::OnceLock::new();
+        let pattern = MODEL.get_or_init(|| {
+            regex::bytes::Regex::new(r#""model"\s*:\s*"([^"]{1,40})""#).expect("valid regex")
+        });
         let model = (headers.get("content-encoding").is_none())
-            .then(|| serde_json::from_slice::<Model>(body).ok())
+            .then(|| pattern.captures(prefix))
             .flatten()
-            .and_then(|body| body.model)
+            .and_then(|captures| String::from_utf8(captures[1].to_vec()).ok())
             .filter(|model| {
                 model.starts_with("gpt-")
                     && model.len() <= 40
@@ -480,10 +519,12 @@ impl FrameRewriter {
         }
         match Some(kind) {
             Some("response.failed") if policy::is_overloaded_failure(&event) => {
-                match self
-                    .relay
-                    .failure(Kind::Overloaded, &self.labels, self.request_id.as_deref())
-                {
+                match self.relay.failure(
+                    Kind::Overloaded,
+                    &self.labels,
+                    self.request_id.as_deref(),
+                    upstream_event_secs(&event),
+                ) {
                     Some(secs) => with_retry_advice(&frame, event, secs),
                     None => without_retry_advice(frame, event),
                 }
@@ -509,6 +550,20 @@ fn is_output(kind: &str) -> bool {
         ]
         .iter()
         .any(|prefix| kind.starts_with(prefix))
+}
+
+/// Numeric `error.headers["retry-after"]` sent by upstream on a streamed error.
+fn upstream_event_secs(event: &Value) -> Option<u64> {
+    event
+        .pointer("/response/error/headers")?
+        .as_object()?
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| match value {
+            Value::String(text) => text.trim().parse().ok(),
+            Value::Number(number) => number.as_u64(),
+            _ => None,
+        })
 }
 
 /// Index just past the blank line that ends the first frame (LF or CRLF).

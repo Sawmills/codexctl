@@ -13,8 +13,8 @@ use serde_json::Value;
 const BASE_DELAY_SECS: u64 = 2;
 /// Longest single delay the relay advises.
 const MAX_DELAY_SECS: u64 = 60;
-/// A failure this long after the previous one starts a new streak: Codex
-/// retries within `MAX_DELAY_SECS`, so a longer gap means a later resume.
+/// A failure this long after the advised retry time starts a new streak:
+/// Codex retries at that time, so a longer gap means a later resume.
 const STREAK_IDLE: Duration = Duration::from_secs(120);
 /// Streaks idle this long are dropped so the table stays bounded.
 const STREAK_EVICT: Duration = Duration::from_secs(3600);
@@ -105,6 +105,8 @@ struct Streak {
     kind: Kind,
     started: Instant,
     last_failure: Instant,
+    /// When Codex is expected to retry.
+    retry_at: Instant,
     attempts: u32,
     exhausted: bool,
 }
@@ -129,7 +131,16 @@ impl Streaks {
         }
     }
 
-    pub(crate) fn failure(&mut self, thread: &str, kind: Kind, now: Instant) -> Advice {
+    /// Records one advisable failure. `upstream_secs` is the server's own
+    /// numeric advice; when present it is the delay, and it counts against
+    /// the budget like the relay's own.
+    pub(crate) fn failure(
+        &mut self,
+        thread: &str,
+        kind: Kind,
+        now: Instant,
+        upstream_secs: Option<u64>,
+    ) -> Advice {
         self.by_thread
             .retain(|_, streak| now.duration_since(streak.last_failure) < STREAK_EVICT);
         let streak = self
@@ -141,7 +152,7 @@ impl Streaks {
                 // failure belongs to a resumed turn.
                 if streak.kind != kind
                     || streak.exhausted
-                    || now.duration_since(streak.last_failure) > STREAK_IDLE
+                    || now.saturating_duration_since(streak.retry_at) > STREAK_IDLE
                 {
                     *streak = Streak::new(kind, now);
                 }
@@ -158,11 +169,12 @@ impl Streaks {
             Kind::Overloaded => self.overloaded_budget,
         };
         let started = streak.started;
-        let secs = self.jittered(cap);
+        let secs = upstream_secs.unwrap_or_else(|| self.jittered(cap));
         let streak = self
             .by_thread
             .get_mut(thread)
             .expect("streak inserted above");
+        streak.retry_at = now + Duration::from_secs(secs);
         if now.duration_since(started) + Duration::from_secs(secs) > budget {
             streak.exhausted = true;
             return Advice::Exhausted { attempt };
@@ -202,6 +214,7 @@ impl Streak {
             kind,
             started: now,
             last_failure: now,
+            retry_at: now,
             attempts: 0,
             exhausted: false,
         }
@@ -218,7 +231,7 @@ mod tests {
         let now = Instant::now();
         let mut caps = vec![];
         for _ in 0..8 {
-            let Advice::RetryAfter { secs, .. } = streaks.failure("t", Kind::Overloaded, now)
+            let Advice::RetryAfter { secs, .. } = streaks.failure("t", Kind::Overloaded, now, None)
             else {
                 panic!("advice expected");
             };
@@ -239,38 +252,38 @@ mod tests {
         let at = |secs| start + Duration::from_secs(secs);
         for secs in [0, 100] {
             assert!(matches!(
-                streaks.failure("t", Kind::Rate429, at(secs)),
+                streaks.failure("t", Kind::Rate429, at(secs), None),
                 Advice::RetryAfter { .. }
             ));
         }
         // Attempt 3 waits 4 to 8 s: 170 + 8 still fits 180 s.
         assert!(matches!(
-            streaks.failure("t", Kind::Rate429, at(170)),
+            streaks.failure("t", Kind::Rate429, at(170), None),
             Advice::RetryAfter { .. }
         ));
         // Attempt 4 waits at least 8 s: 179 + 8 passes 180 s.
         assert_eq!(
-            streaks.failure("t", Kind::Rate429, at(179)),
+            streaks.failure("t", Kind::Rate429, at(179), None),
             Advice::Exhausted { attempt: 4 }
         );
         assert!(
             matches!(
-                streaks.failure("t", Kind::Rate429, at(185)),
+                streaks.failure("t", Kind::Rate429, at(185), None),
                 Advice::RetryAfter { attempt: 1, .. }
             ),
             "a failure after exhaustion is a resume"
         );
         assert!(matches!(
-            streaks.failure("u", Kind::Overloaded, at(0)),
+            streaks.failure("u", Kind::Overloaded, at(0), None),
             Advice::RetryAfter { .. }
         ));
         assert!(matches!(
-            streaks.failure("u", Kind::Overloaded, at(100)),
+            streaks.failure("u", Kind::Overloaded, at(100), None),
             Advice::RetryAfter { .. }
         ));
         assert!(
             matches!(
-                streaks.failure("u", Kind::Overloaded, at(200)),
+                streaks.failure("u", Kind::Overloaded, at(200), None),
                 Advice::RetryAfter { .. }
             ),
             "overloaded keeps its longer budget past 180 s"
@@ -282,16 +295,45 @@ mod tests {
         let mut streaks = Streaks::new(Duration::ZERO, Duration::ZERO);
         let start = Instant::now();
         assert!(matches!(
-            streaks.failure("t", Kind::Rate429, start),
+            streaks.failure("t", Kind::Rate429, start, None),
             Advice::Exhausted { .. }
         ));
         assert!(matches!(
             streaks.failure(
                 "t",
                 Kind::Rate429,
-                start + STREAK_IDLE + Duration::from_secs(1)
+                start + STREAK_IDLE + Duration::from_secs(1),
+                None
             ),
             Advice::Exhausted { attempt: 1 }
+        ));
+    }
+
+    #[test]
+    fn an_upstream_delay_counts_against_the_budget() {
+        let mut streaks = Streaks::new(Duration::from_secs(180), Duration::from_secs(600));
+        assert_eq!(
+            streaks.failure("t", Kind::Rate429, Instant::now(), Some(200)),
+            Advice::Exhausted { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn a_long_upstream_delay_keeps_the_streak() {
+        let mut streaks = Streaks::new(Duration::from_secs(3600), Duration::from_secs(600));
+        let start = Instant::now();
+        assert_eq!(
+            streaks.failure("t", Kind::Rate429, start, Some(150)),
+            Advice::RetryAfter {
+                secs: 150,
+                attempt: 1
+            }
+        );
+        // Codex retries at 150 s; that is more than 120 s after the last
+        // failure but still the same streak.
+        assert!(matches!(
+            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(152), None),
+            Advice::RetryAfter { attempt: 2, .. }
         ));
     }
 
@@ -300,10 +342,15 @@ mod tests {
         let mut streaks = Streaks::new(Duration::from_secs(180), Duration::from_secs(600));
         let start = Instant::now();
         for secs in [0, 100, 200] {
-            streaks.failure("t", Kind::Overloaded, start + Duration::from_secs(secs));
+            streaks.failure(
+                "t",
+                Kind::Overloaded,
+                start + Duration::from_secs(secs),
+                None,
+            );
         }
         assert!(matches!(
-            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(260)),
+            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(260), None),
             Advice::RetryAfter { attempt: 1, .. }
         ));
     }
@@ -312,14 +359,14 @@ mod tests {
     fn a_failure_after_exhaustion_is_a_resume_and_gets_advice() {
         let mut streaks = Streaks::new(Duration::from_secs(5), Duration::from_secs(600));
         let start = Instant::now();
-        streaks.failure("t", Kind::Rate429, start);
+        streaks.failure("t", Kind::Rate429, start, None);
         assert!(matches!(
-            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(4)),
+            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(4), None),
             Advice::Exhausted { .. }
         ));
         // Codex stopped; the next request is a resume within 120 s.
         assert!(matches!(
-            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(30)),
+            streaks.failure("t", Kind::Rate429, start + Duration::from_secs(30), None),
             Advice::RetryAfter { attempt: 1, .. }
         ));
     }
@@ -328,8 +375,8 @@ mod tests {
     fn success_reports_recovery_only_for_live_streaks() {
         let mut streaks = Streaks::new(Duration::from_secs(600), Duration::ZERO);
         let now = Instant::now();
-        streaks.failure("t", Kind::Rate429, now);
-        streaks.failure("t", Kind::Rate429, now);
+        streaks.failure("t", Kind::Rate429, now, None);
+        streaks.failure("t", Kind::Rate429, now, None);
         assert_eq!(
             streaks.success("t"),
             Some(Recovered {
@@ -338,7 +385,7 @@ mod tests {
             })
         );
         assert_eq!(streaks.success("t"), None);
-        streaks.failure("u", Kind::Overloaded, now);
+        streaks.failure("u", Kind::Overloaded, now, None);
         assert_eq!(
             streaks.success("u"),
             None,
