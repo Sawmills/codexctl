@@ -412,11 +412,13 @@ fn file_state(paths: &Paths, state: Option<&State>) -> Result<FileState> {
         return Ok(FileState::Foreign);
     };
     let ours = document["auth_mode"] == MODE
+        // The digest alone proves app-auth wrote these bytes. It must not also
+        // require the pinned workspace: an interrupted re-enable to another
+        // account leaves the previous account's file under the new pin.
         && state.is_none_or(|state| {
-            document["tokens"]["account_id"] == state.connection.account_id.as_str()
-                && [&state.written, &state.pending]
-                    .into_iter()
-                    .any(|digest| digest.as_deref() == Some(vault::digest(&bytes).as_str()))
+            [&state.written, &state.pending]
+                .into_iter()
+                .any(|digest| digest.as_deref() == Some(vault::digest(&bytes).as_str()))
         });
     Ok(if ours {
         FileState::Ours
@@ -813,6 +815,12 @@ mod tests {
         state.pending = Some(vault::digest(&bytes));
         state.written = Some("old".into());
         assert!(file_state(&paths, Some(&state)).unwrap() == FileState::Ours);
+        // An interrupted re-enable to another account: the previous file is
+        // still app-auth's own under the new pin.
+        let mut moved = test_state();
+        moved.connection.account_id = "other-seat".into();
+        moved.written = Some(vault::digest(&bytes));
+        assert!(file_state(&paths, Some(&moved)).unwrap() == FileState::Ours);
         // Same mode and workspace, other bytes: another login.
         let mut other: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         other["tokens"]["refresh_token"] = "user".into();
