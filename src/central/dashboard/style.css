@@ -1,58 +1,48 @@
-/* codexctl UI v3 · one stylesheet for every page.
-   Tokens, base, layout, components, pages, responsive. */
-
-@font-face {
-  font-family: "Instrument Sans";
-  src: url("/assets/fonts/instrument-sans.woff2") format("woff2");
-  font-weight: 400 700;
-  font-stretch: 75% 100%;
-  font-display: swap;
-}
-@font-face {
-  font-family: "JetBrains Mono";
-  src: url("/assets/fonts/jetbrains-mono.woff2") format("woff2");
-  font-weight: 400 800;
-  font-display: swap;
-}
+/* codexctl account server · one stylesheet for every dashboard page.
+   Same tokens as the enrollment pages: system fonts, neutral palette, one accent. */
 
 /* ---------- Tokens ---------- */
 :root {
   color-scheme: light;
 
-  --bg: #f7f7f4;
+  --bg: #ffffff;
   --surface: #ffffff;
-  --sunken: #efefea;
-  --ink: #18191b;
-  --ink-2: #4f5258; /* 7.4:1 on bg */
-  --ink-3: #63676e; /* 5.3:1 on bg, 4.9:1 on sunken, 4.8:1 on accent-soft */
-  --line: #e3e3dd;
-  --line-strong: #cfcfc8;
+  --sunken: #f6f6f6;
+  --ink: #0a0a0a;
+  --ink-2: #4d4d4d; /* 8.5:1 on bg */
+  --ink-3: #6b6b6b; /* 5.3:1 on bg, 4.9:1 on sunken */
+  --line: #efefef;
+  --line-strong: #e3e3e3;
 
   /* One accent: action and "use this". */
-  --accent: #2443c4;
+  --accent: #2f5bea;
   --accent-ink: #ffffff;
-  --accent-soft: #e8ecfb;
+  --accent-soft: #f1f4fe;
 
   /* Status colors mark exceptions only, always beside a word. */
-  --ok: #1d7646;
-  --warn: #8a5300;
-  --warn-fill: #b06d00;
-  --warn-soft: #fbf1df;
-  --bad: #b3261e;
+  --ok: #15803d;
+  --warn: #9a5b00;
+  --warn-fill: #b06d00; /* 3.6:1 on the meter track */
+  --warn-soft: #fdf6e7;
+  --bad: #c62828;
 
-  --meter: #2c2e33;
-  --meter-track: #e3e3dc;
+  --meter: #0a0a0a;
+  --meter-track: #ededed;
 
-  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-sans:
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
   --t-xs: 0.75rem; /* 12 */
   --t-sm: 0.8125rem; /* 13 */
   --t-base: 0.875rem; /* 14 */
-  --t-md: 1rem; /* 16 */
-  --t-lg: 1.25rem; /* 20 */
-  --t-xl: 1.75rem; /* 28 */
-  --t-answer: 2.25rem; /* 36 */
-  --t-figure: 2.75rem; /* 44 */
+  --t-md: 0.9375rem; /* 15 */
+  --t-lg: 1.125rem; /* 18 */
+  --t-xl: 1.5rem; /* 24 */
+  --t-answer: 1.75rem; /* 28 */
+  --t-figure: 2.25rem; /* 36 */
 
   --s1: 4px;
   --s2: 8px;
@@ -63,9 +53,9 @@
   --s7: 48px;
   --s8: 64px;
 
-  --radius: 6px;
+  --radius: 8px;
   --radius-lg: 10px;
-  --page: 1200px;
+  --page: 1120px;
   --gutter: clamp(16px, 4vw, 40px);
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -73,33 +63,27 @@
 @media (prefers-color-scheme: dark) {
   :root {
     color-scheme: dark;
-    --bg: #121314;
-    --surface: #1a1b1d;
-    --sunken: #1f2123;
-    --ink: #ececea;
-    --ink-2: #b0b2b7;
-    --ink-3: #8f9298;
-    --line: #27292c;
-    --line-strong: #383b3f;
+    --bg: #0b0b0c;
+    --surface: #0b0b0c;
+    --sunken: #161618;
+    --ink: #f2f2f2;
+    --ink-2: #b8b8b8;
+    --ink-3: #9a9a9a;
+    --line: #1f1f21;
+    --line-strong: #2a2a2d;
 
-    --accent: #93a6ff;
-    --accent-ink: #0d1330;
-    --accent-soft: #1f2645;
+    --accent: #7c9bff;
+    --accent-ink: #0b0b0c;
+    --accent-soft: #151a2b;
 
-    --ok: #5cc98e;
+    --ok: #4ade80;
     --warn: #f0b44c;
     --warn-fill: #e3a33a;
-    --warn-soft: #2a2213;
-    --bad: #ff8a80;
+    --warn-soft: #221c10;
+    --bad: #ff7b72;
 
-    --meter: #d4d5d8;
-    --meter-track: #2c2e32;
-  }
-}
-@media (prefers-color-scheme: dark) {
-  /* Light text on a dark ground reads thinner: open the tracking slightly. */
-  body {
-    letter-spacing: 0.01em;
+    --meter: #f2f2f2;
+    --meter-track: #262628;
   }
 }
 
@@ -215,7 +199,7 @@ summary {
   padding-inline: var(--gutter);
 }
 .topbar {
-  border-bottom: 1px solid var(--line);
+  border-bottom: 0;
 }
 .topbar-inner {
   display: flex;
@@ -229,19 +213,13 @@ summary {
   align-items: center;
   color: var(--ink);
   font-family: var(--font-mono);
-  font-size: 15px;
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
   text-decoration: none;
 }
 .wordmark .caret {
-  display: inline-block;
-  width: 0.5em;
-  height: 1.05em;
-  margin-left: 3px;
-  background: var(--accent);
-  border-radius: 1px;
-  transform: translateY(1px);
+  display: none;
 }
 .identity {
   display: flex;
@@ -269,7 +247,6 @@ main {
   justify-content: space-between;
   gap: var(--s2) var(--s4);
   padding-block: var(--s5) var(--s6);
-  border-top: 1px solid var(--line);
   color: var(--ink-3);
   font-size: var(--t-xs);
 }
@@ -304,7 +281,7 @@ main {
   justify-content: space-between;
   gap: var(--s1) var(--s4);
   padding-bottom: var(--s3);
-  border-bottom: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line);
 }
 .section-head h2 {
   font-size: var(--t-md);
@@ -331,10 +308,11 @@ main {
   min-height: 40px;
   padding: 0 var(--s4);
   border: 1px solid var(--line-strong);
+  box-shadow: none;
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--ink);
-  font: 600 var(--t-base) / 1 var(--font-sans);
+  font: 500 var(--t-base) / 1 var(--font-sans);
   text-decoration: none;
   white-space: nowrap;
   cursor: pointer;
@@ -359,7 +337,7 @@ main {
   border-color: color-mix(in srgb, var(--accent) 86%, var(--ink));
 }
 .button.small {
-  min-height: 28px;
+  min-height: 30px;
   padding: 0 var(--s3);
   font-size: var(--t-sm);
 }
@@ -429,10 +407,10 @@ main {
   padding: 0 5px;
   border-radius: 4px;
   background: var(--sunken);
-  color: var(--ink-2);
-  font-size: 11px;
-  font-weight: 600;
-  letter-spacing: 0.03em;
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
   line-height: 18px;
   white-space: nowrap;
 }
@@ -446,7 +424,7 @@ main {
 /* Meter: the fill is what is LEFT, the same quantity as the figure. */
 .meter {
   position: relative;
-  height: 4px;
+  height: 3px;
   border-radius: 2px;
   background: var(--meter-track);
   overflow: hidden;
@@ -478,8 +456,9 @@ main {
   display: flex;
   align-items: flex-start;
   gap: var(--s2);
-  border-radius: var(--radius-lg);
-  background: var(--sunken);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
 }
 .command pre {
   flex: 1;
@@ -498,7 +477,7 @@ main {
   margin: 8px 8px 8px 0;
 }
 .command .flag {
-  color: var(--accent);
+  color: var(--ink-2);
 }
 .command .placeholder {
   color: var(--ink-2);
@@ -580,8 +559,7 @@ details > summary:hover {
   align-items: baseline;
   gap: var(--s1) var(--s3);
   font-size: var(--t-answer);
-  font-stretch: 90%;
-  letter-spacing: -0.03em;
+  letter-spacing: -0.02em;
   line-height: 1.08;
 }
 .answer h1 .alias {
@@ -601,8 +579,7 @@ details > summary:hover {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: var(--s5);
-  padding-block: var(--s4);
-  border-block: 1px solid var(--line);
+  padding-block: var(--s2);
 }
 .figure {
   display: grid;
@@ -610,8 +587,8 @@ details > summary:hover {
 }
 .figure-value {
   font-size: var(--t-figure);
-  font-stretch: 82%;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   letter-spacing: -0.03em;
   line-height: 1;
 }
@@ -619,7 +596,6 @@ details > summary:hover {
   margin-left: 2px;
   color: var(--ink-3);
   font-size: var(--t-lg);
-  font-stretch: 100%;
   font-weight: 500;
   letter-spacing: 0;
 }
@@ -633,7 +609,6 @@ details > summary:hover {
 .figure-value.none {
   color: var(--ink-3);
   font-size: var(--t-xl);
-  font-stretch: 100%;
   letter-spacing: -0.01em;
   line-height: 1.6;
 }
@@ -641,13 +616,13 @@ details > summary:hover {
   color: var(--ink-2);
 }
 .answer .command pre {
-  padding-block: var(--s4);
-  font-size: var(--t-md);
+  padding-block: var(--s3);
+  font-size: var(--t-base);
   font-weight: 500;
 }
 .answer .command .copy {
-  margin: 10px 10px 10px 0;
-  min-height: 36px;
+  margin: 6px 6px 6px 0;
+  min-height: 32px;
 }
 .effect {
   color: var(--ink);
@@ -741,7 +716,7 @@ details > summary:hover {
   padding: var(--s3) var(--s4) var(--s2) 0;
   color: var(--ink-3);
   font-size: var(--t-xs);
-  font-weight: 500;
+  font-weight: 400;
   text-align: left;
   white-space: nowrap;
 }
@@ -782,7 +757,7 @@ details > summary:hover {
   gap: 2px;
 }
 .account-name strong {
-  font-weight: 600;
+  font-weight: 500;
   overflow-wrap: anywhere;
 }
 .account-name .line {
@@ -817,8 +792,9 @@ details > summary:hover {
   gap: 0 var(--s2);
 }
 .usage-value {
-  font-size: var(--t-md);
+  font-size: var(--t-base);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 .usage-value small {
@@ -900,7 +876,7 @@ details > summary:hover {
   padding: var(--s3) var(--s4) var(--s2) 0;
   color: var(--ink-3);
   font-size: var(--t-xs);
-  font-weight: 500;
+  font-weight: 400;
   text-align: left;
 }
 .machines td {
@@ -909,7 +885,7 @@ details > summary:hover {
   vertical-align: baseline;
 }
 .machines td:first-child {
-  font-weight: 600;
+  font-weight: 500;
   overflow-wrap: anywhere;
 }
 .machines .col-state {
@@ -968,8 +944,7 @@ details > summary:hover {
 }
 .signin h1 {
   font-size: var(--t-answer);
-  font-stretch: 90%;
-  letter-spacing: -0.03em;
+  letter-spacing: -0.02em;
   line-height: 1.08;
 }
 .signin .lede {
@@ -996,10 +971,10 @@ details > summary:hover {
   justify-content: space-between;
   gap: var(--s1) var(--s4);
   padding-bottom: var(--s3);
-  border-bottom: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line);
 }
 .steps-head h2 {
-  font-size: var(--t-lg);
+  font-size: var(--t-md);
 }
 .steps-head p {
   color: var(--ink-3);
@@ -1062,107 +1037,6 @@ details > summary:hover {
 }
 .step details > * + * {
   margin-top: var(--s3);
-}
-
-/* ---------- Machine setup pages ---------- */
-.enroll {
-  display: grid;
-  min-height: 100dvh;
-  grid-template-rows: auto 1fr auto;
-}
-.enroll main {
-  display: grid;
-  place-items: start center;
-  padding-block: clamp(32px, 9vh, 96px) var(--s8);
-}
-.panel {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: var(--s5);
-  width: 100%;
-  max-width: 440px;
-}
-.panel h1 {
-  font-size: var(--t-xl);
-  letter-spacing: -0.02em;
-  line-height: 1.15;
-  overflow-wrap: anywhere;
-}
-.panel .lede {
-  margin-top: calc(-1 * var(--s3));
-  color: var(--ink-2);
-  font-size: var(--t-md);
-}
-.facts-list {
-  display: grid;
-  border-block: 1px solid var(--line);
-}
-.facts-list div {
-  display: grid;
-  grid-template-columns: 120px minmax(0, 1fr);
-  gap: var(--s3);
-  padding: var(--s3) 0;
-}
-.facts-list div + div {
-  border-top: 1px solid var(--line);
-}
-.facts-list dt {
-  color: var(--ink-3);
-}
-.facts-list dd {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  font-weight: 500;
-}
-.code-check {
-  display: grid;
-  gap: var(--s2);
-  padding: var(--s5) var(--s4);
-  border-radius: var(--radius-lg);
-  background: var(--sunken);
-  text-align: center;
-}
-.code-check .label {
-  color: var(--ink-2);
-  font-size: var(--t-sm);
-}
-.code-check code {
-  color: var(--ink);
-  font-size: clamp(1.125rem, 5vw, 2rem);
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  line-height: 1.2;
-}
-.panel form .button {
-  width: 100%;
-  min-height: 44px;
-}
-.panel .footnote {
-  color: var(--ink-3);
-  font-size: var(--t-sm);
-}
-.panel .next {
-  display: grid;
-  gap: var(--s2);
-}
-.panel .next + .next {
-  padding-top: var(--s4);
-  border-top: 1px solid var(--line);
-}
-.panel .next h2 {
-  font-size: var(--t-base);
-}
-.panel .next p {
-  color: var(--ink-2);
-}
-.done-mark {
-  display: grid;
-  place-items: center;
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
-  background: color-mix(in srgb, var(--ok) 14%, transparent);
-  color: var(--ok);
 }
 
 /* ---------- Responsive ---------- */
@@ -1400,4 +1274,24 @@ progress.meter.warn::-moz-progress-bar {
   margin: -8px 0 0;
   color: var(--ink-3);
   font-size: var(--t-xs);
+}
+
+/* Empty state: the answer gives one line and one action; empty tables stay out. */
+.section:not(:has(tbody tr)):not(:has(details)) {
+  display: none;
+}
+table:has(> tbody:empty),
+table:has(> tbody:empty) + .machines-note {
+  display: none;
+}
+#overview[data-has-accounts="false"] .attention {
+  display: none;
+}
+#overview[data-has-accounts="false"] .lead {
+  grid-template-columns: minmax(0, 640px);
+}
+[data-load-error] h1 {
+  margin-bottom: var(--s5);
+  font-size: var(--t-xl);
+  letter-spacing: -0.02em;
 }
