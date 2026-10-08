@@ -55,8 +55,11 @@ impl Fixture {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
+            login_holder_live: Arc::new(AtomicBool::new(true)),
             holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
             registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

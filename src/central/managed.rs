@@ -22,7 +22,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -37,6 +37,7 @@ const IMPORT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(120
 const IMPORT_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const IMPORT_LEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const IMPORT_LEASE_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+const LOGIN_HOLDER_RENEWAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
@@ -154,9 +155,29 @@ pub(super) struct Broker {
     pub(super) recovery_stop: Arc<tokio::sync::Notify>,
     pub(super) background_recovery: bool,
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    pub(super) shared_login_workers: Arc<StdMutex<BTreeSet<(String, String)>>>,
     pub(super) central: Option<CentralStore>,
+    /// Stable for the process: refresh leases outlive a login holder outage.
     pub(super) holder_id: String,
+    /// Login incarnation. It changes when a lost holder lease recovers.
+    pub(super) login_holder: Arc<StdMutex<String>>,
+    pub(super) login_holder_live: Arc<AtomicBool>,
     pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
+}
+impl Broker {
+    pub(super) fn login_holder(&self) -> String {
+        self.login_holder
+            .lock()
+            .expect("login holder lock poisoned")
+            .clone()
+    }
+
+    fn replace_login_holder(&self, holder: String) {
+        *self
+            .login_holder
+            .lock()
+            .expect("login holder lock poisoned") = holder;
+    }
 }
 #[derive(Clone)]
 pub(super) struct RegistryState {
@@ -276,6 +297,23 @@ fn instance_holder_id() -> String {
         .unwrap_or_else(|_| "unknown-host".into());
     let boot_nonce = vault::digest(&enrollment::random_bytes());
     vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
+}
+
+fn holder_renewal_lost(renewed: &Result<bool>, since_last_success: std::time::Duration) -> bool {
+    match renewed {
+        Ok(true) => false,
+        Ok(false) => true,
+        Err(_) => since_last_success >= LOGIN_HOLDER_RENEWAL_RETRY_WINDOW,
+    }
+}
+
+fn shared_login_ready(
+    local: bool,
+    reachable: Option<bool>,
+    central: bool,
+    holder_live: bool,
+) -> bool {
+    local && reachable.is_none_or(|value| value) && (!central || holder_live)
 }
 
 pub(super) fn account_summary(owner: &Owner) -> Account {
@@ -2776,7 +2814,12 @@ async fn ready(State(broker): State<Broker>) -> Response {
         Some(store) => Some(store.reachable().await),
         None => None,
     };
-    let healthy = local && reachable.is_none_or(|value| value);
+    let healthy = shared_login_ready(
+        local,
+        reachable,
+        broker.central.is_some(),
+        broker.login_holder_live.load(Ordering::Acquire),
+    );
     let status = if healthy {
         StatusCode::OK
     } else {
@@ -2798,7 +2841,13 @@ async fn ready(State(broker): State<Broker>) -> Response {
 }
 
 pub(super) fn readiness(broker: &Broker) -> StatusCode {
-    if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
+    let local = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
+    if !shared_login_ready(
+        local,
+        None,
+        broker.central.is_some(),
+        broker.login_holder_live.load(Ordering::Acquire),
+    ) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -3731,6 +3780,7 @@ pub async fn serve(
     } else {
         None
     };
+    let holder = instance_holder_id();
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -3771,7 +3821,10 @@ pub async fn serve(
         recovery_stop: Arc::new(tokio::sync::Notify::new()),
         background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
-        holder_id: instance_holder_id(),
+        shared_login_workers: Arc::new(StdMutex::new(Default::default())),
+        holder_id: holder.clone(),
+        login_holder: Arc::new(StdMutex::new(holder)),
+        login_holder_live: Arc::new(AtomicBool::new(true)),
         registry,
         central,
         metrics_hash: metrics_token_file
@@ -3786,6 +3839,69 @@ pub async fn serve(
                 Ok(vault::digest(token.as_bytes()))
             })
             .transpose()?,
+    };
+    let (holder_stop, mut holder_stop_rx) = tokio::sync::oneshot::channel();
+    let holder_task = if let Some(shared) = broker.central.as_ref() {
+        let initial_holder = broker.login_holder();
+        shared.login_register_holder(&initial_holder).await?;
+        let holder_store = shared.clone();
+        let holder_broker = broker.clone();
+        Some(tokio::spawn(async move {
+            let mut last_renewal = std::time::Instant::now();
+            let mut holder_id = initial_holder;
+            loop {
+                tokio::select! {
+                    _ = &mut holder_stop_rx => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        let renewed = holder_store.login_renew_holder(&holder_id).await;
+                        if holder_renewal_lost(&renewed, last_renewal.elapsed()) {
+                            holder_broker.login_holder_live.store(false, Ordering::Release);
+                            let error = match renewed {
+                                Err(error) => format!("{error:#}"),
+                                _ => "login holder incarnation expired".into(),
+                            };
+                            eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_lost","error":error}));
+                            holder_broker.record_failure("relogin_failed", "login_holder", StatusCode::SERVICE_UNAVAILABLE);
+                            loop {
+                                tokio::select! {
+                                    _ = &mut holder_stop_rx => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                                }
+                                let replacement = instance_holder_id();
+                                match holder_store.login_register_holder(&replacement).await {
+                                    Ok(()) => {
+                                        // Give up the abandoned incarnation now, so other
+                                        // replicas can recover its operations at once.
+                                        if let Err(error) = holder_store.login_release_holder(&holder_id).await {
+                                            eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"abandoned_release_failed","error":format!("{error:#}")}));
+                                        }
+                                        holder_broker.replace_login_holder(replacement.clone());
+                                        holder_id = replacement;
+                                        last_renewal = std::time::Instant::now();
+                                        holder_broker.login_holder_live.store(true, Ordering::Release);
+                                        eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_recovered"}));
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_recovery_retry","error":format!("{error:#}")}));
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        match renewed {
+                            Ok(true) => last_renewal = std::time::Instant::now(),
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_renewal_retry","error":format!("{error:#}")}));
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
     };
     for _ in 0..recovery_failures {
         broker.record_failure(
@@ -3864,6 +3980,14 @@ pub async fn serve(
     for result in futures::future::join_all(tasks).await {
         result?;
     }
+    if let Some(task) = holder_task {
+        let _ = holder_stop.send(());
+        task.await.context("login holder heartbeat task failed")?;
+        if let Some(shared) = broker.central.as_ref() {
+            let holder_id = broker.login_holder();
+            shared.login_release_holder(&holder_id).await?;
+        }
+    }
     Ok(())
 }
 
@@ -3912,8 +4036,11 @@ impl Broker {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
             holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
+            login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         }
     }
@@ -3944,6 +4071,35 @@ pub(super) fn api_routes() -> Router<Broker> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fenced_shared_login_replica_is_not_ready() {
+        assert!(!super::shared_login_ready(true, Some(true), true, false));
+        assert!(super::shared_login_ready(true, Some(true), true, true));
+        assert!(super::shared_login_ready(true, None, false, false));
+    }
+
+    #[test]
+    fn transient_holder_renewal_error_keeps_admission_live_within_lease_window() {
+        let error = Err(anyhow::Error::msg("database unavailable"));
+
+        assert!(!super::holder_renewal_lost(
+            &error,
+            std::time::Duration::from_secs(19),
+        ));
+        assert!(super::holder_renewal_lost(
+            &error,
+            std::time::Duration::from_secs(20),
+        ));
+        assert!(super::holder_renewal_lost(
+            &Ok(false),
+            std::time::Duration::ZERO,
+        ));
+        assert!(!super::holder_renewal_lost(
+            &Ok(true),
+            std::time::Duration::ZERO,
+        ));
+    }
+
     #[test]
     fn holder_id_changes_for_each_boot() {
         assert_ne!(super::instance_holder_id(), super::instance_holder_id());
@@ -4020,8 +4176,11 @@ mod tests {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: Some(central),
             holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
+            login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         };
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

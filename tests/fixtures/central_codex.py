@@ -23,6 +23,10 @@ if "login" in sys.argv:
         print("\033]52;unsupported\n", flush=True)
         while True:
             time.sleep(1)
+    if mode == "login-prompt-gate":
+        prompt_gate = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-prompt-release")
+        while not prompt_gate.exists():
+            time.sleep(0.02)
     print("1. Open this link in your browser and sign in to your account", flush=True)
     print("   https://auth.openai.com/codex/device", flush=True)
     print("\n2. Enter this one-time code (expires in 15 minutes)", flush=True)

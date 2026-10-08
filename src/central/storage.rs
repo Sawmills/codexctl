@@ -1738,7 +1738,7 @@ impl PostgresStore {
         holder_id: &str,
         ttl: Duration,
     ) -> Result<Lease> {
-        self.acquire_login_lease(account_id, holder_id, ttl, None, None)
+        self.acquire_login_lease(account_id, holder_id, ttl, None)
             .await?
             .context("refresh lease is held by another instance")
     }
@@ -1748,16 +1748,39 @@ impl PostgresStore {
         account_id: &str,
         holder_id: &str,
         ttl: Duration,
-        login_id: Option<&str>,
-        local_holder: Option<&str>,
+        login: Option<(&login::LoginOperation, &str)>,
     ) -> Result<Option<Lease>> {
-        let client = self.client().await?;
+        let login_id = login.map(|(op, _)| op.id.as_str());
+        let local_holder = login.map(|(op, _)| op.holder.as_str());
+        let login_epoch = login.map(|(op, _)| op.epoch);
+        let refresh_holder = login.map(|(_, refresh)| refresh);
+        let ttl_seconds = ttl.as_secs() as i64;
         // Expiry alone cannot prove a foreign refresh child stopped. A renewal
-        // can replace its own local holder because its worker settles that child.
-        let row = client.query_opt(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$5 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch",
-            &[&account_id, &holder_id, &(ttl.as_secs() as i64), &login_id, &local_holder],
-        ).await?;
+        // can replace its own replica's refresh lease because its worker settles
+        // that child. The login holder rotates after an outage; the refresh
+        // holder does not, so match the lease by the refresh holder.
+        const CLAIM: &str = "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch";
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
+            &account_id,
+            &holder_id,
+            &ttl_seconds,
+            &login_id,
+            &local_holder,
+            &login_epoch,
+            &refresh_holder,
+        ];
+        let row = if login.is_some() {
+            // Serialize candidate epoch claims and account-lease admission. A
+            // late request from an older epoch must not acquire a refresh lease.
+            let mut connection = self.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = identity::lock_admission(&tx).await?;
+            let row = tx.query_opt(CLAIM, &params).await?;
+            tx.commit().await?;
+            row
+        } else {
+            self.client().await?.query_opt(CLAIM, &params).await?
+        };
         Ok(row.map(|row| Lease {
             account_id: account_id.into(),
             holder_id: holder_id.into(),

@@ -11,6 +11,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    SuperviseLogin {
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        codex_bin: PathBuf,
+    },
     /// Initialize an empty multi-user server. No account credentials are required.
     Setup {
         #[arg(long)]
@@ -159,8 +169,21 @@ async fn main() {
         }
         return;
     }
+    #[cfg(target_os = "linux")]
+    let supervising = matches!(&cli.command, Commands::SuperviseLogin { .. });
     let result = execute(cli).await;
     if let Err(error) = result {
+        #[cfg(target_os = "linux")]
+        if supervising {
+            let detail: String = format!("{error:#}").chars().take(4096).collect();
+            eprintln!(
+                "{}",
+                serde_json::json!({"operation":"login_polling","stage":"settlement","reason":"relogin_failed","error":detail})
+            );
+        } else {
+            eprintln!("{error}");
+        }
+        #[cfg(not(target_os = "linux"))]
         eprintln!("{error}");
         std::process::exit(1);
     }
@@ -179,6 +202,12 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         );
     }
     match cli.command {
+        #[cfg(target_os = "linux")]
+        Commands::SuperviseLogin {
+            state,
+            key_file,
+            codex_bin,
+        } => central::supervise_login(&state, &key_file, &codex_bin).await?,
         Commands::Setup { state, key_file } => central::managed::setup(&state, &key_file)?,
         Commands::Users {
             state,

@@ -2,6 +2,12 @@
 use super::*;
 
 pub(in crate::central) const LOGIN_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS central_login_holders (
+    holder_id TEXT PRIMARY KEY,
+    expires_at TIMESTAMPTZ NOT NULL,
+    polling_bound BOOLEAN NOT NULL,
+    deleted_at TIMESTAMPTZ
+);
 ALTER TABLE account_refresh_leases ADD COLUMN IF NOT EXISTS legacy_handoff BOOLEAN NOT NULL DEFAULT false;
 DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='account_refresh_leases'::regclass AND attname='released' AND NOT attisdropped) THEN
@@ -31,6 +37,7 @@ CREATE TABLE IF NOT EXISTS central_login_operations (
     PRIMARY KEY (user_id, id)
 );
 ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS polling_clear BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE central_login_operations ADD COLUMN IF NOT EXISTS failure_reported BOOLEAN NOT NULL DEFAULT false;
 CREATE UNIQUE INDEX IF NOT EXISTS central_login_active_account
     ON central_login_operations(account_id)
     WHERE phase NOT IN ('completed','failed','canceled','rejected','replica_lost');
@@ -202,6 +209,8 @@ pub(in crate::central) struct LoginOperation {
     pub epoch: i64,
     pub payload: LoginPayload,
     pub polling_clear: bool,
+    pub lease_expired: bool,
+    pub failure_reported: bool,
 }
 impl LoginOperation {
     pub fn account(&self) -> Result<&str> {
@@ -246,10 +255,244 @@ impl PostgresStore {
                 payload
             },
             polling_clear: row.get("polling_clear"),
+            lease_expired: row.get("lease_expired"),
+            failure_reported: row.get("failure_reported"),
         })
     }
 }
 impl CentralStore {
+    pub(in crate::central) async fn login_register_holder(&self, holder: &str) -> Result<()> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "INSERT INTO central_login_holders(holder_id,expires_at,polling_bound) VALUES($1,clock_timestamp()+interval '30 seconds',$2) ON CONFLICT DO NOTHING",
+                &[&holder, &cfg!(target_os = "linux")],
+            ).await?;
+            if changed != 1 { bail!("login holder incarnation already registered"); }
+            Ok(())
+        }).await
+    }
+
+    pub(in crate::central) async fn login_renew_holder(&self, holder: &str) -> Result<bool> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            Ok(db.client().await?.execute(
+                "UPDATE central_login_holders SET expires_at=clock_timestamp()+interval '30 seconds' WHERE holder_id=$1 AND deleted_at IS NULL AND expires_at>clock_timestamp()",
+                &[&holder],
+            ).await? == 1)
+        }).await
+    }
+
+    pub(in crate::central) async fn login_release_holder(&self, holder: &str) -> Result<()> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            // Expiry is the liveness bit. Keep the parent-bound provenance
+            // immutable so a durable candidate can still be taken over after
+            // graceful shutdown.
+            db.client().await?.execute("UPDATE central_login_holders SET expires_at=clock_timestamp() WHERE holder_id=$1 AND deleted_at IS NULL", &[&holder]).await?;
+            Ok(())
+        }).await
+    }
+
+    /// Only a registered, parent-bound polling incarnation proves automatic exit.
+    /// Unregistered legacy operations and verification evidence remain fenced.
+    pub(in crate::central) async fn login_recover_polling(
+        &self,
+        op: &mut LoginOperation,
+        holder: &str,
+    ) -> Result<bool> {
+        if op.phase != LoginPhase::ReplicaLost {
+            return Ok(false);
+        }
+        let db = self.login_db()?;
+        let recovered = bounded_db(async {
+            let mut connection = db.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = super::identity::lock_admission(&tx).await?;
+            let row = tx.query_opt(
+                "UPDATE central_login_operations o SET polling_clear=true,selected_reserved=false,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='replica_lost' AND o.polling_clear AND o.selected_reserved AND o.candidate_workspace IS NULL AND o.expires_at<=clock_timestamp() AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND h.expires_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder],
+            ).await?;
+            if row.is_some() {
+                tx.execute("UPDATE central_login_identity_reservations SET deleted_at=clock_timestamp() WHERE user_id=$1 AND id=$2 AND deleted_at IS NULL", &[&op.user,&op.id]).await?;
+                tx.execute("UPDATE central_login_identity_reservation_history SET deleted_at=clock_timestamp() WHERE user_id=$1 AND id=$2 AND deleted_at IS NULL", &[&op.user,&op.id]).await?;
+            }
+            tx.commit().await?;
+            Ok(row)
+        }).await?;
+        if let Some(row) = recovered {
+            *op = db.login_row(row)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Claim only a durable candidate that has not started verification.
+    /// Foreign refresh leases remain untouched until their own settlement.
+    /// A live holder reclaims its own candidate even after the operation lease
+    /// expires, because no other replica may claim it while the holder lives.
+    pub(in crate::central) async fn login_takeover_candidate(
+        &self,
+        op: &mut LoginOperation,
+        holder: &str,
+    ) -> Result<bool> {
+        if op.phase != LoginPhase::Candidate {
+            return Ok(false);
+        }
+        let db = self.login_db()?;
+        let row = bounded_db(async {
+            let mut connection = db.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = super::identity::lock_admission(&tx).await?;
+            let row = tx.query_opt(
+                "UPDATE central_login_operations o SET holder_id=$6,epoch=epoch+1,sequence=sequence+1,expires_at=clock_timestamp()+interval '30 seconds' FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='candidate' AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND ((o.holder_id=$6 AND h.expires_at>clock_timestamp()) OR (o.expires_at<=clock_timestamp() AND h.expires_at<=clock_timestamp())) AND NOT EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder],
+            ).await?;
+            tx.commit().await?;
+            Ok(row)
+        }).await?;
+        if let Some(row) = row {
+            *op = db.login_row(row)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Expired verification, or unsettled pre-verification refresh ownership,
+    /// keeps all credential and reservation evidence without replaying work.
+    /// The caller settles its own holder's receipt only after its worker exits.
+    pub(in crate::central) async fn login_recover_unresolved(
+        &self,
+        op: &mut LoginOperation,
+        holder: &str,
+    ) -> Result<bool> {
+        if !matches!(op.phase, LoginPhase::Candidate | LoginPhase::Verifying) {
+            return Ok(false);
+        }
+        let db = self.login_db()?;
+        let mut payload = op.payload.clone();
+        payload.error = Some(
+            if op.phase == LoginPhase::Verifying {
+                "relogin_verification_unresolved"
+            } else {
+                "relogin_settlement_unresolved"
+            }
+            .into(),
+        );
+        let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&payload)?)?;
+        let row = bounded_db(async {
+            let mut connection = db.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = super::identity::lock_admission(&tx).await?;
+            let row = tx.query_opt(
+                "UPDATE central_login_operations o SET phase='unresolved',encrypted_payload=$7,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase=$8 AND o.expires_at<=clock_timestamp() AND (o.phase='verifying' OR (o.phase='candidate' AND EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released))) AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND (h.expires_at<=clock_timestamp() OR o.holder_id=$6) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder,&encrypted,&op.phase.as_str()],
+            ).await?;
+            tx.commit().await?;
+            Ok(row)
+        }).await?;
+        if let Some(row) = row {
+            *op = db.login_row(row)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// A supervisor's awaited native exit and private home prove grant absence.
+    #[cfg(target_os = "linux")]
+    pub(in crate::central) async fn login_record_polling_absence(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<()> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "UPDATE central_login_operations SET polling_clear=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase IN ('starting','pending','replica_lost') AND candidate_workspace IS NULL",
+                &[&op.user,&op.id,&op.holder,&op.epoch],
+            ).await?;
+            if changed != 1 {bail!("polling settlement fenced");}
+            Ok(())
+        }).await
+    }
+
+    /// Late capture retains evidence without restoring authority or verifying.
+    #[cfg(target_os = "linux")]
+    pub(in crate::central) async fn login_record_unpublished_grant(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<()> {
+        let db = self.login_db()?;
+        let mut payload = op.payload.clone();
+        payload.code = None;
+        payload.error = Some("relogin_grant_unpublished".into());
+        let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&payload)?)?;
+        bounded_db(async {
+            let changed = db.client().await?.execute(
+                "UPDATE central_login_operations SET phase='unresolved',sequence=sequence+1,encrypted_payload=$6 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase IN ('starting','pending','replica_lost') AND candidate_workspace IS NULL",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&encrypted],
+            ).await?;
+            if changed != 1 {bail!("late grant settlement fenced");}
+            Ok(())
+        }).await
+    }
+
+    /// One serving replica reports each durable supervisor/unknown-exit failure.
+    /// A holder with no row predates registration and reports its own failures.
+    /// A worker reports after its durable save, so a `failed` receipt counts.
+    pub(in crate::central) async fn login_take_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+    ) -> Result<bool> {
+        self.take_failure(op, reporter, false).await
+    }
+
+    /// Claims only when the durable receipt proves no grant can still complete:
+    /// never a candidate or a verification, and live or lost polling only after
+    /// proven absence.
+    pub(in crate::central) async fn login_take_grantless_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+    ) -> Result<bool> {
+        self.take_failure(op, reporter, true).await
+    }
+
+    async fn take_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+        grantless: bool,
+    ) -> Result<bool> {
+        let db = self.login_db()?;
+        let changed = bounded_db(async {
+            Ok(db.client().await?.execute(
+                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','canceled') AND NOT failure_reported AND (holder_id=$5 OR (EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3) AND NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))) AND (NOT $6::boolean OR (phase NOT IN ('candidate','verifying') AND (phase NOT IN ('starting','pending','replica_lost') OR polling_clear)))",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&reporter,&grantless],
+            ).await? == 1)
+        }).await?;
+        if changed {
+            op.failure_reported = true;
+        }
+        Ok(changed)
+    }
+
+    /// The supervisor reads durable cancellation without extending parent authority.
+    #[cfg(target_os = "linux")]
+    pub(in crate::central) async fn login_polling_authority(
+        &self,
+        op: &LoginOperation,
+    ) -> Result<(bool, bool)> {
+        let db = self.login_db()?;
+        bounded_db(async {
+            let row=db.client().await?.query_opt(
+                "SELECT cancel_requested,phase IN ('starting','pending') AND expires_at>clock_timestamp() AND deadline>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) FROM central_login_operations WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4",
+                &[&op.user,&op.id,&op.holder,&op.epoch],
+            ).await?.context("polling incarnation fenced")?;
+            Ok((row.get(0),row.get(1)))
+        }).await
+    }
+
     pub(super) fn login_db(&self) -> Result<&PostgresStore> {
         match self {
             Self::Postgres(db) => Ok(db),
@@ -300,7 +543,7 @@ impl CentralStore {
             db.client()
                 .await?
                 .query_opt(
-                    "SELECT * FROM central_login_operations WHERE user_id=$1 AND id=$2",
+                    "SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND id=$2",
                     &[&user, &id],
                 )
                 .await?
@@ -332,7 +575,7 @@ impl CentralStore {
         let db = self.login_db()?;
         bounded_db(async {
             db.expire_polling_login(user,None,Some(alias)).await?;
-            db.client().await?.query_opt("SELECT * FROM central_login_operations WHERE user_id=$1 AND lower(alias)=lower($2) AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost')", &[&user,&alias]).await?
+            db.client().await?.query_opt("SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND lower(alias)=lower($2) AND (phase NOT IN ('completed','failed','canceled','rejected','replica_lost') OR (phase='replica_lost' AND selected_reserved)) ORDER BY (phase='replica_lost'), id LIMIT 1", &[&user,&alias]).await?
                 .map(|row| db.login_row(row)).transpose()
         }).await
     }
@@ -342,14 +585,14 @@ impl CentralStore {
     ) -> Result<Option<LoginOperation>> {
         let db = self.login_db()?;
         bounded_db(async {
-            db.client().await?.query_opt("SELECT * FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost')",&[&account]).await?.map(|row|db.login_row(row)).transpose()
+            db.client().await?.query_opt("SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE account_id=$1 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost')",&[&account]).await?.map(|row|db.login_row(row)).transpose()
         }).await
     }
     pub(in crate::central) async fn login_create(&self, op: &LoginOperation) -> Result<bool> {
         let db = self.login_db()?;
         let encrypted = vault::encrypt_bytes(&db.key, &serde_json::to_vec(&op.payload)?)?;
         bounded_db(async {
-            Ok(db.client().await?.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload,kind) VALUES($1,$2,$3,$4,$5,'starting',$6,clock_timestamp()+interval '30 seconds',$7,$8) ON CONFLICT DO NOTHING",
+            Ok(db.client().await?.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload,kind) SELECT $1,$2,$3,$4,$5,'starting',$6,clock_timestamp()+interval '30 seconds',$7,$8 WHERE EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$6 AND deleted_at IS NULL AND expires_at>clock_timestamp()) ON CONFLICT DO NOTHING",
                 &[&op.user,&op.id,&op.account_id,&op.alias,&op.device,&op.holder,&encrypted,&op.kind.as_str()]).await? == 1)
         }).await
     }
@@ -364,7 +607,7 @@ impl CentralStore {
     pub(in crate::central) async fn login_heartbeat(&self, op: &LoginOperation) -> Result<bool> {
         let db = self.login_db()?;
         bounded_db(async {
-            let row = db.client().await?.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND expires_at>clock_timestamp() AND (deadline>clock_timestamp() OR phase IN ('candidate','verifying')) RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
+            let row = db.client().await?.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase IN ('starting','pending','candidate','verifying') AND expires_at>clock_timestamp() AND (deadline>clock_timestamp() OR phase IN ('candidate','verifying')) AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
             Ok(row.context("login lease lost")?.get(0))
         }).await
     }
@@ -422,7 +665,7 @@ impl CentralStore {
             let mut connection=db.admission_client().await?;
             let client=connection.transaction().await?;
             let _admission_timing = identity::lock_admission(&client).await?;
-            let changed = client.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9,candidate_claims=$10::text::jsonb,candidate_uid=$11,candidate_sub=$12 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost') AND expires_at>clock_timestamp()", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login,&claims,&candidate_logins.uid,&candidate_logins.sub]).await?;
+            let changed = client.execute("UPDATE central_login_operations SET phase=$6, encrypted_payload=$7, sequence=sequence+1, candidate_workspace=$8, candidate_login=$9,candidate_claims=$10::text::jsonb,candidate_uid=$11,candidate_sub=$12 WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND sequence=$5 AND phase NOT IN ('completed','failed','canceled','rejected','replica_lost') AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp())", &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&phase.as_str(),&encrypted,&workspace,&login,&claims,&candidate_logins.uid,&candidate_logins.sub]).await?;
             if changed != 1 { bail!("login transition fenced"); }
             client.commit().await?;
             Ok(())
@@ -434,9 +677,12 @@ impl CentralStore {
 }
 
 impl CentralStore {
+    /// `refresh_holder` is this replica's refresh identity. The worker settles
+    /// that replica's own refresh child, so it may replace its lease.
     pub(in crate::central) async fn login_account_lease(
         &self,
         op: &LoginOperation,
+        refresh_holder: &str,
     ) -> Result<Option<Lease>> {
         let db = self.login_db()?;
         // Different from the replica's normal refresh holder: no reentrant lease.
@@ -445,8 +691,7 @@ impl CentralStore {
             op.account()?,
             &holder,
             Duration::from_secs(120),
-            Some(&op.id),
-            Some(&op.holder),
+            Some((op, refresh_holder)),
         ))
         .await
     }
@@ -460,7 +705,7 @@ impl CentralStore {
         let db = self.login_db()?;
         bounded_db(async {
             let changed = db.client().await?.execute(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE) UPDATE central_login_operations SET phase='verifying',sequence=sequence+1,repair_evidence=(SELECT COALESCE(jsonb_agg(jsonb_build_array(r.user_id,r.id,r.sequence)), '[]'::jsonb) FROM central_login_operations r JOIN central_accounts a ON a.account_id=$1 WHERE r.phase='rejected' AND (r.account_id=$1 OR central_login_identity_agrees(r.candidate_workspace,r.candidate_uid,r.candidate_sub,$1))) WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence)",
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE) UPDATE central_login_operations SET phase='verifying',sequence=sequence+1,repair_evidence=(SELECT COALESCE(jsonb_agg(jsonb_build_array(r.user_id,r.id,r.sequence)), '[]'::jsonb) FROM central_login_operations r JOIN central_accounts a ON a.account_id=$1 WHERE r.phase='rejected' AND (r.account_id=$1 OR central_login_identity_agrees(r.candidate_workspace,r.candidate_uid,r.candidate_sub,$1))) WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='candidate' AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$6 AND deleted_at IS NULL AND expires_at>clock_timestamp()) AND account_id IN (SELECT account_id FROM fence)",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence]).await?;
             if changed != 1 { bail!("login verification fenced"); }
             Ok(())
@@ -493,7 +738,7 @@ impl CentralStore {
             let client = connection.transaction().await?;
             let _admission_timing = identity::lock_admission(&client).await?;
             let row = client.query_one(
-                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,workspace=$13,login=$14,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_login END,candidate_claims=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN '{}'::jsonb ELSE candidate_claims END,candidate_uid=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_uid END,candidate_sub=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_sub END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1))) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence))) RETURNING user_id,id), released_claims AS (UPDATE central_login_identity_reservations SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))), released_history AS (UPDATE central_login_identity_reservation_history SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))) SELECT count(*) FROM receipt",
+                "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$6 AND deleted_at IS NULL AND expires_at>clock_timestamp()) AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,workspace=$13,login=$14,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_login END,candidate_claims=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN '{}'::jsonb ELSE candidate_claims END,candidate_uid=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_uid END,candidate_sub=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_sub END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1))) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence))) RETURNING user_id,id), released_claims AS (UPDATE central_login_identity_reservations SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))), released_history AS (UPDATE central_login_identity_reservation_history SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))) SELECT count(*) FROM receipt",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload,&record.workspace,&record.login]).await?;
             if row.get::<_,i64>(0)!=1 { bail!("login completion fenced"); }
             if let Some(claims)=claims.as_ref() {identity::record_claims(&client,op.account()?,claims).await?;}
@@ -549,7 +794,10 @@ mod tests {
             epoch: 1,
             payload: LoginPayload::default(),
             polling_clear: false,
+            lease_expired: false,
+            failure_reported: false,
         };
+        shared.login_register_holder(&op.holder).await.unwrap();
         assert!(shared.login_create(&op).await.unwrap());
         op.payload.candidate = Some(
             serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
@@ -569,6 +817,254 @@ mod tests {
             op.phase,
             LoginPhase::Unresolved,
             "failure classification must preserve unresolved intent"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_holder_cannot_publish_a_candidate_with_a_live_operation_lease() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let mut op = LoginOperation {
+            kind: LoginKind::Renewal,
+            user: "user".into(),
+            id: "a".repeat(64),
+            account_id: Some("seat".into()),
+            alias: "seat".into(),
+            device: "machine".into(),
+            phase: LoginPhase::Starting,
+            sequence: 0,
+            holder: "replica".into(),
+            epoch: 1,
+            payload: LoginPayload::default(),
+            polling_clear: false,
+            lease_expired: false,
+            failure_reported: false,
+        };
+        shared.login_register_holder(&op.holder).await.unwrap();
+        assert!(shared.login_create(&op).await.unwrap());
+        shared.login_release_holder(&op.holder).await.unwrap();
+        op.payload.candidate = Some(
+            serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
+        );
+        assert!(
+            shared
+                .login_save(&mut op, LoginPhase::Candidate)
+                .await
+                .is_err(),
+            "holder expiry must fence publication before the operation lease expires"
+        );
+        assert!(shared.login_heartbeat(&op).await.is_err());
+        assert!(
+            !shared.login_renew_holder(&op.holder).await.unwrap(),
+            "an expired holder cannot resurrect"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn candidate_takeover_fences_the_previous_holder_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let mut op = LoginOperation {
+            kind: LoginKind::Renewal,
+            user: "user".into(),
+            id: "a".repeat(64),
+            account_id: Some("seat".into()),
+            alias: "seat".into(),
+            device: "machine".into(),
+            phase: LoginPhase::Starting,
+            sequence: 0,
+            holder: "replica".into(),
+            epoch: 1,
+            payload: LoginPayload::default(),
+            polling_clear: false,
+            lease_expired: false,
+            failure_reported: false,
+        };
+        shared.login_register_holder(&op.holder).await.unwrap();
+        assert!(shared.login_create(&op).await.unwrap());
+        op.payload.candidate = Some(
+            serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
+        );
+        shared
+            .login_save(&mut op, LoginPhase::Candidate)
+            .await
+            .unwrap();
+        let mut stale = op.clone();
+        shared.login_register_holder("replacement").await.unwrap();
+        shared.login_release_holder(&op.holder).await.unwrap();
+        control.execute("UPDATE central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&op.id]).await.unwrap();
+        assert!(
+            shared
+                .login_takeover_candidate(&mut op, "replacement")
+                .await
+                .unwrap()
+        );
+        assert_eq!(op.epoch, stale.epoch + 1);
+        assert!(
+            shared
+                .login_save(&mut stale, LoginPhase::Rejected)
+                .await
+                .is_err()
+        );
+        assert!(shared.login_heartbeat(&stale).await.is_err());
+        assert!(
+            shared
+                .login_account_lease(&stale, &stale.holder)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!shared.login_heartbeat(&op).await.unwrap());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grantless_failure_claim_requires_durable_grant_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let new_op = |id: &str, alias: &str| LoginOperation {
+            kind: LoginKind::Add,
+            user: "user".into(),
+            id: id.repeat(64),
+            account_id: None,
+            alias: alias.into(),
+            device: "machine".into(),
+            phase: LoginPhase::Starting,
+            sequence: 0,
+            holder: "replica".into(),
+            epoch: 1,
+            payload: LoginPayload::default(),
+            polling_clear: false,
+            lease_expired: false,
+            failure_reported: false,
+        };
+        shared.login_register_holder("replica").await.unwrap();
+        let mut polling = new_op("a", "first");
+        assert!(shared.login_create(&polling).await.unwrap());
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut polling, "replica")
+                .await
+                .unwrap(),
+            "polling without proven absence may still publish a grant"
+        );
+        control
+            .execute(
+                &format!(
+                    "UPDATE {schema}.central_login_operations SET polling_clear=true WHERE id=$1"
+                ),
+                &[&polling.id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            shared
+                .login_take_grantless_failure(&mut polling, "replica")
+                .await
+                .unwrap()
+        );
+        // An expired polling receipt may still settle a late grant.
+        let mut lost = new_op("c", "third");
+        assert!(shared.login_create(&lost).await.unwrap());
+        control
+            .execute(
+                &format!(
+                    "UPDATE {schema}.central_login_operations SET phase='replica_lost' WHERE id=$1"
+                ),
+                &[&lost.id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut lost, "replica")
+                .await
+                .unwrap(),
+            "lost polling without proven absence may still settle a grant"
+        );
+        let mut candidate = new_op("b", "second");
+        assert!(shared.login_create(&candidate).await.unwrap());
+        candidate.payload.candidate = Some(
+            serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
+        );
+        shared
+            .login_save(&mut candidate, LoginPhase::Candidate)
+            .await
+            .unwrap();
+        // The worker may not have seen the committed grant.
+        candidate.payload.candidate = None;
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut candidate, "replica")
+                .await
+                .unwrap(),
+            "a committed candidate may still complete"
         );
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))

@@ -5,6 +5,8 @@ use crate::central::storage::{
     login::{AddAdmission, LoginKind, LoginOperation, LoginPayload, LoginPhase},
 };
 use std::{process::Stdio, time::Duration};
+#[cfg(target_os = "linux")]
+use tokio::io::AsyncWriteExt;
 use tokio::{io::AsyncReadExt, process::Command};
 
 type Body = Result<Json<Request>, axum::extract::rejection::JsonRejection>;
@@ -49,6 +51,109 @@ fn owned(
     }
     Ok(())
 }
+/// The reporter is the holder that observed the failure: a worker reports as
+/// the holder it ran under, a recovery read as the current login holder.
+/// A `grantless` claim counts only when the durable receipt proves no grant.
+async fn record_login_failure(
+    broker: &Broker,
+    op: &mut LoginOperation,
+    reporter: &str,
+    grantless: bool,
+) -> Result<(), HttpError> {
+    if op.failure_reported {
+        return Ok(());
+    }
+    let db = database(broker)?;
+    let claimed = if grantless {
+        db.login_take_grantless_failure(op, reporter).await
+    } else {
+        db.login_take_failure(op, reporter).await
+    };
+    if claimed.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))? {
+        let reason = if op.payload.error.as_deref() == Some("account_identity_unresolved")
+            || ((op.phase == LoginPhase::Unresolved
+                || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear))
+                && op.payload.candidate.is_none())
+        {
+            "relogin_identity_unresolved"
+        } else {
+            "relogin_failed"
+        };
+        eprintln!(
+            "{}",
+            json!({"operation":"login_recovery","stage":"polling_settlement","reason":reason})
+        );
+        broker.record_failure(
+            reason,
+            "polling_settlement",
+            StatusCode::SERVICE_UNAVAILABLE,
+        );
+    }
+    Ok(())
+}
+async fn recover(
+    broker: &Broker,
+    headers: &HeaderMap,
+    op: &mut LoginOperation,
+) -> Result<(), HttpError> {
+    let holder_id = broker.login_holder();
+    if matches!(op.phase, LoginPhase::Rejected | LoginPhase::Unresolved)
+        || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear)
+    {
+        record_login_failure(broker, op, &holder_id, false).await?;
+    }
+    // The same database read that returns the receipt observes lease expiry.
+    // Live receipts must not queue behind admission or settlement work.
+    if !op.lease_expired && !(op.phase == LoginPhase::Candidate && op.holder == holder_id) {
+        return Ok(());
+    }
+    if database(broker)?
+        .login_recover_polling(op, &holder_id)
+        .await
+        .map_err(|_| failure(broker))?
+    {
+        eprintln!(
+            "{}",
+            json!({"operation":"login_recovery","stage":"device_polling","reason":"replica_lost"})
+        );
+        record_login_failure(broker, op, &holder_id, false).await?;
+    }
+    // A live holder settles its own receipt only after its local worker exits.
+    let own = op.holder == holder_id;
+    let guard = if own {
+        WorkerGuard::claim(broker, op)?
+    } else {
+        None
+    };
+    let settled = (!own || guard.is_some())
+        && database(broker)?
+            .login_recover_unresolved(op, &holder_id)
+            .await
+            .map_err(|_| failure(broker))?;
+    drop(guard);
+    if settled {
+        eprintln!(
+            "{}",
+            json!({"operation":"login_recovery","stage":"verification","reason":"replica_lost"})
+        );
+        record_login_failure(broker, op, &holder_id, false).await?;
+    }
+    if op.phase == LoginPhase::Candidate
+        && !broker.read_only
+        && !broker.stopping.load(Ordering::Acquire)
+        && !broker.ownership_unresolved.load(Ordering::Acquire)
+        && broker.login_holder_live.load(Ordering::Acquire)
+        && let Ok(permit) = broker.work.clone().try_acquire_owned()
+        && let Some(guard) = WorkerGuard::claim(broker, op)?
+        && database(broker)?
+            .login_takeover_candidate(op, &holder_id)
+            .await
+            .map_err(|_| failure(broker))?
+    {
+        spawn_claimed_worker(broker.clone(), headers.clone(), op.clone(), permit, guard);
+    }
+    Ok(())
+}
 async fn lookup(
     broker: &Broker,
     headers: &HeaderMap,
@@ -79,7 +184,8 @@ pub(super) async fn status(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
-    let op = lookup(&broker, &headers, body, LoginKind::Renewal).await?;
+    let mut op = lookup(&broker, &headers, body, LoginKind::Renewal).await?;
+    recover(&broker, &headers, &mut op).await?;
     Ok(view(&op))
 }
 pub(super) async fn cancel(
@@ -106,9 +212,9 @@ pub(super) async fn add_status(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
-    Ok(view(
-        &lookup(&broker, &headers, body, LoginKind::Add).await?,
-    ))
+    let mut op = lookup(&broker, &headers, body, LoginKind::Add).await?;
+    recover(&broker, &headers, &mut op).await?;
+    Ok(view(&op))
 }
 pub(super) async fn add_cancel(
     broker: Broker,
@@ -136,7 +242,7 @@ pub(super) async fn start_kind(
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let db = database(&broker)?;
     // Receipts precede availability and alias checks, including completed retries.
-    if let Some(op) = db
+    if let Some(mut op) = db
         .login_get(&device.user, &request.id)
         .await
         .map_err(|_| failure(&broker))?
@@ -145,17 +251,19 @@ pub(super) async fn start_kind(
             return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
         }
         owned(&broker, &device, &request, &op)?;
+        recover(&broker, &headers, &mut op).await?;
         return Ok(view(&op));
     }
     if broker.read_only
         || broker.stopping.load(Ordering::Acquire)
         || broker.ownership_unresolved.load(Ordering::Acquire)
+        || !broker.login_holder_live.load(Ordering::Acquire)
     {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "relogin_unavailable"));
     }
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
-    if let Some(active) = db
+    if let Some(mut active) = db
         .login_active_alias(&device.user, alias)
         .await
         .map_err(|_| failure(&broker))?
@@ -163,8 +271,15 @@ pub(super) async fn start_kind(
         if active.kind != kind {
             return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
         }
-        owned(&broker, &device, &request, &active)?;
-        return Ok(view(&active));
+        if active.phase == LoginPhase::ReplicaLost {
+            // A fresh request belongs to its caller. Cleanup uses company-user
+            // authorization and does not expose another machine's old receipt.
+            recover(&broker, &headers, &mut active).await?;
+        } else {
+            owned(&broker, &device, &request, &active)?;
+            recover(&broker, &headers, &mut active).await?;
+            return Ok(view(&active));
+        }
     }
     if kind == LoginKind::Add
         && db
@@ -211,13 +326,15 @@ pub(super) async fn start_kind(
         device: device.id.clone(),
         phase: LoginPhase::Starting,
         sequence: 0,
-        holder: broker.holder_id.clone(),
+        holder: broker.login_holder(),
         epoch: 1,
         payload: LoginPayload {
             label,
             ..Default::default()
         },
         polling_clear: false,
+        lease_expired: false,
+        failure_reported: false,
     };
     if !db.login_create(&op).await.map_err(|_| failure(&broker))? {
         let existing = db
@@ -248,11 +365,78 @@ pub(super) async fn start_kind(
         owned(&broker, &device, &request, &existing)?;
         return Ok(view(&existing));
     }
-    let worker = broker.clone();
-    let worker_headers = headers.clone();
-    let mut worker_op = op.clone();
+    spawn_worker(broker.clone(), headers.clone(), op.clone(), permit)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let current = db
+            .login_get(&op.user, &op.id)
+            .await
+            .map_err(|_| failure(&broker))?
+            .ok_or_else(|| failure(&broker))?;
+        if current.phase != LoginPhase::Starting || tokio::time::Instant::now() >= deadline {
+            broker.authorize(&headers).await?;
+            return Ok(view(&current));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+struct WorkerGuard {
+    broker: Broker,
+    key: (String, String),
+}
+impl WorkerGuard {
+    fn claim(broker: &Broker, op: &LoginOperation) -> Result<Option<Self>, HttpError> {
+        let key = (op.user.clone(), op.id.clone());
+        let mut workers = broker
+            .shared_login_workers
+            .lock()
+            .map_err(|_| failure(broker))?;
+        if !workers.insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            broker: broker.clone(),
+            key,
+        }))
+    }
+}
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut workers) = self.broker.shared_login_workers.lock() {
+            workers.remove(&self.key);
+        }
+    }
+}
+fn spawn_worker(
+    worker: Broker,
+    worker_headers: HeaderMap,
+    worker_op: LoginOperation,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), HttpError> {
+    if let Some(guard) = WorkerGuard::claim(&worker, &worker_op)? {
+        spawn_claimed_worker(worker, worker_headers, worker_op, permit, guard);
+    }
+    Ok(())
+}
+async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation, grantless: bool) {
+    let reporter = op.holder.clone();
+    if let Err(error) = record_login_failure(broker, op, &reporter, grantless).await {
+        eprintln!(
+            "{}",
+            json!({"operation":"login_failure_report","stage":"settlement","reason":"report_unavailable","status":error.status.as_u16()})
+        );
+    }
+}
+fn spawn_claimed_worker(
+    worker: Broker,
+    worker_headers: HeaderMap,
+    mut worker_op: LoginOperation,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    guard: WorkerGuard,
+) {
     tokio::spawn(async move {
         let _permit = permit;
+        let _guard = guard;
         if let Err(error) = run(&worker, &worker_headers, &mut worker_op).await {
             let mut detail = format!("{error:#}");
             if let Some(auth) = worker_op.payload.candidate.as_ref() {
@@ -263,17 +447,6 @@ pub(super) async fn start_kind(
                 "{}",
                 json!({"operation":if worker_op.kind == LoginKind::Add {"login_add"} else {"login_renewal"},"stage":worker_op.phase.as_str(),"error":detail})
             );
-            worker.record_failure(
-                if worker_op.phase == LoginPhase::Unresolved
-                    && worker_op.payload.candidate.is_none()
-                {
-                    "relogin_identity_unresolved"
-                } else {
-                    "relogin_failed"
-                },
-                "relogin",
-                StatusCode::SERVICE_UNAVAILABLE,
-            );
             if matches!(
                 worker_op.phase,
                 LoginPhase::Completed
@@ -281,6 +454,7 @@ pub(super) async fn start_kind(
                     | LoginPhase::Rejected
                     | LoginPhase::ReplicaLost
             ) {
+                report_worker_failure(&worker, &mut worker_op, false).await;
                 return;
             }
             worker_op
@@ -299,27 +473,45 @@ pub(super) async fn start_kind(
                 LoginPhase::Failed
             };
             if let Ok(db) = database(&worker) {
-                let _ = db.login_save(&mut worker_op, phase).await;
+                // A transient database error must not leave a stale receipt.
+                // Report a durable outcome. After a fenced save, recovery decides
+                // between resume and an unresolved failure for a grant.
+                for attempt in 1..=3 {
+                    let Err(error) = db.login_save(&mut worker_op, phase).await else {
+                        report_worker_failure(&worker, &mut worker_op, false).await;
+                        break;
+                    };
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let mut detail = format!("{error:#}");
+                    if let Some(auth) = worker_op.payload.candidate.as_ref() {
+                        crate::central::resets::redact_auth_strings(auth, &mut detail);
+                    }
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"login_settlement","stage":"terminal_save","reason":"save_unavailable","error":detail})
+                    );
+                    // Without a grant the attempt cannot resume as a success. The
+                    // worker may have missed a committed grant, so the database
+                    // decides from the durable receipt.
+                    if worker_op.payload.candidate.is_none() {
+                        report_worker_failure(&worker, &mut worker_op, true).await;
+                    }
+                }
             }
         }
     });
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let current = db
-            .login_get(&op.user, &op.id)
-            .await
-            .map_err(|_| failure(&broker))?
-            .ok_or_else(|| failure(&broker))?;
-        if current.phase != LoginPhase::Starting || tokio::time::Instant::now() >= deadline {
-            broker.authorize(&headers).await?;
-            return Ok(view(&current));
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
 }
 async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> Result<()> {
     let db = database(broker).map_err(|_| anyhow::anyhow!("shared store unavailable"))?;
-    let root = broker.state.join("shared-logins").join(&op.id);
+    if op.phase == LoginPhase::Candidate {
+        return continue_candidate(broker, headers, op).await;
+    }
+    let root = std::fs::canonicalize(&broker.state)?
+        .join("shared-logins")
+        .join(&op.id);
     store::ensure_private_dir(&root)?;
     let home = tempfile::Builder::new()
         .prefix("login-")
@@ -336,34 +528,59 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         }))?,
     )?;
     let binary = process::owner_binary(&broker.binary)?;
-    let mut command = Command::new(binary);
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut command = Command::new(std::env::current_exe()?);
+        command
+            .arg("supervise-login")
+            .arg("--state")
+            .arg(std::fs::canonicalize(&broker.state)?)
+            .arg("--key-file")
+            .arg(std::fs::canonicalize(&broker.key)?)
+            .arg("--codex-bin")
+            .arg(binary);
+        command.process_group(0);
+        command
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut command = {
+        let mut command = Command::new(binary);
+        command.args(process::LOGIN_ARGS);
+        process::isolate(&mut command);
+        command
+    };
     command
-        .args([
-            "login",
-            "--device-auth",
-            "-c",
-            "cli_auth_credentials_store=\"file\"",
-            "-c",
-            "forced_login_method=\"chatgpt\"",
-            "-c",
-            "features.daemon_auto_start=false",
-        ])
         .env("CODEX_HOME", &home)
         .env_remove("CODEXCTL_PINNED_ALIAS")
         .env_remove("CODEX_ACCESS_TOKEN")
         .env_remove("OPENAI_API_KEY")
-        .current_dir(&home)
-        .stdin(Stdio::null())
+        // The supervisor opens relative connection configuration from the
+        // server cwd. Its native child still runs inside the private home.
+        .current_dir(if cfg!(target_os = "linux") {
+            std::env::current_dir()?
+        } else {
+            home.clone()
+        })
+        .stdin(if cfg!(target_os = "linux") {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if cfg!(target_os = "linux") {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .kill_on_drop(true);
-    process::isolate(&mut command);
     if db.login_heartbeat(op).await? {
         db.login_save(op, LoginPhase::Canceled).await?;
         std::fs::remove_dir_all(&home)?;
         return Ok(());
     }
     let mut child = command.spawn()?;
+    #[cfg(target_os = "linux")]
+    let mut heartbeat = child.stdin.take();
     let mut output = child.stdout.take().context("missing login output")?;
     let mut bytes = Vec::new();
     let mut output_open = true;
@@ -375,6 +592,17 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
                 _ = tick.tick() => {
                     let canceled = db.login_heartbeat(op).await? || broker.stopping.load(Ordering::Acquire) || broker.login_machine_revoked(headers).await?;
                     if canceled { return Ok(false); }
+                    #[cfg(target_os = "linux")]
+                    if let Err(error) = heartbeat.as_mut().context("polling heartbeat pipe missing")?.write_all(b"H").await {
+                        if error.kind() != std::io::ErrorKind::BrokenPipe {return Err(error.into());}
+                        if child.wait().await?.success() {return Ok(true);}
+                        bail!("native login failed");
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(current) = db.login_get(&op.user, &op.id).await? {
+                        if current.holder != op.holder || current.epoch != op.epoch {bail!("polling incarnation fenced");}
+                        *op = current;
+                    }
                     if started.elapsed() > DEADLINE || (op.phase == LoginPhase::Starting && started.elapsed() > Duration::from_secs(30)) { bail!("login deadline expired"); }
                 }
                 status = child.wait() => { if !status?.success() { bail!("native login failed"); } return Ok(true); }
@@ -383,6 +611,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
                         Ok(byte) => {
                             bytes.push(byte);
                             if bytes.len() > 32768 { bail!("login output exceeds bound"); }
+                            #[cfg(not(target_os = "linux"))]
                             if byte == b'\n' && op.phase == LoginPhase::Starting && let Some(code) = challenge(&bytes)? {
                                 op.payload.code = Some(code);
                                 db.login_save(op,LoginPhase::Pending).await?;
@@ -398,14 +627,79 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
     // Await exit even on DB loss. A dropped RPC future alone is not settlement.
     if !matches!(result, Ok(true))
         && let Err(error) = async {
-            child.start_kill()?;
-            child.wait().await?;
+            #[cfg(target_os = "linux")]
+            {
+                drop(heartbeat.take());
+                tokio::time::timeout(Duration::from_secs(12), child.wait())
+                    .await
+                    .map_err(|_| std::io::Error::other("polling supervisor did not settle"))??;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                child.start_kill()?;
+                child.wait().await?;
+            }
             Ok::<_, std::io::Error>(())
         }
         .await
     {
         op.phase = LoginPhase::Unresolved;
         return Err(error.into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(current) = db
+            .login_get(&op.user, &op.id)
+            .await
+            .inspect_err(|_| op.phase = LoginPhase::Unresolved)?
+            && current.holder == op.holder
+            && current.epoch == op.epoch
+        {
+            *op = current;
+        }
+        if op.phase == LoginPhase::Canceled && op.polling_clear && op.payload.candidate.is_none() {
+            std::fs::remove_dir_all(&home)?;
+            return Ok(());
+        }
+        // Once published, PostgreSQL owns the grant. Loss or damage of the
+        // local copy must never erase its identity or remove its refresh fence.
+        if op.payload.candidate.is_some() {
+            // The publication commit may have completed even when the
+            // supervisor response was interrupted. The durable phase is the
+            // authority once the candidate is visible in PostgreSQL.
+            if op.phase != LoginPhase::Candidate {
+                bail!("polling grant retained after interruption");
+            }
+            if let Err(error) = std::fs::remove_dir_all(&home)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(error.into());
+            }
+            return continue_candidate(broker, headers, op).await;
+        }
+        let settled: Result<()> = async {
+            // A durable absence receipt also covers spawn failure and exit
+            // before a live process identity could be recorded.
+            if op.polling_clear {
+                return Ok(());
+            }
+            let native: process::Process =
+                serde_json::from_slice(&vault::private_read(&home.join("process.json"))?)?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while native.alive()? {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("native polling exit unproven")??;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = settled {
+            op.phase = LoginPhase::Unresolved;
+            return Err(error);
+        }
     }
     // A child can save an issued grant and then fail or be canceled. Capture it
     // after confirmed exit before classifying the process outcome.
@@ -441,20 +735,33 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         bail!("native login did not save credentials");
     }
     op.payload.code = None;
-    db.login_save(op, LoginPhase::Candidate).await?;
+    if op.phase == LoginPhase::Unresolved {
+        bail!("polling grant publication unresolved");
+    }
+    if op.phase != LoginPhase::Candidate {
+        db.login_save(op, LoginPhase::Candidate).await?;
+    }
     std::fs::remove_dir_all(&home)?;
+    continue_candidate(broker, headers, op).await
+}
+async fn continue_candidate(
+    broker: &Broker,
+    headers: &HeaderMap,
+    op: &mut LoginOperation,
+) -> Result<()> {
+    let db = database(broker).map_err(|_| anyhow::anyhow!("shared store unavailable"))?;
     if op.kind == LoginKind::Add
+        && op.account_id.is_none()
         && let AddAdmission::Refused(reason) = db.login_admit_add(op).await?
     {
         op.payload.error = Some(reason.into());
         if matches!(reason, "account_identity_unresolved" | "login_canceled") {
             db.login_save(op, LoginPhase::Rejected).await?;
             if reason == "account_identity_unresolved" {
-                broker.record_failure(
-                    "relogin_identity_unresolved",
-                    "relogin",
-                    StatusCode::SERVICE_UNAVAILABLE,
-                );
+                let reporter = op.holder.clone();
+                record_login_failure(broker, op, &reporter, false)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("login failure report unavailable"))?;
             }
         } else {
             op.payload.candidate = None;
