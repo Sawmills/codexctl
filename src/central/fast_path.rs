@@ -438,6 +438,21 @@ mod tests {
     }
 
     #[test]
+    fn an_extreme_expiry_claim_fails_closed() {
+        for exp in [i64::MIN, i64::MIN + 1] {
+            let auth = auth(exp);
+            let evidence = evidence(&auth, None);
+            assert_eq!(
+                miss(decide(
+                    &candidate(&auth, Some(&evidence)),
+                    &request(false, None)
+                )),
+                Miss::Expiring
+            );
+        }
+    }
+
+    #[test]
     fn a_rejected_current_revision_forces_the_lease_path() {
         let auth = auth(NOW + 7200);
         let evidence = evidence(&auth, None);
