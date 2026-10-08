@@ -22,7 +22,7 @@ spec:
             description: Check the HA pods, SSO configuration, database health, and ExternalSecret.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
         - alert: CodexctlRelayCapacityExhausted
-          expr: sum(increase(codexctl_central_relay_capacity_events_total{outcome="exhausted"}[15m])) > 0
+          expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0
           for: 0m
           labels:
             severity: warning

@@ -4236,6 +4236,47 @@ fn relay_capacity_exhausted_series_exist_before_the_first_event() {
 }
 
 #[test]
+fn relay_capacity_exhaustion_exports_event_time_for_a_first_scrape() {
+    let server = Server::start();
+    let response = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({
+            "kind": "overloaded",
+            "model": "gpt-6.1-sol",
+            "account_class": "included",
+            "outcome": "exhausted"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("codexctl_central_relay_capacity_event_timestamp_seconds{")
+                && line.contains("kind=\"overloaded\"")
+                && line.contains("model=\"gpt-6.1-sol\"")
+                && line.contains("account_class=\"included\"")
+                && line.contains("outcome=\"exhausted\"")
+        })
+        .expect("accepted exhaustion must export its event timestamp");
+    let timestamp = line
+        .rsplit_once(' ')
+        .and_then(|(_, value)| value.parse::<i64>().ok())
+        .expect("timestamp metric value");
+    assert!(timestamp > 0, "{line}");
+}
+
+#[test]
 fn relay_capacity_events_are_rate_limited_per_device() {
     let server = Server::start();
     let event = json!({

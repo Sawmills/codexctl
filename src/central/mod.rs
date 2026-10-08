@@ -44,6 +44,7 @@ pub async fn revoke_central(state: &Path, key: &Path, tenant: &str, id: &str) ->
     {
         bail!("device changed concurrently; retry");
     }
+    central.retire_relay_event_limiter(id).await?;
     Ok(())
 }
 

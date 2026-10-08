@@ -102,8 +102,10 @@ retries cannot consume the per-device central event budget. The relay uses a bou
 queue and drops an event when central is unavailable or the queue is full;
 `codexctl_relay_central_dropped_total`
 records each reason. The central server exports
-`codexctl_central_relay_capacity_events_total` and rejects unknown labels or an
-over-limit device with HTTP 400 or 429.
+`codexctl_central_relay_capacity_events_total` plus an event-time gauge for each
+accepted exhausted label set. The gauge makes a one-off event visible even when
+it arrives before the first Prometheus scrape. The server rejects unknown labels
+or an over-limit device with HTTP 400 or 429.
 
 The staging and staging-ha Prometheus rules alert on one exhausted event in a 15-minute
 window. They intentionally exclude `advised`: that outcome means the relay is still

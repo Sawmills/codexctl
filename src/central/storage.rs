@@ -243,10 +243,13 @@ CREATE TABLE IF NOT EXISTS central_relay_rate_limits (
     device_id TEXT PRIMARY KEY,
     tokens DOUBLE PRECISION NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    allowed BOOLEAN NOT NULL DEFAULT true
+    allowed BOOLEAN NOT NULL DEFAULT true,
+    deleted_at TIMESTAMPTZ
 );
 ALTER TABLE central_relay_rate_limits
     ADD COLUMN IF NOT EXISTS allowed BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE central_relay_rate_limits
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 "#;
 
 impl CentralStore {
@@ -365,6 +368,16 @@ impl CentralStore {
             Self::File(_) => Ok(true),
             Self::Postgres(db) => db.relay_event_allowed(device).await,
             Self::Dual { postgres, .. } => postgres.relay_event_allowed(device).await,
+        }
+    }
+
+    /// Retain a tombstone for a revoked device's relay limiter state. A
+    /// tombstoned row is never eligible for a future bucket upsert.
+    pub async fn retire_relay_event_limiter(&self, device: &str) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) => db.retire_relay_event_limiter(device).await,
+            Self::Dual { postgres, .. } => postgres.retire_relay_event_limiter(device).await,
         }
     }
 
@@ -1354,12 +1367,26 @@ impl PostgresStore {
         bounded_db(async {
             let client = self.client().await?;
             let row = client
-                .query_one(
-                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed) VALUES($1,31,clock_timestamp(),true) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 THEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))))-1.0 ELSE LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) END,updated_at=clock_timestamp(),allowed=LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 RETURNING allowed",
+                .query_opt(
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,31,clock_timestamp(),true,NULL) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 THEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))))-1.0 ELSE LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) END,updated_at=clock_timestamp(),allowed=LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 WHERE central_relay_rate_limits.deleted_at IS NULL RETURNING allowed",
                     &[&device],
                 )
                 .await?;
-            Ok(row.get(0))
+            Ok(row.is_some_and(|row| row.get(0)))
+        })
+        .await
+    }
+
+    async fn retire_relay_event_limiter(&self, device: &str) -> Result<()> {
+        bounded_db(async {
+            let client = self.client().await?;
+            client
+                .execute(
+                    "UPDATE central_relay_rate_limits SET deleted_at=COALESCE(deleted_at,clock_timestamp()),updated_at=clock_timestamp() WHERE device_id=$1",
+                    &[&device],
+                )
+                .await?;
+            Ok(())
         })
         .await
     }
@@ -2651,6 +2678,57 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "relay bucket must use the general client");
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_relay_bucket_retirement_tombstones_and_cannot_revive_device() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let store = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = store.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        assert!(store.relay_event_allowed("retired-device").await.unwrap());
+        store
+            .retire_relay_event_limiter("retired-device")
+            .await
+            .unwrap();
+        let client = match &store {
+            CentralStore::Postgres(db) => db.client().await.unwrap(),
+            _ => unreachable!(),
+        };
+        let retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"retired-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(retired, "device limiter must retain a retirement tombstone");
+        assert!(
+            !store.relay_event_allowed("retired-device").await.unwrap(),
+            "a retired limiter row must not be silently revived"
+        );
+        let still_retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"retired-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(still_retired);
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await

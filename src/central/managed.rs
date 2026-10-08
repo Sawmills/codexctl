@@ -137,6 +137,7 @@ struct RelayMetricKey {
 
 struct RelayMetrics {
     accepted: BTreeMap<RelayMetricKey, u64>,
+    event_timestamps: BTreeMap<RelayMetricKey, i64>,
     rejected: BTreeMap<&'static str, u64>,
     buckets: BTreeMap<String, RelayTokenBucket>,
 }
@@ -165,6 +166,7 @@ impl Default for RelayMetrics {
         }
         Self {
             accepted,
+            event_timestamps: BTreeMap::new(),
             rejected: BTreeMap::new(),
             buckets: BTreeMap::new(),
         }
@@ -318,7 +320,12 @@ impl Broker {
             .relay_metrics
             .lock()
             .expect("relay metric lock poisoned");
-        *metrics.accepted.entry(key).or_default() += 1;
+        *metrics.accepted.entry(key.clone()).or_default() += 1;
+        if key.outcome == "exhausted" {
+            metrics
+                .event_timestamps
+                .insert(key, chrono::Utc::now().timestamp());
+        }
         Ok(true)
     }
 
@@ -2904,6 +2911,10 @@ async fn revoke_device(
         if !updated {
             return Err(broker.error(StatusCode::CONFLICT, "registry_changed"));
         }
+        central
+            .retire_relay_event_limiter(&input.id)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     } else {
         let _lock = vault::registry_lock(&broker.state, "devices.lock")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
@@ -2959,6 +2970,13 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         output.push_str(&format!(
             "codexctl_central_relay_capacity_events_total{{account_class=\"{}\",kind=\"{}\",model=\"{}\",outcome=\"{}\"}} {}\n",
             key.account_class, key.kind, key.model, key.outcome, count
+        ));
+    }
+    output.push_str("# TYPE codexctl_central_relay_capacity_event_timestamp_seconds gauge\n");
+    for (key, timestamp) in &relay_metrics.event_timestamps {
+        output.push_str(&format!(
+            "codexctl_central_relay_capacity_event_timestamp_seconds{{account_class=\"{}\",kind=\"{}\",model=\"{}\",outcome=\"{}\"}} {}\n",
+            key.account_class, key.kind, key.model, key.outcome, timestamp
         ));
     }
     output.push_str("# TYPE codexctl_central_relay_events_rejected_total counter\n");
