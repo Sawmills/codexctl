@@ -157,20 +157,26 @@ pub(super) struct Broker {
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
     pub(super) shared_login_workers: Arc<StdMutex<BTreeSet<(String, String)>>>,
     pub(super) central: Option<CentralStore>,
-    pub(super) holder_id: Arc<StdMutex<String>>,
+    /// Stable for the process: refresh leases outlive a login holder outage.
+    pub(super) holder_id: String,
+    /// Login incarnation. It changes when a lost holder lease recovers.
+    pub(super) login_holder: Arc<StdMutex<String>>,
     pub(super) login_holder_live: Arc<AtomicBool>,
     pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
 }
 impl Broker {
-    pub(super) fn holder_id(&self) -> String {
-        self.holder_id
+    pub(super) fn login_holder(&self) -> String {
+        self.login_holder
             .lock()
-            .expect("holder id lock poisoned")
+            .expect("login holder lock poisoned")
             .clone()
     }
 
-    fn replace_holder_id(&self, holder: String) {
-        *self.holder_id.lock().expect("holder id lock poisoned") = holder;
+    fn replace_login_holder(&self, holder: String) {
+        *self
+            .login_holder
+            .lock()
+            .expect("login holder lock poisoned") = holder;
     }
 }
 #[derive(Clone)]
@@ -1353,7 +1359,7 @@ async fn token(
                 central
                     .acquire_lease(
                         &account_id,
-                        &worker.holder_id(),
+                        &worker.holder_id,
                         std::time::Duration::from_secs(120),
                     )
                     .await
@@ -2390,7 +2396,7 @@ impl Broker {
                 central
                     .acquire_lease(
                         &account_key(&owner.vault.user, &owner.vault.alias),
-                        &self.holder_id(),
+                        &self.holder_id,
                         IMPORT_LEASE_TTL,
                     )
                     .await
@@ -3157,7 +3163,7 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             match central
                 .acquire_lease(
                     &account_id,
-                    &broker.holder_id(),
+                    &broker.holder_id,
                     std::time::Duration::from_secs(120),
                 )
                 .await
@@ -3774,6 +3780,7 @@ pub async fn serve(
     } else {
         None
     };
+    let holder = instance_holder_id();
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -3815,7 +3822,8 @@ pub async fn serve(
         background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
         shared_login_workers: Arc::new(StdMutex::new(Default::default())),
-        holder_id: Arc::new(StdMutex::new(instance_holder_id())),
+        holder_id: holder.clone(),
+        login_holder: Arc::new(StdMutex::new(holder)),
         login_holder_live: Arc::new(AtomicBool::new(true)),
         registry,
         central,
@@ -3834,7 +3842,7 @@ pub async fn serve(
     };
     let (holder_stop, mut holder_stop_rx) = tokio::sync::oneshot::channel();
     let holder_task = if let Some(shared) = broker.central.as_ref() {
-        let initial_holder = broker.holder_id();
+        let initial_holder = broker.login_holder();
         shared.login_register_holder(&initial_holder).await?;
         let holder_store = shared.clone();
         let holder_broker = broker.clone();
@@ -3862,7 +3870,7 @@ pub async fn serve(
                                 let replacement = instance_holder_id();
                                 match holder_store.login_register_holder(&replacement).await {
                                     Ok(()) => {
-                                        holder_broker.replace_holder_id(replacement.clone());
+                                        holder_broker.replace_login_holder(replacement.clone());
                                         holder_id = replacement;
                                         last_renewal = std::time::Instant::now();
                                         holder_broker.login_holder_live.store(true, Ordering::Release);
@@ -3971,7 +3979,7 @@ pub async fn serve(
         let _ = holder_stop.send(());
         task.await.context("login holder heartbeat task failed")?;
         if let Some(shared) = broker.central.as_ref() {
-            let holder_id = broker.holder_id();
+            let holder_id = broker.login_holder();
             shared.login_release_holder(&holder_id).await?;
         }
     }
@@ -4025,7 +4033,8 @@ impl Broker {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
-            holder_id: Arc::new(StdMutex::new("test-holder".into())),
+            holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
             login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         }
@@ -4164,7 +4173,8 @@ mod tests {
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: Some(central),
-            holder_id: Arc::new(StdMutex::new("test-holder".into())),
+            holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
             login_holder_live: Arc::new(AtomicBool::new(true)),
             registry: None,
         };

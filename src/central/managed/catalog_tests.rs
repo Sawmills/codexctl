@@ -115,7 +115,8 @@ impl Fixture {
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
             login_holder_live: Arc::new(AtomicBool::new(true)),
-            holder_id: Arc::new(StdMutex::new("test-holder".into())),
+            holder_id: "test-holder".into(),
+            login_holder: Arc::new(StdMutex::new("test-holder".into())),
             registry: None,
         };
         Self {
@@ -1940,7 +1941,7 @@ async fn retry_keeps_recovery_epoch_after_the_native_process_stops() {
     let central = fixture.attach_refresh_store("").await;
     let id = account_key("test", "fixture");
     let lease = central
-        .acquire_lease(&id, &fixture.broker.holder_id(), Duration::from_secs(60))
+        .acquire_lease(&id, &fixture.broker.holder_id, Duration::from_secs(60))
         .await
         .unwrap();
     let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();

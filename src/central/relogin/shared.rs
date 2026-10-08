@@ -51,13 +51,18 @@ fn owned(
     }
     Ok(())
 }
-async fn record_login_failure(broker: &Broker, op: &mut LoginOperation) -> Result<(), HttpError> {
+/// The reporter is the holder that observed the failure: a worker reports as
+/// the holder it ran under, a recovery read as the current login holder.
+async fn record_login_failure(
+    broker: &Broker,
+    op: &mut LoginOperation,
+    reporter: &str,
+) -> Result<(), HttpError> {
     if op.failure_reported {
         return Ok(());
     }
-    let holder_id = broker.holder_id();
     if database(broker)?
-        .login_take_failure(op, &holder_id)
+        .login_take_failure(op, reporter)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
     {
@@ -87,11 +92,11 @@ async fn recover(
     headers: &HeaderMap,
     op: &mut LoginOperation,
 ) -> Result<(), HttpError> {
-    let holder_id = broker.holder_id();
+    let holder_id = broker.login_holder();
     if matches!(op.phase, LoginPhase::Rejected | LoginPhase::Unresolved)
         || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear)
     {
-        record_login_failure(broker, op).await?;
+        record_login_failure(broker, op, &holder_id).await?;
     }
     // The same database read that returns the receipt observes lease expiry.
     // Live receipts must not queue behind admission or settlement work.
@@ -107,7 +112,7 @@ async fn recover(
             "{}",
             json!({"operation":"login_recovery","stage":"device_polling","reason":"replica_lost"})
         );
-        record_login_failure(broker, op).await?;
+        record_login_failure(broker, op, &holder_id).await?;
     }
     // A live holder settles its own receipt only after its local worker exits.
     let own = op.holder == holder_id;
@@ -127,7 +132,7 @@ async fn recover(
             "{}",
             json!({"operation":"login_recovery","stage":"verification","reason":"replica_lost"})
         );
-        record_login_failure(broker, op).await?;
+        record_login_failure(broker, op, &holder_id).await?;
     }
     if op.phase == LoginPhase::Candidate
         && !broker.read_only
@@ -317,7 +322,7 @@ pub(super) async fn start_kind(
         device: device.id.clone(),
         phase: LoginPhase::Starting,
         sequence: 0,
-        holder: broker.holder_id(),
+        holder: broker.login_holder(),
         epoch: 1,
         payload: LoginPayload {
             label,
@@ -410,7 +415,8 @@ fn spawn_worker(
     Ok(())
 }
 async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation) {
-    if let Err(error) = record_login_failure(broker, op).await {
+    let reporter = op.holder.clone();
+    if let Err(error) = record_login_failure(broker, op, &reporter).await {
         eprintln!(
             "{}",
             json!({"operation":"login_failure_report","stage":"settlement","reason":"report_unavailable","status":error.status.as_u16()})
@@ -742,7 +748,8 @@ async fn continue_candidate(
         if matches!(reason, "account_identity_unresolved" | "login_canceled") {
             db.login_save(op, LoginPhase::Rejected).await?;
             if reason == "account_identity_unresolved" {
-                record_login_failure(broker, op)
+                let reporter = op.holder.clone();
+                record_login_failure(broker, op, &reporter)
                     .await
                     .map_err(|_| anyhow::anyhow!("login failure report unavailable"))?;
             }

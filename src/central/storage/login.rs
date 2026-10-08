@@ -656,9 +656,12 @@ impl CentralStore {
 }
 
 impl CentralStore {
+    /// `refresh_holder` is this replica's refresh identity. The worker settles
+    /// that replica's own refresh child, so it may replace its lease.
     pub(in crate::central) async fn login_account_lease(
         &self,
         op: &LoginOperation,
+        refresh_holder: &str,
     ) -> Result<Option<Lease>> {
         let db = self.login_db()?;
         // Different from the replica's normal refresh holder: no reentrant lease.
@@ -667,7 +670,7 @@ impl CentralStore {
             op.account()?,
             &holder,
             Duration::from_secs(120),
-            Some(op),
+            Some((op, refresh_holder)),
         ))
         .await
     }
