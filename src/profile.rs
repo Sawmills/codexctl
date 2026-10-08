@@ -162,6 +162,8 @@ pub fn save_profile_and_activate_locked(
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let live_auth = paths.codex_auth_json();
+    #[cfg(feature = "central-prototype")]
+    crate::central::native::refuse_app_auth(paths, "activating a new login")?;
 
     if auth_json_src != live_auth {
         // Capture protects the *outgoing* profile's rotated tokens, and it runs

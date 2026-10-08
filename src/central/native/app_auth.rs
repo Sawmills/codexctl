@@ -63,6 +63,12 @@ struct State {
     alias: String,
     connection: Connection,
     allow_billing: bool,
+    /// The plan and billing class `--allow-billing` approved; a billing
+    /// token that no longer matches needs a new approval.
+    #[serde(default)]
+    approved_plan: Option<String>,
+    #[serde(default)]
+    approved_class: Option<api::BillingClass>,
     allow_codex_version: bool,
     #[serde(default)]
     backup_account: Option<String>,
@@ -185,7 +191,12 @@ fn enable(
     if account.loan.is_some() {
         bail!("app-auth pins only your own server accounts, not a borrowed one");
     }
-    let token = server_token(&connection, &account.alias, allow_billing)?;
+    let approval = if allow_billing {
+        Approval::Any
+    } else {
+        Approval::None
+    };
+    let token = server_token(&connection, &account.alias, approval)?;
     // Take the locks `use`, activation, and recovery write under, in their
     // order, and recheck: one of them may have changed ~/.codex meanwhile.
     let _native = native_lock(&root()?)?;
@@ -206,6 +217,10 @@ fn enable(
         alias: account.alias.clone(),
         connection,
         allow_billing,
+        approved_plan: allow_billing
+            .then(|| token.chatgpt_plan_type.clone())
+            .flatten(),
+        approved_class: allow_billing.then_some(token.billing_class).flatten(),
         allow_codex_version,
         backup_account,
         last: None,
@@ -248,9 +263,23 @@ fn refresh_locked(paths: &Paths, state: &State) -> Result<&'static str> {
         FileState::Ours => {}
     }
     check_codex_version(state.allow_codex_version)?;
-    let token = server_token(&state.connection, &state.alias, state.allow_billing)?;
-    if current_access_token(paths)?.as_deref() == Some(token.access_token.as_str()) {
+    let approval = if state.allow_billing {
+        Approval::Exact(&state.approved_plan, &state.approved_class)
+    } else {
+        Approval::None
+    };
+    let token = server_token(&state.connection, &state.alias, approval)?;
+    let current = current_access_token(paths)?.context("~/.codex/auth.json has no access token")?;
+    if current == token.access_token {
         return Ok("token unchanged");
+    }
+    // One account is its workspace and its login together: replace the file
+    // only with positive proof that the server token is the same login.
+    if !api::token_logins(&current).same(&api::token_logins(&token.access_token)) {
+        bail!(
+            "the server token for {} is not provably the login app-auth pinned; refresh stopped; run codexctl app-auth enable again",
+            state.alias
+        );
     }
     write_auth(paths, &state.connection.account_id, &token.access_token)?;
     Ok("token rewritten")
@@ -447,11 +476,25 @@ fn check_codex_version(allow_other: bool) -> Result<()> {
 }
 
 /// A server token that passes every check before it can be written.
-fn server_token(
-    connection: &Connection,
-    alias: &str,
-    allow_billing: bool,
-) -> Result<TokenResponse> {
+enum Approval<'a> {
+    None,
+    Any,
+    Exact(&'a Option<String>, &'a Option<api::BillingClass>),
+}
+
+/// The repository's billing rule: a billing token needs an approval that
+/// still names its plan and billing class.
+fn billing_approved(approval: &Approval, token: &TokenResponse) -> bool {
+    match approval {
+        Approval::None => false,
+        Approval::Any => true,
+        Approval::Exact(plan, class) => {
+            **plan == token.chatgpt_plan_type && **class == token.billing_class
+        }
+    }
+}
+
+fn server_token(connection: &Connection, alias: &str, approval: Approval) -> Result<TokenResponse> {
     let mut token = fetch(connection, false)?;
     if claims(&token.access_token)?.exp - now() < MIN_LIFETIME_SECONDS {
         // The server forces a renewal only for a request that names the
@@ -479,11 +522,11 @@ fn server_token(
             "the server token for {alias} is below the minimum lifetime of {MIN_LIFETIME_SECONDS} s"
         );
     }
-    if !allow_billing {
+    if !billing_approved(&approval, &token) {
         launch::require_headroom(alias, &token)?;
         if token.billing_class != Some(api::BillingClass::RateLimited) {
             bail!(
-                "server account {alias} may bill credits; pass --allow-billing to pin the app to it"
+                "server account {alias} may bill credits (or its billing changed since approval); run codexctl app-auth enable --allow-billing"
             );
         }
     }
@@ -644,6 +687,30 @@ fn remove_agent() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn token(plan: &str, class: api::BillingClass) -> TokenResponse {
+        serde_json::from_value(serde_json::json!({
+            "accessToken": "a.b.c", "chatgptAccountId": "seat",
+            "chatgptPlanType": plan, "revision": "r", "billingClass": class,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn billing_approval_holds_only_while_plan_and_class_match() {
+        use api::BillingClass::UsageBased;
+        let approved = token("team", UsageBased);
+        let plan = Some("team".to_owned());
+        let class = Some(UsageBased);
+        assert!(billing_approved(&Approval::Exact(&plan, &class), &approved));
+        assert!(!billing_approved(
+            &Approval::Exact(&plan, &class),
+            &token("pro", UsageBased)
+        ));
+        assert!(!billing_approved(&Approval::Exact(&plan, &None), &approved));
+        assert!(!billing_approved(&Approval::None, &approved));
+        assert!(billing_approved(&Approval::Any, &approved));
+    }
 
     #[test]
     fn auth_document_is_codex_external_tokens_mode() {
