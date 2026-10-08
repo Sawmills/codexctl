@@ -1495,6 +1495,19 @@ async fn token(
             }
             let observed_from = std::time::Instant::now();
             let token_result = owner.tokens(request).await;
+            // A failed native read may mean lost routing or a fenced owner.
+            // Withdraw the evidence so no replica serves this account
+            // lease-free until the lease path observes it again.
+            if token_result.is_err()
+                && lease.is_some()
+                && let Some(central) = worker.central.as_ref()
+                && let Err(error) = central.clear_token_evidence(&account_id).await
+            {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"token_evidence","stage":"clear","reason":"clear_failed","error":format!("{error:#}")})
+                );
+            }
             if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
                 if owner.retry_started.is_none() {

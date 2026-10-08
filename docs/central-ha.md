@@ -304,7 +304,9 @@ these hold:
 - The row is not tombstoned, carries the requested user and alias, matches a
   requested `accountId`, is verified, and no login journal or identity
   reservation fences it (the same predicate as the lease claim). A locally
-  fenced owner also takes the lease path.
+  fenced owner also takes the lease path, and any failed lease-path read
+  deletes the account's evidence, so no replica serves it until the lease path
+  observes the account again.
 
 The lease path publishes the evidence in the same `fenced_write` transaction as
 the credential, under the valid-lease predicate, also when the credential is

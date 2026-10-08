@@ -842,6 +842,26 @@ impl CentralStore {
         }
     }
 
+    /// Drop an account's evidence so no replica serves it lease-free until
+    /// the lease path observes the account again.
+    pub(in crate::central) async fn clear_token_evidence(&self, account_id: &str) -> Result<()> {
+        let db = match self {
+            Self::File(_) => return Ok(()),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            db.client()
+                .await?
+                .execute(
+                    "DELETE FROM central_token_evidence WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// The committed integer revision of an account, for a lease loser.
     pub(in crate::central) async fn account_revision(
         &self,
