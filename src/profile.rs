@@ -823,6 +823,10 @@ pub fn switch_to_from(paths: &Paths, alias: &str) -> Result<String> {
 pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -> Result<String> {
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
+    #[cfg(feature = "central-prototype")]
+    if codex_auth == paths.codex_home().join("auth.json") {
+        crate::central::native::refuse_app_auth(paths, "an account switch")?;
+    }
     let profile = get_profile_from(paths, alias)?;
     crate::store::require_local_auth(&profile.auth_json_path())?;
 

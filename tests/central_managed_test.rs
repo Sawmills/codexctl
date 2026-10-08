@@ -11506,6 +11506,24 @@ fn app_auth_refuses_keyring_storage_and_unsupported_codex() {
         ),
         "cli_auth_credentials_store",
     );
+    std::fs::write(
+        home.path().join(".codex/config.toml"),
+        "profile = \"lane\"\n[profiles.lane]\nmodel_provider = \"codexctl-central\"\n",
+    )
+    .unwrap();
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "team",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "profile lane",
+    );
     std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
     let old = app_auth_home(&server, "0.100.0");
     refused(

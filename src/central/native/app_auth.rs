@@ -104,7 +104,17 @@ impl Paths {
 /// Refuse a command that would replace `~/.codex/auth.json` while the
 /// desktop app is pinned to a server account through it.
 pub fn refuse_while_enabled(action: &str) -> Result<()> {
-    if Paths::new()?.state().try_exists()? {
+    refuse_app_auth(&config::default_paths()?, action)
+}
+
+/// The same refusal for a writer that already holds the store lock, so the
+/// check and its write cannot interleave with `enable`.
+pub fn refuse_app_auth(paths: &config::Paths, action: &str) -> Result<()> {
+    if paths
+        .codexctl_dir()
+        .join("app-auth/state.json")
+        .try_exists()?
+    {
         bail!(
             "app-auth pins ~/.codex to a server account for the desktop app; {action} would replace that login; run codexctl app-auth disable first"
         );
@@ -154,20 +164,20 @@ fn enable(
     }
     let paths = Paths::new()?;
     let _lock = lock(&paths)?;
-    let previous = paths
-        .state()
-        .try_exists()?
-        .then(|| read_state(&paths))
-        .transpose()?;
-    if previous.is_some() && file_state(&paths, None)? == FileState::Foreign {
-        bail!(
-            "~/.codex/auth.json changed since app-auth enable; run codexctl app-auth disable first"
-        );
-    }
-    if central_active()? {
-        bail!("the central provider is active in ~/.codex; switch it off before app-auth enable");
-    }
-    check_codex_config(&paths.codex_home)?;
+    let preconditions = || -> Result<()> {
+        if paths.state().try_exists()? && file_state(&paths, None)? == FileState::Foreign {
+            bail!(
+                "~/.codex/auth.json changed since app-auth enable; run codexctl app-auth disable first"
+            );
+        }
+        if central_active()? {
+            bail!(
+                "the central provider is active in ~/.codex; switch it off before app-auth enable"
+            );
+        }
+        check_codex_config(&paths.codex_home)
+    };
+    preconditions()?;
     check_codex_version(allow_codex_version)?;
     let catalog =
         super::super::remote::catalog()?.context("app-auth requires a connected account server")?;
@@ -176,6 +186,17 @@ fn enable(
         bail!("app-auth pins only your own server accounts, not a borrowed one");
     }
     let token = server_token(&connection, &account.alias, allow_billing)?;
+    // Take the locks `use`, activation, and recovery write under, in their
+    // order, and recheck: one of them may have changed ~/.codex meanwhile.
+    let _native = native_lock(&root()?)?;
+    let _store = store::try_lock(&config::default_paths()?)?
+        .context("local account store is busy; retry app-auth enable")?;
+    preconditions()?;
+    let previous = paths
+        .state()
+        .try_exists()?
+        .then(|| read_state(&paths))
+        .transpose()?;
     let backup_account = match previous {
         Some(state) => state.backup_account,
         None => back_up_login(&paths)?,
@@ -358,6 +379,18 @@ fn check_codex_config(codex_home: &Path) -> Result<()> {
     {
         bail!(
             "cli_auth_credentials_store = \"{store}\" in ~/.codex/config.toml keeps logins outside auth.json; set it to \"file\" or remove it"
+        );
+    }
+    if let Some(selected) = document.get("profile").and_then(Item::as_str)
+        && let Some(provider) = document
+            .get("profiles")
+            .and_then(|profiles| profiles.get(selected))
+            .and_then(|profile| profile.get("model_provider"))
+            .and_then(Item::as_str)
+        && provider != "openai"
+    {
+        bail!(
+            "the selected Codex profile {selected} overrides model_provider with \"{provider}\"; app-auth needs the built-in openai provider"
         );
     }
     if let Some(provider) = document.get("model_provider").and_then(Item::as_str)

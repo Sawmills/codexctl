@@ -996,12 +996,6 @@ impl ProfileSwitcher for CodexctlProfileSwitcher {
             *slot = Some(launch);
             return Ok(());
         }
-        #[cfg(feature = "central-prototype")]
-        if config::default_paths()
-            .is_ok_and(|paths| self.auth_json == paths.codex_home().join("auth.json"))
-        {
-            codexctl::central::native::refuse_while_enabled("account recovery")?;
-        }
         // Inside a pinned lane the outgoing token is this lane's own account,
         // and the switch is about to overwrite it. Fold it back under the alias
         // the launch named first: subject alone cannot name it when one seat is
