@@ -38,10 +38,10 @@ original failure through and removes any upstream `Retry-After`. Codex then stop
 the board resumes the lane. A new streak starts when the error kind changes, after 120 s
 without a failure, or on the first failure after a stop (that request is a resume).
 
-| Error | Default budget | Flag |
-|---|---|---|
-| HTTP 429 rate limit | 180 s | `--rate-budget-secs` |
-| Model at capacity | 600 s | `--overloaded-budget-secs` |
+| Error               | Default budget | Flag                       |
+| ------------------- | -------------- | -------------------------- |
+| HTTP 429 rate limit | 180 s          | `--rate-budget-secs`       |
+| Model at capacity   | 600 s          | `--overloaded-budget-secs` |
 
 ## Run it
 

@@ -4,14 +4,14 @@ Linked: SAW-12544 (429 bursts). Design decision (guide + w9C:tF, 2026-10-07 19:5
 
 ## Decision after HQ review (M1 to M6): build M3
 
-| | M3: advice-only relay (built) | A: retrying relay |
-|---|---|---|
-| Who retries | Codex's own turn loop (`Reconnecting n/N`) | The relay |
-| Relay state | Streak per thread, no buffering | Buffers head events, owns a retry loop |
-| Covers 429 on Codex 0.161.0 | Yes: `Retry-After` header | Yes |
-| Covers SSE capacity on 0.161.0 | Only with the shim: code `rate_limit_exceeded` plus "try again in Ns" (0.161.0 reads only that) | Yes |
-| Covers SSE capacity on 0.162.0-alpha.8+ | Yes: `error.headers["retry-after"]` | Yes |
-| Risk | Codex `stream_max_retries` caps attempts (lanes set 20) | Holds the response before headers; Codex sees nothing for minutes |
+|                                         | M3: advice-only relay (built)                                                                   | A: retrying relay                                                 |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Who retries                             | Codex's own turn loop (`Reconnecting n/N`)                                                      | The relay                                                         |
+| Relay state                             | Streak per thread, no buffering                                                                 | Buffers head events, owns a retry loop                            |
+| Covers 429 on Codex 0.161.0             | Yes: `Retry-After` header                                                                       | Yes                                                               |
+| Covers SSE capacity on 0.161.0          | Only with the shim: code `rate_limit_exceeded` plus "try again in Ns" (0.161.0 reads only that) | Yes                                                               |
+| Covers SSE capacity on 0.162.0-alpha.8+ | Yes: `error.headers["retry-after"]`                                                             | Yes                                                               |
+| Risk                                    | Codex `stream_max_retries` caps attempts (lanes set 20)                                         | Holds the response before headers; Codex sees nothing for minutes |
 
 Live proof against real `codex` 0.161.0 and a mock upstream (`docs/relay.md`): without the relay a 429 stops at once (1 request). With it, 429 then success recovers after the advised 1 s. Two capacity events then success recover after 2 s and 4 s. With a 5 s budget, Codex stops on the original capacity text after 2 requests.
 
@@ -31,11 +31,11 @@ The sections below are the original plan (Option A), kept for review history.
 
 ## Options
 
-| Option | Gain | Cost and risk |
-|---|---|---|
-| A. codexctl loopback relay (recommended) | codexctl already owns `base_url` for every central lane. Fix ships with a codexctl release. | New host process. If it is down, lanes get connection errors (Codex retries those). About 500 lines plus tests. |
-| B. Codex upstream patch: backoff for `ServerOverloaded`/`RetryLimit` without Retry-After | Right layer, about 20 lines | Lanes run brew Codex; release timing is not ours. Upstream issue or PR is an outward message (Amir's call). |
-| C. Config only | No code | Does not work (finding 4). |
+| Option                                                                                   | Gain                                                                                        | Cost and risk                                                                                                   |
+| ---------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| A. codexctl loopback relay (recommended)                                                 | codexctl already owns `base_url` for every central lane. Fix ships with a codexctl release. | New host process. If it is down, lanes get connection errors (Codex retries those). About 500 lines plus tests. |
+| B. Codex upstream patch: backoff for `ServerOverloaded`/`RetryLimit` without Retry-After | Right layer, about 20 lines                                                                 | Lanes run brew Codex; release timing is not ours. Upstream issue or PR is an outward message (Amir's call).     |
+| C. Config only                                                                           | No code                                                                                     | Does not work (finding 4).                                                                                      |
 
 ## Design (Option A)
 
