@@ -107,11 +107,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codexctl", type=pathlib.Path, required=True)
     parser.add_argument("--codex", default="codex")
+    # Codex 0.160.1 treats every HTTP 429 as final; pass `stop` to expect that
+    # and still check the capacity cases.
+    parser.add_argument("--rate-429", choices=["retry", "stop"], default="retry")
     args = parser.parse_args()
     print(subprocess.run([args.codex, "--version"], capture_output=True, text=True).stdout.strip())
     with tempfile.TemporaryDirectory(prefix="codexctl-relay-e2e-") as home:
         home = pathlib.Path(home)
-        scenario(args, home, ["rate", "ok"], 600, True, ["rate", "ok"])
+        if args.rate_429 == "retry":
+            scenario(args, home, ["rate", "ok"], 600, True, ["rate", "ok"])
+        else:
+            scenario(args, home, ["rate", "ok"], 600, False, ["rate"])
         scenario(args, home, ["overloaded", "overloaded", "ok"], 600, True, ["overloaded", "overloaded", "ok"])
         # A 2 s budget fits the first advice (1 to 2 s) but never the second
         # (2 s or more after at least 1 s), so Codex stops after two calls.

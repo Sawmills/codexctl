@@ -28,7 +28,15 @@ The relay helps only where Codex honors retry advice. Each row was checked live 
 | 0.162.0-alpha.9 | Covered                                      | Covered           |
 
 Codex 0.160.1 ignores `Retry-After` on a 429 (`protocol/src/error.rs` at
-rust-v0.160.1). Run `codex --version` on the lane host before you opt a lane in.
+rust-v0.160.1). Codex 0.160.0 has the same rules (source check at rust-v0.160.0, not
+run live). Run `codex --version` on the lane host before you opt a lane in.
+
+To check a lane host, run the live check with that host's Codex. For 0.160.1, add
+`--rate-429 stop`, so the check expects the 429 stop and still tests the capacity cases:
+
+```sh
+python3 -I tests/relay_codex_e2e.py --codexctl <codexctl> --codex <codex> [--rate-429 stop]
+```
 
 ## What it does
 
