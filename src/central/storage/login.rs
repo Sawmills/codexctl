@@ -1028,6 +1028,25 @@ mod tests {
                 .await
                 .unwrap()
         );
+        // An expired polling receipt may still settle a late grant.
+        let mut lost = new_op("c", "third");
+        assert!(shared.login_create(&lost).await.unwrap());
+        control
+            .execute(
+                &format!(
+                    "UPDATE {schema}.central_login_operations SET phase='replica_lost' WHERE id=$1"
+                ),
+                &[&lost.id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut lost, "replica")
+                .await
+                .unwrap(),
+            "lost polling without proven absence may still settle a grant"
+        );
         let mut candidate = new_op("b", "second");
         assert!(shared.login_create(&candidate).await.unwrap());
         candidate.payload.candidate = Some(
