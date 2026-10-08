@@ -227,6 +227,8 @@ for line in sys.stdin:
             result["rateLimits"]["spendControlReached"] = False
         if mode == "dashboard-unknown":
             result["rateLimits"]["primary"] = {"usedPercent":15}
+        if mode == "used-95":
+            result["rateLimits"]["primary"]["usedPercent"] = 95
         if mode in ["status-reset", "rate-distinct-reset"]:
             result["rateLimits"]["secondary"] = {"usedPercent":37,"windowDurationMins":10080,"resetsAt":4102444800}
         if mode == "status-weekly":
