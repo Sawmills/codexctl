@@ -57,6 +57,12 @@ enum Commands {
         revoke: Option<String>,
     },
     #[cfg(feature = "central-prototype")]
+    /// Pin the Codex desktop app to a server account with ChatGPT features.
+    #[cfg(feature = "central-prototype")]
+    AppAuth {
+        #[command(subcommand)]
+        action: codexctl::central::native::AppAuthAction,
+    },
     /// Lend a server account to a teammate, or manage your loans.
     Loans {
         #[command(subcommand)]
@@ -291,6 +297,8 @@ fn main() {
         #[cfg(feature = "central-prototype")]
         Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
         #[cfg(feature = "central-prototype")]
+        #[cfg(feature = "central-prototype")]
+        Commands::AppAuth { action } => codexctl::central::native::run_app_auth(action),
         Commands::Loans { action } => codexctl::central::loans::client::run(action),
         Commands::Status {
             json,

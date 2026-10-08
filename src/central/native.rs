@@ -17,7 +17,9 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
+mod app_auth;
 mod launch;
+pub use app_auth::{AppAuthAction, refuse_while_enabled, run as run_app_auth};
 pub(super) use launch::LaunchSignals;
 #[cfg(feature = "central-prototype")]
 pub use launch::pinned_arguments;

@@ -40,3 +40,9 @@ Back up both files; write one file through a small `codexctl app-auth enable --n
 ## Tests (test-first, `tests/app_auth_test.rs` plus unit tests)
 
 `auth_mode` exactly `"chatgptAuthTokens"` (M6); exact file shape and 0600; JWT without plan or account refused (M5); missing `auth.json` stops refresh with no write (M3); token with too little life refused, unchanged token skipped (M4); `use`, activation, and recovery refused while enabled (M2); backup login of a server account not restored by default (M1); atomic replace; keyring and auto refused; central provider active refused; usage-billed refused without `--allow-billing`; refresh skips a fresh token and rewrites a near-expiry one; foreign file stops refresh with no write; token account mismatch refused; disable restores both files byte for byte and removes the agent; changed files refused without `--force`; unsupported Codex version refused; refresh failure keeps the old file and records the reason; no token on stdout or in the log.
+
+## Build notes
+
+- `enable` does not edit `config.toml`. It requires `model_provider` to be absent or `openai`, and it refuses while the central provider is active, so there is no provider to remove and no config to restore.
+- `--account` is required: the central account that `codexctl use` selects is unavailable here, because an active central provider makes `enable` refuse.
+- Borrowed accounts are refused; the app is pinned only to the caller's own server accounts.

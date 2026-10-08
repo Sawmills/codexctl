@@ -679,6 +679,24 @@ estimated or included. Response counts are log evidence, not a throughput quota.
 Local-account launches retain the existing recovery behavior.
 Run `codexctl use` after an upgrade to refresh the provider helper path and see the launch command.
 
+## Pin the Codex Desktop App
+
+The `codexctl-central` provider hides the ChatGPT account from Codex, so the desktop app shows no apps, Meetings, or web search. `codexctl app-auth` gives the app a server account through Codex's built-in `openai` provider instead. Use it only on a Mac whose `~/.codex` serves the desktop app, never on a lane home.
+
+```sh
+codexctl app-auth enable --account amir@sawmills.ai --allow-billing
+# Quit and reopen the desktop app.
+codexctl app-auth status
+codexctl app-auth disable
+```
+
+- `enable` writes `~/.codex/auth.json` in Codex's `chatgptAuthTokens` mode: the server's access token, the workspace, and an empty refresh token. Codex never refreshes this mode, so the server stays the only refresh owner. It backs up the login it replaces to `~/.codexctl/app-auth/backup/` and installs the launchd agent `ai.sawmills.codexctl.app-auth`.
+- The agent runs `codexctl app-auth refresh` at load and every 5 minutes. It rewrites the file only when the server token changed, and it never switches accounts: Codex reloads the file after a 401, and a different workspace would be a mismatch. Each rotation costs the app one 401.
+- `enable` refuses a usage-billed account without `--allow-billing`, a token without a plan or workspace claim, a token with less than 20 minutes of life, a borrowed account, an active central provider, a keyring or `auto` credential store, and a Codex version outside the tested list unless `--allow-codex-version` is set.
+- `refresh` stops without writing when `auth.json` is missing (the app signed out) or holds another login. `status` shows the reason.
+- While app-auth is enabled, `codexctl use` and account recovery refuse to replace `~/.codex/auth.json`.
+- `disable` removes the agent and the app-auth file. It restores the backed-up login only when the server does not hold that workspace, or with `--restore-login`: a server account's refresh token on disk would be a second refresh owner.
+
 ## Manage Devices and Users
 
 ```sh

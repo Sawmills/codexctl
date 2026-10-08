@@ -1,0 +1,619 @@
+//! Desktop app auth (CODEX-APP-A): `~/.codex/auth.json` in Codex's
+//! `chatgptAuthTokens` mode, written from server tokens with no refresh
+//! token. Codex never refreshes this mode; on a 401 it reloads the file, so
+//! the account server stays the only refresh owner and a launchd agent keeps
+//! the file current.
+use super::*;
+
+/// Codex versions whose file-backed `chatgptAuthTokens` mode passed LIVE-A.
+const SUPPORTED_CODEX: &[&str] = &["0.161.0", "0.162.0-alpha.2"];
+/// The Codex binary the desktop app runs.
+const APP_CODEX: &str = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex";
+const AGENT_LABEL: &str = "ai.sawmills.codexctl.app-auth";
+const AGENT_INTERVAL_SECONDS: i64 = 300;
+/// A written token must outlive the next agent run with room for a retry.
+const MIN_LIFETIME_SECONDS: i64 = AGENT_INTERVAL_SECONDS + 900;
+const AUTH_CLAIM: &str = "https://api.openai.com/auth";
+const MODE: &str = "chatgptAuthTokens";
+
+#[derive(clap::Subcommand)]
+pub enum AppAuthAction {
+    /// Pin the desktop app's ~/.codex to one server account.
+    Enable {
+        #[arg(long)]
+        account: String,
+        /// Accept an account the server may bill.
+        #[arg(long)]
+        allow_billing: bool,
+        /// Write the file without installing the refresh agent.
+        #[arg(long)]
+        no_agent: bool,
+        /// Accept a Codex version app-auth has not been tested with.
+        #[arg(long)]
+        allow_codex_version: bool,
+    },
+    /// Rewrite the file from the server when its token changed (the agent runs this).
+    Refresh,
+    /// Show the pinned account and the last refresh result.
+    Status,
+    /// Remove the agent and the app-auth file.
+    Disable {
+        /// Restore the login that enable backed up, even a server account's.
+        #[arg(long)]
+        restore_login: bool,
+    },
+}
+
+pub fn run(action: AppAuthAction) -> Result<()> {
+    match action {
+        AppAuthAction::Enable {
+            account,
+            allow_billing,
+            no_agent,
+            allow_codex_version,
+        } => enable(&account, allow_billing, no_agent, allow_codex_version),
+        AppAuthAction::Refresh => refresh(),
+        AppAuthAction::Status => status(),
+        AppAuthAction::Disable { restore_login } => disable(restore_login),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct State {
+    alias: String,
+    connection: Connection,
+    allow_billing: bool,
+    allow_codex_version: bool,
+    #[serde(default)]
+    backup_account: Option<String>,
+    #[serde(default)]
+    last: Option<Outcome>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Outcome {
+    at: String,
+    ok: bool,
+    detail: String,
+}
+
+struct Paths {
+    state_dir: PathBuf,
+    codex_home: PathBuf,
+}
+
+impl Paths {
+    fn new() -> Result<Self> {
+        let paths = config::default_paths()?;
+        Ok(Self {
+            state_dir: paths.codexctl_dir().join("app-auth"),
+            codex_home: paths.codex_home(),
+        })
+    }
+    fn state(&self) -> PathBuf {
+        self.state_dir.join("state.json")
+    }
+    fn backup(&self) -> PathBuf {
+        self.state_dir.join("backup/auth.json")
+    }
+    fn auth(&self) -> PathBuf {
+        self.codex_home.join("auth.json")
+    }
+}
+
+/// Refuse a command that would replace `~/.codex/auth.json` while the
+/// desktop app is pinned to a server account through it.
+pub fn refuse_while_enabled(action: &str) -> Result<()> {
+    if Paths::new()?.state().try_exists()? {
+        bail!(
+            "app-auth pins ~/.codex to a server account for the desktop app; {action} would replace that login; run codexctl app-auth disable first"
+        );
+    }
+    Ok(())
+}
+
+fn lock(paths: &Paths) -> Result<vault::Lock> {
+    store::ensure_private_dir(&paths.state_dir)?;
+    vault::lock(&paths.state_dir, "app-auth.lock")
+}
+
+fn read_state(paths: &Paths) -> Result<State> {
+    match std::fs::read(paths.state()) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("app-auth is not enabled; run codexctl app-auth enable --account <alias>")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_state(paths: &Paths, state: &State) -> Result<()> {
+    store::atomic_write(&paths.state(), &serde_json::to_vec_pretty(state)?)
+}
+
+fn record(paths: &Paths, state: &mut State, ok: bool, detail: &str) -> Result<()> {
+    state.last = Some(Outcome {
+        at: chrono::Utc::now().to_rfc3339(),
+        ok,
+        detail: detail.to_owned(),
+    });
+    save_state(paths, state)
+}
+
+fn enable(
+    alias: &str,
+    allow_billing: bool,
+    no_agent: bool,
+    allow_codex_version: bool,
+) -> Result<()> {
+    if std::env::var_os("CODEX_HOME").is_some() {
+        bail!("app-auth writes ~/.codex for the desktop app; unset CODEX_HOME");
+    }
+    if !no_agent && !cfg!(target_os = "macos") {
+        bail!("the refresh agent needs launchd (macOS); pass --no-agent");
+    }
+    let paths = Paths::new()?;
+    let _lock = lock(&paths)?;
+    let previous = paths
+        .state()
+        .try_exists()?
+        .then(|| read_state(&paths))
+        .transpose()?;
+    if previous.is_some() && file_state(&paths, None)? == FileState::Foreign {
+        bail!(
+            "~/.codex/auth.json changed since app-auth enable; run codexctl app-auth disable first"
+        );
+    }
+    if central_active()? {
+        bail!("the central provider is active in ~/.codex; switch it off before app-auth enable");
+    }
+    check_codex_config(&paths.codex_home)?;
+    check_codex_version(allow_codex_version)?;
+    let catalog =
+        super::super::remote::catalog()?.context("app-auth requires a connected account server")?;
+    let (account, connection) = launch::catalog_connection(&catalog, alias, false)?;
+    if account.loan.is_some() {
+        bail!("app-auth pins only your own server accounts, not a borrowed one");
+    }
+    let token = server_token(&connection, &account.alias, allow_billing)?;
+    let backup_account = match previous {
+        Some(state) => state.backup_account,
+        None => back_up_login(&paths)?,
+    };
+    write_auth(&paths, &connection.account_id, &token.access_token)?;
+    let mut state = State {
+        alias: account.alias.clone(),
+        connection,
+        allow_billing,
+        allow_codex_version,
+        backup_account,
+        last: None,
+    };
+    record(&paths, &mut state, true, "written by enable")?;
+    if !no_agent {
+        install_agent()?;
+    }
+    eprintln!(
+        "codexctl: app-auth pinned ~/.codex to {} (plan {}); quit and reopen the desktop app",
+        state.alias,
+        token.chatgpt_plan_type.as_deref().unwrap_or("unknown")
+    );
+    Ok(())
+}
+
+fn refresh() -> Result<()> {
+    let paths = Paths::new()?;
+    let _lock = lock(&paths)?;
+    let mut state = read_state(&paths)?;
+    let result = refresh_locked(&paths, &state);
+    match &result {
+        Ok(detail) => {
+            record(&paths, &mut state, true, detail)?;
+            eprintln!("codexctl: app-auth {detail}");
+        }
+        Err(error) => record(&paths, &mut state, false, &format!("{error:#}"))?,
+    }
+    result.map(|_| ())
+}
+
+fn refresh_locked(paths: &Paths, state: &State) -> Result<&'static str> {
+    match file_state(paths, Some(&state.connection.account_id))? {
+        FileState::Missing => bail!(
+            "~/.codex/auth.json is missing (signed out in the app?); refresh stopped; run codexctl app-auth enable again"
+        ),
+        FileState::Foreign => {
+            bail!("~/.codex/auth.json was not written by app-auth (a new login?); refresh stopped")
+        }
+        FileState::Ours => {}
+    }
+    check_codex_version(state.allow_codex_version)?;
+    let token = server_token(&state.connection, &state.alias, state.allow_billing)?;
+    if current_access_token(paths)?.as_deref() == Some(token.access_token.as_str()) {
+        return Ok("token unchanged");
+    }
+    write_auth(paths, &state.connection.account_id, &token.access_token)?;
+    Ok("token rewritten")
+}
+
+fn status() -> Result<()> {
+    let paths = Paths::new()?;
+    let state = read_state(&paths)?;
+    let file = match file_state(&paths, Some(&state.connection.account_id))? {
+        FileState::Ours => match current_access_token(&paths)?.and_then(|t| claims(&t).ok()) {
+            Some(claims) => format!(
+                "written by app-auth, token expires in {} min",
+                (claims.exp - now()) / 60
+            ),
+            None => "written by app-auth".to_owned(),
+        },
+        FileState::Foreign => "replaced by another login".to_owned(),
+        FileState::Missing => "missing".to_owned(),
+    };
+    println!("account   {}", state.alias);
+    println!("file      {file}");
+    match &state.last {
+        Some(last) => println!(
+            "last      {} at {}: {}",
+            if last.ok { "ok" } else { "failed" },
+            last.at,
+            last.detail
+        ),
+        None => println!("last      none"),
+    }
+    println!(
+        "agent     {}",
+        if agent_path()?.try_exists()? {
+            "installed"
+        } else {
+            "not installed"
+        }
+    );
+    Ok(())
+}
+
+fn disable(restore_login: bool) -> Result<()> {
+    let paths = Paths::new()?;
+    let _lock = lock(&paths)?;
+    let state = read_state(&paths)?;
+    remove_agent()?;
+    match file_state(&paths, Some(&state.connection.account_id))? {
+        FileState::Ours => std::fs::remove_file(paths.auth())?,
+        FileState::Foreign => {
+            eprintln!("codexctl: ~/.codex/auth.json holds another login; left in place")
+        }
+        FileState::Missing => {}
+    }
+    let backup = paths.backup();
+    if backup.try_exists()? && !paths.auth().try_exists()? {
+        // A server account's backed-up refresh token would be a second
+        // refresh owner beside the server; restore it only when asked.
+        let held_by_server = match &state.backup_account {
+            Some(account) => super::super::remote::catalog()
+                .ok()
+                .flatten()
+                .is_none_or(|catalog| catalog.accounts.iter().any(|a| &a.account_id == account)),
+            None => false,
+        };
+        if restore_login || !held_by_server {
+            std::fs::copy(&backup, paths.auth())?;
+            std::fs::set_permissions(paths.auth(), std::fs::Permissions::from_mode(0o600))?;
+            std::fs::remove_file(&backup)?;
+            eprintln!("codexctl: restored the login app-auth backed up");
+        } else {
+            eprintln!(
+                "codexctl: the backed-up login is a server account; kept at {} (use --restore-login to restore it)",
+                backup.display()
+            );
+        }
+    }
+    std::fs::remove_file(paths.state())?;
+    eprintln!("codexctl: app-auth disabled; quit and reopen the desktop app");
+    Ok(())
+}
+
+#[derive(PartialEq)]
+enum FileState {
+    Ours,
+    Foreign,
+    Missing,
+}
+
+/// Whether `~/.codex/auth.json` is this feature's file for `account`; with no
+/// account, any app-auth file counts.
+fn file_state(paths: &Paths, account: Option<&str>) -> Result<FileState> {
+    let bytes = match std::fs::read(paths.auth()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileState::Missing);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Ok(document) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Ok(FileState::Foreign);
+    };
+    let ours = document["auth_mode"] == MODE
+        && account.is_none_or(|account| document["tokens"]["account_id"] == account);
+    Ok(if ours {
+        FileState::Ours
+    } else {
+        FileState::Foreign
+    })
+}
+
+fn current_access_token(paths: &Paths) -> Result<Option<String>> {
+    let document: serde_json::Value = serde_json::from_slice(&std::fs::read(paths.auth())?)?;
+    Ok(document["tokens"]["access_token"]
+        .as_str()
+        .map(str::to_owned))
+}
+
+fn check_codex_config(codex_home: &Path) -> Result<()> {
+    let document = document(codex_home)?;
+    if let Some(store) = document
+        .get("cli_auth_credentials_store")
+        .and_then(Item::as_str)
+        && store != "file"
+    {
+        bail!(
+            "cli_auth_credentials_store = \"{store}\" in ~/.codex/config.toml keeps logins outside auth.json; set it to \"file\" or remove it"
+        );
+    }
+    if let Some(provider) = document.get("model_provider").and_then(Item::as_str)
+        && provider != "openai"
+    {
+        bail!(
+            "~/.codex/config.toml selects model_provider \"{provider}\"; app-auth needs the built-in openai provider"
+        );
+    }
+    Ok(())
+}
+
+fn check_codex_version(allow_other: bool) -> Result<()> {
+    let app = std::env::var_os("CODEXCTL_APP_AUTH_APP_CODEX")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(APP_CODEX));
+    let on_path = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join("codex"))
+        .find(|candidate| candidate.is_file());
+    let binaries: Vec<PathBuf> = [Some(app), on_path]
+        .into_iter()
+        .flatten()
+        .filter(|binary| binary.is_file())
+        .collect();
+    if binaries.is_empty() {
+        if allow_other {
+            return Ok(());
+        }
+        bail!("no Codex binary found; app-auth checks the Codex version it writes for");
+    }
+    for binary in binaries {
+        let output = std::process::Command::new(&binary)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed to run {} --version", binary.display()))?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let version = text
+            .trim()
+            .rsplit(' ')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        if !allow_other && !SUPPORTED_CODEX.contains(&version.as_str()) {
+            bail!(
+                "{} is Codex {version}; app-auth is tested with {}; pass --allow-codex-version to accept it",
+                binary.display(),
+                SUPPORTED_CODEX.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A server token that passes every check before it can be written.
+fn server_token(
+    connection: &Connection,
+    alias: &str,
+    allow_billing: bool,
+) -> Result<TokenResponse> {
+    let mut token = fetch(connection, false)?;
+    if claims(&token.access_token)?.exp - now() < MIN_LIFETIME_SECONDS {
+        token = fetch(connection, true).with_context(|| {
+            format!("the server token for {alias} is below the minimum lifetime and the server could not renew it")
+        })?;
+    }
+    validate_token_account(&token.access_token, &connection.account_id)?;
+    let claims = claims(&token.access_token)?;
+    if claims.plan.is_none() {
+        bail!(
+            "the server token for {alias} has no chatgpt_plan_type claim; the app cannot show its plan"
+        );
+    }
+    if claims.account.as_deref() != Some(connection.account_id.as_str())
+        || token.chatgpt_account_id != connection.account_id
+    {
+        bail!("the server token for {alias} names another workspace");
+    }
+    if claims.exp - now() < MIN_LIFETIME_SECONDS {
+        bail!(
+            "the server token for {alias} is below the minimum lifetime of {MIN_LIFETIME_SECONDS} s"
+        );
+    }
+    if !allow_billing {
+        launch::require_headroom(alias, &token)?;
+        if token.billing_class != Some(api::BillingClass::RateLimited) {
+            bail!(
+                "server account {alias} may bill credits; pass --allow-billing to pin the app to it"
+            );
+        }
+    }
+    Ok(token)
+}
+
+struct Claims {
+    plan: Option<String>,
+    account: Option<String>,
+    exp: i64,
+}
+
+fn claims(token: &str) -> Result<Claims> {
+    use base64::Engine;
+    let payload = token
+        .split('.')
+        .nth(1)
+        .context("access token is not a JWT")?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload.trim_end_matches('='))
+        .context("access token payload is not base64url")?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let auth = &value[AUTH_CLAIM];
+    Ok(Claims {
+        plan: auth["chatgpt_plan_type"].as_str().map(str::to_owned),
+        account: auth["chatgpt_account_id"].as_str().map(str::to_owned),
+        exp: value["exp"]
+            .as_i64()
+            .context("access token has no exp claim")?,
+    })
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Codex's file shape for externally managed ChatGPT tokens
+/// (`AuthDotJson::from_external_access_token`): the access token also
+/// stands in for the ID token, and the refresh token is empty.
+fn auth_document(account_id: &str, access_token: &str) -> serde_json::Value {
+    serde_json::json!({
+        "auth_mode": MODE,
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": access_token,
+            "access_token": access_token,
+            "refresh_token": "",
+            "account_id": account_id,
+        },
+        "last_refresh": chrono::Utc::now().to_rfc3339(),
+    })
+}
+
+fn write_auth(paths: &Paths, account_id: &str, access_token: &str) -> Result<()> {
+    store::atomic_write(
+        &paths.auth(),
+        &serde_json::to_vec_pretty(&auth_document(account_id, access_token))?,
+    )
+}
+
+/// Keep the login enable replaces and return its workspace. With no login
+/// to keep, an earlier backup stays.
+fn back_up_login(paths: &Paths) -> Result<Option<String>> {
+    let bytes = match std::fs::read(paths.auth()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    store::atomic_write(&paths.backup(), &bytes)?;
+    Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|document| document["tokens"]["account_id"].as_str().map(str::to_owned)))
+}
+
+fn agent_path() -> Result<PathBuf> {
+    Ok(config::default_paths()?
+        .home
+        .join(format!("Library/LaunchAgents/{AGENT_LABEL}.plist")))
+}
+
+fn agent_plist(program: &Path, log: &Path) -> String {
+    let escape = |path: &Path| {
+        path.display()
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>app-auth</string><string>refresh</string></array>
+  <key>StartInterval</key><integer>{AGENT_INTERVAL_SECONDS}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        escape(program),
+        escape(log)
+    )
+}
+
+fn launchctl(args: &[&str]) -> Result<std::process::Output> {
+    std::process::Command::new("launchctl")
+        .args(args)
+        .output()
+        .context("failed to run launchctl")
+}
+
+fn install_agent() -> Result<()> {
+    let plist = agent_path()?;
+    let log = config::default_paths()?
+        .codexctl_dir()
+        .join("logs/app-auth.log");
+    store::ensure_private_dir(log.parent().context("log path has no parent")?)?;
+    let program = std::env::current_exe()?;
+    if let Some(parent) = plist.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&plist, agent_plist(&program, &log))?;
+    let domain = format!("gui/{}", unsafe { libc::getuid() });
+    let _ = launchctl(&["bootout", &format!("{domain}/{AGENT_LABEL}")]);
+    let output = launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
+    if !output.status.success() {
+        bail!(
+            "launchctl bootstrap failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn remove_agent() -> Result<()> {
+    let plist = agent_path()?;
+    if !plist.try_exists()? {
+        return Ok(());
+    }
+    let domain = format!("gui/{}", unsafe { libc::getuid() });
+    let _ = launchctl(&["bootout", &format!("{domain}/{AGENT_LABEL}")]);
+    std::fs::remove_file(plist)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_document_is_codex_external_tokens_mode() {
+        let document = auth_document("seat", "a.b.c");
+        assert_eq!(document["auth_mode"], "chatgptAuthTokens");
+        assert_eq!(document["tokens"]["refresh_token"], "");
+        assert_eq!(document["tokens"]["id_token"], "a.b.c");
+        assert!(document["OPENAI_API_KEY"].is_null());
+    }
+
+    #[test]
+    fn agent_runs_refresh_at_load_and_every_interval() {
+        let plist = agent_plist(Path::new("/opt/codexctl"), Path::new("/tmp/a&b.log"));
+        assert!(plist.contains(
+            "<string>/opt/codexctl</string><string>app-auth</string><string>refresh</string>"
+        ));
+        assert!(plist.contains("<key>RunAtLoad</key><true/>"));
+        assert!(plist.contains("<integer>300</integer>"));
+        assert!(plist.contains("/tmp/a&amp;b.log"));
+    }
+}
