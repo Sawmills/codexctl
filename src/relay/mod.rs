@@ -56,19 +56,6 @@ type Log = Arc<dyn Fn(&str) + Send + Sync>;
 type MetricKey = (&'static str, String, &'static str, &'static str);
 const CENTRAL_EVENT_QUEUE_CAPACITY: usize = 256;
 const CENTRAL_EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
-const RELAY_KNOWN_MODELS: &[&str] = &[
-    "gpt-5",
-    "gpt-5.1",
-    "gpt-5.2",
-    "gpt-5.3",
-    "gpt-5.4",
-    "gpt-6",
-    "gpt-6.1",
-    "gpt-6.1-sol",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-];
 
 /// Relay settings. Build with [`RelayConfig::new`].
 pub struct RelayConfig {
@@ -265,7 +252,10 @@ pub async fn serve(
         .await
         .context("relay stopped")?;
     if let Some(worker) = central_worker {
-        worker.await.context("central reporter task panicked")?;
+        // Capacity reporting is best effort. Do not hold relay shutdown on a
+        // slow or unreachable central server while draining the queue.
+        worker.abort();
+        let _ = worker.await;
     }
     Ok(())
 }
@@ -506,34 +496,36 @@ impl Relay {
                 outcome,
             ))
             .or_default() += 1;
-        let report = CapacityEvent {
-            kind: kind.label().into(),
-            model: labels.model.clone(),
-            account_class: labels.account_class.into(),
-            outcome: outcome.into(),
-        };
-        match &self.central_events {
-            Some(sender) => {
-                if let Err(error) = sender.try_send(report) {
-                    let reason = match error {
-                        TrySendError::Full(_) => "queue_full",
-                        TrySendError::Closed(_) => "connection_closed",
-                    };
+        if outcome != "advised" {
+            let report = CapacityEvent {
+                kind: kind.label().into(),
+                model: labels.model.clone(),
+                account_class: labels.account_class.into(),
+                outcome: outcome.into(),
+            };
+            match &self.central_events {
+                Some(sender) => {
+                    if let Err(error) = sender.try_send(report) {
+                        let reason = match error {
+                            TrySendError::Full(_) => "queue_full",
+                            TrySendError::Closed(_) => "connection_closed",
+                        };
+                        *self
+                            .central_dropped
+                            .lock()
+                            .expect("central drop metric lock")
+                            .entry(reason)
+                            .or_default() += 1;
+                    }
+                }
+                None => {
                     *self
                         .central_dropped
                         .lock()
                         .expect("central drop metric lock")
-                        .entry(reason)
+                        .entry("no_connection")
                         .or_default() += 1;
                 }
-            }
-            None => {
-                *self
-                    .central_dropped
-                    .lock()
-                    .expect("central drop metric lock")
-                    .entry("no_connection")
-                    .or_default() += 1;
             }
         }
         let line = json!({
@@ -569,7 +561,7 @@ impl Relay {
                     })
             });
         model
-            .filter(|model| RELAY_KNOWN_MODELS.contains(&model.as_str()))
+            .filter(|model| crate::RELAY_KNOWN_MODELS.contains(&model.as_str()))
             .unwrap_or_else(|| "other".into())
     }
 }
@@ -878,7 +870,7 @@ mod tests {
         };
 
         for _ in 0..=CENTRAL_EVENT_QUEUE_CAPACITY {
-            relay.event(Kind::Rate429, &labels, "advised", None, None);
+            relay.event(Kind::Rate429, &labels, "exhausted", None, None);
         }
 
         assert_eq!(

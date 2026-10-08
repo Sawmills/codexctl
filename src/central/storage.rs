@@ -242,8 +242,11 @@ CREATE INDEX IF NOT EXISTS central_users_enabled_idx
 CREATE TABLE IF NOT EXISTS central_relay_rate_limits (
     device_id TEXT PRIMARY KEY,
     tokens DOUBLE PRECISION NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    allowed BOOLEAN NOT NULL DEFAULT true
 );
+ALTER TABLE central_relay_rate_limits
+    ADD COLUMN IF NOT EXISTS allowed BOOLEAN NOT NULL DEFAULT true;
 "#;
 
 impl CentralStore {
@@ -1349,34 +1352,14 @@ impl PostgresStore {
 
     async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
         bounded_db(async {
-            let mut connection = self.admission_client().await?;
-            let client = connection.transaction().await?;
-            client
-                .execute(
-                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at) VALUES($1,32,now()) ON CONFLICT DO NOTHING",
-                    &[&device],
-                )
-                .await?;
+            let client = self.client().await?;
             let row = client
-                .query_opt(
-                    "SELECT tokens, EXTRACT(EPOCH FROM (now() - updated_at))::double precision FROM central_relay_rate_limits WHERE device_id=$1 FOR UPDATE",
+                .query_one(
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed) VALUES($1,31,clock_timestamp(),true) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 THEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))))-1.0 ELSE LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) END,updated_at=clock_timestamp(),allowed=LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 RETURNING allowed",
                     &[&device],
                 )
                 .await?;
-            let row = row.context("relay rate-limit row disappeared")?;
-            let tokens: f64 = row.get(0);
-            let elapsed: f64 = row.get(1);
-            let available = (tokens + elapsed.max(0.0)).min(32.0);
-            let allowed = available >= 1.0;
-            let tokens = if allowed { available - 1.0 } else { available };
-            client
-                .execute(
-                    "UPDATE central_relay_rate_limits SET tokens=$2,updated_at=now() WHERE device_id=$1",
-                    &[&device, &tokens],
-                )
-                .await?;
-            client.commit().await?;
-            Ok(allowed)
+            Ok(row.get(0))
         })
         .await
     }
@@ -2638,6 +2621,36 @@ mod tests {
             "fenced credential writes must retain learned UID proof"
         );
         assert!(shared.load_account("duplicate").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_relay_bucket_does_not_wait_on_admission_connection() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let store = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = store.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        let CentralStore::Postgres(db) = &store else {
+            unreachable!();
+        };
+        let _admission = db.admission_client().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            store.relay_event_allowed("independent-device"),
+        )
+        .await;
+        assert!(result.is_ok(), "relay bucket must use the general client");
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await

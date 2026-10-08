@@ -4194,6 +4194,48 @@ fn relay_capacity_events_require_valid_labels_and_are_exported() {
 }
 
 #[test]
+fn relay_capacity_event_authorizes_before_reading_a_large_body() {
+    let server = Server::start();
+    let response = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .header("content-type", "application/json")
+        .body(vec![b'x'; 1024 * 1024 + 1])
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[test]
+fn relay_capacity_exhausted_series_exist_before_the_first_event() {
+    let server = Server::start();
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let exhausted: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("codexctl_central_relay_capacity_events_total{")
+                && line.contains("outcome=\"exhausted\"")
+        })
+        .collect();
+    assert_eq!(
+        exhausted.len(),
+        72,
+        "all allowed exhausted series: {metrics}"
+    );
+    assert!(
+        exhausted.iter().all(|line| line.ends_with(" 0")),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn relay_capacity_events_are_rate_limited_per_device() {
     let server = Server::start();
     let event = json!({

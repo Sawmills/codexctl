@@ -126,19 +126,6 @@ const RELAY_EVENT_KINDS: &[&str] = &["rate_429", "overloaded"];
 const RELAY_EVENT_ACCOUNT_CLASSES: &[&str] = &["included", "credit", "unknown"];
 const RELAY_EVENT_OUTCOMES: &[&str] =
     &["advised", "recovered", "exhausted", "terminal_passthrough"];
-const RELAY_KNOWN_MODELS: &[&str] = &[
-    "gpt-5",
-    "gpt-5.1",
-    "gpt-5.2",
-    "gpt-5.3",
-    "gpt-5.4",
-    "gpt-6",
-    "gpt-6.1",
-    "gpt-6.1-sol",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-];
 
 #[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
 struct RelayMetricKey {
@@ -148,11 +135,40 @@ struct RelayMetricKey {
     outcome: String,
 }
 
-#[derive(Default)]
 struct RelayMetrics {
     accepted: BTreeMap<RelayMetricKey, u64>,
     rejected: BTreeMap<&'static str, u64>,
     buckets: BTreeMap<String, RelayTokenBucket>,
+}
+
+impl Default for RelayMetrics {
+    fn default() -> Self {
+        let mut accepted = BTreeMap::new();
+        for kind in RELAY_EVENT_KINDS {
+            for model in crate::RELAY_KNOWN_MODELS
+                .iter()
+                .copied()
+                .chain(std::iter::once("other"))
+            {
+                for account_class in RELAY_EVENT_ACCOUNT_CLASSES {
+                    accepted.insert(
+                        RelayMetricKey {
+                            kind: (*kind).into(),
+                            model: model.into(),
+                            account_class: (*account_class).into(),
+                            outcome: "exhausted".into(),
+                        },
+                        0,
+                    );
+                }
+            }
+        }
+        Self {
+            accepted,
+            rejected: BTreeMap::new(),
+            buckets: BTreeMap::new(),
+        }
+    }
 }
 
 struct RelayTokenBucket {
@@ -199,7 +215,7 @@ impl RelayCapacityEvent {
         {
             return Err(());
         }
-        let model = if RELAY_KNOWN_MODELS.contains(&self.model.as_str()) {
+        let model = if crate::RELAY_KNOWN_MODELS.contains(&self.model.as_str()) {
             self.model
         } else {
             "other".into()
@@ -2960,11 +2976,13 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
 
 async fn relay_capacity_event(
     State(broker): State<Broker>,
-    headers: HeaderMap,
-    Json(payload): Json<Value>,
+    request: Request,
 ) -> Result<StatusCode, HttpError> {
-    let device = broker.authorize(&headers).await?;
-    let event = serde_json::from_value::<RelayCapacityEvent>(payload)
+    let device = broker.authorize(request.headers()).await?;
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"))?;
+    let event = serde_json::from_slice::<RelayCapacityEvent>(&body)
         .ok()
         .and_then(|event| event.validate().ok());
     let Some(event) = event else {

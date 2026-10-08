@@ -72,6 +72,9 @@ spec:
     - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
       action: keep
       regex: codexctl
+    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+      action: keep
+      regex: broker
     - sourceLabels: [__meta_kubernetes_pod_container_port_name]
       action: keep
       regex: http

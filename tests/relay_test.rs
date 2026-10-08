@@ -121,6 +121,8 @@ struct Harness {
     upstream: Upstream,
     logs: Arc<Mutex<Vec<String>>>,
     client: reqwest::Client,
+    shutdown: Option<oneshot::Sender<()>>,
+    serve_task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
@@ -134,6 +136,18 @@ async fn central_capacity_event(
     body: Bytes,
 ) -> StatusCode {
     sink.events.send((headers, body)).await.unwrap();
+    StatusCode::NO_CONTENT
+}
+
+async fn slow_central_capacity_event(
+    State(started): State<Arc<Mutex<Option<oneshot::Sender<()>>>>>,
+    _headers: HeaderMap,
+    _body: Bytes,
+) -> StatusCode {
+    if let Some(sender) = started.lock().unwrap().take() {
+        let _ = sender.send(());
+    }
+    tokio::time::sleep(Duration::from_secs(30)).await;
     StatusCode::NO_CONTENT
 }
 
@@ -166,16 +180,21 @@ async fn harness_with(
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        relay::serve(listener, config, std::future::pending())
-            .await
-            .unwrap()
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let serve_task = tokio::spawn(async move {
+        relay::serve(listener, config, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+        .unwrap()
     });
     Harness {
         relay_url,
         upstream,
         logs,
         client: reqwest::Client::new(),
+        shutdown: Some(shutdown),
+        serve_task,
     }
 }
 
@@ -194,6 +213,7 @@ async fn central_report_contains_only_the_four_metric_labels() {
         vec![Scripted::Status(429, vec![], RATE_429.into())],
         |config| {
             config
+                .with_budgets(Duration::ZERO, Duration::ZERO)
                 .with_central_reporter(&central_url, "central-test-token")
                 .unwrap()
         },
@@ -228,6 +248,39 @@ async fn central_report_contains_only_the_four_metric_labels() {
 }
 
 #[tokio::test]
+async fn advised_capacity_events_do_not_consume_central_event_budget() {
+    let (events, mut received) = mpsc::channel(4);
+    let sink = CentralSink { events };
+    let app = Router::new()
+        .route("/v1/relay/capacity-events", post(central_capacity_event))
+        .with_state(sink);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let h = harness_with(
+        vec![
+            Scripted::Status(429, vec![], RATE_429.into()),
+            Scripted::Status(429, vec![], RATE_429.into()),
+        ],
+        |config| {
+            config
+                .with_central_reporter(&central_url, "central-test-token")
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(h.post("advised-1").await.status(), 429);
+    assert_eq!(h.post("advised-2").await.status(), 429);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), received.recv())
+            .await
+            .is_err(),
+        "advised events must not enter the central reporter queue"
+    );
+}
+
+#[tokio::test]
 async fn unreachable_central_does_not_add_request_latency() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let central_url = format!("http://{}", listener.local_addr().unwrap());
@@ -236,6 +289,7 @@ async fn unreachable_central_does_not_add_request_latency() {
         vec![Scripted::Status(429, vec![], RATE_429.into())],
         |config| {
             config
+                .with_budgets(Duration::ZERO, Duration::ZERO)
                 .with_central_reporter(&central_url, "central-test-token")
                 .unwrap()
         },
@@ -250,6 +304,44 @@ async fn unreachable_central_does_not_add_request_latency() {
     assert!(
         started.elapsed() < Duration::from_millis(500),
         "request waited for unreachable central: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn relay_shutdown_drops_in_flight_central_reports() {
+    let (started, started_rx) = oneshot::channel();
+    let started = Arc::new(Mutex::new(Some(started)));
+    let app = Router::new()
+        .route(
+            "/v1/relay/capacity-events",
+            post(slow_central_capacity_event),
+        )
+        .with_state(started);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| {
+            config
+                .with_budgets(Duration::ZERO, Duration::ZERO)
+                .with_central_reporter(&central_url, "central-test-token")
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(h.post("shutdown").await.status(), 429);
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("central reporter must start the request")
+        .unwrap();
+    let started = std::time::Instant::now();
+    h.shutdown().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "shutdown waited for the central request: {:?}",
         started.elapsed()
     );
 }
@@ -272,6 +364,11 @@ async fn unknown_models_use_the_other_metric_label() {
 }
 
 impl Harness {
+    async fn shutdown(mut self) {
+        self.shutdown.take().unwrap().send(()).unwrap();
+        self.serve_task.await.unwrap();
+    }
+
     async fn post(&self, thread: &str) -> reqwest::Response {
         self.post_model(thread, "gpt-6.1-sol").await
     }
