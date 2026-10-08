@@ -158,6 +158,14 @@ pub struct BackfillCounts {
     pub loans: usize,
 }
 
+/// Login journals and identity reservations that fence account `$1`. The
+/// refresh lease claim and the lease-free token read share it.
+macro_rules! login_fence {
+    () => {
+        "(((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear))"
+    };
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS central_schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -239,6 +247,18 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
+-- Evidence the lease path observed on one credential revision (layout 8).
+CREATE TABLE IF NOT EXISTS central_token_evidence (
+    account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id) ON DELETE CASCADE,
+    account_revision BIGINT NOT NULL,
+    auth_revision TEXT NOT NULL,
+    routing_supported BOOLEAN NOT NULL,
+    routing_observed_at TIMESTAMPTZ NOT NULL,
+    billing_class TEXT,
+    plan_type TEXT,
+    limits JSONB,
+    billing_observed_at TIMESTAMPTZ
+);
 "#;
 
 impl CentralStore {
@@ -803,8 +823,12 @@ impl CentralStore {
         record: &CredentialRecord,
         observation: Option<&super::fast_path::Observation>,
     ) -> Result<bool> {
-        let _ = observation;
-        self.fenced_write(lease, record).await
+        match (self, observation) {
+            (Self::Postgres(db), Some(observation)) => {
+                bounded_db(db.fenced_write_observed(lease, record, Some(observation))).await
+            }
+            _ => self.fenced_write(lease, record).await,
+        }
     }
 
     /// The committed record and its evidence, for the lease-free path.
@@ -814,8 +838,10 @@ impl CentralStore {
         &self,
         account_id: &str,
     ) -> Result<Option<super::fast_path::FastRead>> {
-        let _ = account_id;
-        Ok(None)
+        match self {
+            Self::Postgres(db) => bounded_db(db.fast_token_read(account_id)).await,
+            _ => Ok(None),
+        }
     }
 
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
@@ -1783,7 +1809,11 @@ impl PostgresStore {
         // can replace its own replica's refresh lease because its worker settles
         // that child. The login holder rotates after an outage; the refresh
         // holder does not, so match the lease by the refresh holder.
-        const CLAIM: &str = "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch";
+        const CLAIM: &str = concat!(
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
+            login_fence!(),
+            " AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch"
+        );
         let params: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
             &account_id,
             &holder_id,
@@ -1813,6 +1843,17 @@ impl PostgresStore {
     }
 
     async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
+        self.fenced_write_observed(lease, record, None).await
+    }
+
+    /// Both branches publish the observation under the same lease predicate,
+    /// so evidence never outlives the credential it describes.
+    async fn fenced_write_observed(
+        &self,
+        lease: &Lease,
+        record: &CredentialRecord,
+        observation: Option<&super::fast_path::Observation>,
+    ) -> Result<bool> {
         if lease.account_id != record.account_id {
             bail!("lease account does not match credential account")
         }
@@ -1835,15 +1876,77 @@ impl PostgresStore {
                     Err(error) => return Err(error),
                 }
             }
+            if let Some(observation) = observation {
+                record_observation(&client, lease, record, observation).await?;
+            }
             client.commit().await?;
             return Ok(true);
         }
         let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > clock_timestamp() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
-        Ok(row.is_some_and(|row| {
+        let unchanged = row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
             vault::decrypt_with_cipher(&cipher, &stored)
                 .ok()
                 .is_some_and(|plain| plain == serialized)
+        });
+        if unchanged && let Some(observation) = observation {
+            record_observation(&client, lease, record, observation).await?;
+            client.commit().await?;
+        }
+        Ok(unchanged)
+    }
+
+    async fn fast_token_read(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<super::fast_path::FastRead>> {
+        let row = self.client().await?.query_opt(concat!(
+            "SELECT a.user_id,a.alias,a.revision,a.encrypted_vault,",
+            "EXISTS(SELECT 1 FROM central_login_operations WHERE ", login_fence!(), ") AS fenced,",
+            "e.auth_revision,e.account_revision,e.routing_supported,",
+            "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
+            "e.billing_class,e.plan_type,e.limits::text AS limits,",
+            "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
+            "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
+            "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id ",
+            "WHERE a.account_id=$1 AND a.deleted_at IS NULL"
+        ), &[&account_id]).await?;
+        let Some(row) = row else { return Ok(None) };
+        let encrypted: Vec<u8> = row.get("encrypted_vault");
+        let vault = serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?;
+        let age = |seconds: f64| Duration::from_secs_f64(seconds.max(0.0));
+        let evidence = match row.get::<_, Option<String>>("auth_revision") {
+            None => None,
+            Some(auth_revision) => Some(super::fast_path::Evidence {
+                auth_revision,
+                account_revision: row.get("account_revision"),
+                routing_supported: row.get("routing_supported"),
+                routing_age: age(row.get("routing_age")),
+                billing: match (
+                    row.get::<_, Option<String>>("billing_class"),
+                    row.get::<_, Option<f64>>("billing_age"),
+                ) {
+                    (Some(class), Some(seconds)) => Some(super::fast_path::Billing {
+                        class: serde_json::from_value(Value::String(class))?,
+                        plan_type: row.get("plan_type"),
+                        limits: row
+                            .get::<_, Option<String>>("limits")
+                            .map(|text| serde_json::from_str(&text))
+                            .transpose()?,
+                        age: age(seconds),
+                    }),
+                    _ => None,
+                },
+            }),
+        };
+        Ok(Some(super::fast_path::FastRead {
+            user_id: row.get("user_id"),
+            alias: row.get("alias"),
+            revision: row.get("revision"),
+            vault,
+            fenced: row.get("fenced"),
+            evidence,
+            now: row.get("now"),
         }))
     }
 
@@ -1870,6 +1973,32 @@ impl PostgresStore {
         })
         .transpose()
     }
+}
+
+/// Upsert evidence only while the writer's lease is valid. A billing-free
+/// observation keeps billing evidence of the same revisions and drops older.
+async fn record_observation(
+    client: &tokio_postgres::Transaction<'_>,
+    lease: &Lease,
+    record: &CredentialRecord,
+    observation: &super::fast_path::Observation,
+) -> Result<()> {
+    let millis = |age: Duration| age.as_millis().min(i64::MAX as u128) as i64;
+    let billing = observation.billing.as_ref();
+    let class = billing
+        .map(|billing| serde_json::to_value(billing.class))
+        .transpose()?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let plan = billing.and_then(|billing| billing.plan_type.clone());
+    let limits = billing
+        .and_then(|billing| billing.limits.as_ref())
+        .map(Value::to_string);
+    let billing_age = billing.map(|billing| millis(billing.age));
+    client.execute(
+        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,limits,billing_observed_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7::text::jsonb,CASE WHEN $8::bigint IS NULL THEN NULL ELSE clock_timestamp()-($8::bigint*interval '1 millisecond') END WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$9 AND epoch=$10 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,billing_class=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.billing_class WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.billing_class END,plan_type=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.plan_type WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.plan_type END,limits=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.limits WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.limits END,billing_observed_at=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.billing_observed_at WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.billing_observed_at END",
+        &[&record.account_id, &record.revision, &observation.auth_revision, &millis(observation.routing_age), &class, &plan, &limits, &billing_age, &lease.holder_id, &lease.epoch],
+    ).await?;
+    Ok(())
 }
 
 fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
