@@ -80,7 +80,7 @@ pub(super) fn enabled() -> bool {
     })
 }
 
-const RESULTS: [&str; 11] = [
+const RESULTS: [&str; 12] = [
     "served",
     "disabled",
     "expiring",
@@ -92,8 +92,9 @@ const RESULTS: [&str; 11] = [
     "fenced",
     "identity",
     "read_failed",
+    "busy",
 ];
-static RESULT_COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static RESULT_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// Count one fast-path decision by its bounded result label.
 pub(super) fn record(result: Result<(), Miss>) {
@@ -224,6 +225,8 @@ pub(super) enum Miss {
     Fenced,
     Identity,
     ReadFailed,
+    /// The local owner was busy, so its fence could not be read.
+    Busy,
 }
 
 impl Miss {
@@ -239,6 +242,7 @@ impl Miss {
             Self::Fenced => "fenced",
             Self::Identity => "identity",
             Self::ReadFailed => "read_failed",
+            Self::Busy => "busy",
         }
     }
 }

@@ -1296,12 +1296,13 @@ async fn token(
     };
     let template = request;
     let mut try_fast = fast_on;
+    let mut busy_owner = false;
     let mut wait: Option<(tokio::time::Instant, tokio::time::Instant)> = None;
     let (mut token, alias, account_id) = loop {
         if try_fast {
             let result = fast_token(
                 &broker,
-                &owner,
+                LocalOwner::Probe(&owner),
                 &fast_account,
                 &fast_user,
                 &fast_alias,
@@ -1309,11 +1310,14 @@ async fn token(
             )
             .await;
             fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
-            if let Ok((token, alias)) = result {
-                if let Some((started, _)) = wait {
-                    fast_path::Wait::Committed.record(started.elapsed());
+            match result {
+                Ok((token, alias)) => {
+                    if let Some((started, _)) = wait {
+                        fast_path::Wait::Committed.record(started.elapsed());
+                    }
+                    break (token, alias, fast_account.clone());
                 }
-                break (token, alias, fast_account.clone());
+                Err(miss) => busy_owner = miss == fast_path::Miss::Busy,
             }
         }
         let permit = broker
@@ -1329,6 +1333,10 @@ async fn token(
             .as_ref()
             .map(|borrowed| borrowed.grant.alias.clone());
         let mut request = template.clone();
+        // A request that found the owner busy re-checks under its lock.
+        let fast_locked =
+            busy_owner.then(|| (fast_account.clone(), fast_user.clone(), fast_alias.clone()));
+        busy_owner = false;
         let busy = Arc::new(StdMutex::new(None::<(String, i64)>));
         let busy_slot = busy.clone();
         let attempt = tokio::spawn(async move {
@@ -1389,6 +1397,25 @@ async fn token(
             .map_err(|failure| worker.owner_failure(failure))?;
         if !owner.available {
             return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+        }
+        // Under the owner lock the local fence is visible, so a request that
+        // found the owner busy may still be served without the lease.
+        if let Some((fast_account, fast_user, fast_alias)) = fast_locked.as_ref()
+            && !owner.routing_refused
+        {
+            let result = fast_token(
+                &worker,
+                LocalOwner::Locked,
+                fast_account,
+                fast_user,
+                fast_alias,
+                &request,
+            )
+            .await;
+            fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
+            if let Ok((token, alias)) = result {
+                return Ok((token, alias, account_id));
+            }
         }
         // `account/read` may refresh even without a forced request. Every
         // PostgreSQL token path therefore takes the account lease before
@@ -1863,9 +1890,17 @@ async fn token(
 
 /// Serve a committed token from PostgreSQL without the lease or a child. The
 /// row must carry the expected user and alias, and no fence may cover it.
+/// How the fast path sees this replica's own owner.
+enum LocalOwner<'a> {
+    /// Probe it without waiting; a busy owner hides its fence, so it misses.
+    Probe(&'a Arc<Mutex<Owner>>),
+    /// The caller holds the owner lock and has checked its fence.
+    Locked,
+}
+
 async fn fast_token(
     broker: &Broker,
-    owner: &Arc<Mutex<Owner>>,
+    local: LocalOwner<'_>,
     account_id: &str,
     user: &str,
     alias: &str,
@@ -1893,11 +1928,14 @@ async fn fast_token(
     {
         return Err(Miss::Identity);
     }
-    // A busy local owner is not a fence; a fenced one is.
-    if let Ok(local) = owner.try_lock()
-        && (!local.available || local.routing_refused)
-    {
-        return Err(Miss::Fenced);
+    if let LocalOwner::Probe(owner) = local {
+        let fenced = owner
+            .try_lock()
+            .map(|owner| !owner.available || owner.routing_refused)
+            .map_err(|_| Miss::Busy)?;
+        if fenced {
+            return Err(Miss::Fenced);
+        }
     }
     let token = fast_path::decide(
         &fast_path::Candidate {

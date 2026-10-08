@@ -304,9 +304,10 @@ these hold:
 - The row is not tombstoned, carries the requested user and alias, matches a
   requested `accountId`, is verified, and no login journal or identity
   reservation fences it (the same predicate as the lease claim). A locally
-  fenced owner also takes the lease path, and any failed lease-path read
-  deletes the account's evidence, so no replica serves it until the lease path
-  observes the account again. If that delete fails three times, the failure is
+  fenced owner also takes the lease path. A busy local owner hides its fence,
+  so the request waits for the owner lock and re-checks there. Any failed
+  lease-path read tombstones the account's evidence, so no replica serves it until the lease path
+  observes the account again. If that update fails three times, the failure is
   counted as `token_evidence_clear_failed`, and the old evidence still expires
   within 60 s.
 

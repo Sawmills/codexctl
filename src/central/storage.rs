@@ -249,7 +249,7 @@ CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
 -- Evidence the lease path observed on one credential revision (layout 8).
 CREATE TABLE IF NOT EXISTS central_token_evidence (
-    account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id) ON DELETE CASCADE,
+    account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id),
     account_revision BIGINT NOT NULL,
     auth_revision TEXT NOT NULL,
     routing_supported BOOLEAN NOT NULL,
@@ -851,8 +851,8 @@ impl CentralStore {
         }
     }
 
-    /// Drop an account's evidence so no replica serves it lease-free until
-    /// the lease path observes the account again.
+    /// Tombstone an account's evidence so no replica serves it lease-free
+    /// until the lease path observes the account again and reactivates it.
     pub(in crate::central) async fn clear_token_evidence(&self, account_id: &str) -> Result<()> {
         let db = match self {
             Self::File(_) => return Ok(()),
@@ -862,7 +862,7 @@ impl CentralStore {
             db.client()
                 .await?
                 .execute(
-                    "DELETE FROM central_token_evidence WHERE account_id=$1",
+                    "UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL",
                     &[&account_id],
                 )
                 .await?;
@@ -1983,7 +1983,7 @@ impl PostgresStore {
             "e.usage_five_hour_used_percent,e.usage_five_hour_resets_at,e.usage_allowed,e.usage_limit_reached,e.usage_max_used_percent,e.peak_used_percent,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
             "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
-            "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id ",
+            "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id AND e.deleted_at IS NULL ",
             "WHERE a.account_id=$1 AND a.deleted_at IS NULL"
         ), &[&account_id]).await?;
         let Some(row) = row else { return Ok(None) };
