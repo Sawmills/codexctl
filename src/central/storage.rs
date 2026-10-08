@@ -158,6 +158,14 @@ pub struct BackfillCounts {
     pub loans: usize,
 }
 
+/// Login journals and identity reservations that fence account `$1`. The
+/// refresh lease claim and the lease-free token read share it.
+macro_rules! login_fence {
+    () => {
+        "(((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear))"
+    };
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS central_schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -239,6 +247,27 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
+-- Evidence the lease path observed on one credential revision (layout 8).
+CREATE TABLE IF NOT EXISTS central_token_evidence (
+    account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id),
+    account_revision BIGINT NOT NULL,
+    auth_revision TEXT NOT NULL,
+    routing_supported BOOLEAN NOT NULL,
+    routing_observed_at TIMESTAMPTZ NOT NULL,
+    billing_class TEXT,
+    plan_type TEXT,
+    usage_weekly_used_percent DOUBLE PRECISION,
+    usage_weekly_resets_at BIGINT,
+    usage_five_hour_used_percent DOUBLE PRECISION,
+    usage_five_hour_resets_at BIGINT,
+    usage_allowed BOOLEAN,
+    usage_limit_reached BOOLEAN,
+    usage_max_used_percent DOUBLE PRECISION,
+    usage_present BOOLEAN NOT NULL DEFAULT false,
+    peak_used_percent DOUBLE PRECISION,
+    billing_observed_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ
+);
 "#;
 
 impl CentralStore {
@@ -792,6 +821,101 @@ impl CentralStore {
                 Ok(lease)
             }
         }
+    }
+
+    /// Publish a credential, and with it the evidence the lease path observed
+    /// on it, under the same lease fence.
+    pub(in crate::central) async fn fenced_write_with_evidence(
+        &self,
+        lease: &Lease,
+        record: &CredentialRecord,
+        observation: Option<&super::fast_path::Observation>,
+    ) -> Result<bool> {
+        match (self, observation) {
+            (Self::Postgres(db), Some(observation)) => {
+                bounded_db(db.fenced_write_observed(lease, record, Some(observation))).await
+            }
+            _ => self.fenced_write(lease, record).await,
+        }
+    }
+
+    /// The committed record and its evidence, for the lease-free path.
+    /// PostgreSQL mode only: dual mode keeps today's path.
+    pub(in crate::central) async fn fast_token_read(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<super::fast_path::FastRead>> {
+        match self {
+            Self::Postgres(db) => bounded_db(db.fast_token_read(account_id)).await,
+            _ => Ok(None),
+        }
+    }
+
+    /// Tombstone an account's evidence so no replica serves it lease-free
+    /// until the lease path observes the account again and reactivates it.
+    pub(in crate::central) async fn clear_token_evidence(&self, account_id: &str) -> Result<()> {
+        let db = match self {
+            Self::File(_) => return Ok(()),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            db.client()
+                .await?
+                .execute(
+                    "UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL",
+                    &[&account_id],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The committed integer revision of an account, for a lease loser.
+    pub(in crate::central) async fn account_revision(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<i64>> {
+        let db = match self {
+            Self::File(_) => return Ok(None),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            Ok(db
+                .client()
+                .await?
+                .query_opt(
+                    "SELECT revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL",
+                    &[&account_id],
+                )
+                .await?
+                .map(|row| row.get(0)))
+        })
+        .await
+    }
+
+    /// Another holder's live, unreleased lease blocks this account.
+    pub(in crate::central) async fn lease_held_elsewhere(
+        &self,
+        account_id: &str,
+        holder_id: &str,
+    ) -> Result<bool> {
+        let db = match self {
+            Self::File(_) => return Ok(false),
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+        };
+        bounded_db(async {
+            Ok(db
+                .client()
+                .await?
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id<>$2 AND NOT released AND expires_at>clock_timestamp())",
+                    &[&account_id, &holder_id],
+                )
+                .await?
+                .get(0))
+        })
+        .await
     }
 
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
@@ -1759,7 +1883,11 @@ impl PostgresStore {
         // can replace its own replica's refresh lease because its worker settles
         // that child. The login holder rotates after an outage; the refresh
         // holder does not, so match the lease by the refresh holder.
-        const CLAIM: &str = "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE (((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear)) AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch";
+        const CLAIM: &str = concat!(
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
+            login_fence!(),
+            " AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch"
+        );
         let params: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
             &account_id,
             &holder_id,
@@ -1789,6 +1917,17 @@ impl PostgresStore {
     }
 
     async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
+        self.fenced_write_observed(lease, record, None).await
+    }
+
+    /// Both branches publish the observation under the same lease predicate,
+    /// so evidence never outlives the credential it describes.
+    async fn fenced_write_observed(
+        &self,
+        lease: &Lease,
+        record: &CredentialRecord,
+        observation: Option<&super::fast_path::Observation>,
+    ) -> Result<bool> {
         if lease.account_id != record.account_id {
             bail!("lease account does not match credential account")
         }
@@ -1811,15 +1950,88 @@ impl PostgresStore {
                     Err(error) => return Err(error),
                 }
             }
+            if let Some(observation) = observation {
+                record_observation(&client, lease, record, observation).await?;
+            }
             client.commit().await?;
             return Ok(true);
         }
         let row = client.query_opt("SELECT encrypted_vault FROM central_accounts JOIN account_refresh_leases USING(account_id) WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND account_refresh_leases.holder_id=$2 AND account_refresh_leases.epoch=$3 AND account_refresh_leases.expires_at > clock_timestamp() AND central_accounts.revision=$4", &[&record.account_id, &lease.holder_id, &lease.epoch, &record.revision]).await?;
-        Ok(row.is_some_and(|row| {
+        let unchanged = row.is_some_and(|row| {
             let stored: Vec<u8> = row.get(0);
             vault::decrypt_with_cipher(&cipher, &stored)
                 .ok()
                 .is_some_and(|plain| plain == serialized)
+        });
+        if unchanged && let Some(observation) = observation {
+            record_observation(&client, lease, record, observation).await?;
+            client.commit().await?;
+        }
+        Ok(unchanged)
+    }
+
+    async fn fast_token_read(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<super::fast_path::FastRead>> {
+        let row = self.client().await?.query_opt(concat!(
+            "SELECT a.user_id,a.alias,a.revision,a.encrypted_vault,",
+            "EXISTS(SELECT 1 FROM central_login_operations WHERE ", login_fence!(), ") AS fenced,",
+            "e.auth_revision,e.account_revision,e.routing_supported,",
+            "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
+            "e.billing_class,e.plan_type,e.usage_present,e.usage_weekly_used_percent,e.usage_weekly_resets_at,",
+            "e.usage_five_hour_used_percent,e.usage_five_hour_resets_at,e.usage_allowed,e.usage_limit_reached,e.usage_max_used_percent,e.peak_used_percent,",
+            "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
+            "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
+            "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id AND e.deleted_at IS NULL ",
+            "WHERE a.account_id=$1 AND a.deleted_at IS NULL"
+        ), &[&account_id]).await?;
+        let Some(row) = row else { return Ok(None) };
+        let encrypted: Vec<u8> = row.get("encrypted_vault");
+        let vault = serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?;
+        let age = |seconds: f64| Duration::from_secs_f64(seconds.max(0.0));
+        let evidence = match row.get::<_, Option<String>>("auth_revision") {
+            None => None,
+            Some(auth_revision) => Some(super::fast_path::Evidence {
+                auth_revision,
+                account_revision: row.get("account_revision"),
+                routing_supported: row.get("routing_supported"),
+                routing_age: age(row.get("routing_age")),
+                billing: match (
+                    row.get::<_, Option<String>>("billing_class"),
+                    row.get::<_, Option<f64>>("billing_age"),
+                ) {
+                    (Some(class), Some(seconds)) => Some(super::fast_path::Billing {
+                        class: serde_json::from_value(Value::String(class))?,
+                        plan_type: row.get("plan_type"),
+                        usage: row
+                            .get::<_, Option<bool>>("usage_present")
+                            .unwrap_or(false)
+                            .then(|| crate::statusline::Usage {
+                                age_seconds: 0,
+                                weekly_used_percent: row.get("usage_weekly_used_percent"),
+                                weekly_resets_at: row.get("usage_weekly_resets_at"),
+                                five_hour_used_percent: row.get("usage_five_hour_used_percent"),
+                                five_hour_resets_at: row.get("usage_five_hour_resets_at"),
+                                allowed: row.get("usage_allowed"),
+                                limit_reached: row.get("usage_limit_reached"),
+                                max_used_percent: row.get("usage_max_used_percent"),
+                            }),
+                        peak_used_percent: row.get("peak_used_percent"),
+                        age: age(seconds),
+                    }),
+                    _ => None,
+                },
+            }),
+        };
+        Ok(Some(super::fast_path::FastRead {
+            user_id: row.get("user_id"),
+            alias: row.get("alias"),
+            revision: row.get("revision"),
+            vault,
+            fenced: row.get("fenced"),
+            evidence,
+            now: row.get("now"),
         }))
     }
 
@@ -1846,6 +2058,74 @@ impl PostgresStore {
         })
         .transpose()
     }
+}
+
+/// Upsert evidence only while the writer's lease is valid. A billing-free
+/// observation keeps billing evidence of the same revisions and drops older.
+async fn record_observation(
+    client: &tokio_postgres::Transaction<'_>,
+    lease: &Lease,
+    record: &CredentialRecord,
+    observation: &super::fast_path::Observation,
+) -> Result<()> {
+    let millis = |age: Duration| age.as_millis().min(i64::MAX as u128) as i64;
+    let billing = observation.billing.as_ref();
+    let class = billing
+        .map(|billing| serde_json::to_value(billing.class))
+        .transpose()?
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let plan = billing.and_then(|billing| billing.plan_type.clone());
+    let usage = billing.and_then(|billing| billing.usage.as_ref());
+    let billing_age = billing.map(|billing| millis(billing.age));
+    // Billing columns follow a billing observation, or keep an active row's
+    // values for the same revisions; anything else clears them.
+    const KEEP: &str = "central_token_evidence.deleted_at IS NULL AND central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision";
+    let billing_columns = [
+        "billing_class",
+        "plan_type",
+        "usage_weekly_used_percent",
+        "usage_weekly_resets_at",
+        "usage_five_hour_used_percent",
+        "usage_five_hour_resets_at",
+        "usage_allowed",
+        "usage_limit_reached",
+        "usage_max_used_percent",
+        "peak_used_percent",
+        "billing_observed_at",
+    ]
+    .map(|column| {
+        format!("{column}=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.{column} WHEN {KEEP} THEN central_token_evidence.{column} END")
+    })
+    .join(",");
+    let statement = format!(
+        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,usage_weekly_used_percent,usage_weekly_resets_at,usage_five_hour_used_percent,usage_five_hour_resets_at,usage_allowed,usage_limit_reached,usage_max_used_percent,usage_present,peak_used_percent,billing_observed_at,deleted_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$18,CASE WHEN $15::bigint IS NULL THEN NULL ELSE clock_timestamp()-($15::bigint*interval '1 millisecond') END,NULL WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$16 AND epoch=$17 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,{billing_columns},usage_present=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.usage_present WHEN {KEEP} THEN central_token_evidence.usage_present ELSE false END,deleted_at=NULL"
+    );
+    client
+        .execute(
+            &statement,
+            &[
+                &record.account_id,
+                &record.revision,
+                &observation.auth_revision,
+                &millis(observation.routing_age),
+                &class,
+                &plan,
+                &usage.and_then(|usage| usage.weekly_used_percent),
+                &usage.and_then(|usage| usage.weekly_resets_at),
+                &usage.and_then(|usage| usage.five_hour_used_percent),
+                &usage.and_then(|usage| usage.five_hour_resets_at),
+                &usage.and_then(|usage| usage.allowed),
+                &usage.and_then(|usage| usage.limit_reached),
+                &usage.and_then(|usage| usage.max_used_percent),
+                &usage.is_some(),
+                &billing_age,
+                &lease.holder_id,
+                &lease.epoch,
+                &billing.and_then(|billing| billing.peak_used_percent),
+            ],
+        )
+        .await?;
+    Ok(())
 }
 
 fn tls_connector() -> Result<tokio_postgres_rustls::MakeRustlsConnect> {
@@ -1920,6 +2200,201 @@ mod tests {
             vault: serde_json::json!({"refresh":"secret"}),
             revision,
         }
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn token_evidence_follows_the_lease_and_the_credential_revision() {
+        use super::super::fast_path::{Billing, Observation};
+        use crate::api;
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[23; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared.save_account(&record("a", 1)).await.unwrap();
+        let lease = shared
+            .acquire_lease("a", "holder", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let billing = Billing {
+            class: api::BillingClass::RateLimited,
+            plan_type: Some("plus".into()),
+            usage: Some(crate::statusline::Usage {
+                age_seconds: 0,
+                weekly_used_percent: Some(12.0),
+                weekly_resets_at: Some(4_102_444_800),
+                five_hour_used_percent: Some(40.0),
+                five_hour_resets_at: None,
+                allowed: Some(true),
+                limit_reached: Some(false),
+                max_used_percent: Some(40.0),
+            }),
+            peak_used_percent: Some(40.0),
+            age: Duration::from_secs(1),
+        };
+        let observed = |auth: &str, routing: u64, billing: Option<Billing>| Observation {
+            auth_revision: auth.into(),
+            routing_age: Duration::from_secs(routing),
+            billing,
+        };
+        // A changed credential publishes its evidence.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 2),
+                    Some(&observed("rev-2", 2, Some(billing.clone())))
+                )
+                .await
+                .unwrap()
+        );
+        let read = shared.fast_token_read("a").await.unwrap().expect("account");
+        assert_eq!((read.revision, read.alias.as_str()), (2, "seat"));
+        assert!(!read.fenced);
+        assert!(read.now > 1_700_000_000);
+        let evidence = read.evidence.expect("evidence");
+        assert_eq!(
+            (evidence.auth_revision.as_str(), evidence.account_revision),
+            ("rev-2", 2)
+        );
+        assert!(evidence.routing_supported);
+        assert!(evidence.routing_age >= Duration::from_secs(2));
+        assert!(evidence.routing_age < Duration::from_secs(30));
+        let cached = evidence.billing.expect("billing evidence");
+        assert_eq!(cached.class, api::BillingClass::RateLimited);
+        assert!(cached.age >= Duration::from_secs(1));
+        let usage = cached.usage.expect("typed usage");
+        assert_eq!(
+            (
+                usage.five_hour_used_percent,
+                usage.max_used_percent,
+                usage.weekly_resets_at
+            ),
+            (Some(40.0), Some(40.0), Some(4_102_444_800))
+        );
+        // An unchanged credential commits fresh routing and keeps billing.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 2),
+                    Some(&observed("rev-2", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert!(evidence.routing_age < Duration::from_secs(2));
+        assert_eq!(
+            evidence.billing.unwrap().class,
+            api::BillingClass::RateLimited
+        );
+        // A new credential revision without a billing read drops old billing.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-3", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(
+            (evidence.auth_revision.as_str(), evidence.account_revision),
+            ("rev-3", 3)
+        );
+        assert!(evidence.billing.is_none());
+        // Withdrawal leaves a tombstone that reads ignore; a new observation
+        // under the lease reactivates the row without the old billing.
+        shared.clear_token_evidence("a").await.unwrap();
+        assert!(
+            shared
+                .fast_token_read("a")
+                .await
+                .unwrap()
+                .unwrap()
+                .evidence
+                .is_none()
+        );
+        let tombstoned: bool = control
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_token_evidence WHERE account_id='a'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(tombstoned, "withdrawal must not delete the row");
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-3", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(evidence.auth_revision, "rev-3");
+        assert!(evidence.billing.is_none());
+        // A lost lease publishes neither credential nor evidence.
+        assert!(shared.release_lease(&lease).await.unwrap());
+        assert!(
+            !shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-x", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(evidence.auth_revision, "rev-3");
+        // A tombstoned account is never read.
+        control
+            .execute(
+                "UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(shared.fast_token_read("a").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
