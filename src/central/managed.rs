@@ -3870,6 +3870,11 @@ pub async fn serve(
                                 let replacement = instance_holder_id();
                                 match holder_store.login_register_holder(&replacement).await {
                                     Ok(()) => {
+                                        // Give up the abandoned incarnation now, so other
+                                        // replicas can recover its operations at once.
+                                        if let Err(error) = holder_store.login_release_holder(&holder_id).await {
+                                            eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"abandoned_release_failed","error":format!("{error:#}")}));
+                                        }
                                         holder_broker.replace_login_holder(replacement.clone());
                                         holder_id = replacement;
                                         last_renewal = std::time::Instant::now();
