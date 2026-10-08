@@ -1470,14 +1470,14 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
     Ok(None)
 }
 
-/// Best-effort: fold a live Codex auth file into the saved profile that owns it.
-/// Failures only warn because token capture must not block a requested switch.
 /// Fold the live login's rotated tokens back into its saved profile before a
 /// caller holding the store lock replaces `~/.codex/auth.json`.
 pub fn capture_live_tokens_locked(_lock: &store::StoreLock, paths: &Paths) {
     capture_auth_file_profile_tokens(paths, &paths.codex_auth_json(), None);
 }
 
+/// Best-effort: fold a live Codex auth file into the saved profile that owns it.
+/// Failures only warn because token capture must not block a requested switch.
 fn capture_auth_file_profile_tokens(paths: &Paths, codex_auth: &Path, skip_alias: Option<&str>) {
     if !codex_auth.exists() {
         return;
