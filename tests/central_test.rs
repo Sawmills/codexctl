@@ -2270,6 +2270,12 @@ fn when_remote_use_succeeds_then_provider_refreshes_every_minute() {
     assert_eq!(
         config["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
         Some(12)
+    ); // The relay reads HTTPS event streams; a WebSocket session would bypass it.
+    assert!(
+        config["model_providers"]["codexctl-central"]
+            .get("supports_websockets")
+            .and_then(toml_edit::Item::as_bool)
+            .is_none_or(|enabled| !enabled)
     );
 }
 

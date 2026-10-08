@@ -584,3 +584,9 @@ On a connected machine, `codexctl login <new-alias>` adds an account to the serv
 runs the OpenAI device login, so the refresh token never reaches your machine. Use `--local` for
 a local profile instead.
 See [server setup, migration, and staging deployment](docs/central-server.md).
+
+## Relay for capacity stops
+
+`codexctl relay` keeps an opted-in Codex lane working through short OpenAI 429 and
+"model at capacity" stops. It adds retry advice that Codex honors and passes everything
+else through. See [the relay guide](docs/relay.md).

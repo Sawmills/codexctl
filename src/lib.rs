@@ -4,6 +4,8 @@ pub mod central;
 pub mod config;
 pub mod daemon;
 pub mod profile;
+#[cfg(feature = "central-prototype")]
+pub mod relay;
 pub mod status_format;
 pub mod status_json;
 pub mod status_pace;

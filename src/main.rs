@@ -51,6 +51,12 @@ enum Commands {
         action: codexctl::central::native::SessionProviderAction,
     },
     #[cfg(feature = "central-prototype")]
+    /// Run the loopback relay that adds retry advice for Codex lanes.
+    Relay {
+        #[command(subcommand)]
+        action: codexctl::relay::cli::RelayAction,
+    },
+    #[cfg(feature = "central-prototype")]
     /// List your registered devices, or revoke one.
     Devices {
         #[arg(long)]
@@ -294,6 +300,8 @@ fn main() {
         } => codexctl::central::remote::migrate(all, exclusive_owner),
         #[cfg(feature = "central-prototype")]
         Commands::SessionProvider { action } => codexctl::central::native::session_provider(action),
+        #[cfg(feature = "central-prototype")]
+        Commands::Relay { action } => codexctl::relay::cli::run(action),
         #[cfg(feature = "central-prototype")]
         Commands::Devices { revoke } => codexctl::central::remote::devices(revoke.as_deref()),
         #[cfg(feature = "central-prototype")]
