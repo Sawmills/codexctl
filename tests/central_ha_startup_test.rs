@@ -3069,23 +3069,47 @@ async fn postgres_live_holder_settles_its_own_verification_after_worker_lease_lo
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fenced_worker_without_a_grant_still_counts_its_failure() {
-    let f = login_fixture().await;
+    let mut f = login_fixture().await;
+    f.first.stop().await;
+    f.first = Pod::spawn_with_binary(
+        &f.database,
+        &f.key,
+        f.first.root,
+        "postgres",
+        false,
+        Path::new("/bin/false"),
+    )
+    .await;
     let id = "e4".repeat(32);
-    assert_eq!(
-        login_request(&f, &f.first, "start", &id).await["status"],
-        "pending"
-    );
-    // Expire only the operation lease: the worker stops, and its terminal save
-    // is fenced. No grant exists, so the attempt cannot resume as a success.
-    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", f.schema), &[&id]).await.unwrap();
-    // No receipt read here: the worker itself must count the failure.
+    // Refuse every terminal save, as a fenced or lost database write would.
+    f.control
+        .batch_execute(&format!(
+            r#"
+            CREATE FUNCTION {0}.fail_terminal_save() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.id = '{1}' AND NEW.phase = 'failed' THEN
+                    RAISE EXCEPTION 'synthetic terminal save failure';
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER fail_terminal_save BEFORE UPDATE ON {0}.central_login_operations
+                FOR EACH ROW EXECUTE FUNCTION {0}.fail_terminal_save();
+            "#,
+            f.schema, id
+        ))
+        .await
+        .unwrap();
+    let operation = json!({"alias":"new-one","id":id});
+    add_request(&f, &f.first, "start", &operation).await;
+    // No receipt read here: without a grant the attempt cannot resume as a
+    // success, so the worker itself must count the failure.
     timeout(Duration::from_secs(10), async {
         while relogin_failure_metrics(&f, &f.first).await.is_empty() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("a fenced worker without a grant must count its failure");
+    .expect("a worker without a grant must count its failure when its save fails");
     assert_eq!(
         relogin_failure_metrics(&f, &f.first).await,
         ["codexctl_central_failed_requests_total{reason=\"relogin_failed\"} 1"]
