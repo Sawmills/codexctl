@@ -286,7 +286,10 @@ impl CentralStore {
     pub(in crate::central) async fn login_release_holder(&self, holder: &str) -> Result<()> {
         let db = self.login_db()?;
         bounded_db(async {
-            db.client().await?.execute("UPDATE central_login_holders SET expires_at=clock_timestamp(),polling_bound=false WHERE holder_id=$1 AND deleted_at IS NULL", &[&holder]).await?;
+            // Expiry is the liveness bit. Keep the parent-bound provenance
+            // immutable so a durable candidate can still be taken over after
+            // graceful shutdown.
+            db.client().await?.execute("UPDATE central_login_holders SET expires_at=clock_timestamp() WHERE holder_id=$1 AND deleted_at IS NULL", &[&holder]).await?;
             Ok(())
         }).await
     }
@@ -439,7 +442,7 @@ impl CentralStore {
         let db = self.login_db()?;
         let changed = bounded_db(async {
             Ok(db.client().await?.execute(
-                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND NOT failure_reported AND (holder_id=$5 OR NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))",
+                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','failed','canceled') AND NOT failure_reported AND (holder_id=$5 OR NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&reporter],
             ).await? == 1)
         }).await?;
@@ -905,7 +908,7 @@ mod tests {
             .unwrap();
         let mut stale = op.clone();
         shared.login_register_holder("replacement").await.unwrap();
-        control.execute("UPDATE central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=$1", &[&op.holder]).await.unwrap();
+        shared.login_release_holder(&op.holder).await.unwrap();
         control.execute("UPDATE central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", &[&op.id]).await.unwrap();
         assert!(
             shared

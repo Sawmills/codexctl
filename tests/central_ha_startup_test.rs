@@ -2215,6 +2215,24 @@ async fn renewal_after_unpublished_refresh(overlap: bool, remote: bool, restart:
     .await
     .expect("renewal must commit even when a previous refresh advanced only local state");
     if overlap {
+        let completed_failures: i64 = f
+            .control
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM {}.central_login_operations WHERE phase='completed' AND failure_reported",
+                    f.schema
+                ),
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            completed_failures, 0,
+            "a committed receipt must not count as a failure"
+        );
+    }
+    if overlap {
         // The obsolete callback can now acquire the renewed owner.
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -2936,7 +2954,7 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
         wait_parent_bound_exit(pid).await;
         let query = if missing {
             format!(
-                "DELETE FROM {}.central_login_holders WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",
+                "UPDATE {}.central_login_holders SET deleted_at=clock_timestamp() WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)",
                 f.schema, f.schema
             )
         } else {
