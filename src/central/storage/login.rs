@@ -444,26 +444,36 @@ impl CentralStore {
         op: &mut LoginOperation,
         reporter: &str,
     ) -> Result<bool> {
+        self.take_failure(op, reporter, false).await
+    }
+
+    /// Claims only when the durable receipt proves no grant can still complete:
+    /// never a candidate or a verification, and polling only after proven absence.
+    pub(in crate::central) async fn login_take_grantless_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+    ) -> Result<bool> {
+        self.take_failure(op, reporter, true).await
+    }
+
+    async fn take_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+        grantless: bool,
+    ) -> Result<bool> {
         let db = self.login_db()?;
         let changed = bounded_db(async {
             Ok(db.client().await?.execute(
-                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','canceled') AND NOT failure_reported AND (holder_id=$5 OR (EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3) AND NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp())))",
-                &[&op.user,&op.id,&op.holder,&op.epoch,&reporter],
+                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','canceled') AND NOT failure_reported AND (holder_id=$5 OR (EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3) AND NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))) AND (NOT $6::boolean OR (phase NOT IN ('candidate','verifying') AND (phase NOT IN ('starting','pending') OR polling_clear)))",
+                &[&op.user,&op.id,&op.holder,&op.epoch,&reporter,&grantless],
             ).await? == 1)
         }).await?;
         if changed {
             op.failure_reported = true;
         }
         Ok(changed)
-    }
-
-    /// Claims only when the durable receipt proves no grant can still complete.
-    pub(in crate::central) async fn login_take_grantless_failure(
-        &self,
-        op: &mut LoginOperation,
-        reporter: &str,
-    ) -> Result<bool> {
-        self.login_take_failure(op, reporter).await
     }
 
     /// The supervisor reads durable cancellation without extending parent authority.
