@@ -35,6 +35,8 @@ pub(super) struct Billing {
     pub class: api::BillingClass,
     pub plan_type: Option<String>,
     pub usage: Option<crate::statusline::Usage>,
+    /// Highest use over every reported window; `None` when a window is malformed.
+    pub peak_used_percent: Option<f64>,
     pub age: Duration,
 }
 
@@ -286,7 +288,7 @@ pub(super) fn decide(
             return Err(Miss::EvidenceStale);
         }
         if billing.class == api::BillingClass::RateLimited
-            && !billing.usage.as_ref().is_some_and(below_ceiling)
+            && !billing.peak_used_percent.is_some_and(below_ceiling)
         {
             return Err(Miss::UsageHigh);
         }
@@ -300,12 +302,26 @@ pub(super) fn decide(
     Ok(token)
 }
 
-/// The highest use over every reported window is below the ceiling. A
-/// partial source reports no maximum, which is not proof of headroom.
-fn below_ceiling(usage: &crate::statusline::Usage) -> bool {
-    usage
-        .max_used_percent
-        .is_some_and(|used| used.is_finite() && (0.0..USAGE_CEILING_PERCENT).contains(&used))
+/// Use below the ceiling, as a finite percentage.
+fn below_ceiling(used: f64) -> bool {
+    used.is_finite() && (0.0..USAGE_CEILING_PERCENT).contains(&used)
+}
+
+/// The highest `usedPercent` over the reported windows of a native rate-limit
+/// read. A malformed window, or none at all, is not proof of headroom.
+pub(super) fn peak_used_percent(limits: &Value) -> Option<f64> {
+    let mut peak: Option<f64> = None;
+    for name in ["primary", "secondary"] {
+        let window = &limits["rateLimits"][name];
+        if window.is_null() {
+            continue;
+        }
+        let used = window["usedPercent"]
+            .as_f64()
+            .filter(|used| used.is_finite())?;
+        peak = Some(peak.map_or(used, |peak| peak.max(used)));
+    }
+    peak
 }
 
 #[cfg(test)]
@@ -370,6 +386,7 @@ mod tests {
             class,
             plan_type: Some("plus".into()),
             usage: Some(usage(primary)),
+            peak_used_percent: Some(primary),
             age: Duration::from_secs(5),
         }
     }
@@ -434,6 +451,27 @@ mod tests {
             )),
             Miss::Expiring
         );
+    }
+
+    #[test]
+    fn peak_use_covers_every_reported_window_and_fails_closed() {
+        let limits = |primary: Value, secondary: Value| json!({"rateLimits":{"primary":primary,"secondary":secondary}});
+        assert_eq!(
+            peak_used_percent(&limits(
+                json!({"usedPercent":20}),
+                json!({"usedPercent":91})
+            )),
+            Some(91.0)
+        );
+        assert_eq!(
+            peak_used_percent(&limits(json!({"usedPercent":20}), Value::Null)),
+            Some(20.0)
+        );
+        assert_eq!(
+            peak_used_percent(&limits(json!({"windowDurationMins":300}), Value::Null)),
+            None
+        );
+        assert_eq!(peak_used_percent(&limits(Value::Null, Value::Null)), None);
     }
 
     #[test]

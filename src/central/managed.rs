@@ -1930,6 +1930,7 @@ fn observation(
             class,
             plan_type: token.chatgpt_plan_type.clone(),
             usage: token.statusline_usage.clone(),
+            peak_used_percent: owner.limits.as_ref().and_then(fast_path::peak_used_percent),
             age: at.elapsed(),
         })
     });

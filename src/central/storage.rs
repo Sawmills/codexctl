@@ -264,6 +264,7 @@ CREATE TABLE IF NOT EXISTS central_token_evidence (
     usage_limit_reached BOOLEAN,
     usage_max_used_percent DOUBLE PRECISION,
     usage_present BOOLEAN NOT NULL DEFAULT false,
+    peak_used_percent DOUBLE PRECISION,
     billing_observed_at TIMESTAMPTZ,
     deleted_at TIMESTAMPTZ
 );
@@ -1979,7 +1980,7 @@ impl PostgresStore {
             "e.auth_revision,e.account_revision,e.routing_supported,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
             "e.billing_class,e.plan_type,e.usage_present,e.usage_weekly_used_percent,e.usage_weekly_resets_at,",
-            "e.usage_five_hour_used_percent,e.usage_five_hour_resets_at,e.usage_allowed,e.usage_limit_reached,e.usage_max_used_percent,",
+            "e.usage_five_hour_used_percent,e.usage_five_hour_resets_at,e.usage_allowed,e.usage_limit_reached,e.usage_max_used_percent,e.peak_used_percent,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
             "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
             "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id ",
@@ -2016,6 +2017,7 @@ impl PostgresStore {
                                 limit_reached: row.get("usage_limit_reached"),
                                 max_used_percent: row.get("usage_max_used_percent"),
                             }),
+                        peak_used_percent: row.get("peak_used_percent"),
                         age: age(seconds),
                     }),
                     _ => None,
@@ -2088,6 +2090,7 @@ async fn record_observation(
         "usage_allowed",
         "usage_limit_reached",
         "usage_max_used_percent",
+        "peak_used_percent",
         "billing_observed_at",
     ]
     .map(|column| {
@@ -2095,7 +2098,7 @@ async fn record_observation(
     })
     .join(",");
     let statement = format!(
-        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,usage_weekly_used_percent,usage_weekly_resets_at,usage_five_hour_used_percent,usage_five_hour_resets_at,usage_allowed,usage_limit_reached,usage_max_used_percent,usage_present,billing_observed_at,deleted_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CASE WHEN $15::bigint IS NULL THEN NULL ELSE clock_timestamp()-($15::bigint*interval '1 millisecond') END,NULL WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$16 AND epoch=$17 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,{billing_columns},usage_present=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.usage_present WHEN {KEEP} THEN central_token_evidence.usage_present ELSE false END,deleted_at=NULL"
+        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,usage_weekly_used_percent,usage_weekly_resets_at,usage_five_hour_used_percent,usage_five_hour_resets_at,usage_allowed,usage_limit_reached,usage_max_used_percent,usage_present,peak_used_percent,billing_observed_at,deleted_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$18,CASE WHEN $15::bigint IS NULL THEN NULL ELSE clock_timestamp()-($15::bigint*interval '1 millisecond') END,NULL WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$16 AND epoch=$17 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,{billing_columns},usage_present=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.usage_present WHEN {KEEP} THEN central_token_evidence.usage_present ELSE false END,deleted_at=NULL"
     );
     client
         .execute(
@@ -2118,6 +2121,7 @@ async fn record_observation(
                 &billing_age,
                 &lease.holder_id,
                 &lease.epoch,
+                &billing.and_then(|billing| billing.peak_used_percent),
             ],
         )
         .await?;
@@ -2229,6 +2233,7 @@ mod tests {
                 limit_reached: Some(false),
                 max_used_percent: Some(40.0),
             }),
+            peak_used_percent: Some(40.0),
             age: Duration::from_secs(1),
         };
         let observed = |auth: &str, routing: u64, billing: Option<Billing>| Observation {
