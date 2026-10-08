@@ -316,7 +316,7 @@ async fn streamed_rate_limit_events_are_left_to_codex() {
 }
 
 #[tokio::test]
-async fn exhausted_budget_lets_codex_stop_and_counts_once() {
+async fn exhausted_budget_lets_codex_stop_and_counts_each_streak_once() {
     let h = harness_with(
         vec![
             Scripted::Status(429, vec![], RATE_429.into()),
@@ -339,7 +339,8 @@ async fn exhausted_budget_lets_codex_stop_and_counts_once() {
             &metrics,
             "kind=\"rate_429\",model=\"gpt-6.1-sol\",account_class=\"included\",outcome=\"exhausted\""
         ),
-        1
+        2,
+        "each stop ends its streak; the next request is a resume"
     );
     assert_eq!(
         metric(

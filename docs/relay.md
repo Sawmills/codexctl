@@ -35,7 +35,8 @@ the account, or the auth headers, and it never resumes a goal.
 Delays double from 2 s up to 60 s, with jitter. Each Codex thread (`thread-id`
 header) has one failure streak. When a streak spends its budget, the relay passes the
 original failure through and removes any upstream `Retry-After`. Codex then stops, and
-the board resumes the lane.
+the board resumes the lane. A new streak starts when the error kind changes, after 120 s
+without a failure, or on the first failure after a stop (that request is a resume).
 
 | Error | Default budget | Flag |
 |---|---|---|

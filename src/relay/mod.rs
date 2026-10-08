@@ -295,7 +295,6 @@ impl Relay {
                 self.event(kind, labels, "exhausted", Some((attempt, None)), request_id);
                 None
             }
-            Advice::StillExhausted => None,
         }
     }
 
