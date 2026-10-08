@@ -55,12 +55,13 @@ spec:
               \if :migrated
               \echo '== lease fence (rollback step 3): must be 0'
               SELECT count(*) AS unreleased_leases FROM account_refresh_leases WHERE NOT released;
-              \echo '== login journals (rollback step 3 and HA-only credentials): every row needs action'
-              SELECT user_id, kind, phase, polling_clear, alias, landed_alias, account_id,
-                     candidate_workspace IS NOT NULL AS holds_candidate
+              \echo '== login journals (rollback step 3 and HA-only credentials): counts only, any row needs action'
+              SELECT kind, phase, polling_clear, candidate_workspace IS NOT NULL AS holds_candidate,
+                     count(*) AS operations
               FROM central_login_operations
               WHERE phase NOT IN ('failed', 'canceled') OR candidate_workspace IS NOT NULL
-              ORDER BY user_id, alias;
+              GROUP BY 1, 2, 3, 4
+              ORDER BY 1, 2, 3, 4;
               \else
               \echo '== not migrated: lease and login checks skipped'
               \endif
