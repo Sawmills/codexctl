@@ -16,6 +16,20 @@ Codex 0.161.0 stops a turn at once on two errors:
 The provider settings `request_max_retries` and `stream_max_retries` do not reach either
 error.
 
+## Codex versions
+
+The relay helps only where Codex honors retry advice. Each row was checked live with
+`tests/relay_codex_e2e.py`.
+
+| Codex           | HTTP 429                                     | Model at capacity |
+| --------------- | -------------------------------------------- | ----------------- |
+| 0.160.1         | Not covered: Codex treats every 429 as final | Covered           |
+| 0.161.0         | Covered                                      | Covered           |
+| 0.162.0-alpha.9 | Covered                                      | Covered           |
+
+Codex 0.160.1 ignores `Retry-After` on a 429 (`protocol/src/error.rs` at
+rust-v0.160.1). Run `codex --version` on the lane host before you opt a lane in.
+
 ## What it does
 
 The relay adds retry advice. Codex's own loop then retries and shows
