@@ -245,7 +245,11 @@ fn enable(
         connection,
         allow_billing,
         approved_plan: allow_billing
-            .then(|| token.chatgpt_plan_type.clone())
+            .then(|| {
+                claims(&token.access_token)
+                    .ok()
+                    .and_then(|claims| claims.plan)
+            })
             .flatten(),
         approved_class: allow_billing.then_some(token.billing_class).flatten(),
         allow_codex_version,
@@ -257,10 +261,18 @@ fn enable(
     // Journal first: if the write below never lands, the marker still exists,
     // so the guards hold and disable can undo what enable began.
     write_auth(&paths, &mut state, &account_id, &token.access_token)?;
-    record(&paths, &mut state, true, "written by enable")?;
-    if !no_agent {
-        install_agent()?;
+    if !no_agent && let Err(error) = install_agent() {
+        // A file with no refresh agent would expire unnoticed; say so.
+        let _ = remove_agent_file();
+        record(
+            &paths,
+            &mut state,
+            false,
+            &format!("agent not installed: {error:#}"),
+        )?;
+        return Err(error);
     }
+    record(&paths, &mut state, true, "written by enable")?;
     eprintln!(
         "codexctl: app-auth pinned ~/.codex to {} (plan {}); quit and reopen the desktop app",
         state.alias,
@@ -532,13 +544,18 @@ enum Approval<'a> {
 }
 
 /// The repository's billing rule: a billing token needs an approval that
-/// still names its plan and billing class.
-fn billing_approved(approval: &Approval, token: &TokenResponse) -> bool {
+/// still names its plan and billing class. The plan is the token's own JWT
+/// claim, which enable requires; an absent plan never matches.
+fn billing_approved(
+    approval: &Approval,
+    plan: Option<&str>,
+    class: Option<api::BillingClass>,
+) -> bool {
     match approval {
         Approval::None => false,
         Approval::Any => true,
-        Approval::Exact(plan, class) => {
-            **plan == token.chatgpt_plan_type && **class == token.billing_class
+        Approval::Exact(approved_plan, approved_class) => {
+            plan.is_some() && approved_plan.as_deref() == plan && **approved_class == class
         }
     }
 }
@@ -571,7 +588,7 @@ fn server_token(connection: &Connection, alias: &str, approval: Approval) -> Res
             "the server token for {alias} is below the minimum lifetime of {MIN_LIFETIME_SECONDS} s"
         );
     }
-    if !billing_approved(&approval, &token) {
+    if !billing_approved(&approval, claims.plan.as_deref(), token.billing_class) {
         launch::require_headroom(alias, &token)?;
         if token.billing_class != Some(api::BillingClass::RateLimited) {
             bail!(
@@ -734,7 +751,9 @@ fn install_agent() -> Result<()> {
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plist, agent_plist(&program, &log))?;
+    let temporary = plist.with_extension("plist.tmp");
+    std::fs::write(&temporary, agent_plist(&program, &log))?;
+    std::fs::rename(&temporary, &plist)?;
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     let _ = launchctl(&["bootout", &format!("{domain}/{AGENT_LABEL}")]);
     let output = launchctl(&["bootstrap", &domain, &plist.to_string_lossy()])?;
@@ -745,6 +764,13 @@ fn install_agent() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn remove_agent_file() -> Result<()> {
+    match std::fs::remove_file(agent_path()?) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Ok(()),
+    }
 }
 
 fn remove_agent() -> Result<()> {
@@ -767,28 +793,32 @@ fn remove_agent() -> Result<()> {
 mod tests {
     use super::*;
 
-    fn token(plan: &str, class: api::BillingClass) -> TokenResponse {
-        serde_json::from_value(serde_json::json!({
-            "accessToken": "a.b.c", "chatgptAccountId": "seat",
-            "chatgptPlanType": plan, "revision": "r", "billingClass": class,
-        }))
-        .unwrap()
-    }
-
     #[test]
     fn billing_approval_holds_only_while_plan_and_class_match() {
-        use api::BillingClass::UsageBased;
-        let approved = token("team", UsageBased);
+        use api::BillingClass::{RateLimited, UsageBased};
         let plan = Some("team".to_owned());
         let class = Some(UsageBased);
-        assert!(billing_approved(&Approval::Exact(&plan, &class), &approved));
+        let exact = Approval::Exact(&plan, &class);
+        assert!(billing_approved(&exact, Some("team"), Some(UsageBased)));
+        assert!(!billing_approved(&exact, Some("pro"), Some(UsageBased)));
+        assert!(!billing_approved(&exact, Some("team"), Some(RateLimited)));
+        // Two absent plans never prove the approval still holds.
+        let none = None;
         assert!(!billing_approved(
-            &Approval::Exact(&plan, &class),
-            &token("pro", UsageBased)
+            &Approval::Exact(&none, &class),
+            None,
+            Some(UsageBased)
         ));
-        assert!(!billing_approved(&Approval::Exact(&plan, &None), &approved));
-        assert!(!billing_approved(&Approval::None, &approved));
-        assert!(billing_approved(&Approval::Any, &approved));
+        assert!(!billing_approved(
+            &Approval::None,
+            Some("team"),
+            Some(UsageBased)
+        ));
+        assert!(billing_approved(
+            &Approval::Any,
+            Some("team"),
+            Some(UsageBased)
+        ));
     }
 
     fn jwt(subject: &str) -> String {
