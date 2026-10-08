@@ -210,7 +210,8 @@ fn enable(
     // Take the locks `use`, activation, and recovery write under, in their
     // order, and recheck: one of them may have changed ~/.codex meanwhile.
     let _native = native_lock(&root()?)?;
-    let _store = store::try_lock(&config::default_paths()?)?
+    let store_paths = config::default_paths()?;
+    let store_lock = store::try_lock(&store_paths)?
         .context("local account store is busy; retry app-auth enable")?;
     preconditions()?;
     let previous = paths
@@ -220,10 +221,23 @@ fn enable(
         .transpose()?;
     // Keep the digest of the file on disk until the new write is confirmed;
     // a failed re-enable must still recognize the previous app-auth file.
-    let previous_written = previous.as_ref().and_then(|state| state.written.clone());
+    // The bytes on disk may be recognized through either digest of the
+    // previous state; carry the one that matches them.
+    let previous_written = match &previous {
+        Some(state) if file_state(&paths, Some(state))? == FileState::Ours => {
+            Some(vault::digest(&std::fs::read(paths.auth())?))
+        }
+        Some(state) => state.written.clone(),
+        None => None,
+    };
     let backup_account = match previous {
         Some(state) => state.backup_account,
-        None => back_up_login(&paths)?,
+        None => {
+            // The live file is a real login Codex rotates in place; fold its
+            // tokens into the owning profile first, as every switch does.
+            crate::profile::capture_live_tokens_locked(&store_lock, &store_paths);
+            back_up_login(&paths)?
+        }
     };
     let account_id = connection.account_id.clone();
     let mut state = State {
@@ -381,7 +395,7 @@ fn disable(restore_login: bool) -> Result<()> {
             eprintln!("codexctl: restored the login app-auth backed up");
         } else {
             eprintln!(
-                "codexctl: the backed-up login is a server account; kept at {} (use --restore-login to restore it)",
+                "codexctl: the server holds an account in the backed-up login's workspace; kept at {} (use --restore-login to restore it)",
                 backup.display()
             );
         }
