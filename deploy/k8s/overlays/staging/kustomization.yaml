@@ -21,3 +21,8 @@ patches:
       kind: StatefulSet
       name: codexctl
       namespace: codexctl
+# B33 attempt 3, PR W: stop the file writer. The PVC stays; reverting this
+# PR returns codexctl-0 on the same state before PR H merges.
+replicas:
+  - name: codexctl
+    count: 0
