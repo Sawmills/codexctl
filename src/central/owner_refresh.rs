@@ -269,6 +269,15 @@ mod tests {
         assert!(!safe.contains(jwt), "{safe}");
         assert!(!safe.contains(&"A".repeat(40)), "{safe}");
         assert!(safe.contains("[redacted]"));
+        // Short prefixed tokens below the 40-character arm are caught too.
+        for short in [
+            "sk-abcdefghijklmnop12",
+            "rt_0123456789abcdefXY",
+            "at-ABCDEFGHIJKLMNOPQR",
+        ] {
+            let safe = redact(&format!("ERROR x: token {short} rejected"));
+            assert!(!safe.contains(short), "{short} leaked: {safe}");
+        }
         assert!(safe.chars().count() <= MAX_LINE_CHARS + 1, "{}", safe.len());
         assert!(redact(REUSED_TEXT).contains("refresh_token_reused"));
     }

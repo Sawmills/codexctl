@@ -283,6 +283,53 @@ The target uses a **PostgreSQL per-account lease with a fencing epoch**:
    or changing the refresh owner. This prevents a renewal or reset from racing a
    refresh and preserves the existing identity and idempotency fences.
 
+### Valid-token fast path (layout 8)
+
+Item 3 ships behind `CODEXCTL_CENTRAL_TOKEN_FAST_PATH=1`, in PostgreSQL mode
+only; dual and file mode keep the lease path. Without the flag, every token
+request takes the lease and starts a native child, as before. With it, any
+replica serves the committed token without the lease or a child when all of
+these hold:
+
+- The access token expires at least one hour after the database clock, which
+  leaves early-refresh time during an OpenAI auth outage.
+- The request is not a forced refresh: `previousRevision` is absent or names an
+  older revision.
+- `central_token_evidence` holds evidence for this exact auth digest and integer
+  account revision, observed at most 60 s ago, with a completed routing check.
+- A `billing` request has billing evidence of the same age. A rate-limited
+  account is served only while every window is below 90% used; otherwise the
+  request takes a live read. Usage-based and unknown classes may be served,
+  because the client refuses them.
+- The row is not tombstoned, carries the requested user and alias, matches a
+  requested `accountId`, is verified, and no login journal or identity
+  reservation fences it (the same predicate as the lease claim). A locally
+  fenced owner also takes the lease path. A busy local owner hides its fence,
+  so the request waits for the owner lock and re-checks there. Any failed
+  lease-path read tombstones the account's evidence, so no replica serves it until the lease path
+  observes the account again. If that update fails three times, the failure is
+  counted as `token_evidence_clear_failed`, and the old evidence still expires
+  within 60 s.
+
+The lease path publishes the evidence in the same `fenced_write` transaction as
+the credential, under the valid-lease predicate, also when the credential is
+unchanged. Its observation time is the database clock minus the time since the
+child read. A request that meets another replica's live lease drops its owner
+lock, import guard, and work permit, then polls the account revision with
+jittered backoff (50 ms to 1 s) for up to 15 s: a new revision is served through
+the fast path, a released lease is taken, and a timeout returns
+`refresh_in_progress`.
+
+`/metrics` reports `codexctl_central_token_fast_path_total{result}` for every
+decision and `codexctl_central_lease_waits_total{outcome="committed|acquired|timeout|refused"}`
+with `codexctl_central_lease_wait_seconds_sum` and `_count`. The staging
+PrometheusRule alerts on lease-wait timeouts and on the `owner_unavailable`
+rate; both carry `severity: warning` and route to the `warnings-slack` receiver.
+
+Layout 8 adds `central_token_evidence`. A layout-7 binary refuses to start on a
+layout-8 database, so roll every replica onto the layout-8 image before turning
+the flag on; the flag only takes effect where every writer publishes evidence.
+
 Lease parameters should be measured in staging; an initial proposal is a 15 s
 lease, renewal every 5 s, and a 55 s request deadline. The 60 s outage objective
 then leaves time for one failed pod, lease expiry, new acquisition, and a retry.

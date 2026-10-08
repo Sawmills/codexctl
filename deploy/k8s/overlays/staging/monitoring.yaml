@@ -22,7 +22,7 @@ spec:
             description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlCredentialOperationFailed
-          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
+          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected|token_evidence_clear_failed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
           for: 0m
           labels:
             severity: warning
@@ -32,11 +32,33 @@ spec:
             summary: Codexctl account operation failed
             description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+        - alert: CodexctlTokenLeaseWaitTimeouts
+          expr: sum(increase(codexctl_central_lease_waits_total{outcome="timeout"}[15m])) > 3
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl token requests time out waiting for an account lease
+            description: More than three token requests failed with refresh_in_progress after waiting 15 seconds for another replica's lease in 15 minutes. Check lease holders and stuck refresh children.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+        - alert: CodexctlOwnerUnavailableRate
+          expr: sum(increase(codexctl_central_failed_requests_total{reason="owner_unavailable"}[15m])) > 5
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl token requests keep failing with owner_unavailable
+            description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
         # SAW-12651: the first rejected refresh grant per account, before token
         # requests start failing with owner_unavailable. The `unless offset`
         # branch fires on a new series, which increase() cannot see.
-        # Routed by severity to the default staging receiver warnings-slack
-        # (#warning-alerts) in infra helm-charts/prometheus/staging/values.yaml.
+        # Routed to warnings-slack (#warning-alerts) by a per-account route in
+        # infra helm-charts/prometheus/staging/values.yaml.
         - alert: CodexctlOwnerRefreshRejected
           expr: |
             (increase(codexctl_central_owner_refresh_failed_total[10m]) > 0)

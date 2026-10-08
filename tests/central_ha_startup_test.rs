@@ -52,7 +52,11 @@ impl Pod {
         for name in ["count", "launch-count"] {
             store::atomic_write(&root.path().join(name), b"0").unwrap();
         }
-        let mut child = command(database, &state, key, "serve")
+        let mut command = command(database, &state, key, "serve");
+        if root.path().join("fast-path").exists() {
+            command.env("CODEXCTL_CENTRAL_TOKEN_FAST_PATH", "1");
+        }
+        let mut child = command
             .env("CODEXCTL_CENTRAL_STORE", mode)
             .env(
                 "CODEXCTL_CENTRAL_BACKGROUND_RECOVERY",
@@ -3231,6 +3235,355 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
         login_request(&f, &f.second, "cancel", &fresh).await;
         stop_fixture(f).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn enable_fast_path(mut f: LoginFixture) -> LoginFixture {
+    f.first.stop().await;
+    store::atomic_write(&f.first.root.path().join("fast-path"), b"1").unwrap();
+    f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
+    f.second.stop().await;
+    store::atomic_write(&f.second.root.path().join("fast-path"), b"1").unwrap();
+    f.second = Pod::spawn(&f.database, &f.key, f.second.root, "postgres").await;
+    f
+}
+
+#[cfg(target_os = "linux")]
+async fn metric(f: &LoginFixture, pod: &Pod, series: &str) -> u64 {
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", pod.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    metrics
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+const SERVED: &str = "codexctl_central_token_fast_path_total{result=\"served\"}";
+#[cfg(target_os = "linux")]
+const OWNER_UNAVAILABLE: &str =
+    "codexctl_central_failed_requests_total{reason=\"owner_unavailable\"}";
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_path_serves_a_valid_token_without_the_lease_or_a_child() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let first: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(f.first.launches(), 1);
+    let response = request(&f.http, &f.second, &f.token).await;
+    assert_eq!(response.status(), 200);
+    let second: Value = response.json().await.unwrap();
+    assert_eq!(second["revision"], first["revision"]);
+    assert_eq!(second["billingClass"], first["billingClass"]);
+    assert_eq!(second["nativeRoutingSupported"], true);
+    assert_eq!(f.second.launches(), 0, "a valid token needs no child");
+    assert_eq!(metric(&f, &f.second, SERVED).await, 1);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_path_serves_while_another_replica_holds_the_lease() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let previous = warm["revision"].as_str().unwrap().to_owned();
+    let holder = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true,"previousRevision":previous}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forced refresh must hold the lease");
+    let started = std::time::Instant::now();
+    let response = request(&f.http, &f.second, &f.token).await;
+    assert_eq!(response.status(), 200);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let served: Value = response.json().await.unwrap();
+    assert_eq!(served["revision"], warm["revision"]);
+    assert_eq!(f.second.launches(), 0);
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"go").unwrap();
+    assert_eq!(holder.await.unwrap().status(), 200);
+    for pod in [&f.first, &f.second] {
+        assert_eq!(metric(&f, pod, OWNER_UNAVAILABLE).await, 0);
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_lease_loser_serves_the_holders_committed_revision() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let previous = warm["revision"].as_str().unwrap().to_owned();
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let holder = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        let previous = previous.clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true,"previousRevision":previous}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forced refresh must hold the lease");
+    // The same rejected revision on the second replica waits for the holder.
+    let loser = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.second.url.clone();
+        let token = f.token.clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true,"previousRevision":previous}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!loser.is_finished(), "the loser must wait, not fail");
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"go").unwrap();
+    let committed: Value = holder.await.unwrap().json().await.unwrap();
+    let response = loser.await.unwrap();
+    assert_eq!(response.status(), 200);
+    let served: Value = response.json().await.unwrap();
+    assert_eq!(served["revision"], committed["revision"]);
+    assert_ne!(served["revision"], warm["revision"]);
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "the loser serves the holder's commit"
+    );
+    assert_eq!(
+        metric(
+            &f,
+            &f.second,
+            "codexctl_central_lease_waits_total{outcome=\"committed\"}"
+        )
+        .await,
+        1
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_path_refuses_a_nearly_spent_rate_limited_account() {
+    let f = enable_fast_path(login_fixture().await).await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"used-95").unwrap();
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(warm["billingClass"], "rate_limited");
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    assert_eq!(f.second.launches(), 1, "95% use needs a live billing read");
+    assert_eq!(
+        metric(
+            &f,
+            &f.second,
+            "codexctl_central_token_fast_path_total{result=\"usage_high\"}"
+        )
+        .await,
+        1
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_path_refuses_stale_evidence() {
+    let f = enable_fast_path(login_fixture().await).await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_token_evidence SET routing_observed_at=clock_timestamp()-interval '61 seconds',billing_observed_at=clock_timestamp()-interval '61 seconds'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    assert_eq!(f.second.launches(), 1);
+    assert_eq!(
+        metric(
+            &f,
+            &f.second,
+            "codexctl_central_token_fast_path_total{result=\"evidence_stale\"}"
+        )
+        .await,
+        1
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_failed_lease_read_clears_evidence_for_every_replica() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    // The next native read on the first replica refuses native routing.
+    store::atomic_write(&f.first.root.path().join("mode"), b"non-exportable").unwrap();
+    let refused = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":warm["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!refused.status().is_success());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    assert_eq!(f.second.launches(), 1, "refused evidence must not serve");
+    assert_eq!(metric(&f, &f.second, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_busy_local_owner_cannot_hide_a_failing_read() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    // The holder's native start fails once it is released.
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold-error").unwrap();
+    let holder = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        let previous = warm["revision"].clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true,"previousRevision":previous}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forced refresh must hold the local owner");
+    // A request on the same replica must not use the old evidence while the
+    // owner it would fence is busy.
+    let contender = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !contender.is_finished(),
+        "a busy local owner must not let the old evidence serve"
+    );
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"go").unwrap();
+    assert!(!holder.await.unwrap().status().is_success());
+    assert!(!contender.await.unwrap().status().is_success());
+    assert_eq!(metric(&f, &f.first, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_fast_path_never_serves_a_fenced_account() {
+    let f = enable_fast_path(login_fixture().await).await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let account = account_key("test", "seat");
+    // A foreign refresh owner keeps the renewal at its durable candidate.
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) VALUES($1,'foreign-settling',41,clock_timestamp()-interval '1 second',false) ON CONFLICT(account_id) DO UPDATE SET holder_id='foreign-settling',epoch=41,expires_at=clock_timestamp()-interval '1 second',released=false",f.schema), &[&account]).await.unwrap();
+    let id = "e5".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(
+        metric(
+            &f,
+            &f.second,
+            "codexctl_central_token_fast_path_total{result=\"fenced\"}"
+        )
+        .await,
+        1
+    );
+    login_request(&f, &f.first, "cancel", &id).await;
+    stop_fixture(f).await;
 }
 
 #[tokio::test]
@@ -6795,7 +7148,7 @@ async fn postgres_older_reader_refuses_a_newer_schema_before_native_startup() {
     f.control
         .execute(
             &format!(
-                "INSERT INTO {}.central_schema_migrations(version) VALUES(8)",
+                "INSERT INTO {}.central_schema_migrations(version) VALUES(9)",
                 f.schema
             ),
             &[],
@@ -6828,7 +7181,7 @@ async fn postgres_older_reader_refuses_a_newer_schema_before_native_startup() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("schema v8 is newer than this binary; upgrade codexctl-central")
+            .contains("schema v9 is newer than this binary; upgrade codexctl-central")
     );
     assert_eq!(f.first.launches(), 0);
     stop_fixture(f).await;

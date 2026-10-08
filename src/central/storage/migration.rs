@@ -2,7 +2,7 @@
 use super::*;
 use tokio_postgres::Row;
 
-pub(super) const READY_VERSION: i32 = 7;
+pub(super) const READY_VERSION: i32 = 8;
 const BATCH_ROWS: usize = 32;
 const BATCH_BYTES: usize = 8 * 1024 * 1024;
 const INVENTORY_ROWS: i64 = 5_000;

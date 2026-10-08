@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TokenRequest {
     pub previous_revision: Option<String>,
