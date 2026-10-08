@@ -931,7 +931,13 @@ mod tests {
                 .is_err()
         );
         assert!(shared.login_heartbeat(&stale).await.is_err());
-        assert!(shared.login_account_lease(&stale).await.unwrap().is_none());
+        assert!(
+            shared
+                .login_account_lease(&stale, &stale.holder)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!shared.login_heartbeat(&op).await.unwrap());
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
