@@ -2,13 +2,13 @@ apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
   namespace: codexctl
-  name: codexctl
+  name: codexctl-ha
   labels:
     release: kube-prometheus
     environment: staging
 spec:
   groups:
-    - name: codexctl
+    - name: codexctl-ha
       rules:
         - alert: CodexctlBrokerUnavailable
           expr: up{namespace="codexctl",service="codexctl"} == 0 or absent(up{namespace="codexctl",service="codexctl"})
@@ -19,19 +19,8 @@ spec:
             environment: staging
           annotations:
             summary: Codexctl token server is unavailable
-            description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
-            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
-        - alert: CodexctlCredentialOperationFailed
-          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
-          for: 0m
-          labels:
-            severity: warning
-            service: codexctl
-            environment: staging
-          annotations:
-            summary: Codexctl account operation failed
-            description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
-            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+            description: Check the HA pods, SSO configuration, database health, and ExternalSecret.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
         - alert: CodexctlRelayCapacityExhausted
           expr: sum(increase(codexctl_central_relay_capacity_events_total{outcome="exhausted"}[15m])) > 0
           for: 0m
@@ -44,17 +33,15 @@ spec:
             description: A relay lane exhausted its retry budget in the last 15 minutes. The advised outcome is intentionally excluded because it is still retrying without operator action.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
 ---
-# The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports
-# credentials and pod discovery, so every broker replica is scraped directly.
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: ScrapeConfig
 metadata:
   namespace: codexctl
-  name: codexctl
+  name: codexctl-ha
   labels:
     release: kube-prometheus
 spec:
-  jobName: codexctl
+  jobName: codexctl-ha
   metricsPath: /metrics
   scrapeInterval: 30s
   scrapeTimeout: 5s
@@ -72,6 +59,9 @@ spec:
     - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
       action: keep
       regex: codexctl
+    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+      action: keep
+      regex: broker-ha
     - sourceLabels: [__meta_kubernetes_pod_container_port_name]
       action: keep
       regex: http

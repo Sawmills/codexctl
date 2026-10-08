@@ -96,4 +96,17 @@ codexctl_relay_capacity_events_total{kind,model,account_class,outcome}
   output), `exhausted` (one per streak that spent its budget), or
   `terminal_passthrough`.
 
-This is instrumentation only. No alert reads it yet.
+The relay also sends the four labels to the authenticated central endpoint
+`/v1/relay/capacity-events`. The relay uses a bounded queue and drops an event when
+central is unavailable or the queue is full; `codexctl_relay_central_dropped_total`
+records each reason. The central server exports
+`codexctl_central_relay_capacity_events_total` and rejects unknown labels or an
+over-limit device with HTTP 400 or 429.
+
+The staging and staging-ha Prometheus rules alert on one exhausted event in a 15-minute
+window. They intentionally exclude `advised`: that outcome means the relay is still
+retrying and does not need operator action. Alerts carry `severity=warning` and
+`service=codexctl`; the existing Alertmanager `warnings-slack` receiver routes them to
+`#warning-alerts`. Validate that route with
+`amtool config routes test --config.file deploy/monitoring/alertmanager-route.test.yml
+severity=warning service=codexctl`; it must print `warnings-slack`.

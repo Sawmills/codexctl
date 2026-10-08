@@ -27,7 +27,10 @@ use axum::{
     routing::get,
 };
 use futures::{Stream, StreamExt};
+use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 
 use policy::{Advice, Http429, Kind, Streaks};
 
@@ -51,6 +54,21 @@ pub const DEFAULT_OVERLOADED_BUDGET: Duration = Duration::from_secs(600);
 type Log = Arc<dyn Fn(&str) + Send + Sync>;
 /// kind, model, account class, outcome.
 type MetricKey = (&'static str, String, &'static str, &'static str);
+const CENTRAL_EVENT_QUEUE_CAPACITY: usize = 256;
+const CENTRAL_EVENT_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+const RELAY_KNOWN_MODELS: &[&str] = &[
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5.3",
+    "gpt-5.4",
+    "gpt-6",
+    "gpt-6.1",
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+];
 
 /// Relay settings. Build with [`RelayConfig::new`].
 pub struct RelayConfig {
@@ -58,6 +76,7 @@ pub struct RelayConfig {
     rate_budget: Duration,
     overloaded_budget: Duration,
     log: Log,
+    central: Option<CentralReporter>,
 }
 
 impl RelayConfig {
@@ -77,6 +96,7 @@ impl RelayConfig {
             rate_budget: DEFAULT_RATE_BUDGET,
             overloaded_budget: DEFAULT_OVERLOADED_BUDGET,
             log: Arc::new(|line| eprintln!("{line}")),
+            central: None,
         })
     }
 
@@ -92,6 +112,87 @@ impl RelayConfig {
         self.log = Arc::new(log);
         self
     }
+
+    /// Reports bounded capacity events to an authenticated account server.
+    pub fn with_central_reporter(mut self, server: &str, token: &str) -> Result<Self> {
+        self.central = Some(CentralReporter::new(server, token)?);
+        Ok(self)
+    }
+
+    pub(crate) fn with_active_central_reporter(mut self) -> Self {
+        let connection = crate::central::remote::connection().ok().flatten();
+        if let Some(connection) = connection {
+            match crate::central::remote::secret(&connection)
+                .and_then(|token| CentralReporter::new(&connection.server, &token))
+            {
+                Ok(reporter) => self.central = Some(reporter),
+                Err(error) => eprintln!("relay central reporter disabled: {error:#}"),
+            }
+        }
+        self
+    }
+}
+
+#[derive(Clone)]
+struct CentralReporter {
+    endpoint: String,
+    token: String,
+    client: reqwest::Client,
+}
+
+impl CentralReporter {
+    fn new(server: &str, token: &str) -> Result<Self> {
+        let mut url = reqwest::Url::parse(server.trim_end_matches('/'))?;
+        let host = url.host_str().context("central reporter needs a host")?;
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback());
+        if !matches!(url.scheme(), "http" | "https") {
+            bail!("central reporter needs an HTTP(S) server URL");
+        }
+        if url.scheme() == "http" && !loopback {
+            bail!("central reporter requires HTTPS except for loopback tests");
+        }
+        url.set_path(&format!(
+            "{}/v1/relay/capacity-events",
+            url.path().trim_end_matches('/')
+        ));
+        Ok(Self {
+            endpoint: url.to_string(),
+            token: token.to_owned(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_millis(100))
+                .build()
+                .context("could not build central reporter client")?,
+        })
+    }
+
+    async fn send(&self, event: &CapacityEvent) -> Result<()> {
+        let response = tokio::time::timeout(
+            CENTRAL_EVENT_SEND_TIMEOUT,
+            self.client
+                .post(&self.endpoint)
+                .bearer_auth(&self.token)
+                .json(event)
+                .send(),
+        )
+        .await
+        .context("central event report timed out")??;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            bail!("central event report rejected with {}", response.status())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct CapacityEvent {
+    kind: String,
+    model: String,
+    account_class: String,
+    outcome: String,
 }
 
 #[derive(Clone)]
@@ -100,8 +201,9 @@ struct Relay {
     client: reqwest::Client,
     streaks: Arc<Mutex<Streaks>>,
     counts: Arc<Mutex<BTreeMap<MetricKey, u64>>>,
-    model_labels: Arc<Mutex<Vec<String>>>,
     log: Log,
+    central_events: Option<mpsc::Sender<CapacityEvent>>,
+    central_dropped: Arc<Mutex<BTreeMap<&'static str, u64>>>,
 }
 
 /// Serves until `shutdown` completes, then drains open responses.
@@ -121,6 +223,25 @@ pub async fn serve(
         .connect_timeout(Duration::from_secs(30))
         .build()
         .context("could not build relay HTTP client")?;
+    let central_dropped = Arc::new(Mutex::new(BTreeMap::new()));
+    let (central_events, central_worker) = if let Some(reporter) = config.central {
+        let (sender, mut receiver) = mpsc::channel(CENTRAL_EVENT_QUEUE_CAPACITY);
+        let dropped = central_dropped.clone();
+        let worker = tokio::spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                if reporter.send(&event).await.is_err() {
+                    *dropped
+                        .lock()
+                        .expect("central drop metric lock")
+                        .entry("send_failed")
+                        .or_default() += 1;
+                }
+            }
+        });
+        (Some(sender), Some(worker))
+    } else {
+        (None, None)
+    };
     let relay = Relay {
         upstream: config.upstream.into(),
         client,
@@ -129,8 +250,9 @@ pub async fn serve(
             config.overloaded_budget,
         ))),
         counts: Arc::default(),
-        model_labels: Arc::default(),
         log: config.log,
+        central_events,
+        central_dropped,
     };
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
@@ -141,7 +263,11 @@ pub async fn serve(
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await
-        .context("relay stopped")
+        .context("relay stopped")?;
+    if let Some(worker) = central_worker {
+        worker.await.context("central reporter task panicked")?;
+    }
+    Ok(())
 }
 
 struct Labels {
@@ -380,6 +506,36 @@ impl Relay {
                 outcome,
             ))
             .or_default() += 1;
+        let report = CapacityEvent {
+            kind: kind.label().into(),
+            model: labels.model.clone(),
+            account_class: labels.account_class.into(),
+            outcome: outcome.into(),
+        };
+        match &self.central_events {
+            Some(sender) => {
+                if let Err(error) = sender.try_send(report) {
+                    let reason = match error {
+                        TrySendError::Full(_) => "queue_full",
+                        TrySendError::Closed(_) => "connection_closed",
+                    };
+                    *self
+                        .central_dropped
+                        .lock()
+                        .expect("central drop metric lock")
+                        .entry(reason)
+                        .or_default() += 1;
+                }
+            }
+            None => {
+                *self
+                    .central_dropped
+                    .lock()
+                    .expect("central drop metric lock")
+                    .entry("no_connection")
+                    .or_default() += 1;
+            }
+        }
         let line = json!({
             "ts": chrono::Utc::now().to_rfc3339(),
             "component": "codexctl-relay",
@@ -395,7 +551,7 @@ impl Relay {
         (self.log)(&line.to_string());
     }
 
-    /// A bounded model label: one of at most 16 `gpt-` names seen, else `other`.
+    /// A bounded model label from the fixed central allowlist, else `other`.
     fn model_label(&self, headers: &HeaderMap, prefix: &[u8]) -> String {
         static MODEL: std::sync::OnceLock<regex::bytes::Regex> = std::sync::OnceLock::new();
         let pattern = MODEL.get_or_init(|| {
@@ -412,18 +568,9 @@ impl Relay {
                         b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
                     })
             });
-        let Some(model) = model else {
-            return "other".into();
-        };
-        let mut labels = self.model_labels.lock().expect("model label lock");
-        if labels.contains(&model) {
-            return model;
-        }
-        if labels.len() >= 16 {
-            return "other".into();
-        }
-        labels.push(model.clone());
         model
+            .filter(|model| RELAY_KNOWN_MODELS.contains(&model.as_str()))
+            .unwrap_or_else(|| "other".into())
     }
 }
 
@@ -679,6 +826,17 @@ async fn metrics(State(relay): State<Relay>) -> Response {
             "codexctl_relay_capacity_events_total{{kind=\"{kind}\",model=\"{model}\",account_class=\"{account_class}\",outcome=\"{outcome}\"}} {count}\n"
         ));
     }
+    out.push_str("# TYPE codexctl_relay_central_dropped_total counter\n");
+    for (reason, count) in relay
+        .central_dropped
+        .lock()
+        .expect("central drop metric lock")
+        .iter()
+    {
+        out.push_str(&format!(
+            "codexctl_relay_central_dropped_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
     (
         [(
             HeaderName::from_static("content-type"),
@@ -691,4 +849,51 @@ async fn metrics(State(relay): State<Relay>) -> Response {
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn central_queue_full_is_counted_without_blocking_the_relay() {
+        let (sender, _receiver) = mpsc::channel(CENTRAL_EVENT_QUEUE_CAPACITY);
+        let dropped = Arc::new(Mutex::new(BTreeMap::new()));
+        let relay = Relay {
+            upstream: Arc::from("http://127.0.0.1:1"),
+            client: reqwest::Client::new(),
+            streaks: Arc::new(Mutex::new(Streaks::new(
+                DEFAULT_RATE_BUDGET,
+                DEFAULT_OVERLOADED_BUDGET,
+            ))),
+            counts: Arc::default(),
+            log: Arc::new(|_| {}),
+            central_events: Some(sender),
+            central_dropped: dropped.clone(),
+        };
+        let labels = Labels {
+            thread: "thread".into(),
+            model: "gpt-6.1-sol".into(),
+            account_class: "included",
+        };
+
+        for _ in 0..=CENTRAL_EVENT_QUEUE_CAPACITY {
+            relay.event(Kind::Rate429, &labels, "advised", None, None);
+        }
+
+        assert_eq!(
+            dropped
+                .lock()
+                .expect("central drop metric lock")
+                .get("queue_full"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn central_reporter_requires_tls_for_non_loopback_servers() {
+        assert!(CentralReporter::new("http://central.example", "token").is_err());
+        assert!(CentralReporter::new("https://central.example", "token").is_ok());
+        assert!(CentralReporter::new("http://127.0.0.1:8787", "token").is_ok());
+    }
 }

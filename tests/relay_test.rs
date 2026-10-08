@@ -13,7 +13,7 @@ use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     response::Response,
     routing::post,
 };
@@ -123,6 +123,20 @@ struct Harness {
     client: reqwest::Client,
 }
 
+#[derive(Clone)]
+struct CentralSink {
+    events: mpsc::Sender<(HeaderMap, Bytes)>,
+}
+
+async fn central_capacity_event(
+    State(sink): State<CentralSink>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    sink.events.send((headers, body)).await.unwrap();
+    StatusCode::NO_CONTENT
+}
+
 async fn harness(script: Vec<Scripted>) -> Harness {
     harness_with(script, |config| config).await
 }
@@ -165,14 +179,110 @@ async fn harness_with(
     }
 }
 
+#[tokio::test]
+async fn central_report_contains_only_the_four_metric_labels() {
+    let (events, mut received) = mpsc::channel(1);
+    let sink = CentralSink { events };
+    let app = Router::new()
+        .route("/v1/relay/capacity-events", post(central_capacity_event))
+        .with_state(sink);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| {
+            config
+                .with_central_reporter(&central_url, "central-test-token")
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(
+        h.post_model("thread-hidden-from-central", "gpt-future-private")
+            .await
+            .status(),
+        429
+    );
+
+    let (headers, body) = tokio::time::timeout(Duration::from_secs(1), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok()),
+        Some("Bearer central-test-token")
+    );
+    let event: Value = serde_json::from_slice(&body).unwrap();
+    let object = event.as_object().unwrap();
+    assert_eq!(object.len(), 4, "central payload: {event}");
+    for label in ["kind", "model", "account_class", "outcome"] {
+        assert!(object.contains_key(label), "central payload: {event}");
+    }
+    assert_eq!(event["model"], "other");
+    assert!(!object.contains_key("thread_id"));
+    assert!(!object.contains_key("request_id"));
+}
+
+#[tokio::test]
+async fn unreachable_central_does_not_add_request_latency() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| {
+            config
+                .with_central_reporter(&central_url, "central-test-token")
+                .unwrap()
+        },
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let response = tokio::time::timeout(Duration::from_millis(500), h.post("latency"))
+        .await
+        .expect("central reporting must not block the relay");
+    assert_eq!(response.status(), 429);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "request waited for unreachable central: {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn unknown_models_use_the_other_metric_label() {
+    let h = harness(vec![Scripted::Status(429, vec![], RATE_429.into())]).await;
+    assert_eq!(
+        h.post_model("unknown-model", "gpt-future-private")
+            .await
+            .status(),
+        429
+    );
+    assert!(
+        h.metrics()
+            .await
+            .contains("model=\"other\",account_class=\"included\""),
+        "unknown model must be normalized in relay metrics"
+    );
+}
+
 impl Harness {
     async fn post(&self, thread: &str) -> reqwest::Response {
+        self.post_model(thread, "gpt-6.1-sol").await
+    }
+
+    async fn post_model(&self, thread: &str, model: &str) -> reqwest::Response {
         self.client
             .post(format!("{}/backend-api/codex/responses", self.relay_url))
             .header("authorization", "Bearer synthetic-secret-token")
             .header("thread-id", thread)
             .header("x-codexctl-account-class", "included")
-            .json(&json!({"model": "gpt-6.1-sol", "input": "synthetic-body-marker"}))
+            .json(&json!({"model": model, "input": "synthetic-body-marker"}))
             .send()
             .await
             .unwrap()

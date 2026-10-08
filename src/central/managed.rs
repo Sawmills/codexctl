@@ -5,7 +5,7 @@ use super::{
     catalog, enrollment, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest, TokenResponse},
-    storage::{CentralStore, CredentialRecord},
+    storage::{CentralStore, CredentialRecord, StoreMode},
     transport,
     vault::{self, Vault},
 };
@@ -119,6 +119,99 @@ pub(super) struct AccountIndex {
     pub(super) alias: String,
 }
 type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
+
+const RELAY_EVENT_BUCKET_CAPACITY: f64 = 32.0;
+const RELAY_EVENT_BUCKET_REFILL_PER_SECOND: f64 = 1.0;
+const RELAY_EVENT_KINDS: &[&str] = &["rate_429", "overloaded"];
+const RELAY_EVENT_ACCOUNT_CLASSES: &[&str] = &["included", "credit", "unknown"];
+const RELAY_EVENT_OUTCOMES: &[&str] =
+    &["advised", "recovered", "exhausted", "terminal_passthrough"];
+const RELAY_KNOWN_MODELS: &[&str] = &[
+    "gpt-5",
+    "gpt-5.1",
+    "gpt-5.2",
+    "gpt-5.3",
+    "gpt-5.4",
+    "gpt-6",
+    "gpt-6.1",
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-luna",
+    "gpt-6-sol",
+];
+
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+struct RelayMetricKey {
+    kind: String,
+    model: String,
+    account_class: String,
+    outcome: String,
+}
+
+#[derive(Default)]
+struct RelayMetrics {
+    accepted: BTreeMap<RelayMetricKey, u64>,
+    rejected: BTreeMap<&'static str, u64>,
+    buckets: BTreeMap<String, RelayTokenBucket>,
+}
+
+struct RelayTokenBucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl RelayTokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: RELAY_EVENT_BUCKET_CAPACITY,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * RELAY_EVENT_BUCKET_REFILL_PER_SECOND)
+            .min(RELAY_EVENT_BUCKET_CAPACITY);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayCapacityEvent {
+    kind: String,
+    model: String,
+    account_class: String,
+    outcome: String,
+}
+
+impl RelayCapacityEvent {
+    fn validate(self) -> Result<RelayMetricKey, ()> {
+        if !RELAY_EVENT_KINDS.contains(&self.kind.as_str())
+            || !RELAY_EVENT_ACCOUNT_CLASSES.contains(&self.account_class.as_str())
+            || !RELAY_EVENT_OUTCOMES.contains(&self.outcome.as_str())
+        {
+            return Err(());
+        }
+        let model = if RELAY_KNOWN_MODELS.contains(&self.model.as_str()) {
+            self.model
+        } else {
+            "other".into()
+        };
+        Ok(RelayMetricKey {
+            kind: self.kind,
+            model,
+            account_class: self.account_class,
+            outcome: self.outcome,
+        })
+    }
+}
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
 pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
@@ -148,6 +241,7 @@ pub(super) struct Broker {
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
+    relay_metrics: Arc<StdMutex<RelayMetrics>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
     pub(super) session_writes: Arc<Semaphore>,
@@ -165,6 +259,53 @@ pub(super) struct Broker {
     pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
 }
 impl Broker {
+    fn relay_reject(&self, reason: &'static str) {
+        *self
+            .relay_metrics
+            .lock()
+            .expect("relay metric lock poisoned")
+            .rejected
+            .entry(reason)
+            .or_default() += 1;
+    }
+
+    async fn relay_accept(
+        &self,
+        device: &str,
+        key: RelayMetricKey,
+    ) -> std::result::Result<bool, HttpError> {
+        let allowed = match self.central.as_ref() {
+            Some(store) if !matches!(store.mode(), StoreMode::File) => {
+                store.relay_event_allowed(device).await.map_err(|_| {
+                    self.error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "relay_rate_limiter_unavailable",
+                    )
+                })?
+            }
+            Some(_) | None => {
+                let mut metrics = self
+                    .relay_metrics
+                    .lock()
+                    .expect("relay metric lock poisoned");
+                let bucket = metrics
+                    .buckets
+                    .entry(device.to_owned())
+                    .or_insert_with(RelayTokenBucket::new);
+                bucket.take()
+            }
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        let mut metrics = self
+            .relay_metrics
+            .lock()
+            .expect("relay metric lock poisoned");
+        *metrics.accepted.entry(key).or_default() += 1;
+        Ok(true)
+    }
+
     pub(super) fn login_holder(&self) -> String {
         self.login_holder
             .lock()
@@ -2793,11 +2934,48 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
     ));
+    let relay_metrics = broker
+        .relay_metrics
+        .lock()
+        .expect("relay metric lock poisoned");
+    output.push_str("# TYPE codexctl_central_relay_capacity_events_total counter\n");
+    for (key, count) in &relay_metrics.accepted {
+        output.push_str(&format!(
+            "codexctl_central_relay_capacity_events_total{{account_class=\"{}\",kind=\"{}\",model=\"{}\",outcome=\"{}\"}} {}\n",
+            key.account_class, key.kind, key.model, key.outcome, count
+        ));
+    }
+    output.push_str("# TYPE codexctl_central_relay_events_rejected_total counter\n");
+    for (reason, count) in &relay_metrics.rejected {
+        output.push_str(&format!(
+            "codexctl_central_relay_events_rejected_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
     )
         .into_response())
+}
+
+async fn relay_capacity_event(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<StatusCode, HttpError> {
+    let device = broker.authorize(&headers).await?;
+    let event = serde_json::from_value::<RelayCapacityEvent>(payload)
+        .ok()
+        .and_then(|event| event.validate().ok());
+    let Some(event) = event else {
+        broker.relay_reject("invalid_label");
+        return Err(broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"));
+    };
+    if !broker.relay_accept(&device.id, event).await? {
+        broker.relay_reject("rate_limited");
+        return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "relay_event_rate_limited"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
@@ -3815,6 +3993,7 @@ pub async fn serve(
             .map(|r| (r, Failure::default()))
             .collect(),
         )),
+        relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
         work: Arc::new(Semaphore::new(128)),
         session_writes: Arc::new(Semaphore::new(32)),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -4029,6 +4208,7 @@ impl Broker {
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
@@ -4064,6 +4244,7 @@ pub(super) fn api_routes() -> Router<Broker> {
         .route("/v1/accounts/login/start", post(relogin::add::start))
         .route("/v1/accounts/login/status", post(relogin::add::status))
         .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
+        .route("/v1/relay/capacity-events", post(relay_capacity_event))
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }))
@@ -4169,6 +4350,7 @@ mod tests {
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),

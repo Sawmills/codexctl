@@ -239,6 +239,11 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
+CREATE TABLE IF NOT EXISTS central_relay_rate_limits (
+    device_id TEXT PRIMARY KEY,
+    tokens DOUBLE PRECISION NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 "#;
 
 impl CentralStore {
@@ -347,6 +352,16 @@ impl CentralStore {
             Self::File(file) => file.path().exists() || file.state.exists(),
             Self::Postgres(db) => bounded_db(db.client()).await.is_ok(),
             Self::Dual { postgres, .. } => bounded_db(postgres.client()).await.is_ok(),
+        }
+    }
+
+    /// Consume one shared relay event token. PostgreSQL keeps this bucket
+    /// durable so every HA replica applies the same per-device limit.
+    pub async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
+        match self {
+            Self::File(_) => Ok(true),
+            Self::Postgres(db) => db.relay_event_allowed(device).await,
+            Self::Dual { postgres, .. } => postgres.relay_event_allowed(device).await,
         }
     }
 
@@ -1330,6 +1345,40 @@ impl PostgresStore {
             )
             .await?;
         Ok(changed == 1)
+    }
+
+    async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
+        bounded_db(async {
+            let mut connection = self.admission_client().await?;
+            let client = connection.transaction().await?;
+            client
+                .execute(
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at) VALUES($1,32,now()) ON CONFLICT DO NOTHING",
+                    &[&device],
+                )
+                .await?;
+            let row = client
+                .query_opt(
+                    "SELECT tokens, EXTRACT(EPOCH FROM (now() - updated_at))::double precision FROM central_relay_rate_limits WHERE device_id=$1 FOR UPDATE",
+                    &[&device],
+                )
+                .await?;
+            let row = row.context("relay rate-limit row disappeared")?;
+            let tokens: f64 = row.get(0);
+            let elapsed: f64 = row.get(1);
+            let available = (tokens + elapsed.max(0.0)).min(32.0);
+            let allowed = available >= 1.0;
+            let tokens = if allowed { available - 1.0 } else { available };
+            client
+                .execute(
+                    "UPDATE central_relay_rate_limits SET tokens=$2,updated_at=now() WHERE device_id=$1",
+                    &[&device, &tokens],
+                )
+                .await?;
+            client.commit().await?;
+            Ok(allowed)
+        })
+        .await
     }
 
     async fn release_lease(&self, lease: &Lease) -> Result<bool> {
@@ -2614,6 +2663,18 @@ mod tests {
             .unwrap();
         let (first, control, schema) = first.isolated_test_schema().await.unwrap();
         first.migrate().await.unwrap();
+        for _ in 0..32 {
+            assert!(first.relay_event_allowed("shared-device").await.unwrap());
+        }
+        let mut replica = first.clone();
+        if let CentralStore::Postgres(db) = &mut replica {
+            db.client = Arc::new(tokio::sync::Mutex::new(None));
+            db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        }
+        assert!(
+            !replica.relay_event_allowed("shared-device").await.unwrap(),
+            "the per-device bucket must be shared across HA replicas"
+        );
         if let CentralStore::Postgres(db) = &first {
             let client = db.client().await.unwrap();
             let query = "SELECT oid FROM pg_constraint WHERE conrelid='account_live_sessions'::regclass AND conname='account_live_sessions_account_id_fkey'";

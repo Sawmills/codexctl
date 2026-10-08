@@ -4089,6 +4089,146 @@ fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_reject
     );
 }
 
+#[test]
+fn relay_capacity_events_require_valid_labels_and_are_exported() {
+    let server = Server::start();
+    let valid = json!({
+        "kind": "overloaded",
+        "model": "gpt-6.1-sol",
+        "account_class": "included",
+        "outcome": "exhausted"
+    });
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&valid)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let unknown_model = json!({
+        "kind": "overloaded",
+        "model": "gpt-future-private",
+        "account_class": "included",
+        "outcome": "exhausted"
+    });
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&unknown_model)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let invalid = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({
+            "kind": "other",
+            "model": "gpt-6.1-sol",
+            "account_class": "included",
+            "outcome": "exhausted"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({
+                "kind": "overloaded",
+                "model": "gpt-6.1-sol",
+                "account_class": "included",
+                "outcome": "exhausted",
+                "request_id": "must-not-be-accepted"
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .json(&valid)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_relay_capacity_events_total{account_class=\"included\",kind=\"overloaded\",model=\"gpt-6.1-sol\",outcome=\"exhausted\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "codexctl_central_relay_capacity_events_total{account_class=\"included\",kind=\"overloaded\",model=\"other\",outcome=\"exhausted\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .contains("codexctl_central_relay_events_rejected_total{reason=\"invalid_label\"} 2"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn relay_capacity_events_are_rate_limited_per_device() {
+    let server = Server::start();
+    let event = json!({
+        "kind": "rate_429",
+        "model": "gpt-6.1-sol",
+        "account_class": "credit",
+        "outcome": "advised"
+    });
+    let mut limited = 0;
+    for _ in 0..40 {
+        let status = server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&event)
+            .send()
+            .unwrap()
+            .status();
+        limited += usize::from(status == 429);
+    }
+    assert!(limited > 0, "the device bucket must eventually return 429");
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_relay_events_rejected_total{reason=\"rate_limited\"}"),
+        "{metrics}"
+    );
+}
+
 fn account_directory(server: &Server, user: &str, alias: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     server.root.path().join("state/accounts").join(format!(
