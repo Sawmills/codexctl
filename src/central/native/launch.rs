@@ -329,6 +329,48 @@ pub fn prepare_included_codex(alias: &str) -> Result<PinnedLaunch> {
     prepare_pinned_codex(alias, false, true)
 }
 
+/// The catalog account an alias names and a token connection for it.
+pub(super) fn catalog_connection<'a>(
+    catalog: &'a super::super::remote::Catalog,
+    alias: &str,
+    launch_pinned: bool,
+) -> Result<(&'a super::super::managed::Account, Connection)> {
+    let account = catalog
+        .accounts
+        .iter()
+        .find(|a| a.alias.eq_ignore_ascii_case(alias))
+        .with_context(|| {
+            format!(
+                "server account {alias} not found; run codexctl list (it may have been renamed)"
+            )
+        })?;
+    if !account.available {
+        bail!("server account {} is unavailable", account.alias);
+    }
+    if account.user_id != catalog.connection.user_id {
+        bail!("server user identity changed");
+    }
+    let connection = Connection {
+        user_id: Some(account.user_id.clone()),
+        alias: Some(account.alias.clone()),
+        server: catalog.connection.server.clone(),
+        device_token_file: catalog.connection.token_file.clone(),
+        account_id: account.account_id.clone(),
+        revision: String::new(),
+        allow_billing: false,
+        launch_pinned,
+        approved_billing_plan: None,
+        approved_billing_class: None,
+        session_id: if launch_pinned {
+            vault::digest(&super::super::enrollment::random_bytes())
+        } else {
+            String::new()
+        },
+        loan_id: account.loan.as_ref().map(|loan| loan.id.clone()),
+    };
+    Ok((account, connection))
+}
+
 fn prepare_pinned_codex(
     alias: &str,
     allow_billing: bool,
@@ -358,35 +400,7 @@ fn prepare_pinned_codex(
     let lease = vault::mode_lock(&directory, vault::LockMode::Shared)?;
     let catalog = super::super::remote::catalog()?
         .context("server account launch requires a connected account server")?;
-    let account = catalog
-        .accounts
-        .iter()
-        .find(|a| a.alias.eq_ignore_ascii_case(alias))
-        .with_context(|| {
-            format!(
-                "server account {alias} not found; run codexctl list (it may have been renamed)"
-            )
-        })?;
-    if !account.available {
-        bail!("server account {} is unavailable", account.alias);
-    }
-    if account.user_id != catalog.connection.user_id {
-        bail!("server user identity changed");
-    }
-    let mut connection = Connection {
-        user_id: Some(account.user_id.clone()),
-        alias: Some(account.alias.clone()),
-        server: catalog.connection.server.clone(),
-        device_token_file: catalog.connection.token_file.clone(),
-        account_id: account.account_id.clone(),
-        revision: String::new(),
-        allow_billing: false,
-        launch_pinned: true,
-        approved_billing_plan: None,
-        approved_billing_class: None,
-        session_id: vault::digest(&super::super::enrollment::random_bytes()),
-        loan_id: account.loan.as_ref().map(|loan| loan.id.clone()),
-    };
+    let (account, mut connection) = catalog_connection(&catalog, alias, true)?;
     let token = fetch(&connection, false)?;
     validate_token_account(&token.access_token, &connection.account_id)?;
     let exhausted = is_exhausted(&token);

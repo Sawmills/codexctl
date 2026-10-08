@@ -9,6 +9,8 @@ use crate::store;
 use std::io::IsTerminal;
 
 pub fn run(alias: Option<&str>, label: Option<&str>, allow_adopt: bool) -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    codexctl::central::native::refuse_while_enabled("codexctl save")?;
     // Consent has to name what it consents to. Without an alias, `save` derives
     // one from the token's email claim, so the flag would pre-approve replacing
     // whichever profile that resolves to — and one login can hold seats in

@@ -142,6 +142,10 @@ pub fn save_live_profile_locked(
     auth_json_src: &Path,
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
+    // The live file is the server's token with no refresh token while
+    // app-auth is enabled; saving it would make a dead local profile.
+    #[cfg(feature = "central-prototype")]
+    crate::central::native::refuse_app_auth(paths, "codexctl save")?;
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
     set_active_unlocked(paths, alias)
 }
@@ -162,6 +166,8 @@ pub fn save_profile_and_activate_locked(
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
     let live_auth = paths.codex_auth_json();
+    #[cfg(feature = "central-prototype")]
+    crate::central::native::refuse_app_auth(paths, "activating a new login")?;
 
     if auth_json_src != live_auth {
         // Capture protects the *outgoing* profile's rotated tokens, and it runs
@@ -823,6 +829,10 @@ pub fn switch_to_from(paths: &Paths, alias: &str) -> Result<String> {
 pub fn switch_to_auth_json_from(paths: &Paths, alias: &str, codex_auth: &Path) -> Result<String> {
     let alias = store::validate_alias(alias)?;
     let _lock = store::lock(paths)?;
+    #[cfg(feature = "central-prototype")]
+    if codex_auth == paths.codex_home().join("auth.json") {
+        crate::central::native::refuse_app_auth(paths, "an account switch")?;
+    }
     let profile = get_profile_from(paths, alias)?;
     crate::store::require_local_auth(&profile.auth_json_path())?;
 
@@ -1458,6 +1468,12 @@ pub fn alias_for_auth_json_from(paths: &Paths, auth_json: &Path) -> Result<Optio
         return Ok(Some((*alias).clone()));
     }
     Ok(None)
+}
+
+/// Fold the live login's rotated tokens back into its saved profile before a
+/// caller holding the store lock replaces `~/.codex/auth.json`.
+pub fn capture_live_tokens_locked(_lock: &store::StoreLock, paths: &Paths) {
+    capture_auth_file_profile_tokens(paths, &paths.codex_auth_json(), None);
 }
 
 /// Best-effort: fold a live Codex auth file into the saved profile that owns it.

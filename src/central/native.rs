@@ -17,7 +17,9 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
+mod app_auth;
 mod launch;
+pub use app_auth::{AppAuthAction, refuse_app_auth, refuse_while_enabled, run as run_app_auth};
 pub(super) use launch::LaunchSignals;
 #[cfg(feature = "central-prototype")]
 pub use launch::pinned_arguments;
@@ -72,7 +74,7 @@ fn billing_switch_prompt() -> String {
     format!("This remote account may bill credits. {BILLING_SWITCH_NOTICE} Switch?")
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Connection {
     #[serde(default)]
@@ -1468,6 +1470,7 @@ pub fn activate(
     // Migration takes store then native. Never wait for the store while holding native.
     let _store =
         store::try_lock(&paths)?.context("local account store is busy; retry selection")?;
+    app_auth::refuse_app_auth(&paths, "codexctl use")?;
     super::remote::require_local_handoff(
         &paths,
         &serde_json::json!({"tokens":{"access_token":token.access_token,"account_id":token.chatgpt_account_id}}),

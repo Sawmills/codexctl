@@ -104,6 +104,9 @@ fn run_from_with_consent(
     let label = label.map(store::validate_label).transpose()?.flatten();
     #[cfg(feature = "central-prototype")]
     let operation = codexctl::central::native::local_operation(paths)?;
+    // Refuse before the browser login: refusing after it would discard it.
+    #[cfg(feature = "central-prototype")]
+    codexctl::central::native::refuse_app_auth(paths, "codexctl login")?;
     // A retained transfer marker owns this alias even after disconnect. Refuse
     // before authentication can revoke the grant owned by the server.
     store::require_local_auth(&store::profile_dir(paths, alias)?.join("auth.json"))?;

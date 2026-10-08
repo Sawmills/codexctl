@@ -11294,3 +11294,444 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
         "{kinds:?}"
     );
 }
+
+// CODEX-APP-A: the desktop app reads ~/.codex/auth.json in chatgptAuthTokens
+// mode, written from server tokens; the server stays the only refresh owner.
+fn app_auth_token(account: &str, plan: Option<&str>, exp: u64) -> Value {
+    app_auth_token_for("amir-login", account, plan, exp)
+}
+
+fn app_auth_token_for(subject: &str, account: &str, plan: Option<&str>, exp: u64) -> Value {
+    let mut claims = json!({"chatgpt_account_id": account});
+    if let Some(plan) = plan {
+        claims["chatgpt_plan_type"] = json!(plan);
+    }
+    let payload = URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({"sub":subject,"iat":2000000000_u64,"exp":exp,"https://api.openai.com/auth":claims}))
+            .unwrap(),
+    );
+    json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic-refresh","account_id":account}})
+}
+
+fn app_auth_home(server: &Server, version: &str) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = server.connected_home();
+    let bin = home.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        bin.join("codex"),
+        format!("#!/bin/sh\necho 'codex-cli {version}'\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    home
+}
+
+fn app_auth_cli(home: &std::path::Path, args: &[&str]) -> std::process::Output {
+    let mut full = vec!["app-auth"];
+    full.extend_from_slice(args);
+    Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", home.join("bin").display()),
+        )
+        .env("CODEXCTL_APP_AUTH_APP_CODEX", "/nonexistent/codex")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .args(full)
+        .output()
+        .unwrap()
+}
+
+fn import_auth(server: &Server, alias: &str, auth: Value) {
+    let response = server
+        .http
+        .post(format!("{}/v1/accounts", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"alias":alias,"label":"Team","auth":auth}))
+        .send()
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().unwrap()
+    );
+}
+
+fn read_auth(home: &std::path::Path) -> Value {
+    serde_json::from_slice(&std::fs::read(home.join(".codex/auth.json")).unwrap()).unwrap()
+}
+
+fn ok(output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn refused(output: &std::process::Output, needle: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "expected refusal: {stderr}");
+    assert!(stderr.contains(needle), "{stderr}");
+}
+
+const FAR: u64 = 4102444800;
+
+#[test]
+fn app_auth_enable_writes_an_external_tokens_file_without_a_refresh_token() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    let home = app_auth_home(&server, "0.161.0");
+    let enabled = app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    );
+    ok(&enabled);
+    let auth = read_auth(home.path());
+    assert_eq!(auth["auth_mode"], "chatgptAuthTokens");
+    assert_eq!(auth["tokens"]["refresh_token"], "");
+    assert_eq!(auth["tokens"]["account_id"], "team-seat");
+    assert_eq!(auth["tokens"]["id_token"], auth["tokens"]["access_token"]);
+    let mode = std::fs::metadata(home.path().join(".codex/auth.json"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let token = auth["tokens"]["access_token"].as_str().unwrap();
+    for stream in [&enabled.stdout, &enabled.stderr] {
+        assert!(!String::from_utf8_lossy(stream).contains(token));
+    }
+    let status = app_auth_cli(home.path(), &["status"]);
+    ok(&status);
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(text.contains("team") && !text.contains(token), "{text}");
+}
+
+#[test]
+fn app_auth_refuses_a_billing_account_without_allow_billing() {
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    let home = app_auth_home(&server, "0.161.0");
+    refused(
+        &app_auth_cli(home.path(), &["enable", "--account", "team", "--no-agent"]),
+        "--allow-billing",
+    );
+    assert!(!home.path().join(".codex/auth.json").exists());
+}
+
+#[test]
+fn app_auth_refuses_a_token_without_plan_or_with_too_little_life() {
+    let server = Server::start();
+    import_auth(&server, "noplan", app_auth_token("noplan-seat", None, FAR));
+    let home = app_auth_home(&server, "0.161.0");
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "noplan",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "chatgpt_plan_type",
+    );
+    let soon = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 600;
+    import_auth(
+        &server,
+        "short",
+        app_auth_token("short-seat", Some("team"), soon),
+    );
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "short",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "lifetime",
+    );
+    assert!(!home.path().join(".codex/auth.json").exists());
+}
+
+#[test]
+fn app_auth_refuses_keyring_storage_and_unsupported_codex() {
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    let home = app_auth_home(&server, "0.161.0");
+    std::fs::write(
+        home.path().join(".codex/config.toml"),
+        "cli_auth_credentials_store = \"auto\"\n",
+    )
+    .unwrap();
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "team",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "cli_auth_credentials_store",
+    );
+    std::fs::write(
+        home.path().join(".codex/config.toml"),
+        "profile = \"lane\"\n[profiles.lane]\nmodel_provider = \"codexctl-central\"\n",
+    )
+    .unwrap();
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "team",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "profile lane",
+    );
+    std::fs::remove_file(home.path().join(".codex/config.toml")).unwrap();
+    let old = app_auth_home(&server, "0.100.0");
+    refused(
+        &app_auth_cli(
+            old.path(),
+            &[
+                "enable",
+                "--account",
+                "team",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "0.100.0",
+    );
+    ok(&app_auth_cli(
+        old.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+            "--allow-codex-version",
+        ],
+    ));
+}
+
+#[test]
+fn app_auth_refuses_while_the_central_provider_is_active_and_guards_use_while_enabled() {
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    let home = app_auth_home(&server, "0.161.0");
+    ok(&server.cli(home.path(), &["use", "team", "--allow-billing"]));
+    refused(
+        &app_auth_cli(
+            home.path(),
+            &[
+                "enable",
+                "--account",
+                "team",
+                "--allow-billing",
+                "--no-agent",
+            ],
+        ),
+        "central provider",
+    );
+    let other = app_auth_home(&server, "0.161.0");
+    ok(&app_auth_cli(
+        other.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    let before = std::fs::read(other.path().join(".codex/auth.json")).unwrap();
+    refused(
+        &server.cli(other.path(), &["use", "team", "--allow-billing"]),
+        "app-auth",
+    );
+    refused(&server.cli(other.path(), &["switch"]), "app-auth");
+    refused(&server.cli(other.path(), &["save", "copy"]), "app-auth");
+    // A local login (no server connection) refuses before the browser step.
+    let local = tempfile::tempdir().unwrap();
+    store::ensure_private_dir(&local.path().join(".codexctl/app-auth")).unwrap();
+    std::fs::write(local.path().join(".codexctl/app-auth/state.json"), b"{}").unwrap();
+    refused(&server.cli(local.path(), &["login", "fresh"]), "app-auth");
+    assert!(!local.path().join(".codexctl/login-homes/fresh").exists());
+    assert_eq!(
+        std::fs::read(other.path().join(".codex/auth.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn app_auth_refresh_skips_an_unchanged_token_and_stops_on_a_missing_or_foreign_file() {
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    let home = app_auth_home(&server, "0.161.0");
+    ok(&app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    let path = home.path().join(".codex/auth.json");
+    let written = std::fs::read(&path).unwrap();
+    let refreshed = app_auth_cli(home.path(), &["refresh"]);
+    ok(&refreshed);
+    assert!(String::from_utf8_lossy(&refreshed.stderr).contains("unchanged"));
+    assert_eq!(std::fs::read(&path).unwrap(), written);
+
+    // Same mode and workspace, other bytes: still another login.
+    let mut edited = read_auth(home.path());
+    edited["tokens"]["refresh_token"] = json!("user-refresh");
+    let edited = serde_json::to_vec(&edited).unwrap();
+    std::fs::write(&path, &edited).unwrap();
+    refused(
+        &app_auth_cli(home.path(), &["refresh"]),
+        "not written by app-auth",
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), edited);
+    let foreign = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"r","account_id":"team-seat","id_token":"x"}}"#;
+    std::fs::write(&path, foreign).unwrap();
+    refused(
+        &app_auth_cli(home.path(), &["refresh"]),
+        "not written by app-auth",
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), foreign);
+
+    std::fs::remove_file(&path).unwrap();
+    refused(&app_auth_cli(home.path(), &["refresh"]), "missing");
+    assert!(!path.exists());
+    let status = app_auth_cli(home.path(), &["status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("missing"));
+}
+
+#[test]
+fn app_auth_disable_keeps_a_server_login_backup_unless_asked_and_restores_a_foreign_one() {
+    let server = Server::start();
+    import_auth(
+        &server,
+        "team",
+        app_auth_token("team-seat", Some("team"), FAR),
+    );
+    // The backed-up login is a server account: restoring its refresh token
+    // would make a second refresh owner, so disable leaves it out by default.
+    let home = app_auth_home(&server, "0.161.0");
+    let server_login = serde_json::to_vec(&app_auth_token("team-seat", Some("team"), FAR)).unwrap();
+    std::fs::write(home.path().join(".codex/auth.json"), &server_login).unwrap();
+    ok(&app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    ok(&app_auth_cli(home.path(), &["disable"]));
+    assert!(!home.path().join(".codex/auth.json").exists());
+    assert!(!home.path().join(".codexctl/app-auth/state.json").exists());
+    // A second cycle keeps the backup and still knows it is a server login.
+    ok(&app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    ok(&app_auth_cli(home.path(), &["disable"]));
+    assert!(!home.path().join(".codex/auth.json").exists());
+    ok(&app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    ok(&app_auth_cli(home.path(), &["disable", "--restore-login"]));
+    assert_eq!(
+        std::fs::read(home.path().join(".codex/auth.json")).unwrap(),
+        server_login
+    );
+
+    // A login the server does not hold comes back on its own.
+    let other = app_auth_home(&server, "0.161.0");
+    let own_login = serde_json::to_vec(&app_auth_token("own-seat", Some("plus"), FAR)).unwrap();
+    std::fs::write(other.path().join(".codex/auth.json"), &own_login).unwrap();
+    ok(&app_auth_cli(
+        other.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    ok(&app_auth_cli(other.path(), &["disable"]));
+    assert_eq!(
+        std::fs::read(other.path().join(".codex/auth.json")).unwrap(),
+        own_login
+    );
+}

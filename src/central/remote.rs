@@ -1762,6 +1762,16 @@ pub(super) fn select_for_activation(
 }
 
 fn same_seat(left: &Value, right: &Value) -> Result<bool> {
+    // app-auth's desktop file carries a server access token and no refresh
+    // token: it owns nothing to migrate, hand off, or retire.
+    if right.get("auth_mode").and_then(Value::as_str) == Some("chatgptAuthTokens")
+        && right
+            .pointer("/tokens/refresh_token")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+    {
+        return Ok(false);
+    }
     if right.get("tokens").is_none_or(Value::is_null)
         && right.get("access_token").is_none_or(Value::is_null)
         && right
@@ -1993,6 +2003,26 @@ fn require_stopped_owners(paths: &config::Paths) -> Result<()> {
 mod tests {
     use super::*;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[test]
+    fn an_app_auth_file_is_not_a_local_holder_of_its_seat() {
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "sub": "amir", "exp": 4102444800_u64,
+                "https://api.openai.com/auth": {"chatgpt_account_id": "seat", "chatgpt_plan_type": "team"},
+            }))
+            .unwrap(),
+        );
+        let token = format!("h.{payload}.s");
+        let server = serde_json::json!({"tokens": {"access_token": token, "refresh_token": "r", "account_id": "seat"}});
+        let app_auth = serde_json::json!({"auth_mode": "chatgptAuthTokens",
+            "tokens": {"access_token": token, "id_token": token, "refresh_token": "", "account_id": "seat"}});
+        assert!(!same_seat(&server, &app_auth).unwrap());
+        // The same seat with a refresh token is a holder.
+        let login = serde_json::json!({"auth_mode": "chatgpt",
+            "tokens": {"access_token": token, "refresh_token": "r", "account_id": "seat"}});
+        assert!(same_seat(&server, &login).unwrap());
+    }
 
     #[test]
     fn local_usage_keeps_a_weekly_only_window_in_the_long_column() {
