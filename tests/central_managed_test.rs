@@ -4226,7 +4226,7 @@ fn relay_capacity_exhausted_series_exist_before_the_first_event() {
         .collect();
     assert_eq!(
         exhausted.len(),
-        72,
+        78,
         "all allowed exhausted series: {metrics}"
     );
     assert!(

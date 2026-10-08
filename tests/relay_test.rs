@@ -363,6 +363,18 @@ async fn unknown_models_use_the_other_metric_label() {
     );
 }
 
+#[tokio::test]
+async fn gpt_5_5_keeps_its_central_metric_label() {
+    let h = harness(vec![Scripted::Status(429, vec![], RATE_429.into())]).await;
+    assert_eq!(h.post_model("gpt-5-5", "gpt-5.5").await.status(), 429);
+    assert!(
+        h.metrics()
+            .await
+            .contains("model=\"gpt-5.5\",account_class=\"included\""),
+        "supported gpt-5.5 must not be normalized to other"
+    );
+}
+
 impl Harness {
     async fn shutdown(mut self) {
         self.shutdown.take().unwrap().send(()).unwrap();
