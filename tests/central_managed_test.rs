@@ -11573,6 +11573,7 @@ fn app_auth_refuses_while_the_central_provider_is_active_and_guards_use_while_en
         &server.cli(other.path(), &["use", "team", "--allow-billing"]),
         "app-auth",
     );
+    refused(&server.cli(other.path(), &["switch"]), "app-auth");
     assert_eq!(
         std::fs::read(other.path().join(".codex/auth.json")).unwrap(),
         before
@@ -11646,6 +11647,19 @@ fn app_auth_disable_keeps_a_server_login_backup_unless_asked_and_restores_a_fore
     ok(&app_auth_cli(home.path(), &["disable"]));
     assert!(!home.path().join(".codex/auth.json").exists());
     assert!(!home.path().join(".codexctl/app-auth/state.json").exists());
+    // A second cycle keeps the backup and still knows it is a server login.
+    ok(&app_auth_cli(
+        home.path(),
+        &[
+            "enable",
+            "--account",
+            "team",
+            "--allow-billing",
+            "--no-agent",
+        ],
+    ));
+    ok(&app_auth_cli(home.path(), &["disable"]));
+    assert!(!home.path().join(".codex/auth.json").exists());
     ok(&app_auth_cli(
         home.path(),
         &[

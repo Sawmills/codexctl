@@ -74,7 +74,7 @@ fn billing_switch_prompt() -> String {
     format!("This remote account may bill credits. {BILLING_SWITCH_NOTICE} Switch?")
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct Connection {
     #[serde(default)]

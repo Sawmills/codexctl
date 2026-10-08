@@ -8,6 +8,8 @@ use crate::config;
 use crate::profile;
 
 pub fn run() -> Result<()> {
+    #[cfg(feature = "central-prototype")]
+    codexctl::central::native::refuse_while_enabled("codexctl switch")?;
     let profiles = profile::list_profiles()?;
     if profiles.is_empty() {
         println!("no profiles saved. Use 'codexctl save' to save the current account.");

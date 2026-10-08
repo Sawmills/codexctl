@@ -292,7 +292,9 @@ fn disable(restore_login: bool) -> Result<()> {
                 .ok()
                 .flatten()
                 .is_none_or(|catalog| catalog.accounts.iter().any(|a| &a.account_id == account)),
-            None => false,
+            // A login whose workspace cannot be read could be a server
+            // account's; only --restore-login brings it back.
+            None => true,
         };
         if restore_login || !held_by_server {
             std::fs::copy(&backup, paths.auth())?;
@@ -419,7 +421,11 @@ fn server_token(
 ) -> Result<TokenResponse> {
     let mut token = fetch(connection, false)?;
     if claims(&token.access_token)?.exp - now() < MIN_LIFETIME_SECONDS {
-        token = fetch(connection, true).with_context(|| {
+        // The server forces a renewal only for a request that names the
+        // revision it is replacing.
+        let mut renewal = connection.clone();
+        renewal.revision = token.revision.clone();
+        token = fetch(&renewal, true).with_context(|| {
             format!("the server token for {alias} is below the minimum lifetime and the server could not renew it")
         })?;
     }
@@ -505,15 +511,24 @@ fn write_auth(paths: &Paths, account_id: &str, access_token: &str) -> Result<()>
     )
 }
 
-/// Keep the login enable replaces and return its workspace. With no login
-/// to keep, an earlier backup stays.
+/// Keep the login enable replaces and return the workspace of the backup.
+/// With no login to keep, an earlier backup stays, and its workspace is
+/// read back so a later disable still knows whose login it holds.
 fn back_up_login(paths: &Paths) -> Result<Option<String>> {
     let bytes = match std::fs::read(paths.auth()) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(bytes) => {
+            store::atomic_write(&paths.backup(), &bytes)?;
+            bytes
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::read(paths.backup()) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
         Err(error) => return Err(error.into()),
     };
-    store::atomic_write(&paths.backup(), &bytes)?;
     Ok(serde_json::from_slice::<serde_json::Value>(&bytes)
         .ok()
         .and_then(|document| document["tokens"]["account_id"].as_str().map(str::to_owned)))
