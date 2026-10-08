@@ -483,7 +483,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - { name: keys, mountPath: /keys }
          containers:
            - name: migrate
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f67698fe7de7e35eb3659f98a358552edbe1b1d5b52147a4645f25cfa11b0273
              command:
                [
                  codexctl-central,
@@ -606,7 +606,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - {name: keys, mountPath: /keys}
          containers:
            - name: backfill
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:2dfcb874068e89a1e68327c491567fd330e486fcc14b557e58188432fc4dcc68
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f67698fe7de7e35eb3659f98a358552edbe1b1d5b52147a4645f25cfa11b0273
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
              securityContext:
                allowPrivilegeEscalation: false

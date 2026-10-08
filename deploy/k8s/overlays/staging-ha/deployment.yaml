@@ -118,6 +118,9 @@ spec:
           env:
             - name: CODEXCTL_CENTRAL_STORE
               value: postgres
+            # Every replica runs layout 8 from its first start (B33 attempt 3).
+            - name: CODEXCTL_CENTRAL_TOKEN_FAST_PATH
+              value: "1"
             - {
                 name: DB_HOST,
                 valueFrom:
