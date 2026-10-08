@@ -37,7 +37,7 @@ const CHATGPT: &str = "https://chatgpt.com";
 const FORWARDED_PREFIX: &str = "/backend-api/codex/";
 /// Lane-only header that labels metrics; it never leaves the host.
 const ACCOUNT_CLASS_HEADER: &str = "x-codexctl-account-class";
-/// A 429 body larger than this is not classified and passes through.
+/// A 429 body larger than this is not classified; it passes through without advice.
 const MAX_429_BODY: usize = 64 * 1024;
 /// Default listen address used by `codexctl relay` and the lane override.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:47631";
@@ -239,8 +239,10 @@ impl Relay {
             Ok(body) => body,
             Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
         };
+        // An unclassified body may be a usage or billing stop, so it gets no
+        // advice and reaches Codex unchanged.
         let class = if body.len() > MAX_429_BODY {
-            Http429::Rate
+            Http429::Terminal
         } else {
             policy::classify_429(&body)
         };

@@ -572,3 +572,15 @@ async fn a_terminal_429_ends_the_streak() {
         "the resume after a stop starts at attempt 1"
     );
 }
+
+#[tokio::test]
+async fn oversized_429_bodies_pass_through_without_advice() {
+    let body = format!(
+        r#"{{"error":{{"type":"usage_limit_reached","message":"{}"}}}}"#,
+        "x".repeat(70 * 1024)
+    );
+    let h = harness(vec![Scripted::Status(429, vec![], body.clone())]).await;
+    let response = h.post("t1").await;
+    assert_eq!(retry_after(&response), None);
+    assert_eq!(response.text().await.unwrap(), body);
+}
