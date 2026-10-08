@@ -7063,7 +7063,7 @@ async fn postgres_older_reader_refuses_a_newer_schema_before_native_startup() {
     f.control
         .execute(
             &format!(
-                "INSERT INTO {}.central_schema_migrations(version) VALUES(8)",
+                "INSERT INTO {}.central_schema_migrations(version) VALUES(9)",
                 f.schema
             ),
             &[],
@@ -7096,7 +7096,7 @@ async fn postgres_older_reader_refuses_a_newer_schema_before_native_startup() {
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("schema v8 is newer than this binary; upgrade codexctl-central")
+            .contains("schema v9 is newer than this binary; upgrade codexctl-central")
     );
     assert_eq!(f.first.launches(), 0);
     stop_fixture(f).await;
