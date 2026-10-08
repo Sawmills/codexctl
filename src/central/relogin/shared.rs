@@ -53,19 +53,23 @@ fn owned(
 }
 /// The reporter is the holder that observed the failure: a worker reports as
 /// the holder it ran under, a recovery read as the current login holder.
+/// A `grantless` claim counts only when the durable receipt proves no grant.
 async fn record_login_failure(
     broker: &Broker,
     op: &mut LoginOperation,
     reporter: &str,
+    grantless: bool,
 ) -> Result<(), HttpError> {
     if op.failure_reported {
         return Ok(());
     }
-    if database(broker)?
-        .login_take_failure(op, reporter)
-        .await
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
-    {
+    let db = database(broker)?;
+    let claimed = if grantless {
+        db.login_take_grantless_failure(op, reporter).await
+    } else {
+        db.login_take_failure(op, reporter).await
+    };
+    if claimed.map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))? {
         let reason = if op.payload.error.as_deref() == Some("account_identity_unresolved")
             || ((op.phase == LoginPhase::Unresolved
                 || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear))
@@ -96,7 +100,7 @@ async fn recover(
     if matches!(op.phase, LoginPhase::Rejected | LoginPhase::Unresolved)
         || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear)
     {
-        record_login_failure(broker, op, &holder_id).await?;
+        record_login_failure(broker, op, &holder_id, false).await?;
     }
     // The same database read that returns the receipt observes lease expiry.
     // Live receipts must not queue behind admission or settlement work.
@@ -112,7 +116,7 @@ async fn recover(
             "{}",
             json!({"operation":"login_recovery","stage":"device_polling","reason":"replica_lost"})
         );
-        record_login_failure(broker, op, &holder_id).await?;
+        record_login_failure(broker, op, &holder_id, false).await?;
     }
     // A live holder settles its own receipt only after its local worker exits.
     let own = op.holder == holder_id;
@@ -132,7 +136,7 @@ async fn recover(
             "{}",
             json!({"operation":"login_recovery","stage":"verification","reason":"replica_lost"})
         );
-        record_login_failure(broker, op, &holder_id).await?;
+        record_login_failure(broker, op, &holder_id, false).await?;
     }
     if op.phase == LoginPhase::Candidate
         && !broker.read_only
@@ -414,9 +418,9 @@ fn spawn_worker(
     }
     Ok(())
 }
-async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation) {
+async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation, grantless: bool) {
     let reporter = op.holder.clone();
-    if let Err(error) = record_login_failure(broker, op, &reporter).await {
+    if let Err(error) = record_login_failure(broker, op, &reporter, grantless).await {
         eprintln!(
             "{}",
             json!({"operation":"login_failure_report","stage":"settlement","reason":"report_unavailable","status":error.status.as_u16()})
@@ -450,7 +454,7 @@ fn spawn_claimed_worker(
                     | LoginPhase::Rejected
                     | LoginPhase::ReplicaLost
             ) {
-                report_worker_failure(&worker, &mut worker_op).await;
+                report_worker_failure(&worker, &mut worker_op, false).await;
                 return;
             }
             worker_op
@@ -474,7 +478,7 @@ fn spawn_claimed_worker(
                 // between resume and an unresolved failure for a grant.
                 for attempt in 1..=3 {
                     let Err(error) = db.login_save(&mut worker_op, phase).await else {
-                        report_worker_failure(&worker, &mut worker_op).await;
+                        report_worker_failure(&worker, &mut worker_op, false).await;
                         break;
                     };
                     if attempt < 3 {
@@ -489,9 +493,11 @@ fn spawn_claimed_worker(
                         "{}",
                         json!({"operation":"login_settlement","stage":"terminal_save","reason":"save_unavailable","error":detail})
                     );
-                    // Without a grant the attempt cannot resume as a success.
+                    // Without a grant the attempt cannot resume as a success. The
+                    // worker may have missed a committed grant, so the database
+                    // decides from the durable receipt.
                     if worker_op.payload.candidate.is_none() {
-                        report_worker_failure(&worker, &mut worker_op).await;
+                        report_worker_failure(&worker, &mut worker_op, true).await;
                     }
                 }
             }
@@ -753,7 +759,7 @@ async fn continue_candidate(
             db.login_save(op, LoginPhase::Rejected).await?;
             if reason == "account_identity_unresolved" {
                 let reporter = op.holder.clone();
-                record_login_failure(broker, op, &reporter)
+                record_login_failure(broker, op, &reporter, false)
                     .await
                     .map_err(|_| anyhow::anyhow!("login failure report unavailable"))?;
             }

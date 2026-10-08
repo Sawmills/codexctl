@@ -457,6 +457,15 @@ impl CentralStore {
         Ok(changed)
     }
 
+    /// Claims only when the durable receipt proves no grant can still complete.
+    pub(in crate::central) async fn login_take_grantless_failure(
+        &self,
+        op: &mut LoginOperation,
+        reporter: &str,
+    ) -> Result<bool> {
+        self.login_take_failure(op, reporter).await
+    }
+
     /// The supervisor reads durable cancellation without extending parent authority.
     #[cfg(target_os = "linux")]
     pub(in crate::central) async fn login_polling_authority(
@@ -940,6 +949,93 @@ mod tests {
                 .is_none()
         );
         assert!(!shared.login_heartbeat(&op).await.unwrap());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn grantless_failure_claim_requires_durable_grant_absence() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared
+            .save_account(&CredentialRecord {
+                account_id: "seat".into(),
+                user_id: Some("user".into()),
+                alias: "seat".into(),
+                workspace: Some("workspace".into()),
+                login: None,
+                vault: serde_json::json!({}),
+                revision: 1,
+            })
+            .await
+            .unwrap();
+        let new_op = |id: &str, alias: &str| LoginOperation {
+            kind: LoginKind::Add,
+            user: "user".into(),
+            id: id.repeat(64),
+            account_id: None,
+            alias: alias.into(),
+            device: "machine".into(),
+            phase: LoginPhase::Starting,
+            sequence: 0,
+            holder: "replica".into(),
+            epoch: 1,
+            payload: LoginPayload::default(),
+            polling_clear: false,
+            lease_expired: false,
+            failure_reported: false,
+        };
+        shared.login_register_holder("replica").await.unwrap();
+        let mut polling = new_op("a", "first");
+        assert!(shared.login_create(&polling).await.unwrap());
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut polling, "replica")
+                .await
+                .unwrap(),
+            "polling without proven absence may still publish a grant"
+        );
+        control
+            .execute(
+                &format!(
+                    "UPDATE {schema}.central_login_operations SET polling_clear=true WHERE id=$1"
+                ),
+                &[&polling.id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            shared
+                .login_take_grantless_failure(&mut polling, "replica")
+                .await
+                .unwrap()
+        );
+        let mut candidate = new_op("b", "second");
+        assert!(shared.login_create(&candidate).await.unwrap());
+        candidate.payload.candidate = Some(
+            serde_json::json!({"tokens":{"account_id":"workspace","access_token":"synthetic","refresh_token":"synthetic"}}),
+        );
+        shared
+            .login_save(&mut candidate, LoginPhase::Candidate)
+            .await
+            .unwrap();
+        // The worker may not have seen the committed grant.
+        candidate.payload.candidate = None;
+        assert!(
+            !shared
+                .login_take_grantless_failure(&mut candidate, "replica")
+                .await
+                .unwrap(),
+            "a committed candidate may still complete"
+        );
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await
