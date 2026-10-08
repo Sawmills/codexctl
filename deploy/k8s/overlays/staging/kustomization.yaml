@@ -9,6 +9,11 @@ resources:
   - sso.yaml
   - monitoring.yaml
   - migration-networkpolicy.yaml
+  - ha-deployment.yaml
+  - ha-service.yaml
+  - ha-metrics-service.yaml
+  - ha-pdb.yaml
+  - ha-networkpolicy.yaml
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
