@@ -40,37 +40,50 @@ impl ReasonSlot {
     }
 }
 
-/// Reduces a Codex refresh-failure log line to a bounded reason. Returns
-/// `None` for any other line, and for a refresh failure without a provider
-/// status.
+/// Codex's fixed messages for a permanent refresh rejection, after
+/// `Failed to refresh token: ` (codex-rs/login/src/auth/manager.rs). Codex
+/// logs the same unknown message for 400 `invalid_grant` and for a 401 with
+/// another code, so those two share `other`.
+const REJECTIONS: &[(&str, &str)] = &[
+    (
+        "Your access token could not be refreshed because your refresh token was already used.",
+        "refresh_token_reused",
+    ),
+    (
+        "Your access token could not be refreshed because your refresh token has expired.",
+        "refresh_token_expired",
+    ),
+    (
+        "Your access token could not be refreshed because your refresh token was revoked.",
+        "refresh_token_invalidated",
+    ),
+    (
+        "Your access token could not be refreshed because you have since logged out or signed in to another account.",
+        "account_mismatch",
+    ),
+    (
+        "Your access token could not be refreshed. Please log out and sign in again.",
+        "other",
+    ),
+];
+
+/// Removes terminal color codes; Codex's stderr logger emits them.
+fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
+    static ANSI: OnceLock<Regex> = OnceLock::new();
+    ANSI.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*m").expect("valid regex"))
+        .replace_all(line, "")
+}
+
+/// Reduces a Codex refresh log line to a bounded reason. Only Codex's fixed
+/// permanent-rejection messages count; a transient failure (Codex logs it
+/// with `status=` and retries) and any other line return `None`.
 pub(super) fn classify(line: &str) -> Option<&'static str> {
-    if !line.contains(REFRESH_FAILED) {
-        return None;
-    }
-    static CODE: OnceLock<Regex> = OnceLock::new();
-    static STATUS: OnceLock<Regex> = OnceLock::new();
-    let code = CODE
-        .get_or_init(|| {
-            Regex::new(r#"error_code: Some\(\\?"([A-Za-z0-9_.-]{1,64})\\?"\)"#)
-                .expect("valid regex")
-        })
-        .captures(line)
-        .map(|captures| captures[1].to_ascii_lowercase());
-    let status = STATUS
-        .get_or_init(|| Regex::new(r#"status"?[=:]\s*"?(\d{3})\b"#).expect("valid regex"))
-        .captures(line)
-        .and_then(|captures| captures[1].parse::<u16>().ok());
-    // A provider rejection always carries the token endpoint's status. A
-    // line without one is local (transport, parsing) and proves nothing.
-    status?;
-    Some(match code.as_deref() {
-        Some("refresh_token_expired") => "refresh_token_expired",
-        Some("refresh_token_reused") => "refresh_token_reused",
-        Some("refresh_token_invalidated") => "refresh_token_invalidated",
-        Some("invalid_grant") => "invalid_grant",
-        _ if status == Some(401) => "unauthorized",
-        _ => "other",
-    })
+    let line = strip_ansi(line);
+    let message = line.split_once(REFRESH_FAILED)?.1.strip_prefix(": ")?;
+    REJECTIONS
+        .iter()
+        .find(|(text, _)| message.starts_with(text))
+        .map(|(_, reason)| *reason)
 }
 
 /// Removes token-shaped values and caps the length. Codex already keeps
@@ -85,7 +98,8 @@ pub(super) fn redact(line: &str) -> String {
         ))
         .expect("valid regex")
     });
-    let cleaned = secret.replace_all(line, "[redacted]");
+    let plain = strip_ansi(line);
+    let cleaned = secret.replace_all(&plain, "[redacted]");
     let mut short: String = cleaned.chars().take(MAX_LINE_CHARS).collect();
     if cleaned.chars().count() > MAX_LINE_CHARS {
         short.push('…');
@@ -211,50 +225,35 @@ pub(super) fn metrics() -> String {
 mod tests {
     use super::*;
 
-    const REUSED_TEXT: &str = r#"2026-10-08T18:30:01.123Z ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: Some("Your refresh token has already been used to generate a new access token. Please try signing in again."), .. }"#;
-    const INVALID_GRANT_JSON: &str = r#"{"timestamp":"2026-10-08T18:30:01.123Z","level":"ERROR","fields":{"message":"Failed to refresh token","status":"400 Bad Request","detail":"TokenErrorDetail { error_code: Some(\"invalid_grant\"), error_message: None, .. }"},"target":"codex_login::auth::manager"}"#;
+    // Real lines from codex-cli 0.161.0 app-server stderr (ANSI included),
+    // captured against a local token endpoint answering each provider code.
+    const REUSED_TEXT: &str = "\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+    const EXPIRED_TEXT: &str = "\x1b[2m2026-10-08T21:04:44.322603Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
+    const REVOKED_TEXT: &str = "\x1b[2m2026-10-08T21:04:44.837697Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.";
+    /// What Codex logs for 400 invalid_grant and for a 401 with another code.
+    const UNKNOWN_TEXT: &str = "\x1b[2m2026-10-08T21:04:45.953995Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.";
+    /// A transient 503: Codex retries it, so it is not a rejection.
+    const TRANSIENT_TEXT: &str = "\x1b[2m2026-10-08T21:04:46.574894Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token \x1b[3mstatus\x1b[0m\x1b[2m=\x1b[0m503 Service Unavailable \x1b[3mdetail\x1b[0m\x1b[2m=\x1b[0mTokenErrorDetail { error_code: Some(\"server_error\"), error_message: Some(\"synthetic rejection\"), .. }";
 
     #[test]
-    fn refresh_failures_map_to_a_bounded_reason() {
+    fn real_codex_refresh_lines_map_to_a_bounded_reason() {
         assert_eq!(classify(REUSED_TEXT), Some("refresh_token_reused"));
-        assert_eq!(classify(INVALID_GRANT_JSON), Some("invalid_grant"));
-        let with = |code: &str, status: &str| {
-            format!(
-                "ERROR codex_login: Failed to refresh token status={status} detail=TokenErrorDetail {{ error_code: Some(\"{code}\"), error_message: None, .. }}"
-            )
-        };
-        assert_eq!(
-            classify(&with("refresh_token_expired", "401 Unauthorized")),
-            Some("refresh_token_expired")
-        );
-        assert_eq!(
-            classify(&with("refresh_token_invalidated", "401 Unauthorized")),
-            Some("refresh_token_invalidated")
-        );
-        assert_eq!(
-            classify(&with("INVALID_GRANT", "400 Bad Request")),
-            Some("invalid_grant")
-        );
-        assert_eq!(
-            classify(&with("something_new", "401 Unauthorized")),
-            Some("unauthorized")
-        );
-        assert_eq!(
-            classify(&with("something_new", "500 Internal Server Error")),
-            Some("other")
-        );
+        assert_eq!(classify(EXPIRED_TEXT), Some("refresh_token_expired"));
+        assert_eq!(classify(REVOKED_TEXT), Some("refresh_token_invalidated"));
+        assert_eq!(classify(UNKNOWN_TEXT), Some("other"));
         assert_eq!(
             classify(
-                "ERROR codex_login: Failed to refresh token status=403 Forbidden detail=TokenErrorDetail { error_code: None, .. }"
+                "ERROR codex_login::auth::manager: Failed to refresh token: Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
             ),
-            Some("other")
+            Some("account_mismatch")
         );
-        assert_eq!(classify("ERROR codex_core: stream disconnected"), None);
+        assert_eq!(classify(TRANSIENT_TEXT), None, "transient, Codex retries");
         assert_eq!(
             classify("ERROR codex_login: Failed to refresh token: connection reset"),
             None,
-            "no provider status, no provider evidence"
+            "not a provider rejection message"
         );
+        assert_eq!(classify("ERROR codex_core: stream disconnected"), None);
     }
 
     #[test]
@@ -279,7 +278,9 @@ mod tests {
             assert!(!safe.contains(short), "{short} leaked: {safe}");
         }
         assert!(safe.chars().count() <= MAX_LINE_CHARS + 1, "{}", safe.len());
-        assert!(redact(REUSED_TEXT).contains("refresh_token_reused"));
+        let plain = redact(REUSED_TEXT);
+        assert!(plain.contains("refresh token was already used"), "{plain}");
+        assert!(!plain.contains('\x1b'), "color codes removed: {plain:?}");
     }
 
     #[tokio::test]

@@ -3858,7 +3858,8 @@ fn a_rejected_forced_refresh_is_counted_too() {
         .unwrap();
     assert_eq!(
         owner_refresh_failures(&metrics),
-        vec![("personal".to_owned(), "invalid_grant".to_owned(), 1)],
+        // Codex logs the same unknown message for 400 invalid_grant.
+        vec![("personal".to_owned(), "other".to_owned(), 1)],
         "{metrics}"
     );
 }

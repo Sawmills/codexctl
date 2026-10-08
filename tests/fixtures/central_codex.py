@@ -131,7 +131,7 @@ for line in sys.stdin:
         if not params.get("refreshToken") and after_limits and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-read-reused":
             # Only the routing read right after a usage read fails: it can
             # refresh too, and no other read path may report the reason.
-            print('ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: None, .. }', file=sys.stderr, flush=True)
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
         if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
@@ -142,7 +142,7 @@ for line in sys.stdin:
         if params.get("refreshToken"):
             mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
             if mode == "forced-refresh-invalid-grant":
-                print('ERROR codex_login::auth::manager: Failed to refresh token status=400 Bad Request detail=TokenErrorDetail { error_code: Some("invalid_grant"), error_message: None, .. }', file=sys.stderr, flush=True)
+                print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.", file=sys.stderr, flush=True)
                 send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed. Please log out and sign in again."}})
                 continue
             partial_failure = mode == "partial-migration" and json.loads(auth_path.read_text())["tokens"].get("account_id") == "bad-seat"
@@ -187,7 +187,7 @@ for line in sys.stdin:
             definitive_rejection = True
         if mode == "startup-refresh-expired":
             # The cached-status call refreshes at owner start and is rejected.
-            print('ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_expired"), error_message: None, .. }', file=sys.stderr, flush=True)
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.", file=sys.stderr, flush=True)
             definitive_rejection = True
         current = json.loads(auth_path.read_text())["tokens"]["access_token"]
         result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection else current, "requiresOpenaiAuth":True}
@@ -209,8 +209,8 @@ for line in sys.stdin:
             print("{invalid", flush=True)
             sys.exit(1)
         if mode == "refresh-reused":
-            # What Codex logs, then answers, when the token endpoint rejects the grant.
-            print('2026-10-08T18:30:01.123Z ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: Some("synthetic"), .. }', file=sys.stderr, flush=True)
+            # The real codex 0.161.0 stderr line (captured), then its answer.
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
         if mode == "billing-permanent-error":
