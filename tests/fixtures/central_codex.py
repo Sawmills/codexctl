@@ -14,6 +14,7 @@ waiting = False
 pending_turn = None
 definitive_rejection = False
 billing_rotated = False
+limits_read = False
 
 if "login" in sys.argv:
     pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-pid").write_text(str(os.getpid()))
@@ -126,6 +127,13 @@ for line in sys.stdin:
             continue
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
+        after_limits, limits_read = limits_read, False
+        if not params.get("refreshToken") and after_limits and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-read-reused":
+            # Only the routing read right after a usage read fails: it can
+            # refresh too, and no other read path may report the reason.
+            print('ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: None, .. }', file=sys.stderr, flush=True)
+            send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
+            continue
         if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
             rotate(plan_change=True)
         if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "notifications":
@@ -183,6 +191,7 @@ for line in sys.stdin:
             result = {"authMethod":None, "authToken":None, "requiresOpenaiAuth":True}
     elif method == "account/rateLimits/read":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        limits_read = True
         if mode == "billing-policy-wrong-method":
             send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
             continue

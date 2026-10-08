@@ -445,6 +445,13 @@ impl Owner {
                 .context("missing owner")?
                 .call("account/read", json!({"refreshToken":false}))
                 .await;
+            // This routing read can refresh too, so it reports rejections.
+            if result
+                .as_ref()
+                .is_err_and(|error| !error.is::<RoutingPolicyError>())
+            {
+                self.refresh_failed().await;
+            }
             let snapshot = self.snapshot();
             if result
                 .as_ref()

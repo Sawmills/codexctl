@@ -14,8 +14,10 @@ use std::{
 
 use regex::Regex;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
+/// Bytes of one stderr line held while reading; the rest is dropped.
+const MAX_LINE_BYTES: usize = 8 * 1024;
 /// Longest forwarded stderr line, in characters.
 const MAX_LINE_CHARS: usize = 300;
 /// Forwarded stderr lines per window; the rest is drained and counted.
@@ -87,29 +89,37 @@ pub(super) fn redact(line: &str) -> String {
     short
 }
 
-/// Drains an owner child's stderr. Every line is read, so the child never
-/// blocks on a full pipe; at most `MAX_LINES_PER_WINDOW` lines per minute are
-/// forwarded to `sink`, redacted, as structured JSON. A refresh failure line
-/// always sets `slot`, even when forwarding is suppressed.
+/// Drains an owner child's stderr. Every byte is read, so the child never
+/// blocks on a full pipe, and at most `MAX_LINE_BYTES` of one line are held;
+/// the rest of an overlong line is dropped. At most `MAX_LINES_PER_WINDOW`
+/// lines per minute are forwarded to `sink`, redacted, as structured JSON. A
+/// refresh failure line always sets `slot`, even when forwarding is suppressed.
 pub(super) async fn forward(stderr: impl AsyncRead + Unpin, slot: ReasonSlot, sink: impl Fn(&str)) {
-    let mut lines = BufReader::new(stderr).lines();
+    forward_with(stderr, slot, sink, |_| {}).await;
+}
+
+/// `forward`, reporting the bytes held for each completed line to `held`.
+async fn forward_with(
+    mut stderr: impl AsyncRead + Unpin,
+    slot: ReasonSlot,
+    sink: impl Fn(&str),
+    held: impl Fn(usize),
+) {
     let mut window_start = Instant::now();
     let mut forwarded = 0usize;
     let mut suppressed = 0u64;
-    let flush = |suppressed: u64, sink: &dyn Fn(&str)| {
-        if suppressed > 0 {
-            sink(
-                &json!({"operation":"owner_child","stage":"stderr","suppressed":suppressed})
-                    .to_string(),
-            );
-        }
-    };
-    while let Ok(Some(line)) = lines.next_line().await {
+    let mut line = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 4096];
+    let mut handle = |line: &[u8]| {
+        held(line.len());
+        let line = String::from_utf8_lossy(line);
         if let Some(reason) = classify(&line) {
             slot.set(reason);
         }
         if window_start.elapsed() >= WINDOW {
-            flush(suppressed, &sink);
+            if suppressed > 0 {
+                sink(&suppressed_note(suppressed));
+            }
             window_start = Instant::now();
             forwarded = 0;
             suppressed = 0;
@@ -123,8 +133,32 @@ pub(super) async fn forward(stderr: impl AsyncRead + Unpin, slot: ReasonSlot, si
         } else {
             suppressed += 1;
         }
+    };
+    loop {
+        let read = match stderr.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        for &byte in &chunk[..read] {
+            if byte == b'\n' {
+                handle(&line);
+                line.clear();
+            } else if line.len() < MAX_LINE_BYTES {
+                line.push(byte);
+            }
+        }
     }
-    flush(suppressed, &sink);
+    if !line.is_empty() {
+        handle(&line);
+    }
+    drop(handle);
+    if suppressed > 0 {
+        sink(&suppressed_note(suppressed));
+    }
+}
+
+fn suppressed_note(suppressed: u64) -> String {
+    json!({"operation":"owner_child","stage":"stderr","suppressed":suppressed}).to_string()
 }
 
 /// Failures per (account, account key, reason) for this server process.
@@ -284,5 +318,38 @@ mod tests {
             "same alias, other user, separate series: {text}"
         );
         assert!(text.contains("account=\"other\\\"acct\","), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_endless_line_is_capped_while_it_is_read() {
+        let mut input = vec![b'x'; 4 * 1024 * 1024];
+        input.push(b'\n');
+        input.extend_from_slice(REUSED_TEXT.as_bytes());
+        input.push(b'\n');
+        let slot = ReasonSlot::default();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        let longest = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = longest.clone();
+        forward_with(
+            input.as_slice(),
+            slot.clone(),
+            move |line| sink.lock().unwrap().push(line.to_owned()),
+            move |held| {
+                seen.fetch_max(held, std::sync::atomic::Ordering::Relaxed);
+            },
+        )
+        .await;
+        assert!(
+            longest.load(std::sync::atomic::Ordering::Relaxed) <= MAX_LINE_BYTES,
+            "held {} bytes for one line",
+            longest.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(lines.lock().unwrap().len(), 2);
+        assert_eq!(
+            slot.take(),
+            Some("refresh_token_reused"),
+            "the next line still parses"
+        );
     }
 }

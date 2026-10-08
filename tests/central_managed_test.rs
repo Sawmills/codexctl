@@ -3863,6 +3863,27 @@ fn a_rejected_forced_refresh_is_counted_too() {
     );
 }
 
+#[test]
+fn a_rejected_refresh_on_the_routing_read_is_counted_too() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"routing-read-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_reused".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
 /// (account, reason, count) per series; each series also carries a
 /// 12-character account_key so two users' equal aliases stay apart.
 fn owner_refresh_failures(metrics: &str) -> Vec<(String, String, u64)> {
