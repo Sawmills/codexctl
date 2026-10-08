@@ -247,7 +247,8 @@ pub(super) fn decide(
     let auth = candidate.auth;
     let access_token = super::vault::token(auth).map_err(|_| Miss::Identity)?;
     let expires = api::token_expiry(access_token).ok_or(Miss::Expiring)?;
-    if expires - candidate.now < MIN_REMAINING_SECONDS {
+    // The claim is untrusted: compare without overflow.
+    if expires < candidate.now.saturating_add(MIN_REMAINING_SECONDS) {
         return Err(Miss::Expiring);
     }
     let revision = super::vault::digest(&serde_json::to_vec(auth).map_err(|_| Miss::Identity)?);
