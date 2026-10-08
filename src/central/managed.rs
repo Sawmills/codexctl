@@ -170,10 +170,7 @@ impl Broker {
     }
 
     fn replace_holder_id(&self, holder: String) {
-        *self
-            .holder_id
-            .lock()
-            .expect("holder id lock poisoned") = holder;
+        *self.holder_id.lock().expect("holder id lock poisoned") = holder;
     }
 }
 #[derive(Clone)]
