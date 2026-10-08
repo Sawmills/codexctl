@@ -246,6 +246,11 @@ impl Relay {
         };
         match class {
             Http429::Terminal => {
+                // Codex stops on this; the next request is a resume.
+                self.streaks
+                    .lock()
+                    .expect("streak lock")
+                    .end(&labels.thread);
                 self.event(
                     Kind::Rate429,
                     &labels,
@@ -473,7 +478,7 @@ impl FrameRewriter {
                     .failure(Kind::Overloaded, &self.labels, self.request_id.as_deref())
                 {
                     Some(secs) => with_retry_advice(&frame, event, secs),
-                    None => frame,
+                    None => without_retry_advice(frame, event),
                 }
             }
             Some("response.failed") => frame,
@@ -486,9 +491,17 @@ impl FrameRewriter {
     }
 }
 
-/// Index just past the blank line that ends the first frame.
+/// Index just past the blank line that ends the first frame (LF or CRLF).
 fn find_frame_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
+    let lf = buffer.windows(2).position(|w| w == b"\n\n").map(|i| i + 2);
+    let crlf = buffer
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4);
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) => Some(lf.min(crlf)),
+        (lf, crlf) => lf.or(crlf),
+    }
 }
 
 fn frame_data(frame: &[u8]) -> Option<Value> {
@@ -535,6 +548,34 @@ fn with_retry_advice(frame: &[u8], mut event: Value, secs: u64) -> Vec<u8> {
         return frame.to_vec();
     };
     headers.insert("retry-after".into(), Value::String(secs.to_string()));
+    rebuild_frame(frame, &event)
+}
+
+/// The exhausted stop: the original frame, minus any upstream retry advice,
+/// so Codex stops and the board takes over.
+fn without_retry_advice(frame: Vec<u8>, mut event: Value) -> Vec<u8> {
+    let removed = event
+        .pointer_mut("/response/error/headers")
+        .and_then(Value::as_object_mut)
+        .and_then(|headers| {
+            let names: Vec<String> = headers
+                .keys()
+                .filter(|name| name.eq_ignore_ascii_case("retry-after"))
+                .cloned()
+                .collect();
+            names.iter().for_each(|name| {
+                headers.remove(name);
+            });
+            (!names.is_empty()).then_some(())
+        });
+    match removed {
+        Some(()) => rebuild_frame(&frame, &event),
+        None => frame,
+    }
+}
+
+/// Writes `event` as the frame's data line; other lines keep their order.
+fn rebuild_frame(frame: &[u8], event: &Value) -> Vec<u8> {
     let text = String::from_utf8_lossy(frame);
     let mut out = String::with_capacity(frame.len() + 32);
     let mut wrote_data = false;
@@ -546,7 +587,7 @@ fn with_retry_advice(frame: &[u8], mut event: Value, secs: u64) -> Vec<u8> {
                 out.push('\n');
                 wrote_data = true;
             }
-        } else {
+        } else if !line.is_empty() {
             out.push_str(line);
             out.push('\n');
         }

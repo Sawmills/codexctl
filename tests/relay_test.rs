@@ -507,3 +507,68 @@ fn relay_refuses_non_loopback_binds_and_foreign_upstreams() {
         );
     });
 }
+
+#[tokio::test]
+async fn exhausted_capacity_event_loses_upstream_retry_advice() {
+    let with_advice = OVERLOADED.replace(
+        "\"code\":\"server_is_overloaded\"",
+        "\"code\":\"server_is_overloaded\",\"headers\":{\"retry-after\":\"5\"}",
+    );
+    let h = harness_with(
+        vec![Scripted::Sse(vec![CREATED.into(), with_advice])],
+        |config| config.with_budgets(Duration::ZERO, Duration::ZERO),
+    )
+    .await;
+    let body = h.post("t1").await.text().await.unwrap();
+    let event = failed_event(&body);
+    assert_eq!(event["response"]["error"]["code"], "server_is_overloaded");
+    assert!(
+        event["response"]["error"]["headers"]
+            .get("retry-after")
+            .is_none(),
+        "Codex must stop once the budget is spent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn crlf_framed_capacity_events_get_advice() {
+    let crlf = |frame: &str| frame.replace('\n', "\r\n");
+    let h = harness(vec![Scripted::Sse(vec![crlf(CREATED), crlf(OVERLOADED)])]).await;
+    let body = h.post("t1").await.text().await.unwrap();
+    let event: Value = serde_json::from_str(
+        body.split("\r\n\r\n")
+            .chain(body.split("\n\n"))
+            .find(|frame| frame.contains("response.failed"))
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        event["response"]["error"]["headers"]["retry-after"].is_string(),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_429_ends_the_streak() {
+    let terminal = json!({"error": {"type": "usage_limit_reached"}}).to_string();
+    let h = harness(vec![
+        Scripted::Status(429, vec![], RATE_429.into()),
+        Scripted::Status(429, vec![], RATE_429.into()),
+        Scripted::Status(429, vec![], terminal),
+        Scripted::Status(429, vec![], RATE_429.into()),
+    ])
+    .await;
+    for _ in 0..4 {
+        h.post("t1").await.text().await.unwrap();
+    }
+    let logs = h.logs.lock().unwrap().clone();
+    let last: Value = serde_json::from_str(logs.last().unwrap()).unwrap();
+    assert_eq!(last["outcome"], "advised");
+    assert_eq!(
+        last["attempt"], 1,
+        "the resume after a stop starts at attempt 1"
+    );
+}

@@ -180,6 +180,12 @@ impl Streaks {
         })
     }
 
+    /// Ends the thread's streak without a recovery (Codex stopped on a
+    /// terminal error).
+    pub(crate) fn end(&mut self, thread: &str) {
+        self.by_thread.remove(thread);
+    }
+
     /// A delay in `[ceil(cap / 2), cap]`, at least one second.
     fn jittered(&mut self, cap: u64) -> u64 {
         self.draws += 1;
