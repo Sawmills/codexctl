@@ -174,10 +174,15 @@ impl Streaks {
             .by_thread
             .get_mut(thread)
             .expect("streak inserted above");
-        streak.retry_at = now + Duration::from_secs(secs);
-        if now.duration_since(started) + Duration::from_secs(secs) > budget {
+        // Saturating: upstream advice is external and may be any u64.
+        let delay = Duration::from_secs(secs);
+        if now.saturating_duration_since(started).saturating_add(delay) > budget {
             streak.exhausted = true;
             return Advice::Exhausted { attempt };
+        }
+        // A budget from the command line can be huge too, so stay checked.
+        if let Some(retry_at) = now.checked_add(delay) {
+            streak.retry_at = retry_at;
         }
         Advice::RetryAfter { secs, attempt }
     }
@@ -314,6 +319,15 @@ mod tests {
         let mut streaks = Streaks::new(Duration::from_secs(180), Duration::from_secs(600));
         assert_eq!(
             streaks.failure("t", Kind::Rate429, Instant::now(), Some(200)),
+            Advice::Exhausted { attempt: 1 }
+        );
+    }
+
+    #[test]
+    fn a_huge_upstream_delay_exhausts_without_overflow() {
+        let mut streaks = Streaks::new(Duration::from_secs(180), Duration::from_secs(600));
+        assert_eq!(
+            streaks.failure("t", Kind::Rate429, Instant::now(), Some(u64::MAX)),
             Advice::Exhausted { attempt: 1 }
         );
     }
