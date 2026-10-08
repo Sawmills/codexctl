@@ -306,7 +306,9 @@ these hold:
   reservation fences it (the same predicate as the lease claim). A locally
   fenced owner also takes the lease path, and any failed lease-path read
   deletes the account's evidence, so no replica serves it until the lease path
-  observes the account again.
+  observes the account again. If that delete fails three times, the failure is
+  counted as `token_evidence_clear_failed`, and the old evidence still expires
+  within 60 s.
 
 The lease path publishes the evidence in the same `fenced_write` transaction as
 the credential, under the valid-lease predicate, also when the credential is

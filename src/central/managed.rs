@@ -1498,15 +1498,33 @@ async fn token(
             // A failed native read may mean lost routing or a fenced owner.
             // Withdraw the evidence so no replica serves this account
             // lease-free until the lease path observes it again.
+            // A clear that keeps failing leaves at most the 60 s evidence
+            // bound; it is counted so the failure alert fires.
             if token_result.is_err()
                 && lease.is_some()
                 && let Some(central) = worker.central.as_ref()
-                && let Err(error) = central.clear_token_evidence(&account_id).await
             {
-                eprintln!(
-                    "{}",
-                    json!({"operation":"token_evidence","stage":"clear","reason":"clear_failed","error":format!("{error:#}")})
-                );
+                let mut cleared = Err(anyhow::anyhow!("not attempted"));
+                for attempt in 0..3 {
+                    if attempt > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    cleared = central.clear_token_evidence(&account_id).await;
+                    if cleared.is_ok() {
+                        break;
+                    }
+                }
+                if let Err(error) = cleared {
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"token_evidence","stage":"clear","reason":"clear_failed","error":format!("{error:#}")})
+                    );
+                    worker.record_failure(
+                        "token_evidence_clear_failed",
+                        "token_evidence",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                }
             }
             if matches!(&token_result, Err(TokenFailure::Retryable(_))) {
                 owner.fence(true);
