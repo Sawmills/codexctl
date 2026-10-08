@@ -329,6 +329,8 @@ impl CentralStore {
 
     /// Claim only a durable candidate that has not started verification.
     /// Foreign refresh leases remain untouched until their own settlement.
+    /// A live holder reclaims its own candidate even after the operation lease
+    /// expires, because no other replica may claim it while the holder lives.
     pub(in crate::central) async fn login_takeover_candidate(
         &self,
         op: &mut LoginOperation,
@@ -343,7 +345,7 @@ impl CentralStore {
             let tx = connection.transaction().await?;
             let _timing = super::identity::lock_admission(&tx).await?;
             let row = tx.query_opt(
-                "UPDATE central_login_operations o SET holder_id=$6,epoch=epoch+1,sequence=sequence+1,expires_at=clock_timestamp()+interval '30 seconds' FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='candidate' AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND ((o.holder_id=$6 AND o.expires_at>clock_timestamp() AND h.expires_at>clock_timestamp()) OR (o.expires_at<=clock_timestamp() AND h.expires_at<=clock_timestamp())) AND NOT EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                "UPDATE central_login_operations o SET holder_id=$6,epoch=epoch+1,sequence=sequence+1,expires_at=clock_timestamp()+interval '30 seconds' FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='candidate' AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND ((o.holder_id=$6 AND h.expires_at>clock_timestamp()) OR (o.expires_at<=clock_timestamp() AND h.expires_at<=clock_timestamp())) AND NOT EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder],
             ).await?;
             tx.commit().await?;
@@ -358,6 +360,7 @@ impl CentralStore {
 
     /// Expired verification, or unsettled pre-verification refresh ownership,
     /// keeps all credential and reservation evidence without replaying work.
+    /// The caller settles its own holder's receipt only after its worker exits.
     pub(in crate::central) async fn login_recover_unresolved(
         &self,
         op: &mut LoginOperation,
@@ -382,7 +385,7 @@ impl CentralStore {
             let tx = connection.transaction().await?;
             let _timing = super::identity::lock_admission(&tx).await?;
             let row = tx.query_opt(
-                "UPDATE central_login_operations o SET phase='unresolved',encrypted_payload=$7,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase=$8 AND o.expires_at<=clock_timestamp() AND (o.phase='verifying' OR (o.phase='candidate' AND EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released))) AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.expires_at<=clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                "UPDATE central_login_operations o SET phase='unresolved',encrypted_payload=$7,holder_id=$6,epoch=epoch+1,sequence=sequence+1 FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase=$8 AND o.expires_at<=clock_timestamp() AND (o.phase='verifying' OR (o.phase='candidate' AND EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released))) AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND (h.expires_at<=clock_timestamp() OR o.holder_id=$6) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder,&encrypted,&op.phase.as_str()],
             ).await?;
             tx.commit().await?;
@@ -434,6 +437,7 @@ impl CentralStore {
     }
 
     /// One serving replica reports each durable supervisor/unknown-exit failure.
+    /// A holder with no row predates registration and reports its own failures.
     pub(in crate::central) async fn login_take_failure(
         &self,
         op: &mut LoginOperation,
@@ -442,7 +446,7 @@ impl CentralStore {
         let db = self.login_db()?;
         let changed = bounded_db(async {
             Ok(db.client().await?.execute(
-                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','failed','canceled') AND NOT failure_reported AND (holder_id=$5 OR NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()))",
+                "UPDATE central_login_operations SET failure_reported=true WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase NOT IN ('completed','failed','canceled') AND NOT failure_reported AND (holder_id=$5 OR (EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3) AND NOT EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp())))",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&reporter],
             ).await? == 1)
         }).await?;

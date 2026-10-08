@@ -109,11 +109,20 @@ async fn recover(
         );
         record_login_failure(broker, op).await?;
     }
-    if database(broker)?
-        .login_recover_unresolved(op, &holder_id)
-        .await
-        .map_err(|_| failure(broker))?
-    {
+    // A live holder settles its own receipt only after its local worker exits.
+    let own = op.holder == holder_id;
+    let guard = if own {
+        WorkerGuard::claim(broker, op)?
+    } else {
+        None
+    };
+    let settled = (!own || guard.is_some())
+        && database(broker)?
+            .login_recover_unresolved(op, &holder_id)
+            .await
+            .map_err(|_| failure(broker))?;
+    drop(guard);
+    if settled {
         eprintln!(
             "{}",
             json!({"operation":"login_recovery","stage":"verification","reason":"replica_lost"})
@@ -451,7 +460,24 @@ fn spawn_claimed_worker(
                 LoginPhase::Failed
             };
             if let Ok(db) = database(&worker) {
-                let _ = db.login_save(&mut worker_op, phase).await;
+                // A transient database error must not leave a stale receipt.
+                for attempt in 1..=3 {
+                    let Err(error) = db.login_save(&mut worker_op, phase).await else {
+                        break;
+                    };
+                    if attempt < 3 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    let mut detail = format!("{error:#}");
+                    if let Some(auth) = worker_op.payload.candidate.as_ref() {
+                        crate::central::resets::redact_auth_strings(auth, &mut detail);
+                    }
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"login_settlement","stage":"terminal_save","reason":"save_unavailable","error":detail})
+                    );
+                }
             }
         }
     });
