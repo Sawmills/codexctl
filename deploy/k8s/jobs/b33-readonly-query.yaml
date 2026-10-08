@@ -1,0 +1,106 @@
+# B33 attempt 3: the read-only database checks from the cutover runbook
+# (docs/superpowers/plans/b33-attempt-3-cutover.md, "Read-Only Queries").
+# No kustomization includes this file, so nothing syncs it. The operator runs
+#   kubectl -n codexctl create -f deploy/k8s/jobs/b33-readonly-query.yaml
+# and reads the result with kubectl logs. Every statement runs in a read-only
+# transaction, and the job label selects the codexctl-migration egress policy.
+# Before migrate, the emptiness check returns no rows. After migrate, only the
+# bookkeeping tables central_schema_migrations and
+# central_identity_migration_progress hold rows.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: codexctl
+  generateName: codexctl-readonly-query-
+  labels:
+    app.kubernetes.io/name: codexctl-migration
+    app.kubernetes.io/component: readonly-query
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy codexctl-migration selects this pod.
+    checkov.io/skip2: CKV_K8S_35=Database credentials come from the codexctl-postgres ExternalSecret by design.
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codexctl-migration
+        app.kubernetes.io/component: readonly-query
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: query
+          image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            - |
+              psql -X -v ON_ERROR_STOP=1 <<'SQL'
+              \echo '== emptiness (prerequisite 3): no row, or 0 in every row, means empty'
+              SELECT table_name,
+                     (xpath('/row/c/text()',
+                            query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
+                                         false, true, '')))[1]::text::bigint AS row_count
+              FROM information_schema.tables
+              WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+              ORDER BY table_name;
+              SELECT to_regclass('account_refresh_leases') IS NOT NULL AS migrated \gset
+              \if :migrated
+              \echo '== lease fence (rollback step 3): must be 0'
+              SELECT count(*) AS unreleased_leases FROM account_refresh_leases WHERE NOT released;
+              \echo '== login journals (rollback step 3 and HA-only credentials): every row needs action'
+              SELECT user_id, kind, phase, polling_clear, alias, landed_alias, account_id,
+                     candidate_workspace IS NOT NULL AS holds_candidate
+              FROM central_login_operations
+              WHERE phase NOT IN ('failed', 'canceled') OR candidate_workspace IS NOT NULL
+              ORDER BY user_id, alias;
+              \else
+              \echo '== not migrated: lease and login checks skipped'
+              \endif
+              SQL
+          env:
+            - name: PGHOST
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-hostname } }
+            - name: PGPORT
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-port } }
+            - name: PGDATABASE
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-name } }
+            - name: PGUSER
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-user } }
+            - name: PGPASSWORD
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-password } }
+            - name: PGSSLMODE
+              value: verify-full
+            - name: PGSSLROOTCERT
+              value: /etc/codexctl/rds-ca/global-bundle.pem
+            - name: PGOPTIONS
+              value: -c default_transaction_read_only=on
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+          volumeMounts:
+            - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
+            - { name: temporary, mountPath: /tmp }
+      volumes:
+        - name: rds-ca
+          configMap: { name: codexctl-rds-ca }
+        - name: temporary
+          emptyDir: {}
