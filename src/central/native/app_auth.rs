@@ -212,7 +212,7 @@ fn enable(
         Some(state) => state.backup_account,
         None => back_up_login(&paths)?,
     };
-    write_auth(&paths, &connection.account_id, &token.access_token)?;
+    let account_id = connection.account_id.clone();
     let mut state = State {
         alias: account.alias.clone(),
         connection,
@@ -225,6 +225,15 @@ fn enable(
         backup_account,
         last: None,
     };
+    // Journal first: if the write below never lands, the marker still exists,
+    // so the guards hold and disable can undo what enable began.
+    record(
+        &paths,
+        &mut state,
+        false,
+        "enable started; auth.json not yet written",
+    )?;
+    write_auth(&paths, &account_id, &token.access_token)?;
     record(&paths, &mut state, true, "written by enable")?;
     if !no_agent {
         install_agent()?;
@@ -347,8 +356,7 @@ fn disable(restore_login: bool) -> Result<()> {
             None => true,
         };
         if restore_login || !held_by_server {
-            std::fs::copy(&backup, paths.auth())?;
-            std::fs::set_permissions(paths.auth(), std::fs::Permissions::from_mode(0o600))?;
+            store::atomic_write(&paths.auth(), &std::fs::read(&backup)?)?;
             std::fs::remove_file(&backup)?;
             eprintln!("codexctl: restored the login app-auth backed up");
         } else {
