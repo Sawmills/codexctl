@@ -3825,12 +3825,61 @@ fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
         .unwrap()
         .text()
         .unwrap();
-    assert!(
-        metrics.contains(
-            "codexctl_central_owner_refresh_failed_total{account=\"personal\",reason=\"refresh_token_reused\"} 1\n"
-        ),
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_reused".to_owned(), 1)],
         "{metrics}"
     );
+}
+
+#[test]
+fn a_rejected_forced_refresh_is_counted_too() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"forced-refresh-invalid-grant",
+    )
+    .unwrap();
+    assert_eq!(
+        server
+            .token(&server.amir, "personal", initial["revision"].as_str())
+            .status(),
+        503
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "invalid_grant".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
+/// (account, reason, count) per series; each series also carries a
+/// 12-character account_key so two users' equal aliases stay apart.
+fn owner_refresh_failures(metrics: &str) -> Vec<(String, String, u64)> {
+    let pattern = regex::Regex::new(
+        r#"^codexctl_central_owner_refresh_failed_total\{account="([^"]+)",account_key="[0-9a-f]{12}",reason="([a-z_]+)"\} (\d+)$"#,
+    )
+    .unwrap();
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("codexctl_central_owner_refresh_failed_total"))
+        .map(|line| {
+            let c = pattern
+                .captures(line)
+                .unwrap_or_else(|| panic!("bad series: {line}"));
+            (c[1].to_owned(), c[2].to_owned(), c[3].parse().unwrap())
+        })
+        .collect()
 }
 
 #[test]

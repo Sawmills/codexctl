@@ -127,19 +127,24 @@ pub(super) async fn forward(stderr: impl AsyncRead + Unpin, slot: ReasonSlot, si
     flush(suppressed, &sink);
 }
 
-/// Failures per (account, reason) for this server process.
-fn failures() -> &'static Mutex<BTreeMap<(String, &'static str), u64>> {
-    static FAILURES: OnceLock<Mutex<BTreeMap<(String, &'static str), u64>>> = OnceLock::new();
+/// Failures per (account, account key, reason) for this server process.
+type FailureKey = (String, String, &'static str);
+
+fn failures() -> &'static Mutex<BTreeMap<FailureKey, u64>> {
+    static FAILURES: OnceLock<Mutex<BTreeMap<FailureKey, u64>>> = OnceLock::new();
     FAILURES.get_or_init(Default::default)
 }
 
-/// Counts one rejected owner refresh. The account set is the small set of
-/// server accounts, so the label stays bounded.
-pub(super) fn record(account: &str, reason: &'static str) {
+/// Counts one rejected owner refresh. `account` is the readable alias; two
+/// company users can share it, so the series also carries the first 12
+/// characters of the same digest as `managed::account_key`. The set of server
+/// accounts is small, so both labels stay bounded.
+pub(super) fn record(account: &str, user: &str, reason: &'static str) {
+    let key = super::vault::digest(format!("{user}\0{}", account.to_ascii_lowercase()).as_bytes());
     *failures()
         .lock()
         .expect("refresh failure lock")
-        .entry((account.to_owned(), reason))
+        .entry((account.to_owned(), key[..12].to_owned(), reason))
         .or_default() += 1;
 }
 
@@ -155,9 +160,9 @@ pub(super) fn metrics() -> String {
         .lock()
         .expect("refresh failure lock")
         .iter()
-        .map(|((account, reason), count)| {
+        .map(|((account, key, reason), count)| {
             format!(
-                "codexctl_central_owner_refresh_failed_total{{account=\"{}\",reason=\"{reason}\"}} {count}\n",
+                "codexctl_central_owner_refresh_failed_total{{account=\"{}\",account_key=\"{key}\",reason=\"{reason}\"}} {count}\n",
                 escape(account)
             )
         })
@@ -259,16 +264,25 @@ mod tests {
 
     #[test]
     fn metrics_count_each_failure_per_account_and_reason() {
-        record("metrics-test@example.com", "refresh_token_reused");
-        record("metrics-test@example.com", "refresh_token_reused");
-        record("other\"acct", "invalid_grant");
+        record("metrics-test", "metrics-user-a", "refresh_token_reused");
+        record("metrics-test", "metrics-user-a", "refresh_token_reused");
+        record("metrics-test", "metrics-user-b", "refresh_token_reused");
+        record("other\"acct", "metrics-user-a", "invalid_grant");
         let text = metrics();
-        assert!(text.contains(
-            "codexctl_central_owner_refresh_failed_total{account=\"metrics-test@example.com\",reason=\"refresh_token_reused\"} 2\n"
-        ), "{text}");
+        let a = &super::super::vault::digest(b"metrics-user-a\0metrics-test")[..12];
+        let b = &super::super::vault::digest(b"metrics-user-b\0metrics-test")[..12];
         assert!(
-            text.contains("account=\"other\\\"acct\",reason=\"invalid_grant\"} 1\n"),
+            text.contains(&format!(
+                "codexctl_central_owner_refresh_failed_total{{account=\"metrics-test\",account_key=\"{a}\",reason=\"refresh_token_reused\"}} 2\n"
+            )),
             "{text}"
         );
+        assert!(
+            text.contains(&format!(
+                "{{account=\"metrics-test\",account_key=\"{b}\",reason=\"refresh_token_reused\"}} 1\n"
+            )),
+            "same alias, other user, separate series: {text}"
+        );
+        assert!(text.contains("account=\"other\\\"acct\","), "{text}");
     }
 }

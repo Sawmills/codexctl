@@ -48,7 +48,7 @@ spec:
             service: codexctl
             environment: staging
           annotations:
-            summary: "Codexctl server account {{ $labels.account }} lost its refresh grant ({{ $labels.reason }})"
+            summary: "Codexctl server account {{ $labels.account }} ({{ $labels.account_key }}) lost its refresh grant ({{ $labels.reason }})"
             description: The provider rejected the stored refresh grant, so token requests for this account fail until it is renewed with a device code. Check the owner_refresh and owner_child log lines for the provider reason.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
 ---

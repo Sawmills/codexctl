@@ -150,7 +150,7 @@ impl Owner {
         // Only a provider rejection is counted; other read failures already
         // surface as owner_unavailable.
         if let Some(reason) = reason {
-            super::owner_refresh::record(&account, reason);
+            super::owner_refresh::record(&account, &self.vault.user, reason);
         }
         let reason = reason.unwrap_or("unclassified");
         eprintln!(
@@ -355,6 +355,8 @@ impl Owner {
             .as_ref()
             .is_err_and(|error| !error.is::<RoutingPolicyError>())
         {
+            // A forced `account/read` is the normal client refresh path.
+            self.refresh_failed().await;
             self.fence(false);
         }
         if force

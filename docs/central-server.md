@@ -1011,7 +1011,9 @@ Confirm enforcement with the platform owner before relying on it for access cont
 
 When the provider rejects an owner's stored refresh grant, the server logs one
 `owner_refresh` line with the account and a bounded reason. It also counts
-`codexctl_central_owner_refresh_failed_total{account,reason}`. The reason comes
+`codexctl_central_owner_refresh_failed_total{account,account_key,reason}`.
+`account` is the alias; `account_key` is the first 12 characters of the account
+digest, so two company users with the same alias stay apart. The reason comes
 from the status and error code that Codex logs on the owner child's stderr:
 
 | Reason                      | Provider answer                               |

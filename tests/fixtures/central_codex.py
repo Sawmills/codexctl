@@ -133,6 +133,10 @@ for line in sys.stdin:
                 send({"method": "account/rateLimits/updated", "params": {}})
         if params.get("refreshToken"):
             mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+            if mode == "forced-refresh-invalid-grant":
+                print('ERROR codex_login::auth::manager: Failed to refresh token status=400 Bad Request detail=TokenErrorDetail { error_code: Some("invalid_grant"), error_message: None, .. }', file=sys.stderr, flush=True)
+                send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed. Please log out and sign in again."}})
+                continue
             partial_failure = mode == "partial-migration" and json.loads(auth_path.read_text())["tokens"].get("account_id") == "bad-seat"
             invalid_grant = json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh"
             if mode == "rejected-success" and invalid_grant:
