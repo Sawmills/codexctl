@@ -248,6 +248,41 @@ async fn central_report_contains_only_the_four_metric_labels() {
 }
 
 #[tokio::test]
+async fn central_rate_limit_has_its_own_drop_reason() {
+    let app = Router::new().route(
+        "/v1/relay/capacity-events",
+        post(|| async { StatusCode::TOO_MANY_REQUESTS }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| {
+            config
+                .with_budgets(Duration::ZERO, Duration::ZERO)
+                .with_central_reporter(&central_url, "central-test-token")
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(h.post("central-limited").await.status(), 429);
+    let metrics = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let metrics = h.metrics().await;
+            if metrics.contains("codexctl_relay_central_dropped_total{reason=\"rate_limited\"} 1") {
+                break metrics;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("central 429 must be counted as rate limited");
+    assert!(!metrics.contains("reason=\"send_failed\""), "{metrics}");
+}
+
+#[tokio::test]
 async fn advised_capacity_events_do_not_consume_central_event_budget() {
     let (events, mut received) = mpsc::channel(4);
     let sink = CentralSink { events };

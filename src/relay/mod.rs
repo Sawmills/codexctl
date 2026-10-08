@@ -127,6 +127,11 @@ struct CentralReporter {
     client: reqwest::Client,
 }
 
+enum CentralSendFailure {
+    RateLimited,
+    Failed,
+}
+
 impl CentralReporter {
     fn new(server: &str, token: &str) -> Result<Self> {
         let mut url = reqwest::Url::parse(server.trim_end_matches('/'))?;
@@ -155,7 +160,7 @@ impl CentralReporter {
         })
     }
 
-    async fn send(&self, event: &CapacityEvent) -> Result<()> {
+    async fn send(&self, event: &CapacityEvent) -> std::result::Result<(), CentralSendFailure> {
         let response = tokio::time::timeout(
             CENTRAL_EVENT_SEND_TIMEOUT,
             self.client
@@ -165,11 +170,14 @@ impl CentralReporter {
                 .send(),
         )
         .await
-        .context("central event report timed out")??;
+        .map_err(|_| CentralSendFailure::Failed)?
+        .map_err(|_| CentralSendFailure::Failed)?;
         if response.status().is_success() {
             Ok(())
+        } else if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            Err(CentralSendFailure::RateLimited)
         } else {
-            bail!("central event report rejected with {}", response.status())
+            Err(CentralSendFailure::Failed)
         }
     }
 }
@@ -216,11 +224,16 @@ pub async fn serve(
         let dropped = central_dropped.clone();
         let worker = tokio::spawn(async move {
             while let Some(event) = receiver.recv().await {
-                if reporter.send(&event).await.is_err() {
+                let reason = match reporter.send(&event).await {
+                    Ok(()) => continue,
+                    Err(CentralSendFailure::RateLimited) => "rate_limited",
+                    Err(CentralSendFailure::Failed) => "send_failed",
+                };
+                {
                     *dropped
                         .lock()
                         .expect("central drop metric lock")
-                        .entry("send_failed")
+                        .entry(reason)
                         .or_default() += 1;
                 }
             }
