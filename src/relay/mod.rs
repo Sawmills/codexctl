@@ -510,7 +510,8 @@ fn frame_data(frame: &[u8]) -> Option<Value> {
 /// Codex 0.162.0-alpha.8 and later read `error.headers["retry-after"]`. Codex
 /// 0.161.0 ignores advice on `server_is_overloaded` but reads "try again in
 /// N s" from a `rate_limit_exceeded` message, so the code and message change
-/// too. Newer Codex reads the header first for that code, so both agree. The
+/// too. Temporary: SAW-12575 removes this rewrite once lanes run Codex 0.162
+/// stable. Newer Codex reads the header first for that code, so both agree. The
 /// final stop after the budget is the original frame, unchanged. Other lines
 /// keep their order and text.
 fn with_retry_advice(frame: &[u8], mut event: Value, secs: u64) -> Vec<u8> {
