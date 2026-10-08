@@ -3410,6 +3410,8 @@ async fn postgres_stopped_parent_has_an_independent_polling_watchdog() {
 fn central_child_dead(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        // A process that exits during the read reports ESRCH instead.
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => true,
         Ok(stat) => stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z"),
         Err(error) => panic!("child liveness: {error}"),
     }
