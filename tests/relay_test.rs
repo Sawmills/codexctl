@@ -584,3 +584,25 @@ async fn oversized_429_bodies_pass_through_without_advice() {
     assert_eq!(retry_after(&response), None);
     assert_eq!(response.text().await.unwrap(), body);
 }
+
+#[tokio::test]
+async fn metadata_before_output_does_not_end_the_head() {
+    let metadata =
+        "event: response.metadata\ndata: {\"type\":\"response.metadata\",\"metadata\":{}}\n\n";
+    let limits = "event: codex.rate_limits\ndata: {\"type\":\"codex.rate_limits\"}\n\n";
+    let h = harness(vec![Scripted::Sse(vec![
+        CREATED.into(),
+        metadata.into(),
+        limits.into(),
+        OVERLOADED.into(),
+    ])])
+    .await;
+    let body = h.post("t1").await.text().await.unwrap();
+    let event = failed_event(&body);
+    assert!(
+        event["response"]["error"]["headers"]["retry-after"].is_string(),
+        "{body}"
+    );
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0, "{metrics}");
+}

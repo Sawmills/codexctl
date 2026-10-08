@@ -472,8 +472,13 @@ impl FrameRewriter {
         let Some(event) = frame_data(&frame) else {
             return frame;
         };
-        match event.get("type").and_then(Value::as_str) {
-            Some("response.created" | "response.in_progress") => frame,
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
+        if is_output(kind) {
+            self.output_started = true;
+            self.relay.success(&self.labels);
+            return frame;
+        }
+        match Some(kind) {
             Some("response.failed") if policy::is_overloaded_failure(&event) => {
                 match self
                     .relay
@@ -483,14 +488,27 @@ impl FrameRewriter {
                     None => without_retry_advice(frame, event),
                 }
             }
-            Some("response.failed") => frame,
-            _ => {
-                self.output_started = true;
-                self.relay.success(&self.labels);
-                frame
-            }
+            // Head and metadata events (`response.created`, `response.metadata`,
+            // `codex.rate_limits`, ...) and other failures pass unchanged.
+            _ => frame,
         }
     }
+}
+
+/// Events that carry model output, or a completed response. Once one passes,
+/// a retry would repeat output, so the relay stops inspecting the stream.
+fn is_output(kind: &str) -> bool {
+    kind == "response.completed"
+        || [
+            "response.output_item.",
+            "response.output_text.",
+            "response.reasoning",
+            "response.content_part.",
+            "response.function_call_arguments.",
+            "response.refusal.",
+        ]
+        .iter()
+        .any(|prefix| kind.starts_with(prefix))
 }
 
 /// Index just past the blank line that ends the first frame (LF or CRLF).

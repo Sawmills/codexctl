@@ -25,6 +25,8 @@ OK = [
 ]
 OVERLOADED = [
     {"type": "response.created", "response": {"id": "r1"}},
+    # The real backend can send metadata before output; it must not end the head.
+    {"type": "response.metadata", "metadata": {}},
     {"type": "response.failed", "response": {"id": "r1", "error": {
         "code": "server_is_overloaded",
         "message": "Selected model is at capacity. Please try a different model."}}},
