@@ -14,6 +14,7 @@ waiting = False
 pending_turn = None
 definitive_rejection = False
 billing_rotated = False
+limits_read = False
 
 if "login" in sys.argv:
     pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("login-pid").write_text(str(os.getpid()))
@@ -126,6 +127,13 @@ for line in sys.stdin:
             continue
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
+        after_limits, limits_read = limits_read, False
+        if not params.get("refreshToken") and after_limits and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-read-reused":
+            # Only the routing read right after a usage read fails: it can
+            # refresh too, and no other read path may report the reason.
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
+            send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
+            continue
         if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
             rotate(plan_change=True)
         if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "notifications":
@@ -133,6 +141,10 @@ for line in sys.stdin:
                 send({"method": "account/rateLimits/updated", "params": {}})
         if params.get("refreshToken"):
             mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+            if mode == "forced-refresh-invalid-grant":
+                print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.", file=sys.stderr, flush=True)
+                send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed. Please log out and sign in again."}})
+                continue
             partial_failure = mode == "partial-migration" and json.loads(auth_path.read_text())["tokens"].get("account_id") == "bad-seat"
             invalid_grant = json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh"
             if mode == "rejected-success" and invalid_grant:
@@ -173,12 +185,17 @@ for line in sys.stdin:
             rotate()
         if mode == "cached-rejection" and json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh":
             definitive_rejection = True
+        if mode == "startup-refresh-expired":
+            # The cached-status call refreshes at owner start and is rejected.
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.", file=sys.stderr, flush=True)
+            definitive_rejection = True
         current = json.loads(auth_path.read_text())["tokens"]["access_token"]
         result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection else current, "requiresOpenaiAuth":True}
         if mode in ["non-exportable", "baseline-null"]:
             result = {"authMethod":None, "authToken":None, "requiresOpenaiAuth":True}
     elif method == "account/rateLimits/read":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        limits_read = True
         if mode == "billing-policy-wrong-method":
             send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
             continue
@@ -191,6 +208,11 @@ for line in sys.stdin:
         if mode == "rpc-unhealthy":
             print("{invalid", flush=True)
             sys.exit(1)
+        if mode == "refresh-reused":
+            # The real codex 0.161.0 stderr line (captured), then its answer.
+            print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
+            send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
+            continue
         if mode == "billing-permanent-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic permanent billing rejection"}})
             continue

@@ -1007,6 +1007,40 @@ Confirm enforcement with the platform owner before relying on it for access cont
 
 ## Failure and Recovery
 
+### Rejected refresh grant
+
+When the provider rejects an owner's stored refresh grant, the server logs one
+`owner_refresh` line with the account and a bounded reason. It also counts
+`codexctl_central_owner_refresh_failed_total{account,account_key,reason}`.
+`account` is the alias; `account_key` is the first 12 characters of the account
+digest, so two company users with the same alias stay apart. The reason comes
+from the fixed message Codex logs on the owner child's stderr after
+`Failed to refresh token: ` (color codes removed):
+
+| Reason                      | Codex message (provider answer)                                                                                             |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `refresh_token_reused`      | "…your refresh token was already used." (another holder used this grant)                                                    |
+| `refresh_token_expired`     | "…your refresh token has expired."                                                                                          |
+| `refresh_token_invalidated` | "…your refresh token was revoked."                                                                                          |
+| `account_mismatch`          | "…you have since logged out or signed in to another account."                                                               |
+| `other`                     | "Your access token could not be refreshed." (400 `invalid_grant`, or a 401 with another code; Codex logs both the same way) |
+
+A transient refresh failure (Codex logs `status=` and retries), or a failed
+refresh with no such message within 300 ms (for example a usage read error),
+logs `reason="unclassified"` and is not counted. It still reports
+`owner_unavailable`.
+
+The server forwards the owner child's stderr as `owner_child` lines: at most 30
+lines a minute, each at most 300 characters, with token-shaped values replaced
+by `[redacted]`. Extra lines are counted in a `suppressed` line.
+The `CodexctlOwnerRefreshRejected` alert fires on the first failure per account
+and on each later increase. A per-account staging route
+(`group_by: [alertname, account, account_key, reason]`) sends it to
+`warnings-slack` (`#warning-alerts`) without the default 30-minute group delay. Renew the account with a
+device code before its token requests fail as `owner_unavailable`.
+
+### Owners and recovery
+
 One owner process refreshes each account. Different accounts have separate request locks.
 Server owners run in their private homes with the OpenAI provider and ChatGPT login mode fixed.
 Background recovery is controlled by `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY`. It is

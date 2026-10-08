@@ -3044,6 +3044,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         .collect();
     output.push_str(&super::storage::identity::admission_metrics());
     output.push_str(&fast_path::metrics());
+    output.push_str(&super::owner_refresh::metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
@@ -3341,6 +3342,9 @@ async fn initialize_owner(owner: &mut Owner) -> Result<()> {
         // Even the cached-status call can refresh. Persist its journal and
         // rejection evidence before returning any protocol or loading error.
         owner.snapshot()?;
+        if owner.rpc.as_ref().is_some_and(|rpc| rpc.rejected_login()) {
+            owner.refresh_failed().await;
+        }
         let token = status?;
         if token != vault::token(&owner.vault.auth)? {
             bail!("native owner exported a login that differs from its journal");

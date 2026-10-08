@@ -54,6 +54,25 @@ spec:
             summary: Codexctl token requests keep failing with owner_unavailable
             description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+        # SAW-12651: the first rejected refresh grant per account, before token
+        # requests start failing with owner_unavailable. The `unless offset`
+        # branch fires on a new series, which increase() cannot see.
+        # Routed to warnings-slack (#warning-alerts) by a per-account route in
+        # infra helm-charts/prometheus/staging/values.yaml.
+        - alert: CodexctlOwnerRefreshRejected
+          expr: |
+            (increase(codexctl_central_owner_refresh_failed_total[10m]) > 0)
+            or
+            (codexctl_central_owner_refresh_failed_total unless codexctl_central_owner_refresh_failed_total offset 10m)
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: "Codexctl server account {{ $labels.account }} ({{ $labels.account_key }}) lost its refresh grant ({{ $labels.reason }})"
+            description: The provider rejected the stored refresh grant, so token requests for this account fail until it is renewed with a device code. Check the owner_refresh and owner_child log lines for the provider reason.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
 ---
 # The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports
 # credentials and is already selected by the existing Prometheus operator.

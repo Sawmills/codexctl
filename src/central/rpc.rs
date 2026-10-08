@@ -67,6 +67,8 @@ pub struct Rpc {
     rejected_login: bool,
     exportable_login: bool,
     pending: VecDeque<Value>,
+    /// The provider's reason for the last rejected refresh, read from stderr.
+    refresh_reason: super::owner_refresh::ReasonSlot,
 }
 
 impl Rpc {
@@ -147,7 +149,14 @@ impl Rpc {
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Codex logs the token endpoint's rejection only to stderr. Only an
+            // owner child (isolated, no user prompts) is read; a client
+            // session's stderr is never read.
+            .stderr(if isolate_signals {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true);
         if isolate_signals {
             command.current_dir(&home).args([
@@ -173,6 +182,14 @@ impl Rpc {
                 .take()
                 .expect("configured piped app-server stdout"),
         );
+        let refresh_reason = super::owner_refresh::ReasonSlot::default();
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(super::owner_refresh::forward(
+                stderr,
+                refresh_reason.clone(),
+                |line| eprintln!("{line}"),
+            ));
+        }
         Ok(Self {
             _child: child,
             input: Some(input),
@@ -186,7 +203,22 @@ impl Rpc {
             rejected_login: false,
             exportable_login: false,
             pending: VecDeque::new(),
+            refresh_reason,
         })
+    }
+
+    /// The provider's bounded reason for a refresh that just failed. Codex
+    /// writes the stderr line before it answers, but the two pipes race, so
+    /// wait briefly. `None` when Codex logged no provider rejection: the
+    /// failure was something else, such as a usage read error.
+    pub(super) async fn refresh_failure_reason(&self) -> Option<&'static str> {
+        for _ in 0..10 {
+            if let Some(reason) = self.refresh_reason.take() {
+                return Some(reason);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        None
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
@@ -374,6 +406,9 @@ impl Rpc {
             self.rejected_login = false;
         }
         self.outstanding = Some((id, verifies));
+        // A reason belongs to the call during which Codex logged it; drop any
+        // earlier one so it cannot be blamed on this call.
+        self.refresh_reason.take();
         let operation = async {
             self.send(json!({"id":id,"method":method,"params":params}))
                 .await?;
@@ -501,6 +536,36 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["tokens"]["refresh_token"], "synthetic-rotated-refresh");
     }
+    #[tokio::test]
+    async fn a_client_child_stderr_is_never_read() {
+        // Client sessions carry user prompts; only owner children are read.
+        let root = tempfile::tempdir().unwrap();
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"synthetic-user"})).unwrap());
+        store::atomic_write(&root.path().join("auth.json"), &serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic"}})).unwrap()).unwrap();
+        store::atomic_write(&root.path().join("mode"), b"forced-refresh-invalid-grant").unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        let wrapper = root.path().join("codex");
+        let script = format!(
+            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
+            serde_json::to_string(&root.path().join("mode")).unwrap(),
+            serde_json::to_string(&fixture).unwrap(),
+        );
+        store::atomic_write(&wrapper, script.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
+        assert!(
+            rpc.call("account/read", json!({"refreshToken":true}))
+                .await
+                .is_err()
+        );
+        assert_eq!(rpc.refresh_failure_reason().await, None);
+    }
+
     #[tokio::test]
     async fn when_a_client_child_starts_then_it_stays_in_the_terminal_process_group() {
         let root = tempfile::tempdir().unwrap();
