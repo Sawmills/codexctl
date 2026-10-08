@@ -3558,6 +3558,16 @@ async fn postgres_native_spawn_failure_does_not_leave_an_unidentified_grant_fenc
     add_request(&f, &f.first, "start", &operation).await;
     let receipt = wait_add_terminal(&f, &operation).await;
     assert_eq!(receipt["status"], "failed");
+    // The worker counts the failure just after its durable save.
+    timeout(Duration::from_secs(5), async {
+        while relogin_failure_metrics(&f, &f.first).await
+            != ["codexctl_central_failed_requests_total{reason=\"relogin_failed\"} 1"]
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a durably failed login must count once");
     assert_eq!(
         request(&f.http, &f.second, &f.token).await.status(),
         200,
