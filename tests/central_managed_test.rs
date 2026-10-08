@@ -11298,12 +11298,16 @@ fn a_borrower_selects_a_loaned_account_and_loses_it_when_the_loan_ends() {
 // CODEX-APP-A: the desktop app reads ~/.codex/auth.json in chatgptAuthTokens
 // mode, written from server tokens; the server stays the only refresh owner.
 fn app_auth_token(account: &str, plan: Option<&str>, exp: u64) -> Value {
+    app_auth_token_for("amir-login", account, plan, exp)
+}
+
+fn app_auth_token_for(subject: &str, account: &str, plan: Option<&str>, exp: u64) -> Value {
     let mut claims = json!({"chatgpt_account_id": account});
     if let Some(plan) = plan {
         claims["chatgpt_plan_type"] = json!(plan);
     }
     let payload = URL_SAFE_NO_PAD.encode(
-        serde_json::to_vec(&json!({"sub":"amir-login","iat":2000000000_u64,"exp":exp,"https://api.openai.com/auth":claims}))
+        serde_json::to_vec(&json!({"sub":subject,"iat":2000000000_u64,"exp":exp,"https://api.openai.com/auth":claims}))
             .unwrap(),
     );
     json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic-refresh","account_id":account}})

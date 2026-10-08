@@ -352,7 +352,13 @@ fn disable(restore_login: bool) -> Result<()> {
     match file_state(&paths, Some(&state))? {
         FileState::Ours => std::fs::remove_file(paths.auth())?,
         FileState::Foreign => {
-            eprintln!("codexctl: ~/.codex/auth.json holds another login; left in place")
+            eprintln!("codexctl: ~/.codex/auth.json holds another login; left in place");
+            if paths.backup().try_exists()? {
+                eprintln!(
+                    "codexctl: the login app-auth replaced is still at {}",
+                    paths.backup().display()
+                );
+            }
         }
         FileState::Missing => {}
     }
@@ -632,6 +638,19 @@ fn write_auth(
 fn back_up_login(paths: &Paths) -> Result<Option<String>> {
     let bytes = match std::fs::read(paths.auth()) {
         Ok(bytes) => {
+            // An earlier backup no state names is a login no one else holds;
+            // keep it under its own name rather than overwrite it.
+            if paths.backup().try_exists()? {
+                let kept = paths.backup().with_extension(format!(
+                    "json.{}",
+                    chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                ));
+                std::fs::rename(paths.backup(), &kept)?;
+                eprintln!(
+                    "codexctl: kept an earlier app-auth backup at {}",
+                    kept.display()
+                );
+            }
             store::atomic_write(&paths.backup(), &bytes)?;
             bytes
         }
@@ -754,6 +773,58 @@ mod tests {
         assert!(!billing_approved(&Approval::Exact(&plan, &None), &approved));
         assert!(!billing_approved(&Approval::None, &approved));
         assert!(billing_approved(&Approval::Any, &approved));
+    }
+
+    fn jwt(subject: &str) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "sub": subject, "exp": 4102444800_u64,
+                AUTH_CLAIM: {"chatgpt_account_id": "seat", "chatgpt_plan_type": "team"},
+            }))
+            .unwrap(),
+        );
+        format!("h.{payload}.s")
+    }
+
+    fn test_state() -> State {
+        serde_json::from_value(serde_json::json!({
+            "alias": "team", "allow_billing": false, "allow_codex_version": false,
+            "connection": {"server": "https://s", "device_token_file": "/t",
+                "account_id": "seat", "revision": ""},
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn written_and_journaled_files_are_ours_and_other_bytes_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_dir: dir.path().join("app-auth"),
+            codex_home: dir.path().join(".codex"),
+        };
+        let mut state = test_state();
+        write_auth(&paths, &mut state, "seat", &jwt("amir")).unwrap();
+        assert!(state.pending.is_none() && state.written.is_some());
+        assert!(file_state(&paths, Some(&state)).unwrap() == FileState::Ours);
+        // A crash after the journal but before the confirmation: the new
+        // file matches the pending digest.
+        let bytes = std::fs::read(paths.auth()).unwrap();
+        state.pending = Some(vault::digest(&bytes));
+        state.written = Some("old".into());
+        assert!(file_state(&paths, Some(&state)).unwrap() == FileState::Ours);
+        // Same mode and workspace, other bytes: another login.
+        let mut other: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        other["tokens"]["refresh_token"] = "user".into();
+        std::fs::write(paths.auth(), serde_json::to_vec(&other).unwrap()).unwrap();
+        assert!(file_state(&paths, Some(&state)).unwrap() == FileState::Foreign);
+    }
+
+    #[test]
+    fn rotation_needs_positive_proof_of_the_same_login() {
+        let pinned = api::token_logins(&jwt("amir"));
+        assert!(pinned.same(&api::token_logins(&jwt("amir"))));
+        assert!(!pinned.same(&api::token_logins(&jwt("someone-else"))));
     }
 
     #[test]
