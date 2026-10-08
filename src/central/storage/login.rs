@@ -393,6 +393,7 @@ impl CentralStore {
     }
 
     /// A supervisor's awaited native exit and private home prove grant absence.
+    #[cfg(target_os = "linux")]
     pub(in crate::central) async fn login_record_polling_absence(
         &self,
         op: &LoginOperation,
@@ -409,6 +410,7 @@ impl CentralStore {
     }
 
     /// Late capture retains evidence without restoring authority or verifying.
+    #[cfg(target_os = "linux")]
     pub(in crate::central) async fn login_record_unpublished_grant(
         &self,
         op: &LoginOperation,
@@ -448,6 +450,7 @@ impl CentralStore {
     }
 
     /// The supervisor reads durable cancellation without extending parent authority.
+    #[cfg(target_os = "linux")]
     pub(in crate::central) async fn login_polling_authority(
         &self,
         op: &LoginOperation,
