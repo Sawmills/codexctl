@@ -3195,6 +3195,18 @@ async fn postgres_holder_renewal_recovers_readiness_after_database_outage() {
             .status(),
         200
     );
+    let account = account_key("test", "seat");
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let lease_holder = format!(
+        "SELECT holder_id FROM {}.account_refresh_leases WHERE account_id=$1",
+        f.schema
+    );
+    let refresh_holder: String = f
+        .control
+        .query_one(&lease_holder, &[&account])
+        .await
+        .unwrap()
+        .get(0);
     f.control
         .batch_execute(&format!(
             r#"
@@ -3259,6 +3271,26 @@ async fn postgres_holder_renewal_recovers_readiness_after_database_outage() {
     })
     .await
     .expect("readiness must recover after the database returns");
+    // A request cut off by the outage could not release its refresh lease.
+    // The recovered replica still owns it and must not refuse its own lease.
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.account_refresh_leases SET released=false,expires_at=clock_timestamp()+interval '120 seconds' WHERE account_id=$1",
+                f.schema
+            ),
+            &[&account],
+        )
+        .await
+        .unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let after: String = f
+        .control
+        .query_one(&lease_holder, &[&account])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(after, refresh_holder);
     stop_fixture(f).await;
 }
 
