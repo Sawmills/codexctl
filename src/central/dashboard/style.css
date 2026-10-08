@@ -22,7 +22,7 @@
   /* Status colors mark exceptions only, always beside a word. */
   --ok: #15803d;
   --warn: #9a5b00;
-  --warn-fill: #c27c0e;
+  --warn-fill: #b06d00; /* 3.6:1 on the meter track */
   --warn-soft: #fdf6e7;
   --bad: #c62828;
 
