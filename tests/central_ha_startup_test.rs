@@ -3068,6 +3068,33 @@ async fn postgres_live_holder_settles_its_own_verification_after_worker_lease_lo
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_fenced_worker_without_a_grant_still_counts_its_failure() {
+    let f = login_fixture().await;
+    let id = "e4".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    // Expire only the operation lease: the worker stops, and its terminal save
+    // is fenced. No grant exists, so the attempt cannot resume as a success.
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", f.schema), &[&id]).await.unwrap();
+    // No receipt read here: the worker itself must count the failure.
+    timeout(Duration::from_secs(10), async {
+        while relogin_failure_metrics(&f, &f.first).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("a fenced worker without a grant must count its failure");
+    assert_eq!(
+        relogin_failure_metrics(&f, &f.first).await,
+        ["codexctl_central_failed_requests_total{reason=\"relogin_failed\"} 1"]
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_unregistered_holder_failure_is_left_to_its_own_replica() {
     let mut f = login_fixture().await;
     let id = "e3".repeat(32);
