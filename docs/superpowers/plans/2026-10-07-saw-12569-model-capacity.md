@@ -2,6 +2,25 @@
 
 Linked: SAW-12544 (429 bursts). Design decision (guide + w9C:tF, 2026-10-07 19:5x PDT): codexctl retries in-request only, up to about 10 minutes, and never sends `/goal resume`. The board resumes after a stop.
 
+## Decision after HQ review (M1 to M6): build M3
+
+| | M3: advice-only relay (built) | A: retrying relay |
+|---|---|---|
+| Who retries | Codex's own turn loop (`Reconnecting n/N`) | The relay |
+| Relay state | Streak per thread, no buffering | Buffers head events, owns a retry loop |
+| Covers 429 on Codex 0.161.0 | Yes: `Retry-After` header | Yes |
+| Covers SSE capacity on 0.161.0 | Only with the shim: code `rate_limit_exceeded` plus "try again in Ns" (0.161.0 reads only that) | Yes |
+| Covers SSE capacity on 0.162.0-alpha.8+ | Yes: `error.headers["retry-after"]` | Yes |
+| Risk | Codex `stream_max_retries` caps attempts (lanes set 20) | Holds the response before headers; Codex sees nothing for minutes |
+
+Live proof against real `codex` 0.161.0 and a mock upstream (`docs/relay.md`): without the relay a 429 stops at once (1 request). With it, 429 then success recovers after the advised 1 s. Two capacity events then success recover after 2 s and 4 s. With a 5 s budget, Codex stops on the original capacity text after 2 requests.
+
+Codex 0.161.0 ignores `error.headers` for `server_is_overloaded`; support starts at rust-v0.162.0-alpha.8 (bisected alpha.1 to alpha.9). The shim is question Q-12569-M3a to HQ.
+
+Q1 relay now. Q2 instrumentation only, no alert; central metrics are a follow-up ticket. Q3 the `codexctl codex` launcher stays unchanged; follow-up ticket. Q4 two budgets: rate 180 s, capacity 600 s (M5).
+
+The sections below are the original plan (Option A), kept for review history.
+
 ## Findings (Codex rust-v0.161.0, same on origin/main e1b5b56)
 
 1. "Selected model is at capacity" is `CodexErr::ServerOverloaded`. It comes from an SSE `response.failed` event with code `server_is_overloaded` (`codex-api/src/sse/responses_error.rs:87`) or from HTTP 503 with that code (`codex-api/src/api_bridge.rs:101-106`).

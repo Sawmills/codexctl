@@ -1550,8 +1550,10 @@ pub fn activate(
     // reuse to one minute; it does not cancel in-flight work or revoke tokens.
     provider["auth"]["refresh_interval_ms"] = value(60_000);
     provider["auth"]["timeout_ms"] = value(210_000);
-    // OpenAI's short edge-rate-limit bursts are retried by default. Preserve
-    // an operator's explicit values when an active provider is rewritten.
+    // These limits cover 5xx responses, dropped streams and network errors.
+    // Codex does not retry an HTTP 429 or a "model at capacity" stop unless
+    // the server sends retry advice; `codexctl relay` adds that advice.
+    // Preserve an operator's explicit values when an active provider is rewritten.
     provider["request_max_retries"] = existing_provider
         .as_ref()
         .and_then(|item| item.get("request_max_retries"))
