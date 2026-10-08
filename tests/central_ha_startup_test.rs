@@ -2922,6 +2922,201 @@ async fn postgres_add_candidate_takeover_preserves_same_user_landing() {
     stop_fixture(f).await;
 }
 
+#[cfg(target_os = "linux")]
+async fn login_epoch(f: &LoginFixture, id: &str) -> i64 {
+    f.control
+        .query_one(
+            &format!(
+                "SELECT epoch FROM {}.central_login_operations WHERE id=$1",
+                f.schema
+            ),
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[cfg(target_os = "linux")]
+async fn relogin_failure_metrics(f: &LoginFixture, pod: &Pod) -> Vec<String> {
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", pod.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("codexctl_central_failed_requests_total{reason=\"relogin_"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_live_holder_resumes_its_own_candidate_after_worker_lease_loss() {
+    let f = login_fixture().await;
+    let account = account_key("test", "seat");
+    // Hold the candidate before verification so its worker waits in the lease loop.
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) VALUES($1,'foreign-settling',41,clock_timestamp()-interval '1 second',false) ON CONFLICT(account_id) DO UPDATE SET holder_id='foreign-settling',epoch=41,expires_at=clock_timestamp()-interval '1 second',released=false",f.schema), &[&account]).await.unwrap();
+    let id = "e1".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.first, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let epoch = login_epoch(&f, &id).await;
+    // Expire only the operation lease. The worker stops and its terminal save is
+    // fenced, while the replica's holder stays live.
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", f.schema), &[&id]).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let receipt = login_request(&f, &f.first, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if login_epoch(&f, &id).await > epoch {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the live holder must take over its own expired candidate");
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.account_refresh_leases SET released=true WHERE account_id=$1",
+                f.schema
+            ),
+            &[&account],
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_request(&f, &f.first, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the resumed candidate must complete after refresh settlement");
+    assert_eq!(f.first.launches(), 1);
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_live_holder_settles_its_own_verification_after_worker_lease_loss() {
+    let f = login_fixture().await;
+    let id = "e2".repeat(32);
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", f.schema), &[&id]).await.unwrap();
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let receipt = login_request(&f, &f.first, "status", &id).await;
+            if receipt["status"] == "failed" {
+                assert_eq!(receipt["error"], "relogin_verification_unresolved");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the live holder must settle its own expired verification");
+    assert_eq!(
+        f.first.launches(),
+        1,
+        "an in-flight marker must never launch a second verifier"
+    );
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_unregistered_holder_failure_is_left_to_its_own_replica() {
+    let mut f = login_fixture().await;
+    let id = "e3".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Stop the supervisor before it can record grant absence, as in an old
+    // replica that never registered a holder row.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let supervisor: i32 = stat
+        .rsplit_once(')')
+        .unwrap()
+        .1
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(f.first.child.id().unwrap() as i32, libc::SIGSTOP) },
+        0
+    );
+    assert_eq!(unsafe { libc::kill(supervisor, libc::SIGKILL) }, 0);
+    f.first.child.kill().await.unwrap();
+    wait_parent_bound_exit(pid).await;
+    f.control.execute(&format!("DELETE FROM {}.central_login_holders WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)", f.schema, f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1",f.schema), &[&id]).await.unwrap();
+    for _ in 0..2 {
+        let old = login_request(&f, &f.second, "status", &id).await;
+        assert_eq!(old["error"], "login_expired_requires_recovery");
+    }
+    assert_eq!(
+        relogin_failure_metrics(&f, &f.second).await,
+        Vec::<String>::new(),
+        "an unregistered holder may still report its own failure"
+    );
+    let reported: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT failure_reported FROM {}.central_login_operations WHERE id=$1",
+                f.schema
+            ),
+            &[&id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!reported);
+    stop_fixture(f).await;
+}
+
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
