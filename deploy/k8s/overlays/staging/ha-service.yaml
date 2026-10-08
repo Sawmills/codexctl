@@ -1,0 +1,16 @@
+# B33 attempt 3, PR H. Copied from overlays/staging-ha, own app name.
+apiVersion: v1
+kind: Service
+metadata:
+  namespace: codexctl
+  name: codexctl-ha
+  labels:
+    app.kubernetes.io/name: codexctl-ha
+spec:
+  selector:
+    app.kubernetes.io/name: codexctl-ha
+    app.kubernetes.io/component: broker-ha
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
