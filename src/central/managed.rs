@@ -289,6 +289,15 @@ fn holder_renewal_lost(renewed: &Result<bool>, since_last_success: std::time::Du
     }
 }
 
+fn shared_login_ready(
+    local: bool,
+    reachable: Option<bool>,
+    central: bool,
+    holder_live: bool,
+) -> bool {
+    local && reachable.is_none_or(|value| value) && (!central || holder_live)
+}
+
 pub(super) fn account_summary(owner: &Owner) -> Account {
     let limits = owner.limits.as_ref().map(|v| &v["rateLimits"]);
     let usage = owner
@@ -2787,7 +2796,12 @@ async fn ready(State(broker): State<Broker>) -> Response {
         Some(store) => Some(store.reachable().await),
         None => None,
     };
-    let healthy = local && reachable.is_none_or(|value| value);
+    let healthy = shared_login_ready(
+        local,
+        reachable,
+        broker.central.is_some(),
+        broker.login_holder_live.load(Ordering::Acquire),
+    );
     let status = if healthy {
         StatusCode::OK
     } else {
@@ -2809,7 +2823,13 @@ async fn ready(State(broker): State<Broker>) -> Response {
 }
 
 pub(super) fn readiness(broker: &Broker) -> StatusCode {
-    if users(&broker.state).is_err() || vault::devices(&broker.state).is_err() {
+    let local = users(&broker.state).is_ok() && vault::devices(&broker.state).is_ok();
+    if !shared_login_ready(
+        local,
+        None,
+        broker.central.is_some(),
+        broker.login_holder_live.load(Ordering::Acquire),
+    ) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -4002,6 +4022,13 @@ pub(super) fn api_routes() -> Router<Broker> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fenced_shared_login_replica_is_not_ready() {
+        assert!(!super::shared_login_ready(true, Some(true), true, false));
+        assert!(super::shared_login_ready(true, Some(true), true, true));
+        assert!(super::shared_login_ready(true, None, false, false));
+    }
+
     #[test]
     fn transient_holder_renewal_error_keeps_admission_live_within_lease_window() {
         let error = Err(anyhow::Error::msg("database unavailable"));
