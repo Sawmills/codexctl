@@ -409,6 +409,14 @@ fn spawn_worker(
     }
     Ok(())
 }
+async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation) {
+    if let Err(error) = record_login_failure(broker, op).await {
+        eprintln!(
+            "{}",
+            json!({"operation":"login_failure_report","stage":"settlement","reason":"report_unavailable","status":error.status.as_u16()})
+        );
+    }
+}
 fn spawn_claimed_worker(
     worker: Broker,
     worker_headers: HeaderMap,
@@ -429,12 +437,6 @@ fn spawn_claimed_worker(
                 "{}",
                 json!({"operation":if worker_op.kind == LoginKind::Add {"login_add"} else {"login_renewal"},"stage":worker_op.phase.as_str(),"error":detail})
             );
-            if let Err(error) = record_login_failure(&worker, &mut worker_op).await {
-                eprintln!(
-                    "{}",
-                    json!({"operation":"login_failure_report","stage":"settlement","reason":"report_unavailable","status":error.status.as_u16()})
-                );
-            }
             if matches!(
                 worker_op.phase,
                 LoginPhase::Completed
@@ -442,6 +444,7 @@ fn spawn_claimed_worker(
                     | LoginPhase::Rejected
                     | LoginPhase::ReplicaLost
             ) {
+                report_worker_failure(&worker, &mut worker_op).await;
                 return;
             }
             worker_op
@@ -461,8 +464,11 @@ fn spawn_claimed_worker(
             };
             if let Ok(db) = database(&worker) {
                 // A transient database error must not leave a stale receipt.
+                // Report only a durable outcome. After a fenced save, recovery
+                // decides between resume and an unresolved failure.
                 for attempt in 1..=3 {
                     let Err(error) = db.login_save(&mut worker_op, phase).await else {
+                        report_worker_failure(&worker, &mut worker_op).await;
                         break;
                     };
                     if attempt < 3 {
