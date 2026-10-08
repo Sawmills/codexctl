@@ -3015,6 +3015,11 @@ async fn postgres_live_holder_resumes_its_own_candidate_after_worker_lease_loss(
     })
     .await
     .expect("the resumed candidate must complete after refresh settlement");
+    assert_eq!(
+        relogin_failure_metrics(&f, &f.first).await,
+        Vec::<String>::new(),
+        "a fenced worker attempt that later completes is not a failure"
+    );
     assert_eq!(f.first.launches(), 1);
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
     stop_fixture(f).await;
