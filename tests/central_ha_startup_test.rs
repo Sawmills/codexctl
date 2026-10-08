@@ -3254,6 +3254,19 @@ async fn postgres_holder_renewal_recovers_readiness_after_database_outage() {
         ))
         .await
         .unwrap();
+    // Keep the abandoned incarnation live. Recovery must give it up at once,
+    // so other replicas can recover its operations.
+    let abandoned = format!(
+        "UPDATE {}.central_login_holders SET expires_at=clock_timestamp()+interval '60 seconds' WHERE holder_id=$1",
+        f.schema
+    );
+    assert_eq!(
+        f.control
+            .execute(&abandoned, &[&refresh_holder])
+            .await
+            .unwrap(),
+        1
+    );
     timeout(Duration::from_secs(20), async {
         loop {
             if f.http
@@ -3271,6 +3284,19 @@ async fn postgres_holder_renewal_recovers_readiness_after_database_outage() {
     })
     .await
     .expect("readiness must recover after the database returns");
+    let abandoned_live: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT expires_at>clock_timestamp() FROM {}.central_login_holders WHERE holder_id=$1",
+                f.schema
+            ),
+            &[&refresh_holder],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(!abandoned_live, "recovery must expire the abandoned holder");
     // A request cut off by the outage could not release its refresh lease.
     // The recovered replica still owns it and must not refuse its own lease.
     f.control
