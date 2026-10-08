@@ -76,6 +76,10 @@ struct State {
     /// auth.json is another login, even in the same mode and workspace.
     #[serde(default)]
     written: Option<String>,
+    /// Digest of a write journaled but not yet confirmed. A crash between the
+    /// journal and the write leaves either file recognizable.
+    #[serde(default)]
+    pending: Option<String>,
     #[serde(default)]
     last: Option<Outcome>,
 }
@@ -230,17 +234,12 @@ fn enable(
         allow_codex_version,
         backup_account,
         written: None,
+        pending: None,
         last: None,
     };
     // Journal first: if the write below never lands, the marker still exists,
     // so the guards hold and disable can undo what enable began.
-    record(
-        &paths,
-        &mut state,
-        false,
-        "enable started; auth.json not yet written",
-    )?;
-    state.written = Some(write_auth(&paths, &account_id, &token.access_token)?);
+    write_auth(&paths, &mut state, &account_id, &token.access_token)?;
     record(&paths, &mut state, true, "written by enable")?;
     if !no_agent {
         install_agent()?;
@@ -297,11 +296,12 @@ fn refresh_locked(paths: &Paths, state: &mut State) -> Result<&'static str> {
             state.alias
         );
     }
-    state.written = Some(write_auth(
-        paths,
-        &state.connection.account_id,
-        &token.access_token,
-    )?);
+    // The fetch took time; the app may have written another login meanwhile.
+    if file_state(paths, Some(state))? != FileState::Ours {
+        bail!("~/.codex/auth.json changed during refresh (a new login?); refresh stopped");
+    }
+    let account_id = state.connection.account_id.clone();
+    write_auth(paths, state, &account_id, &token.access_token)?;
     Ok("token rewritten")
 }
 
@@ -405,7 +405,9 @@ fn file_state(paths: &Paths, state: Option<&State>) -> Result<FileState> {
     let ours = document["auth_mode"] == MODE
         && state.is_none_or(|state| {
             document["tokens"]["account_id"] == state.connection.account_id.as_str()
-                && state.written.as_deref() == Some(vault::digest(&bytes).as_str())
+                && [&state.written, &state.pending]
+                    .into_iter()
+                    .any(|digest| digest.as_deref() == Some(vault::digest(&bytes).as_str()))
         });
     Ok(if ours {
         FileState::Ours
@@ -602,11 +604,23 @@ fn auth_document(account_id: &str, access_token: &str) -> serde_json::Value {
     })
 }
 
-/// Write the file and return the digest that later proves it is ours.
-fn write_auth(paths: &Paths, account_id: &str, access_token: &str) -> Result<String> {
+/// Write the file, journaling its digest so later runs can prove it is ours.
+fn write_auth(
+    paths: &Paths,
+    state: &mut State,
+    account_id: &str,
+    access_token: &str,
+) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(&auth_document(account_id, access_token))?;
+    let digest = vault::digest(&bytes);
+    // Journal the digest before the write, so a crash on either side of it
+    // leaves a file app-auth still recognizes.
+    state.pending = Some(digest.clone());
+    save_state(paths, state)?;
     store::atomic_write(&paths.auth(), &bytes)?;
-    Ok(vault::digest(&bytes))
+    state.written = Some(digest);
+    state.pending = None;
+    save_state(paths, state)
 }
 
 /// Keep the login enable replaces and return the workspace of the backup.
