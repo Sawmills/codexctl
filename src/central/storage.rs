@@ -2322,6 +2322,46 @@ mod tests {
             ("rev-3", 3)
         );
         assert!(evidence.billing.is_none());
+        // Withdrawal leaves a tombstone that reads ignore; a new observation
+        // under the lease reactivates the row without the old billing.
+        shared.clear_token_evidence("a").await.unwrap();
+        assert!(
+            shared
+                .fast_token_read("a")
+                .await
+                .unwrap()
+                .unwrap()
+                .evidence
+                .is_none()
+        );
+        let tombstoned: bool = control
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_token_evidence WHERE account_id='a'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(tombstoned, "withdrawal must not delete the row");
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-3", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(evidence.auth_revision, "rev-3");
+        assert!(evidence.billing.is_none());
         // A lost lease publishes neither credential nor evidence.
         assert!(shared.release_lease(&lease).await.unwrap());
         assert!(

@@ -3493,6 +3493,66 @@ async fn postgres_failed_lease_read_clears_evidence_for_every_replica() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_busy_local_owner_cannot_hide_a_failing_read() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let holder = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        let previous = warm["revision"].clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true,"previousRevision":previous}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the forced refresh must hold the local owner");
+    // A request on the same replica must not use the old evidence while the
+    // owner it would fence is busy.
+    let contender = tokio::spawn({
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !contender.is_finished(),
+        "a busy local owner must not let the old evidence serve"
+    );
+    // The holder's native read now refuses routing and withdraws the evidence.
+    store::atomic_write(&f.first.root.path().join("mode"), b"non-exportable").unwrap();
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"go").unwrap();
+    assert!(!holder.await.unwrap().status().is_success());
+    assert!(!contender.await.unwrap().status().is_success());
+    assert_eq!(metric(&f, &f.first, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_fast_path_never_serves_a_fenced_account() {
     let f = enable_fast_path(login_fixture().await).await;
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
