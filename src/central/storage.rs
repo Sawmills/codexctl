@@ -794,6 +794,30 @@ impl CentralStore {
         }
     }
 
+    /// Publish a credential, and with it the evidence the lease path observed
+    /// on it, under the same lease fence.
+    #[allow(dead_code)] // Removed when the token handler uses it.
+    pub(in crate::central) async fn fenced_write_with_evidence(
+        &self,
+        lease: &Lease,
+        record: &CredentialRecord,
+        observation: Option<&super::fast_path::Observation>,
+    ) -> Result<bool> {
+        let _ = observation;
+        self.fenced_write(lease, record).await
+    }
+
+    /// The committed record and its evidence, for the lease-free path.
+    /// PostgreSQL mode only: dual mode keeps today's path.
+    #[allow(dead_code)] // Removed when the token handler uses it.
+    pub(in crate::central) async fn fast_token_read(
+        &self,
+        account_id: &str,
+    ) -> Result<Option<super::fast_path::FastRead>> {
+        let _ = account_id;
+        Ok(None)
+    }
+
     pub async fn fenced_write(&self, lease: &Lease, record: &CredentialRecord) -> Result<bool> {
         match self {
             Self::File(file) => file.fenced_write(lease, record),
@@ -1920,6 +1944,143 @@ mod tests {
             vault: serde_json::json!({"refresh":"secret"}),
             revision,
         }
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn token_evidence_follows_the_lease_and_the_credential_revision() {
+        use super::super::fast_path::{Billing, Observation};
+        use crate::api;
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[23; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        shared.migrate().await.unwrap();
+        shared.save_account(&record("a", 1)).await.unwrap();
+        let lease = shared
+            .acquire_lease("a", "holder", Duration::from_secs(60))
+            .await
+            .unwrap();
+        let billing = Billing {
+            class: api::BillingClass::RateLimited,
+            plan_type: Some("plus".into()),
+            limits: Some(serde_json::json!({"rateLimits":{"primary":{"usedPercent":40}}})),
+            age: Duration::from_secs(1),
+        };
+        let observed = |auth: &str, routing: u64, billing: Option<Billing>| Observation {
+            auth_revision: auth.into(),
+            routing_age: Duration::from_secs(routing),
+            billing,
+        };
+        // A changed credential publishes its evidence.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 2),
+                    Some(&observed("rev-2", 2, Some(billing.clone())))
+                )
+                .await
+                .unwrap()
+        );
+        let read = shared.fast_token_read("a").await.unwrap().expect("account");
+        assert_eq!((read.revision, read.alias.as_str()), (2, "seat"));
+        assert!(!read.fenced);
+        assert!(read.now > 1_700_000_000);
+        let evidence = read.evidence.expect("evidence");
+        assert_eq!(
+            (evidence.auth_revision.as_str(), evidence.account_revision),
+            ("rev-2", 2)
+        );
+        assert!(evidence.routing_supported);
+        assert!(evidence.routing_age >= Duration::from_secs(2));
+        assert!(evidence.routing_age < Duration::from_secs(30));
+        let cached = evidence.billing.expect("billing evidence");
+        assert_eq!(cached.class, api::BillingClass::RateLimited);
+        assert!(cached.age >= Duration::from_secs(1));
+        assert_eq!(cached.limits, billing.limits);
+        // An unchanged credential commits fresh routing and keeps billing.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 2),
+                    Some(&observed("rev-2", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert!(evidence.routing_age < Duration::from_secs(2));
+        assert_eq!(
+            evidence.billing.unwrap().class,
+            api::BillingClass::RateLimited
+        );
+        // A new credential revision without a billing read drops old billing.
+        assert!(
+            shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-3", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(
+            (evidence.auth_revision.as_str(), evidence.account_revision),
+            ("rev-3", 3)
+        );
+        assert!(evidence.billing.is_none());
+        // A lost lease publishes neither credential nor evidence.
+        assert!(shared.release_lease(&lease).await.unwrap());
+        assert!(
+            !shared
+                .fenced_write_with_evidence(
+                    &lease,
+                    &record("a", 3),
+                    Some(&observed("rev-x", 0, None))
+                )
+                .await
+                .unwrap()
+        );
+        let evidence = shared
+            .fast_token_read("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence
+            .unwrap();
+        assert_eq!(evidence.auth_revision, "rev-3");
+        // A tombstoned account is never read.
+        control
+            .execute(
+                "UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(shared.fast_token_read("a").await.unwrap().is_none());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

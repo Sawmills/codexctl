@@ -35,6 +35,27 @@ pub(super) struct Billing {
     pub age: Duration,
 }
 
+/// What the lease path observed, written with the credential it published.
+#[derive(Clone, Debug)]
+pub(super) struct Observation {
+    pub auth_revision: String,
+    pub routing_age: Duration,
+    pub billing: Option<Billing>,
+}
+
+/// The committed record and its evidence, read without a lease.
+pub(super) struct FastRead {
+    pub user_id: Option<String>,
+    pub alias: String,
+    pub revision: i64,
+    pub vault: Value,
+    /// A login journal or identity reservation fences this account.
+    pub fenced: bool,
+    pub evidence: Option<Evidence>,
+    /// Database clock, in Unix seconds.
+    pub now: i64,
+}
+
 /// The committed credential as PostgreSQL holds it.
 pub(super) struct Candidate<'a> {
     pub auth: &'a Value,
