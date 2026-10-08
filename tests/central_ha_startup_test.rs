@@ -3500,7 +3500,8 @@ async fn postgres_busy_local_owner_cannot_hide_a_failing_read() {
         .json()
         .await
         .unwrap();
-    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    // The holder's native start fails once it is released.
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold-error").unwrap();
     let holder = tokio::spawn({
         let http = f.http.clone();
         let url = f.first.url.clone();
@@ -3542,8 +3543,6 @@ async fn postgres_busy_local_owner_cannot_hide_a_failing_read() {
         !contender.is_finished(),
         "a busy local owner must not let the old evidence serve"
     );
-    // The holder's native read now refuses routing and withdraws the evidence.
-    store::atomic_write(&f.first.root.path().join("mode"), b"non-exportable").unwrap();
     store::atomic_write(&f.first.root.path().join("release-initialize"), b"go").unwrap();
     assert!(!holder.await.unwrap().status().is_success());
     assert!(!contender.await.unwrap().status().is_success());
