@@ -18,7 +18,7 @@ pub(super) const EVIDENCE_MAX_AGE: Duration = Duration::from_secs(60);
 pub(super) const USAGE_CEILING_PERCENT: f64 = 90.0;
 
 /// Evidence the lease path observed on one credential revision.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct Evidence {
     pub auth_revision: String,
     pub account_revision: i64,
@@ -28,16 +28,18 @@ pub(super) struct Evidence {
     pub billing: Option<Billing>,
 }
 
-#[derive(Clone, Debug)]
+/// Typed billing evidence: the class, the plan, and the status-line usage the
+/// response carries. No raw rate-limit payload is stored.
+#[derive(Clone)]
 pub(super) struct Billing {
     pub class: api::BillingClass,
     pub plan_type: Option<String>,
-    pub limits: Option<Value>,
+    pub usage: Option<crate::statusline::Usage>,
     pub age: Duration,
 }
 
 /// What the lease path observed, written with the credential it published.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct Observation {
     pub auth_revision: String,
     pub routing_age: Duration,
@@ -284,39 +286,26 @@ pub(super) fn decide(
             return Err(Miss::EvidenceStale);
         }
         if billing.class == api::BillingClass::RateLimited
-            && !billing.limits.as_ref().is_some_and(below_ceiling)
+            && !billing.usage.as_ref().is_some_and(below_ceiling)
         {
             return Err(Miss::UsageHigh);
         }
         token.billing_class = Some(billing.class);
         token.chatgpt_plan_type = billing.plan_type.clone();
-        token.statusline_usage = billing
-            .limits
-            .as_ref()
-            .and_then(|limits| super::server::usage(limits).ok())
-            .map(|usage| {
-                let mut usage = crate::statusline::Usage::from_usage(&usage);
-                usage.age_seconds = billing.age.as_secs();
-                usage
-            });
+        token.statusline_usage = billing.usage.clone().map(|mut usage| {
+            usage.age_seconds = billing.age.as_secs();
+            usage
+        });
     }
     Ok(token)
 }
 
-/// Every reported window is below the ceiling. A missing or malformed window
-/// is not proof of headroom.
-fn below_ceiling(limits: &Value) -> bool {
-    let windows: Vec<_> = ["primary", "secondary"]
-        .into_iter()
-        .map(|name| &limits["rateLimits"][name])
-        .filter(|window| !window.is_null())
-        .collect();
-    !windows.is_empty()
-        && windows.iter().all(|window| {
-            window["usedPercent"].as_f64().is_some_and(|used| {
-                used.is_finite() && (0.0..USAGE_CEILING_PERCENT).contains(&used)
-            })
-        })
+/// The highest use over every reported window is below the ceiling. A
+/// partial source reports no maximum, which is not proof of headroom.
+fn below_ceiling(usage: &crate::statusline::Usage) -> bool {
+    usage
+        .max_used_percent
+        .is_some_and(|used| used.is_finite() && (0.0..USAGE_CEILING_PERCENT).contains(&used))
 }
 
 #[cfg(test)]
@@ -353,8 +342,17 @@ mod tests {
         super::super::vault::digest(&serde_json::to_vec(auth).unwrap())
     }
 
-    fn limits(primary: f64) -> Value {
-        json!({"rateLimits":{"planType":"plus","primary":{"usedPercent":primary,"windowDurationMins":300,"resetsAt":4102444800_u64},"secondary":{"usedPercent":10,"windowDurationMins":10080,"resetsAt":4102444800_u64}}})
+    fn usage(max: f64) -> crate::statusline::Usage {
+        crate::statusline::Usage {
+            age_seconds: 0,
+            weekly_used_percent: Some(10.0),
+            weekly_resets_at: Some(4_102_444_800),
+            five_hour_used_percent: Some(max),
+            five_hour_resets_at: Some(4_102_444_800),
+            allowed: Some(true),
+            limit_reached: Some(false),
+            max_used_percent: Some(max),
+        }
     }
 
     fn evidence(auth: &Value, billing: Option<Billing>) -> Evidence {
@@ -371,7 +369,7 @@ mod tests {
         Billing {
             class,
             plan_type: Some("plus".into()),
-            limits: Some(limits(primary)),
+            usage: Some(usage(primary)),
             age: Duration::from_secs(5),
         }
     }

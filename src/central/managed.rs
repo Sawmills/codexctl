@@ -1929,7 +1929,7 @@ fn observation(
         (revision == &token.revision).then(|| fast_path::Billing {
             class,
             plan_type: token.chatgpt_plan_type.clone(),
-            limits: owner.limits.clone(),
+            usage: token.statusline_usage.clone(),
             age: at.elapsed(),
         })
     });

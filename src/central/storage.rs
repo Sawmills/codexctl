@@ -256,8 +256,16 @@ CREATE TABLE IF NOT EXISTS central_token_evidence (
     routing_observed_at TIMESTAMPTZ NOT NULL,
     billing_class TEXT,
     plan_type TEXT,
-    limits JSONB,
-    billing_observed_at TIMESTAMPTZ
+    usage_weekly_used_percent DOUBLE PRECISION,
+    usage_weekly_resets_at BIGINT,
+    usage_five_hour_used_percent DOUBLE PRECISION,
+    usage_five_hour_resets_at BIGINT,
+    usage_allowed BOOLEAN,
+    usage_limit_reached BOOLEAN,
+    usage_max_used_percent DOUBLE PRECISION,
+    usage_present BOOLEAN NOT NULL DEFAULT false,
+    billing_observed_at TIMESTAMPTZ,
+    deleted_at TIMESTAMPTZ
 );
 "#;
 
@@ -1970,7 +1978,8 @@ impl PostgresStore {
             "EXISTS(SELECT 1 FROM central_login_operations WHERE ", login_fence!(), ") AS fenced,",
             "e.auth_revision,e.account_revision,e.routing_supported,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
-            "e.billing_class,e.plan_type,e.limits::text AS limits,",
+            "e.billing_class,e.plan_type,e.usage_present,e.usage_weekly_used_percent,e.usage_weekly_resets_at,",
+            "e.usage_five_hour_used_percent,e.usage_five_hour_resets_at,e.usage_allowed,e.usage_limit_reached,e.usage_max_used_percent,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
             "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
             "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id ",
@@ -1994,10 +2003,19 @@ impl PostgresStore {
                     (Some(class), Some(seconds)) => Some(super::fast_path::Billing {
                         class: serde_json::from_value(Value::String(class))?,
                         plan_type: row.get("plan_type"),
-                        limits: row
-                            .get::<_, Option<String>>("limits")
-                            .map(|text| serde_json::from_str(&text))
-                            .transpose()?,
+                        usage: row
+                            .get::<_, Option<bool>>("usage_present")
+                            .unwrap_or(false)
+                            .then(|| crate::statusline::Usage {
+                                age_seconds: 0,
+                                weekly_used_percent: row.get("usage_weekly_used_percent"),
+                                weekly_resets_at: row.get("usage_weekly_resets_at"),
+                                five_hour_used_percent: row.get("usage_five_hour_used_percent"),
+                                five_hour_resets_at: row.get("usage_five_hour_resets_at"),
+                                allowed: row.get("usage_allowed"),
+                                limit_reached: row.get("usage_limit_reached"),
+                                max_used_percent: row.get("usage_max_used_percent"),
+                            }),
                         age: age(seconds),
                     }),
                     _ => None,
@@ -2055,14 +2073,54 @@ async fn record_observation(
         .transpose()?
         .and_then(|value| value.as_str().map(str::to_owned));
     let plan = billing.and_then(|billing| billing.plan_type.clone());
-    let limits = billing
-        .and_then(|billing| billing.limits.as_ref())
-        .map(Value::to_string);
+    let usage = billing.and_then(|billing| billing.usage.as_ref());
     let billing_age = billing.map(|billing| millis(billing.age));
-    client.execute(
-        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,limits,billing_observed_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7::text::jsonb,CASE WHEN $8::bigint IS NULL THEN NULL ELSE clock_timestamp()-($8::bigint*interval '1 millisecond') END WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$9 AND epoch=$10 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,billing_class=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.billing_class WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.billing_class END,plan_type=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.plan_type WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.plan_type END,limits=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.limits WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.limits END,billing_observed_at=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.billing_observed_at WHEN central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision THEN central_token_evidence.billing_observed_at END",
-        &[&record.account_id, &record.revision, &observation.auth_revision, &millis(observation.routing_age), &class, &plan, &limits, &billing_age, &lease.holder_id, &lease.epoch],
-    ).await?;
+    // Billing columns follow a billing observation, or keep an active row's
+    // values for the same revisions; anything else clears them.
+    const KEEP: &str = "central_token_evidence.deleted_at IS NULL AND central_token_evidence.auth_revision=EXCLUDED.auth_revision AND central_token_evidence.account_revision=EXCLUDED.account_revision";
+    let billing_columns = [
+        "billing_class",
+        "plan_type",
+        "usage_weekly_used_percent",
+        "usage_weekly_resets_at",
+        "usage_five_hour_used_percent",
+        "usage_five_hour_resets_at",
+        "usage_allowed",
+        "usage_limit_reached",
+        "usage_max_used_percent",
+        "billing_observed_at",
+    ]
+    .map(|column| {
+        format!("{column}=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.{column} WHEN {KEEP} THEN central_token_evidence.{column} END")
+    })
+    .join(",");
+    let statement = format!(
+        "INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at,billing_class,plan_type,usage_weekly_used_percent,usage_weekly_resets_at,usage_five_hour_used_percent,usage_five_hour_resets_at,usage_allowed,usage_limit_reached,usage_max_used_percent,usage_present,billing_observed_at,deleted_at) SELECT $1,$2,$3,true,clock_timestamp()-($4::bigint*interval '1 millisecond'),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,CASE WHEN $15::bigint IS NULL THEN NULL ELSE clock_timestamp()-($15::bigint*interval '1 millisecond') END,NULL WHERE EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$16 AND epoch=$17 AND expires_at>clock_timestamp()) ON CONFLICT(account_id) DO UPDATE SET account_revision=EXCLUDED.account_revision,auth_revision=EXCLUDED.auth_revision,routing_supported=EXCLUDED.routing_supported,routing_observed_at=EXCLUDED.routing_observed_at,{billing_columns},usage_present=CASE WHEN EXCLUDED.billing_observed_at IS NOT NULL THEN EXCLUDED.usage_present WHEN {KEEP} THEN central_token_evidence.usage_present ELSE false END,deleted_at=NULL"
+    );
+    client
+        .execute(
+            &statement,
+            &[
+                &record.account_id,
+                &record.revision,
+                &observation.auth_revision,
+                &millis(observation.routing_age),
+                &class,
+                &plan,
+                &usage.and_then(|usage| usage.weekly_used_percent),
+                &usage.and_then(|usage| usage.weekly_resets_at),
+                &usage.and_then(|usage| usage.five_hour_used_percent),
+                &usage.and_then(|usage| usage.five_hour_resets_at),
+                &usage.and_then(|usage| usage.allowed),
+                &usage.and_then(|usage| usage.limit_reached),
+                &usage.and_then(|usage| usage.max_used_percent),
+                &usage.is_some(),
+                &billing_age,
+                &lease.holder_id,
+                &lease.epoch,
+            ],
+        )
+        .await?;
     Ok(())
 }
 
@@ -2161,7 +2219,16 @@ mod tests {
         let billing = Billing {
             class: api::BillingClass::RateLimited,
             plan_type: Some("plus".into()),
-            limits: Some(serde_json::json!({"rateLimits":{"primary":{"usedPercent":40}}})),
+            usage: Some(crate::statusline::Usage {
+                age_seconds: 0,
+                weekly_used_percent: Some(12.0),
+                weekly_resets_at: Some(4_102_444_800),
+                five_hour_used_percent: Some(40.0),
+                five_hour_resets_at: None,
+                allowed: Some(true),
+                limit_reached: Some(false),
+                max_used_percent: Some(40.0),
+            }),
             age: Duration::from_secs(1),
         };
         let observed = |auth: &str, routing: u64, billing: Option<Billing>| Observation {
@@ -2195,7 +2262,15 @@ mod tests {
         let cached = evidence.billing.expect("billing evidence");
         assert_eq!(cached.class, api::BillingClass::RateLimited);
         assert!(cached.age >= Duration::from_secs(1));
-        assert_eq!(cached.limits, billing.limits);
+        let usage = cached.usage.expect("typed usage");
+        assert_eq!(
+            (
+                usage.five_hour_used_percent,
+                usage.max_used_percent,
+                usage.weekly_resets_at
+            ),
+            (Some(40.0), Some(40.0), Some(4_102_444_800))
+        );
         // An unchanged credential commits fresh routing and keeps billing.
         assert!(
             shared
