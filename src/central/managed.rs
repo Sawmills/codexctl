@@ -22,7 +22,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -154,6 +154,7 @@ pub(super) struct Broker {
     pub(super) recovery_stop: Arc<tokio::sync::Notify>,
     pub(super) background_recovery: bool,
     pub(super) relogins: Arc<StdMutex<BTreeMap<String, Arc<AtomicBool>>>>,
+    pub(super) shared_login_workers: Arc<StdMutex<BTreeSet<(String, String)>>>,
     pub(super) central: Option<CentralStore>,
     pub(super) holder_id: String,
     pub(super) login_holder_live: Arc<AtomicBool>,
@@ -3772,6 +3773,7 @@ pub async fn serve(
         recovery_stop: Arc::new(tokio::sync::Notify::new()),
         background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+        shared_login_workers: Arc::new(StdMutex::new(Default::default())),
         holder_id: instance_holder_id(),
         login_holder_live: Arc::new(AtomicBool::new(true)),
         registry,
@@ -3949,6 +3951,7 @@ impl Broker {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
             holder_id: "test-holder".into(),
             login_holder_live: Arc::new(AtomicBool::new(true)),
@@ -4058,6 +4061,7 @@ mod tests {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: Some(central),
             holder_id: "test-holder".into(),
             login_holder_live: Arc::new(AtomicBool::new(true)),

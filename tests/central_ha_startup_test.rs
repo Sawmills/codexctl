@@ -2626,6 +2626,126 @@ async fn postgres_killed_candidate_holder_resumes_without_another_device_login()
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_candidate_takeover_recovers_after_its_commit_response_times_out() {
+    let mut f = login_fixture().await;
+    let account = account_key("test", "seat");
+    // A real foreign refresh owner still needs settlement. Keep verification
+    // before its in-flight marker until that independent owner releases.
+    f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) VALUES($1,'foreign-settling',41,clock_timestamp()-interval '1 second',false) ON CONFLICT(account_id) DO UPDATE SET holder_id='foreign-settling',epoch=41,expires_at=clock_timestamp()-interval '1 second',released=false",f.schema), &[&account]).await.unwrap();
+    f.control.batch_execute(&format!(r#"
+        CREATE FUNCTION {0}.prepare_takeover_delay() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='candidate' AND NEW.holder_id<>OLD.holder_id THEN
+                PERFORM set_config('statement_timeout','0',false);
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER prepare_takeover_delay AFTER UPDATE ON {0}.central_login_operations
+        FOR EACH ROW EXECUTE FUNCTION {0}.prepare_takeover_delay();
+        CREATE FUNCTION {0}.delay_takeover_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='candidate' AND NEW.holder_id<>OLD.holder_id THEN PERFORM pg_sleep(3); END IF;
+            RETURN NEW;
+        END $$;
+        CREATE CONSTRAINT TRIGGER delay_takeover_commit AFTER UPDATE ON {0}.central_login_operations
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {0}.delay_takeover_commit();
+    "#,f.schema)).await.unwrap();
+    let id = "26".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(8), async {
+        while login_request(&f, &f.second, "status", &id).await["status"] != "verifying" {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        f.first.launches(),
+        0,
+        "the candidate is durable before verifier launch"
+    );
+    f.first.child.kill().await.unwrap();
+    // Expire only the killed replica's leases, using the real DB clock.
+    f.control.execute(&format!("UPDATE {}.central_login_holders SET expires_at=clock_timestamp()-interval '1 second' WHERE holder_id=(SELECT holder_id FROM {}.central_login_operations WHERE id=$1)", f.schema,f.schema), &[&id]).await.unwrap();
+    f.control.execute(&format!("UPDATE {}.central_login_operations SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1", f.schema), &[&id]).await.unwrap();
+    let response = f
+        .http
+        .post(format!("{}/v1/relogin/start", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "the takeover commit response must exceed the DB deadline"
+    );
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let receipt = login_request(&f, &f.second, "start", &id).await;
+    assert_eq!(receipt["id"], id);
+    assert_eq!(
+        request(&f.http, &f.second, &f.token).await.status(),
+        503,
+        "a recovered candidate must still wait for the foreign owner's settlement"
+    );
+    assert_eq!(f.second.launches(), 0);
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.account_refresh_leases SET released=true WHERE account_id=$1",
+                f.schema
+            ),
+            &[&account],
+        )
+        .await
+        .unwrap();
+    let mut retries = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let http = f.http.clone();
+        let url = f.second.url.clone();
+        let token = f.token.clone();
+        let id = id.clone();
+        retries.spawn(async move {
+            http.post(format!("{url}/v1/relogin/status"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","id":id}))
+                .send()
+                .await
+                .unwrap()
+        });
+    }
+    while let Some(response) = retries.join_next().await {
+        assert_eq!(response.unwrap().status(), 200);
+    }
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let receipt = login_request(&f, &f.second, "status", &id).await;
+            assert_ne!(receipt["status"], "failed", "{receipt}");
+            if receipt["status"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("B must resume the durable candidate after refresh settlement");
+    assert!(
+        !f.second.root.path().join("login-pid").exists(),
+        "candidate takeover must not repeat device login"
+    );
+    assert_eq!(f.second.launches(), 1);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_killed_verifier_retains_unresolved_receipt_without_reverification() {
     let mut f = login_fixture().await;
     let id = "f4".repeat(32);
@@ -3166,6 +3286,72 @@ async fn postgres_immediate_native_exit_can_retry_without_process_identity() {
         &add_grant("new-workspace", Some("new-login"), None),
     )
     .await;
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_candidate_publication_recovers_after_its_commit_response_times_out() {
+    let f = login_fixture().await;
+    f.control.batch_execute(&format!(r#"
+        CREATE FUNCTION {0}.prepare_candidate_delay() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='candidate' AND OLD.phase IN ('starting','pending') THEN
+                PERFORM set_config('statement_timeout','0',false);
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER prepare_candidate_delay AFTER UPDATE ON {0}.central_login_operations
+        FOR EACH ROW EXECUTE FUNCTION {0}.prepare_candidate_delay();
+        CREATE FUNCTION {0}.delay_candidate_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.phase='candidate' AND OLD.phase IN ('starting','pending') THEN PERFORM pg_sleep(3); END IF;
+            RETURN NEW;
+        END $$;
+        CREATE CONSTRAINT TRIGGER delay_candidate_commit AFTER UPDATE ON {0}.central_login_operations
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {0}.delay_candidate_commit();
+    "#,f.schema)).await.unwrap();
+    let id = "27".repeat(32);
+    login_request(&f, &f.first, "start", &id).await;
+    store::atomic_write(
+        &f.first.root.path().join("login-release"),
+        &serde_json::to_vec(&renewal_grant()).unwrap(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(12), async {
+        loop {
+            let response = f
+                .http
+                .post(format!("{}/v1/relogin/status", f.second.url))
+                .bearer_auth(&f.token)
+                .json(&json!({"alias":"seat","id":id}))
+                .send()
+                .await
+                .unwrap();
+            if response.status() == 200 {
+                let receipt: Value = response.json().await.unwrap();
+                assert_ne!(
+                    receipt["status"], "failed",
+                    "a committed candidate survives its lost response: {receipt}"
+                );
+                if receipt["status"] == "completed" {
+                    break;
+                }
+            } else {
+                assert_eq!(
+                    response.status(),
+                    503,
+                    "transient DB lock wait remains explicit"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.first.launches(), 1);
+    assert!(!f.second.root.path().join("login-pid").exists());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
     stop_fixture(f).await;
 }
 

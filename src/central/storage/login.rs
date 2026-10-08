@@ -340,7 +340,7 @@ impl CentralStore {
             let tx = connection.transaction().await?;
             let _timing = super::identity::lock_admission(&tx).await?;
             let row = tx.query_opt(
-                "UPDATE central_login_operations o SET holder_id=$6,epoch=epoch+1,sequence=sequence+1,expires_at=clock_timestamp()+interval '30 seconds' FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='candidate' AND o.expires_at<=clock_timestamp() AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND h.expires_at<=clock_timestamp() AND NOT EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
+                "UPDATE central_login_operations o SET holder_id=$6,epoch=epoch+1,sequence=sequence+1,expires_at=clock_timestamp()+interval '30 seconds' FROM central_login_holders h WHERE o.user_id=$1 AND o.id=$2 AND o.holder_id=$3 AND o.epoch=$4 AND o.sequence=$5 AND o.phase='candidate' AND h.holder_id=o.holder_id AND h.deleted_at IS NULL AND h.polling_bound AND ((o.holder_id=$6 AND o.expires_at>clock_timestamp() AND h.expires_at>clock_timestamp()) OR (o.expires_at<=clock_timestamp() AND h.expires_at<=clock_timestamp())) AND NOT EXISTS(SELECT 1 FROM account_refresh_leases l WHERE l.account_id=o.account_id AND l.holder_id=o.holder_id||':'||o.id AND NOT l.released) AND EXISTS(SELECT 1 FROM central_login_holders current_holder WHERE current_holder.holder_id=$6 AND current_holder.deleted_at IS NULL AND current_holder.expires_at>clock_timestamp()) RETURNING o.*,o.expires_at<=clock_timestamp() AS lease_expired",
                 &[&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&holder],
             ).await?;
             tx.commit().await?;
@@ -657,8 +657,7 @@ impl CentralStore {
             op.account()?,
             &holder,
             Duration::from_secs(120),
-            Some(&op.id),
-            Some(&op.holder),
+            Some(op),
         ))
         .await
     }

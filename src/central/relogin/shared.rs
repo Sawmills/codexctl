@@ -93,7 +93,7 @@ async fn recover(
     }
     // The same database read that returns the receipt observes lease expiry.
     // Live receipts must not queue behind admission or settlement work.
-    if !op.lease_expired {
+    if !op.lease_expired && !(op.phase == LoginPhase::Candidate && op.holder == broker.holder_id) {
         return Ok(());
     }
     if database(broker)?
@@ -119,18 +119,18 @@ async fn recover(
         record_login_failure(broker, op).await?;
     }
     if op.phase == LoginPhase::Candidate
-        && op.holder != broker.holder_id
         && !broker.read_only
         && !broker.stopping.load(Ordering::Acquire)
         && !broker.ownership_unresolved.load(Ordering::Acquire)
         && broker.login_holder_live.load(Ordering::Acquire)
         && let Ok(permit) = broker.work.clone().try_acquire_owned()
+        && let Some(guard) = WorkerGuard::claim(broker, op)?
         && database(broker)?
             .login_takeover_candidate(op, &broker.holder_id)
             .await
             .map_err(|_| failure(broker))?
     {
-        spawn_worker(broker.clone(), headers.clone(), op.clone(), permit);
+        spawn_claimed_worker(broker.clone(), headers.clone(), op.clone(), permit, guard);
     }
     Ok(())
 }
@@ -345,7 +345,7 @@ pub(super) async fn start_kind(
         owned(&broker, &device, &request, &existing)?;
         return Ok(view(&existing));
     }
-    spawn_worker(broker.clone(), headers.clone(), op.clone(), permit);
+    spawn_worker(broker.clone(), headers.clone(), op.clone(), permit)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let current = db
@@ -360,14 +360,54 @@ pub(super) async fn start_kind(
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
+struct WorkerGuard {
+    broker: Broker,
+    key: (String, String),
+}
+impl WorkerGuard {
+    fn claim(broker: &Broker, op: &LoginOperation) -> Result<Option<Self>, HttpError> {
+        let key = (op.user.clone(), op.id.clone());
+        let mut workers = broker
+            .shared_login_workers
+            .lock()
+            .map_err(|_| failure(broker))?;
+        if !workers.insert(key.clone()) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            broker: broker.clone(),
+            key,
+        }))
+    }
+}
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut workers) = self.broker.shared_login_workers.lock() {
+            workers.remove(&self.key);
+        }
+    }
+}
 fn spawn_worker(
+    worker: Broker,
+    worker_headers: HeaderMap,
+    worker_op: LoginOperation,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<(), HttpError> {
+    if let Some(guard) = WorkerGuard::claim(&worker, &worker_op)? {
+        spawn_claimed_worker(worker, worker_headers, worker_op, permit, guard);
+    }
+    Ok(())
+}
+fn spawn_claimed_worker(
     worker: Broker,
     worker_headers: HeaderMap,
     mut worker_op: LoginOperation,
     permit: tokio::sync::OwnedSemaphorePermit,
+    guard: WorkerGuard,
 ) {
     tokio::spawn(async move {
         let _permit = permit;
+        let _guard = guard;
         if let Err(error) = run(&worker, &worker_headers, &mut worker_op).await {
             let mut detail = format!("{error:#}");
             if let Some(auth) = worker_op.payload.candidate.as_ref() {
@@ -574,7 +614,10 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         // Once published, PostgreSQL owns the grant. Loss or damage of the
         // local copy must never erase its identity or remove its refresh fence.
         if op.payload.candidate.is_some() {
-            if op.phase != LoginPhase::Candidate || !matches!(result, Ok(true)) {
+            // The publication commit may have completed even when the
+            // supervisor response was interrupted. The durable phase is the
+            // authority once the candidate is visible in PostgreSQL.
+            if op.phase != LoginPhase::Candidate {
                 bail!("polling grant retained after interruption");
             }
             if let Err(error) = std::fs::remove_dir_all(&home)
