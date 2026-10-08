@@ -3467,6 +3467,32 @@ async fn postgres_fast_path_refuses_stale_evidence() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_failed_lease_read_clears_evidence_for_every_replica() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    // The next native read on the first replica refuses native routing.
+    store::atomic_write(&f.first.root.path().join("mode"), b"non-exportable").unwrap();
+    let refused = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":warm["revision"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(!refused.status().is_success());
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 200);
+    assert_eq!(f.second.launches(), 1, "refused evidence must not serve");
+    assert_eq!(metric(&f, &f.second, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_fast_path_never_serves_a_fenced_account() {
     let f = enable_fast_path(login_fixture().await).await;
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
