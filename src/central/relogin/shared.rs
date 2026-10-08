@@ -470,8 +470,8 @@ fn spawn_claimed_worker(
             };
             if let Ok(db) = database(&worker) {
                 // A transient database error must not leave a stale receipt.
-                // Report only a durable outcome. After a fenced save, recovery
-                // decides between resume and an unresolved failure.
+                // Report a durable outcome. After a fenced save, recovery decides
+                // between resume and an unresolved failure for a grant.
                 for attempt in 1..=3 {
                     let Err(error) = db.login_save(&mut worker_op, phase).await else {
                         report_worker_failure(&worker, &mut worker_op).await;
@@ -489,6 +489,10 @@ fn spawn_claimed_worker(
                         "{}",
                         json!({"operation":"login_settlement","stage":"terminal_save","reason":"save_unavailable","error":detail})
                     );
+                    // Without a grant the attempt cannot resume as a success.
+                    if worker_op.payload.candidate.is_none() {
+                        report_worker_failure(&worker, &mut worker_op).await;
+                    }
                 }
             }
         }
