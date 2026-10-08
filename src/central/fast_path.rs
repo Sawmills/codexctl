@@ -80,8 +80,78 @@ pub(super) fn decide(
     candidate: &Candidate<'_>,
     request: &TokenRequest,
 ) -> Result<TokenResponse, Miss> {
-    let _ = (candidate, request);
-    Err(Miss::EvidenceMissing)
+    let auth = candidate.auth;
+    let access_token = super::vault::token(auth).map_err(|_| Miss::Identity)?;
+    let expires = api::token_expiry(access_token).ok_or(Miss::Expiring)?;
+    if expires - candidate.now < MIN_REMAINING_SECONDS {
+        return Err(Miss::Expiring);
+    }
+    let revision = super::vault::digest(&serde_json::to_vec(auth).map_err(|_| Miss::Identity)?);
+    // Equal means the client saw this exact token rejected.
+    if request.previous_revision.as_deref() == Some(revision.as_str()) {
+        return Err(Miss::Forced);
+    }
+    let evidence = candidate.evidence.ok_or(Miss::EvidenceMissing)?;
+    if evidence.auth_revision != revision || evidence.account_revision != candidate.account_revision
+    {
+        return Err(Miss::EvidenceStale);
+    }
+    if evidence.routing_age > EVIDENCE_MAX_AGE {
+        return Err(Miss::EvidenceStale);
+    }
+    if !evidence.routing_supported {
+        return Err(Miss::Routing);
+    }
+    let mut token = TokenResponse {
+        user_id: None,
+        chatgpt_account_id: super::vault::account(auth).map_err(|_| Miss::Identity)?,
+        chatgpt_plan_type: api::token_identity(access_token).and_then(|identity| identity.plan),
+        revision,
+        access_token: access_token.to_owned(),
+        billing_class: None,
+        native_routing_supported: true,
+        statusline_usage: None,
+        label: candidate.label.clone(),
+    };
+    if request.billing {
+        let billing = evidence.billing.as_ref().ok_or(Miss::EvidenceMissing)?;
+        if billing.age > EVIDENCE_MAX_AGE {
+            return Err(Miss::EvidenceStale);
+        }
+        if billing.class == api::BillingClass::RateLimited
+            && !billing.limits.as_ref().is_some_and(below_ceiling)
+        {
+            return Err(Miss::UsageHigh);
+        }
+        token.billing_class = Some(billing.class);
+        token.chatgpt_plan_type = billing.plan_type.clone();
+        token.statusline_usage = billing
+            .limits
+            .as_ref()
+            .and_then(|limits| super::server::usage(limits).ok())
+            .map(|usage| {
+                let mut usage = crate::statusline::Usage::from_usage(&usage);
+                usage.age_seconds = billing.age.as_secs();
+                usage
+            });
+    }
+    Ok(token)
+}
+
+/// Every reported window is below the ceiling. A missing or malformed window
+/// is not proof of headroom.
+fn below_ceiling(limits: &Value) -> bool {
+    let windows: Vec<_> = ["primary", "secondary"]
+        .into_iter()
+        .map(|name| &limits["rateLimits"][name])
+        .filter(|window| !window.is_null())
+        .collect();
+    !windows.is_empty()
+        && windows.iter().all(|window| {
+            window["usedPercent"].as_f64().is_some_and(|used| {
+                used.is_finite() && (0.0..USAGE_CEILING_PERCENT).contains(&used)
+            })
+        })
 }
 
 #[cfg(test)]
