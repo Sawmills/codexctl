@@ -3238,13 +3238,14 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
 }
 
 #[cfg(target_os = "linux")]
-async fn enable_fast_path(f: &mut LoginFixture) {
+async fn enable_fast_path(mut f: LoginFixture) -> LoginFixture {
     f.first.stop().await;
     store::atomic_write(&f.first.root.path().join("fast-path"), b"1").unwrap();
     f.first = Pod::spawn(&f.database, &f.key, f.first.root, "postgres").await;
     f.second.stop().await;
     store::atomic_write(&f.second.root.path().join("fast-path"), b"1").unwrap();
     f.second = Pod::spawn(&f.database, &f.key, f.second.root, "postgres").await;
+    f
 }
 
 #[cfg(target_os = "linux")]
@@ -3274,8 +3275,7 @@ const OWNER_UNAVAILABLE: &str =
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fast_path_serves_a_valid_token_without_the_lease_or_a_child() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     let first: Value = request(&f.http, &f.first, &f.token)
         .await
         .json()
@@ -3296,8 +3296,7 @@ async fn postgres_fast_path_serves_a_valid_token_without_the_lease_or_a_child() 
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fast_path_serves_while_another_replica_holds_the_lease() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     let warm: Value = request(&f.http, &f.first, &f.token)
         .await
         .json()
@@ -3343,8 +3342,7 @@ async fn postgres_fast_path_serves_while_another_replica_holds_the_lease() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_lease_loser_serves_the_holders_committed_revision() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     let warm: Value = request(&f.http, &f.first, &f.token)
         .await
         .json()
@@ -3416,8 +3414,7 @@ async fn postgres_lease_loser_serves_the_holders_committed_revision() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fast_path_refuses_a_nearly_spent_rate_limited_account() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     store::atomic_write(&f.first.root.path().join("mode"), b"used-95").unwrap();
     let warm: Value = request(&f.http, &f.first, &f.token)
         .await
@@ -3442,8 +3439,7 @@ async fn postgres_fast_path_refuses_a_nearly_spent_rate_limited_account() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fast_path_refuses_stale_evidence() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
     f.control
         .execute(
@@ -3472,8 +3468,7 @@ async fn postgres_fast_path_refuses_stale_evidence() {
 #[tokio::test]
 #[cfg(target_os = "linux")]
 async fn postgres_fast_path_never_serves_a_fenced_account() {
-    let mut f = login_fixture().await;
-    enable_fast_path(&mut f).await;
+    let f = enable_fast_path(login_fixture().await).await;
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
     let account = account_key("test", "seat");
     // A foreign refresh owner keeps the renewal at its durable candidate.
