@@ -185,6 +185,10 @@ for line in sys.stdin:
             rotate()
         if mode == "cached-rejection" and json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh":
             definitive_rejection = True
+        if mode == "startup-refresh-expired":
+            # The cached-status call refreshes at owner start and is rejected.
+            print('ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_expired"), error_message: None, .. }', file=sys.stderr, flush=True)
+            definitive_rejection = True
         current = json.loads(auth_path.read_text())["tokens"]["access_token"]
         result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection else current, "requiresOpenaiAuth":True}
         if mode in ["non-exportable", "baseline-null"]:

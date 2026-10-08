@@ -3087,6 +3087,9 @@ async fn initialize_owner(owner: &mut Owner) -> Result<()> {
         // Even the cached-status call can refresh. Persist its journal and
         // rejection evidence before returning any protocol or loading error.
         owner.snapshot()?;
+        if owner.rpc.as_ref().is_some_and(|rpc| rpc.rejected_login()) {
+            owner.refresh_failed().await;
+        }
         let token = status?;
         if token != vault::token(&owner.vault.auth)? {
             bail!("native owner exported a login that differs from its journal");

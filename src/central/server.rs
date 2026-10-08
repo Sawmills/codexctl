@@ -141,7 +141,7 @@ pub(super) struct Owner {
 impl Owner {
     /// Logs and counts a failed owner refresh with the provider's bounded
     /// reason, read before the fence can stop the child.
-    async fn refresh_failed(&self) {
+    pub(super) async fn refresh_failed(&self) {
         let reason = match self.rpc.as_ref() {
             Some(rpc) => rpc.refresh_failure_reason().await,
             None => None,

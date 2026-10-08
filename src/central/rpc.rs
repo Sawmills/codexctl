@@ -402,6 +402,9 @@ impl Rpc {
             self.rejected_login = false;
         }
         self.outstanding = Some((id, verifies));
+        // A reason belongs to the call during which Codex logged it; drop any
+        // earlier one so it cannot be blamed on this call.
+        self.refresh_reason.take();
         let operation = async {
             self.send(json!({"id":id,"method":method,"params":params}))
                 .await?;
