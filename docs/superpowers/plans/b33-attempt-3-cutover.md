@@ -66,7 +66,7 @@ PR H must not remove `PrometheusRule/codexctl` or `ScrapeConfig/codexctl`: the s
   3. Run the read-only [lease and login queries](#read-only-queries). Every `account_refresh_leases` row must be released, including login leases (holder `<login holder>:<operation id>`). An unreleased row, even an expired one, means the owner's settlement is unknown: stop, keep PR W merged, and forward-fix in HA. A login operation that is not terminal may hold a grant that file mode cannot see: settle it in HA first, or record its account for relogin.
   4. Only then revert PR W.
 - **Spent tokens:** if the HA logs show any refresh, the file state holds a spent refresh token for each refreshed account. Each such account needs `codexctl login <alias>` and Amir's device code before it serves in file mode. Prefer a forward fix in HA when the fault allows it.
-- **HA-only accounts:** an account added or renewed through HA (PR2 add-account, PR1 renewal) exists only in PostgreSQL. A file-mode rollback loses it; list completed `add` operations with the login query and re-add each one in file mode.
+- **HA-only credentials:** an account added or renewed through HA (PR2 add-account, PR1 renewal) has its credential only in PostgreSQL, and a `rejected` receipt can hold a captured candidate. List them with the login query. Before file mode serves, re-add each completed add and run `codexctl login <alias>` for each completed renewal and each account with `holds_candidate`.
 - Never run the StatefulSet and the HA Deployment as refresh writers at the same time. Keep the PVC archive, both Job logs, and the database until HQ closes B33.
 
 ## Read-Only Queries
@@ -87,11 +87,15 @@ ORDER BY table_name;
 -- Lease fence (rollback step 3): must return 0.
 SELECT count(*) FROM account_refresh_leases WHERE NOT released;
 
--- Login journals (rollback step 3 and HA-only accounts).
-SELECT kind, phase, polling_clear, alias, landed_alias
+-- Login journals (rollback step 3 and HA-only credentials). Every row needs
+-- action before file mode serves: a completed add or renewal and any receipt
+-- with a captured candidate hold credentials only PostgreSQL has.
+SELECT user_id, kind, phase, polling_clear, alias, landed_alias, account_id,
+       candidate_workspace IS NOT NULL AS holds_candidate
 FROM central_login_operations
-WHERE phase NOT IN ('completed','failed','canceled','rejected')
-   OR (kind = 'add' AND phase = 'completed');
+WHERE phase NOT IN ('failed','canceled')
+   OR candidate_workspace IS NOT NULL
+ORDER BY user_id, alias;
 ```
 
 The emptiness query names no table, so it also works before migration 1, when no table exists, and it counts tables added later, such as the loan tables. The lease and login queries run only after migration, when their tables exist.
