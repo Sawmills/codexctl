@@ -191,6 +191,11 @@ for line in sys.stdin:
         if mode == "rpc-unhealthy":
             print("{invalid", flush=True)
             sys.exit(1)
+        if mode == "refresh-reused":
+            # What Codex logs, then answers, when the token endpoint rejects the grant.
+            print('2026-10-08T18:30:01.123Z ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: Some("synthetic"), .. }', file=sys.stderr, flush=True)
+            send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
+            continue
         if mode == "billing-permanent-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic permanent billing rejection"}})
             continue

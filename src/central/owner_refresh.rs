@@ -1,0 +1,274 @@
+//! Why the provider rejected an owner's stored refresh grant.
+//!
+//! Codex logs the token endpoint's status and error code to stderr when a
+//! refresh fails (`Failed to refresh token status=… detail=TokenErrorDetail {
+//! error_code: Some("…"), … }`). The owner child's stderr is the only place
+//! that cause appears, so it is read here, reduced to a bounded reason, and
+//! counted per account. Forwarded lines are capped, rate limited and redacted.
+
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
+use regex::Regex;
+use serde_json::json;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+
+/// Longest forwarded stderr line, in characters.
+const MAX_LINE_CHARS: usize = 300;
+/// Forwarded stderr lines per window; the rest is drained and counted.
+const MAX_LINES_PER_WINDOW: usize = 30;
+const WINDOW: Duration = Duration::from_secs(60);
+/// The line Codex logs when the token endpoint rejects a refresh.
+const REFRESH_FAILED: &str = "Failed to refresh token";
+
+/// The latest provider refresh reason seen on one owner child's stderr.
+#[derive(Clone, Default)]
+pub(super) struct ReasonSlot(Arc<Mutex<Option<&'static str>>>);
+
+impl ReasonSlot {
+    pub(super) fn take(&self) -> Option<&'static str> {
+        self.0.lock().expect("refresh reason lock").take()
+    }
+
+    fn set(&self, reason: &'static str) {
+        *self.0.lock().expect("refresh reason lock") = Some(reason);
+    }
+}
+
+/// Reduces a Codex refresh-failure log line to a bounded reason. Returns
+/// `None` for any other line.
+pub(super) fn classify(line: &str) -> Option<&'static str> {
+    if !line.contains(REFRESH_FAILED) {
+        return None;
+    }
+    static CODE: OnceLock<Regex> = OnceLock::new();
+    static STATUS: OnceLock<Regex> = OnceLock::new();
+    let code = CODE
+        .get_or_init(|| {
+            Regex::new(r#"error_code: Some\(\\?"([A-Za-z0-9_.-]{1,64})\\?"\)"#)
+                .expect("valid regex")
+        })
+        .captures(line)
+        .map(|captures| captures[1].to_ascii_lowercase());
+    let status = STATUS
+        .get_or_init(|| Regex::new(r#"status"?[=:]\s*"?(\d{3})\b"#).expect("valid regex"))
+        .captures(line)
+        .and_then(|captures| captures[1].parse::<u16>().ok());
+    Some(match code.as_deref() {
+        Some("refresh_token_expired") => "refresh_token_expired",
+        Some("refresh_token_reused") => "refresh_token_reused",
+        Some("refresh_token_invalidated") => "refresh_token_invalidated",
+        Some("invalid_grant") => "invalid_grant",
+        _ if status == Some(401) => "unauthorized",
+        _ => "other",
+    })
+}
+
+/// Removes token-shaped values and caps the length. Codex already keeps
+/// tokens out of these logs; this is a second guard before they leave the pod.
+pub(super) fn redact(line: &str) -> String {
+    static SECRET: OnceLock<Regex> = OnceLock::new();
+    let secret = SECRET.get_or_init(|| {
+        Regex::new(concat!(
+            r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+",
+            r"|\b(?:rt|sk|sess|at)[-_][A-Za-z0-9_-]{16,}",
+            r"|[A-Za-z0-9_-]{40,}",
+        ))
+        .expect("valid regex")
+    });
+    let cleaned = secret.replace_all(line, "[redacted]");
+    let mut short: String = cleaned.chars().take(MAX_LINE_CHARS).collect();
+    if cleaned.chars().count() > MAX_LINE_CHARS {
+        short.push('…');
+    }
+    short
+}
+
+/// Drains an owner child's stderr. Every line is read, so the child never
+/// blocks on a full pipe; at most `MAX_LINES_PER_WINDOW` lines per minute are
+/// forwarded to `sink`, redacted, as structured JSON. A refresh failure line
+/// always sets `slot`, even when forwarding is suppressed.
+pub(super) async fn forward(stderr: impl AsyncRead + Unpin, slot: ReasonSlot, sink: impl Fn(&str)) {
+    let mut lines = BufReader::new(stderr).lines();
+    let mut window_start = Instant::now();
+    let mut forwarded = 0usize;
+    let mut suppressed = 0u64;
+    let flush = |suppressed: u64, sink: &dyn Fn(&str)| {
+        if suppressed > 0 {
+            sink(
+                &json!({"operation":"owner_child","stage":"stderr","suppressed":suppressed})
+                    .to_string(),
+            );
+        }
+    };
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(reason) = classify(&line) {
+            slot.set(reason);
+        }
+        if window_start.elapsed() >= WINDOW {
+            flush(suppressed, &sink);
+            window_start = Instant::now();
+            forwarded = 0;
+            suppressed = 0;
+        }
+        if forwarded < MAX_LINES_PER_WINDOW {
+            forwarded += 1;
+            sink(
+                &json!({"operation":"owner_child","stage":"stderr","line":redact(&line)})
+                    .to_string(),
+            );
+        } else {
+            suppressed += 1;
+        }
+    }
+    flush(suppressed, &sink);
+}
+
+/// Failures per (account, reason) for this server process.
+fn failures() -> &'static Mutex<BTreeMap<(String, &'static str), u64>> {
+    static FAILURES: OnceLock<Mutex<BTreeMap<(String, &'static str), u64>>> = OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+/// Counts one rejected owner refresh. The account set is the small set of
+/// server accounts, so the label stays bounded.
+pub(super) fn record(account: &str, reason: &'static str) {
+    *failures()
+        .lock()
+        .expect("refresh failure lock")
+        .entry((account.to_owned(), reason))
+        .or_default() += 1;
+}
+
+/// Prometheus text for `codexctl_central_owner_refresh_failed_total`.
+pub(super) fn metrics() -> String {
+    let escape = |value: &str| {
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    };
+    failures()
+        .lock()
+        .expect("refresh failure lock")
+        .iter()
+        .map(|((account, reason), count)| {
+            format!(
+                "codexctl_central_owner_refresh_failed_total{{account=\"{}\",reason=\"{reason}\"}} {count}\n",
+                escape(account)
+            )
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REUSED_TEXT: &str = r#"2026-10-08T18:30:01.123Z ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized detail=TokenErrorDetail { error_code: Some("refresh_token_reused"), error_message: Some("Your refresh token has already been used to generate a new access token. Please try signing in again."), .. }"#;
+    const INVALID_GRANT_JSON: &str = r#"{"timestamp":"2026-10-08T18:30:01.123Z","level":"ERROR","fields":{"message":"Failed to refresh token","status":"400 Bad Request","detail":"TokenErrorDetail { error_code: Some(\"invalid_grant\"), error_message: None, .. }"},"target":"codex_login::auth::manager"}"#;
+
+    #[test]
+    fn refresh_failures_map_to_a_bounded_reason() {
+        assert_eq!(classify(REUSED_TEXT), Some("refresh_token_reused"));
+        assert_eq!(classify(INVALID_GRANT_JSON), Some("invalid_grant"));
+        let with = |code: &str, status: &str| {
+            format!(
+                "ERROR codex_login: Failed to refresh token status={status} detail=TokenErrorDetail {{ error_code: Some(\"{code}\"), error_message: None, .. }}"
+            )
+        };
+        assert_eq!(
+            classify(&with("refresh_token_expired", "401 Unauthorized")),
+            Some("refresh_token_expired")
+        );
+        assert_eq!(
+            classify(&with("refresh_token_invalidated", "401 Unauthorized")),
+            Some("refresh_token_invalidated")
+        );
+        assert_eq!(
+            classify(&with("INVALID_GRANT", "400 Bad Request")),
+            Some("invalid_grant")
+        );
+        assert_eq!(
+            classify(&with("something_new", "401 Unauthorized")),
+            Some("unauthorized")
+        );
+        assert_eq!(
+            classify(&with("something_new", "500 Internal Server Error")),
+            Some("other")
+        );
+        assert_eq!(
+            classify(
+                "ERROR codex_login: Failed to refresh token status=403 Forbidden detail=TokenErrorDetail { error_code: None, .. }"
+            ),
+            Some("other")
+        );
+        assert_eq!(classify("ERROR codex_core: stream disconnected"), None);
+    }
+
+    #[test]
+    fn forwarded_lines_drop_tokens_and_stay_short() {
+        let jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyLTEyMyJ9.c2lnbmF0dXJlLXZhbHVlLWhlcmU";
+        let line = format!(
+            "ERROR x: refresh with rt_{} and Bearer {jwt} failed {}",
+            "A".repeat(40),
+            "y".repeat(2000)
+        );
+        let safe = redact(&line);
+        assert!(!safe.contains(jwt), "{safe}");
+        assert!(!safe.contains(&"A".repeat(40)), "{safe}");
+        assert!(safe.contains("[redacted]"));
+        assert!(safe.chars().count() <= MAX_LINE_CHARS + 1, "{}", safe.len());
+        assert!(redact(REUSED_TEXT).contains("refresh_token_reused"));
+    }
+
+    #[tokio::test]
+    async fn stderr_is_drained_rate_limited_and_the_reason_is_kept() {
+        let mut input = String::new();
+        for i in 0..(MAX_LINES_PER_WINDOW + 10) {
+            input.push_str(&format!("WARN noise line {i}\n"));
+        }
+        input.push_str(REUSED_TEXT);
+        input.push('\n');
+        let slot = ReasonSlot::default();
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = lines.clone();
+        forward(input.as_bytes(), slot.clone(), move |line| {
+            sink.lock().unwrap().push(line.to_owned())
+        })
+        .await;
+        let lines = lines.lock().unwrap();
+        assert_eq!(
+            lines.len(),
+            MAX_LINES_PER_WINDOW + 1,
+            "window cap plus one suppression note"
+        );
+        assert!(
+            lines.last().unwrap().contains("\"suppressed\""),
+            "{lines:?}"
+        );
+        assert_eq!(
+            slot.take(),
+            Some("refresh_token_reused"),
+            "drained past the cap"
+        );
+    }
+
+    #[test]
+    fn metrics_count_each_failure_per_account_and_reason() {
+        record("metrics-test@example.com", "refresh_token_reused");
+        record("metrics-test@example.com", "refresh_token_reused");
+        record("other\"acct", "invalid_grant");
+        let text = metrics();
+        assert!(text.contains(
+            "codexctl_central_owner_refresh_failed_total{account=\"metrics-test@example.com\",reason=\"refresh_token_reused\"} 2\n"
+        ), "{text}");
+        assert!(
+            text.contains("account=\"other\\\"acct\",reason=\"invalid_grant\"} 1\n"),
+            "{text}"
+        );
+    }
+}

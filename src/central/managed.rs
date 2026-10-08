@@ -2789,6 +2789,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         })
         .collect();
     output.push_str(&super::storage::identity::admission_metrics());
+    output.push_str(&super::owner_refresh::metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))

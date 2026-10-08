@@ -1007,6 +1007,36 @@ Confirm enforcement with the platform owner before relying on it for access cont
 
 ## Failure and Recovery
 
+### Rejected refresh grant
+
+When the provider rejects an owner's stored refresh grant, the server logs one
+`owner_refresh` line with the account and a bounded reason. It also counts
+`codexctl_central_owner_refresh_failed_total{account,reason}`. The reason comes
+from the status and error code that Codex logs on the owner child's stderr:
+
+| Reason                      | Provider answer                               |
+| --------------------------- | --------------------------------------------- |
+| `refresh_token_reused`      | Another holder already used this grant        |
+| `refresh_token_expired`     | The grant expired                             |
+| `refresh_token_invalidated` | The provider revoked the grant                |
+| `invalid_grant`             | 400 `invalid_grant` without a more exact code |
+| `unauthorized`              | 401 with another code                         |
+| `other`                     | Any other provider rejection                  |
+
+A failed refresh with no provider rejection on stderr within 300 ms, such as a
+usage read error, logs `reason="unclassified"` and is not counted. It still
+reports `owner_unavailable`.
+
+The server forwards the owner child's stderr as `owner_child` lines: at most 30
+lines a minute, each at most 300 characters, with token-shaped values replaced
+by `[redacted]`. Extra lines are counted in a `suppressed` line.
+The `CodexctlOwnerRefreshRejected` alert fires on the first failure per account
+and on each later increase. It routes by `severity: warning` to the default
+staging receiver `warnings-slack` (`#warning-alerts`). Renew the account with a
+device code before its token requests fail as `owner_unavailable`.
+
+### Owners and recovery
+
 One owner process refreshes each account. Different accounts have separate request locks.
 Server owners run in their private homes with the OpenAI provider and ChatGPT login mode fixed.
 Background recovery is controlled by `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY`. It is

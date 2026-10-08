@@ -67,6 +67,8 @@ pub struct Rpc {
     rejected_login: bool,
     exportable_login: bool,
     pending: VecDeque<Value>,
+    /// The provider's reason for the last rejected refresh, read from stderr.
+    refresh_reason: super::owner_refresh::ReasonSlot,
 }
 
 impl Rpc {
@@ -147,7 +149,8 @@ impl Rpc {
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // Codex logs the token endpoint's rejection only to stderr.
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if isolate_signals {
             command.current_dir(&home).args([
@@ -173,6 +176,16 @@ impl Rpc {
                 .take()
                 .expect("configured piped app-server stdout"),
         );
+        let refresh_reason = super::owner_refresh::ReasonSlot::default();
+        let stderr = child
+            .stderr
+            .take()
+            .expect("configured piped app-server stderr");
+        tokio::spawn(super::owner_refresh::forward(
+            stderr,
+            refresh_reason.clone(),
+            |line| eprintln!("{line}"),
+        ));
         Ok(Self {
             _child: child,
             input: Some(input),
@@ -186,7 +199,22 @@ impl Rpc {
             rejected_login: false,
             exportable_login: false,
             pending: VecDeque::new(),
+            refresh_reason,
         })
+    }
+
+    /// The provider's bounded reason for a refresh that just failed. Codex
+    /// writes the stderr line before it answers, but the two pipes race, so
+    /// wait briefly. `None` when Codex logged no provider rejection: the
+    /// failure was something else, such as a usage read error.
+    pub(super) async fn refresh_failure_reason(&self) -> Option<&'static str> {
+        for _ in 0..10 {
+            if let Some(reason) = self.refresh_reason.take() {
+                return Some(reason);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        None
     }
 
     pub async fn initialize(&mut self) -> Result<()> {

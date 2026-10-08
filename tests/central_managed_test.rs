@@ -3807,6 +3807,33 @@ fn an_unmarked_billing_rejection_is_permanent_without_respawn() {
 }
 
 #[test]
+fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_owner_refresh_failed_total{account=\"personal\",reason=\"refresh_token_reused\"} 1\n"
+        ),
+        "{metrics}"
+    );
+}
+
+#[test]
 fn retryable_owner_cannot_lift_a_relogin_fence() {
     let server = Server::start();
     assert_eq!(
