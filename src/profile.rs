@@ -142,6 +142,10 @@ pub fn save_live_profile_locked(
     auth_json_src: &Path,
 ) -> Result<()> {
     let alias = store::validate_alias(alias)?;
+    // The live file is the server's token with no refresh token while
+    // app-auth is enabled; saving it would make a dead local profile.
+    #[cfg(feature = "central-prototype")]
+    crate::central::native::refuse_app_auth(paths, "codexctl save")?;
     save_profile_unlocked(paths, alias, email, auth_json_src)?;
     set_active_unlocked(paths, alias)
 }

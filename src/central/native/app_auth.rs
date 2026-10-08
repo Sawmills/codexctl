@@ -218,6 +218,9 @@ fn enable(
         .try_exists()?
         .then(|| read_state(&paths))
         .transpose()?;
+    // Keep the digest of the file on disk until the new write is confirmed;
+    // a failed re-enable must still recognize the previous app-auth file.
+    let previous_written = previous.as_ref().and_then(|state| state.written.clone());
     let backup_account = match previous {
         Some(state) => state.backup_account,
         None => back_up_login(&paths)?,
@@ -233,7 +236,7 @@ fn enable(
         approved_class: allow_billing.then_some(token.billing_class).flatten(),
         allow_codex_version,
         backup_account,
-        written: None,
+        written: previous_written,
         pending: None,
         last: None,
     };

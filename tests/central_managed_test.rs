@@ -11592,6 +11592,13 @@ fn app_auth_refuses_while_the_central_provider_is_active_and_guards_use_while_en
         "app-auth",
     );
     refused(&server.cli(other.path(), &["switch"]), "app-auth");
+    refused(&server.cli(other.path(), &["save", "copy"]), "app-auth");
+    // A local login (no server connection) refuses before the browser step.
+    let local = tempfile::tempdir().unwrap();
+    store::ensure_private_dir(&local.path().join(".codexctl/app-auth")).unwrap();
+    std::fs::write(local.path().join(".codexctl/app-auth/state.json"), b"{}").unwrap();
+    refused(&server.cli(local.path(), &["login", "fresh"]), "app-auth");
+    assert!(!local.path().join(".codexctl/login-homes/fresh").exists());
     assert_eq!(
         std::fs::read(other.path().join(".codex/auth.json")).unwrap(),
         before
