@@ -1382,7 +1382,7 @@ impl PostgresStore {
             let client = self.client().await?;
             client
                 .execute(
-                    "UPDATE central_relay_rate_limits SET deleted_at=COALESCE(deleted_at,clock_timestamp()),updated_at=clock_timestamp() WHERE device_id=$1",
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,0,clock_timestamp(),false,clock_timestamp()) ON CONFLICT(device_id) DO UPDATE SET deleted_at=COALESCE(central_relay_rate_limits.deleted_at,clock_timestamp()),updated_at=clock_timestamp()",
                     &[&device],
                 )
                 .await?;
@@ -2729,6 +2729,26 @@ mod tests {
             .unwrap()
             .get(0);
         assert!(still_retired);
+        store
+            .retire_relay_event_limiter("never-reported-device")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .relay_event_allowed("never-reported-device")
+                .await
+                .unwrap(),
+            "retiring before the first event must fence a late in-flight event"
+        );
+        let pre_retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"never-reported-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(pre_retired);
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await
