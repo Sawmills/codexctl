@@ -37,6 +37,7 @@ const IMPORT_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(120
 const IMPORT_LEASE_RENEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 const IMPORT_LEASE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const IMPORT_LEASE_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+const LOGIN_HOLDER_RENEWAL_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct User {
@@ -278,6 +279,14 @@ fn instance_holder_id() -> String {
         .unwrap_or_else(|_| "unknown-host".into());
     let boot_nonce = vault::digest(&enrollment::random_bytes());
     vault::digest(format!("{host}:{}:{boot_nonce}", std::process::id()).as_bytes())
+}
+
+fn holder_renewal_lost(renewed: &Result<bool>, since_last_success: std::time::Duration) -> bool {
+    match renewed {
+        Ok(true) => false,
+        Ok(false) => true,
+        Err(_) => since_last_success >= LOGIN_HOLDER_RENEWAL_RETRY_WINDOW,
+    }
 }
 
 pub(super) fn account_summary(owner: &Owner) -> Account {
@@ -3797,12 +3806,13 @@ pub async fn serve(
         let holder_store = shared.clone();
         let holder_broker = broker.clone();
         Some(tokio::spawn(async move {
+            let mut last_renewal = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = &mut holder_stop_rx => break,
                     _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
                         let renewed = holder_store.login_renew_holder(&holder_broker.holder_id).await;
-                        if !matches!(renewed, Ok(true)) {
+                        if holder_renewal_lost(&renewed, last_renewal.elapsed()) {
                             holder_broker.login_holder_live.store(false, Ordering::Release);
                             let error = match renewed {
                                 Err(error) => format!("{error:#}"),
@@ -3811,6 +3821,13 @@ pub async fn serve(
                             eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_lost","error":error}));
                             holder_broker.record_failure("relogin_failed", "login_holder", StatusCode::SERVICE_UNAVAILABLE);
                             break;
+                        }
+                        match renewed {
+                            Ok(true) => last_renewal = std::time::Instant::now(),
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("{}", json!({"operation":"login_holder","stage":"heartbeat","reason":"lease_renewal_retry","error":format!("{error:#}")}));
+                            }
                         }
                     }
                 }
@@ -3985,6 +4002,28 @@ pub(super) fn api_routes() -> Router<Broker> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transient_holder_renewal_error_keeps_admission_live_within_lease_window() {
+        let error = Err(anyhow::Error::msg("database unavailable"));
+
+        assert!(!super::holder_renewal_lost(
+            &error,
+            std::time::Duration::from_secs(19),
+        ));
+        assert!(super::holder_renewal_lost(
+            &error,
+            std::time::Duration::from_secs(20),
+        ));
+        assert!(super::holder_renewal_lost(
+            &Ok(false),
+            std::time::Duration::ZERO,
+        ));
+        assert!(!super::holder_renewal_lost(
+            &Ok(true),
+            std::time::Duration::ZERO,
+        ));
+    }
+
     #[test]
     fn holder_id_changes_for_each_boot() {
         assert_ne!(super::instance_holder_id(), super::instance_holder_id());
