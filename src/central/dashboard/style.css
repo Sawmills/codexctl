@@ -1280,9 +1280,15 @@ progress.meter.warn::-moz-progress-bar {
 .section:not(:has(tbody tr)):not(:has(details)) {
   display: none;
 }
-table:has(> tbody:not(:has(tr))),
-table:has(> tbody:not(:has(tr))) + .machines-note {
+table:has(> tbody:empty),
+table:has(> tbody:empty) + .machines-note {
   display: none;
+}
+#overview[data-has-accounts="false"] .attention {
+  display: none;
+}
+#overview[data-has-accounts="false"] .lead {
+  grid-template-columns: minmax(0, 640px);
 }
 [data-load-error] h1 {
   margin-bottom: var(--s5);
