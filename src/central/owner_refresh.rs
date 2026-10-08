@@ -41,7 +41,8 @@ impl ReasonSlot {
 }
 
 /// Reduces a Codex refresh-failure log line to a bounded reason. Returns
-/// `None` for any other line.
+/// `None` for any other line, and for a refresh failure without a provider
+/// status.
 pub(super) fn classify(line: &str) -> Option<&'static str> {
     if !line.contains(REFRESH_FAILED) {
         return None;
@@ -59,6 +60,9 @@ pub(super) fn classify(line: &str) -> Option<&'static str> {
         .get_or_init(|| Regex::new(r#"status"?[=:]\s*"?(\d{3})\b"#).expect("valid regex"))
         .captures(line)
         .and_then(|captures| captures[1].parse::<u16>().ok());
+    // A provider rejection always carries the token endpoint's status. A
+    // line without one is local (transport, parsing) and proves nothing.
+    status?;
     Some(match code.as_deref() {
         Some("refresh_token_expired") => "refresh_token_expired",
         Some("refresh_token_reused") => "refresh_token_reused",
@@ -246,6 +250,11 @@ mod tests {
             Some("other")
         );
         assert_eq!(classify("ERROR codex_core: stream disconnected"), None);
+        assert_eq!(
+            classify("ERROR codex_login: Failed to refresh token: connection reset"),
+            None,
+            "no provider status, no provider evidence"
+        );
     }
 
     #[test]
