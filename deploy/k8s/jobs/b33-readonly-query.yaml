@@ -2,7 +2,8 @@
 # (docs/superpowers/plans/b33-attempt-3-cutover.md, "Read-Only Queries").
 # No kustomization includes this file, so nothing syncs it. The operator runs
 #   kubectl -n codexctl create -f deploy/k8s/jobs/b33-readonly-query.yaml
-# and reads the result with kubectl logs. Every statement runs in a read-only
+# and reads the result with kubectl logs. It reads no login journal: the
+# operator has no per-user authority over those rows. Every statement runs in a read-only
 # transaction, and the job label selects the codexctl-migration egress policy.
 # Before migrate, the emptiness check returns no rows. After migrate, only the
 # bookkeeping tables central_schema_migrations and
@@ -55,15 +56,8 @@ spec:
               \if :migrated
               \echo '== lease fence (rollback step 3): must be 0'
               SELECT count(*) AS unreleased_leases FROM account_refresh_leases WHERE NOT released;
-              \echo '== login journals (rollback step 3 and HA-only credentials): counts only, any row needs action'
-              SELECT kind, phase, polling_clear, candidate_workspace IS NOT NULL AS holds_candidate,
-                     count(*) AS operations
-              FROM central_login_operations
-              WHERE phase NOT IN ('failed', 'canceled') OR candidate_workspace IS NOT NULL
-              GROUP BY 1, 2, 3, 4
-              ORDER BY 1, 2, 3, 4;
               \else
-              \echo '== not migrated: lease and login checks skipped'
+              \echo '== not migrated: lease check skipped'
               \endif
               SQL
           env:

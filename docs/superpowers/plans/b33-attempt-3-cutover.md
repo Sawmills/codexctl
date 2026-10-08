@@ -63,10 +63,10 @@ PR H must not remove `PrometheusRule/codexctl` or `ScrapeConfig/codexctl`: the s
 - **After PR H:** fence the HA writers before the file writer returns, in this order:
   1. Revert PR I if merged. `Service/codexctl` has no endpoints, so token traffic stops.
   2. Revert PR H. Wait until no `codexctl-ha` pod exists (`kubectl -n codexctl get pods` shows none; the pods have a 60-second grace period).
-  3. Run the read-only [lease and login checks](#read-only-queries) with `kubectl -n codexctl create -f deploy/k8s/jobs/b33-readonly-query.yaml`. Every `account_refresh_leases` row must be released, including login leases (holder `<login holder>:<operation id>`). An unreleased row, even an expired one, means the owner's settlement is unknown: stop, keep PR W merged, and forward-fix in HA. A login operation that is not terminal may hold a grant that file mode cannot see: settle it in HA first.
+  3. Run the read-only [lease check](#read-only-queries) with `kubectl -n codexctl create -f deploy/k8s/jobs/b33-readonly-query.yaml`. Every `account_refresh_leases` row must be released, including login leases (holder `<login holder>:<operation id>`). An unreleased row, even an expired one, means the owner's settlement is unknown: stop, keep PR W merged, and forward-fix in HA. A login operation may hold a grant that file mode cannot see, and the operator has no per-user authority to read the login journal. So settle open logins in HA first: ask the affected users to finish or cancel them through their own sessions.
   4. Only then revert PR W.
 - **Spent tokens:** if the HA logs show any refresh, the file state holds a spent refresh token for each refreshed account. Each such account needs `codexctl login <alias>` and Amir's device code before it serves in file mode. Prefer a forward fix in HA when the fault allows it.
-- **HA-only credentials:** an account added or renewed through HA (PR2 add-account, PR1 renewal) has its credential only in PostgreSQL, and a `rejected` receipt can hold a captured candidate. The read-only Job reports them as counts only, with no user or account names, because the operator has no per-user authority. Any non-zero count makes a forward fix in HA the preferred path. If file mode must return, each affected user lists and relogs their own accounts through their authorized `codexctl` session (`codexctl list`, `codexctl login <alias>`) before their lanes resume.
+- **HA-only credentials:** after PR H, assume that some account was added or renewed through HA (PR2 add-account, PR1 renewal) or holds a captured candidate, so its credential exists only in PostgreSQL. The operator does not read the login journal across users. A forward fix in HA is the preferred path. If file mode must return, every user compares `codexctl list` with their expected accounts and re-adds or runs `codexctl login <alias>` through their own authorized session before their lanes resume.
 - Never run the StatefulSet and the HA Deployment as refresh writers at the same time. Keep the PVC archive, both Job logs, and the database until HQ closes B33.
 
 ## Read-Only Queries
@@ -86,20 +86,9 @@ ORDER BY table_name;
 
 -- Lease fence (rollback step 3): must return 0.
 SELECT count(*) FROM account_refresh_leases WHERE NOT released;
-
--- Login journals (rollback step 3 and HA-only credentials), counts only.
--- Any row means credentials only PostgreSQL has: a completed add or
--- renewal, or a receipt with a captured candidate.
-SELECT kind, phase, polling_clear, candidate_workspace IS NOT NULL AS holds_candidate,
-       count(*) AS operations
-FROM central_login_operations
-WHERE phase NOT IN ('failed','canceled')
-   OR candidate_workspace IS NOT NULL
-GROUP BY 1, 2, 3, 4
-ORDER BY 1, 2, 3, 4;
 ```
 
-The emptiness query names no table, so it also works before migration 1, when no table exists, and it counts tables added later, such as the loan tables. The lease and login queries run only after migration, when their tables exist.
+The emptiness query names no table, so it also works before migration 1, when no table exists, and it counts tables added later, such as the loan tables. The lease query runs only after migration, when its table exists. No query reads the login journal across users.
 
 ## Done
 
