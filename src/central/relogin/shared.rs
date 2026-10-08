@@ -55,8 +55,9 @@ async fn record_login_failure(broker: &Broker, op: &mut LoginOperation) -> Resul
     if op.failure_reported {
         return Ok(());
     }
+    let holder_id = broker.holder_id();
     if database(broker)?
-        .login_take_failure(op, &broker.holder_id)
+        .login_take_failure(op, &holder_id)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"))?
     {
@@ -86,6 +87,7 @@ async fn recover(
     headers: &HeaderMap,
     op: &mut LoginOperation,
 ) -> Result<(), HttpError> {
+    let holder_id = broker.holder_id();
     if matches!(op.phase, LoginPhase::Rejected | LoginPhase::Unresolved)
         || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear)
     {
@@ -93,11 +95,11 @@ async fn recover(
     }
     // The same database read that returns the receipt observes lease expiry.
     // Live receipts must not queue behind admission or settlement work.
-    if !op.lease_expired && !(op.phase == LoginPhase::Candidate && op.holder == broker.holder_id) {
+    if !op.lease_expired && !(op.phase == LoginPhase::Candidate && op.holder == holder_id) {
         return Ok(());
     }
     if database(broker)?
-        .login_recover_polling(op, &broker.holder_id)
+        .login_recover_polling(op, &holder_id)
         .await
         .map_err(|_| failure(broker))?
     {
@@ -108,7 +110,7 @@ async fn recover(
         record_login_failure(broker, op).await?;
     }
     if database(broker)?
-        .login_recover_unresolved(op, &broker.holder_id)
+        .login_recover_unresolved(op, &holder_id)
         .await
         .map_err(|_| failure(broker))?
     {
@@ -126,7 +128,7 @@ async fn recover(
         && let Ok(permit) = broker.work.clone().try_acquire_owned()
         && let Some(guard) = WorkerGuard::claim(broker, op)?
         && database(broker)?
-            .login_takeover_candidate(op, &broker.holder_id)
+            .login_takeover_candidate(op, &holder_id)
             .await
             .map_err(|_| failure(broker))?
     {
@@ -306,7 +308,7 @@ pub(super) async fn start_kind(
         device: device.id.clone(),
         phase: LoginPhase::Starting,
         sequence: 0,
-        holder: broker.holder_id.clone(),
+        holder: broker.holder_id(),
         epoch: 1,
         payload: LoginPayload {
             label,

@@ -2984,6 +2984,86 @@ async fn postgres_missing_or_unbound_polling_holder_keeps_refresh_fenced() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_holder_renewal_recovers_readiness_after_database_outage() {
+    let f = login_fixture().await;
+    assert_eq!(
+        f.http
+            .get(format!("{}/ready", f.first.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    f.control
+        .batch_execute(&format!(
+            r#"
+            CREATE FUNCTION {0}.fail_holder_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                RAISE EXCEPTION 'synthetic database outage';
+            END $$;
+            CREATE TRIGGER fail_holder_renewal
+                BEFORE UPDATE ON {0}.central_login_holders
+                FOR EACH ROW EXECUTE FUNCTION {0}.fail_holder_renewal();
+            "#,
+            f.schema
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(30), async {
+        loop {
+            let response = f
+                .http
+                .get(format!("{}/ready", f.first.url))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                f.http
+                    .get(format!("{}/health", f.first.url))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
+            if response.status() == 503 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("holder loss must fence readiness after the retry window");
+    f.control
+        .batch_execute(&format!(
+            "DROP TRIGGER fail_holder_renewal ON {}.central_login_holders; DROP FUNCTION {}.fail_holder_renewal()",
+            f.schema, f.schema
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(20), async {
+        loop {
+            if f.http
+                .get(format!("{}/ready", f.first.url))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == 200
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("readiness must recover after the database returns");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_stopped_parent_has_an_independent_polling_watchdog() {
     let f = login_fixture().await;
     let id = "fb".repeat(32);
