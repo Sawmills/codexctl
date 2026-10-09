@@ -4404,18 +4404,32 @@ fn relay_capacity_events_are_rate_limited_per_device() {
         "account_class": "credit",
         "outcome": "advised"
     });
-    let mut limited = 0;
-    for _ in 0..40 {
-        let status = server
-            .http
-            .post(format!("{}/v1/relay/capacity-events", server.url))
-            .bearer_auth(&server.amir)
-            .json(&event)
-            .send()
-            .unwrap()
-            .status();
-        limited += usize::from(status == 429);
-    }
+    let client = server.http.clone();
+    let url = format!("{}/v1/relay/capacity-events", server.url);
+    let token = server.amir.clone();
+    let requests = std::thread::scope(|scope| {
+        (0..40)
+            .map(|_| {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                let event = event.clone();
+                scope.spawn(move || {
+                    client
+                        .post(url)
+                        .bearer_auth(token)
+                        .json(&event)
+                        .send()
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|request| request.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let limited = requests.into_iter().filter(|status| *status == 429).count();
     assert!(limited > 0, "the device bucket must eventually return 429");
     let metrics = server
         .http

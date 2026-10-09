@@ -3253,6 +3253,17 @@ mod tests {
             assert!(first.relay_event_allowed("shared-device").await.unwrap());
         }
         let mut replica = first.clone();
+        if let CentralStore::Postgres(db) = &first {
+            db.client()
+                .await
+                .unwrap()
+                .execute(
+                    "UPDATE central_relay_rate_limits SET tokens=0,updated_at=clock_timestamp() WHERE device_id=$1",
+                    &[&"shared-device"],
+                )
+                .await
+                .unwrap();
+        }
         if let CentralStore::Postgres(db) = &mut replica {
             db.client = Arc::new(tokio::sync::Mutex::new(None));
             db.admission = Arc::new(tokio::sync::Mutex::new(None));
