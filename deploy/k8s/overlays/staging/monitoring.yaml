@@ -22,7 +22,7 @@ spec:
             description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlCredentialOperationFailed
-          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
+          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected|token_evidence_clear_failed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
           for: 0m
           labels:
             severity: warning
@@ -43,9 +43,50 @@ spec:
             summary: Codexctl relay exhausted its capacity retry budget
             description: A relay lane exhausted its retry budget in the last 15 minutes. The advised outcome is intentionally excluded because it is still retrying without operator action.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
+        - alert: CodexctlTokenLeaseWaitTimeouts
+          expr: sum(increase(codexctl_central_lease_waits_total{outcome="timeout"}[15m])) > 3
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl token requests time out waiting for an account lease
+            description: More than three token requests failed with refresh_in_progress after waiting 15 seconds for another replica's lease in 15 minutes. Check lease holders and stuck refresh children.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+        - alert: CodexctlOwnerUnavailableRate
+          expr: sum(increase(codexctl_central_failed_requests_total{reason="owner_unavailable"}[15m])) > 5
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl token requests keep failing with owner_unavailable
+            description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+        # SAW-12651: the first rejected refresh grant per account, before token
+        # requests start failing with owner_unavailable. The `unless offset`
+        # branch fires on a new series, which increase() cannot see.
+        # Routed to warnings-slack (#warning-alerts) by a per-account route in
+        # infra helm-charts/prometheus/staging/values.yaml.
+        - alert: CodexctlOwnerRefreshRejected
+          expr: |
+            (increase(codexctl_central_owner_refresh_failed_total[10m]) > 0)
+            or
+            (codexctl_central_owner_refresh_failed_total unless codexctl_central_owner_refresh_failed_total offset 10m)
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: "Codexctl server account {{ $labels.account }} ({{ $labels.account_key }}) lost its refresh grant ({{ $labels.reason }})"
+            description: The provider rejected the stored refresh grant, so token requests for this account fail until it is renewed with a device code. Check the owner_refresh and owner_child log lines for the provider reason.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
 ---
 # The staging ServiceMonitor schema lacks authentication. ScrapeConfig supports
-# credentials and pod discovery, so every broker replica is scraped directly.
+# credentials and is already selected by the existing Prometheus operator.
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: ScrapeConfig
 metadata:
@@ -64,26 +105,8 @@ spec:
     credentials:
       name: codexctl-secrets
       key: metrics-token
-  kubernetesSDConfigs:
-    - role: pod
-      namespaces:
-        names: [codexctl]
-  relabelings:
-    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
-      action: keep
-      regex: codexctl
-    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
-      action: keep
-      regex: broker
-    - sourceLabels: [__meta_kubernetes_pod_container_port_name]
-      action: keep
-      regex: http
-    - sourceLabels: [__meta_kubernetes_pod_phase]
-      action: keep
-      regex: Running
-    - sourceLabels: [__meta_kubernetes_namespace]
-      targetLabel: namespace
-    - sourceLabels: [__meta_kubernetes_pod_name]
-      targetLabel: pod
-    - targetLabel: service
-      replacement: codexctl
+  staticConfigs:
+    - targets: [codexctl.codexctl.svc.cluster.local:80]
+      labels:
+        namespace: codexctl
+        service: codexctl

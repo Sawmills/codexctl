@@ -3807,6 +3807,125 @@ fn an_unmarked_billing_rejection_is_permanent_without_respawn() {
 }
 
 #[test]
+fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_reused".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
+#[test]
+fn a_rejected_forced_refresh_is_counted_too() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"forced-refresh-invalid-grant",
+    )
+    .unwrap();
+    assert_eq!(
+        server
+            .token(&server.amir, "personal", initial["revision"].as_str())
+            .status(),
+        503
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        // Codex logs the same unknown message for 400 invalid_grant.
+        vec![("personal".to_owned(), "other".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
+#[test]
+fn a_rejected_refresh_on_the_routing_read_is_counted_too() {
+    let server = Server::start();
+    server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    store::atomic_write(&server.root.path().join("mode"), b"routing-read-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_reused".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
+#[test]
+fn a_rejected_refresh_at_owner_start_is_counted() {
+    let server = Server::start();
+    store::atomic_write(&server.root.path().join("mode"), b"startup-refresh-expired").unwrap();
+    let imported = server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    assert_ne!(imported.status(), 200);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_expired".to_owned(), 1)],
+        "{metrics}"
+    );
+}
+
+/// (account, reason, count) per series; each series also carries a
+/// 12-character account_key so two users' equal aliases stay apart.
+fn owner_refresh_failures(metrics: &str) -> Vec<(String, String, u64)> {
+    let pattern = regex::Regex::new(
+        r#"^codexctl_central_owner_refresh_failed_total\{account="([^"]+)",account_key="[0-9a-f]{12}",reason="([a-z_]+)"\} (\d+)$"#,
+    )
+    .unwrap();
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("codexctl_central_owner_refresh_failed_total"))
+        .map(|line| {
+            let c = pattern
+                .captures(line)
+                .unwrap_or_else(|| panic!("bad series: {line}"));
+            (c[1].to_owned(), c[2].to_owned(), c[3].parse().unwrap())
+        })
+        .collect()
+}
+
+#[test]
 fn retryable_owner_cannot_lift_a_relogin_fence() {
     let server = Server::start();
     assert_eq!(

@@ -22,7 +22,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-#[derive(Deserialize, Serialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TokenRequest {
     pub previous_revision: Option<String>,
@@ -139,6 +139,26 @@ pub(super) struct Owner {
 }
 
 impl Owner {
+    /// Logs and counts a failed owner refresh with the provider's bounded
+    /// reason, read before the fence can stop the child.
+    pub(super) async fn refresh_failed(&self) {
+        let reason = match self.rpc.as_ref() {
+            Some(rpc) => rpc.refresh_failure_reason().await,
+            None => None,
+        };
+        let account = self.vault.alias.to_ascii_lowercase();
+        // Only a provider rejection is counted; other read failures already
+        // surface as owner_unavailable.
+        if let Some(reason) = reason {
+            super::owner_refresh::record(&account, &self.vault.user, reason);
+        }
+        let reason = reason.unwrap_or("unclassified");
+        eprintln!(
+            "{}",
+            json!({"operation":"owner_refresh","stage":"provider","reason":reason,"account":account,"account_key":super::managed::account_key(&self.vault.user, &self.vault.alias)})
+        );
+    }
+
     // Shared refresh paths persist this baseline before native work. A later
     // unpublished snapshot must not hide a completed renewal after restart.
     pub(super) fn persist_shared_revision(&mut self, revision: i64) -> Result<()> {
@@ -335,6 +355,8 @@ impl Owner {
             .as_ref()
             .is_err_and(|error| !error.is::<RoutingPolicyError>())
         {
+            // A forced `account/read` is the normal client refresh path.
+            self.refresh_failed().await;
             self.fence(false);
         }
         if force
@@ -398,13 +420,13 @@ impl Owner {
                             && !error.is::<RoutingPolicyError>() =>
                     {
                         self.retry_requires_billing = true;
+                        self.refresh_failed().await;
                         self.fence(true);
-                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
                         return Err(TokenFailure::Retryable(error));
                     }
                     Err(error) => {
+                        self.refresh_failed().await;
                         self.fence(false);
-                        eprintln!("central owner refresh failed reason=owner_refresh_failed");
                         return Err(error.into());
                     }
                 };
@@ -423,6 +445,13 @@ impl Owner {
                 .context("missing owner")?
                 .call("account/read", json!({"refreshToken":false}))
                 .await;
+            // This routing read can refresh too, so it reports rejections.
+            if result
+                .as_ref()
+                .is_err_and(|error| !error.is::<RoutingPolicyError>())
+            {
+                self.refresh_failed().await;
+            }
             let snapshot = self.snapshot();
             if result
                 .as_ref()
@@ -677,12 +706,13 @@ async fn tokens(
 async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     broker.authorize(&headers)?;
     let counters = broker.failures.lock().expect("failure counter lock");
-    let output: String = counters
+    let mut output: String = counters
         .iter()
         .map(|(reason, count)| {
             format!("codexctl_central_failed_requests_total{{reason=\"{reason}\"}} {count}\n")
         })
         .collect();
+    output.push_str(&super::owner_refresh::metrics());
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
