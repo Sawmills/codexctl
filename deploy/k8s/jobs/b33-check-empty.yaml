@@ -1,21 +1,18 @@
-# B33 attempt 3: the read-only database checks from the cutover runbook
-# (docs/superpowers/plans/b33-attempt-3-cutover.md, "Read-Only Queries").
+# B33 attempt 3: database emptiness before migrate (runbook prerequisite 3).
 # No kustomization includes this file, so nothing syncs it. The operator runs
-#   kubectl -n codexctl create -f deploy/k8s/jobs/b33-readonly-query.yaml
-# and reads the result with kubectl logs. It reads no login journal: the
-# operator has no per-user authority over those rows. Every statement runs in a read-only
-# transaction, and the job label selects the codexctl-migration egress policy.
-# Before migrate, the emptiness check returns no rows. After migrate, only the
-# bookkeeping tables central_schema_migrations and
-# central_identity_migration_progress hold rows.
+#   kubectl -n codexctl create -f deploy/k8s/jobs/b33-check-empty.yaml
+# at go/no-go, before the migrate Job, and reads kubectl logs. Run it only
+# against the target before migration; a rollback uses b33-check-leases.yaml.
+# Every statement runs in a read-only transaction, and the job label selects
+# the codexctl-migration egress policy.
 apiVersion: batch/v1
 kind: Job
 metadata:
   namespace: codexctl
-  generateName: codexctl-readonly-query-
+  generateName: codexctl-check-empty-
   labels:
     app.kubernetes.io/name: codexctl-migration
-    app.kubernetes.io/component: readonly-query
+    app.kubernetes.io/component: check-empty
   annotations:
     checkov.io/skip1: CKV2_K8S_6=NetworkPolicy codexctl-migration selects this pod.
     checkov.io/skip2: CKV_K8S_35=Database credentials come from the codexctl-postgres ExternalSecret by design.
@@ -27,7 +24,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: codexctl-migration
-        app.kubernetes.io/component: readonly-query
+        app.kubernetes.io/component: check-empty
     spec:
       restartPolicy: Never
       automountServiceAccountToken: false
@@ -44,7 +41,7 @@ spec:
           args:
             - |
               psql -X -v ON_ERROR_STOP=1 <<'SQL'
-              \echo '== emptiness (prerequisite 3): no row, or 0 in every row, means empty'
+              \echo '== emptiness (prerequisite 3, before migrate only): no row, or 0 in every row, means empty'
               SELECT table_name,
                      (xpath('/row/c/text()',
                             query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
@@ -52,13 +49,6 @@ spec:
               FROM information_schema.tables
               WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
               ORDER BY table_name;
-              SELECT to_regclass('account_refresh_leases') IS NOT NULL AS migrated \gset
-              \if :migrated
-              \echo '== lease fence (rollback step 3): must be 0'
-              SELECT count(*) AS unreleased_leases FROM account_refresh_leases WHERE NOT released;
-              \else
-              \echo '== not migrated: lease check skipped'
-              \endif
               SQL
           env:
             - name: PGHOST
