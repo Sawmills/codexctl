@@ -26,11 +26,13 @@ const RATE_429: &str = r#"{"error":{"type":"rate_limit_exceeded","code":"rate_li
 const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n";
 const OVERLOADED: &str = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"r1\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n";
 const DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n";
+const REASONING_DELTA: &str = "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"synthetic reasoning\"}\n\n";
 const COMPLETED: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n";
 
 enum Scripted {
     Status(u16, Vec<(&'static str, String)>, String),
     Sse(Vec<String>),
+    Chunked(u16, Vec<String>),
     /// Sends the first frame, then waits for the test before each later one and
     /// reports when the relay stopped reading.
     Gated(Vec<String>, mpsc::Receiver<()>, oneshot::Sender<()>),
@@ -74,6 +76,21 @@ async fn upstream_responses(
             response.body(Body::from(body)).unwrap()
         }
         Scripted::Sse(frames) => sse(Body::from(frames.concat())),
+        Scripted::Chunked(status, frames) => {
+            let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
+            tokio::spawn(async move {
+                for frame in frames {
+                    if tx.send(Ok(Bytes::from(frame))).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            Response::builder()
+                .status(status)
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(tokio_stream(rx)))
+                .unwrap()
+        }
         Scripted::Gated(frames, mut gate, closed) => {
             let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(1);
             tokio::spawn(async move {
@@ -473,6 +490,17 @@ fn metric(metrics: &str, needle: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn metric_stream(metrics: &str, needle: &str) -> u64 {
+    metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("codexctl_relay_stream_failures_total") && line.contains(needle)
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(0)
+}
+
 #[tokio::test]
 async fn rate_limited_429_gets_retry_advice_and_keeps_its_body() {
     let h = harness(vec![Scripted::Status(429, vec![], RATE_429.into())]).await;
@@ -534,6 +562,159 @@ async fn other_statuses_pass_through_unchanged() {
 }
 
 #[tokio::test]
+async fn responses_http_error_is_recorded_without_changing_body() {
+    let body =
+        r#"{"error":{"code":"server_error","type":"upstream","message":"temporary failure"}}"#;
+    let h = harness(vec![Scripted::Status(
+        500,
+        vec![
+            ("cf-ray", "ray-test".into()),
+            ("x-oai-request-id", "oai-test".into()),
+        ],
+        body.into(),
+    )])
+    .await;
+    let response = h.post("http-error").await;
+    assert_eq!(response.status(), 500);
+    assert_eq!(response.text().await.unwrap(), body);
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert_eq!(failure["kind"], "http_error");
+    assert_eq!(failure["http_status"], 500);
+    assert_eq!(failure["cf_ray"], "ray-test");
+    assert_eq!(failure["x_oai_request_id"], "oai-test");
+    assert_eq!(failure["failure"]["error"]["code"], "server_error");
+    assert_eq!(metric_stream(&h.metrics().await, "kind=\"http_error\""), 1);
+}
+
+#[tokio::test]
+async fn split_responses_http_error_keeps_bounded_details() {
+    let chunks = vec![
+        r#"{"error":{"code":"server_"#.to_owned(),
+        r#"error","type":"upstream","message":"temporary failure"}}"#.to_owned(),
+    ];
+    let expected = chunks.concat();
+    let h = harness(vec![Scripted::Chunked(500, chunks)]).await;
+    let response = h.post("split-http-error").await;
+    assert_eq!(response.status(), 500);
+    assert_eq!(response.text().await.unwrap(), expected);
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert_eq!(failure["failure"]["error"]["code"], "server_error");
+}
+
+#[tokio::test]
+async fn stream_failure_redacts_messages_and_never_logs_output_text() {
+    let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature-value";
+    let token = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+    let bearer = "Bearer synthetic-secret-token";
+    let short_key = "0123456789abcdef0123456789abcdef";
+    let basic = "Basic dXNlcjpwYXNz";
+    let cookie = "Cookie: sid=abc123";
+    let failure = format!(
+        "event: response.failed\ndata: {}\n\n",
+        json!({
+            "type": "response.failed",
+            "response": {"error": {"code": "model_unavailable", "message": format!("\u{1b}[2J\u{1b}[K\u{1b}]0;evil\u{7}jwt {jwt} token {token} {bearer} {basic} {cookie} key {short_key}")}}
+        })
+    );
+    let output = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"NEVER_LOG_THIS_OUTPUT\"}\n\n";
+    let h = harness(vec![Scripted::Sse(vec![output.into(), failure])]).await;
+    h.post("redaction").await.text().await.unwrap();
+    let logs = h.logs.lock().unwrap().join("\n");
+    assert!(!logs.contains('\u{1b}'), "ANSI escape leaked: {logs}");
+    assert!(!logs.contains("evil"), "OSC payload leaked: {logs}");
+    assert!(!logs.contains(jwt), "JWT leaked: {logs}");
+    assert!(!logs.contains(token), "token leaked: {logs}");
+    assert!(!logs.contains(bearer), "bearer credential leaked: {logs}");
+    assert!(!logs.contains(basic), "basic credential leaked: {logs}");
+    assert!(!logs.contains(cookie), "cookie credential leaked: {logs}");
+    assert!(!logs.contains(short_key), "short key leaked: {logs}");
+    assert!(
+        !logs.contains("NEVER_LOG_THIS_OUTPUT"),
+        "output leaked: {logs}"
+    );
+    assert!(
+        logs.contains("[redacted]"),
+        "redaction marker missing: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn stream_failure_type_trace_is_bounded() {
+    let mut frames = vec![CREATED.to_string(), DELTA.to_string()];
+    for index in 0..40 {
+        frames.push(format!(
+            "event: response.custom_{index}\ndata: {{\"type\":\"response.custom_{index}\"}}\n\n"
+        ));
+    }
+    frames.push(OVERLOADED.into());
+    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    assert_eq!(
+        h.post("bounded").await.text().await.unwrap(),
+        frames.concat()
+    );
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert!(failure["types"].as_array().unwrap().len() <= 32);
+    assert_eq!(failure["truncated"], true);
+}
+
+#[tokio::test]
+async fn stream_failure_logs_are_rate_limited() {
+    let script = (0..40)
+        .map(|_| Scripted::Sse(vec![OVERLOADED.into()]))
+        .collect();
+    let h = harness_with(script, |config| {
+        config.with_budgets(Duration::ZERO, Duration::ZERO)
+    })
+    .await;
+    for index in 0..40 {
+        assert_eq!(h.post(&format!("limited-{index}")).await.status(), 200);
+    }
+    let logs = h.logs.lock().unwrap();
+    let stream_lines: Vec<Value> = logs
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["outcome"] == "stream_failure")
+        .collect();
+    assert_eq!(stream_lines.len(), 30);
+    assert!(stream_lines.iter().all(|line| line["suppressed"].is_null()));
+}
+
+#[tokio::test]
+async fn multiple_failure_frames_emit_one_stream_failure_observation() {
+    let second = OVERLOADED.replace("server_is_overloaded", "model_unavailable");
+    let h = harness(vec![Scripted::Sse(vec![OVERLOADED.into(), second])]).await;
+    h.post("one-observation").await.text().await.unwrap();
+    let logs = h.logs.lock().unwrap();
+    let count = logs
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["outcome"] == "stream_failure")
+        .count();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn overloaded_before_output_gets_retry_advice_in_the_event() {
     let h = harness(vec![Scripted::Sse(vec![CREATED.into(), OVERLOADED.into()])]).await;
     let body = h.post("t1").await.text().await.unwrap();
@@ -553,13 +734,338 @@ async fn overloaded_before_output_gets_retry_advice_in_the_event() {
         )
     );
     assert!(body.ends_with("\n\n"), "frame stays a complete event");
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("pre-output failure is recorded");
+    assert_eq!(failure["kind"], "overloaded");
+    assert_eq!(failure["stage"], "pre_output");
+    assert_eq!(failure["advised"], true);
+}
+
+#[tokio::test]
+async fn multiline_sse_failure_is_classified_and_advised() {
+    let multiline = "event: response.failed\ndata: {\ndata: \"type\":\"response.failed\",\ndata: \"response\":{\"error\":{\"code\":\"server_is_overloaded\"}}}\n\n";
+    let h = harness(vec![Scripted::Sse(vec![multiline.into()])]).await;
+    let body = h.post("multiline").await.text().await.unwrap();
+    let event = failed_event(&body);
+    assert!(event["response"]["error"]["headers"]["retry-after"].is_string());
+    assert!(
+        h.logs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("\"outcome\":\"stream_failure\""))
+    );
+}
+
+#[tokio::test]
+async fn large_sse_failure_payload_still_gets_advice() {
+    let padding = "x".repeat(400);
+    let multiline = format!(
+        "event: response.failed\ndata: {{\"padding\":\"{padding}\",\ndata: \"type\":\"response.failed\",\ndata: \"response\":{{\"error\":{{\"code\":\"server_is_overloaded\"}}}}}}\n\n"
+    );
+    let h = harness(vec![Scripted::Sse(vec![multiline])]).await;
+    let body = h.post("large-failure").await.text().await.unwrap();
+    assert!(!body.contains("server_is_overloaded"));
+    assert!(body.contains("retry-after"));
+}
+
+#[tokio::test]
+async fn oversized_post_output_failure_is_recorded_before_partial_flush() {
+    let prefix = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"";
+    let suffix = "\"}}}\n\n";
+    let padding = "x".repeat(70 * 1024);
+    let frames = vec![
+        CREATED.to_string(),
+        REASONING_DELTA.to_string(),
+        prefix.to_owned(),
+        padding,
+        suffix.to_owned(),
+    ];
+    let expected = frames.concat();
+    let h = harness(vec![Scripted::Chunked(200, frames)]).await;
+    assert_eq!(
+        h.post("oversized-after-output").await.text().await.unwrap(),
+        expected
+    );
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("oversized failure is recorded");
+    assert_eq!(failure["kind"], "overloaded");
+    assert_eq!(failure["stage"], "after_output");
+}
+
+#[tokio::test]
+async fn oversized_post_output_completed_frame_is_not_truncated() {
+    let prefix = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"padding\":\"";
+    let suffix = "\"}}}\n\n";
+    let padding = "x".repeat(70 * 1024);
+    let frames = vec![
+        CREATED.to_string(),
+        REASONING_DELTA.to_string(),
+        prefix.to_owned(),
+        padding,
+        suffix.to_owned(),
+    ];
+    let expected = frames.concat();
+    let h = harness(vec![Scripted::Chunked(200, frames)]).await;
+    assert_eq!(
+        h.post("oversized-completed").await.text().await.unwrap(),
+        expected
+    );
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
+}
+
+#[tokio::test]
+async fn oversized_post_output_failure_with_late_type_is_not_truncated() {
+    let prefix = "event: response.failed\ndata: {\"response\":{\"error\":{\"code\":\"server_is_overloaded\"}},\"padding\":\"";
+    let suffix = "\",\"type\":\"response.failed\"}\n\n";
+    let padding = "x".repeat(70 * 1024);
+    let frames = vec![
+        CREATED.to_string(),
+        REASONING_DELTA.to_string(),
+        prefix.to_owned(),
+        padding,
+        suffix.to_owned(),
+    ];
+    let h = harness(vec![Scripted::Chunked(200, frames)]).await;
+    h.post("oversized-late-type").await.text().await.unwrap();
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
+}
+
+#[tokio::test]
+async fn oversized_failure_uses_top_level_type_after_nested_error_type() {
+    let prefix = r#"event: response.failed
+data: {"response":{"error":{"type":"server_error","code":"server_is_overloaded"}},"padding":""#;
+    let suffix = r#"","type":"response.failed"}
+
+"#;
+    let padding = "x".repeat(70 * 1024);
+    let mut chunks = vec![prefix.to_owned()];
+    chunks.extend(
+        padding
+            .as_bytes()
+            .chunks(200)
+            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap()),
+    );
+    chunks.push(suffix.to_owned());
+    let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
+    h.post("nested-type").await.text().await.unwrap();
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("failure is recorded");
+    assert_eq!(failure["kind"], "overloaded");
+}
+
+#[tokio::test]
+async fn oversized_complete_failure_is_recorded_without_parsing_the_body() {
+    let padding = "x".repeat(70 * 1024);
+    let event = json!({
+        "type": "response.failed",
+        "response": {"error": {"code": "server_is_overloaded", "message": padding}}
+    });
+    let failure = format!("event: response.failed\ndata: {event}\n\n");
+    let h = harness(vec![Scripted::Sse(vec![
+        CREATED.into(),
+        REASONING_DELTA.into(),
+        failure.clone(),
+    ])])
+    .await;
+    assert_eq!(
+        h.post("oversized-complete").await.text().await.unwrap(),
+        format!("{CREATED}{REASONING_DELTA}{failure}")
+    );
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("oversized failure is recorded");
+    assert_eq!(failure["kind"], "overloaded");
+    assert_eq!(failure["stage"], "after_output");
+    assert_eq!(failure["failure"]["type"], "response.failed");
+    assert!(
+        failure.to_string().len() < 10_000,
+        "failure log must stay bounded"
+    );
+}
+
+#[tokio::test]
+async fn oversized_pre_output_overload_gets_retry_advice() {
+    let padding = "x".repeat(70 * 1024);
+    let event = json!({
+        "type": "response.failed",
+        "response": {"error": {"code": "server_is_overloaded", "message": padding}}
+    });
+    let failure = format!("event: response.failed\ndata: {event}\n\n");
+    let h = harness(vec![Scripted::Sse(vec![failure])]).await;
+    let body = h
+        .post("oversized-before-output")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("server_is_overloaded"));
+    assert!(body.contains("retry-after"));
+}
+
+#[tokio::test]
+async fn late_terminal_type_does_not_create_a_false_truncation() {
+    let padding = "x".repeat(400);
+    let completed = format!(
+        "event: response.completed\ndata: {{\"response\":{{\"padding\":\"{padding}\"}},\"type\":\"response.completed\"}}\n\n"
+    );
+    let h = harness(vec![Scripted::Sse(vec![
+        CREATED.into(),
+        REASONING_DELTA.into(),
+        completed.clone(),
+    ])])
+    .await;
+    assert_eq!(
+        h.post("late-completed").await.text().await.unwrap(),
+        format!("{CREATED}{REASONING_DELTA}{completed}")
+    );
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
+}
+
+#[tokio::test]
+async fn data_only_late_completed_type_does_not_create_a_false_truncation() {
+    let padding = "x".repeat(400);
+    let completed = format!(
+        "data: {{\"response\":{{\"padding\":\"{padding}\"}},\"type\":\"response.completed\"}}\n\n"
+    );
+    let h = harness(vec![Scripted::Sse(vec![
+        CREATED.into(),
+        REASONING_DELTA.into(),
+        completed.clone(),
+    ])])
+    .await;
+    assert_eq!(
+        h.post("data-only-late-completed")
+            .await
+            .text()
+            .await
+            .unwrap(),
+        format!("{CREATED}{REASONING_DELTA}{completed}")
+    );
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
+}
+
+#[tokio::test]
+async fn oversized_data_only_late_completed_type_does_not_create_a_false_truncation() {
+    let padding = "{".repeat(70 * 1024);
+    let completed = format!(
+        "data: {{\"response\":{{\"padding\":\"{padding}\"}},\"type\":\"response.completed\"}}\n\n"
+    );
+    let mut chunks = vec![CREATED.into(), REASONING_DELTA.into()];
+    chunks.extend(
+        completed
+            .as_bytes()
+            .chunks(200)
+            .map(|chunk| String::from_utf8(chunk.to_vec()).unwrap()),
+    );
+    let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
+    assert_eq!(
+        h.post("oversized-data-only-late-completed")
+            .await
+            .text()
+            .await
+            .unwrap(),
+        format!("{CREATED}{REASONING_DELTA}{completed}")
+    );
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
 }
 
 #[tokio::test]
 async fn overloaded_after_output_passes_through_byte_for_byte() {
-    let frames = vec![CREATED.to_string(), DELTA.into(), OVERLOADED.into()];
+    let frames = vec![
+        CREATED.to_string(),
+        REASONING_DELTA.into(),
+        REASONING_DELTA.into(),
+        REASONING_DELTA.into(),
+        OVERLOADED.into(),
+    ];
     let h = harness(vec![Scripted::Sse(frames.clone())]).await;
     assert_eq!(h.post("t1").await.text().await.unwrap(), frames.concat());
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("post-output failure is recorded");
+    assert_eq!(failure["kind"], "overloaded");
+    assert_eq!(failure["stage"], "after_output");
+    assert_eq!(failure["advised"], false);
+    assert_eq!(failure["types"][0], json!(["response.created", 1]));
+    assert_eq!(
+        failure["types"][1],
+        json!(["response.reasoning_summary_text.delta", 3])
+    );
+    assert_eq!(failure["types"][2], json!(["response.failed", 1]));
+    assert!(failure["ms_to_first_output"].is_number());
+}
+
+#[tokio::test]
+async fn audio_output_before_failure_is_not_rewritten() {
+    let audio = r#"event: response.audio.delta
+data: {"type":"response.audio.delta","delta":"abc"}
+
+"#;
+    let frames = vec![CREATED.to_string(), audio.to_owned(), OVERLOADED.to_owned()];
+    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    assert_eq!(
+        h.post("audio-output").await.text().await.unwrap(),
+        frames.concat()
+    );
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .expect("post-output failure is recorded");
+    assert_eq!(failure["stage"], "after_output");
+    assert_eq!(failure["advised"], false);
 }
 
 #[tokio::test]
@@ -568,6 +1074,74 @@ async fn streamed_rate_limit_events_are_left_to_codex() {
     let frames = vec![CREATED.to_string(), rate];
     let h = harness(vec![Scripted::Sse(frames.clone())]).await;
     assert_eq!(h.post("t1").await.text().await.unwrap(), frames.concat());
+}
+
+#[tokio::test]
+async fn unknown_failed_code_is_recorded_without_rewriting() {
+    let unknown = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":500,\"error\":{\"code\":\"model_unavailable\",\"type\":\"server_error\",\"message\":\"try later\"}}}\n\n";
+    let h = harness(vec![Scripted::Sse(vec![CREATED.into(), unknown.into()])]).await;
+    let body = h.post("unknown-code").await.text().await.unwrap();
+    assert!(body.contains(unknown));
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert_eq!(failure["kind"], "other_code");
+    assert_eq!(failure["advised"], false);
+    assert_eq!(
+        failure["failure"]["response"]["error"]["code"],
+        "model_unavailable"
+    );
+}
+
+#[tokio::test]
+async fn error_and_incomplete_events_are_recorded() {
+    let error = "event: error\ndata: {\"type\":\"error\",\"code\":\"bad_gateway\",\"message\":\"provider failed\",\"param\":null}\n\n";
+    let incomplete = "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n";
+    for (frame, expected_kind) in [(error, "error_event"), (incomplete, "incomplete")] {
+        let h = harness(vec![Scripted::Sse(vec![frame.into()])]).await;
+        assert_eq!(h.post("failure-event").await.text().await.unwrap(), frame);
+        let failure = h
+            .logs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["outcome"] == "stream_failure")
+            .unwrap();
+        assert_eq!(failure["kind"], expected_kind);
+        assert_eq!(failure["advised"], false);
+        if expected_kind == "error_event" {
+            assert_eq!(failure["failure"]["error"]["code"], "bad_gateway");
+            assert_eq!(failure["failure"]["error"]["message"], "provider failed");
+            assert!(failure["failure"]["error"]["param"].is_null());
+        }
+    }
+}
+
+#[tokio::test]
+async fn stream_without_terminal_event_is_recorded_as_truncated() {
+    let frames = vec![CREATED.to_string(), REASONING_DELTA.into()];
+    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    assert_eq!(
+        h.post("truncated").await.text().await.unwrap(),
+        frames.concat()
+    );
+    let failure = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|line| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert_eq!(failure["kind"], "truncated");
+    assert_eq!(failure["stage"], "after_output");
+    assert!(failure["failure"].is_null());
 }
 
 #[tokio::test]
@@ -689,6 +1263,54 @@ async fn responses_stream_and_client_disconnect_cancels_upstream() {
         .await
         .expect("upstream stream closes after the client leaves")
         .unwrap();
+}
+
+#[tokio::test]
+async fn post_output_partial_frames_forward_without_waiting_for_the_delimiter() {
+    let (gate, gate_rx) = mpsc::channel(1);
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let partial = "event: response.failed\ndata: {\"type\":\"response.failed\"";
+    let h = harness(vec![Scripted::Gated(
+        vec![CREATED.into(), DELTA.into(), partial.into()],
+        gate_rx,
+        closed_tx,
+    )])
+    .await;
+    let response = h.post("partial-forward").await;
+    let mut stream = response.bytes_stream();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap().as_ref(),
+        CREATED.as_bytes()
+    );
+    gate.send(()).await.unwrap();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap().as_ref(),
+        DELTA.as_bytes()
+    );
+    gate.send(()).await.unwrap();
+    let forwarded = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("partial post-output frame is forwarded promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(forwarded.as_ref(), partial.as_bytes());
+    drop(stream);
+    let _ = gate.send(()).await;
+    tokio::time::timeout(Duration::from_secs(5), closed_rx)
+        .await
+        .expect("upstream stream closes after the client leaves")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn post_output_partial_frame_is_not_replayed_at_eof() {
+    let partial = "event: response.failed\ndata: {\"type\":\"response.failed\"";
+    let frames = vec![CREATED.to_string(), DELTA.to_string(), partial.to_owned()];
+    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    assert_eq!(
+        h.post("partial-eof").await.text().await.unwrap(),
+        frames.concat()
+    );
 }
 
 #[tokio::test]
