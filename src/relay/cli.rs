@@ -47,10 +47,12 @@ pub fn run(action: RelayAction) -> Result<()> {
             rate_budget_secs,
             overloaded_budget_secs,
         } => {
-            let config = RelayConfig::new(&upstream)?.with_budgets(
-                Duration::from_secs(rate_budget_secs),
-                Duration::from_secs(overloaded_budget_secs),
-            );
+            let config = RelayConfig::new(&upstream)?
+                .with_budgets(
+                    Duration::from_secs(rate_budget_secs),
+                    Duration::from_secs(overloaded_budget_secs),
+                )
+                .with_active_central_reporter();
             tokio::runtime::Runtime::new()?.block_on(async move {
                 // A bind failure is fatal so the service manager reports it.
                 let listener = tokio::net::TcpListener::bind(listen)

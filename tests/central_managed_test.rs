@@ -4208,6 +4208,243 @@ fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_reject
     );
 }
 
+#[test]
+fn relay_capacity_events_require_valid_labels_and_are_exported() {
+    let server = Server::start();
+    let valid = json!({
+        "kind": "overloaded",
+        "model": "gpt-6.1-sol",
+        "account_class": "included",
+        "outcome": "exhausted"
+    });
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&valid)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let unknown_model = json!({
+        "kind": "overloaded",
+        "model": "gpt-future-private",
+        "account_class": "included",
+        "outcome": "exhausted"
+    });
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&unknown_model)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let invalid = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({
+            "kind": "other",
+            "model": "gpt-6.1-sol",
+            "account_class": "included",
+            "outcome": "exhausted"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({
+                "kind": "overloaded",
+                "model": "gpt-6.1-sol",
+                "account_class": "included",
+                "outcome": "exhausted",
+                "request_id": "must-not-be-accepted"
+            }))
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    assert_eq!(
+        server
+            .http
+            .post(format!("{}/v1/relay/capacity-events", server.url))
+            .json(&valid)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains(
+            "codexctl_central_relay_capacity_events_total{account_class=\"included\",kind=\"overloaded\",model=\"gpt-6.1-sol\",outcome=\"exhausted\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "codexctl_central_relay_capacity_events_total{account_class=\"included\",kind=\"overloaded\",model=\"other\",outcome=\"exhausted\"} 1"
+        ),
+        "{metrics}"
+    );
+    assert!(
+        metrics
+            .contains("codexctl_central_relay_events_rejected_total{reason=\"invalid_label\"} 2"),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn relay_capacity_event_authorizes_before_reading_a_large_body() {
+    let server = Server::start();
+    let response = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .header("content-type", "application/json")
+        .body(vec![b'x'; 1024 * 1024 + 1])
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[test]
+fn relay_capacity_exhausted_series_exist_before_the_first_event() {
+    let server = Server::start();
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let exhausted: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("codexctl_central_relay_capacity_events_total{")
+                && line.contains("outcome=\"exhausted\"")
+        })
+        .collect();
+    assert_eq!(
+        exhausted.len(),
+        78,
+        "all allowed exhausted series: {metrics}"
+    );
+    assert!(
+        exhausted.iter().all(|line| line.ends_with(" 0")),
+        "{metrics}"
+    );
+}
+
+#[test]
+fn relay_capacity_exhaustion_exports_event_time_for_a_first_scrape() {
+    let server = Server::start();
+    let response = server
+        .http
+        .post(format!("{}/v1/relay/capacity-events", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({
+            "kind": "overloaded",
+            "model": "gpt-6.1-sol",
+            "account_class": "included",
+            "outcome": "exhausted"
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let line = metrics
+        .lines()
+        .find(|line| {
+            line.starts_with("codexctl_central_relay_capacity_event_timestamp_seconds{")
+                && line.contains("kind=\"overloaded\"")
+                && line.contains("model=\"gpt-6.1-sol\"")
+                && line.contains("account_class=\"included\"")
+                && line.contains("outcome=\"exhausted\"")
+        })
+        .expect("accepted exhaustion must export its event timestamp");
+    let timestamp = line
+        .rsplit_once(' ')
+        .and_then(|(_, value)| value.parse::<i64>().ok())
+        .expect("timestamp metric value");
+    assert!(timestamp > 0, "{line}");
+}
+
+#[test]
+fn relay_capacity_events_are_rate_limited_per_device() {
+    let server = Server::start();
+    let event = json!({
+        "kind": "rate_429",
+        "model": "gpt-6.1-sol",
+        "account_class": "credit",
+        "outcome": "advised"
+    });
+    let client = server.http.clone();
+    let url = format!("{}/v1/relay/capacity-events", server.url);
+    let token = server.amir.clone();
+    let requests = std::thread::scope(|scope| {
+        (0..40)
+            .map(|_| {
+                let client = client.clone();
+                let url = url.clone();
+                let token = token.clone();
+                let event = event.clone();
+                scope.spawn(move || {
+                    client
+                        .post(url)
+                        .bearer_auth(token)
+                        .json(&event)
+                        .send()
+                        .unwrap()
+                        .status()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|request| request.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let limited = requests.into_iter().filter(|status| *status == 429).count();
+    assert!(limited > 0, "the device bucket must eventually return 429");
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_relay_events_rejected_total{reason=\"rate_limited\"}"),
+        "{metrics}"
+    );
+}
+
 fn account_directory(server: &Server, user: &str, alias: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     server.root.path().join("state/accounts").join(format!(

@@ -247,6 +247,17 @@ CREATE INDEX IF NOT EXISTS central_devices_authorize_idx
     ON central_devices (tenant, token_hash) WHERE deleted_at IS NULL AND revoked = false;
 CREATE INDEX IF NOT EXISTS central_users_enabled_idx
     ON central_users (id) WHERE deleted_at IS NULL AND enabled = true;
+CREATE TABLE IF NOT EXISTS central_relay_rate_limits (
+    device_id TEXT PRIMARY KEY,
+    tokens DOUBLE PRECISION NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    allowed BOOLEAN NOT NULL DEFAULT true,
+    deleted_at TIMESTAMPTZ
+);
+ALTER TABLE central_relay_rate_limits
+    ADD COLUMN IF NOT EXISTS allowed BOOLEAN NOT NULL DEFAULT true;
+ALTER TABLE central_relay_rate_limits
+    ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 -- Evidence the lease path observed on one credential revision (layout 8).
 CREATE TABLE IF NOT EXISTS central_token_evidence (
     account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id),
@@ -376,6 +387,26 @@ impl CentralStore {
             Self::File(file) => file.path().exists() || file.state.exists(),
             Self::Postgres(db) => bounded_db(db.client()).await.is_ok(),
             Self::Dual { postgres, .. } => bounded_db(postgres.client()).await.is_ok(),
+        }
+    }
+
+    /// Consume one shared relay event token. PostgreSQL keeps this bucket
+    /// durable so every HA replica applies the same per-device limit.
+    pub async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
+        match self {
+            Self::File(_) => Ok(true),
+            Self::Postgres(db) => db.relay_event_allowed(device).await,
+            Self::Dual { postgres, .. } => postgres.relay_event_allowed(device).await,
+        }
+    }
+
+    /// Retain a tombstone for a revoked device's relay limiter state. A
+    /// tombstoned row is never eligible for a future bucket upsert.
+    pub async fn retire_relay_event_limiter(&self, device: &str) -> Result<()> {
+        match self {
+            Self::File(_) => Ok(()),
+            Self::Postgres(db) => db.retire_relay_event_limiter(device).await,
+            Self::Dual { postgres, .. } => postgres.retire_relay_event_limiter(device).await,
         }
     }
 
@@ -1454,6 +1485,34 @@ impl PostgresStore {
             )
             .await?;
         Ok(changed == 1)
+    }
+
+    async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
+        bounded_db(async {
+            let client = self.client().await?;
+            let row = client
+                .query_opt(
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,31,clock_timestamp(),true,NULL) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 THEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))))-1.0 ELSE LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) END,updated_at=clock_timestamp(),allowed=LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 WHERE central_relay_rate_limits.deleted_at IS NULL RETURNING allowed",
+                    &[&device],
+                )
+                .await?;
+            Ok(row.is_some_and(|row| row.get(0)))
+        })
+        .await
+    }
+
+    async fn retire_relay_event_limiter(&self, device: &str) -> Result<()> {
+        bounded_db(async {
+            let client = self.client().await?;
+            client
+                .execute(
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,0,clock_timestamp(),false,clock_timestamp()) ON CONFLICT(device_id) DO UPDATE SET deleted_at=COALESCE(central_relay_rate_limits.deleted_at,clock_timestamp()),updated_at=clock_timestamp()",
+                    &[&device],
+                )
+                .await?;
+            Ok(())
+        })
+        .await
     }
 
     async fn release_lease(&self, lease: &Lease) -> Result<bool> {
@@ -3072,6 +3131,107 @@ mod tests {
 
     #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
+    async fn postgres_relay_bucket_does_not_wait_on_admission_connection() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let store = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = store.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        let CentralStore::Postgres(db) = &store else {
+            unreachable!();
+        };
+        let _admission = db.admission_client().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(250),
+            store.relay_event_allowed("independent-device"),
+        )
+        .await;
+        assert!(result.is_ok(), "relay bucket must use the general client");
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_relay_bucket_retirement_tombstones_and_cannot_revive_device() {
+        if std::env::var("DATABASE_URL").is_err() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let store = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = store.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        assert!(store.relay_event_allowed("retired-device").await.unwrap());
+        store
+            .retire_relay_event_limiter("retired-device")
+            .await
+            .unwrap();
+        let client = match &store {
+            CentralStore::Postgres(db) => db.client().await.unwrap(),
+            _ => unreachable!(),
+        };
+        let retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"retired-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(retired, "device limiter must retain a retirement tombstone");
+        assert!(
+            !store.relay_event_allowed("retired-device").await.unwrap(),
+            "a retired limiter row must not be silently revived"
+        );
+        let still_retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"retired-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(still_retired);
+        store
+            .retire_relay_event_limiter("never-reported-device")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .relay_event_allowed("never-reported-device")
+                .await
+                .unwrap(),
+            "retiring before the first event must fence a late in-flight event"
+        );
+        let pre_retired: bool = client
+            .query_one(
+                "SELECT deleted_at IS NOT NULL FROM central_relay_rate_limits WHERE device_id=$1",
+                &[&"never-reported-device"],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(pre_retired);
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
     async fn postgres_real_store_scenarios() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3089,6 +3249,29 @@ mod tests {
             .unwrap();
         let (first, control, schema) = first.isolated_test_schema().await.unwrap();
         first.migrate().await.unwrap();
+        for _ in 0..32 {
+            assert!(first.relay_event_allowed("shared-device").await.unwrap());
+        }
+        let mut replica = first.clone();
+        if let CentralStore::Postgres(db) = &first {
+            db.client()
+                .await
+                .unwrap()
+                .execute(
+                    "UPDATE central_relay_rate_limits SET tokens=0,updated_at=clock_timestamp() WHERE device_id=$1",
+                    &[&"shared-device"],
+                )
+                .await
+                .unwrap();
+        }
+        if let CentralStore::Postgres(db) = &mut replica {
+            db.client = Arc::new(tokio::sync::Mutex::new(None));
+            db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        }
+        assert!(
+            !replica.relay_event_allowed("shared-device").await.unwrap(),
+            "the per-device bucket must be shared across HA replicas"
+        );
         if let CentralStore::Postgres(db) = &first {
             let client = db.client().await.unwrap();
             let query = "SELECT oid FROM pg_constraint WHERE conrelid='account_live_sessions'::regclass AND conname='account_live_sessions_account_id_fkey'";
