@@ -219,7 +219,6 @@ struct StreamFailureLogState {
     window_start: Instant,
     emitted: u64,
     suppressed: u64,
-    summary_emitted: bool,
 }
 
 struct StreamFailureContext<'a> {
@@ -236,7 +235,6 @@ impl StreamFailureLogState {
             window_start: Instant::now(),
             emitted: 0,
             suppressed: 0,
-            summary_emitted: false,
         }
     }
 }
@@ -296,6 +294,14 @@ pub async fn serve(
         central_events,
         central_dropped,
     };
+    let suppression_relay = relay.clone();
+    let suppression_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            suppression_relay.flush_suppression_summary();
+        }
+    });
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
@@ -306,6 +312,8 @@ pub async fn serve(
         .with_graceful_shutdown(shutdown)
         .await
         .context("relay stopped")?;
+    suppression_task.abort();
+    let _ = suppression_task.await;
     if let Some(worker) = central_worker {
         // Capacity reporting is best effort. Do not hold relay shutdown on a
         // slow or unreachable central server while draining the queue.
@@ -327,6 +335,8 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         .path_and_query()
         .map(|p| p.as_str().to_owned())
         .unwrap_or_default();
+    let is_responses = path.split_once('?').map_or(path.as_str(), |(path, _)| path)
+        == "/backend-api/codex/responses";
     if !path.starts_with(FORWARDED_PREFIX) {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -395,14 +405,10 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             .rate_limited(upstream, headers, labels, request_id)
             .await;
     }
-    if status.is_client_error() || status.is_server_error() {
-        let is_responses = path.split_once('?').map_or(path.as_str(), |(path, _)| path)
-            == "/backend-api/codex/responses";
-        if is_responses {
-            return relay
-                .http_error(upstream, headers, labels, request_id, status, headers_at)
-                .await;
-        }
+    if (status.is_client_error() || status.is_server_error()) && is_responses {
+        return relay
+            .http_error(upstream, headers, labels, request_id, status, headers_at)
+            .await;
     }
     let is_stream = status.is_success()
         && header_str(&headers, "content-type").is_some_and(|t| t.starts_with("text/event-stream"))
@@ -412,7 +418,14 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         headers.remove("content-length");
         let frame_headers = headers.clone();
         *builder.headers_mut().expect("fresh builder") = headers;
-        let frames = FrameRewriter::new(relay, labels, request_id, frame_headers, headers_at);
+        let frames = FrameRewriter::new(
+            relay,
+            labels,
+            request_id,
+            frame_headers,
+            headers_at,
+            is_responses,
+        );
         builder
             .body(Body::from_stream(frames.wrap(upstream.bytes_stream())))
             .expect("valid response parts")
@@ -546,29 +559,38 @@ impl Relay {
     }
 
     fn log_stream_failure(&self, line: Value) {
+        self.flush_suppression_summary();
         let mut limiter = self.stream_log.lock().expect("stream log lock");
-        if limiter.window_start.elapsed() >= STREAM_FAILURE_LOG_WINDOW {
-            if limiter.suppressed > 0 && !limiter.summary_emitted {
-                (self.log)(
-                    &json!({
-                        "ts": chrono::Utc::now().to_rfc3339(),
-                        "component": "codexctl-relay",
-                        "outcome": "stream_failure",
-                        "suppressed": limiter.suppressed,
-                    })
-                    .to_string(),
-                );
-            }
-            limiter.window_start = Instant::now();
-            limiter.emitted = 0;
-            limiter.suppressed = 0;
-            limiter.summary_emitted = false;
-        }
         if limiter.emitted < STREAM_FAILURE_LOG_LIMIT {
             limiter.emitted += 1;
             (self.log)(&line.to_string());
         } else {
             limiter.suppressed += 1;
+        }
+    }
+
+    fn flush_suppression_summary(&self) {
+        let suppressed = {
+            let mut limiter = self.stream_log.lock().expect("stream log lock");
+            if limiter.window_start.elapsed() < STREAM_FAILURE_LOG_WINDOW {
+                return;
+            }
+            let suppressed = limiter.suppressed;
+            limiter.window_start = Instant::now();
+            limiter.emitted = 0;
+            limiter.suppressed = 0;
+            suppressed
+        };
+        if suppressed > 0 {
+            (self.log)(
+                &json!({
+                    "ts": chrono::Utc::now().to_rfc3339(),
+                    "component": "codexctl-relay",
+                    "outcome": "stream_failure",
+                    "suppressed": suppressed,
+                })
+                .to_string(),
+            );
         }
     }
 
@@ -849,6 +871,7 @@ struct FrameRewriter {
     forwarded: usize,
     partial_scanner: PartialTypeScanner,
     partial_scanned: usize,
+    is_responses: bool,
     trace: StreamTrace,
 }
 
@@ -956,6 +979,7 @@ impl FrameRewriter {
         request_id: Option<String>,
         headers: HeaderMap,
         headers_at: Instant,
+        is_responses: bool,
     ) -> Self {
         Self {
             relay,
@@ -966,6 +990,7 @@ impl FrameRewriter {
             forwarded: 0,
             partial_scanner: PartialTypeScanner::default(),
             partial_scanned: 0,
+            is_responses,
             trace: StreamTrace::new(headers_at),
         }
     }
@@ -1105,6 +1130,9 @@ impl FrameRewriter {
     }
 
     fn finish_truncated(&mut self) {
+        if !self.is_responses {
+            return;
+        }
         if !self.trace.terminal && !self.trace.failure_recorded {
             self.trace.failure_recorded = true;
             self.trace.terminal = true;
@@ -1207,7 +1235,7 @@ impl FrameRewriter {
 }
 
 /// Events that carry model output, or a completed response. Once one passes,
-/// a retry would repeat output, so the relay stops inspecting the stream.
+/// retry advice would repeat output, so failures are observed without rewriting.
 fn is_output(kind: &str) -> bool {
     kind == "response.completed"
         || [
@@ -1525,9 +1553,11 @@ fn failure_detail(event: &Value) -> Value {
             .get("incomplete_details")
             .and_then(Value::as_object)
             .and_then(|details| details.get("reason"))
-            && let Some(reason) = bounded_detail_string(reason)
         {
-            response_detail.insert("incomplete_details".into(), json!({"reason": reason}));
+            response_detail.insert(
+                "incomplete_details".into(),
+                json!({"reason": bounded_detail_value(reason)}),
+            );
         }
         if !response_detail.is_empty() {
             detail.insert("response".into(), Value::Object(response_detail));
@@ -1574,40 +1604,74 @@ fn http_failure_detail(body: &Value) -> Value {
 
 fn error_fields(error: &serde_json::Map<String, Value>) -> Value {
     let mut fields = serde_json::Map::new();
-    for key in ["code", "type", "message"] {
-        if let Some(value) = error.get(key)
-            && let Some(value) = bounded_detail_string(value)
-        {
-            fields.insert(key.into(), value);
+    for key in ["code", "type"] {
+        if let Some(value) = error.get(key) {
+            fields.insert(key.into(), bounded_detail_value(value));
         }
     }
+    insert_message_metadata(error, &mut fields);
     if let Some(reason) = error
         .get("incomplete_details")
         .and_then(Value::as_object)
         .and_then(|details| details.get("reason"))
-        && let Some(reason) = bounded_detail_string(reason)
     {
-        fields.insert("incomplete_details".into(), json!({"reason": reason}));
+        fields.insert(
+            "incomplete_details".into(),
+            json!({"reason": bounded_detail_value(reason)}),
+        );
     }
     Value::Object(fields)
 }
 
 fn top_level_error_fields(error: &serde_json::Map<String, Value>) -> Value {
     let mut fields = serde_json::Map::new();
-    for key in ["code", "type", "message", "param"] {
-        if let Some(value) = error.get(key)
-            && let Some(value) = bounded_detail_string(value)
-        {
-            fields.insert(key.into(), value);
+    for key in ["code", "type"] {
+        if let Some(value) = error.get(key) {
+            fields.insert(key.into(), bounded_detail_value(value));
         }
     }
+    insert_message_metadata(error, &mut fields);
     Value::Object(fields)
 }
 
-fn bounded_detail_string(value: &Value) -> Option<Value> {
-    value
-        .as_str()
-        .map(|value| Value::String(redact_message(value)))
+fn bounded_detail_value(value: &Value) -> Value {
+    let Some(value) = value.as_str() else {
+        return Value::String("other".into());
+    };
+    let value = redact_message(value);
+    if (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Value::String(value)
+    } else {
+        Value::String("other".into())
+    }
+}
+
+fn insert_message_metadata(
+    error: &serde_json::Map<String, Value>,
+    fields: &mut serde_json::Map<String, Value>,
+) {
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return;
+    };
+    let stripped = strip_ansi(message);
+    let guarded = redact_message(&stripped);
+    fields.insert("message_len".into(), json!(stripped.chars().count()));
+    fields.insert("message_class".into(), json!(message_class(&guarded)));
+}
+
+fn message_class(message: &str) -> &'static str {
+    let message = message.to_ascii_lowercase();
+    if message.contains("capacity") || message.contains("overloaded") {
+        "capacity"
+    } else if message.contains("rate limit") || message.contains("try again") {
+        "rate_limit"
+    } else {
+        "other"
+    }
 }
 
 fn strip_ansi(text: &str) -> String {
@@ -1642,7 +1706,9 @@ fn strip_ansi(text: &str) -> String {
                             index += 1;
                         }
                     }
-                    Some(_) => index += 1,
+                    Some(_) => {
+                        index += text[index..].chars().next().map_or(1, char::len_utf8);
+                    }
                     None => {}
                 }
             }
@@ -1878,7 +1944,7 @@ mod tests {
             .expect("stream log lock")
             .window_start = Instant::now() - STREAM_FAILURE_LOG_WINDOW - Duration::from_secs(1);
         relay.stream_log.lock().expect("stream log lock").suppressed = 10;
-        relay.log_stream_failure(json!({"outcome": "stream_failure"}));
+        relay.flush_suppression_summary();
         let lines = lines.lock().expect("test log lock");
         let summary: Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(summary["suppressed"], 10);
@@ -1905,7 +1971,8 @@ mod tests {
             model: "gpt-6.1-sol".into(),
             account_class: "included",
         };
-        let mut frames = FrameRewriter::new(relay, labels, None, HeaderMap::new(), Instant::now());
+        let mut frames =
+            FrameRewriter::new(relay, labels, None, HeaderMap::new(), Instant::now(), true);
         frames.push(b"data: {\"type\":\"response.created\"}\n\n");
         frames.push(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
         let partial = vec![b'x'; MAX_PENDING_FRAME_BYTES * 2];

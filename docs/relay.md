@@ -136,10 +136,11 @@ For each streamed `/responses` request, the relay also writes at most one
 `response.incomplete`, an unclean end, or an unclassified HTTP error. The line records
 `stage` (`pre_output` or `after_output`), the bounded run-length event-type trace,
 elapsed times, model and account class, and upstream `cf-ray` and
-`x-oai-request-id` headers. Failure messages are ANSI-stripped, redacted, and capped at
-300 characters. Output text, deltas, request bodies, authorization, and cookies are
-never included. The process emits at most 30 failure lines per minute and then one
-suppression summary.
+`x-oai-request-id` headers. Failure messages are reduced to their character length and
+one of the bounded classes `capacity`, `rate_limit`, or `other`; their text and
+parameters are never logged. Output text, deltas, request bodies, authorization, and
+cookies are never included. The process emits at most 30 failure lines per minute and
+then one suppression summary.
 
 The existing central capacity endpoint accepts only its four capacity labels and does
 not have a `stream_failure` event schema. Stream-failure forwarding is therefore a

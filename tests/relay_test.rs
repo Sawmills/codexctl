@@ -182,6 +182,7 @@ async fn harness_with(
     };
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
+        .route("/backend-api/codex/other", post(upstream_responses))
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(upstream.clone());
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -438,8 +439,13 @@ impl Harness {
     }
 
     async fn post_model(&self, thread: &str, model: &str) -> reqwest::Response {
+        self.post_path("/backend-api/codex/responses", thread, model)
+            .await
+    }
+
+    async fn post_path(&self, path: &str, thread: &str, model: &str) -> reqwest::Response {
         self.client
-            .post(format!("{}/backend-api/codex/responses", self.relay_url))
+            .post(format!("{}{}", self.relay_url, path))
             .header("authorization", "Bearer synthetic-secret-token")
             .header("thread-id", thread)
             .header("x-codexctl-account-class", "included")
@@ -627,7 +633,7 @@ async fn stream_failure_redacts_messages_and_never_logs_output_text() {
         "event: response.failed\ndata: {}\n\n",
         json!({
             "type": "response.failed",
-            "response": {"error": {"code": "model_unavailable", "message": format!("\u{1b}[2J\u{1b}[K\u{1b}]0;evil\u{7}jwt {jwt} token {token} {bearer} {basic} {cookie} key {short_key}")}}
+            "response": {"error": {"code": "model_unavailable", "message": format!("\u{1b}é \u{1b}[2J\u{1b}[K\u{1b}]0;evil\u{7}jwt {jwt} token {token} {bearer} {basic} {cookie} key {short_key}")}}
         })
     );
     let output = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"NEVER_LOG_THIS_OUTPUT\"}\n\n";
@@ -642,13 +648,24 @@ async fn stream_failure_redacts_messages_and_never_logs_output_text() {
     assert!(!logs.contains(basic), "basic credential leaked: {logs}");
     assert!(!logs.contains(cookie), "cookie credential leaked: {logs}");
     assert!(!logs.contains(short_key), "short key leaked: {logs}");
+    let failure: Value = h
+        .logs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .find(|line: &Value| line["outcome"] == "stream_failure")
+        .unwrap();
+    assert!(failure["failure"]["response"]["error"]["message"].is_null());
+    assert!(failure["failure"]["response"]["error"]["param"].is_null());
+    assert!(failure["failure"]["response"]["error"]["message_len"].is_number());
+    assert_eq!(
+        failure["failure"]["response"]["error"]["message_class"],
+        "other"
+    );
     assert!(
         !logs.contains("NEVER_LOG_THIS_OUTPUT"),
         "output leaked: {logs}"
-    );
-    assert!(
-        logs.contains("[redacted]"),
-        "redaction marker missing: {logs}"
     );
 }
 
@@ -1117,8 +1134,10 @@ async fn error_and_incomplete_events_are_recorded() {
         assert_eq!(failure["advised"], false);
         if expected_kind == "error_event" {
             assert_eq!(failure["failure"]["error"]["code"], "bad_gateway");
-            assert_eq!(failure["failure"]["error"]["message"], "provider failed");
+            assert!(failure["failure"]["error"]["message"].is_null());
             assert!(failure["failure"]["error"]["param"].is_null());
+            assert_eq!(failure["failure"]["error"]["message_len"], 15);
+            assert_eq!(failure["failure"]["error"]["message_class"], "other");
         }
     }
 }
@@ -1142,6 +1161,25 @@ async fn stream_without_terminal_event_is_recorded_as_truncated() {
     assert_eq!(failure["kind"], "truncated");
     assert_eq!(failure["stage"], "after_output");
     assert!(failure["failure"].is_null());
+}
+
+#[tokio::test]
+async fn non_responses_stream_does_not_record_truncated() {
+    let h = harness(vec![Scripted::Sse(vec![
+        CREATED.into(),
+        REASONING_DELTA.into(),
+    ])])
+    .await;
+    h.post_path("/backend-api/codex/other", "other-stream", "gpt-6.1-sol")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!h.logs.lock().unwrap().iter().any(|line| {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|value| value["kind"] == "truncated")
+    }));
 }
 
 #[tokio::test]
