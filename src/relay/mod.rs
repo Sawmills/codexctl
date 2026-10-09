@@ -1547,7 +1547,12 @@ fn failure_detail(event: &Value) -> Value {
         }
         if let Some(error) = response.get("error").and_then(Value::as_object) {
             response_detail.insert("error".into(), error_fields(error));
-            error_keys.extend(error.keys().take(MAX_ERROR_KEYS).map(|key| key.to_owned()));
+            error_keys.extend(
+                error
+                    .keys()
+                    .filter_map(|key| allowlisted_error_key(key).map(str::to_owned))
+                    .take(MAX_ERROR_KEYS),
+            );
         }
         if let Some(reason) = response
             .get("incomplete_details")
@@ -1565,7 +1570,12 @@ fn failure_detail(event: &Value) -> Value {
     }
     if let Some(error) = event.get("error").and_then(Value::as_object) {
         detail.insert("error".into(), top_level_error_fields(error));
-        error_keys.extend(error.keys().take(MAX_ERROR_KEYS).map(|key| key.to_owned()));
+        error_keys.extend(
+            error
+                .keys()
+                .filter_map(|key| allowlisted_error_key(key).map(str::to_owned))
+                .take(MAX_ERROR_KEYS),
+        );
     } else if event_type == "error"
         && let Some(error) = event.as_object()
     {
@@ -1583,15 +1593,22 @@ fn failure_detail(event: &Value) -> Value {
         error_keys.truncate(MAX_ERROR_KEYS);
         detail.insert(
             "error_keys".into(),
-            Value::Array(
-                error_keys
-                    .into_iter()
-                    .map(|key| Value::String(redact_message(&key)))
-                    .collect(),
-            ),
+            Value::Array(error_keys.into_iter().map(Value::String).collect()),
         );
     }
     Value::Object(detail)
+}
+
+fn allowlisted_error_key(key: &str) -> Option<&'static str> {
+    match key {
+        "code" => Some("code"),
+        "type" => Some("type"),
+        "message" => Some("message"),
+        "param" => Some("param"),
+        "incomplete_details" => Some("incomplete_details"),
+        "headers" => Some("headers"),
+        _ => None,
+    }
 }
 
 fn http_failure_detail(body: &Value) -> Value {

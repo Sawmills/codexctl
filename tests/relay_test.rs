@@ -633,7 +633,7 @@ async fn stream_failure_redacts_messages_and_never_logs_output_text() {
         "event: response.failed\ndata: {}\n\n",
         json!({
             "type": "response.failed",
-            "response": {"error": {"code": "model_unavailable", "message": format!("\u{1b}é \u{1b}[2J\u{1b}[K\u{1b}]0;evil\u{7}jwt {jwt} token {token} {bearer} {basic} {cookie} key {short_key}")}}
+            "response": {"error": {"code": "model_unavailable", "message": format!("\u{1b}é \u{1b}[2J\u{1b}[K\u{1b}]0;evil\u{7}jwt {jwt} token {token} {bearer} {basic} {cookie} key {short_key}"), "password=hunter2": "secret"}}
         })
     );
     let output = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"NEVER_LOG_THIS_OUTPUT\"}\n\n";
@@ -648,6 +648,10 @@ async fn stream_failure_redacts_messages_and_never_logs_output_text() {
     assert!(!logs.contains(basic), "basic credential leaked: {logs}");
     assert!(!logs.contains(cookie), "cookie credential leaked: {logs}");
     assert!(!logs.contains(short_key), "short key leaked: {logs}");
+    assert!(
+        !logs.contains("password=hunter2"),
+        "hostile error key leaked: {logs}"
+    );
     let failure: Value = h
         .logs
         .lock()
