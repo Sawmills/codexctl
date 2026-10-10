@@ -198,6 +198,11 @@ impl Owner {
         self.retry_started
             .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
     }
+    pub(super) fn on_demand_cooldown_active(&self) -> bool {
+        let backoff = (5_000u64 << self.retry_failures.min(4)).min(60_000);
+        self.retry_started
+            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
+    }
     pub(super) fn selectable(&self) -> bool {
         self.available && !self.routing_refused
     }

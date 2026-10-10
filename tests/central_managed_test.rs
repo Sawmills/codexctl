@@ -3669,7 +3669,7 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
 }
 
 #[test]
-fn background_recovery_is_off_by_default_and_import_can_repair() {
+fn token_request_recovers_retryable_refresh_owner_with_background_recovery_off() {
     let mut server = Server::start();
     server.stop();
     let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
@@ -3685,19 +3685,14 @@ fn background_recovery_is_off_by_default_and_import_can_repair() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     assert_eq!(
         std::fs::read(server.root.path().join("launch-count")).unwrap(),
         launches
     );
-    assert_eq!(
-        server
-            .import(&server.amir, "personal", "amir-login", "amir-seat")
-            .status(),
-        200
-    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 

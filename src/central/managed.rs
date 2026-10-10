@@ -1438,6 +1438,30 @@ async fn token(
         Some(borrowed) => borrowed.owner.clone(),
         None => broker.owner(&device, alias).await?,
     };
+    if !broker.background_recovery
+        && broker
+            .central
+            .as_ref()
+            .is_none_or(|s| s.mode() == super::storage::StoreMode::File)
+    {
+        let worker = broker.clone();
+        let owner_ref = owner.clone();
+        let account_id = request.account_id.clone();
+        // Detached work retains its permit and settles native refreshes even
+        // when the requesting client disconnects.
+        tokio::spawn(async move {
+            {
+                let owner = owner_ref.lock().await;
+                owner
+                    .validate_account_id(account_id.as_deref())
+                    .map_err(|failure| worker.owner_failure(failure))?;
+            }
+            recover_owners(&worker, Some(owner_ref)).await;
+            Ok::<_, HttpError>(())
+        })
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
+    }
     // The fast path and the lease wait run only behind the flag, in
     // PostgreSQL mode. Dual and file mode keep today's path.
     let fast_on = fast_path::enabled()
@@ -3582,19 +3606,27 @@ async fn launch_startup_owner(
 }
 
 async fn recover_unhealthy_owners(broker: &Broker) {
+    recover_owners(broker, None).await;
+}
+
+async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
+    let on_demand = requested.is_some();
     if broker.read_only
         || broker.stopping.load(Ordering::Acquire)
         || broker.ownership_unresolved.load(Ordering::Acquire)
     {
         return;
     }
-    let owners = broker
-        .owners
-        .read()
-        .await
-        .values()
-        .map(|(_, owner)| owner.clone())
-        .collect::<Vec<_>>();
+    let owners = match requested {
+        Some(owner) => vec![owner],
+        None => broker
+            .owners
+            .read()
+            .await
+            .values()
+            .map(|(_, owner)| owner.clone())
+            .collect(),
+    };
     for owner_ref in owners {
         if broker.stopping.load(Ordering::Acquire) {
             return;
@@ -3617,7 +3649,11 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             || owner.available
             || !owner.retryable_unavailable
             || owner.routing_refused
-            || owner.retry_cooldown_active()
+            || (if on_demand {
+                owner.on_demand_cooldown_active()
+            } else {
+                owner.retry_cooldown_active()
+            })
         {
             continue;
         }
@@ -3707,10 +3743,17 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 || owner.available
                 || !owner.retryable_unavailable
                 || owner.routing_refused
-                || owner.retry_cooldown_active()
+                || (if on_demand {
+                    owner.on_demand_cooldown_active()
+                } else {
+                    owner.retry_cooldown_active()
+                })
             {
                 None
             } else {
+                if on_demand {
+                    owner.retry_started = Some(owner.retry_clock_now());
+                }
                 let identities = if let Some(central) = central
                     .as_ref()
                     .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
