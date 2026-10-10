@@ -23,6 +23,8 @@ pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod browser;
+pub(in crate::central) use browser::BrowserIdentity;
 mod loans;
 mod migration;
 
@@ -134,6 +136,7 @@ pub struct PostgresStore {
     client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     observation_client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     admission: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
+    browser_logins: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
     key: PathBuf,
 }
 
@@ -224,6 +227,13 @@ CREATE TABLE IF NOT EXISTS enrollment_challenges (
     consumed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challenges (expires_at);
+CREATE TABLE IF NOT EXISTS browser_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    signed_in_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS browser_sessions_expiry_idx ON browser_sessions (expires_at);
 CREATE TABLE IF NOT EXISTS central_users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,
@@ -323,6 +333,7 @@ impl CentralStore {
         db.client = Arc::new(tokio::sync::Mutex::new(None));
         db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
         db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
         let control = db.establish().await?;
         Ok((isolated, control, schema))
     }
@@ -1372,6 +1383,7 @@ impl PostgresStore {
             client: Arc::new(tokio::sync::Mutex::new(None)),
             observation_client: Arc::new(tokio::sync::Mutex::new(None)),
             admission: Arc::new(tokio::sync::Mutex::new(None)),
+            browser_logins: Arc::new(tokio::sync::Mutex::new(None)),
             key: key.into(),
         };
         let _ = store.client().await?;
@@ -1452,6 +1464,21 @@ impl PostgresStore {
         .await
         .context("central PostgreSQL statement timeout setup timed out")??;
         Ok(Arc::new(client))
+    }
+
+    async fn transaction_client<'a>(
+        &'a self,
+        cache: &'a tokio::sync::Mutex<Option<tokio_postgres::Client>>,
+    ) -> Result<tokio::sync::MappedMutexGuard<'a, tokio_postgres::Client>> {
+        let mut slot = cache.lock().await;
+        if slot.as_ref().is_none_or(tokio_postgres::Client::is_closed) {
+            *slot = Some(
+                Arc::try_unwrap(self.establish().await?)
+                    .map_err(|_| anyhow::anyhow!("transaction connection is shared"))?,
+            );
+        }
+        tokio::sync::MutexGuard::try_map(slot, Option::as_mut)
+            .map_err(|_| anyhow::anyhow!("transaction connection is absent"))
     }
 
     async fn client(&self) -> Result<Arc<tokio_postgres::Client>> {
@@ -3267,6 +3294,7 @@ mod tests {
         if let CentralStore::Postgres(db) = &mut replica {
             db.client = Arc::new(tokio::sync::Mutex::new(None));
             db.admission = Arc::new(tokio::sync::Mutex::new(None));
+            db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
         }
         assert!(
             !replica.relay_event_allowed("shared-device").await.unwrap(),
@@ -3311,6 +3339,7 @@ mod tests {
             db.client = Arc::new(tokio::sync::Mutex::new(None));
             db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
             db.admission = Arc::new(tokio::sync::Mutex::new(None));
+            db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
         }
         let id = format!(
             "test-{}",

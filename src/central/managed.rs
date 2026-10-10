@@ -255,6 +255,7 @@ pub(super) struct Broker {
     pub(super) owners: Arc<RwLock<Owners>>,
     pub(super) imports: Arc<Mutex<()>>,
     pub sso: Option<Arc<enrollment::Sso>>,
+    pub(super) browser_sessions_available: bool,
     pub(super) activity: Arc<super::activity::Activity>,
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
@@ -559,7 +560,7 @@ pub(super) async fn central_registry_users(central: &CentralStore) -> Result<Vec
         .collect()
 }
 
-async fn central_registry_devices_for_tenant(
+pub(super) async fn central_registry_devices_for_tenant(
     central: &CentralStore,
     tenant: &str,
 ) -> Result<Vec<vault::Device>> {
@@ -4341,6 +4342,28 @@ pub async fn serve(
         None
     };
     let holder = instance_holder_id();
+    let browser_sessions_available = match central
+        .as_ref()
+        .filter(|s| s.mode() == StoreMode::Postgres && sso.is_some())
+    {
+        Some(store) => match store.browser_sessions_ready().await {
+            Ok(available) => available,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"browser_sessions", "stage":"startup", "reason":"browser_sessions_probe_failed", "error":format!("{error:#}")})
+                );
+                return Err(error.context("browser session startup probe failed"));
+            }
+        },
+        None => true,
+    };
+    if !browser_sessions_available {
+        eprintln!(
+            "{}",
+            json!({"operation":"browser_sessions", "stage":"startup", "reason":"browser_sessions_unavailable"})
+        );
+    }
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -4351,6 +4374,7 @@ pub async fn serve(
         owners: Arc::new(RwLock::new(owners)),
         imports,
         sso,
+        browser_sessions_available,
         reset_reader: super::resets::Reader::new()?,
         catalog: Arc::new(catalog::Reader::new()?),
         failures: Arc::new(StdMutex::new(
@@ -4586,6 +4610,7 @@ impl Broker {
             )),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            browser_sessions_available: true,
             activity: Arc::default(),
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
@@ -4728,6 +4753,7 @@ mod tests {
             owners: Arc::new(RwLock::new(BTreeMap::new())),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            browser_sessions_available: true,
             activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),

@@ -62,7 +62,8 @@ async fn snapshot(
     headers: &HeaderMap,
     elapsed: fn(&Instant) -> Duration,
 ) -> Result<Snapshot, HttpError> {
-    let identity = enrollment::browser_user(broker, headers)?
+    let identity = enrollment::browser_user(broker, headers)
+        .await?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     let user = identity.id;
     let catalog =
@@ -77,8 +78,17 @@ async fn snapshot(
     for account in &mut accounts {
         account.advance_usage_age(elapsed(&sampled_at));
     }
-    let machines: Vec<_> = vault::devices(&broker.state)
-        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
+    let devices = if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+    {
+        central.browser_devices("sawmills", &user).await
+    } else {
+        vault::devices(&broker.state)
+    }
+    .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+    let machines: Vec<_> = devices
         .into_iter()
         .filter(|d| d.user == user && d.tenant == "sawmills")
         .map(|d| {
@@ -92,7 +102,8 @@ async fn snapshot(
         })
         .collect();
     // Revalidate after awaited observations, as on the JSON endpoint.
-    let identity = enrollment::browser_user(broker, headers)?
+    let identity = enrollment::browser_user(broker, headers)
+        .await?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     Ok(Snapshot {
         version: 1,
@@ -274,7 +285,17 @@ async fn landing(
     content: String,
 ) -> Result<Response, HttpError> {
     // Session lookup is optional on the public page. Only an enabled identity redirects.
-    if matches!(enrollment::browser_user(&broker, &headers), Ok(Some(_))) {
+    let sessions_usable = broker.browser_sessions_available
+        && broker
+            .central
+            .as_ref()
+            .is_none_or(|s| s.mode() != super::storage::StoreMode::Dual);
+    if sessions_usable
+        && matches!(
+            enrollment::browser_user(&broker, &headers).await,
+            Ok(Some(_))
+        )
+    {
         return Ok(([("cache-control", "no-store")], Redirect::to("/accounts")).into_response());
     }
     let ready = managed::readiness(&broker).is_success();

@@ -13,7 +13,11 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use base64::{Engine, engine::general_purpose::STANDARD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use hmac::{Hmac, Mac};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce,
     OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope,
@@ -67,7 +71,7 @@ type CompanyClient = openidconnect::Client<
 >;
 const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
-mod identity;
+pub(super) mod identity;
 
 pub fn random_bytes() -> [u8; 32] {
     let mut bytes = [0u8; 32];
@@ -124,6 +128,11 @@ struct Login {
     nonce: Nonce,
     verifier: PkceCodeVerifier,
     created: Instant,
+}
+#[derive(Serialize, Deserialize)]
+struct SharedAccountsLogin {
+    binding: String,
+    nonce: String,
 }
 struct Approval {
     device_hash: String,
@@ -254,6 +263,42 @@ fn sso(broker: &Broker) -> Result<&Sso, HttpError> {
         .sso
         .as_deref()
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
+}
+fn dashboard_sso(broker: &Broker) -> Result<&Sso, HttpError> {
+    if !broker.browser_sessions_available {
+        return Err(broker.error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "browser_sessions_unavailable",
+        ));
+    }
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == super::storage::StoreMode::Dual)
+    {
+        return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"));
+    }
+    broker
+        .sso
+        .as_deref()
+        .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))
+}
+fn shared_dashboard(broker: &Broker) -> Option<&super::storage::CentralStore> {
+    broker
+        .central
+        .as_ref()
+        .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
+}
+fn shared_pkce_verifier(broker: &Broker, state: &str) -> Result<PkceCodeVerifier, HttpError> {
+    let key = vault::private_read(&broker.key)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(&key)
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
+    mac.update(b"codexctl-dashboard-pkce:");
+    mac.update(state.as_bytes());
+    Ok(PkceCodeVerifier::new(
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()),
+    ))
 }
 fn page(html: String) -> Response {
     let styles = include_str!("enrollment/style.css");
@@ -471,7 +516,11 @@ async fn verify(
     begin_login(&broker, Destination::Enrollment(device_hash)).await
 }
 async fn begin_login(broker: &Broker, destination: Destination) -> Result<Response, HttpError> {
-    let sso = sso(broker)?;
+    let sso = if matches!(destination, Destination::Accounts(_)) {
+        dashboard_sso(broker)?
+    } else {
+        sso(broker)?
+    };
     let metadata = sso
         .metadata()
         .await
@@ -485,11 +534,20 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
         RedirectUrl::new(format!("{}/auth/callback", sso.public_url))
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "sso_unavailable"))?,
     );
-    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    let csrf = CsrfToken::new_random();
+    let (challenge, verifier) = if shared_dashboard(broker).is_some() {
+        let verifier = shared_pkce_verifier(broker, csrf.secret())?;
+        (
+            PkceCodeChallenge::from_code_verifier_sha256(&verifier),
+            verifier,
+        )
+    } else {
+        PkceCodeChallenge::new_random_sha256()
+    };
     let mut authorization = client
         .authorize_url(
             CoreAuthenticationFlow::AuthorizationCode,
-            CsrfToken::new_random,
+            || csrf,
             Nonce::new_random,
         )
         .add_scope(Scope::new("email".into()))
@@ -504,20 +562,37 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
         authorization = authorization.add_extra_param("hd", hint);
     }
     let (url, state, nonce) = authorization.url();
-    let mut flows = sso.flows.lock().expect("enrollment lock");
-    Sso::cleanup(&mut flows);
-    if flows.logins.len() >= 1024 {
-        return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
+    if let (Some(central), Destination::Accounts(binding)) =
+        (shared_dashboard(broker), &destination)
+    {
+        let payload = serde_json::to_vec(&SharedAccountsLogin {
+            binding: binding.clone(),
+            nonce: nonce.secret().clone(),
+        })
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
+        let inserted = central
+            .create_browser_login(&format!("accounts:{}", state.secret()), &payload, TTL)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
+        if !inserted {
+            return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
+        }
+    } else {
+        let mut flows = sso.flows.lock().expect("enrollment lock");
+        Sso::cleanup(&mut flows);
+        if flows.logins.len() >= 1024 {
+            return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
+        }
+        flows.logins.insert(
+            vault::digest(state.secret().as_bytes()),
+            Login {
+                destination,
+                nonce,
+                verifier,
+                created: Instant::now(),
+            },
+        );
     }
-    flows.logins.insert(
-        vault::digest(state.secret().as_bytes()),
-        Login {
-            destination,
-            nonce,
-            verifier,
-            created: Instant::now(),
-        },
-    );
     Ok((
         [
             ("cache-control", "no-store"),
@@ -537,8 +612,26 @@ async fn callback(
     Query(input): Query<Callback>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    let sso = sso(&broker)?;
-    let login = {
+    let sso = if shared_dashboard(&broker).is_some() {
+        dashboard_sso(&broker)?
+    } else {
+        sso(&broker)?
+    };
+    let login = if let Some(central) = shared_dashboard(&broker) {
+        let payload = central
+            .consume_enrollment(&format!("accounts:{}", input.state))
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?
+            .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
+        let stored: SharedAccountsLogin = serde_json::from_slice(&payload)
+            .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
+        Login {
+            destination: Destination::Accounts(stored.binding),
+            nonce: Nonce::new(stored.nonce),
+            verifier: shared_pkce_verifier(&broker, &input.state)?,
+            created: Instant::now(),
+        }
+    } else {
         let mut flows = sso.flows.lock().expect("enrollment lock");
         Sso::cleanup(&mut flows);
         flows
@@ -620,7 +713,12 @@ async fn callback(
     {
         return Err(broker.error(StatusCode::FORBIDDEN, "company_identity_required"));
     }
-    let user = match identity::resolve(&broker.state, &sso.config, claims.subject().as_str(), email)
+    let resolved = if let Some(central) = shared_dashboard(&broker) {
+        identity::resolve_shared(central, &sso.config, claims.subject().as_str(), email).await
+    } else {
+        identity::resolve(&broker.state, &sso.config, claims.subject().as_str(), email)
+    };
+    let user = match resolved
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
     {
         identity::Resolution::User(user) => user,
@@ -634,7 +732,18 @@ async fn callback(
     let device_hash = match login.destination {
         Destination::Enrollment(hash) => hash,
         Destination::Accounts(_) => {
-            let result = if broker.central.is_some() {
+            let result = if let Some(central) = shared_dashboard(&broker) {
+                central
+                    .record_browser_user(&user, email)
+                    .await
+                    .map(|recorded| {
+                        if recorded {
+                            managed::UserEnrollment::Recorded
+                        } else {
+                            managed::UserEnrollment::Disabled
+                        }
+                    })
+            } else if broker.central.is_some() {
                 broker.record_user_central(&user, email).await
             } else {
                 managed::record_user(&broker.state, &user, email)
@@ -651,18 +760,36 @@ async fn callback(
                 broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable")
             })?;
             let token = secret();
-            let mut flows = sso.flows.lock().expect("enrollment lock");
-            Sso::cleanup(&mut flows);
-            if flows.sessions.len() >= 1024 {
-                return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "session_capacity"));
+            if let Some(central) = shared_dashboard(&broker) {
+                let signed_in_at = claims
+                    .auth_time()
+                    .map_or_else(|| chrono::Utc::now().timestamp(), |time| time.timestamp());
+                let created = central
+                    .create_browser_session(&token, &user, signed_in_at, SESSION_TTL)
+                    .await
+                    .map_err(|_| {
+                        broker.error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "browser_sessions_unavailable",
+                        )
+                    })?;
+                if !created {
+                    return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "session_capacity"));
+                }
+            } else {
+                let mut flows = sso.flows.lock().expect("enrollment lock");
+                Sso::cleanup(&mut flows);
+                if flows.sessions.len() >= 1024 {
+                    return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "session_capacity"));
+                }
+                flows.sessions.insert(
+                    vault::digest(token.as_bytes()),
+                    Session {
+                        user,
+                        created: Instant::now(),
+                    },
+                );
             }
-            flows.sessions.insert(
-                vault::digest(token.as_bytes()),
-                Session {
-                    user,
-                    created: Instant::now(),
-                },
-            );
             let mut response = (
                 [
                     ("cache-control", "no-store"),
@@ -846,12 +973,22 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
             (key == name).then_some(value)
         })
 }
-pub(super) fn browser_user(
+pub(super) async fn browser_user(
     broker: &Broker,
     headers: &HeaderMap,
 ) -> Result<Option<managed::User>, HttpError> {
-    if let Some(error) = broker.reject_unshared_workflow("enrollment_unavailable") {
-        return Err(error);
+    if !broker.browser_sessions_available {
+        return Err(broker.error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "browser_sessions_unavailable",
+        ));
+    }
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == super::storage::StoreMode::Dual)
+    {
+        return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"));
     }
     let Some(sso) = broker.sso.as_deref() else {
         return Ok(None);
@@ -859,6 +996,18 @@ pub(super) fn browser_user(
     let Some(token) = cookie(headers, sso.cookie_name("session")) else {
         return Ok(None);
     };
+    if let Some(central) = shared_dashboard(broker) {
+        let user = central.browser_session_user(token).await.map_err(|_| {
+            broker.error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "browser_sessions_unavailable",
+            )
+        })?;
+        if user.as_ref().is_some_and(|u| !u.enabled) {
+            return Err(broker.error(StatusCode::FORBIDDEN, "user_disabled"));
+        }
+        return Ok(user);
+    }
     let user = {
         let mut flows = sso.flows.lock().expect("enrollment lock");
         Sso::cleanup(&mut flows);
@@ -882,17 +1031,26 @@ pub(super) async fn accounts_sign_out(
     State(broker): State<Broker>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    let sso = sso(&broker)?;
+    let sso = dashboard_sso(&broker)?;
     // A link-styled form submits same-origin POST; cross-site forms cannot end a session.
     if headers.get("origin").and_then(|h| h.to_str().ok()) != Some(sso.public_url.as_str()) {
         return Err(broker.error(StatusCode::FORBIDDEN, "invalid_browser_origin"));
     }
     if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
-        sso.flows
-            .lock()
-            .expect("enrollment lock")
-            .sessions
-            .remove(&vault::digest(token.as_bytes()));
+        if let Some(central) = shared_dashboard(&broker) {
+            central.end_browser_session(token).await.map_err(|_| {
+                broker.error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "browser_sessions_unavailable",
+                )
+            })?;
+        } else {
+            sso.flows
+                .lock()
+                .expect("enrollment lock")
+                .sessions
+                .remove(&vault::digest(token.as_bytes()));
+        }
     }
     let mut response = (
         [
@@ -912,7 +1070,7 @@ pub(super) async fn accounts_sign_out(
 }
 
 pub(super) async fn accounts_sign_in(State(broker): State<Broker>) -> Result<Response, HttpError> {
-    let sso = sso(&broker)?;
+    let sso = dashboard_sso(&broker)?;
     let binding = secret();
     let mut response = begin_login(
         &broker,
