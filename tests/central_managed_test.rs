@@ -3762,7 +3762,15 @@ fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
     };
     let wait_for_launches = |expected| {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while launches() < expected {
+        loop {
+            let observed = launches();
+            if observed == expected {
+                return;
+            }
+            assert!(
+                observed < expected,
+                "background recovery reached {observed} launches before the {expected} ms retry clock"
+            );
             assert!(
                 std::time::Instant::now() < deadline,
                 "background recovery did not reach {expected} launches"
