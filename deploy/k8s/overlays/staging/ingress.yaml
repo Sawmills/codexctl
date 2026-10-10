@@ -20,7 +20,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                # B33 attempt 3, PR I: traffic moves to the HA broker. Merge
+                # B33 attempt 4, PR I: traffic moves to the HA broker. Merge
                 # only after PR H and window step 7 pass.
                 name: codexctl-ha
                 port:
