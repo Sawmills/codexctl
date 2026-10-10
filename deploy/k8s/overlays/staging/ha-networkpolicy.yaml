@@ -1,4 +1,4 @@
-# B33 attempt 3, PR H: the same rules as NetworkPolicy/codexctl plus database
+# B33 attempt 4, PR H: the same rules as NetworkPolicy/codexctl plus database
 # egress, for the HA pods only. Copied from overlays/staging-ha.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

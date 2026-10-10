@@ -105,7 +105,7 @@ spec:
     credentials:
       name: codexctl-secrets
       key: metrics-token
-  # B33 attempt 3, PR H: one target per HA pod. The labels keep the existing
+  # B33 attempt 4, PR H: one target per HA pod. The labels keep the existing
   # alert expressions valid.
   dnsSDConfigs:
     - names: [codexctl-ha-pods.codexctl.svc.cluster.local]

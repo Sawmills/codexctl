@@ -1,4 +1,4 @@
-# B33 attempt 3, PR H: the HA broker beside the stopped StatefulSet. Copied from
+# B33 attempt 4, PR H: the HA broker beside the stopped StatefulSet. Copied from
 # overlays/staging-ha with its own app name, so Service/codexctl and the
 # public Ingress never select these pods before PR I. The Google client
 # secret key matches the staging ExternalSecret after SAW-12467.
@@ -122,7 +122,7 @@ spec:
           env:
             - name: CODEXCTL_CENTRAL_STORE
               value: postgres
-            # Every replica runs layout 8 from its first start (B33 attempt 3).
+            # Every replica runs layout 8 from its first start (B33 attempt 4).
             - name: CODEXCTL_CENTRAL_TOKEN_FAST_PATH
               value: "1"
             - {

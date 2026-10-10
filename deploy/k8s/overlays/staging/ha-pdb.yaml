@@ -1,4 +1,4 @@
-# B33 attempt 3, PR H. Copied from overlays/staging-ha, own app name.
+# B33 attempt 4, PR H. Copied from overlays/staging-ha, own app name.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
