@@ -32,7 +32,7 @@ codexctl keeps several OpenAI Codex logins on a private account server that ever
 - Recommendation rule, matching automatic selection in `codexctl use` from v0.1.37 (PR #76, open on 2026-10-03): available accounts with included usage (`rate_limited` billing), fresh data, at least one reported window, and every reported window below 100% qualify; an absent window (for example a weekly-only account) does not disqualify. If any qualifying account has a window below 95% used, accounts with any window at 95% or more drop out. The soonest 7-day reset wins, then the lower availability score (5-hour used counts double). Usage-based and unknown billing never qualify. Source: `remote::select_for_activation` and `remote::select` in PR #76 at `268fcfe`.
 - From v0.1.37, `codexctl use <alias>` moves running Codex sessions on that machine to the selected account within 60 seconds. Before v0.1.37, running sessions kept their startup account.
 - `codexctl reset <alias>` redeems the soonest-expiring banked reset, and only for an account with an exhausted window. `codexctl login <alias>` renews a server account's login.
-- Terms follow `CONTEXT.md`: company user, machine, account server, server account, alias, login renewal. Avoid "device" except for the OpenAI device code and the `codexctl devices` command.
+- Terms follow `GLOSSARY.md`: company user, machine, account server, server account, alias, login renewal. Avoid "device" except for the OpenAI device code and the `codexctl devices` command.
 
 ## Brand Commitments
 
