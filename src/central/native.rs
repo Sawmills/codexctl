@@ -1262,10 +1262,7 @@ fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
             .as_millis(),
     )?;
     calls.retain(|_, previous| now.checked_sub(*previous).is_some_and(|age| age < 600_000));
-    #[cfg(unix)]
     let parent = std::os::unix::process::parent_id();
-    #[cfg(not(unix))]
-    let parent = std::process::id();
     let retry = calls
         .insert(parent, now)
         .is_some_and(|previous| now - previous < 10_000);

@@ -5227,16 +5227,21 @@ fn relay_capacity_events_require_valid_labels_and_are_exported() {
 
 #[test]
 fn relay_capacity_event_authorizes_before_reading_a_large_body() {
+    use std::io::Write;
     let server = Server::start();
-    let response = server
-        .http
-        .post(format!("{}/v1/relay/capacity-events", server.url))
-        .header("content-type", "application/json")
-        .header("expect", "100-continue")
-        .body(vec![b'x'; 1024 * 1024 + 1])
-        .send()
+    let authority = server.url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(authority).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    assert_eq!(response.status(), 401);
+    // Wait for authorization before sending the body, as Expect requires.
+    // Uploading it immediately can race the early rejection and reset the socket.
+    stream.write_all(format!(
+        "POST /v1/relay/capacity-events HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 1048577\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+    ).as_bytes()).unwrap();
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status).unwrap();
+    assert_eq!(status.split_whitespace().nth(1), Some("401"));
 }
 
 #[test]
