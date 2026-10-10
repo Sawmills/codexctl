@@ -121,6 +121,7 @@ pub fn init(
         state,
         key,
         &vault::Vault {
+            last_rotation_ms: None,
             alias: alias.into(),
             tenant: tenant.into(),
             user: user.into(),

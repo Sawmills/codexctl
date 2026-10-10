@@ -299,6 +299,7 @@ impl CentralStore {
         }
         let proposed = crate::central::managed::account_key(&op.user, &op.alias);
         let saved = vault::Vault {
+            last_rotation_ms: None,
             alias: op.alias.clone(),
             tenant: "sawmills".into(),
             user: op.user.clone(),

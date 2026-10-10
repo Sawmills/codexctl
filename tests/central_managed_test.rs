@@ -3669,6 +3669,35 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
 }
 
 #[test]
+fn recent_rotation_guard_survives_refresh_owner_restart() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    server.stop();
+    server.restart();
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
 fn matching_forced_requests_share_one_rotation_until_sixty_seconds_pass() {
     let server = Server::start();
     assert_eq!(

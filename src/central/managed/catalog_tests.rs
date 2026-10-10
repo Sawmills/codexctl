@@ -39,6 +39,7 @@ impl Fixture {
             &account,
             &key,
             &Vault {
+                last_rotation_ms: None,
                 user: "test".into(),
                 tenant: "sawmills".into(),
                 alias: "fixture".into(),

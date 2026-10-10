@@ -15,6 +15,9 @@ use std::{
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Vault {
+    /// Wall-clock rotation time, shared with the encrypted credential state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotation_ms: Option<u64>,
     pub alias: String,
     pub tenant: String,
     pub user: String,
@@ -271,6 +274,7 @@ mod tests {
             root.path(),
             &key,
             &Vault {
+                last_rotation_ms: None,
                 alias: "personal".into(),
                 tenant: "personal".into(),
                 user: "amir".into(),

@@ -125,7 +125,6 @@ pub(super) struct Owner {
     pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
-    pub(super) last_rotation: Option<u64>,
     pub(super) recovery_generation: u64,
     /// Last observed or successfully published shared revision, excluding local journals.
     pub(super) shared_revision: Option<i64>,
@@ -185,6 +184,18 @@ impl Owner {
             return clock();
         }
         retry_clock_now()
+    }
+
+    fn rotation_clock_now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = self.retry_clock.as_ref() {
+            return clock();
+        }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CENTRAL_TEST_RETRY_CLOCK").is_some() {
+            return retry_clock_now();
+        }
+        chrono::Utc::now().timestamp_millis().max(0) as u64
     }
 
     pub(super) fn retry_cooldown_active(&self) -> bool {
@@ -300,10 +311,10 @@ impl Owner {
         }
         let rotated = self.vault.auth.get("tokens") != auth.get("tokens");
         self.vault.auth = auth;
-        vault::save(&self.state, &self.key, &self.vault)?;
         if rotated {
-            self.last_rotation = Some(self.retry_clock_now());
+            self.vault.last_rotation_ms = Some(self.rotation_clock_now());
         }
+        vault::save(&self.state, &self.key, &self.vault)?;
         let access_token = vault::token(&self.vault.auth)?.to_owned();
         Ok(TokenResponse {
             user_id: None,
@@ -350,8 +361,9 @@ impl Owner {
                 return Err(TokenFailure::RefreshDisabled);
             }
             let age_ms = self
-                .last_rotation
-                .map(|rotated| self.retry_clock_now().saturating_sub(rotated));
+                .vault
+                .last_rotation_ms
+                .map(|rotated| self.rotation_clock_now().saturating_sub(rotated));
             let recent = age_ms.is_some_and(|age| age < 60_000);
             if let Some(device) = device {
                 super::refresh_control::forced(
@@ -808,7 +820,6 @@ pub async fn serve(
         retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
-        last_rotation: None,
         recovery_generation: 0,
         shared_revision: None,
         routing_refused: false,

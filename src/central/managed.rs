@@ -2779,6 +2779,7 @@ impl Broker {
             store::ensure_private_dir(&state)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             let vault = Vault {
+                last_rotation_ms: None,
                 alias: input.alias,
                 tenant: "sawmills".into(),
                 user: user.into(),
@@ -3503,7 +3504,6 @@ pub(super) fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result
         retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
-        last_rotation: None,
         recovery_generation: 0,
         shared_revision: Owner::read_shared_revision(state)?,
         routing_refused: false,
@@ -4205,7 +4205,6 @@ pub async fn serve(
                     retry_requires_billing: false,
                     retry_started: None,
                     retry_failures: 0,
-                    last_rotation: None,
                     recovery_generation: 0,
                     shared_revision: None,
                     routing_refused: true,
@@ -4773,6 +4772,7 @@ mod tests {
             root.path(),
             &key,
             &vault::Vault {
+                last_rotation_ms: None,
                 alias: "test".into(),
                 tenant: "test".into(),
                 user: "user".into(),

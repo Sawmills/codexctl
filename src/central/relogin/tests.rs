@@ -14,6 +14,7 @@ fn fixture() -> (tempfile::TempDir, PathBuf, PathBuf, Record) {
         &state,
         &key,
         &Vault {
+            last_rotation_ms: None,
             auth: original.clone(),
             alias: "personal".into(),
             user: "amir".into(),

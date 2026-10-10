@@ -3287,6 +3287,7 @@ mod tests {
         let legacy_state = root.path().join("accounts").join("legacy-seat");
         crate::store::ensure_private_dir(&legacy_state).unwrap();
         let legacy_vault = crate::central::vault::Vault {
+            last_rotation_ms: None,
             alias: "legacy-seat".into(),
             tenant: "sawmills".into(),
             user: "legacy-user".into(),
