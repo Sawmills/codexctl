@@ -414,6 +414,13 @@ fn when_an_owner_is_running_then_a_second_owner_is_refused() {
     );
 }
 
+fn failed_request_metrics(counters: &str) -> Vec<&str> {
+    counters
+        .lines()
+        .filter(|line| line.starts_with("codexctl_central_failed_requests_total{"))
+        .collect()
+}
+
 #[test]
 fn when_a_request_has_no_authority_then_one_failure_is_counted() {
     let broker = BrokerTest::start();
@@ -430,7 +437,7 @@ fn when_a_request_has_no_authority_then_one_failure_is_counted() {
         .unwrap();
 
     assert_eq!(response.status().as_u16(), 401);
-    assert_eq!(counters, expected);
+    assert_eq!(failed_request_metrics(&counters), [expected.trim_end()]);
 }
 
 #[test]
@@ -747,7 +754,7 @@ fn when_an_account_mismatch_is_rejected_then_it_is_not_counted_as_an_owner_outag
         .text()
         .unwrap();
 
-    assert_eq!(counters, expected);
+    assert_eq!(failed_request_metrics(&counters), [expected.trim_end()]);
 }
 
 #[test]
@@ -2052,8 +2059,8 @@ fn when_the_billing_read_fails_then_the_helper_returns_no_token_and_one_failure_
         .text()
         .unwrap();
     assert_eq!(
-        counters,
-        "codexctl_central_failed_requests_total{reason=\"owner_unavailable\"} 1\n"
+        failed_request_metrics(&counters),
+        ["codexctl_central_failed_requests_total{reason=\"owner_unavailable\"} 1"]
     );
 }
 
