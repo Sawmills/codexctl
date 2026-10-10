@@ -78,6 +78,24 @@ impl CentralStore {
         .await
     }
 
+    pub(in crate::central) async fn browser_devices(
+        &self,
+        tenant: &str,
+        user: &str,
+    ) -> Result<Vec<vault::Device>> {
+        let db = self.browser_store()?;
+        bounded_db(async {
+            let rows = db.client().await?.query(
+                "SELECT id,tenant,user_id,token_hash,revoked FROM central_devices WHERE tenant=$1 AND user_id=$2 AND deleted_at IS NULL ORDER BY id",
+                &[&tenant, &user],
+            ).await?;
+            Ok(rows.into_iter().map(|row| vault::Device {
+                id: row.get(0), tenant: row.get(1), user: row.get(2),
+                token_hash: row.get(3), revoked: row.get(4),
+            }).collect())
+        }).await
+    }
+
     fn browser_store(&self) -> Result<&PostgresStore> {
         match self {
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => Ok(db),

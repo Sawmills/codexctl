@@ -83,7 +83,7 @@ async fn snapshot(
         .as_ref()
         .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
     {
-        managed::central_registry_devices_for_tenant(central, "sawmills").await
+        central.browser_devices("sawmills", &user).await
     } else {
         vault::devices(&broker.state)
     }

@@ -263,6 +263,10 @@ async fn postgres_dashboard_lists_only_the_company_users_machines_from_the_store
     ] {
         f.control.execute(&format!("INSERT INTO {}.central_devices(id,tenant,user_id,token_hash,revoked) VALUES($1,$2,$3,$4,false)", f.schema), &[&id,&tenant,&owner,&id]).await.unwrap();
     }
+    // A failure while reading another user's device must not break this user's list.
+    f.control.batch_execute(&format!(
+        "ALTER TABLE {0}.central_devices RENAME TO central_devices_source; CREATE FUNCTION {0}.device_token_hash(text,text) RETURNS text LANGUAGE plpgsql AS $$ BEGIN IF $2='foreign' THEN RAISE EXCEPTION 'synthetic foreign device read failure'; END IF; RETURN $1; END $$; CREATE VIEW {0}.central_devices AS SELECT id,tenant,user_id,{0}.device_token_hash(token_hash,user_id) AS token_hash,revoked,revision,deleted_at FROM {0}.central_devices_source", f.schema,
+    )).await.unwrap();
     for pod in [&f.first, &f.second] {
         let response = f
             .http
