@@ -3739,6 +3739,117 @@ fn recent_rotation_guard_survives_refresh_owner_restart() {
 }
 
 #[test]
+fn served_recent_reuses_billing_evidence_without_a_live_limits_read() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(rotated["revision"], before["revision"]);
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+    // A repeated request must survive a provider failure it need not contact.
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    let response = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(response.status(), 200);
+    let recent: Value = response.json().unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(recent["billingClass"], rotated["billingClass"]);
+    assert_eq!(recent["chatgptPlanType"], rotated["chatgptPlanType"]);
+    assert_eq!(recent["statuslineUsage"]["five_hour_used_percent"], 0.0);
+    assert_eq!(
+        recent["statuslineUsage"]["five_hour_resets_at"],
+        4102444800_u64
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+}
+
+#[test]
+fn served_recent_limits_expire_without_extending_the_observation_time() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(rotated["billingClass"], "rate_limited");
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    // The provider starts failing, but fresh evidence for this revision is reused.
+    std::thread::sleep(Duration::from_secs(5));
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["billingClass"], "rate_limited");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+    assert!(recent["statuslineUsage"]["age_seconds"].as_u64().unwrap() >= 5);
+    // Reuse must not move the observation time forward. Now it is over 30 s old.
+    std::thread::sleep(Duration::from_secs(26));
+    let updated = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(updated.status(), 503);
+    assert_eq!(
+        updated.json::<Value>().unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn served_recent_discards_billing_evidence_if_routing_rotates_the_revision() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(rotated["chatgptPlanType"], "pro");
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"routing-billing-change-once",
+    )
+    .unwrap();
+    let recent = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(recent.status(), 200);
+    let recent: Value = recent.json().unwrap();
+    assert_ne!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["chatgptPlanType"], "business");
+    assert_eq!(recent["nativeRoutingSupported"], true);
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+}
+
+#[test]
 fn flat_credentials_share_recent_rotations_including_refresh_only_changes() {
     for mode in ["", "refresh-only"] {
         let mut server = Server::start();

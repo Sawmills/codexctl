@@ -1047,7 +1047,9 @@ Background recovery is controlled by `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY`. It 
 disabled by default. In file mode with background recovery off, a token request
 can recover a retryable fence through the same identity checks and settlement
 path. The first retry waits 5 seconds. Failed attempts double that delay up to
-60 seconds; success resets it. Requests during the delay return
+60 seconds; success resets it. Retryable failures continue at the 60-second cap
+until recovery succeeds, without the background recovery attempt cutoff.
+Requests during the delay return
 `503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
 whole seconds, rounded up. Permanent provider rejections still require login
 renewal. Explicit import remains available through the normal identity and
@@ -1059,7 +1061,11 @@ A matching `previousRevision` also receives the current token when the account
 rotated within the last 60 seconds. The rotation timestamp is saved with the
 encrypted vault and follows shared-store reconciliation and restart. Changes to
 access, refresh, or ID tokens count as rotations in both nested and flat auth
-files. Each matching request logs one JSON
+files. On `served_recent` with `billing:true`, limits observed less than
+30 seconds ago for the same revision are reused without a live rate-limit read.
+Reuse preserves the original observation time; stale or missing evidence takes
+a live read. Workspace routing is still checked before delivery.
+Each matching request logs one JSON
 `forced_refresh` decision with `outcome`, lowercase `account`, `account_key`,
 registered `device`, `reason="previous_revision_current"`, and
 `last_rotation_age_s`. The age is null when no rotation has been observed or the saved timestamp is

@@ -83,6 +83,13 @@ pub(super) fn supported_native_routing(account: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+#[derive(Clone, Copy)]
+enum BillingRead {
+    Omit,
+    Live,
+    Recent,
+}
+
 pub(super) enum TokenFailure {
     AccountMismatch,
     RefreshDisabled,
@@ -349,6 +356,11 @@ impl Owner {
         request: TokenRequest,
         device: Option<&str>,
     ) -> Result<TokenResponse, TokenFailure> {
+        let billing = if request.billing {
+            BillingRead::Live
+        } else {
+            BillingRead::Omit
+        };
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
                 "credential owner unavailable"
@@ -363,7 +375,7 @@ impl Owner {
         };
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
-                return self.with_billing(current, request.billing).await;
+                return self.with_billing(current, billing).await;
             }
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
@@ -389,7 +401,12 @@ impl Owner {
                 );
             }
             if recent {
-                return self.with_billing(current, request.billing).await;
+                let billing = if request.billing {
+                    BillingRead::Recent
+                } else {
+                    BillingRead::Omit
+                };
+                return self.with_billing(current, billing).await;
             }
         }
         // Serialize all calls, and persist any rotated credentials even when RPC fails.
@@ -441,14 +458,15 @@ impl Owner {
             }
             return Err(error.into());
         }
-        self.with_billing(current, request.billing).await
+        self.with_billing(current, billing).await
     }
 
     async fn with_billing(
         &mut self,
         mut token: TokenResponse,
-        requested: bool,
+        billing: BillingRead,
     ) -> Result<TokenResponse, TokenFailure> {
+        let requested = !matches!(billing, BillingRead::Omit);
         if self.rpc.is_none() {
             if requested {
                 token.billing_class = Some(api::BillingClass::Unknown);
@@ -459,36 +477,54 @@ impl Owner {
             let revision = token.revision.clone();
             let mut observed_limits = None;
             if requested {
-                // Rate-limit reads can refresh too. Persist on every result.
-                let result = self
-                    .rpc
-                    .as_mut()
-                    .context("missing owner")?
-                    .call("account/rateLimits/read", json!({}))
-                    .await;
-                let observed_at = std::time::Instant::now();
-                let snapshot = self.snapshot();
-                if snapshot.is_err() {
-                    self.fence(false);
-                }
-                token = snapshot?;
-                let limits = match result {
-                    Ok(limits) => limits,
-                    Err(error)
-                        if self.vault.verified
-                            && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
-                            && !error.is::<RoutingPolicyError>() =>
-                    {
-                        self.retry_requires_billing = true;
-                        self.refresh_failed().await;
-                        self.fence(true);
-                        return Err(TokenFailure::Retryable(error));
-                    }
-                    Err(error) => {
-                        self.refresh_failed().await;
+                let cached = if matches!(billing, BillingRead::Recent) {
+                    self.limits_observed
+                        .as_ref()
+                        .filter(|(at, observed_revision)| {
+                            observed_revision == &revision
+                                && at.elapsed() < std::time::Duration::from_secs(30)
+                        })
+                        .and_then(|(at, _)| {
+                            self.limits.as_ref().map(|limits| (limits.clone(), *at))
+                        })
+                } else {
+                    None
+                };
+                let (limits, observed_at) = if let Some(cached) = cached {
+                    cached
+                } else {
+                    // Rate-limit reads can refresh too. Persist on every result.
+                    let result = self
+                        .rpc
+                        .as_mut()
+                        .context("missing owner")?
+                        .call("account/rateLimits/read", json!({}))
+                        .await;
+                    let observed_at = std::time::Instant::now();
+                    let snapshot = self.snapshot();
+                    if snapshot.is_err() {
                         self.fence(false);
-                        return Err(error.into());
                     }
+                    token = snapshot?;
+                    let limits = match result {
+                        Ok(limits) => limits,
+                        Err(error)
+                            if self.vault.verified
+                                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                                && !error.is::<RoutingPolicyError>() =>
+                        {
+                            self.retry_requires_billing = true;
+                            self.refresh_failed().await;
+                            self.fence(true);
+                            return Err(TokenFailure::Retryable(error));
+                        }
+                        Err(error) => {
+                            self.refresh_failed().await;
+                            self.fence(false);
+                            return Err(error.into());
+                        }
+                    };
+                    (limits, observed_at)
                 };
                 token.billing_class = Some(billing_class(&limits));
                 token.chatgpt_plan_type = limits

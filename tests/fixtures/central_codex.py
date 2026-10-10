@@ -14,6 +14,7 @@ waiting = False
 pending_turn = None
 definitive_rejection = False
 billing_rotated = False
+routing_rotated = False
 limits_read = False
 
 if "login" in sys.argv:
@@ -138,8 +139,13 @@ for line in sys.stdin:
             print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
-        if not params.get("refreshToken") and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-billing-change":
+        routing_mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if not params.get("refreshToken") and (
+            routing_mode == "routing-billing-change"
+            or (routing_mode == "routing-billing-change-once" and not routing_rotated)
+        ):
             rotate(plan_change=True)
+            routing_rotated = True
         if pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "notifications":
             for _ in range(1500):
                 send({"method": "account/rateLimits/updated", "params": {}})
@@ -198,6 +204,9 @@ for line in sys.stdin:
         if mode in ["non-exportable", "baseline-null"]:
             result = {"authMethod":None, "authToken":None, "requiresOpenaiAuth":True}
     elif method == "account/rateLimits/read":
+        counter = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("limits-count")
+        if counter.exists():
+            counter.write_text(str(int(counter.read_text()) + 1))
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         limits_read = True
         if mode == "billing-policy-wrong-method":
