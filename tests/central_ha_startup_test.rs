@@ -100,6 +100,15 @@ impl Pod {
         }
     }
 
+    fn advance_rotation_clock(&self) {
+        let path = self.root.path().join("retry-clock");
+        let now = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64);
+        store::atomic_write(&path, (now + 61_000).to_string().as_bytes()).unwrap();
+    }
+
     fn launches(&self) -> u32 {
         std::fs::read_to_string(self.root.path().join("launch-count"))
             .unwrap()
@@ -1132,6 +1141,17 @@ async fn login_fixture_with_accounts(legacy: bool, foreign: bool) -> LoginFixtur
     login_fixture_with_rename(legacy, foreign, false).await
 }
 async fn login_fixture_with_rename(legacy: bool, foreign: bool, renamed: bool) -> LoginFixture {
+    login_fixture_with_expiry(legacy, foreign, renamed, 4102444800).await
+}
+async fn login_fixture_expiring() -> LoginFixture {
+    login_fixture_with_expiry(false, false, false, chrono::Utc::now().timestamp() + 1800).await
+}
+async fn login_fixture_with_expiry(
+    legacy: bool,
+    foreign: bool,
+    renamed: bool,
+    expires: i64,
+) -> LoginFixture {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(
             std::env::var("CI").ok().as_deref(),
@@ -1184,7 +1204,7 @@ async fn login_fixture_with_rename(legacy: bool, foreign: bool, renamed: bool) -
     let mut seed = Pod::spawn(database.as_str(), &key, root, "file").await;
     store::atomic_write(&seed.root.path().join("mode"), b"").unwrap();
     for (alias, account) in [("seat", "synthetic-seat"), ("other", "other-seat")] {
-        let claims = json!({"sub":account,"iat":2000000000_u64,"exp":4102444800_u64,
+        let claims = json!({"sub":account,"iat":2000000000_u64,"exp":expires,
             "https://api.openai.com/auth":{"chatgpt_account_id":account,"chatgpt_plan_type":"pro"}});
         let auth = json!({"tokens":{
             "access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),
@@ -1407,7 +1427,10 @@ async fn postgres_cancel_stops_a_login_holder_cut_off_from_the_database() {
 }
 
 fn renewal_grant() -> Value {
-    let claims = json!({"sub":"synthetic-seat","iat":2000001000_u64,"exp":4102444800_u64,"generation":10,
+    renewal_grant_with_expiry(4102444800)
+}
+fn renewal_grant_with_expiry(expires: i64) -> Value {
+    let claims = json!({"sub":"synthetic-seat","iat":2000001000_u64,"exp":expires,"generation":10,
         "https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
     json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-renewal","account_id":"synthetic-seat"}})
 }
@@ -1927,14 +1950,96 @@ async fn postgres_cancel_monitors_previous_owner_settlement_after_lease_expiry()
 }
 
 #[tokio::test]
-async fn postgres_shared_renewal_restores_a_previously_fenced_replica() {
+async fn postgres_forced_requests_reuse_a_valid_token_after_the_rotation_guard_expires() {
     let f = login_fixture().await;
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("mode"), b"").unwrap();
+    }
+    let initial: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    for pod in [&f.first, &f.second] {
+        pod.advance_rotation_clock();
+        let response = f
+            .http
+            .post(format!("{}/v1/token", pod.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":true,"previousRevision":initial["revision"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let recent: Value = response.json().await.unwrap();
+        assert_eq!(recent["revision"], initial["revision"]);
+        assert_eq!(recent["accessToken"], initial["accessToken"]);
+        assert_eq!(
+            std::fs::read_to_string(pod.root.path().join("count")).unwrap(),
+            "0"
+        );
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_recent_rotation_guard_follows_the_committed_vault_to_a_peer() {
+    let f = login_fixture_expiring().await;
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("mode"), b"").unwrap();
+    }
+    let initial: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let recent: Value = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":initial["revision"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recent["revision"], initial["revision"]);
+    assert_eq!(recent["accessToken"], initial["accessToken"]);
+    assert_eq!(
+        std::fs::read_to_string(f.second.root.path().join("count")).unwrap(),
+        "0"
+    );
+    f.second.advance_rotation_clock();
+    let next: Value = f
+        .http
+        .post(format!("{}/v1/token", f.second.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","billing":true,"previousRevision":recent["revision"]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ne!(next["revision"], recent["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(f.second.root.path().join("count")).unwrap(),
+        "1"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_shared_renewal_restores_a_previously_fenced_replica() {
+    let f = login_fixture_expiring().await;
     let before: Value = request(&f.http, &f.first, &f.token)
         .await
         .json()
         .await
         .unwrap();
     store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    f.first.advance_rotation_clock();
     let failed = f
         .http
         .post(format!("{}/v1/token", f.first.url))
@@ -2082,7 +2187,10 @@ async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
     login_request(&f, &f.first, "start", &id).await;
     store::atomic_write(
         &f.first.root.path().join("login-release"),
-        &serde_json::to_vec(&renewal_grant()).unwrap(),
+        &serde_json::to_vec(&renewal_grant_with_expiry(
+            chrono::Utc::now().timestamp() + 1800,
+        ))
+        .unwrap(),
     )
     .unwrap();
     timeout(Duration::from_secs(10), async {
@@ -2104,6 +2212,7 @@ async fn postgres_committed_renewal_recovers_after_its_response_times_out() {
     );
     let before: Value = response.json().await.unwrap();
     store::atomic_write(&f.first.root.path().join("mode"), b"error").unwrap();
+    f.first.advance_rotation_clock();
     let failed = f
         .http
         .post(format!("{}/v1/token", f.first.url))
@@ -3475,7 +3584,8 @@ async fn postgres_failed_lease_read_clears_evidence_for_every_replica() {
         .await
         .unwrap();
     // The next native read on the first replica refuses native routing.
-    store::atomic_write(&f.first.root.path().join("mode"), b"non-exportable").unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"routing-policy-missing").unwrap();
+    f.first.advance_rotation_clock();
     let refused = f
         .http
         .post(format!("{}/v1/token", f.first.url))

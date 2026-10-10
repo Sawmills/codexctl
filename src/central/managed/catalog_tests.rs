@@ -39,6 +39,7 @@ impl Fixture {
             &account,
             &key,
             &Vault {
+                last_rotation_ms: None,
                 user: "test".into(),
                 tenant: "sawmills".into(),
                 alias: "fixture".into(),
@@ -105,6 +106,7 @@ impl Fixture {
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::testing(endpoint, timeout)),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),

@@ -31,6 +31,13 @@ OVERLOADED = [
         "code": "server_is_overloaded",
         "message": "Selected model is at capacity. Please try a different model."}}},
 ]
+AFTER_OUTPUT_OVERLOADED = [
+    {"type": "response.created", "response": {"id": "r1"}},
+    {"type": "response.reasoning_summary_text.delta", "delta": "synthetic reasoning"},
+    {"type": "response.failed", "response": {"id": "r1", "error": {
+        "code": "server_is_overloaded",
+        "message": "Selected model is at capacity. Please try a different model."}}},
+]
 RATE = b'{"error":{"type":"rate_limit_exceeded","message":"synthetic"}}'
 
 
@@ -59,7 +66,8 @@ def mock_upstream(script):
                 self.send_header("content-type", "application/json")
             else:
                 self.send_response(200)
-                events = OVERLOADED if step == "overloaded" else OK
+                events = (OVERLOADED if step == "overloaded" else
+                          AFTER_OUTPUT_OVERLOADED if step == "after_output" else OK)
                 body = "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events).encode()
                 self.send_header("content-type", "text/event-stream")
             self.send_header("content-length", str(len(body)))
@@ -119,6 +127,7 @@ def main():
         else:
             scenario(args, home, ["rate", "ok"], 600, False, ["rate"])
         scenario(args, home, ["overloaded", "overloaded", "ok"], 600, True, ["overloaded", "overloaded", "ok"])
+        scenario(args, home, ["after_output"], 600, False, ["after_output"])
         # A 2 s budget fits the first advice (1 to 2 s) but never the second
         # (2 s or more after at least 1 s), so Codex stops after two calls.
         scenario(args, home, ["overloaded"] * 4, 2, False, ["overloaded"] * 2)

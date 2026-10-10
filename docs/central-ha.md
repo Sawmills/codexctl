@@ -462,6 +462,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
            runAsGroup: 10001
            runAsNonRoot: true
            fsGroup: 10001
+           fsGroupChangePolicy: OnRootMismatch
            seccompProfile: { type: RuntimeDefault }
          restartPolicy: Never
          initContainers:
@@ -483,7 +484,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - { name: keys, mountPath: /keys }
          containers:
            - name: migrate
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f67698fe7de7e35eb3659f98a358552edbe1b1d5b52147a4645f25cfa11b0273
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:1b7a83ab6fed64a146f0eeb391d40bdd4bd3829f8466a83cf6c10aa4fbf0c515
              command:
                [
                  codexctl-central,
@@ -557,6 +558,12 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
              emptyDir: { medium: Memory }
    ```
 
+   Keep `fsGroupChangePolicy: OnRootMismatch`, as the StatefulSet does. With the
+   default policy, kubelet adds group read and write to every file on the claim
+   at mount. `vault::private_read` then refuses those files, `backfill` reports
+   pending logins, and `codexctl-0` cannot read its own state after a rollback
+   (B33 attempt 3, 2026-10-09).
+
    Apply the reviewed Job, wait for completion, and repeat the manifest with
    `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]`.
    Keep both Job logs and the backfill JSON counts as the migration receipt.
@@ -585,6 +592,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
            runAsGroup: 10001
            runAsNonRoot: true
            fsGroup: 10001
+           fsGroupChangePolicy: OnRootMismatch
            seccompProfile: { type: RuntimeDefault }
          restartPolicy: Never
          initContainers:
@@ -606,7 +614,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - {name: keys, mountPath: /keys}
          containers:
            - name: backfill
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f67698fe7de7e35eb3659f98a358552edbe1b1d5b52147a4645f25cfa11b0273
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:1b7a83ab6fed64a146f0eeb391d40bdd4bd3829f8466a83cf6c10aa4fbf0c515
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
              securityContext:
                allowPrivilegeEscalation: false

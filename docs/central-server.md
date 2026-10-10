@@ -199,6 +199,11 @@ No flag for billing consent approves a banked reset.
 
 The provider uses `auth.refresh_interval_ms = 60000`.
 The helper asks the account server for current billing evidence on every refresh.
+It requests an OAuth rotation only when its saved access-token expiry is less than
+one hour away. A rapid rerun after HTTP 401 fetches the current revision without
+forcing a rotation. A missing expiry hint does not force a rotation. This lets
+sessions obtain credentials rotated by another session without causing a refresh
+storm.
 After included usage ends, the helper returns no token unless the account has billing approval.
 A failed billing read also refuses unapproved token delivery.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.
@@ -1044,11 +1049,47 @@ device code before its token requests fail as `owner_unavailable`.
 One owner process refreshes each account. Different accounts have separate request locks.
 Server owners run in their private homes with the OpenAI provider and ChatGPT login mode fixed.
 Background recovery is controlled by `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY`. It is
-disabled by default. Explicit import remains available to repair an unavailable
-owner through the normal identity and verification checks. Enable background
+disabled by default. In file mode with background recovery off, a token request
+can recover a retryable fence through the same identity checks and settlement
+path. The first retry waits 5 seconds. Failed attempts double that delay up to
+60 seconds; success resets it. Retryable failures continue at the 60-second cap
+until recovery succeeds, without the background recovery attempt cutoff.
+Requests during the delay return
+`503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
+whole seconds, rounded up. Permanent provider rejections still require login
+renewal. Explicit import remains available through the normal identity and
+verification checks. Enable background
 recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, or
 `on`; the setting takes effect when the server starts.
 Concurrent requests for the same old revision reuse the refreshed token.
+A matching `previousRevision` also receives the current token when the account
+has at least one hour of stored access-token life left, with
+`outcome=served_recent` and `reason=token_valid`. Older clients cannot force
+rotations of healthy access tokens. Near-expiry requests still receive the
+current token if the account rotated within the last 60 seconds. Internal
+login verification and reset probes still exercise the refresh grant.
+Without a usable expiry claim, the existing refresh path and 60-second guard
+apply; each matching request logs `reason=exp_unknown` and counts in the same
+forced-refresh counter.
+The rotation timestamp is saved with the
+encrypted vault and follows shared-store reconciliation and restart. Changes to
+access, refresh, or ID tokens count as rotations in both nested and flat auth
+files. On `served_recent` with `billing:true`, limits observed less than
+30 seconds ago for the same revision are reused without a live rate-limit read.
+Reuse preserves the original observation time; stale or missing evidence takes
+a live read. Workspace routing is still checked before delivery.
+Each matching request logs one JSON
+`forced_refresh` decision with `outcome`, lowercase `account`, `account_key`,
+registered `device`, `reason="token_valid|exp_unknown|previous_revision_current"`, and
+`last_rotation_age_s`. The age is null when no rotation has been observed or the saved timestamp is
+ahead of the current clock. A future timestamp does not hold the guard open.
+The log contains no credentials or provider response body.
+`codexctl_central_forced_refresh_total{outcome="refreshed|served_recent"}` counts
+these decisions. `refreshed` means the decision to attempt a native refresh;
+provider failures still use the existing failure metrics.
+`codexctl_central_owner_recovery_total{result="recovered|failed|backoff"}` counts
+request-driven recovery results and requests held by the cooldown. These counters
+add visibility; this change adds no notification route.
 Revisions cover the full credential state, including refresh-only rotations.
 Client disconnection does not cancel a refresh or an import that already started.
 A graceful shutdown drains requests, stops account owners in parallel, and saves credentials after owner exit.

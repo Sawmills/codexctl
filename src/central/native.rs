@@ -1188,6 +1188,14 @@ fn finish_token(
     if latest.revision == connection.revision {
         latest.revision = token.revision;
         save_connection(path, &latest)?;
+        let hint = TokenExpiryHint {
+            revision: latest.revision.clone(),
+            access_expires_at: api::token_expiry(&token.access_token),
+        };
+        store::atomic_write(
+            &token_sidecar_path(path, "token-expiry")?,
+            &serde_json::to_vec(&hint)?,
+        )?;
     }
     if let (Ok(paths), Ok(selection), Some(usage)) = (
         config::default_paths(),
@@ -1212,6 +1220,40 @@ fn connection_lock_directory(path: &Path, root: &Path) -> Result<PathBuf> {
         .to_owned())
 }
 
+#[derive(Serialize, Deserialize)]
+struct TokenExpiryHint {
+    revision: String,
+    #[serde(default)]
+    access_expires_at: Option<i64>,
+}
+
+fn token_sidecar_path(path: &Path, name: &str) -> Result<PathBuf> {
+    Ok(path.with_file_name(format!(
+        ".{}.{name}.json",
+        path.file_name()
+            .context("missing connection filename")?
+            .to_string_lossy()
+    )))
+}
+
+// A prior helper can change the connection during rollback. Ignore expiry from
+// a different revision, including a crash between the two atomic file writes.
+fn token_expiry_hint(path: &Path, connection: &Connection) -> Result<Option<i64>> {
+    let hint = vault::private_read(&token_sidecar_path(path, "token-expiry")?)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<TokenExpiryHint>(&bytes).ok());
+    Ok(hint
+        .filter(|hint| hint.revision == connection.revision)
+        .and_then(|hint| hint.access_expires_at))
+}
+
+// Callers hold the native lock. A rerun after a 401 fetches the current
+// revision without forcing another rotation of healthy shared credentials.
+fn token_needs_refresh(path: &Path, connection: &Connection) -> Result<bool> {
+    Ok(token_expiry_hint(path, connection)?
+        .is_some_and(|expiry| expiry.saturating_sub(chrono::Utc::now().timestamp()) < 3600))
+}
+
 pub fn print_token(path: &Path) -> Result<()> {
     let directory = connection_lock_directory(path, &root()?)?;
     let directory = directory.as_path();
@@ -1229,7 +1271,11 @@ pub fn print_token(path: &Path) -> Result<()> {
     if connection.launch_pinned {
         launch::require_live_launch(path)?;
     }
-    let token = fetch(&connection, true)?;
+    let refresh = {
+        let _lock = native_lock(directory)?;
+        token_needs_refresh(path, &connection)?
+    };
+    let token = fetch(&connection, refresh)?;
     let _lock = native_lock(directory)?;
     finish_token(path, &connection, token, None)
 }
@@ -1238,7 +1284,7 @@ pub fn print_active_token() -> Result<()> {
         bail!("remote credentials cannot be supplied to a pinned local launch");
     }
     let directory = root()?;
-    let (alias, path, connection) = {
+    let (alias, path, connection, refresh) = {
         let _lock = native_lock(&directory)?;
         let alias = read_active_alias()?;
         let path = connection_path(&alias)?;
@@ -1248,9 +1294,10 @@ pub fn print_active_token() -> Result<()> {
             );
         }
         let connection = read_connection(&path)?;
-        (alias, path, connection)
+        let refresh = token_needs_refresh(&path, &connection)?;
+        (alias, path, connection, refresh)
     };
-    let token = fetch(&connection, true)?;
+    let token = fetch(&connection, refresh)?;
     let _lock = native_lock(&directory)?;
     finish_token(&path, &connection, token, Some(&alias))
 }

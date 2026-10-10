@@ -49,7 +49,7 @@ fn registration(path: &Path) -> Result<Option<Connection>> {
 pub fn connection() -> Result<Option<Connection>> {
     registration(&path()?)
 }
-pub(super) fn secret(connection: &Connection) -> Result<String> {
+pub(crate) fn secret(connection: &Connection) -> Result<String> {
     transport::origin(&connection.server)?;
     Ok(
         String::from_utf8(vault::private_read(&connection.token_file)?)?
