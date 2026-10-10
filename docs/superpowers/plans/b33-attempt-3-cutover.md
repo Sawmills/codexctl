@@ -4,6 +4,12 @@
 
 Reader: the cutover operator and the HQ that approves the window. The design and the Job manifests are in [central-ha.md section 5](../../central-ha.md#5-staging-migration-and-rollback); this runbook changes how they are delivered, not what they do.
 
+## Attempt 4 image and window (2026-10-10)
+
+The next window is Mon 2026-10-12 17:00-18:00Z. Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:4a22377efa5b9d1a776283fef4993e77c70743d75dcc3f4efdf344d49ec5dde3` for the HA broker and both migration Jobs. [Central server image run 38072337625](https://github.com/Sawmills/codexctl/actions/runs/38072337625) succeeded on main `ac4afeb8f539ba9277fe3d9675d59f5805d62dc1`, which contains #176 and #182 as well as SAW-12484 recovery and layout 8. This digest supersedes the attempt 3 image in the historical readiness table below.
+
+PR H (#167) and PR I (#168) stage this digest in both overlays; the migrate and backfill templates in `central-ha.md` use it too. Both Jobs retain `fsGroupChangePolicy: OnRootMismatch`. Fresh Architect approval and green checks are required on each updated PR head. Keep both PRs unmerged until the Monday window; t5D owns the Sunday canary. SAW-12757 PR 1 (#177) must remain outside this image and unmerged until HQ confirms attempt 4 closed.
+
 ## Readiness Check (2026-10-08)
 
 Checked against `main` at `c7fd94e` after SAW-12484 PR1 (#143), PR2 (#145), and PR3 (#154) merged. Verdict (updated after #162): prerequisite 7 is met in code, so a window can be proposed. HQ decisions on 2026-10-08: the valid-token fast path (#162) replaces the bounded lease wait (prerequisite 7); the fast-path flag is on in PR H; and window step 7 runs `central-ha.md` section 6 items 1, 4, 5, and 7 (prerequisite 1).
