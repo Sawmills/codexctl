@@ -124,13 +124,14 @@ impl BrokerTest {
             .args(options)
             .process_group(0)
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
+            .env("CENTRAL_TEST_RETRY_CLOCK", root.path().join("retry-clock"))
             .env("CENTRAL_TEST_KEY_FILE", &key)
             .env(
                 "CENTRAL_TEST_REFRESH_COUNTER",
                 root.path().join("refresh-count"),
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(root.path().join("server.stderr")).unwrap())
             .spawn()
             .unwrap();
         let mut line = String::new();
@@ -213,6 +214,66 @@ impl Drop for BrokerTest {
 }
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py")
+}
+
+#[test]
+fn legacy_token_endpoint_reports_both_forced_refresh_decisions() {
+    let broker = BrokerTest::start();
+    let initial = broker.grant();
+    let rotated: Value = broker
+        .token_request(
+            &broker.token,
+            json!({"previousRevision":initial["revision"]}),
+        )
+        .json()
+        .unwrap();
+    let recent: Value = broker
+        .token_request(
+            &broker.token,
+            json!({"previousRevision":rotated["revision"]}),
+        )
+        .json()
+        .unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    let metrics = broker
+        .http
+        .get(format!("{}/metrics", broker.url))
+        .bearer_auth(&broker.token)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for outcome in ["refreshed", "served_recent"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_forced_refresh_total{{outcome=\"{outcome}\"}} 1\n"
+            )),
+            "{metrics}"
+        );
+    }
+    let stderr = std::fs::read_to_string(broker.root.path().join("server.stderr")).unwrap();
+    let entries: Vec<Value> = stderr
+        .lines()
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(|entry| entry["operation"] == "forced_refresh")
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["outcome"], "refreshed");
+    assert_eq!(entries[1]["outcome"], "served_recent");
+    for entry in entries {
+        assert_eq!(entry["device"], "laptop");
+        assert_eq!(entry["account"], "personal");
+    }
+    for secret in [
+        broker.token.as_str(),
+        initial["accessToken"].as_str().unwrap(),
+        rotated["accessToken"].as_str().unwrap(),
+        "synthetic-initial-refresh",
+        "synthetic-rotated-refresh",
+    ] {
+        assert!(!stderr.contains(secret));
+        assert!(!metrics.contains(secret));
+    }
 }
 
 #[test]
@@ -354,6 +415,13 @@ fn when_an_owner_is_running_then_a_second_owner_is_refused() {
     );
 }
 
+fn failed_request_metrics(counters: &str) -> Vec<&str> {
+    counters
+        .lines()
+        .filter(|line| line.starts_with("codexctl_central_failed_requests_total{"))
+        .collect()
+}
+
 #[test]
 fn when_a_request_has_no_authority_then_one_failure_is_counted() {
     let broker = BrokerTest::start();
@@ -370,7 +438,7 @@ fn when_a_request_has_no_authority_then_one_failure_is_counted() {
         .unwrap();
 
     assert_eq!(response.status().as_u16(), 401);
-    assert_eq!(counters, expected);
+    assert_eq!(failed_request_metrics(&counters), [expected.trim_end()]);
 }
 
 #[test]
@@ -687,7 +755,7 @@ fn when_an_account_mismatch_is_rejected_then_it_is_not_counted_as_an_owner_outag
         .text()
         .unwrap();
 
-    assert_eq!(counters, expected);
+    assert_eq!(failed_request_metrics(&counters), [expected.trim_end()]);
 }
 
 #[test]
@@ -1992,8 +2060,8 @@ fn when_the_billing_read_fails_then_the_helper_returns_no_token_and_one_failure_
         .text()
         .unwrap();
     assert_eq!(
-        counters,
-        "codexctl_central_failed_requests_total{reason=\"owner_unavailable\"} 1\n"
+        failed_request_metrics(&counters),
+        ["codexctl_central_failed_requests_total{reason=\"owner_unavailable\"} 1"]
     );
 }
 
@@ -2221,6 +2289,12 @@ fn when_included_headroom_exhausts_then_helper_returns_no_token() {
     let selected = client.select();
     let initial = client.helper();
     std::fs::write(client.broker.root.path().join("mode"), "exhausted-weekly").unwrap();
+    // Require a new native billing observation beyond the recent-token guard.
+    std::fs::write(
+        client.broker.root.path().join("retry-clock"),
+        (chrono::Utc::now().timestamp_millis() + 61_000).to_string(),
+    )
+    .unwrap();
 
     let helper = client.helper();
 

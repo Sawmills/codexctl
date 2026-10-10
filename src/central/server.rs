@@ -83,6 +83,13 @@ pub(super) fn supported_native_routing(account: &Value) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+#[derive(Clone, Copy)]
+enum BillingRead {
+    Omit,
+    Live,
+    Recent,
+}
+
 pub(super) enum TokenFailure {
     AccountMismatch,
     RefreshDisabled,
@@ -91,13 +98,16 @@ pub(super) enum TokenFailure {
     Retryable(anyhow::Error),
 }
 
+#[cfg(debug_assertions)]
+fn injected_retry_clock() -> Option<u64> {
+    let path = std::env::var("CENTRAL_TEST_RETRY_CLOCK").ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 pub(super) fn retry_clock_now() -> u64 {
     // Integration tests run the debug binary; release builds cannot read this hook.
     #[cfg(debug_assertions)]
-    if let Ok(path) = std::env::var("CENTRAL_TEST_RETRY_CLOCK")
-        && let Ok(value) = std::fs::read_to_string(path)
-        && let Ok(milliseconds) = value.trim().parse()
-    {
+    if let Some(milliseconds) = injected_retry_clock() {
         return milliseconds;
     }
     static START: OnceLock<Instant> = OnceLock::new();
@@ -186,6 +196,18 @@ impl Owner {
         retry_clock_now()
     }
 
+    fn rotation_clock_now(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(clock) = self.retry_clock.as_ref() {
+            return clock();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(milliseconds) = injected_retry_clock() {
+            return milliseconds;
+        }
+        chrono::Utc::now().timestamp_millis().max(0) as u64
+    }
+
     pub(super) fn retry_cooldown_active(&self) -> bool {
         if self.retry_failures >= 3 {
             return true;
@@ -197,6 +219,16 @@ impl Owner {
         };
         self.retry_started
             .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
+    }
+    pub(super) fn on_demand_retry_after(&self) -> Option<u64> {
+        let started = self.retry_started?;
+        let backoff = (5_000u64 << self.retry_failures.min(4)).min(60_000);
+        let remaining = backoff.saturating_sub(self.retry_clock_now().saturating_sub(started));
+        (remaining > 0).then(|| remaining.div_ceil(1000))
+    }
+
+    pub(super) fn on_demand_cooldown_active(&self) -> bool {
+        self.on_demand_retry_after().is_some()
     }
     pub(super) fn selectable(&self) -> bool {
         self.available && !self.routing_refused
@@ -292,7 +324,11 @@ impl Owner {
                 self.vault.import_rejected = false;
             }
         }
+        let rotated = vault::credentials_changed(&self.vault.auth, &auth);
         self.vault.auth = auth;
+        if rotated {
+            self.vault.last_rotation_ms = Some(self.rotation_clock_now());
+        }
         vault::save(&self.state, &self.key, &self.vault)?;
         let access_token = vault::token(&self.vault.auth)?.to_owned();
         Ok(TokenResponse {
@@ -312,6 +348,19 @@ impl Owner {
         &mut self,
         request: TokenRequest,
     ) -> Result<TokenResponse, TokenFailure> {
+        self.tokens_for_device(request, None).await
+    }
+
+    pub(super) async fn tokens_for_device(
+        &mut self,
+        request: TokenRequest,
+        device: Option<&str>,
+    ) -> Result<TokenResponse, TokenFailure> {
+        let billing = if request.billing {
+            BillingRead::Live
+        } else {
+            BillingRead::Omit
+        };
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
                 "credential owner unavailable"
@@ -326,10 +375,38 @@ impl Owner {
         };
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
-                return self.with_billing(current, request.billing).await;
+                return self.with_billing(current, billing).await;
             }
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
+            }
+            let age_ms = self
+                .vault
+                .last_rotation_ms
+                .and_then(|rotated| self.rotation_clock_now().checked_sub(rotated));
+            // Verification and reset-auth probes must still exercise the grant.
+            // The cooldown governs forced refreshes requested by machines.
+            let recent = device.is_some() && age_ms.is_some_and(|age| age < 60_000);
+            if let Some(device) = device {
+                super::refresh_control::forced(
+                    if recent {
+                        super::refresh_control::Forced::ServedRecent
+                    } else {
+                        super::refresh_control::Forced::Refreshed
+                    },
+                    &self.vault.alias,
+                    &self.vault.user,
+                    device,
+                    age_ms,
+                );
+            }
+            if recent {
+                let billing = if request.billing {
+                    BillingRead::Recent
+                } else {
+                    BillingRead::Omit
+                };
+                return self.with_billing(current, billing).await;
             }
         }
         // Serialize all calls, and persist any rotated credentials even when RPC fails.
@@ -381,14 +458,15 @@ impl Owner {
             }
             return Err(error.into());
         }
-        self.with_billing(current, request.billing).await
+        self.with_billing(current, billing).await
     }
 
     async fn with_billing(
         &mut self,
         mut token: TokenResponse,
-        requested: bool,
+        billing: BillingRead,
     ) -> Result<TokenResponse, TokenFailure> {
+        let requested = !matches!(billing, BillingRead::Omit);
         if self.rpc.is_none() {
             if requested {
                 token.billing_class = Some(api::BillingClass::Unknown);
@@ -399,36 +477,54 @@ impl Owner {
             let revision = token.revision.clone();
             let mut observed_limits = None;
             if requested {
-                // Rate-limit reads can refresh too. Persist on every result.
-                let result = self
-                    .rpc
-                    .as_mut()
-                    .context("missing owner")?
-                    .call("account/rateLimits/read", json!({}))
-                    .await;
-                let observed_at = std::time::Instant::now();
-                let snapshot = self.snapshot();
-                if snapshot.is_err() {
-                    self.fence(false);
-                }
-                token = snapshot?;
-                let limits = match result {
-                    Ok(limits) => limits,
-                    Err(error)
-                        if self.vault.verified
-                            && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
-                            && !error.is::<RoutingPolicyError>() =>
-                    {
-                        self.retry_requires_billing = true;
-                        self.refresh_failed().await;
-                        self.fence(true);
-                        return Err(TokenFailure::Retryable(error));
-                    }
-                    Err(error) => {
-                        self.refresh_failed().await;
+                let cached = if matches!(billing, BillingRead::Recent) {
+                    self.limits_observed
+                        .as_ref()
+                        .filter(|(at, observed_revision)| {
+                            observed_revision == &revision
+                                && at.elapsed() < std::time::Duration::from_secs(30)
+                        })
+                        .and_then(|(at, _)| {
+                            self.limits.as_ref().map(|limits| (limits.clone(), *at))
+                        })
+                } else {
+                    None
+                };
+                let (limits, observed_at) = if let Some(cached) = cached {
+                    cached
+                } else {
+                    // Rate-limit reads can refresh too. Persist on every result.
+                    let result = self
+                        .rpc
+                        .as_mut()
+                        .context("missing owner")?
+                        .call("account/rateLimits/read", json!({}))
+                        .await;
+                    let observed_at = std::time::Instant::now();
+                    let snapshot = self.snapshot();
+                    if snapshot.is_err() {
                         self.fence(false);
-                        return Err(error.into());
                     }
+                    token = snapshot?;
+                    let limits = match result {
+                        Ok(limits) => limits,
+                        Err(error)
+                            if self.vault.verified
+                                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                                && !error.is::<RoutingPolicyError>() =>
+                        {
+                            self.retry_requires_billing = true;
+                            self.refresh_failed().await;
+                            self.fence(true);
+                            return Err(TokenFailure::Retryable(error));
+                        }
+                        Err(error) => {
+                            self.refresh_failed().await;
+                            self.fence(false);
+                            return Err(error.into());
+                        }
+                    };
+                    (limits, observed_at)
                 };
                 token.billing_class = Some(billing_class(&limits));
                 token.chatgpt_plan_type = limits
@@ -653,7 +749,7 @@ impl Broker {
         );
         (status, Json(json!({"error":reason})))
     }
-    fn authorize(&self, headers: &HeaderMap) -> Result<(), HttpError> {
+    fn authorize(&self, headers: &HeaderMap) -> Result<String, HttpError> {
         let bearer = headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
@@ -669,7 +765,7 @@ impl Broker {
         if device.tenant != self.tenant || device.user != self.user {
             return Err(self.error(StatusCode::FORBIDDEN, "forbidden"));
         }
-        Ok(())
+        Ok(device.id.clone())
     }
 }
 
@@ -678,7 +774,7 @@ async fn tokens(
     headers: HeaderMap,
     body: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
-    broker.authorize(&headers)?;
+    let device = broker.authorize(&headers)?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     // A disconnected HTTP client must not cancel a refresh after OpenAI rotates its token.
@@ -686,7 +782,7 @@ async fn tokens(
     let task = tokio::spawn(async move {
         let mut owner = owner.lock().await;
         owner.validate_account_id(request.account_id.as_deref())?;
-        owner.tokens(request).await
+        owner.tokens_for_device(request, Some(&device)).await
     });
     let result = task
         .await
@@ -713,6 +809,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         })
         .collect();
     output.push_str(&super::owner_refresh::metrics());
+    output.push_str(&super::refresh_control::metrics());
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,

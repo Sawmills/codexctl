@@ -282,7 +282,7 @@ impl Server {
             .env("CENTRAL_TEST_OWNER_CWD_FILE", root.path().join("owner-cwd"))
             .env("CENTRAL_TEST_RECOVERY_INTERVAL_MS", "20")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(root.path().join("server.stderr")).unwrap())
             .spawn()
             .unwrap();
         let mut line = String::new();
@@ -352,6 +352,16 @@ impl Server {
             .send()
             .unwrap()
     }
+    fn advance_rotation_clock(&self) {
+        let path = self.root.path().join("retry-clock");
+        let now: u64 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        store::atomic_write(&path, (now + 61_000).to_string().as_bytes()).unwrap();
+    }
+
     fn stop(&mut self) {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         assert!(self.child.wait().unwrap().success());
@@ -2505,6 +2515,7 @@ fn when_a_user_requests_another_users_alias_then_no_access_token_is_returned() {
 fn when_an_import_is_retried_after_refresh_then_the_latest_credentials_are_preserved() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -2545,6 +2556,7 @@ fn when_a_user_is_disabled_then_existing_devices_lose_access() {
 fn when_the_server_restarts_then_it_preserves_the_refreshed_account() {
     let mut server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -2559,6 +2571,7 @@ fn when_the_server_restarts_then_it_preserves_the_refreshed_account() {
 fn when_multiple_clients_refresh_the_same_revision_then_the_owner_rotates_once() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let results = std::thread::scope(|scope| {
         let first = scope.spawn(|| {
@@ -3669,7 +3682,421 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
 }
 
 #[test]
-fn background_recovery_is_off_by_default_and_import_can_repair() {
+fn a_future_rotation_timestamp_does_not_suppress_machine_refresh() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", initial["revision"].as_str())
+        .json()
+        .unwrap();
+    // A backward wall-clock step must not extend the forced-refresh guard.
+    store::atomic_write(&server.root.path().join("retry-clock"), b"50000").unwrap();
+    let next: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(next["revision"], rotated["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "3"
+    );
+}
+
+#[test]
+fn recent_rotation_guard_survives_refresh_owner_restart() {
+    let mut server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    server.stop();
+    server.restart();
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn served_recent_reuses_billing_evidence_without_a_live_limits_read() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(rotated["revision"], before["revision"]);
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+    // A repeated request must survive a provider failure it need not contact.
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    let response = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(response.status(), 200);
+    let recent: Value = response.json().unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(recent["billingClass"], rotated["billingClass"]);
+    assert_eq!(recent["chatgptPlanType"], rotated["chatgptPlanType"]);
+    assert_eq!(recent["statuslineUsage"]["five_hour_used_percent"], 0.0);
+    assert_eq!(
+        recent["statuslineUsage"]["five_hour_resets_at"],
+        4102444800_u64
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+}
+
+#[test]
+fn served_recent_limits_expire_without_extending_the_observation_time() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(rotated["billingClass"], "rate_limited");
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    // The provider starts failing, but fresh evidence for this revision is reused.
+    std::thread::sleep(Duration::from_secs(5));
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["billingClass"], "rate_limited");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "1");
+    assert!(recent["statuslineUsage"]["age_seconds"].as_u64().unwrap() >= 5);
+    // Reuse must not move the observation time forward. Now it is over 30 s old.
+    std::thread::sleep(Duration::from_secs(26));
+    let updated = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(updated.status(), 503);
+    assert_eq!(
+        updated.json::<Value>().unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+}
+
+#[test]
+fn served_recent_discards_billing_evidence_if_routing_rotates_the_revision() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    server.advance_rotation_clock();
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let counter = server.root.path().join("limits-count");
+    store::atomic_write(&counter, b"0").unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", before["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(rotated["chatgptPlanType"], "pro");
+    store::atomic_write(
+        &server.root.path().join("mode"),
+        b"routing-billing-change-once",
+    )
+    .unwrap();
+    let recent = server.token(&server.amir, "personal", rotated["revision"].as_str());
+    assert_eq!(recent.status(), 200);
+    let recent: Value = recent.json().unwrap();
+    assert_ne!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["chatgptPlanType"], "business");
+    assert_eq!(recent["nativeRoutingSupported"], true);
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+}
+
+#[test]
+fn flat_credentials_share_recent_rotations_including_refresh_only_changes() {
+    for mode in ["", "refresh-only"] {
+        let mut server = Server::start();
+        let flat = auth("amir-login", "amir-seat")["tokens"].clone();
+        let imported = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"personal","auth":flat}))
+            .send()
+            .unwrap();
+        assert_eq!(imported.status(), 200, "{}", imported.text().unwrap());
+        server.advance_rotation_clock();
+        let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let rotated: Value = server
+            .token(&server.amir, "personal", first["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(rotated["revision"], first["revision"], "mode={mode}");
+        if mode == "refresh-only" {
+            assert_eq!(rotated["accessToken"], first["accessToken"]);
+        } else {
+            assert_ne!(rotated["accessToken"], first["accessToken"]);
+        }
+        let recent: Value = server
+            .token(&server.amir, "personal", rotated["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_eq!(recent["revision"], rotated["revision"], "mode={mode}");
+        assert_eq!(recent["accessToken"], rotated["accessToken"]);
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "2"
+        );
+        server.stop();
+        server.restart();
+        let restored: Value = server
+            .token(&server.amir, "personal", rotated["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_eq!(restored["revision"], rotated["revision"], "mode={mode}");
+        server.advance_rotation_clock();
+        let next: Value = server
+            .token(&server.amir, "personal", restored["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(next["revision"], restored["revision"], "mode={mode}");
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "3"
+        );
+    }
+}
+
+#[test]
+fn matching_forced_requests_share_one_rotation_until_sixty_seconds_pass() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(rotated["revision"], first["revision"]);
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+    // A stale revision still gets the current token without rotating.
+    let stale: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(stale["revision"], rotated["revision"]);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"121000").unwrap();
+    let next: Value = server
+        .token(&server.amir, "personal", recent["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(next["revision"], recent["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "3"
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"refreshed\"} 2\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"served_recent\"} 1\n"),
+        "{metrics}"
+    );
+    let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+    let decisions: Vec<Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["operation"] == "forced_refresh")
+        .collect();
+    assert_eq!(decisions.len(), 3, "{stderr}");
+    for (entry, outcome, age) in [
+        (&decisions[0], "refreshed", 60),
+        (&decisions[1], "served_recent", 0),
+        (&decisions[2], "refreshed", 61),
+    ] {
+        assert_eq!(entry["outcome"], outcome);
+        assert_eq!(entry["account"], "personal");
+        assert_eq!(
+            entry["account_key"],
+            "6ba9ac331db132b647376ae248690786b6e5958513de3490b10422fad3e7344a"
+        );
+        assert_eq!(entry["device"], "amir-laptop");
+        assert_eq!(entry["reason"], "previous_revision_current");
+        assert_eq!(entry["last_rotation_age_s"], age);
+        assert_eq!(entry.as_object().unwrap().len(), 7);
+    }
+    for secret in [
+        server.amir.as_str(),
+        first["accessToken"].as_str().unwrap(),
+        rotated["accessToken"].as_str().unwrap(),
+        next["accessToken"].as_str().unwrap(),
+        "synthetic-refresh",
+        "synthetic-rotated-refresh",
+        "auth.json",
+    ] {
+        assert!(!stderr.contains(secret), "secret in stderr");
+        assert!(!metrics.contains(secret), "secret in metrics");
+    }
+}
+
+#[test]
+fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let launches = || {
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    for (index, due) in [5_000u64, 15_000, 35_000, 75_000, 135_000]
+        .into_iter()
+        .enumerate()
+    {
+        store::atomic_write(
+            &server.root.path().join("retry-clock"),
+            (due - 1).to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        assert_eq!(launches(), index as u32 + 1);
+        store::atomic_write(
+            &server.root.path().join("retry-clock"),
+            due.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        assert_eq!(launches(), index as u32 + 2);
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"194999").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 6);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"195000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"200000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for (result, count) in [("recovered", 2), ("failed", 5), ("backoff", 6)] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_owner_recovery_total{{result=\"{result}\"}} {count}\n"
+            )),
+            "{metrics}"
+        );
+    }
+}
+
+#[test]
+fn on_demand_recovery_never_relaunches_a_provider_rejected_refresh_owner() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"600000").unwrap();
+    let rejected = server.token(&server.amir, "personal", None);
+    assert_eq!(rejected.status(), 503);
+    assert!(rejected.headers().get("retry-after").is_none());
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
+fn token_request_recovers_retryable_refresh_owner_with_background_recovery_off() {
     let mut server = Server::start();
     server.stop();
     let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
@@ -3685,19 +4112,19 @@ fn background_recovery_is_off_by_default_and_import_can_repair() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let blocked = server.token(&server.amir, "personal", None);
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers().get("retry-after").unwrap(), "5");
+    store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let blocked = server.token(&server.amir, "personal", None);
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers().get("retry-after").unwrap(), "1");
     assert_eq!(
         std::fs::read(server.root.path().join("launch-count")).unwrap(),
         launches
     );
-    assert_eq!(
-        server
-            .import(&server.amir, "personal", "amir-login", "amir-seat")
-            .status(),
-        200
-    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 
@@ -3851,6 +4278,7 @@ fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
 fn a_rejected_forced_refresh_is_counted_too() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(
         &server.root.path().join("mode"),
@@ -4066,6 +4494,7 @@ fn when_a_crash_leaves_a_newer_journal_then_restart_recovers_it() {
         .unwrap()
         .path();
     let old = std::fs::read(account.join("vault.enc")).unwrap();
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -4126,6 +4555,7 @@ fn when_another_users_refresh_is_blocked_then_your_account_catalog_still_respond
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
     server.import(&server.alex, "personal", "alex-login", "alex-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.alex, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
     let response = std::thread::scope(|scope| {
@@ -5432,6 +5862,7 @@ fn refresh_only_rotation_changes_the_revision_and_is_not_replayed_for_another_cl
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"refresh-only").unwrap();
     let after: Value = server
@@ -5445,6 +5876,14 @@ fn refresh_only_rotation_changes_the_revision_and_is_not_replayed_for_another_cl
         .json()
         .unwrap();
     assert_eq!(second["revision"], after["revision"]);
+    // A matching revision is also held: refreshing only the grant is still
+    // a credential rotation, even when the access token stays the same.
+    let matching: Value = server
+        .token(&server.amir, "personal", after["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(matching["revision"], after["revision"]);
+    assert_eq!(matching["accessToken"], after["accessToken"]);
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
         "2"
@@ -5544,6 +5983,7 @@ fn a_legacy_migration_retry_keeps_the_uid_learned_by_the_server() {
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let token: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
     assert_eq!(
@@ -6051,6 +6491,8 @@ fn routing_refresh_cannot_reuse_billing_evidence_for_an_older_revision() {
                 .success()
         );
         store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        // These native billing hooks must run beyond the recent-token guard.
+        server.advance_rotation_clock();
         let output = server.cli(
             home.path(),
             &[
@@ -6061,7 +6503,7 @@ fn routing_refresh_cannot_reuse_billing_evidence_for_an_older_revision() {
         );
         assert!(
             !output.status.success(),
-            "new plan must not inherit the old plan's approval"
+            "new plan must not inherit the old plan's approval: mode={mode}"
         );
         assert!(output.stdout.is_empty());
         let saved = saved_vault(&server, &account_directory(&server, "amir", "personal"));
@@ -7663,6 +8105,7 @@ fn hq6_slow_refresh_does_not_block_another_alias_of_the_same_company_user() {
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "slow", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
     let fast = std::thread::scope(|scope| {
@@ -9866,6 +10309,9 @@ assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat
 active = subprocess.run([helper_command, 'central-token', '--active'], capture_output=True)
 assert active.returncode == 1
 pathlib.Path(os.environ['B21_MODE']).write_text('exhausted-weekly')
+# Exercise a new native billing observation beyond the recent-token guard.
+clock = pathlib.Path(os.environ['B21_MODE']).with_name('retry-clock')
+clock.write_text(str(int(clock.read_text()) + 61000))
 exhausted = subprocess.run([helper_command] + helper, capture_output=True, text=True)
 assert exhausted.returncode == 1 and 'exhausted' in exhausted.stderr, exhausted.stderr
 pathlib.Path(os.environ['B21_MODE']).write_text('normal')
