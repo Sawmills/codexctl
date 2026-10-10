@@ -381,6 +381,20 @@ impl Server {
             .output()
             .unwrap()
     }
+    #[cfg(unix)]
+    fn cli_from_fresh_parent(&self, home: &std::path::Path, args: &[&str]) -> std::process::Output {
+        // Keep the shell alive while the helper runs, so it is a distinct Codex parent.
+        Command::new("sh")
+            .args(["-c", "\"$@\"; exit \"$?\"", "token-parent"])
+            .arg(env!("CARGO_BIN_EXE_codexctl"))
+            .args(args)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("HOME", home)
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    }
     fn connected_home(&self) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().join(".codexctl/central");
@@ -2594,6 +2608,263 @@ fn when_multiple_clients_refresh_the_same_revision_then_the_owner_rotates_once()
         "2"
     );
 }
+#[test]
+fn healthy_native_token_helpers_do_not_force_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let connection = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec![
+                "central-token",
+                "--connection",
+                connection.to_str().unwrap(),
+            ]
+        };
+        assert!(server.cli(home.path(), &args).status.success());
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        // Exercise the actual provider interval with the same parent. Advance the
+        // server guard too, so it cannot hide an unnecessary forced refresh.
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_secs(60));
+            server.advance_rotation_clock();
+            let token = server.cli(home.path(), &args);
+            assert!(
+                token.status.success(),
+                "{}",
+                String::from_utf8_lossy(&token.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap(),
+                before,
+                "scheduled helper rechecks must not rotate healthy access (active={active})"
+            );
+        }
+    }
+}
+
+#[test]
+fn rapid_native_token_retry_from_the_same_parent_forces_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let connection = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec![
+                "central-token",
+                "--connection",
+                connection.to_str().unwrap(),
+            ]
+        };
+        let first = server.cli(home.path(), &args);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before: u32 = std::fs::read_to_string(&count).unwrap().parse().unwrap();
+        let retry = server.cli(home.path(), &args);
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        let after: u32 = std::fs::read_to_string(count).unwrap().parse().unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "a fast retry must rotate once (active={active})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn near_expiry_native_token_helpers_force_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        assert!(server.cli(home.path(), &args).status.success());
+        let mut connection: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        connection["access_expires_at"] = json!(chrono::Utc::now().timestamp() + 3599);
+        store::atomic_write(&path, &serde_json::to_vec(&connection).unwrap()).unwrap();
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before: u32 = std::fs::read_to_string(&count).unwrap().parse().unwrap();
+        let token = server.cli_from_fresh_parent(home.path(), &args);
+        assert!(
+            token.status.success(),
+            "{}",
+            String::from_utf8_lossy(&token.stderr)
+        );
+        let after: u32 = std::fs::read_to_string(count).unwrap().parse().unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "near-expiry access must rotate (active={active})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn another_native_token_parent_does_not_force_and_old_connections_gain_only_expiry() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        let first = server.cli(home.path(), &args);
+        assert!(first.status.success());
+        let mut old: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("access_expires_at");
+        store::atomic_write(&path, &serde_json::to_vec(&old).unwrap()).unwrap();
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        let second = server.cli_from_fresh_parent(home.path(), &args);
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(count).unwrap(),
+            before,
+            "another parent must not trigger recovery (active={active})"
+        );
+        let connection_text = std::fs::read_to_string(&path).unwrap();
+        let connection: Value = serde_json::from_str(&connection_text).unwrap();
+        assert_eq!(connection["access_expires_at"], 4102444800_i64);
+        let history_path = path.with_file_name(".personal.json.token-calls.json");
+        let history_text = std::fs::read_to_string(&history_path).unwrap();
+        let history: Value = serde_json::from_str(&history_text).unwrap();
+        assert_eq!(history.as_object().unwrap().len(), 2);
+        let access = String::from_utf8(second.stdout).unwrap();
+        for text in [connection_text, history_text] {
+            assert!(
+                !text.contains(access.trim()),
+                "access token must never be persisted"
+            );
+            assert!(
+                !text.contains("synthetic-refresh"),
+                "refresh token must never be persisted"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(history_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn rapid_native_token_calls_on_different_connections_do_not_force() {
+    let server = Server::start();
+    for (alias, seat) in [("personal", "amir-seat"), ("work", "work-seat")] {
+        assert_eq!(
+            server
+                .import(&server.amir, alias, "amir-login", seat)
+                .status(),
+            200
+        );
+    }
+    let home = server.connected_home();
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
+    );
+    assert!(
+        server
+            .cli(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    assert!(server.cli(home.path(), &["use", "work"]).status.success());
+    server.advance_rotation_clock();
+    let count = server.root.path().join("count");
+    let before = std::fs::read_to_string(&count).unwrap();
+    let token = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(count).unwrap(), before);
+}
+
 #[test]
 fn when_a_machine_uses_the_server_then_the_regular_codex_provider_has_a_token_helper() {
     let server = Server::start();

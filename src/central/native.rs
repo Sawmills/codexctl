@@ -85,6 +85,8 @@ struct Connection {
     device_token_file: PathBuf,
     account_id: String,
     revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_expires_at: Option<i64>,
     #[serde(default)]
     allow_billing: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -877,6 +879,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         device_token_file: std::fs::canonicalize(token_file)?,
         account_id: String::new(),
         revision: String::new(),
+        access_expires_at: None,
         allow_billing: false,
         launch_pinned: false,
         approved_billing_plan: None,
@@ -1187,6 +1190,7 @@ fn finish_token(
     }
     if latest.revision == connection.revision {
         latest.revision = token.revision;
+        latest.access_expires_at = api::token_expiry(&token.access_token);
         save_connection(path, &latest)?;
     }
     if let (Ok(paths), Ok(selection), Some(usage)) = (
@@ -1212,6 +1216,46 @@ fn connection_lock_directory(path: &Path, root: &Path) -> Result<PathBuf> {
         .to_owned())
 }
 
+// Callers hold the connection's native lock. Each connection has its own
+// private history, and unrelated Codex parents cannot trigger each other's retries.
+fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
+    let history_path = path.with_file_name(format!(
+        ".{}.token-calls.json",
+        path.file_name()
+            .context("missing connection filename")?
+            .to_string_lossy()
+    ));
+    let mut calls: std::collections::BTreeMap<u32, u64> = match vault::private_read(&history_path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid token call history")?,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Default::default()
+        }
+        Err(error) => return Err(error),
+    };
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    calls.retain(|_, previous| now.checked_sub(*previous).is_some_and(|age| age < 600_000));
+    #[cfg(unix)]
+    let parent = unsafe { libc::getppid() } as u32;
+    #[cfg(not(unix))]
+    let parent = std::process::id();
+    let retry = calls
+        .insert(parent, now)
+        .is_some_and(|previous| now - previous < 10_000);
+    store::atomic_write(&history_path, &serde_json::to_vec(&calls)?)?;
+    let near_expiry = connection
+        .access_expires_at
+        .is_some_and(|expiry| expiry.saturating_sub(chrono::Utc::now().timestamp()) < 3600);
+    Ok(retry || near_expiry)
+}
+
 pub fn print_token(path: &Path) -> Result<()> {
     let directory = connection_lock_directory(path, &root()?)?;
     let directory = directory.as_path();
@@ -1229,7 +1273,11 @@ pub fn print_token(path: &Path) -> Result<()> {
     if connection.launch_pinned {
         launch::require_live_launch(path)?;
     }
-    let token = fetch(&connection, true)?;
+    let refresh = {
+        let _lock = native_lock(directory)?;
+        record_token_call(path, &connection)?
+    };
+    let token = fetch(&connection, refresh)?;
     let _lock = native_lock(directory)?;
     finish_token(path, &connection, token, None)
 }
@@ -1238,7 +1286,7 @@ pub fn print_active_token() -> Result<()> {
         bail!("remote credentials cannot be supplied to a pinned local launch");
     }
     let directory = root()?;
-    let (alias, path, connection) = {
+    let (alias, path, connection, refresh) = {
         let _lock = native_lock(&directory)?;
         let alias = read_active_alias()?;
         let path = connection_path(&alias)?;
@@ -1248,9 +1296,10 @@ pub fn print_active_token() -> Result<()> {
             );
         }
         let connection = read_connection(&path)?;
-        (alias, path, connection)
+        let refresh = record_token_call(&path, &connection)?;
+        (alias, path, connection, refresh)
     };
-    let token = fetch(&connection, true)?;
+    let token = fetch(&connection, refresh)?;
     let _lock = native_lock(&directory)?;
     finish_token(&path, &connection, token, Some(&alias))
 }
@@ -1831,6 +1880,7 @@ pub(super) fn sync_account(
             device_token_file: device.token_file.clone(),
             account_id: account.account_id.clone(),
             revision: String::new(),
+            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2073,6 +2123,7 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: true,
             launch_pinned: true,
             approved_billing_plan: Some("pro".into()),
@@ -2112,6 +2163,7 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "shared-workspace".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2149,6 +2201,7 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2177,6 +2230,7 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("pro".into()),
@@ -2199,6 +2253,7 @@ mod tests {
             device_token_file: root.path().join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
@@ -2431,6 +2486,7 @@ mod tests {
             device_token_file: root.join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
@@ -2523,6 +2579,7 @@ mod tests {
             device_token_file: root.path().join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
+            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
