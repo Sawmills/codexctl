@@ -2828,6 +2828,7 @@ fn another_native_token_parent_does_not_force_and_old_connections_gain_only_expi
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn rapid_native_token_calls_on_different_connections_do_not_force() {
     let server = Server::start();
@@ -2840,6 +2841,21 @@ fn rapid_native_token_calls_on_different_connections_do_not_force() {
         );
     }
     let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "work"]).status.success());
+    assert!(
+        server
+            .cli_from_fresh_parent(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    let work: Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".codexctl/central/work.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !work["revision"].as_str().unwrap().is_empty(),
+        "work needs a revision so an incorrect shared timer would force it"
+    );
     assert!(
         server
             .cli(home.path(), &["use", "personal"])
