@@ -570,10 +570,13 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
             nonce: nonce.secret().clone(),
         })
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
-        central
-            .create_enrollment(&format!("accounts:{}", state.secret()), &payload, TTL)
+        let inserted = central
+            .create_browser_login(&format!("accounts:{}", state.secret()), &payload, TTL)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
+        if !inserted {
+            return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "enrollment_capacity"));
+        }
     } else {
         let mut flows = sso.flows.lock().expect("enrollment lock");
         Sso::cleanup(&mut flows);

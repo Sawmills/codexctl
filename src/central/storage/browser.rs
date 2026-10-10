@@ -1,4 +1,4 @@
-//! Shared browser sessions. Only the cookie digest enters PostgreSQL.
+//! Shared browser sign-in state and sessions. Only the cookie digest identifies sessions.
 use super::{CentralStore, PostgresStore, bounded_db, vault};
 use anyhow::{Result, bail};
 use std::time::Duration;
@@ -86,6 +86,30 @@ impl CentralStore {
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => Ok(db),
             Self::File(_) => bail!("shared browser sessions require PostgreSQL"),
         }
+    }
+
+    pub(in crate::central) async fn create_browser_login(
+        &self,
+        challenge: &str,
+        payload: &[u8],
+        ttl: Duration,
+    ) -> Result<bool> {
+        let db = self.browser_store()?;
+        let hash = vault::digest(challenge.as_bytes());
+        let encrypted = vault::encrypt_bytes(&db.key, payload)?;
+        bounded_db(async {
+            let mut connection = db.admission_client().await?;
+            let tx = connection.transaction().await?;
+            // Count after the cross-pod lock so each insertion sees its predecessor.
+            tx.query_one("SELECT pg_advisory_xact_lock(73912758)", &[]).await?;
+            tx.execute("DELETE FROM enrollment_challenges WHERE expires_at <= now() OR consumed_at IS NOT NULL", &[]).await?;
+            let inserted = tx.execute(
+                "INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) SELECT $1,$2,now()+($3::bigint * interval '1 second') WHERE (SELECT count(*) FROM enrollment_challenges WHERE expires_at > now() AND consumed_at IS NULL) < 1024",
+                &[&hash, &encrypted, &(ttl.as_secs() as i64)],
+            ).await?;
+            tx.commit().await?;
+            Ok(inserted == 1)
+        }).await
     }
 
     pub(in crate::central) async fn create_browser_session(

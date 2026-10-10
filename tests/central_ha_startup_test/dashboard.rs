@@ -817,3 +817,38 @@ async fn postgres_dashboard_pending_flows_are_bounded_and_retired_on_new_sign_in
     assert_eq!(count, 1, "a new sign-in retires expired and consumed state");
     f.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_dashboard_last_pending_flow_slot_is_global_across_pods() {
+    let f = BrowserFixture::start().await;
+    for _ in 0..3 {
+        f.control.batch_execute(&format!(
+            "DELETE FROM {0}.enrollment_challenges; INSERT INTO {0}.enrollment_challenges(challenge_hash,encrypted_payload,expires_at) SELECT lpad(n::text,64,'0'),decode('','hex'),now()+interval '1 hour' FROM generate_series(1,1023) n",
+            f.schema,
+        )).await.unwrap();
+        let (first, second) = tokio::join!(
+            f.http
+                .get(format!("{}/accounts/sign-in", f.first.url))
+                .send(),
+            f.http
+                .get(format!("{}/accounts/sign-in", f.second.url))
+                .send(),
+        );
+        let mut statuses = [
+            first.unwrap().status().as_u16(),
+            second.unwrap().status().as_u16(),
+        ];
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            [303, 429],
+            "only one pod can admit the final pending flow"
+        );
+        let count: i64 = f.control.query_one(
+            &format!("SELECT count(*) FROM {}.enrollment_challenges WHERE consumed_at IS NULL AND expires_at > now()", f.schema),
+            &[],
+        ).await.unwrap().get(0);
+        assert_eq!(count, 1024);
+    }
+    f.finish().await;
+}

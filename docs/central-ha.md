@@ -68,7 +68,9 @@ confirms that attempt 4 is closed.
 
 The dashboard stores only the session cookie's digest, the company-user ID,
 signed-in time, and one-hour expiry. The existing encrypted enrollment table
-holds one-time sign-in state for five minutes. The PKCE verifier is derived
+holds one-time sign-in state for five minutes. Pending sign-ins share a
+1,024-flow cap across replicas. Creating a new flow retires expired and consumed
+challenge rows before checking that cap. The PKCE verifier is derived
 from the vault key and state with HMAC-SHA256, and is never persisted. All pods
 use the same vault key. Sign-out ends the session on every replica;
 each request checks the current company-user status. A missing session table at
