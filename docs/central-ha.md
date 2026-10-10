@@ -66,8 +66,6 @@ empty or differ across replicas. Shared activity storage is outside this upgrade
 For the dashboard session upgrade, run the existing migrate Job before rolling
 the server image. Migration adds `browser_sessions` and its expiry index with
 `IF NOT EXISTS`; it keeps schema version 8, so the previous image can still run.
-Do not include this image in B33 attempt 4. Merge and deploy it only after HQ
-confirms that attempt 4 is closed.
 
 The dashboard stores only the session cookie's digest, the company-user ID,
 signed-in time, and one-hour expiry. The existing encrypted enrollment table
@@ -89,6 +87,9 @@ the database cause and exits. Restore database access before restarting the
 pod; this error does not mean the session table is missing. Successful company
 identity links emit `SSO_IDENTITY_LINKED` with identity digests only, after the
 transaction commits. Refused or rolled-back links emit no success event.
+Company-identity resolution holds the existing admission lock and contributes
+to `codexctl_central_admission_lock_seconds_sum/count`, alongside migration and
+account writes. These metrics measure lock hold duration, not account counts.
 
 Shared-store startup
 also fences retained relogin operations that still need replacement verification
