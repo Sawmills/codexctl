@@ -6491,6 +6491,8 @@ fn routing_refresh_cannot_reuse_billing_evidence_for_an_older_revision() {
                 .success()
         );
         store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        // These native billing hooks must run beyond the recent-token guard.
+        server.advance_rotation_clock();
         let output = server.cli(
             home.path(),
             &[
@@ -6501,7 +6503,7 @@ fn routing_refresh_cannot_reuse_billing_evidence_for_an_older_revision() {
         );
         assert!(
             !output.status.success(),
-            "new plan must not inherit the old plan's approval"
+            "new plan must not inherit the old plan's approval: mode={mode}"
         );
         assert!(output.stdout.is_empty());
         let saved = saved_vault(&server, &account_directory(&server, "amir", "personal"));
@@ -10307,6 +10309,9 @@ assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat
 active = subprocess.run([helper_command, 'central-token', '--active'], capture_output=True)
 assert active.returncode == 1
 pathlib.Path(os.environ['B21_MODE']).write_text('exhausted-weekly')
+# Exercise a new native billing observation beyond the recent-token guard.
+clock = pathlib.Path(os.environ['B21_MODE']).with_name('retry-clock')
+clock.write_text(str(int(clock.read_text()) + 61000))
 exhausted = subprocess.run([helper_command] + helper, capture_output=True, text=True)
 assert exhausted.returncode == 1 and 'exhausted' in exhausted.stderr, exhausted.stderr
 pathlib.Path(os.environ['B21_MODE']).write_text('normal')
