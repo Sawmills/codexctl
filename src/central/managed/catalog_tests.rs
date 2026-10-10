@@ -101,6 +101,7 @@ impl Fixture {
             )]))),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            browser_sessions_available: true,
             activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::testing(endpoint, timeout)),

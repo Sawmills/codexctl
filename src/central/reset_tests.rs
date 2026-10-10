@@ -44,6 +44,7 @@ impl Fixture {
             owners: Arc::new(RwLock::new(BTreeMap::new())),
             imports: Arc::new(Mutex::new(())),
             sso: None,
+            browser_sessions_available: true,
             activity: Arc::default(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             reset_reader: crate::central::resets::Reader::with_base(base),

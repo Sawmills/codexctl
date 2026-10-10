@@ -10,6 +10,9 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "central_ha_startup_test/dashboard.rs"]
+mod dashboard;
+
 struct Pod {
     child: Child,
     root: tempfile::TempDir,
@@ -53,6 +56,17 @@ impl Pod {
             store::atomic_write(&root.path().join(name), b"0").unwrap();
         }
         let mut command = command(database, &state, key, "serve");
+        if root.path().join("sso.json").exists() {
+            command
+                .arg("--sso-config")
+                .arg(root.path().join("sso.json"))
+                .stderr(std::fs::File::create(root.path().join("dashboard.log")).unwrap());
+        }
+        if root.path().join("metrics.token").exists() {
+            command
+                .arg("--metrics-token-file")
+                .arg(root.path().join("metrics.token"));
+        }
         if root.path().join("fast-path").exists() {
             command.env("CODEXCTL_CENTRAL_TOKEN_FAST_PATH", "1");
         }

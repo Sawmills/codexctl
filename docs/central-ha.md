@@ -54,10 +54,30 @@ only for explicit migration commands and still requires
 `CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
 The PostgreSQL server supports shared add and renewal receipts, status, and
-cancellation. Enrollment and reset listing/redemption remain unavailable in
-shared mode. Their browser sessions and reset journals remain file-backed.
+cancellation. The read-only dashboard supports company sign-in, sessions,
+sign-out, and the company user's machine list across replicas. Machine
+enrollment and reset listing/redemption remain unavailable in shared mode.
 Keep those workflows on the single file-mode writer until their shared storage
-is complete. Shared-store startup
+is complete.
+
+For the dashboard session upgrade, run the existing migrate Job before rolling
+the server image. Migration adds `browser_sessions` and its expiry index with
+`IF NOT EXISTS`; it keeps schema version 8, so the previous image can still run.
+Do not include this image in B33 attempt 4. Merge and deploy it only after HQ
+confirms that attempt 4 is closed.
+
+The dashboard stores only the session cookie's digest, the company-user ID,
+signed-in time, and one-hour expiry. The existing encrypted enrollment table
+holds one-time sign-in state for five minutes. The PKCE verifier is derived
+from the vault key and state with HMAC-SHA256, and is never persisted. All pods
+use the same vault key. Sign-out ends the session on every replica;
+each request checks the current company-user status. A missing session table at
+startup logs one structured `browser_sessions_unavailable` error. Dashboard
+routes return 503 with that reason, counted in
+`codexctl_central_failed_requests_total`. Token routes and readiness remain
+available. Run migrate and roll the image to restore the dashboard.
+
+Shared-store startup
 also fences retained relogin operations that still need replacement verification
 (`Promoted` or unfinished `Retiring`). Complete those operations on the file-mode
 writer before migration; shared mode does not verify them through ordinary token

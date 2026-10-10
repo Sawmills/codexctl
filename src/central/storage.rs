@@ -23,6 +23,7 @@ pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod browser;
 mod loans;
 mod migration;
 
@@ -224,6 +225,13 @@ CREATE TABLE IF NOT EXISTS enrollment_challenges (
     consumed_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS enrollment_challenges_expiry_idx ON enrollment_challenges (expires_at);
+CREATE TABLE IF NOT EXISTS browser_sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    signed_in_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS browser_sessions_expiry_idx ON browser_sessions (expires_at);
 CREATE TABLE IF NOT EXISTS central_users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL,

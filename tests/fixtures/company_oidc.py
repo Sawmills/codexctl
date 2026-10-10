@@ -64,6 +64,8 @@ class Handler(BaseHTTPRequestHandler):
         claims = {"iss": issuer, "sub": identity["sub"], "aud": identity.get("aud", "codexctl-test"), "iat": now, "exp": now + 300, "nonce": identity.get("nonce", params["nonce"]), "email": identity["email"], "email_verified": identity.get("verified", True)}
         if "hd" in identity:
             claims["hd"] = identity["hd"]
+        if "auth_time" in identity:
+            claims["auth_time"] = identity["auth_time"]
         signing_input = (b64(json.dumps({"alg": "RS256", "kid": "test-key"}).encode()) + "." + b64(json.dumps(claims).encode())).encode()
         signature = subprocess.run(["openssl", "dgst", "-sha256", "-sign", str(key)], input=signing_input, check=True, capture_output=True).stdout
         token = signing_input.decode() + "." + b64(signature)
