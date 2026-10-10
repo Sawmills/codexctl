@@ -226,6 +226,15 @@ async fn postgres_dashboard_sign_in_callback_and_session_work_on_different_pods(
                 .unwrap()
                 .contains("dashboard@example.invalid")
         );
+        let root = f
+            .http
+            .get(format!("{}/", pod.url))
+            .header("cookie", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(root.status(), 303);
+        assert_eq!(root.headers()["location"], "/accounts");
     }
     f.finish().await;
 }
@@ -646,6 +655,13 @@ async fn postgres_missing_browser_table_fails_only_the_dashboard_at_startup() {
         data.json::<Value>().await.unwrap()["error"],
         "browser_sessions_unavailable"
     );
+    for cookie in [None, Some("codexctl-session=synthetic-expired-session")] {
+        let mut landing = f.http.get(format!("{}/", f.first.url));
+        if let Some(cookie) = cookie {
+            landing = landing.header("cookie", cookie);
+        }
+        assert_eq!(landing.send().await.unwrap().status(), 200);
+    }
     let metrics = f
         .http
         .get(format!("{}/metrics", f.first.url))
@@ -654,11 +670,13 @@ async fn postgres_missing_browser_table_fails_only_the_dashboard_at_startup() {
         .await
         .unwrap();
     assert_eq!(metrics.status(), 200);
-    assert!(
-        metrics.text().await.unwrap().contains(
-            "codexctl_central_failed_requests_total{reason=\"browser_sessions_unavailable\"} 2"
-        ),
-        "each failed dashboard request counts once"
+    let metrics = metrics.text().await.unwrap();
+    assert_eq!(
+        metrics.lines().find(|line| line.starts_with(
+            "codexctl_central_failed_requests_total{reason=\"browser_sessions_unavailable\"}"
+        )),
+        Some("codexctl_central_failed_requests_total{reason=\"browser_sessions_unavailable\"} 2"),
+        "only failed dashboard requests count; successful public visits do not"
     );
     let log = std::fs::read_to_string(f.first.root.path().join("dashboard.log")).unwrap();
     let startup = log

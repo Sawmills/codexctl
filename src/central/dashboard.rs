@@ -285,10 +285,17 @@ async fn landing(
     content: String,
 ) -> Result<Response, HttpError> {
     // Session lookup is optional on the public page. Only an enabled identity redirects.
-    if matches!(
-        enrollment::browser_user(&broker, &headers).await,
-        Ok(Some(_))
-    ) {
+    let sessions_usable = broker.browser_sessions_available
+        && broker
+            .central
+            .as_ref()
+            .is_none_or(|s| s.mode() != super::storage::StoreMode::Dual);
+    if sessions_usable
+        && matches!(
+            enrollment::browser_user(&broker, &headers).await,
+            Ok(Some(_))
+        )
+    {
         return Ok(([("cache-control", "no-store")], Redirect::to("/accounts")).into_response());
     }
     let ready = managed::readiness(&broker).is_success();
