@@ -81,9 +81,15 @@ impl BrokerTest {
         Self::start_with_plan(options, Some("pro"))
     }
     fn start_with_plan(options: &[&str], plan: Option<&str>) -> Self {
+        Self::start_with_expiry(options, plan, 4102444800)
+    }
+    fn start_expiring() -> Self {
+        Self::start_with_expiry(&[], Some("pro"), chrono::Utc::now().timestamp() + 1800)
+    }
+    fn start_with_expiry(options: &[&str], plan: Option<&str>, expires: i64) -> Self {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
-        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"user-central","generation":0,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-central","chatgpt_plan_type":plan}})).unwrap());
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"user-central","generation":0,"exp":expires,"https://api.openai.com/auth":{"chatgpt_account_id":"acct-central","chatgpt_plan_type":plan}})).unwrap());
         let auth = json!({"auth_mode":"chatgpt","tokens":{"access_token":format!("eyJhbGciOiJub25lIn0.{payload}."),"refresh_token":"synthetic-initial-refresh","account_id":"acct-central"}});
         store::atomic_write(
             &root.path().join("auth.json"),
@@ -217,8 +223,54 @@ fn fixture() -> PathBuf {
 }
 
 #[test]
-fn legacy_token_endpoint_reports_both_forced_refresh_decisions() {
+fn legacy_forced_request_reuses_a_valid_token() {
     let broker = BrokerTest::start();
+    let initial = broker.grant();
+    for _ in 0..2 {
+        let response = broker.token_request(
+            &broker.token,
+            json!({"previousRevision":initial["revision"]}),
+        );
+        assert_eq!(response.status(), 200);
+        let recent: Value = response.json().unwrap();
+        assert_eq!(recent["revision"], initial["revision"]);
+        assert_eq!(recent["accessToken"], initial["accessToken"]);
+    }
+    assert_eq!(
+        std::fs::read_to_string(broker.root.path().join("refresh-count")).unwrap(),
+        "0"
+    );
+    let metrics = broker
+        .http
+        .get(format!("{}/metrics", broker.url))
+        .bearer_auth(&broker.token)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"served_recent\"} 2\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"refreshed\"} 0\n"),
+        "{metrics}"
+    );
+    let stderr = std::fs::read_to_string(broker.root.path().join("server.stderr")).unwrap();
+    let entries: Vec<Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["operation"] == "forced_refresh")
+        .collect();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert_eq!(entry["reason"], "token_valid");
+    }
+}
+
+#[test]
+fn legacy_token_endpoint_reports_both_forced_refresh_decisions() {
+    let broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     let rotated: Value = broker
         .token_request(
@@ -337,7 +389,7 @@ fn when_tokens_are_issued_then_refresh_credentials_stay_on_the_server() {
 
 #[test]
 fn when_two_clients_refresh_the_same_revision_then_the_owner_rotates_once() {
-    let broker = BrokerTest::start();
+    let broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     let body =
         json!({"previousRevision":initial["revision"],"accountId":initial["chatgptAccountId"]});
@@ -459,7 +511,7 @@ fn when_read_only_mode_is_used_then_no_owner_process_receives_refresh_credential
 
 #[test]
 fn when_the_owner_rejects_refresh_then_subsequent_requests_fail_closed() {
-    let broker = BrokerTest::start();
+    let broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     std::fs::write(broker.root.path().join("mode"), "error").unwrap();
     let request =
@@ -479,7 +531,7 @@ fn when_the_owner_rejects_refresh_then_subsequent_requests_fail_closed() {
 
 #[test]
 fn when_refresh_changes_identity_then_the_owner_refuses_credential_distribution() {
-    let broker = BrokerTest::start();
+    let broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     std::fs::write(broker.root.path().join("mode"), "identity").unwrap();
     let request =
@@ -492,7 +544,7 @@ fn when_refresh_changes_identity_then_the_owner_refuses_credential_distribution(
 
 #[test]
 fn when_final_persistence_fails_then_shutdown_retains_rotated_credentials() {
-    let mut broker = BrokerTest::start();
+    let mut broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     std::fs::write(broker.root.path().join("mode"), "break-key").unwrap();
     let request =
@@ -547,7 +599,7 @@ fn when_a_refresh_callback_precedes_the_turn_response_then_the_client_still_comp
 
 #[test]
 fn when_a_client_disconnects_during_refresh_then_the_owner_persists_the_result() {
-    let broker = BrokerTest::start();
+    let broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     std::fs::write(broker.root.path().join("mode"), "disconnect").unwrap();
     let request =
@@ -616,7 +668,7 @@ fn when_an_owner_exits_abruptly_then_restart_refuses_an_unfinished_runtime() {
 
 #[test]
 fn when_the_owner_restarts_then_it_uses_the_encrypted_rotated_credentials() {
-    let mut broker = BrokerTest::start();
+    let mut broker = BrokerTest::start_expiring();
     let initial = broker.grant();
     let request =
         json!({"previousRevision":initial["revision"],"accountId":initial["chatgptAccountId"]});
@@ -790,7 +842,9 @@ impl NativeClient {
         Self::with_plan(Some("pro"))
     }
     fn with_plan(plan: Option<&str>) -> Self {
-        let broker = BrokerTest::start_with_plan(&[], plan);
+        Self::from_broker(BrokerTest::start_with_plan(&[], plan))
+    }
+    fn from_broker(broker: BrokerTest) -> Self {
         let home = broker.root.path().join("client");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         // The host's container overlay mount emits an lsof diagnostic that
@@ -2068,7 +2122,11 @@ fn when_the_billing_read_fails_then_the_helper_returns_no_token_and_one_failure_
 
 #[test]
 fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_no_token() {
-    let client = NativeClient::with_plan(Some("usage_based"));
+    let client = NativeClient::from_broker(BrokerTest::start_with_expiry(
+        &[],
+        Some("usage_based"),
+        chrono::Utc::now().timestamp() + 1800,
+    ));
     client.connect();
     assert!(
         client

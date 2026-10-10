@@ -385,11 +385,20 @@ impl Owner {
                 .last_rotation_ms
                 .and_then(|rotated| self.rotation_clock_now().checked_sub(rotated));
             // Verification and reset-auth probes must still exercise the grant.
-            // The cooldown governs forced refreshes requested by machines.
+            // Machine requests cannot force a healthy access token to rotate.
+            let token_valid = device.is_some()
+                && api::token_expiry(&current.access_token).is_some_and(|expires| {
+                    expires
+                        >= chrono::Utc::now()
+                            .timestamp()
+                            .saturating_add(super::fast_path::MIN_REMAINING_SECONDS)
+                });
             let recent = device.is_some() && age_ms.is_some_and(|age| age < 60_000);
             if let Some(device) = device {
                 super::refresh_control::forced(
-                    if recent {
+                    if token_valid {
+                        super::refresh_control::Forced::TokenValid
+                    } else if recent {
                         super::refresh_control::Forced::ServedRecent
                     } else {
                         super::refresh_control::Forced::Refreshed
@@ -400,7 +409,7 @@ impl Owner {
                     age_ms,
                 );
             }
-            if recent {
+            if token_valid || recent {
                 let billing = if request.billing {
                     BillingRead::Recent
                 } else {
