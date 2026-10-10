@@ -32,6 +32,17 @@ spec:
             summary: Codexctl account operation failed
             description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+        - alert: CodexctlRelayCapacityExhausted
+          expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl relay exhausted its capacity retry budget
+            description: A relay lane exhausted its retry budget in the last 15 minutes. The advised outcome is intentionally excluded because it is still retrying without operator action.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
         - alert: CodexctlTokenLeaseWaitTimeouts
           expr: sum(increase(codexctl_central_lease_waits_total{outcome="timeout"}[15m])) > 3
           for: 0m

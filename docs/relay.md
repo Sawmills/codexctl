@@ -52,7 +52,8 @@ the account, or the auth headers, and it never resumes a goal.
 - **Usage, quota, billing, plan and flex 429s:** pass through unchanged, so the quota
   guard still sees them.
 - **Everything else:** passes through unchanged, byte for byte. This covers 401, 403
-  and 5xx, streamed rate-limit codes, and any error after output started.
+  and 5xx, streamed rate-limit codes, and any error after output started. The relay
+  records a bounded `stream_failure` observation for these errors.
 
 Delays double from 2 s up to 60 s, with jitter. Each Codex thread (`thread-id`
 header) has one failure streak. When a streak spends its budget, the relay passes the
@@ -111,6 +112,7 @@ never holds a token or a body. `GET /metrics` on the relay serves:
 
 ```
 codexctl_relay_capacity_events_total{kind,model,account_class,outcome}
+codexctl_relay_stream_failures_total{kind,stage,model,account_class}
 ```
 
 - `kind`: `rate_429` or `overloaded`.
@@ -118,4 +120,37 @@ codexctl_relay_capacity_events_total{kind,model,account_class,outcome}
   output), `exhausted` (one per streak that spent its budget), or
   `terminal_passthrough`.
 
-This is instrumentation only. No alert reads it yet.
+The relay sends the four labels for non-advised capacity outcomes to the authenticated
+central endpoint `/v1/relay/capacity-events`. Advised events stay local so repeated
+retries cannot consume the per-device central event budget. The relay uses a bounded
+queue and drops an event when central is unavailable or the queue is full;
+`codexctl_relay_central_dropped_total`
+records each reason. The central server exports
+`codexctl_central_relay_capacity_events_total` plus an event-time gauge for each
+accepted exhausted label set. The gauge makes a one-off event visible even when
+it arrives before the first Prometheus scrape. The server rejects unknown labels
+or an over-limit device with HTTP 400 or 429.
+
+For each streamed `/responses` request, the relay also writes at most one
+`outcome="stream_failure"` JSON line when it sees `response.failed`, `error`,
+`response.incomplete`, an unclean end, or an unclassified HTTP error. The line records
+`stage` (`pre_output` or `after_output`), the bounded run-length event-type trace,
+elapsed times, model and account class, and upstream `cf-ray` and
+`x-oai-request-id` headers. Failure messages are reduced to their character length and
+one of the bounded classes `capacity`, `rate_limit`, or `other`; their text and
+parameters are never logged. Output text, deltas, request bodies, authorization, and
+cookies are never included. The process emits at most 30 failure lines per minute and
+then one suppression summary.
+
+The existing central capacity endpoint accepts only its four capacity labels and does
+not have a `stream_failure` event schema. Stream-failure forwarding is therefore a
+follow-up server API change; this release keeps the observation local to the relay.
+
+The staging and staging-ha Prometheus rules alert on one exhausted event in a 15-minute
+window. They intentionally exclude `advised`: that outcome means the relay is still
+retrying and does not need operator action. Alerts carry `severity=warning` and
+`service=codexctl`; the platform Alertmanager
+`warnings-slack` receiver routes them to `#warning-alerts`. The platform route file is
+owned outside this repository, so `amtool` cannot validate the live route here. The
+monitoring guide must run `amtool config routes test` against that platform file with
+`severity=warning service=codexctl` and confirm `warnings-slack`.

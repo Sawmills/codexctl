@@ -1,6 +1,6 @@
 # codexctl Web UI v3: Jobs to Be Done
 
-This document derives the web app's jobs from the people who arrive and the moment they arrive in, not from the pages that exist today. The ranking decides the information architecture at the end. Terms follow [`CONTEXT.md`](../../CONTEXT.md): company user, machine, account server, server account, alias, login renewal.
+This document derives the web app's jobs from the people who arrive and the moment they arrive in, not from the pages that exist today. The ranking decides the information architecture at the end. Terms follow [`GLOSSARY.md`](../../GLOSSARY.md): company user, machine, account server, server account, alias, login renewal.
 
 ## Who Arrives, and When
 

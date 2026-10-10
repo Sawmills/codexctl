@@ -21,6 +21,7 @@ spec:
         karpenter.sh/do-not-disrupt: "true"
       labels:
         app.kubernetes.io/name: codexctl
+        app.kubernetes.io/component: broker
     spec:
       terminationGracePeriodSeconds: 600
       automountServiceAccountToken: false

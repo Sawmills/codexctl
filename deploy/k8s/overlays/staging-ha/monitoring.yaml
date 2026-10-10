@@ -1,0 +1,76 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  namespace: codexctl
+  name: codexctl-ha
+  labels:
+    release: kube-prometheus
+    environment: staging
+spec:
+  groups:
+    - name: codexctl-ha
+      rules:
+        - alert: CodexctlBrokerUnavailable
+          expr: up{namespace="codexctl",service="codexctl"} == 0 or absent(up{namespace="codexctl",service="codexctl"})
+          for: 5m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl token server is unavailable
+            description: Check the HA pods, SSO configuration, database health, and ExternalSecret.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+        - alert: CodexctlRelayCapacityExhausted
+          expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl relay exhausted its capacity retry budget
+            description: A relay lane exhausted its retry budget in the last 15 minutes. The advised outcome is intentionally excluded because it is still retrying without operator action.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  namespace: codexctl
+  name: codexctl-ha
+  labels:
+    release: kube-prometheus
+spec:
+  jobName: codexctl-ha
+  metricsPath: /metrics
+  scrapeInterval: 30s
+  scrapeTimeout: 5s
+  scrapeProtocols: [PrometheusText0.0.4]
+  authorization:
+    type: Bearer
+    credentials:
+      name: codexctl-secrets
+      key: metrics-token
+  kubernetesSDConfigs:
+    - role: pod
+      namespaces:
+        names: [codexctl]
+  relabelings:
+    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+      action: keep
+      regex: codexctl
+    - sourceLabels: [__meta_kubernetes_pod_label_app_kubernetes_io_component]
+      action: keep
+      regex: broker-ha
+    - sourceLabels: [__meta_kubernetes_pod_container_port_name]
+      action: keep
+      regex: http
+    - sourceLabels: [__meta_kubernetes_pod_phase]
+      action: keep
+      regex: Running
+    - sourceLabels: [__meta_kubernetes_namespace]
+      targetLabel: namespace
+    - sourceLabels: [__meta_kubernetes_pod_name]
+      targetLabel: pod
+    - targetLabel: service
+      replacement: codexctl

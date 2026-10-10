@@ -15,6 +15,9 @@ use std::{
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Vault {
+    /// Wall-clock rotation time, shared with the encrypted credential state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rotation_ms: Option<u64>,
     pub alias: String,
     pub tenant: String,
     pub user: String,
@@ -202,9 +205,20 @@ pub fn load(state: &Path, key: &Path) -> Result<Vault> {
     serde_json::from_slice(&plaintext).context("invalid vault data")
 }
 
+fn credential<'a>(auth: &'a Value, field: &str) -> Option<&'a Value> {
+    auth.get("tokens")
+        .and_then(|tokens| tokens.get(field))
+        .or_else(|| auth.get(field))
+}
+
+pub(super) fn credentials_changed(before: &Value, after: &Value) -> bool {
+    ["access_token", "refresh_token", "id_token"]
+        .into_iter()
+        .any(|field| credential(before, field) != credential(after, field))
+}
+
 pub fn token(auth: &Value) -> Result<&str> {
-    auth.pointer("/tokens/access_token")
-        .or_else(|| auth.get("access_token"))
+    credential(auth, "access_token")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .context("missing access token")
@@ -234,9 +248,7 @@ pub fn account(auth: &Value) -> Result<String> {
 
 pub fn validate_auth(auth: &Value) -> Result<()> {
     account(auth)?;
-    if auth
-        .pointer("/tokens/refresh_token")
-        .or_else(|| auth.get("refresh_token"))
+    if credential(auth, "refresh_token")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .is_none()
@@ -271,6 +283,7 @@ mod tests {
             root.path(),
             &key,
             &Vault {
+                last_rotation_ms: None,
                 alias: "personal".into(),
                 tenant: "personal".into(),
                 user: "amir".into(),

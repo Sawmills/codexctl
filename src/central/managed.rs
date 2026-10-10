@@ -5,7 +5,7 @@ use super::{
     catalog, enrollment, fast_path, relogin,
     rpc::Rpc,
     server::{Owner, TokenFailure, TokenRequest, TokenResponse},
-    storage::{CentralStore, CredentialRecord},
+    storage::{CentralStore, CredentialRecord, StoreMode},
     transport,
     vault::{self, Vault},
 };
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -119,6 +119,117 @@ pub(super) struct AccountIndex {
     pub(super) alias: String,
 }
 type Owners = BTreeMap<String, (AccountIndex, Arc<Mutex<Owner>>)>;
+
+const RELAY_EVENT_BUCKET_CAPACITY: f64 = 32.0;
+const RELAY_EVENT_BUCKET_REFILL_PER_SECOND: f64 = 1.0;
+const RELAY_EVENT_KINDS: &[&str] = &["rate_429", "overloaded"];
+const RELAY_EVENT_ACCOUNT_CLASSES: &[&str] = &["included", "credit", "unknown"];
+const RELAY_EVENT_OUTCOMES: &[&str] =
+    &["advised", "recovered", "exhausted", "terminal_passthrough"];
+
+#[derive(Clone, Debug, Ord, PartialOrd, Eq, PartialEq)]
+struct RelayMetricKey {
+    kind: String,
+    model: String,
+    account_class: String,
+    outcome: String,
+}
+
+struct RelayMetrics {
+    accepted: BTreeMap<RelayMetricKey, u64>,
+    event_timestamps: BTreeMap<RelayMetricKey, i64>,
+    rejected: BTreeMap<&'static str, u64>,
+    buckets: BTreeMap<String, RelayTokenBucket>,
+}
+
+impl Default for RelayMetrics {
+    fn default() -> Self {
+        let mut accepted = BTreeMap::new();
+        for kind in RELAY_EVENT_KINDS {
+            for model in crate::RELAY_KNOWN_MODELS
+                .iter()
+                .copied()
+                .chain(std::iter::once("other"))
+            {
+                for account_class in RELAY_EVENT_ACCOUNT_CLASSES {
+                    accepted.insert(
+                        RelayMetricKey {
+                            kind: (*kind).into(),
+                            model: model.into(),
+                            account_class: (*account_class).into(),
+                            outcome: "exhausted".into(),
+                        },
+                        0,
+                    );
+                }
+            }
+        }
+        Self {
+            accepted,
+            event_timestamps: BTreeMap::new(),
+            rejected: BTreeMap::new(),
+            buckets: BTreeMap::new(),
+        }
+    }
+}
+
+struct RelayTokenBucket {
+    tokens: f64,
+    last: std::time::Instant,
+}
+
+impl RelayTokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: RELAY_EVENT_BUCKET_CAPACITY,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * RELAY_EVENT_BUCKET_REFILL_PER_SECOND)
+            .min(RELAY_EVENT_BUCKET_CAPACITY);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayCapacityEvent {
+    kind: String,
+    model: String,
+    account_class: String,
+    outcome: String,
+}
+
+impl RelayCapacityEvent {
+    fn validate(self) -> Result<RelayMetricKey, ()> {
+        if !RELAY_EVENT_KINDS.contains(&self.kind.as_str())
+            || !RELAY_EVENT_ACCOUNT_CLASSES.contains(&self.account_class.as_str())
+            || !RELAY_EVENT_OUTCOMES.contains(&self.outcome.as_str())
+        {
+            return Err(());
+        }
+        let model = if crate::RELAY_KNOWN_MODELS.contains(&self.model.as_str()) {
+            self.model
+        } else {
+            "other".into()
+        };
+        Ok(RelayMetricKey {
+            kind: self.kind,
+            model,
+            account_class: self.account_class,
+            outcome: self.outcome,
+        })
+    }
+}
 // Overlap retains a seat reservation even if UID evidence is missing or conflicts.
 // It is never permission to replace credentials.
 pub(super) fn overlaps(left: &Value, right: &Value) -> bool {
@@ -148,6 +259,7 @@ pub(super) struct Broker {
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
+    relay_metrics: Arc<StdMutex<RelayMetrics>>,
     metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
     pub(super) session_writes: Arc<Semaphore>,
@@ -165,6 +277,58 @@ pub(super) struct Broker {
     pub(super) registry: Option<Arc<std::sync::RwLock<RegistryState>>>,
 }
 impl Broker {
+    fn relay_reject(&self, reason: &'static str) {
+        *self
+            .relay_metrics
+            .lock()
+            .expect("relay metric lock poisoned")
+            .rejected
+            .entry(reason)
+            .or_default() += 1;
+    }
+
+    async fn relay_accept(
+        &self,
+        device: &str,
+        key: RelayMetricKey,
+    ) -> std::result::Result<bool, HttpError> {
+        let allowed = match self.central.as_ref() {
+            Some(store) if !matches!(store.mode(), StoreMode::File) => {
+                store.relay_event_allowed(device).await.map_err(|_| {
+                    self.error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "relay_rate_limiter_unavailable",
+                    )
+                })?
+            }
+            Some(_) | None => {
+                let mut metrics = self
+                    .relay_metrics
+                    .lock()
+                    .expect("relay metric lock poisoned");
+                let bucket = metrics
+                    .buckets
+                    .entry(device.to_owned())
+                    .or_insert_with(RelayTokenBucket::new);
+                bucket.take()
+            }
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        let mut metrics = self
+            .relay_metrics
+            .lock()
+            .expect("relay metric lock poisoned");
+        *metrics.accepted.entry(key.clone()).or_default() += 1;
+        if key.outcome == "exhausted" {
+            metrics
+                .event_timestamps
+                .insert(key, chrono::Utc::now().timestamp());
+        }
+        Ok(true)
+    }
+
     pub(super) fn login_holder(&self) -> String {
         self.login_holder
             .lock()
@@ -189,6 +353,7 @@ pub(super) struct HttpError {
     pub(super) reason: &'static str,
     /// The current alias, for `account_renamed`.
     pub(super) alias: Option<String>,
+    pub(super) retry_after: Option<u64>,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
@@ -197,6 +362,11 @@ impl IntoResponse for HttpError {
             None => json!({"error":self.reason}),
         };
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
         response.extensions_mut().insert(FailureReason);
         response
     }
@@ -614,9 +784,18 @@ impl Broker {
             json!({"operation":"broker_request","stage":stage,"reason":reason,"status":status.as_u16()})
         );
     }
+    fn on_demand_recovery(&self) -> bool {
+        !self.background_recovery
+            && self
+                .central
+                .as_ref()
+                .is_none_or(|store| store.mode() == super::storage::StoreMode::File)
+    }
+
     pub fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
         self.record_failure(reason, "broker", status);
         HttpError {
+            retry_after: None,
             status,
             reason,
             alias: None,
@@ -959,6 +1138,7 @@ where
         result = verification => result,
         _ = wait_for_lease_loss(lost, signal) => {
             Err(HttpError {
+                retry_after: None,
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 reason: "refresh_fenced",
                 alias: None,
@@ -1274,6 +1454,33 @@ async fn token(
         Some(borrowed) => borrowed.owner.clone(),
         None => broker.owner(&device, alias).await?,
     };
+    if broker.on_demand_recovery() {
+        let worker = broker.clone();
+        let owner_ref = owner.clone();
+        let account_id = request.account_id.clone();
+        // Detached work retains its permit and settles native refreshes even
+        // when the requesting client disconnects.
+        tokio::spawn(async move {
+            let permit =
+                worker.work.clone().acquire_owned().await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping")
+                })?;
+            {
+                let owner = owner_ref.lock().await;
+                owner
+                    .validate_account_id(account_id.as_deref())
+                    .map_err(|failure| worker.owner_failure(failure))?;
+                if owner.available || !owner.retryable_unavailable || owner.routing_refused {
+                    return Ok(());
+                }
+            }
+            drop(permit);
+            recover_owners(&worker, Some(owner_ref)).await;
+            Ok::<_, HttpError>(())
+        })
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))??;
+    }
     // The fast path and the lease wait run only behind the flag, in
     // PostgreSQL mode. Dual and file mode keep today's path.
     let fast_on = fast_path::enabled()
@@ -1333,6 +1540,7 @@ async fn token(
             .as_ref()
             .map(|borrowed| borrowed.grant.alias.clone());
         let mut request = template.clone();
+        let requesting_device = device.id.clone();
         // A request that found the owner busy re-checks under its lock.
         let fast_locked =
             busy_owner.then(|| (fast_account.clone(), fast_user.clone(), fast_alias.clone()));
@@ -1396,7 +1604,11 @@ async fn token(
             .validate_account_id(request.account_id.as_deref())
             .map_err(|failure| worker.owner_failure(failure))?;
         if !owner.available {
-            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            let mut error = worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable");
+            if worker.on_demand_recovery() && owner.retryable_unavailable && !owner.routing_refused {
+                error.retry_after = owner.on_demand_retry_after();
+            }
+            return Err(error);
         }
         // Under the owner lock the local fence is visible, so a request that
         // found the owner busy may still be served without the lease.
@@ -1449,6 +1661,7 @@ async fn token(
                     {
                         *slot = Some((account_id.clone(), owner.vault.revision));
                         return Err(HttpError {
+                            retry_after: None,
                             status: StatusCode::SERVICE_UNAVAILABLE,
                             reason: "refresh_in_progress",
                             alias: None,
@@ -1521,7 +1734,7 @@ async fn token(
                 return Err(error);
             }
             let observed_from = std::time::Instant::now();
-            let token_result = owner.tokens(request).await;
+            let token_result = owner.tokens_for_device(request, Some(&requesting_device)).await;
             // A failed native read may mean lost routing or a fenced owner.
             // Withdraw the evidence so no replica serves this account
             // lease-free until the lease path observes it again.
@@ -2590,6 +2803,7 @@ impl Broker {
             store::ensure_private_dir(&state)
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
             let vault = Vault {
+                last_rotation_ms: None,
                 alias: input.alias,
                 tenant: "sawmills".into(),
                 user: user.into(),
@@ -3001,6 +3215,10 @@ async fn revoke_device(
         if !updated {
             return Err(broker.error(StatusCode::CONFLICT, "registry_changed"));
         }
+        central
+            .retire_relay_event_limiter(&input.id)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     } else {
         let _lock = vault::registry_lock(&broker.state, "devices.lock")
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
@@ -3045,15 +3263,62 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
     output.push_str(&super::storage::identity::admission_metrics());
     output.push_str(&fast_path::metrics());
     output.push_str(&super::owner_refresh::metrics());
+    output.push_str(&super::refresh_control::metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
     ));
+    let relay_metrics = broker
+        .relay_metrics
+        .lock()
+        .expect("relay metric lock poisoned");
+    output.push_str("# TYPE codexctl_central_relay_capacity_events_total counter\n");
+    for (key, count) in &relay_metrics.accepted {
+        output.push_str(&format!(
+            "codexctl_central_relay_capacity_events_total{{account_class=\"{}\",kind=\"{}\",model=\"{}\",outcome=\"{}\"}} {}\n",
+            key.account_class, key.kind, key.model, key.outcome, count
+        ));
+    }
+    output.push_str("# TYPE codexctl_central_relay_capacity_event_timestamp_seconds gauge\n");
+    for (key, timestamp) in &relay_metrics.event_timestamps {
+        output.push_str(&format!(
+            "codexctl_central_relay_capacity_event_timestamp_seconds{{account_class=\"{}\",kind=\"{}\",model=\"{}\",outcome=\"{}\"}} {}\n",
+            key.account_class, key.kind, key.model, key.outcome, timestamp
+        ));
+    }
+    output.push_str("# TYPE codexctl_central_relay_events_rejected_total counter\n");
+    for (reason, count) in &relay_metrics.rejected {
+        output.push_str(&format!(
+            "codexctl_central_relay_events_rejected_total{{reason=\"{reason}\"}} {count}\n"
+        ));
+    }
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,
     )
         .into_response())
+}
+
+async fn relay_capacity_event(
+    State(broker): State<Broker>,
+    request: Request,
+) -> Result<StatusCode, HttpError> {
+    let device = broker.authorize(request.headers()).await?;
+    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"))?;
+    let event = serde_json::from_slice::<RelayCapacityEvent>(&body)
+        .ok()
+        .and_then(|event| event.validate().ok());
+    let Some(event) = event else {
+        broker.relay_reject("invalid_label");
+        return Err(broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"));
+    };
+    if !broker.relay_accept(&device.id, event).await? {
+        broker.relay_reject("rate_limited");
+        return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "relay_event_rate_limited"));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn observe(State(broker): State<Broker>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
@@ -3368,19 +3633,27 @@ async fn launch_startup_owner(
 }
 
 async fn recover_unhealthy_owners(broker: &Broker) {
+    recover_owners(broker, None).await;
+}
+
+async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
+    let on_demand = requested.is_some();
     if broker.read_only
         || broker.stopping.load(Ordering::Acquire)
         || broker.ownership_unresolved.load(Ordering::Acquire)
     {
         return;
     }
-    let owners = broker
-        .owners
-        .read()
-        .await
-        .values()
-        .map(|(_, owner)| owner.clone())
-        .collect::<Vec<_>>();
+    let owners = match requested {
+        Some(owner) => vec![owner],
+        None => broker
+            .owners
+            .read()
+            .await
+            .values()
+            .map(|(_, owner)| owner.clone())
+            .collect(),
+    };
     for owner_ref in owners {
         if broker.stopping.load(Ordering::Acquire) {
             return;
@@ -3403,8 +3676,18 @@ async fn recover_unhealthy_owners(broker: &Broker) {
             || owner.available
             || !owner.retryable_unavailable
             || owner.routing_refused
-            || owner.retry_cooldown_active()
         {
+            continue;
+        }
+        let cooldown = if on_demand {
+            owner.on_demand_cooldown_active()
+        } else {
+            owner.retry_cooldown_active()
+        };
+        if cooldown {
+            if on_demand {
+                super::refresh_control::recovery(super::refresh_control::Recovery::Backoff);
+            }
             continue;
         }
         if pending && !exited {
@@ -3493,10 +3776,17 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 || owner.available
                 || !owner.retryable_unavailable
                 || owner.routing_refused
-                || owner.retry_cooldown_active()
+                || (if on_demand {
+                    owner.on_demand_cooldown_active()
+                } else {
+                    owner.retry_cooldown_active()
+                })
             {
                 None
             } else {
+                if on_demand {
+                    owner.retry_started = Some(owner.retry_clock_now());
+                }
                 let identities = if let Some(central) = central
                     .as_ref()
                     .filter(|s| s.mode() == super::storage::StoreMode::Postgres)
@@ -3587,6 +3877,9 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 }
                 let probe_pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
                 let probe_ok = probe.is_ok();
+                if on_demand && (!probe_ok || !local_saved) {
+                    super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
+                }
                 if probe_pending || !local_saved || lease.is_some() {
                     if matches!(probe, Err(TokenFailure::Retryable(_))) {
                         owner.retryable_unavailable = owner.vault.verified;
@@ -3664,6 +3957,11 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                         owner.retry_requires_billing = false;
                         owner.retry_started = None;
                         owner.retry_failures = 0;
+                        if on_demand {
+                            super::refresh_control::recovery(
+                                super::refresh_control::Recovery::Recovered,
+                            );
+                        }
                     }
                     (Ok(_), true, false) => {
                         fence_background_owner(&mut owner);
@@ -3728,6 +4026,9 @@ async fn recover_unhealthy_owners(broker: &Broker) {
                 }
             }
             Err(error) => {
+                if on_demand {
+                    super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
+                }
                 owner.available = false;
                 owner.retry_failures = owner.retry_failures.saturating_add(1);
                 if owner.retry_started.is_none() {
@@ -4074,6 +4375,7 @@ pub async fn serve(
             .map(|r| (r, Failure::default()))
             .collect(),
         )),
+        relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
         work: Arc::new(Semaphore::new(128)),
         session_writes: Arc::new(Semaphore::new(32)),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -4288,6 +4590,7 @@ impl Broker {
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
@@ -4323,6 +4626,7 @@ pub(super) fn api_routes() -> Router<Broker> {
         .route("/v1/accounts/login/start", post(relogin::add::start))
         .route("/v1/accounts/login/status", post(relogin::add::status))
         .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
+        .route("/v1/relay/capacity-events", post(relay_capacity_event))
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }))
@@ -4428,6 +4732,7 @@ mod tests {
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
+            relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
             metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
@@ -4492,6 +4797,7 @@ mod tests {
             root.path(),
             &key,
             &vault::Vault {
+                last_rotation_ms: None,
                 alias: "test".into(),
                 tenant: "test".into(),
                 user: "user".into(),
