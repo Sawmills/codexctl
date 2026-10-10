@@ -71,7 +71,7 @@ type CompanyClient = openidconnect::Client<
 >;
 const GOOGLE_ISSUER: &str = "https://accounts.google.com";
 
-mod identity;
+pub(super) mod identity;
 
 pub fn random_bytes() -> [u8; 32] {
     let mut bytes = [0u8; 32];

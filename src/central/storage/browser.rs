@@ -1,5 +1,6 @@
 //! Shared browser sign-in state and sessions. Only the cookie digest identifies sessions.
 use super::{CentralStore, PostgresStore, bounded_db, vault};
+use crate::central::enrollment::identity::{self as browser_identity, Decision};
 use anyhow::{Result, bail};
 use std::time::Duration;
 
@@ -27,24 +28,15 @@ impl CentralStore {
                     id: row.get(0), email: row.get(1), enabled: row.get(2), oidc_identity: row.get(3),
                 }).collect();
             let mut linked_user = None;
-            let resolution = if let Some(user) = users.iter().find(|u| u.oidc_identity.as_deref() == Some(arriving)) {
-                if user.enabled { BrowserIdentity::User(user.id.clone()) } else { BrowserIdentity::Disabled }
-            } else if let Some(user) = users.iter().find(|u| u.id == arriving) {
-                if !user.enabled { BrowserIdentity::Disabled } else if user.oidc_identity.is_some() { BrowserIdentity::Conflict } else { BrowserIdentity::User(user.id.clone()) }
-            } else {
-                let matches: Vec<_> = users.iter().filter(|u| u.email.eq_ignore_ascii_case(email)).collect();
-                if enforce_email_link && (!matches.is_empty() || authorized_source.is_some()) {
-                    match (matches.as_slice(), authorized_source) {
-                        ([user], Some(source)) if user.id == source && user.oidc_identity.is_none() => {
-                            if !user.enabled { BrowserIdentity::Disabled } else {
-                                tx.execute("UPDATE central_users SET oidc_identity=$2,revision=revision+1,updated_at=now() WHERE id=$1", &[&user.id,&arriving]).await?;
-                                linked_user = Some(user.id.clone());
-                                BrowserIdentity::User(user.id.clone())
-                            }
-                        }
-                        _ => BrowserIdentity::Conflict,
-                    }
-                } else {
+            let resolution = match browser_identity::decide(&users, arriving, email, enforce_email_link, authorized_source) {
+                Decision::Known(resolution) => resolution,
+                Decision::Link(index) => {
+                    let user = &users[index];
+                    tx.execute("UPDATE central_users SET oidc_identity=$2,revision=revision+1,updated_at=now() WHERE id=$1", &[&user.id,&arriving]).await?;
+                    linked_user = Some(user.id.clone());
+                    BrowserIdentity::User(user.id.clone())
+                }
+                Decision::Reserve => {
                     // Reserve under the same admission lock as resolution. A competing
                     // verified subject must see this email before it can claim another ID.
                     let inserted = tx.query_opt("INSERT INTO central_users(id,email,enabled) VALUES($1,$2,true) ON CONFLICT(id) DO NOTHING RETURNING id", &[&arriving,&email]).await?.is_some();
