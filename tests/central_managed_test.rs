@@ -5702,6 +5702,14 @@ fn refresh_only_rotation_changes_the_revision_and_is_not_replayed_for_another_cl
         .json()
         .unwrap();
     assert_eq!(second["revision"], after["revision"]);
+    // A matching revision is also held: refreshing only the grant is still
+    // a credential rotation, even when the access token stays the same.
+    let matching: Value = server
+        .token(&server.amir, "personal", after["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(matching["revision"], after["revision"]);
+    assert_eq!(matching["accessToken"], after["accessToken"]);
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
         "2"
