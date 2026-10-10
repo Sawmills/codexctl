@@ -1450,12 +1450,17 @@ async fn token(
         // Detached work retains its permit and settles native refreshes even
         // when the requesting client disconnects.
         tokio::spawn(async move {
+            let permit =
+                worker.work.clone().acquire_owned().await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping")
+                })?;
             {
                 let owner = owner_ref.lock().await;
                 owner
                     .validate_account_id(account_id.as_deref())
                     .map_err(|failure| worker.owner_failure(failure))?;
             }
+            drop(permit);
             recover_owners(&worker, Some(owner_ref)).await;
             Ok::<_, HttpError>(())
         })

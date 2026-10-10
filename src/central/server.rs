@@ -364,7 +364,9 @@ impl Owner {
                 .vault
                 .last_rotation_ms
                 .map(|rotated| self.rotation_clock_now().saturating_sub(rotated));
-            let recent = age_ms.is_some_and(|age| age < 60_000);
+            // Verification and reset-auth probes must still exercise the grant.
+            // The cooldown governs forced refreshes requested by machines.
+            let recent = device.is_some() && age_ms.is_some_and(|age| age < 60_000);
             if let Some(device) = device {
                 super::refresh_control::forced(
                     if recent {
