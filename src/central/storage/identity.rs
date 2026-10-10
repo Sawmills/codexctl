@@ -180,15 +180,7 @@ impl PostgresStore {
     pub(super) async fn admission_client(
         &self,
     ) -> Result<tokio::sync::MappedMutexGuard<'_, tokio_postgres::Client>> {
-        let mut slot = self.admission.lock().await;
-        if slot.as_ref().is_none_or(tokio_postgres::Client::is_closed) {
-            *slot = Some(
-                Arc::try_unwrap(self.establish().await?)
-                    .map_err(|_| anyhow::anyhow!("admission connection is shared"))?,
-            );
-        }
-        tokio::sync::MutexGuard::try_map(slot, Option::as_mut)
-            .map_err(|_| anyhow::anyhow!("admission connection is absent"))
+        self.transaction_client(&self.admission).await
     }
 }
 #[must_use]

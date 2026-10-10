@@ -852,3 +852,55 @@ async fn postgres_dashboard_last_pending_flow_slot_is_global_across_pods() {
     }
     f.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_dashboard_sign_in_does_not_wait_for_account_admission() {
+    let f = BrowserFixture::start().await;
+    let (binding, path) = f.begin_sign_in().await;
+    f.control
+        .query_one(
+            "SELECT pg_advisory_lock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    let callback_http = f.http.clone();
+    let callback_url = format!("{}{path}", f.first.url);
+    let callback = tokio::spawn(async move {
+        callback_http
+            .get(callback_url)
+            .header("cookie", binding)
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let waiting: i64 = f.control.query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",
+                &[&f.schema],
+            ).await.unwrap().get(0);
+            if waiting > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("callback must be waiting for the account admission lock");
+    let pending = f
+        .http
+        .get(format!("{}/accounts/sign-in", f.first.url))
+        .send()
+        .await;
+    f.control
+        .query_one(
+            "SELECT pg_advisory_unlock(hashtextextended($1,12484))",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.unwrap().status(), 303);
+    assert_eq!(
+        callback.await.unwrap().status(),
+        303,
+        "a pending sign-in must not exhaust the verified callback's admission deadline"
+    );
+    f.finish().await;
+}

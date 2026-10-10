@@ -98,7 +98,7 @@ impl CentralStore {
         let hash = vault::digest(challenge.as_bytes());
         let encrypted = vault::encrypt_bytes(&db.key, payload)?;
         bounded_db(async {
-            let mut connection = db.admission_client().await?;
+            let mut connection = db.transaction_client(&db.browser_logins).await?;
             let tx = connection.transaction().await?;
             // Count after the cross-pod lock so each insertion sees its predecessor.
             tx.query_one("SELECT pg_advisory_xact_lock(73912758)", &[]).await?;
