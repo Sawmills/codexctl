@@ -774,3 +774,46 @@ async fn postgres_dashboard_serializes_competing_company_identities_with_the_sam
     assert_eq!(users, 1);
     f.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_dashboard_pending_flows_are_bounded_and_retired_on_new_sign_in() {
+    let f = BrowserFixture::start().await;
+    f.control.batch_execute(&format!("INSERT INTO {}.enrollment_challenges(challenge_hash,encrypted_payload,expires_at) SELECT lpad(n::text,64,'0'),decode('','hex'),now()+interval '1 hour' FROM generate_series(1,1024) n",f.schema)).await.unwrap();
+    for pod in [&f.first, &f.second] {
+        let response = f
+            .http
+            .get(format!("{}/accounts/sign-in", pod.url))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            429,
+            "pending sign-ins share one capacity bound across pods"
+        );
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "enrollment_capacity"
+        );
+    }
+    f.control
+        .batch_execute(&format!(
+            "UPDATE {}.enrollment_challenges SET expires_at=now()-interval '1 second'",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    f.sign_in().await;
+    f.begin_sign_in().await;
+    let count: i64 = f
+        .control
+        .query_one(
+            &format!("SELECT count(*) FROM {}.enrollment_challenges", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1, "a new sign-in retires expired and consumed state");
+    f.finish().await;
+}
