@@ -1063,7 +1063,15 @@ recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, o
 `on`; the setting takes effect when the server starts.
 Concurrent requests for the same old revision reuse the refreshed token.
 A matching `previousRevision` also receives the current token when the account
-rotated within the last 60 seconds. The rotation timestamp is saved with the
+has at least one hour of stored access-token life left, with
+`outcome=served_recent` and `reason=token_valid`. Older clients cannot force
+rotations of healthy access tokens. Near-expiry requests still receive the
+current token if the account rotated within the last 60 seconds. Internal
+login verification and reset probes still exercise the refresh grant.
+Without a usable expiry claim, the existing refresh path and 60-second guard
+apply; each matching request logs `reason=exp_unknown` and counts in the same
+forced-refresh counter.
+The rotation timestamp is saved with the
 encrypted vault and follows shared-store reconciliation and restart. Changes to
 access, refresh, or ID tokens count as rotations in both nested and flat auth
 files. On `served_recent` with `billing:true`, limits observed less than
@@ -1072,7 +1080,7 @@ Reuse preserves the original observation time; stale or missing evidence takes
 a live read. Workspace routing is still checked before delivery.
 Each matching request logs one JSON
 `forced_refresh` decision with `outcome`, lowercase `account`, `account_key`,
-registered `device`, `reason="previous_revision_current"`, and
+registered `device`, `reason="token_valid|exp_unknown|previous_revision_current"`, and
 `last_rotation_age_s`. The age is null when no rotation has been observed or the saved timestamp is
 ahead of the current clock. A future timestamp does not hold the guard open.
 The log contains no credentials or provider response body.

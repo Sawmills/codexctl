@@ -80,6 +80,8 @@ def rotate(plan_change=False):
         payload["sub"] = "different-login"
     if plan_change:
         payload["https://api.openai.com/auth"]["chatgpt_plan_type"] = "business"
+    if mode == "refresh-extends-expiry":
+        payload["exp"] = 4102444800
     payload["generation"] = payload.get("generation", 0) + 1
     payload["iat"] = 2000000000 + payload["generation"]
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")

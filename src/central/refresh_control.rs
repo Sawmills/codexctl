@@ -19,10 +19,17 @@ pub(super) fn recovery(result: Recovery) {
 pub(super) enum Forced {
     Refreshed,
     ServedRecent,
+    TokenValid,
+    UnknownExpiry { recent: bool },
 }
 
 pub(super) fn forced(outcome: Forced, alias: &str, user: &str, device: &str, age_ms: Option<u64>) {
-    let index = outcome as usize;
+    let (index, reason) = match outcome {
+        Forced::Refreshed => (0, "previous_revision_current"),
+        Forced::ServedRecent => (1, "previous_revision_current"),
+        Forced::TokenValid => (1, "token_valid"),
+        Forced::UnknownExpiry { recent } => (usize::from(recent), "exp_unknown"),
+    };
     FORCED[index].fetch_add(1, Ordering::Relaxed);
     let outcome = ["refreshed", "served_recent"][index];
     eprintln!(
@@ -33,7 +40,7 @@ pub(super) fn forced(outcome: Forced, alias: &str, user: &str, device: &str, age
             "account": alias.to_ascii_lowercase(),
             "account_key": super::managed::account_key(user, alias),
             "device": device,
-            "reason": "previous_revision_current",
+            "reason": reason,
             "last_rotation_age_s": age_ms.map(|age| age / 1000),
         })
     );
