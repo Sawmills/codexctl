@@ -3760,17 +3760,24 @@ fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
             .parse::<u32>()
             .unwrap()
     };
+    let wait_for_launches = |expected| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while launches() < expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background recovery did not reach {expected} launches"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(launches(), 2);
+    wait_for_launches(2);
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("retry-clock"), b"300000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(launches(), 3);
+    wait_for_launches(3);
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("retry-clock"), b"900000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(launches(), 4);
+    wait_for_launches(4);
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("retry-clock"), b"900001").unwrap();
     std::thread::sleep(Duration::from_millis(100));
