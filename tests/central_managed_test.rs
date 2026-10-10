@@ -352,6 +352,16 @@ impl Server {
             .send()
             .unwrap()
     }
+    fn advance_rotation_clock(&self) {
+        let path = self.root.path().join("retry-clock");
+        let now: u64 = std::fs::read_to_string(&path)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        store::atomic_write(&path, (now + 61_000).to_string().as_bytes()).unwrap();
+    }
+
     fn stop(&mut self) {
         unsafe { libc::kill(self.child.id() as i32, libc::SIGTERM) };
         assert!(self.child.wait().unwrap().success());
@@ -2505,6 +2515,7 @@ fn when_a_user_requests_another_users_alias_then_no_access_token_is_returned() {
 fn when_an_import_is_retried_after_refresh_then_the_latest_credentials_are_preserved() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -2545,6 +2556,7 @@ fn when_a_user_is_disabled_then_existing_devices_lose_access() {
 fn when_the_server_restarts_then_it_preserves_the_refreshed_account() {
     let mut server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -2559,6 +2571,7 @@ fn when_the_server_restarts_then_it_preserves_the_refreshed_account() {
 fn when_multiple_clients_refresh_the_same_revision_then_the_owner_rotates_once() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let results = std::thread::scope(|scope| {
         let first = scope.spawn(|| {
@@ -4091,6 +4104,7 @@ fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
 fn a_rejected_forced_refresh_is_counted_too() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(
         &server.root.path().join("mode"),
@@ -4306,6 +4320,7 @@ fn when_a_crash_leaves_a_newer_journal_then_restart_recovers_it() {
         .unwrap()
         .path();
     let old = std::fs::read(account.join("vault.enc")).unwrap();
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
@@ -4366,6 +4381,7 @@ fn when_another_users_refresh_is_blocked_then_your_account_catalog_still_respond
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
     server.import(&server.alex, "personal", "alex-login", "alex-seat");
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.alex, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
     let response = std::thread::scope(|scope| {
@@ -5672,6 +5688,7 @@ fn refresh_only_rotation_changes_the_revision_and_is_not_replayed_for_another_cl
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"refresh-only").unwrap();
     let after: Value = server
@@ -5784,6 +5801,7 @@ fn a_legacy_migration_retry_keeps_the_uid_learned_by_the_server() {
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let token: Value = server.token(&server.amir, "personal", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"routing-error").unwrap();
     assert_eq!(
@@ -7903,6 +7921,7 @@ fn hq6_slow_refresh_does_not_block_another_alias_of_the_same_company_user() {
             .status(),
         200
     );
+    server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "slow", None).json().unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"hold").unwrap();
     let fast = std::thread::scope(|scope| {
