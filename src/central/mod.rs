@@ -12,6 +12,7 @@ mod owner_refresh;
 #[cfg(target_os = "linux")]
 mod polling;
 mod process;
+mod refresh_control;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use polling::supervise_login;

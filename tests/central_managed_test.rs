@@ -282,7 +282,7 @@ impl Server {
             .env("CENTRAL_TEST_OWNER_CWD_FILE", root.path().join("owner-cwd"))
             .env("CENTRAL_TEST_RECOVERY_INTERVAL_MS", "20")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(root.path().join("server.stderr")).unwrap())
             .spawn()
             .unwrap();
         let mut line = String::new();
@@ -3710,6 +3710,57 @@ fn matching_forced_requests_share_one_rotation_until_sixty_seconds_pass() {
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
         "3"
     );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"refreshed\"} 2\n"),
+        "{metrics}"
+    );
+    assert!(
+        metrics.contains("codexctl_central_forced_refresh_total{outcome=\"served_recent\"} 1\n"),
+        "{metrics}"
+    );
+    let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+    let decisions: Vec<Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|entry| entry["operation"] == "forced_refresh")
+        .collect();
+    assert_eq!(decisions.len(), 3, "{stderr}");
+    for (entry, outcome, age) in [
+        (&decisions[0], "refreshed", 60),
+        (&decisions[1], "served_recent", 0),
+        (&decisions[2], "refreshed", 61),
+    ] {
+        assert_eq!(entry["outcome"], outcome);
+        assert_eq!(entry["account"], "personal");
+        assert_eq!(
+            entry["account_key"],
+            "6ba9ac331db132b647376ae248690786b6e5958513de3490b10422fad3e7344a"
+        );
+        assert_eq!(entry["device"], "amir-laptop");
+        assert_eq!(entry["reason"], "previous_revision_current");
+        assert_eq!(entry["last_rotation_age_s"], age);
+        assert_eq!(entry.as_object().unwrap().len(), 7);
+    }
+    for secret in [
+        server.amir.as_str(),
+        first["accessToken"].as_str().unwrap(),
+        rotated["accessToken"].as_str().unwrap(),
+        next["accessToken"].as_str().unwrap(),
+        "synthetic-refresh",
+        "synthetic-rotated-refresh",
+        "auth.json",
+    ] {
+        assert!(!stderr.contains(secret), "secret in stderr");
+        assert!(!metrics.contains(secret), "secret in metrics");
+    }
 }
 
 #[test]
@@ -3763,6 +3814,22 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"200000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for (result, count) in [("recovered", 2), ("failed", 5), ("backoff", 6)] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_owner_recovery_total{{result=\"{result}\"}} {count}\n"
+            )),
+            "{metrics}"
+        );
+    }
 }
 
 #[test]

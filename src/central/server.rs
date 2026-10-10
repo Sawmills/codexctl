@@ -322,6 +322,14 @@ impl Owner {
         &mut self,
         request: TokenRequest,
     ) -> Result<TokenResponse, TokenFailure> {
+        self.tokens_for_device(request, None).await
+    }
+
+    pub(super) async fn tokens_for_device(
+        &mut self,
+        request: TokenRequest,
+        device: Option<&str>,
+    ) -> Result<TokenResponse, TokenFailure> {
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
                 "credential owner unavailable"
@@ -341,10 +349,24 @@ impl Owner {
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
             }
-            if self
+            let age_ms = self
                 .last_rotation
-                .is_some_and(|rotated| self.retry_clock_now().saturating_sub(rotated) < 60_000)
-            {
+                .map(|rotated| self.retry_clock_now().saturating_sub(rotated));
+            let recent = age_ms.is_some_and(|age| age < 60_000);
+            if let Some(device) = device {
+                super::refresh_control::forced(
+                    if recent {
+                        super::refresh_control::Forced::ServedRecent
+                    } else {
+                        super::refresh_control::Forced::Refreshed
+                    },
+                    &self.vault.alias,
+                    &self.vault.user,
+                    device,
+                    age_ms,
+                );
+            }
+            if recent {
                 return self.with_billing(current, request.billing).await;
             }
         }
@@ -729,6 +751,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
         })
         .collect();
     output.push_str(&super::owner_refresh::metrics());
+    output.push_str(&super::refresh_control::metrics());
     Ok((
         [("content-type", "text/plain; version=0.0.4; charset=utf-8")],
         output,

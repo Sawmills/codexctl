@@ -1521,6 +1521,7 @@ async fn token(
             .as_ref()
             .map(|borrowed| borrowed.grant.alias.clone());
         let mut request = template.clone();
+        let requesting_device = device.id.clone();
         // A request that found the owner busy re-checks under its lock.
         let fast_locked =
             busy_owner.then(|| (fast_account.clone(), fast_user.clone(), fast_alias.clone()));
@@ -1709,7 +1710,7 @@ async fn token(
                 return Err(error);
             }
             let observed_from = std::time::Instant::now();
-            let token_result = owner.tokens(request).await;
+            let token_result = owner.tokens_for_device(request, Some(&requesting_device)).await;
             // A failed native read may mean lost routing or a fenced owner.
             // Withdraw the evidence so no replica serves this account
             // lease-free until the lease path observes it again.
@@ -3237,6 +3238,7 @@ async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Res
     output.push_str(&super::storage::identity::admission_metrics());
     output.push_str(&fast_path::metrics());
     output.push_str(&super::owner_refresh::metrics());
+    output.push_str(&super::refresh_control::metrics());
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
@@ -3650,12 +3652,18 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
             || owner.available
             || !owner.retryable_unavailable
             || owner.routing_refused
-            || (if on_demand {
-                owner.on_demand_cooldown_active()
-            } else {
-                owner.retry_cooldown_active()
-            })
         {
+            continue;
+        }
+        let cooldown = if on_demand {
+            owner.on_demand_cooldown_active()
+        } else {
+            owner.retry_cooldown_active()
+        };
+        if cooldown {
+            if on_demand {
+                super::refresh_control::recovery(super::refresh_control::Recovery::Backoff);
+            }
             continue;
         }
         if pending && !exited {
@@ -3845,6 +3853,13 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                 }
                 let probe_pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
                 let probe_ok = probe.is_ok();
+                if on_demand {
+                    super::refresh_control::recovery(if probe_ok && local_saved {
+                        super::refresh_control::Recovery::Recovered
+                    } else {
+                        super::refresh_control::Recovery::Failed
+                    });
+                }
                 if probe_pending || !local_saved || lease.is_some() {
                     if matches!(probe, Err(TokenFailure::Retryable(_))) {
                         owner.retryable_unavailable = owner.vault.verified;
@@ -3986,6 +4001,9 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                 }
             }
             Err(error) => {
+                if on_demand {
+                    super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
+                }
                 owner.available = false;
                 owner.retry_failures = owner.retry_failures.saturating_add(1);
                 if owner.retry_started.is_none() {
