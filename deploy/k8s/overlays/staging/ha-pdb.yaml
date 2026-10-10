@@ -1,0 +1,14 @@
+# B33 attempt 4, PR H. Copied from overlays/staging-ha, own app name.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: codexctl-ha
+  namespace: codexctl
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {
+        app.kubernetes.io/name: codexctl-ha,
+        app.kubernetes.io/component: broker-ha,
+      }

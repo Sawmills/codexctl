@@ -1,0 +1,213 @@
+# B33 attempt 4, PR H: the HA broker beside the stopped StatefulSet. Copied from
+# overlays/staging-ha with its own app name, so Service/codexctl and the
+# public Ingress never select these pods before PR I. The Google client
+# secret key matches the staging ExternalSecret after SAW-12467.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codexctl-ha
+  namespace: codexctl
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy codexctl-ha selects these pods.
+    checkov.io/skip2: CKV_K8S_35=Database credentials are sourced from the ExternalSecret by design.
+    checkov.io/skip3: CKV_K8S_43=The staging kustomization pins codexctl-central by digest.
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: codexctl-ha
+      app.kubernetes.io/component: broker-ha
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: codexctl-ha
+        app.kubernetes.io/component: broker-ha
+    spec:
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            {
+              matchLabels:
+                {
+                  app.kubernetes.io/name: codexctl-ha,
+                  app.kubernetes.io/component: broker-ha,
+                },
+            }
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            {
+              matchLabels:
+                {
+                  app.kubernetes.io/name: codexctl-ha,
+                  app.kubernetes.io/component: broker-ha,
+                },
+            }
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                {
+                  matchLabels:
+                    {
+                      app.kubernetes.io/name: codexctl-ha,
+                      app.kubernetes.io/component: broker-ha,
+                    },
+                }
+      initContainers:
+        - name: prepare-secrets
+          image: busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            - >-
+              cp /projected/vault-key /keys/vault-key;
+              cp /projected/google-oidc-client-secret /keys/oidc-client-secret;
+              cp /projected/metrics-token /keys/metrics-token;
+              chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { cpu: 100m, memory: 32Mi }
+          volumeMounts:
+            - { name: projected, mountPath: /projected, readOnly: true }
+            - { name: keys, mountPath: /keys }
+        - name: initialize
+          image: codexctl-central:staging
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            [
+              "if [ ! -f /data/state/users.json ]; then codexctl-central setup --state /data/state --key-file /keys/vault-key; fi",
+            ]
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
+          volumeMounts:
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: state, mountPath: /data }
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 64Mi }
+      containers:
+        - name: broker
+          image: codexctl-central:staging
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            - >-
+              exec codexctl-central serve --state /data/state --key-file /keys/vault-key
+              --listen 0.0.0.0:8787 --public-url https://codexctl.ue1.staging.plat.sm-svc.com
+              --metrics-token-file /keys/metrics-token --sso-config /configuration/sso.json
+          env:
+            - name: CODEXCTL_CENTRAL_STORE
+              value: postgres
+            # Every replica runs layout 8 from its first start (B33 attempt 4).
+            - name: CODEXCTL_CENTRAL_TOKEN_FAST_PATH
+              value: "1"
+            - {
+                name: DB_HOST,
+                valueFrom:
+                  {
+                    secretKeyRef: { name: codexctl-postgres, key: db-hostname },
+                  },
+              }
+            - {
+                name: DB_PORT,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-port } },
+              }
+            - {
+                name: DB_NAME,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-name } },
+              }
+            - {
+                name: DB_USER,
+                valueFrom:
+                  { secretKeyRef: { name: codexctl-postgres, key: db-user } },
+              }
+            - {
+                name: DB_PASSWORD,
+                valueFrom:
+                  {
+                    secretKeyRef: { name: codexctl-postgres, key: db-password },
+                  },
+              }
+            - name: CODEXCTL_CENTRAL_DB_CA_FILE
+              value: /etc/codexctl/rds-ca/global-bundle.pem
+          ports: [{ name: http, containerPort: 8787 }]
+          startupProbe:
+            httpGet: { path: /health, port: http }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            {
+              httpGet: { path: /ready, port: http },
+              periodSeconds: 5,
+              failureThreshold: 3,
+            }
+          livenessProbe:
+            { httpGet: { path: /health, port: http }, periodSeconds: 10 }
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -ec
+                  - |
+                    kill -TERM 1
+                    sleep 5
+          securityContext:
+            {
+              allowPrivilegeEscalation: false,
+              readOnlyRootFilesystem: true,
+              capabilities: { drop: [ALL] },
+            }
+          resources:
+            {
+              requests: { cpu: 100m, memory: 256Mi },
+              limits: { cpu: "2", memory: 2Gi },
+            }
+          volumeMounts:
+            - { name: keys, mountPath: /keys, readOnly: true }
+            - { name: configuration, mountPath: /configuration, readOnly: true }
+            - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
+            - { name: state, mountPath: /data }
+            - { name: home, mountPath: /home/codexctl }
+            - { name: temporary, mountPath: /tmp }
+      volumes:
+        - name: rds-ca
+          configMap: { name: codexctl-rds-ca }
+        - name: projected
+          secret: { secretName: codexctl-secrets, defaultMode: 288 }
+        - name: keys
+          emptyDir: { medium: Memory }
+        - name: configuration
+          configMap: { name: codexctl-sso }
+        - name: state
+          emptyDir: {}
+        - name: home
+          emptyDir: {}
+        - name: temporary
+          emptyDir: {}

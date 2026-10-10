@@ -105,8 +105,14 @@ spec:
     credentials:
       name: codexctl-secrets
       key: metrics-token
-  staticConfigs:
-    - targets: [codexctl.codexctl.svc.cluster.local:80]
-      labels:
-        namespace: codexctl
-        service: codexctl
+  # B33 attempt 4, PR H: one target per HA pod. The labels keep the existing
+  # alert expressions valid.
+  dnsSDConfigs:
+    - names: [codexctl-ha-pods.codexctl.svc.cluster.local]
+      type: A
+      port: 8787
+  relabelings:
+    - targetLabel: namespace
+      replacement: codexctl
+    - targetLabel: service
+      replacement: codexctl
