@@ -1243,7 +1243,7 @@ fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
     )?;
     calls.retain(|_, previous| now.checked_sub(*previous).is_some_and(|age| age < 600_000));
     #[cfg(unix)]
-    let parent = unsafe { libc::getppid() } as u32;
+    let parent = std::os::unix::process::parent_id();
     #[cfg(not(unix))]
     let parent = std::process::id();
     let retry = calls
