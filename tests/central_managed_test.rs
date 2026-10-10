@@ -4561,6 +4561,83 @@ fn flat_credentials_share_recent_rotations_including_refresh_only_changes() {
 }
 
 #[test]
+fn unknown_expiry_forces_keep_the_rotation_guard_and_report_exp_unknown() {
+    for expiry in [None, Some(json!("untrusted-expiry"))] {
+        let server = Server::start();
+        let mut claims = json!({"sub":"amir-login","iat":2000000000_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"amir-seat","chatgpt_plan_type":"pro"}});
+        if let Some(expiry) = expiry {
+            claims["exp"] = expiry;
+        }
+        let imported = json!({"tokens":{"access_token":format!("header.{}.", URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-refresh","account_id":"amir-seat"}});
+        assert_eq!(
+            server
+                .import_auth(&server.amir, "personal", imported)
+                .status(),
+            200
+        );
+        server.advance_rotation_clock();
+        let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
+        let rotated: Value = server
+            .token(&server.amir, "personal", initial["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(rotated["revision"], initial["revision"]);
+        let recent: Value = server
+            .token(&server.amir, "personal", rotated["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_eq!(recent["revision"], rotated["revision"]);
+        assert_eq!(recent["accessToken"], rotated["accessToken"]);
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "2"
+        );
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        for outcome in ["refreshed", "served_recent"] {
+            assert!(
+                metrics.contains(&format!(
+                    "codexctl_central_forced_refresh_total{{outcome=\"{outcome}\"}} 1\n"
+                )),
+                "{metrics}"
+            );
+        }
+        let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+        let decisions: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|entry| entry["operation"] == "forced_refresh")
+            .collect();
+        assert_eq!(decisions.len(), 2, "{stderr}");
+        for (entry, outcome, age) in [
+            (&decisions[0], "refreshed", 61),
+            (&decisions[1], "served_recent", 0),
+        ] {
+            assert_eq!(entry["reason"], "exp_unknown");
+            assert_eq!(entry["outcome"], outcome);
+            assert_eq!(entry["last_rotation_age_s"], age);
+        }
+        for secret in [
+            server.amir.as_str(),
+            "untrusted-expiry",
+            initial["accessToken"].as_str().unwrap(),
+            rotated["accessToken"].as_str().unwrap(),
+            "synthetic-refresh",
+            "synthetic-rotated-refresh",
+        ] {
+            assert!(!stderr.contains(secret), "secret in stderr");
+            assert!(!metrics.contains(secret), "secret in metrics");
+        }
+    }
+}
+
+#[test]
 fn forced_request_rotates_a_near_expiry_token_once_and_retries_share_it() {
     let server = Server::start();
     assert_eq!(

@@ -386,8 +386,9 @@ impl Owner {
                 .and_then(|rotated| self.rotation_clock_now().checked_sub(rotated));
             // Verification and reset-auth probes must still exercise the grant.
             // Machine requests cannot force a healthy access token to rotate.
+            let expiry = api::token_expiry(&current.access_token);
             let token_valid = device.is_some()
-                && api::token_expiry(&current.access_token).is_some_and(|expires| {
+                && expiry.is_some_and(|expires| {
                     expires
                         >= chrono::Utc::now()
                             .timestamp()
@@ -398,6 +399,8 @@ impl Owner {
                 super::refresh_control::forced(
                     if token_valid {
                         super::refresh_control::Forced::TokenValid
+                    } else if expiry.is_none() {
+                        super::refresh_control::Forced::UnknownExpiry { recent }
                     } else if recent {
                         super::refresh_control::Forced::ServedRecent
                     } else {

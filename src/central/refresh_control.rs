@@ -20,15 +20,18 @@ pub(super) enum Forced {
     Refreshed,
     ServedRecent,
     TokenValid,
+    UnknownExpiry { recent: bool },
 }
 
 pub(super) fn forced(outcome: Forced, alias: &str, user: &str, device: &str, age_ms: Option<u64>) {
-    let (index, outcome, reason) = match outcome {
-        Forced::Refreshed => (0, "refreshed", "previous_revision_current"),
-        Forced::ServedRecent => (1, "served_recent", "previous_revision_current"),
-        Forced::TokenValid => (1, "served_recent", "token_valid"),
+    let (index, reason) = match outcome {
+        Forced::Refreshed => (0, "previous_revision_current"),
+        Forced::ServedRecent => (1, "previous_revision_current"),
+        Forced::TokenValid => (1, "token_valid"),
+        Forced::UnknownExpiry { recent } => (usize::from(recent), "exp_unknown"),
     };
     FORCED[index].fetch_add(1, Ordering::Relaxed);
+    let outcome = ["refreshed", "served_recent"][index];
     eprintln!(
         "{}",
         json!({
