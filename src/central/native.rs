@@ -85,8 +85,6 @@ struct Connection {
     device_token_file: PathBuf,
     account_id: String,
     revision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    access_expires_at: Option<i64>,
     #[serde(default)]
     allow_billing: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -879,7 +877,6 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         device_token_file: std::fs::canonicalize(token_file)?,
         account_id: String::new(),
         revision: String::new(),
-        access_expires_at: None,
         allow_billing: false,
         launch_pinned: false,
         approved_billing_plan: None,
@@ -1190,8 +1187,15 @@ fn finish_token(
     }
     if latest.revision == connection.revision {
         latest.revision = token.revision;
-        latest.access_expires_at = api::token_expiry(&token.access_token);
         save_connection(path, &latest)?;
+        let hint = TokenExpiryHint {
+            revision: latest.revision.clone(),
+            access_expires_at: api::token_expiry(&token.access_token),
+        };
+        store::atomic_write(
+            &token_sidecar_path(path, "token-expiry")?,
+            &serde_json::to_vec(&hint)?,
+        )?;
     }
     if let (Ok(paths), Ok(selection), Some(usage)) = (
         config::default_paths(),
@@ -1216,26 +1220,42 @@ fn connection_lock_directory(path: &Path, root: &Path) -> Result<PathBuf> {
         .to_owned())
 }
 
-// Callers hold the connection's native lock. Each connection has its own
-// private history, and unrelated Codex parents cannot trigger each other's retries.
-fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
-    let history_path = path.with_file_name(format!(
-        ".{}.token-calls.json",
+#[derive(Serialize, Deserialize)]
+struct TokenExpiryHint {
+    revision: String,
+    #[serde(default)]
+    access_expires_at: Option<i64>,
+}
+
+fn token_sidecar_path(path: &Path, name: &str) -> Result<PathBuf> {
+    Ok(path.with_file_name(format!(
+        ".{}.{name}.json",
         path.file_name()
             .context("missing connection filename")?
             .to_string_lossy()
-    ));
-    let mut calls: std::collections::BTreeMap<u32, u64> = match vault::private_read(&history_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("invalid token call history")?,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Default::default()
-        }
-        Err(error) => return Err(error),
-    };
+    )))
+}
+
+// A prior helper can change the connection during rollback. Ignore expiry from
+// a different revision, including a crash between the two atomic file writes.
+fn token_expiry_hint(path: &Path, connection: &Connection) -> Result<Option<i64>> {
+    let hint = vault::private_read(&token_sidecar_path(path, "token-expiry")?)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<TokenExpiryHint>(&bytes).ok());
+    Ok(hint
+        .filter(|hint| hint.revision == connection.revision)
+        .and_then(|hint| hint.access_expires_at))
+}
+
+// Callers hold the connection's native lock. Each connection has its own
+// private history, and unrelated Codex parents cannot trigger each other's retries.
+fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
+    let history_path = token_sidecar_path(path, "token-calls")?;
+    // Timing is advisory: replace malformed or unreadable history on this call.
+    let mut calls: std::collections::BTreeMap<u32, u64> = vault::private_read(&history_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
     let now = u64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -1250,8 +1270,7 @@ fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
         .insert(parent, now)
         .is_some_and(|previous| now - previous < 10_000);
     store::atomic_write(&history_path, &serde_json::to_vec(&calls)?)?;
-    let near_expiry = connection
-        .access_expires_at
+    let near_expiry = token_expiry_hint(path, connection)?
         .is_some_and(|expiry| expiry.saturating_sub(chrono::Utc::now().timestamp()) < 3600);
     Ok(retry || near_expiry)
 }
@@ -1880,7 +1899,6 @@ pub(super) fn sync_account(
             device_token_file: device.token_file.clone(),
             account_id: account.account_id.clone(),
             revision: String::new(),
-            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2123,7 +2141,6 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: true,
             launch_pinned: true,
             approved_billing_plan: Some("pro".into()),
@@ -2163,7 +2180,6 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "shared-workspace".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2201,7 +2217,6 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: false,
             launch_pinned: false,
             approved_billing_plan: None,
@@ -2230,7 +2245,6 @@ mod tests {
             device_token_file: "device.token".into(),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("pro".into()),
@@ -2253,7 +2267,6 @@ mod tests {
             device_token_file: root.path().join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
@@ -2486,7 +2499,6 @@ mod tests {
             device_token_file: root.join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),
@@ -2579,7 +2591,6 @@ mod tests {
             device_token_file: root.path().join("device.token"),
             account_id: "account".into(),
             revision: "revision".into(),
-            access_expires_at: None,
             allow_billing: true,
             launch_pinned: false,
             approved_billing_plan: Some("usage_based".into()),

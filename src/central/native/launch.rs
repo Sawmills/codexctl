@@ -357,7 +357,6 @@ pub(super) fn catalog_connection<'a>(
         device_token_file: catalog.connection.token_file.clone(),
         account_id: account.account_id.clone(),
         revision: String::new(),
-        access_expires_at: None,
         allow_billing: false,
         launch_pinned,
         approved_billing_plan: None,
