@@ -106,7 +106,7 @@ impl CentralStore {
             let mut connection = db.transaction_client(&db.browser_logins).await?;
             let tx = connection.transaction().await?;
             // Count after the cross-pod lock so each insertion sees its predecessor.
-            tx.query_one("SELECT pg_advisory_xact_lock(73912758)", &[]).await?;
+            tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),73912758))", &[]).await?;
             tx.execute("DELETE FROM enrollment_challenges WHERE expires_at <= now() OR consumed_at IS NOT NULL", &[]).await?;
             let inserted = tx.execute(
                 "INSERT INTO enrollment_challenges(challenge_hash,encrypted_payload,expires_at) SELECT $1,$2,now()+($3::bigint * interval '1 second') WHERE (SELECT count(*) FROM enrollment_challenges WHERE expires_at > now() AND consumed_at IS NULL) < 1024",
@@ -130,7 +130,7 @@ impl CentralStore {
             let mut connection = db.admission_client().await?;
             let tx = connection.transaction().await?;
             // Serialize the count and insertion across replicas, not just this connection.
-            tx.query_one("SELECT pg_advisory_xact_lock(73912757)", &[]).await?;
+            tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),73912757))", &[]).await?;
             tx.execute("DELETE FROM browser_sessions WHERE expires_at <= now()", &[]).await?;
             let inserted = tx.execute(
                 "INSERT INTO browser_sessions(token_hash,user_id,signed_in_at,expires_at) SELECT $1,$2,to_timestamp($3::double precision),now()+($4::bigint * interval '1 second') WHERE (SELECT count(*) FROM browser_sessions WHERE expires_at > now()) < 1024",

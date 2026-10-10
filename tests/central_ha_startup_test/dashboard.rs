@@ -997,6 +997,48 @@ async fn postgres_dashboard_logs_only_committed_identity_links_once() {
 }
 
 #[tokio::test]
+async fn postgres_dashboard_sign_in_capacity_lock_is_isolated_from_other_schemas() {
+    let f = BrowserFixture::start().await;
+    // Hold the legacy database-wide key and the conventional key of another schema.
+    // A sign-in in this schema must not wait for either unrelated transaction.
+    f.control.query_one("SELECT pg_advisory_lock(73912758), pg_advisory_lock(hashtextextended('unrelated-browser-schema',73912758))", &[]).await.unwrap();
+    let response = f
+        .http
+        .get(format!("{}/accounts/sign-in", f.first.url))
+        .send()
+        .await
+        .unwrap();
+    f.control
+        .query_one("SELECT pg_advisory_unlock_all()", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        303,
+        "another schema cannot consume this dashboard's capacity wait budget"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_session_capacity_lock_is_isolated_from_other_schemas() {
+    let f = BrowserFixture::start().await;
+    let (binding, path) = f.begin_sign_in().await;
+    f.control.query_one("SELECT pg_advisory_lock(73912757), pg_advisory_lock(hashtextextended('unrelated-browser-schema',73912757))", &[]).await.unwrap();
+    let response = f.callback(&f.second, &binding, &path).await;
+    f.control
+        .query_one("SELECT pg_advisory_unlock_all()", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        303,
+        "another schema cannot block a verified session from being created"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_dashboard_sign_in_does_not_wait_for_account_admission() {
     let f = BrowserFixture::start().await;
     let (binding, path) = f.begin_sign_in().await;
