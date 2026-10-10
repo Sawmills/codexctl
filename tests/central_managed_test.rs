@@ -4319,6 +4319,7 @@ fn relay_capacity_event_authorizes_before_reading_a_large_body() {
         .http
         .post(format!("{}/v1/relay/capacity-events", server.url))
         .header("content-type", "application/json")
+        .header("expect", "100-continue")
         .body(vec![b'x'; 1024 * 1024 + 1])
         .send()
         .unwrap();
