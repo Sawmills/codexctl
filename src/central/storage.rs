@@ -24,6 +24,7 @@ pub(in crate::central) mod login;
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
 mod browser;
+pub(in crate::central) use browser::BrowserIdentity;
 mod loans;
 mod migration;
 

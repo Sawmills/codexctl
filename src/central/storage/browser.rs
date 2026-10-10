@@ -3,7 +3,57 @@ use super::{CentralStore, PostgresStore, bounded_db, vault};
 use anyhow::{Result, bail};
 use std::time::Duration;
 
+pub(in crate::central) enum BrowserIdentity {
+    User(String),
+    Disabled,
+    Conflict,
+}
+
 impl CentralStore {
+    pub(in crate::central) async fn resolve_browser_identity(
+        &self,
+        arriving: &str,
+        email: &str,
+        enforce_email_link: bool,
+        authorized_source: Option<&str>,
+    ) -> Result<BrowserIdentity> {
+        let db = self.browser_store()?;
+        bounded_db(async {
+            let mut connection = db.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = super::identity::lock_admission(&tx).await?;
+            let users: Vec<_> = tx.query("SELECT id,email,enabled,oidc_identity FROM central_users WHERE deleted_at IS NULL ORDER BY id", &[]).await?
+                .into_iter().map(|row| crate::central::managed::User {
+                    id: row.get(0), email: row.get(1), enabled: row.get(2), oidc_identity: row.get(3),
+                }).collect();
+            let resolution = if let Some(user) = users.iter().find(|u| u.oidc_identity.as_deref() == Some(arriving)) {
+                if user.enabled { BrowserIdentity::User(user.id.clone()) } else { BrowserIdentity::Disabled }
+            } else if let Some(user) = users.iter().find(|u| u.id == arriving) {
+                if !user.enabled { BrowserIdentity::Disabled } else if user.oidc_identity.is_some() { BrowserIdentity::Conflict } else { BrowserIdentity::User(user.id.clone()) }
+            } else {
+                let matches: Vec<_> = users.iter().filter(|u| u.email.eq_ignore_ascii_case(email)).collect();
+                if enforce_email_link && (!matches.is_empty() || authorized_source.is_some()) {
+                    match (matches.as_slice(), authorized_source) {
+                        ([user], Some(source)) if user.id == source && user.oidc_identity.is_none() => {
+                            if !user.enabled { BrowserIdentity::Disabled } else {
+                                tx.execute("UPDATE central_users SET oidc_identity=$2,revision=revision+1,updated_at=now() WHERE id=$1", &[&user.id,&arriving]).await?;
+                                BrowserIdentity::User(user.id.clone())
+                            }
+                        }
+                        _ => BrowserIdentity::Conflict,
+                    }
+                } else {
+                    // Reserve under the same admission lock as resolution. A competing
+                    // verified subject must see this email before it can claim another ID.
+                    let inserted = tx.query_opt("INSERT INTO central_users(id,email,enabled) VALUES($1,$2,true) ON CONFLICT(id) DO NOTHING RETURNING id", &[&arriving,&email]).await?.is_some();
+                    if inserted { BrowserIdentity::User(arriving.to_owned()) } else { BrowserIdentity::Disabled }
+                }
+            };
+            tx.commit().await?;
+            Ok(resolution)
+        }).await
+    }
+
     pub(in crate::central) async fn record_browser_user(
         &self,
         id: &str,

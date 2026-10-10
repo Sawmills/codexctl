@@ -45,6 +45,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.output(400, {"error": "PKCE required"})
                 return
             code = secrets.token_urlsafe(32)
+            identity = json.loads((root / "identity.json").read_text())
+            if identity.get("freeze_on_authorize"):
+                params["test_identity"] = identity
             codes[code] = params
             self.send_response(302)
             self.send_header("Location", params["redirect_uri"] + "?" + urlencode({"code": code, "state": params["state"]}))
@@ -59,7 +62,7 @@ class Handler(BaseHTTPRequestHandler):
         if params is None or b64(hashlib.sha256(verifier.encode()).digest()) != params["code_challenge"]:
             self.output(400, {"error": "invalid_grant"})
             return
-        identity = json.loads((root / "identity.json").read_text())
+        identity = params.get("test_identity") or json.loads((root / "identity.json").read_text())
         now = int(time.time())
         claims = {"iss": issuer, "sub": identity["sub"], "aud": identity.get("aud", "codexctl-test"), "iat": now, "exp": now + 300, "nonce": identity.get("nonce", params["nonce"]), "email": identity["email"], "email_verified": identity.get("verified", True)}
         if "hd" in identity:

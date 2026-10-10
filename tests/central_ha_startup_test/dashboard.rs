@@ -32,6 +32,9 @@ impl BrowserFixture {
         database
             .query_pairs_mut()
             .append_pair("options", &format!("-csearch_path={schema}"));
+        database
+            .query_pairs_mut()
+            .append_pair("application_name", &schema);
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
         central::managed::setup(&root.path().join("state"), &key).unwrap();
@@ -198,6 +201,8 @@ impl BrowserFixture {
         let mut url = reqwest::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
         url.query_pairs_mut()
             .append_pair("options", &format!("-csearch_path={}", self.schema));
+        url.query_pairs_mut()
+            .append_pair("application_name", &self.schema);
         url.to_string()
     }
 }
@@ -693,5 +698,79 @@ async fn postgres_dashboard_expired_oidc_flow_does_not_create_a_session() {
         .unwrap()
         .get(0);
     assert_eq!(count, 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_serializes_competing_company_identities_with_the_same_email() {
+    let mut f = BrowserFixture::start().await;
+    let database = f.database();
+    let key = f._root.path().join("key");
+    for pod in [&mut f.first, &mut f.second] {
+        pod.stop().await;
+        let config_file = pod.root.path().join("sso.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+        config["allowed_hosted_domains"] = json!(["example.invalid"]);
+        store::atomic_write(&config_file, &serde_json::to_vec(&config).unwrap()).unwrap();
+        let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
+        *pod = Pod::spawn(&database, &key, root, "postgres").await;
+    }
+    let mut callbacks = Vec::new();
+    for sub in ["first-company-identity", "second-company-identity"] {
+        store::atomic_write(&f._root.path().join("identity.json"),&serde_json::to_vec(&json!({"sub":sub,"email":"same@example.invalid","hd":"example.invalid","freeze_on_authorize":true})).unwrap()).unwrap();
+        callbacks.push(f.begin_sign_in().await);
+    }
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.central_users IN SHARE MODE",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let mut tasks = Vec::new();
+    for (pod, (binding, path)) in [&f.first, &f.second].into_iter().zip(callbacks) {
+        let http = f.http.clone();
+        let url = pod.url.clone();
+        tasks.push(tokio::spawn(async move {
+            http.get(format!("{url}{path}"))
+                .header("cookie", binding)
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    timeout(Duration::from_secs(1),async {
+        loop {
+            f.control.query_one("SELECT pg_stat_clear_snapshot()", &[]).await.unwrap();
+            let waiting:i64=f.control.query_one("SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",&[&f.schema]).await.unwrap().get(0);
+            if waiting>=2 { break; }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }).await.expect("both callbacks must reach the contested registry before release");
+    f.control.batch_execute("COMMIT").await.unwrap();
+    let mut statuses = Vec::new();
+    for task in tasks {
+        statuses.push(task.await.unwrap().status().as_u16());
+    }
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [303, 403],
+        "one verified email must not acquire two company-user identities"
+    );
+    let users: i64 = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {}.central_users WHERE email='same@example.invalid'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(users, 1);
     f.finish().await;
 }
