@@ -381,6 +381,20 @@ impl Server {
             .output()
             .unwrap()
     }
+    #[cfg(unix)]
+    fn cli_from_fresh_parent(&self, home: &std::path::Path, args: &[&str]) -> std::process::Output {
+        // Keep the shell alive while the helper runs, so it is a distinct Codex parent.
+        Command::new("sh")
+            .args(["-c", "\"$@\"; exit \"$?\"", "token-parent"])
+            .arg(env!("CARGO_BIN_EXE_codexctl"))
+            .args(args)
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("HOME", home)
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap()
+    }
     fn connected_home(&self) -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         let directory = home.path().join(".codexctl/central");
@@ -2595,6 +2609,460 @@ fn when_multiple_clients_refresh_the_same_revision_then_the_owner_rotates_once()
     );
 }
 #[test]
+fn healthy_native_token_helpers_do_not_force_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let connection = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec![
+                "central-token",
+                "--connection",
+                connection.to_str().unwrap(),
+            ]
+        };
+        assert!(server.cli(home.path(), &args).status.success());
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        // Exercise the actual provider interval with the same parent. Advance the
+        // server guard too, so it cannot hide an unnecessary forced refresh.
+        for _ in 0..2 {
+            std::thread::sleep(Duration::from_secs(60));
+            server.advance_rotation_clock();
+            let token = server.cli(home.path(), &args);
+            assert!(
+                token.status.success(),
+                "{}",
+                String::from_utf8_lossy(&token.stderr)
+            );
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap(),
+                before,
+                "scheduled helper rechecks must not rotate healthy access (active={active})"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_token_helpers_replace_invalid_call_history_and_keep_serving() {
+    use std::os::unix::fs::PermissionsExt;
+    for active in [true, false] {
+        for unreadable in [false, true] {
+            let server = Server::start();
+            assert_eq!(
+                server
+                    .import(&server.amir, "personal", "amir-login", "amir-seat")
+                    .status(),
+                200
+            );
+            let home = server.connected_home();
+            assert!(
+                server
+                    .cli(home.path(), &["use", "personal"])
+                    .status
+                    .success()
+            );
+            let path = home.path().join(".codexctl/central/personal.json");
+            let args = if active {
+                vec!["central-token", "--active"]
+            } else {
+                vec!["central-token", "--connection", path.to_str().unwrap()]
+            };
+            assert!(server.cli(home.path(), &args).status.success());
+            let history_path = path.with_file_name(".personal.json.token-calls.json");
+            if unreadable {
+                // A non-private file is rejected by the private reader on every host.
+                std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            } else {
+                store::atomic_write(&history_path, b"invalid-json").unwrap();
+            }
+            server.advance_rotation_clock();
+            let count = server.root.path().join("count");
+            let before = std::fs::read_to_string(&count).unwrap();
+            let token = server.cli(home.path(), &args);
+            assert!(
+                token.status.success(),
+                "invalid advisory history must not deny tokens (active={active}, unreadable={unreadable}): {}",
+                String::from_utf8_lossy(&token.stderr)
+            );
+            assert_eq!(std::fs::read_to_string(count).unwrap(), before);
+            let history: Value =
+                serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
+            assert_eq!(history.as_object().unwrap().len(), 1);
+            assert_eq!(
+                std::fs::metadata(history_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn native_token_helpers_preserve_the_released_connection_schema() {
+    // These are the fields accepted by the strict v0.1.48 connection reader.
+    const RELEASED_FIELDS: &[&str] = &[
+        "user_id",
+        "alias",
+        "server",
+        "device_token_file",
+        "account_id",
+        "revision",
+        "allow_billing",
+        "launch_pinned",
+        "approved_billing_plan",
+        "approved_billing_class",
+        "session_id",
+        "loan_id",
+    ];
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        let token = server.cli(home.path(), &args);
+        assert!(
+            token.status.success(),
+            "{}",
+            String::from_utf8_lossy(&token.stderr)
+        );
+        let connection: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert!(!connection["revision"].as_str().unwrap().is_empty());
+        assert!(
+            connection
+                .as_object()
+                .unwrap()
+                .keys()
+                .all(|key| RELEASED_FIELDS.contains(&key.as_str())),
+            "token delivery must keep the connection readable by v0.1.48 (active={active})"
+        );
+    }
+}
+
+#[test]
+fn rapid_native_token_retry_from_the_same_parent_forces_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let connection = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec![
+                "central-token",
+                "--connection",
+                connection.to_str().unwrap(),
+            ]
+        };
+        let first = server.cli(home.path(), &args);
+        assert!(
+            first.status.success(),
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before: u32 = std::fs::read_to_string(&count).unwrap().parse().unwrap();
+        let retry = server.cli(home.path(), &args);
+        assert!(
+            retry.status.success(),
+            "{}",
+            String::from_utf8_lossy(&retry.stderr)
+        );
+        let after: u32 = std::fs::read_to_string(count).unwrap().parse().unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "a fast retry must rotate once (active={active})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn near_expiry_native_token_helpers_force_a_refresh() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        assert!(server.cli(home.path(), &args).status.success());
+        let hint_path = path.with_file_name(".personal.json.token-expiry.json");
+        let mut hint: Value = serde_json::from_slice(&std::fs::read(&hint_path).unwrap()).unwrap();
+        hint["access_expires_at"] = json!(chrono::Utc::now().timestamp() + 3599);
+        hint["future_metadata"] = json!(true);
+        store::atomic_write(&hint_path, &serde_json::to_vec(&hint).unwrap()).unwrap();
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before: u32 = std::fs::read_to_string(&count).unwrap().parse().unwrap();
+        let token = server.cli_from_fresh_parent(home.path(), &args);
+        assert!(
+            token.status.success(),
+            "{}",
+            String::from_utf8_lossy(&token.stderr)
+        );
+        let after: u32 = std::fs::read_to_string(count).unwrap().parse().unwrap();
+        assert_eq!(
+            after,
+            before + 1,
+            "near-expiry access must rotate (active={active})"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn native_token_helpers_ignore_expiry_from_a_different_revision() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        assert!(server.cli(home.path(), &args).status.success());
+        let hint_path = path.with_file_name(".personal.json.token-expiry.json");
+        // An old helper or interrupted pair of writes can leave this revision behind.
+        store::atomic_write(
+            &hint_path,
+            &serde_json::to_vec(&json!({
+                "revision":"prior-helper-revision",
+                "access_expires_at":chrono::Utc::now().timestamp()+3599
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        let token = server.cli_from_fresh_parent(home.path(), &args);
+        assert!(
+            token.status.success(),
+            "{}",
+            String::from_utf8_lossy(&token.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(count).unwrap(),
+            before,
+            "stale expiry must not force a different revision (active={active})"
+        );
+        let connection: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let hint: Value = serde_json::from_slice(&std::fs::read(hint_path).unwrap()).unwrap();
+        assert_eq!(hint["revision"], connection["revision"]);
+        assert_eq!(hint["access_expires_at"], 4102444800_i64);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn another_native_token_parent_does_not_force_and_old_connections_gain_an_expiry_hint() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        let first = server.cli(home.path(), &args);
+        assert!(first.status.success());
+        let hint_path = path.with_file_name(".personal.json.token-expiry.json");
+        std::fs::remove_file(&hint_path).unwrap();
+        server.advance_rotation_clock();
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        let second = server.cli_from_fresh_parent(home.path(), &args);
+        assert!(
+            second.status.success(),
+            "{}",
+            String::from_utf8_lossy(&second.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(count).unwrap(),
+            before,
+            "another parent must not trigger recovery (active={active})"
+        );
+        let connection_text = std::fs::read_to_string(&path).unwrap();
+        let connection: Value = serde_json::from_str(&connection_text).unwrap();
+        assert!(connection.get("access_expires_at").is_none());
+        let hint_text = std::fs::read_to_string(&hint_path).unwrap();
+        let hint: Value = serde_json::from_str(&hint_text).unwrap();
+        assert_eq!(hint["revision"], connection["revision"]);
+        assert_eq!(hint["access_expires_at"], 4102444800_i64);
+        let history_path = path.with_file_name(".personal.json.token-calls.json");
+        let history_text = std::fs::read_to_string(&history_path).unwrap();
+        let history: Value = serde_json::from_str(&history_text).unwrap();
+        assert_eq!(history.as_object().unwrap().len(), 2);
+        let access = String::from_utf8(second.stdout).unwrap();
+        for text in [connection_text, history_text, hint_text] {
+            assert!(
+                !text.contains(access.trim()),
+                "access token must never be persisted"
+            );
+            assert!(
+                !text.contains("synthetic-refresh"),
+                "refresh token must never be persisted"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        for private_path in [history_path, hint_path] {
+            assert_eq!(
+                std::fs::metadata(private_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rapid_native_token_calls_on_different_connections_do_not_force() {
+    let server = Server::start();
+    for (alias, seat) in [("personal", "amir-seat"), ("work", "work-seat")] {
+        assert_eq!(
+            server
+                .import(&server.amir, alias, "amir-login", seat)
+                .status(),
+            200
+        );
+    }
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "work"]).status.success());
+    assert!(
+        server
+            .cli_from_fresh_parent(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    let work: Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".codexctl/central/work.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !work["revision"].as_str().unwrap().is_empty(),
+        "work needs a revision so an incorrect shared timer would force it"
+    );
+    assert!(
+        server
+            .cli(home.path(), &["use", "personal"])
+            .status
+            .success()
+    );
+    assert!(
+        server
+            .cli(home.path(), &["central-token", "--active"])
+            .status
+            .success()
+    );
+    assert!(server.cli(home.path(), &["use", "work"]).status.success());
+    server.advance_rotation_clock();
+    let count = server.root.path().join("count");
+    let before = std::fs::read_to_string(&count).unwrap();
+    let token = server.cli(home.path(), &["central-token", "--active"]);
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(count).unwrap(), before);
+}
+
+#[test]
 fn when_a_machine_uses_the_server_then_the_regular_codex_provider_has_a_token_helper() {
     let server = Server::start();
     server.import(&server.amir, "personal", "amir-login", "amir-seat");
@@ -4759,16 +5227,21 @@ fn relay_capacity_events_require_valid_labels_and_are_exported() {
 
 #[test]
 fn relay_capacity_event_authorizes_before_reading_a_large_body() {
+    use std::io::Write;
     let server = Server::start();
-    let response = server
-        .http
-        .post(format!("{}/v1/relay/capacity-events", server.url))
-        .header("content-type", "application/json")
-        .header("expect", "100-continue")
-        .body(vec![b'x'; 1024 * 1024 + 1])
-        .send()
+    let authority = server.url.strip_prefix("http://").unwrap();
+    let mut stream = std::net::TcpStream::connect(authority).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    assert_eq!(response.status(), 401);
+    // Wait for authorization before sending the body, as Expect requires.
+    // Uploading it immediately can race the early rejection and reset the socket.
+    stream.write_all(format!(
+        "POST /v1/relay/capacity-events HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 1048577\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"
+    ).as_bytes()).unwrap();
+    let mut status = String::new();
+    BufReader::new(stream).read_line(&mut status).unwrap();
+    assert_eq!(status.split_whitespace().nth(1), Some("401"));
 }
 
 #[test]

@@ -1137,9 +1137,10 @@ fn when_native_codex_requests_a_token_then_only_access_credentials_are_returned(
         String::from_utf8_lossy(&token.stderr)
     );
     assert!(codexctl::api::token_identity(String::from_utf8_lossy(&token.stdout).trim()).is_some());
+    assert!(!String::from_utf8_lossy(&token.stdout).contains("synthetic-initial-refresh"));
     assert_eq!(
         std::fs::read_to_string(client.broker.root.path().join("refresh-count")).unwrap(),
-        "1"
+        "0"
     );
 }
 
@@ -2078,6 +2079,8 @@ fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_n
             .status
             .success()
     );
+    // Seed the same parent's healthy call; the immediate retry below forces refresh.
+    assert!(client.helper().status.success());
     std::fs::write(client.broker.root.path().join("mode"), "disconnect").unwrap();
     let path = client.home.join(".codexctl/central/remote.json");
     let helper = Command::new(env!("CARGO_BIN_EXE_codexctl"))
