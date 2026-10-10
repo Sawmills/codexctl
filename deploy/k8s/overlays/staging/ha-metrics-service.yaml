@@ -1,4 +1,4 @@
-# B33 attempt 3, PR H: one DNS record per HA pod, so Prometheus scrapes every
+# B33 attempt 4, PR H: one DNS record per HA pod, so Prometheus scrapes every
 # replica, including one that fails readiness.
 apiVersion: v1
 kind: Service
