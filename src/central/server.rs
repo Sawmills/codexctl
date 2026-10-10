@@ -91,13 +91,16 @@ pub(super) enum TokenFailure {
     Retryable(anyhow::Error),
 }
 
+#[cfg(debug_assertions)]
+fn injected_retry_clock() -> Option<u64> {
+    let path = std::env::var("CENTRAL_TEST_RETRY_CLOCK").ok()?;
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 pub(super) fn retry_clock_now() -> u64 {
     // Integration tests run the debug binary; release builds cannot read this hook.
     #[cfg(debug_assertions)]
-    if let Ok(path) = std::env::var("CENTRAL_TEST_RETRY_CLOCK")
-        && let Ok(value) = std::fs::read_to_string(path)
-        && let Ok(milliseconds) = value.trim().parse()
-    {
+    if let Some(milliseconds) = injected_retry_clock() {
         return milliseconds;
     }
     static START: OnceLock<Instant> = OnceLock::new();
@@ -192,8 +195,8 @@ impl Owner {
             return clock();
         }
         #[cfg(debug_assertions)]
-        if std::env::var_os("CENTRAL_TEST_RETRY_CLOCK").is_some() {
-            return retry_clock_now();
+        if let Some(milliseconds) = injected_retry_clock() {
+            return milliseconds;
         }
         chrono::Utc::now().timestamp_millis().max(0) as u64
     }
@@ -363,7 +366,7 @@ impl Owner {
             let age_ms = self
                 .vault
                 .last_rotation_ms
-                .map(|rotated| self.rotation_clock_now().saturating_sub(rotated));
+                .and_then(|rotated| self.rotation_clock_now().checked_sub(rotated));
             // Verification and reset-auth probes must still exercise the grant.
             // The cooldown governs forced refreshes requested by machines.
             let recent = device.is_some() && age_ms.is_some_and(|age| age < 60_000);

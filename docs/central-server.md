@@ -1060,7 +1060,8 @@ encrypted vault and follows shared-store reconciliation and restart. Each
 matching request logs one JSON
 `forced_refresh` decision with `outcome`, lowercase `account`, `account_key`,
 registered `device`, `reason="previous_revision_current"`, and
-`last_rotation_age_s`. The age is null when no rotation has been observed.
+`last_rotation_age_s`. The age is null when no rotation has been observed or the saved timestamp is
+ahead of the current clock. A future timestamp does not hold the guard open.
 The log contains no credentials or provider response body.
 `codexctl_central_forced_refresh_total{outcome="refreshed|served_recent"}` counts
 these decisions. `refreshed` means the decision to attempt a native refresh;

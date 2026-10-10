@@ -3669,6 +3669,34 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
 }
 
 #[test]
+fn a_future_rotation_timestamp_does_not_suppress_machine_refresh() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", initial["revision"].as_str())
+        .json()
+        .unwrap();
+    // A backward wall-clock step must not extend the forced-refresh guard.
+    store::atomic_write(&server.root.path().join("retry-clock"), b"50000").unwrap();
+    let next: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(next["revision"], rotated["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "3"
+    );
+}
+
+#[test]
 fn recent_rotation_guard_survives_refresh_owner_restart() {
     let mut server = Server::start();
     assert_eq!(
