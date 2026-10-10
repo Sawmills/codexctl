@@ -1048,7 +1048,8 @@ disabled by default. In file mode with background recovery off, a token request
 can recover a retryable fence through the same identity checks and settlement
 path. The first retry waits 5 seconds. Failed attempts double that delay up to
 60 seconds; success resets it. Requests during the delay return
-`503 owner_unavailable`. Permanent provider rejections still require login
+`503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
+whole seconds, rounded up. Permanent provider rejections still require login
 renewal. Explicit import remains available through the normal identity and
 verification checks. Enable background
 recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, or

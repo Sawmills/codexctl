@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Request, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode, header::RETRY_AFTER},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -353,6 +353,7 @@ pub(super) struct HttpError {
     pub(super) reason: &'static str,
     /// The current alias, for `account_renamed`.
     pub(super) alias: Option<String>,
+    pub(super) retry_after: Option<u64>,
 }
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
@@ -361,6 +362,11 @@ impl IntoResponse for HttpError {
             None => json!({"error":self.reason}),
         };
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
         response.extensions_mut().insert(FailureReason);
         response
     }
@@ -778,9 +784,18 @@ impl Broker {
             json!({"operation":"broker_request","stage":stage,"reason":reason,"status":status.as_u16()})
         );
     }
+    fn on_demand_recovery(&self) -> bool {
+        !self.background_recovery
+            && self
+                .central
+                .as_ref()
+                .is_none_or(|store| store.mode() == super::storage::StoreMode::File)
+    }
+
     pub fn error(&self, status: StatusCode, reason: &'static str) -> HttpError {
         self.record_failure(reason, "broker", status);
         HttpError {
+            retry_after: None,
             status,
             reason,
             alias: None,
@@ -1123,6 +1138,7 @@ where
         result = verification => result,
         _ = wait_for_lease_loss(lost, signal) => {
             Err(HttpError {
+                retry_after: None,
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 reason: "refresh_fenced",
                 alias: None,
@@ -1438,12 +1454,7 @@ async fn token(
         Some(borrowed) => borrowed.owner.clone(),
         None => broker.owner(&device, alias).await?,
     };
-    if !broker.background_recovery
-        && broker
-            .central
-            .as_ref()
-            .is_none_or(|s| s.mode() == super::storage::StoreMode::File)
-    {
+    if broker.on_demand_recovery() {
         let worker = broker.clone();
         let owner_ref = owner.clone();
         let account_id = request.account_id.clone();
@@ -1593,7 +1604,11 @@ async fn token(
             .validate_account_id(request.account_id.as_deref())
             .map_err(|failure| worker.owner_failure(failure))?;
         if !owner.available {
-            return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+            let mut error = worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable");
+            if worker.on_demand_recovery() && owner.retryable_unavailable && !owner.routing_refused {
+                error.retry_after = owner.on_demand_retry_after();
+            }
+            return Err(error);
         }
         // Under the owner lock the local fence is visible, so a request that
         // found the owner busy may still be served without the lease.
@@ -1646,6 +1661,7 @@ async fn token(
                     {
                         *slot = Some((account_id.clone(), owner.vault.revision));
                         return Err(HttpError {
+                            retry_after: None,
                             status: StatusCode::SERVICE_UNAVAILABLE,
                             reason: "refresh_in_progress",
                             alias: None,

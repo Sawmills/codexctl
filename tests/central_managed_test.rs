@@ -3919,7 +3919,9 @@ fn on_demand_recovery_never_relaunches_a_provider_rejected_refresh_owner() {
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"600000").unwrap();
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let rejected = server.token(&server.amir, "personal", None);
+    assert_eq!(rejected.status(), 503);
+    assert!(rejected.headers().get("retry-after").is_none());
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
         "1"
@@ -3943,9 +3945,14 @@ fn token_request_recovers_retryable_refresh_owner_with_background_recovery_off()
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let blocked = server.token(&server.amir, "personal", None);
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers().get("retry-after").unwrap(), "5");
     store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let blocked = server.token(&server.amir, "personal", None);
+    assert_eq!(blocked.status(), 503);
+    assert_eq!(blocked.headers().get("retry-after").unwrap(), "1");
     assert_eq!(
         std::fs::read(server.root.path().join("launch-count")).unwrap(),
         launches

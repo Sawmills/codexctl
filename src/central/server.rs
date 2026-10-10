@@ -213,10 +213,15 @@ impl Owner {
         self.retry_started
             .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
     }
-    pub(super) fn on_demand_cooldown_active(&self) -> bool {
+    pub(super) fn on_demand_retry_after(&self) -> Option<u64> {
+        let started = self.retry_started?;
         let backoff = (5_000u64 << self.retry_failures.min(4)).min(60_000);
-        self.retry_started
-            .is_some_and(|started| self.retry_clock_now().saturating_sub(started) < backoff)
+        let remaining = backoff.saturating_sub(self.retry_clock_now().saturating_sub(started));
+        (remaining > 0).then(|| remaining.div_ceil(1000))
+    }
+
+    pub(super) fn on_demand_cooldown_active(&self) -> bool {
+        self.on_demand_retry_after().is_some()
     }
     pub(super) fn selectable(&self) -> bool {
         self.available && !self.routing_refused
