@@ -317,7 +317,7 @@ impl Owner {
                 self.vault.import_rejected = false;
             }
         }
-        let rotated = self.vault.auth.get("tokens") != auth.get("tokens");
+        let rotated = vault::credentials_changed(&self.vault.auth, &auth);
         self.vault.auth = auth;
         if rotated {
             self.vault.last_rotation_ms = Some(self.rotation_clock_now());

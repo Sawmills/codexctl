@@ -3739,6 +3739,62 @@ fn recent_rotation_guard_survives_refresh_owner_restart() {
 }
 
 #[test]
+fn flat_credentials_share_recent_rotations_including_refresh_only_changes() {
+    for mode in ["", "refresh-only"] {
+        let mut server = Server::start();
+        let flat = auth("amir-login", "amir-seat")["tokens"].clone();
+        let imported = server
+            .http
+            .post(format!("{}/v1/accounts", server.url))
+            .bearer_auth(&server.amir)
+            .json(&json!({"alias":"personal","auth":flat}))
+            .send()
+            .unwrap();
+        assert_eq!(imported.status(), 200, "{}", imported.text().unwrap());
+        server.advance_rotation_clock();
+        let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let rotated: Value = server
+            .token(&server.amir, "personal", first["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(rotated["revision"], first["revision"], "mode={mode}");
+        if mode == "refresh-only" {
+            assert_eq!(rotated["accessToken"], first["accessToken"]);
+        } else {
+            assert_ne!(rotated["accessToken"], first["accessToken"]);
+        }
+        let recent: Value = server
+            .token(&server.amir, "personal", rotated["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_eq!(recent["revision"], rotated["revision"], "mode={mode}");
+        assert_eq!(recent["accessToken"], rotated["accessToken"]);
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "2"
+        );
+        server.stop();
+        server.restart();
+        let restored: Value = server
+            .token(&server.amir, "personal", rotated["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_eq!(restored["revision"], rotated["revision"], "mode={mode}");
+        server.advance_rotation_clock();
+        let next: Value = server
+            .token(&server.amir, "personal", restored["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(next["revision"], restored["revision"], "mode={mode}");
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+            "3"
+        );
+    }
+}
+
+#[test]
 fn matching_forced_requests_share_one_rotation_until_sixty_seconds_pass() {
     let server = Server::start();
     assert_eq!(

@@ -1057,8 +1057,9 @@ recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, o
 Concurrent requests for the same old revision reuse the refreshed token.
 A matching `previousRevision` also receives the current token when the account
 rotated within the last 60 seconds. The rotation timestamp is saved with the
-encrypted vault and follows shared-store reconciliation and restart. Each
-matching request logs one JSON
+encrypted vault and follows shared-store reconciliation and restart. Changes to
+access, refresh, or ID tokens count as rotations in both nested and flat auth
+files. Each matching request logs one JSON
 `forced_refresh` decision with `outcome`, lowercase `account`, `account_key`,
 registered `device`, `reason="previous_revision_current"`, and
 `last_rotation_age_s`. The age is null when no rotation has been observed or the saved timestamp is

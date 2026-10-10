@@ -55,9 +55,13 @@ def complete():
     send({"method": "turn/completed", "params": {"threadId": "central-thread", "turn": {"id": "central-turn", "status": "completed"}}})
 
 
+def tokens(auth):
+    return auth.get("tokens", auth)
+
+
 def rotate(plan_change=False):
     auth = json.loads(auth_path.read_text())
-    old = auth["tokens"]["access_token"]
+    old = tokens(auth)["access_token"]
     payload = json.loads(base64.urlsafe_b64decode(old.split(".")[1] + "=="))
     mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
     if mode == "disconnect" or (mode == "hold" and payload.get("sub") == "alex-login"):
@@ -79,11 +83,11 @@ def rotate(plan_change=False):
     payload["iat"] = 2000000000 + payload["generation"]
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     if mode != "refresh-only":
-        auth["tokens"]["access_token"] = "eyJhbGciOiJub25lIn0." + body + "."
-    auth["tokens"]["refresh_token"] = "synthetic-rotated-refresh"
+        tokens(auth)["access_token"] = "eyJhbGciOiJub25lIn0." + body + "."
+    tokens(auth)["refresh_token"] = "synthetic-rotated-refresh"
     if mode == "refresh-only":
         counter = pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"])
-        auth["tokens"]["refresh_token"] = "synthetic-only-refresh-" + str(int(counter.read_text()) + 1)
+        tokens(auth)["refresh_token"] = "synthetic-only-refresh-" + str(int(counter.read_text()) + 1)
     auth_path.write_text(json.dumps(auth))
     auth_path.chmod(0o600)
     counter = pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"])
@@ -111,7 +115,7 @@ for line in sys.stdin:
                 sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
-        if mode == "add-startup-hold" or (mode in ["startup-hold", "startup-hold-error"] and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat"):
+        if mode == "add-startup-hold" or (mode in ["startup-hold", "startup-hold-error"] and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat"):
             pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
             deadline = time.monotonic() + 75
             while not pathlib.Path(mode_path).with_name("release-initialize").exists():
@@ -145,8 +149,8 @@ for line in sys.stdin:
                 print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed. Please log out and sign in again.", file=sys.stderr, flush=True)
                 send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed. Please log out and sign in again."}})
                 continue
-            partial_failure = mode == "partial-migration" and json.loads(auth_path.read_text())["tokens"].get("account_id") == "bad-seat"
-            invalid_grant = json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh"
+            partial_failure = mode == "partial-migration" and tokens(json.loads(auth_path.read_text())).get("account_id") == "bad-seat"
+            invalid_grant = tokens(json.loads(auth_path.read_text())).get("refresh_token") == "synthetic-rejected-refresh"
             if mode == "rejected-success" and invalid_grant:
                 definitive_rejection = True
                 send({"id":message["id"],"result":{"account":None,"requiresOpenaiAuth":True}})
@@ -170,8 +174,8 @@ for line in sys.stdin:
             send({"id":message["id"], "error":{"code":code,"message":text}})
             continue
         saved = json.loads(auth_path.read_text())
-        claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
-        account_id = saved["tokens"].get("account_id") or saved.get("chatgpt_account_id") or claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+        claims = json.loads(base64.urlsafe_b64decode(tokens(saved)["access_token"].split(".")[1] + "=="))
+        account_id = tokens(saved).get("account_id") or saved.get("chatgpt_account_id") or claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
         result = {"account": {"type": "chatgpt"}, "workspaceRouting":{"chatgptAccountId":account_id, "backendOrigin":"https://chatgpt.com", "accountRoutingOverride":"NO_CONSTRAINT"}}
         if mode in ["routing-us", "routing-us_cr"]:
             result["workspaceRouting"]["accountRoutingOverride"] = mode.removeprefix("routing-")
@@ -183,13 +187,13 @@ for line in sys.stdin:
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         if mode == "cached-rotation":
             rotate()
-        if mode == "cached-rejection" and json.loads(auth_path.read_text())["tokens"].get("refresh_token") == "synthetic-rejected-refresh":
+        if mode == "cached-rejection" and tokens(json.loads(auth_path.read_text())).get("refresh_token") == "synthetic-rejected-refresh":
             definitive_rejection = True
         if mode == "startup-refresh-expired":
             # The cached-status call refreshes at owner start and is rejected.
             print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.", file=sys.stderr, flush=True)
             definitive_rejection = True
-        current = json.loads(auth_path.read_text())["tokens"]["access_token"]
+        current = tokens(json.loads(auth_path.read_text()))["access_token"]
         result = {"authMethod":"chatgpt", "authToken":None if definitive_rejection else current, "requiresOpenaiAuth":True}
         if mode in ["non-exportable", "baseline-null"]:
             result = {"authMethod":None, "authToken":None, "requiresOpenaiAuth":True}
@@ -202,7 +206,7 @@ for line in sys.stdin:
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
-        if mode in ["billing-error-marked", "billing-error-slow-exit"] or (mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat"):
+        if mode in ["billing-error-marked", "billing-error-slow-exit"] or (mode == "billing-error-held-exit" and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat"):
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure","data":{"retryable":True}}})
             continue
         if mode == "rpc-unhealthy":
@@ -237,7 +241,7 @@ for line in sys.stdin:
             rotate()
             billing_rotated = True
         auth = json.loads(auth_path.read_text())
-        payload = json.loads(base64.urlsafe_b64decode(auth["tokens"]["access_token"].split(".")[1] + "=="))
+        payload = json.loads(base64.urlsafe_b64decode(tokens(auth)["access_token"].split(".")[1] + "=="))
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         result = {"rateLimits": {"planType":payload["https://api.openai.com/auth"].get("chatgpt_plan_type"), "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":4102444800}, "credits":{"hasCredits": mode == "credits", "unlimited":False, "balance":"10" if mode == "credits" else "0"}}}
         if mode in ["closed-spend-cap", "open-spend-cap"]:
@@ -290,7 +294,7 @@ if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).rea
 
 if auth_path.exists() and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "identity-nonzero":
     saved = json.loads(auth_path.read_text())
-    claims = json.loads(base64.urlsafe_b64decode(saved["tokens"]["access_token"].split(".")[1] + "=="))
+    claims = json.loads(base64.urlsafe_b64decode(tokens(saved)["access_token"].split(".")[1] + "=="))
     if claims.get("sub") == "different-login":
         sys.exit(1)
 
@@ -300,6 +304,6 @@ if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
 if mode == "billing-error-slow-exit":
     time.sleep(31)
 
-if mode == "billing-error-held-exit" and json.loads(auth_path.read_text())["tokens"]["account_id"] == "synthetic-seat":
+if mode == "billing-error-held-exit" and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat":
     while not pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release-exit").exists():
         time.sleep(0.01)
