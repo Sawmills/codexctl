@@ -2547,14 +2547,19 @@ fn when_a_user_requests_another_users_alias_then_no_access_token_is_returned() {
 #[test]
 fn when_an_import_is_retried_after_refresh_then_the_latest_credentials_are_preserved() {
     let server = Server::start();
-    server.import_expiring(&server.amir, "personal", "amir-login", "amir-seat");
+    let original = auth_with_expiry(
+        "amir-login",
+        "amir-seat",
+        chrono::Utc::now().timestamp() + 1800,
+    );
+    server.import_auth(&server.amir, "personal", original.clone());
     server.advance_rotation_clock();
     let initial: Value = server.token(&server.amir, "personal", None).json().unwrap();
     let refreshed: Value = server
         .token(&server.amir, "personal", initial["revision"].as_str())
         .json()
         .unwrap();
-    let retry = server.import_expiring(&server.amir, "personal", "amir-login", "amir-seat");
+    let retry = server.import_auth(&server.amir, "personal", original);
     let after: Value = server.token(&server.amir, "personal", None).json().unwrap();
     assert_eq!(retry.status(), 200);
     assert_eq!(after["revision"], refreshed["revision"]);
@@ -6834,10 +6839,15 @@ fn a_verified_alias_refuses_a_conflicting_uid_even_when_the_subject_matches() {
 #[test]
 fn a_legacy_migration_retry_keeps_the_uid_learned_by_the_server() {
     let server = Server::start();
+    let original = auth_with_expiry(
+        "same-login",
+        "same-seat",
+        chrono::Utc::now().timestamp() + 1800,
+    );
     store::atomic_write(&server.root.path().join("mode"), b"gain-uid").unwrap();
     assert_eq!(
         server
-            .import_expiring(&server.amir, "personal", "same-login", "same-seat")
+            .import_auth(&server.amir, "personal", original.clone())
             .status(),
         200
     );
@@ -6853,7 +6863,7 @@ fn a_legacy_migration_retry_keeps_the_uid_learned_by_the_server() {
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     assert_eq!(
         server
-            .import_expiring(&server.amir, "personal", "same-login", "same-seat")
+            .import_auth(&server.amir, "personal", original)
             .status(),
         200
     );
