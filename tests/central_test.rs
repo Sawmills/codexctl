@@ -130,7 +130,7 @@ impl BrokerTest {
                 root.path().join("refresh-count"),
             )
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(root.path().join("server.stderr")).unwrap())
             .spawn()
             .unwrap();
         let mut line = String::new();
@@ -213,6 +213,66 @@ impl Drop for BrokerTest {
 }
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py")
+}
+
+#[test]
+fn legacy_token_endpoint_reports_both_forced_refresh_decisions() {
+    let broker = BrokerTest::start();
+    let initial = broker.grant();
+    let rotated: Value = broker
+        .token_request(
+            &broker.token,
+            json!({"previousRevision":initial["revision"]}),
+        )
+        .json()
+        .unwrap();
+    let recent: Value = broker
+        .token_request(
+            &broker.token,
+            json!({"previousRevision":rotated["revision"]}),
+        )
+        .json()
+        .unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    let metrics = broker
+        .http
+        .get(format!("{}/metrics", broker.url))
+        .bearer_auth(&broker.token)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for outcome in ["refreshed", "served_recent"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_forced_refresh_total{{outcome=\"{outcome}\"}} 1\n"
+            )),
+            "{metrics}"
+        );
+    }
+    let stderr = std::fs::read_to_string(broker.root.path().join("server.stderr")).unwrap();
+    let entries: Vec<Value> = stderr
+        .lines()
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .filter(|entry| entry["operation"] == "forced_refresh")
+        .collect();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["outcome"], "refreshed");
+    assert_eq!(entries[1]["outcome"], "served_recent");
+    for entry in entries {
+        assert_eq!(entry["device"], "laptop");
+        assert_eq!(entry["account"], "personal");
+    }
+    for secret in [
+        broker.token.as_str(),
+        initial["accessToken"].as_str().unwrap(),
+        rotated["accessToken"].as_str().unwrap(),
+        "synthetic-initial-refresh",
+        "synthetic-rotated-refresh",
+    ] {
+        assert!(!stderr.contains(secret));
+        assert!(!metrics.contains(secret));
+    }
 }
 
 #[test]

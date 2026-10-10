@@ -703,7 +703,7 @@ impl Broker {
         );
         (status, Json(json!({"error":reason})))
     }
-    fn authorize(&self, headers: &HeaderMap) -> Result<(), HttpError> {
+    fn authorize(&self, headers: &HeaderMap) -> Result<String, HttpError> {
         let bearer = headers
             .get("authorization")
             .and_then(|h| h.to_str().ok())
@@ -719,7 +719,7 @@ impl Broker {
         if device.tenant != self.tenant || device.user != self.user {
             return Err(self.error(StatusCode::FORBIDDEN, "forbidden"));
         }
-        Ok(())
+        Ok(device.id.clone())
     }
 }
 
@@ -728,7 +728,7 @@ async fn tokens(
     headers: HeaderMap,
     body: Result<Json<TokenRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, HttpError> {
-    broker.authorize(&headers)?;
+    let device = broker.authorize(&headers)?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     // A disconnected HTTP client must not cancel a refresh after OpenAI rotates its token.
@@ -736,7 +736,7 @@ async fn tokens(
     let task = tokio::spawn(async move {
         let mut owner = owner.lock().await;
         owner.validate_account_id(request.account_id.as_deref())?;
-        owner.tokens(request).await
+        owner.tokens_for_device(request, Some(&device)).await
     });
     let result = task
         .await
