@@ -199,6 +199,11 @@ No flag for billing consent approves a banked reset.
 
 The provider uses `auth.refresh_interval_ms = 60000`.
 The helper asks the account server for current billing evidence on every refresh.
+It requests an OAuth rotation only when its saved access-token expiry is less than
+one hour away. A rapid rerun after HTTP 401 fetches the current revision without
+forcing a rotation. A missing expiry hint does not force a rotation. This lets
+sessions obtain credentials rotated by another session without causing a refresh
+storm.
 After included usage ends, the helper returns no token unless the account has billing approval.
 A failed billing read also refuses unapproved token delivery.
 If credentials rotate during billing or routing checks, the broker repeats those checks once.

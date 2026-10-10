@@ -2079,10 +2079,14 @@ fn when_billing_approval_is_withdrawn_during_a_refresh_then_the_helper_returns_n
             .status
             .success()
     );
-    // Seed the same parent's healthy call; the immediate retry below forces refresh.
+    // Seed a matching near-expiry hint to exercise refresh-time billing withdrawal.
     assert!(client.helper().status.success());
     std::fs::write(client.broker.root.path().join("mode"), "disconnect").unwrap();
     let path = client.home.join(".codexctl/central/remote.json");
+    let hint_path = path.with_file_name(".remote.json.token-expiry.json");
+    let mut hint: Value = serde_json::from_slice(&std::fs::read(&hint_path).unwrap()).unwrap();
+    hint["access_expires_at"] = json!(chrono::Utc::now().timestamp() + 3599);
+    store::atomic_write(&hint_path, &serde_json::to_vec(&hint).unwrap()).unwrap();
     let helper = Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .args(["central-token", "--connection"])

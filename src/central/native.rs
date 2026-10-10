@@ -1247,29 +1247,11 @@ fn token_expiry_hint(path: &Path, connection: &Connection) -> Result<Option<i64>
         .and_then(|hint| hint.access_expires_at))
 }
 
-// Callers hold the connection's native lock. Each connection has its own
-// private history, and unrelated Codex parents cannot trigger each other's retries.
-fn record_token_call(path: &Path, connection: &Connection) -> Result<bool> {
-    let history_path = token_sidecar_path(path, "token-calls")?;
-    // Timing is advisory: replace malformed or unreadable history on this call.
-    let mut calls: std::collections::BTreeMap<u32, u64> = vault::private_read(&history_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    let now = u64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis(),
-    )?;
-    calls.retain(|_, previous| now.checked_sub(*previous).is_some_and(|age| age < 600_000));
-    let parent = std::os::unix::process::parent_id();
-    let retry = calls
-        .insert(parent, now)
-        .is_some_and(|previous| now - previous < 10_000);
-    store::atomic_write(&history_path, &serde_json::to_vec(&calls)?)?;
-    let near_expiry = token_expiry_hint(path, connection)?
-        .is_some_and(|expiry| expiry.saturating_sub(chrono::Utc::now().timestamp()) < 3600);
-    Ok(retry || near_expiry)
+// Callers hold the native lock. A rerun after a 401 fetches the current
+// revision without forcing another rotation of healthy shared credentials.
+fn token_needs_refresh(path: &Path, connection: &Connection) -> Result<bool> {
+    Ok(token_expiry_hint(path, connection)?
+        .is_some_and(|expiry| expiry.saturating_sub(chrono::Utc::now().timestamp()) < 3600))
 }
 
 pub fn print_token(path: &Path) -> Result<()> {
@@ -1291,7 +1273,7 @@ pub fn print_token(path: &Path) -> Result<()> {
     }
     let refresh = {
         let _lock = native_lock(directory)?;
-        record_token_call(path, &connection)?
+        token_needs_refresh(path, &connection)?
     };
     let token = fetch(&connection, refresh)?;
     let _lock = native_lock(directory)?;
@@ -1312,7 +1294,7 @@ pub fn print_active_token() -> Result<()> {
             );
         }
         let connection = read_connection(&path)?;
-        let refresh = record_token_call(&path, &connection)?;
+        let refresh = token_needs_refresh(&path, &connection)?;
         (alias, path, connection, refresh)
     };
     let token = fetch(&connection, refresh)?;
