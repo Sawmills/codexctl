@@ -124,6 +124,7 @@ impl BrokerTest {
             .args(options)
             .process_group(0)
             .env("CENTRAL_TEST_MODE_FILE", root.path().join("mode"))
+            .env("CENTRAL_TEST_RETRY_CLOCK", root.path().join("retry-clock"))
             .env("CENTRAL_TEST_KEY_FILE", &key)
             .env(
                 "CENTRAL_TEST_REFRESH_COUNTER",
@@ -2288,6 +2289,12 @@ fn when_included_headroom_exhausts_then_helper_returns_no_token() {
     let selected = client.select();
     let initial = client.helper();
     std::fs::write(client.broker.root.path().join("mode"), "exhausted-weekly").unwrap();
+    // Require a new native billing observation beyond the recent-token guard.
+    std::fs::write(
+        client.broker.root.path().join("retry-clock"),
+        (chrono::Utc::now().timestamp_millis() + 61_000).to_string(),
+    )
+    .unwrap();
 
     let helper = client.helper();
 
