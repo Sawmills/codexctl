@@ -1459,6 +1459,9 @@ async fn token(
                 owner
                     .validate_account_id(account_id.as_deref())
                     .map_err(|failure| worker.owner_failure(failure))?;
+                if owner.available || !owner.retryable_unavailable || owner.routing_refused {
+                    return Ok(());
+                }
             }
             drop(permit);
             recover_owners(&worker, Some(owner_ref)).await;
@@ -3858,12 +3861,8 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                 }
                 let probe_pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
                 let probe_ok = probe.is_ok();
-                if on_demand {
-                    super::refresh_control::recovery(if probe_ok && local_saved {
-                        super::refresh_control::Recovery::Recovered
-                    } else {
-                        super::refresh_control::Recovery::Failed
-                    });
+                if on_demand && (!probe_ok || !local_saved) {
+                    super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
                 }
                 if probe_pending || !local_saved || lease.is_some() {
                     if matches!(probe, Err(TokenFailure::Retryable(_))) {
@@ -3942,6 +3941,11 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                         owner.retry_requires_billing = false;
                         owner.retry_started = None;
                         owner.retry_failures = 0;
+                        if on_demand {
+                            super::refresh_control::recovery(
+                                super::refresh_control::Recovery::Recovered,
+                            );
+                        }
                     }
                     (Ok(_), true, false) => {
                         fence_background_owner(&mut owner);
