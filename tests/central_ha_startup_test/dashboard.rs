@@ -672,6 +672,73 @@ async fn postgres_missing_browser_table_fails_only_the_dashboard_at_startup() {
 }
 
 #[tokio::test]
+async fn postgres_dashboard_startup_probe_failure_preserves_the_database_cause() {
+    let f = BrowserFixture::start().await;
+    // Scope the fault to this schema and this probe; other startup queries still work.
+    f.control.batch_execute(&format!(
+        "CREATE FUNCTION {0}.to_regclass(text) RETURNS regclass LANGUAGE plpgsql AS $$ BEGIN IF $1='browser_sessions' THEN RAISE EXCEPTION 'synthetic browser probe failure'; END IF; RETURN pg_catalog.to_regclass($1); END $$", f.schema,
+    )).await.unwrap();
+    let mut database = reqwest::Url::parse(&std::env::var("DATABASE_URL").unwrap()).unwrap();
+    database
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={},pg_catalog", f.schema));
+    let root = tempfile::tempdir().unwrap();
+    central::managed::setup(&root.path().join("state"), &root.path().join("key")).unwrap();
+    let mut child = command(
+        database.as_str(),
+        &root.path().join("state"),
+        &f._root.path().join("key"),
+        "serve",
+    )
+    .args([
+        "--listen",
+        "127.0.0.1:0",
+        "--public-url",
+        "http://127.0.0.1:8787",
+        "--sso-config",
+    ])
+    .arg(f.first.root.path().join("sso.json"))
+    .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(5),
+        BufReader::new(child.stdout.take().unwrap()).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        line.is_empty(),
+        "a failed database probe must not publish server readiness: {line}"
+    );
+    let output = child.wait_with_output().await.unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let event = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["reason"] == "browser_sessions_probe_failed")
+        .expect("distinct probe failure event");
+    assert_eq!(event["stage"], "startup");
+    assert!(
+        event["error"]
+            .as_str()
+            .unwrap()
+            .contains("synthetic browser probe failure")
+    );
+    assert!(
+        !stderr.contains("browser_sessions_unavailable"),
+        "do not misdiagnose a database fault as missing DDL"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_dashboard_expired_oidc_flow_does_not_create_a_session() {
     let f = BrowserFixture::start().await;
     let (binding, path) = f.begin_sign_in().await;
@@ -849,6 +916,82 @@ async fn postgres_dashboard_last_pending_flow_slot_is_global_across_pods() {
             &[],
         ).await.unwrap().get(0);
         assert_eq!(count, 1024);
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_logs_only_committed_identity_links_once() {
+    let mut f = BrowserFixture::start().await;
+    let source = "c".repeat(64);
+    f.control.execute(
+        &format!("INSERT INTO {}.central_users(id,email,enabled) VALUES($1,'dashboard@example.invalid',true)", f.schema),
+        &[&source],
+    ).await.unwrap();
+    store::atomic_write(&f._root.path().join("identity.json"), &serde_json::to_vec(&json!({
+        "sub":"dashboard-company-user", "email":"dashboard@example.invalid", "hd":"example.invalid"
+    })).unwrap()).unwrap();
+    let database = f.database();
+    let key = f._root.path().join("key");
+    for pod in [&mut f.first, &mut f.second] {
+        pod.stop().await;
+        let config_file = pod.root.path().join("sso.json");
+        let mut config: Value =
+            serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+        config["allowed_hosted_domains"] = json!(["example.invalid"]);
+        config["clerk_migration"] =
+            json!({"users":[{"user_id":source,"email":"dashboard@example.invalid"}]});
+        store::atomic_write(&config_file, &serde_json::to_vec(&config).unwrap()).unwrap();
+        let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
+        *pod = Pod::spawn(&database, &key, root, "postgres").await;
+    }
+    // A deferred failure proves that logging an UPDATE before commit is insufficient.
+    f.control.batch_execute(&format!(
+        "CREATE FUNCTION {0}.reject_identity_commit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic identity commit failure'; END $$; CREATE CONSTRAINT TRIGGER reject_identity_commit AFTER UPDATE ON {0}.central_users DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION {0}.reject_identity_commit()", f.schema,
+    )).await.unwrap();
+    let (binding, path) = f.begin_sign_in().await;
+    assert_eq!(f.callback(&f.second, &binding, &path).await.status(), 503);
+    let log_path = f.second.root.path().join("dashboard.log");
+    assert!(
+        !std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("SSO_IDENTITY_LINKED")
+    );
+    f.control
+        .batch_execute(&format!(
+            "DROP TRIGGER reject_identity_commit ON {}.central_users",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    f.sign_in().await;
+    f.sign_in().await;
+    store::atomic_write(&f._root.path().join("identity.json"), &serde_json::to_vec(&json!({
+        "sub":"hostile-alternate-subject", "email":"dashboard@example.invalid", "hd":"example.invalid"
+    })).unwrap()).unwrap();
+    let (binding, path) = f.begin_sign_in().await;
+    assert_eq!(f.callback(&f.second, &binding, &path).await.status(), 403);
+    let audit = std::fs::read_to_string(log_path).unwrap();
+    let events: Vec<_> = audit
+        .lines()
+        .filter(|line| line.starts_with("SSO_IDENTITY_LINKED "))
+        .collect();
+    assert_eq!(events.len(), 1, "only the committed first link is audited");
+    let suffix = events[0]
+        .strip_prefix(&format!(
+            "SSO_IDENTITY_LINKED company_user={source} oidc_identity="
+        ))
+        .unwrap();
+    assert_eq!(suffix.len(), 64);
+    assert!(suffix.bytes().all(|b| b.is_ascii_hexdigit()));
+    for secret in [
+        "dashboard@example.invalid",
+        "dashboard-company-user",
+        "hostile-alternate-subject",
+        "synthetic-company-client-secret",
+        binding.split_once('=').unwrap().1,
+    ] {
+        assert!(!events[0].contains(secret));
     }
     f.finish().await;
 }

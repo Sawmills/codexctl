@@ -4255,11 +4255,22 @@ pub async fn serve(
         None
     };
     let holder = instance_holder_id();
-    let browser_sessions_available =
-        match central.as_ref().filter(|s| s.mode() == StoreMode::Postgres) {
-            Some(store) => store.browser_sessions_ready().await.unwrap_or(false),
-            None => true,
-        };
+    let browser_sessions_available = match central
+        .as_ref()
+        .filter(|s| s.mode() == StoreMode::Postgres)
+    {
+        Some(store) => match store.browser_sessions_ready().await {
+            Ok(available) => available,
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    json!({"operation":"browser_sessions", "stage":"startup", "reason":"browser_sessions_probe_failed", "error":format!("{error:#}")})
+                );
+                return Err(error.context("browser session startup probe failed"));
+            }
+        },
+        None => true,
+    };
     if !browser_sessions_available {
         eprintln!(
             "{}",

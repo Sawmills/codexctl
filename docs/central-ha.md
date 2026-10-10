@@ -80,6 +80,11 @@ startup logs one structured `browser_sessions_unavailable` error. Dashboard
 routes return 503 with that reason, counted in
 `codexctl_central_failed_requests_total`. Token routes and readiness remain
 available. Run migrate and roll the image to restore the dashboard.
+If the probe itself fails, startup logs `browser_sessions_probe_failed` with
+the database cause and exits. Restore database access before restarting the
+pod; this error does not mean the session table is missing. Successful company
+identity links emit `SSO_IDENTITY_LINKED` with identity digests only, after the
+transaction commits. Refused or rolled-back links emit no success event.
 
 Shared-store startup
 also fences retained relogin operations that still need replacement verification

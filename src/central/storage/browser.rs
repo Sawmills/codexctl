@@ -26,6 +26,7 @@ impl CentralStore {
                 .into_iter().map(|row| crate::central::managed::User {
                     id: row.get(0), email: row.get(1), enabled: row.get(2), oidc_identity: row.get(3),
                 }).collect();
+            let mut linked_user = None;
             let resolution = if let Some(user) = users.iter().find(|u| u.oidc_identity.as_deref() == Some(arriving)) {
                 if user.enabled { BrowserIdentity::User(user.id.clone()) } else { BrowserIdentity::Disabled }
             } else if let Some(user) = users.iter().find(|u| u.id == arriving) {
@@ -37,6 +38,7 @@ impl CentralStore {
                         ([user], Some(source)) if user.id == source && user.oidc_identity.is_none() => {
                             if !user.enabled { BrowserIdentity::Disabled } else {
                                 tx.execute("UPDATE central_users SET oidc_identity=$2,revision=revision+1,updated_at=now() WHERE id=$1", &[&user.id,&arriving]).await?;
+                                linked_user = Some(user.id.clone());
                                 BrowserIdentity::User(user.id.clone())
                             }
                         }
@@ -50,6 +52,9 @@ impl CentralStore {
                 }
             };
             tx.commit().await?;
+            if let Some(stable_id) = linked_user {
+                eprintln!("SSO_IDENTITY_LINKED company_user={stable_id} oidc_identity={arriving}");
+            }
             Ok(resolution)
         }).await
     }
