@@ -735,6 +735,46 @@ async fn postgres_dashboard_startup_probe_failure_preserves_the_database_cause()
         !stderr.contains("browser_sessions_unavailable"),
         "do not misdiagnose a database fault as missing DDL"
     );
+    let mut token_only = command(
+        database.as_str(),
+        &root.path().join("state"),
+        &f._root.path().join("key"),
+        "serve",
+    )
+    .args([
+        "--listen",
+        "127.0.0.1:0",
+        "--public-url",
+        "http://127.0.0.1:8787",
+    ])
+    .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true)
+    .spawn()
+    .unwrap();
+    let mut ready_line = String::new();
+    timeout(
+        Duration::from_secs(5),
+        BufReader::new(token_only.stdout.take().unwrap()).read_line(&mut ready_line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let ready: Value = serde_json::from_str(&ready_line)
+        .expect("a dashboard-only probe must not block token-only startup");
+    let health = f
+        .http
+        .get(format!(
+            "http://{}/ready",
+            ready["listening"].as_str().unwrap()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    token_only.kill().await.unwrap();
+    token_only.wait().await.unwrap();
     f.finish().await;
 }
 

@@ -59,6 +59,9 @@ sign-out, and the company user's machine list across replicas. Machine
 enrollment and reset listing/redemption remain unavailable in shared mode.
 Keep those workflows on the single file-mode writer until their shared storage
 is complete.
+Machine rows are shared, but last-seen time and last-used alias reflect only
+token deliveries handled by the responding pod. These activity fields can be
+empty or differ across replicas. Shared activity storage is outside this upgrade.
 
 For the dashboard session upgrade, run the existing migrate Job before rolling
 the server image. Migration adds `browser_sessions` and its expiry index with
@@ -80,7 +83,8 @@ startup logs one structured `browser_sessions_unavailable` error. Dashboard
 routes return 503 with that reason, counted in
 `codexctl_central_failed_requests_total`. Token routes and readiness remain
 available. Run migrate and roll the image to restore the dashboard.
-If the probe itself fails, startup logs `browser_sessions_probe_failed` with
+The session-table probe runs only when SSO is configured. Token-only pods skip
+it. If the probe itself fails, startup logs `browser_sessions_probe_failed` with
 the database cause and exits. Restore database access before restarting the
 pod; this error does not mean the session table is missing. Successful company
 identity links emit `SSO_IDENTITY_LINKED` with identity digests only, after the

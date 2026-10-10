@@ -4257,7 +4257,7 @@ pub async fn serve(
     let holder = instance_holder_id();
     let browser_sessions_available = match central
         .as_ref()
-        .filter(|s| s.mode() == StoreMode::Postgres)
+        .filter(|s| s.mode() == StoreMode::Postgres && sso.is_some())
     {
         Some(store) => match store.browser_sessions_ready().await {
             Ok(available) => available,
