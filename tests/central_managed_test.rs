@@ -2660,7 +2660,7 @@ fn healthy_native_token_helpers_do_not_force_a_refresh() {
 
 #[cfg(unix)]
 #[test]
-fn native_token_helpers_replace_invalid_call_history_and_keep_serving() {
+fn native_token_helpers_ignore_legacy_call_history_and_keep_serving() {
     use std::os::unix::fs::PermissionsExt;
     for active in [true, false] {
         for unreadable in [false, true] {
@@ -2686,12 +2686,11 @@ fn native_token_helpers_replace_invalid_call_history_and_keep_serving() {
             };
             assert!(server.cli(home.path(), &args).status.success());
             let history_path = path.with_file_name(".personal.json.token-calls.json");
+            store::atomic_write(&history_path, b"invalid-json").unwrap();
             if unreadable {
-                // A non-private file is rejected by the private reader on every host.
+                // Old history must not affect token delivery even when non-private.
                 std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o644))
                     .unwrap();
-            } else {
-                store::atomic_write(&history_path, b"invalid-json").unwrap();
             }
             server.advance_rotation_clock();
             let count = server.root.path().join("count");
@@ -2703,16 +2702,14 @@ fn native_token_helpers_replace_invalid_call_history_and_keep_serving() {
                 String::from_utf8_lossy(&token.stderr)
             );
             assert_eq!(std::fs::read_to_string(count).unwrap(), before);
-            let history: Value =
-                serde_json::from_slice(&std::fs::read(&history_path).unwrap()).unwrap();
-            assert_eq!(history.as_object().unwrap().len(), 1);
+            assert_eq!(std::fs::read(&history_path).unwrap(), b"invalid-json");
             assert_eq!(
                 std::fs::metadata(history_path)
                     .unwrap()
                     .permissions()
                     .mode()
                     & 0o777,
-                0o600
+                if unreadable { 0o644 } else { 0o600 }
             );
         }
     }
@@ -2776,7 +2773,7 @@ fn native_token_helpers_preserve_the_released_connection_schema() {
 }
 
 #[test]
-fn rapid_native_token_retry_from_the_same_parent_forces_a_refresh() {
+fn rapid_native_token_retry_from_the_same_parent_does_not_force_a_refresh() {
     for active in [true, false] {
         let server = Server::start();
         assert_eq!(
@@ -2819,10 +2816,174 @@ fn rapid_native_token_retry_from_the_same_parent_forces_a_refresh() {
         );
         let after: u32 = std::fs::read_to_string(count).unwrap().parse().unwrap();
         assert_eq!(
-            after,
-            before + 1,
-            "a fast retry must rotate once (active={active})"
+            after, before,
+            "a fast retry must not rotate healthy access (active={active})"
         );
+    }
+}
+
+#[test]
+fn native_token_reruns_observe_another_clients_rotation_without_rotating_again() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        // B holds the prior revision and a healthy expiry hint.
+        assert!(server.cli(home.path(), &args).status.success());
+        let prior: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        // A rotates the shared account through the production HTTP API.
+        server.advance_rotation_clock();
+        let rotated: Value = server
+            .token(&server.amir, "personal", prior["revision"].as_str())
+            .json()
+            .unwrap();
+        assert_ne!(rotated["revision"], prior["revision"]);
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        for _ in 0..3 {
+            // B's 401 reruns must fetch A's revision, even after learning it.
+            server.advance_rotation_clock();
+            let token = server.cli(home.path(), &args);
+            assert!(
+                token.status.success(),
+                "{}",
+                String::from_utf8_lossy(&token.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(token.stdout).unwrap().trim(),
+                rotated["accessToken"].as_str().unwrap()
+            );
+            let current: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(current["revision"], rotated["revision"]);
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap(),
+                before,
+                "B must add zero rotations (active={active})"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn ten_native_token_parents_rerun_three_times_without_forcing() {
+    for active in [true, false] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let home = server.connected_home();
+        assert!(
+            server
+                .cli(home.path(), &["use", "personal"])
+                .status
+                .success()
+        );
+        let path = home.path().join(".codexctl/central/personal.json");
+        let args = if active {
+            vec!["central-token", "--active"]
+        } else {
+            vec!["central-token", "--connection", path.to_str().unwrap()]
+        };
+        let initial = server.cli(home.path(), &args);
+        assert!(initial.status.success());
+        let signals = tempfile::tempdir().unwrap();
+        let mut parents: Vec<Child> = (0..10)
+            .map(|parent| {
+                Command::new("sh")
+                    .args([
+                        "-c",
+                        r#"
+                    umask 077
+                    signals=$1; parent=$2; shift 2
+                    for round in 0 1 2 3; do
+                        attempts=0
+                        if [ "$round" -gt 0 ]; then
+                            until [ -f "$signals/go.$round" ]; do
+                                attempts=$((attempts+1))
+                                [ "$attempts" -lt 3000 ] || exit 1
+                                sleep 0.01
+                            done
+                        fi
+                        "$@" > "$signals/$parent.tmp" || exit 1
+                        mv "$signals/$parent.tmp" "$signals/$parent.$round" || exit 1
+                    done
+                "#,
+                        "token-parent",
+                    ])
+                    .arg(signals.path())
+                    .arg(parent.to_string())
+                    .arg(env!("CARGO_BIN_EXE_codexctl"))
+                    .args(&args)
+                    .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+                    .env("HOME", home.path())
+                    .env_remove("CODEX_HOME")
+                    .env_remove("CODEXCTL_PINNED_ALIAS")
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        let count = server.root.path().join("count");
+        let before = std::fs::read_to_string(&count).unwrap();
+        for round in 0..=3 {
+            if round > 0 {
+                // Advance the server guard before each burst so it cannot mask forcing.
+                server.advance_rotation_clock();
+                std::fs::write(signals.path().join(format!("go.{round}")), b"go").unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !(0..10).all(|parent| signals.path().join(format!("{parent}.{round}")).exists()) {
+                if std::time::Instant::now() >= deadline {
+                    for parent in &mut parents {
+                        let _ = parent.kill();
+                        let _ = parent.wait();
+                    }
+                    panic!("ten token parents did not finish round {round}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            for parent in 0..10 {
+                assert!(
+                    std::fs::read(signals.path().join(format!("{parent}.{round}"))).unwrap()
+                        == initial.stdout,
+                    "healthy shared access must stay current (active={active}, round={round})"
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&count).unwrap(),
+                before,
+                "ten parents must add zero rotations (active={active}, round={round})"
+            );
+        }
+        for parent in parents {
+            let output = parent.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 
@@ -2981,11 +3142,12 @@ fn another_native_token_parent_does_not_force_and_old_connections_gain_an_expiry
         assert_eq!(hint["revision"], connection["revision"]);
         assert_eq!(hint["access_expires_at"], 4102444800_i64);
         let history_path = path.with_file_name(".personal.json.token-calls.json");
-        let history_text = std::fs::read_to_string(&history_path).unwrap();
-        let history: Value = serde_json::from_str(&history_text).unwrap();
-        assert_eq!(history.as_object().unwrap().len(), 2);
+        assert!(
+            !history_path.exists(),
+            "helpers must not create call history"
+        );
         let access = String::from_utf8(second.stdout).unwrap();
-        for text in [connection_text, history_text, hint_text] {
+        for text in [connection_text, hint_text] {
             assert!(
                 !text.contains(access.trim()),
                 "access token must never be persisted"
@@ -2996,7 +3158,7 @@ fn another_native_token_parent_does_not_force_and_old_connections_gain_an_expiry
             );
         }
         use std::os::unix::fs::PermissionsExt;
-        for private_path in [history_path, hint_path] {
+        for private_path in [path, hint_path] {
             assert_eq!(
                 std::fs::metadata(private_path)
                     .unwrap()
