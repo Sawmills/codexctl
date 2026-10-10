@@ -3669,6 +3669,127 @@ fn transient_billing_failure_restarts_rpc_and_serves_a_later_token() {
 }
 
 #[test]
+fn matching_forced_requests_share_one_rotation_until_sixty_seconds_pass() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
+    let first: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    let rotated: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(rotated["revision"], first["revision"]);
+    let recent: Value = server
+        .token(&server.amir, "personal", rotated["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(recent["revision"], rotated["revision"]);
+    assert_eq!(recent["accessToken"], rotated["accessToken"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "2"
+    );
+    // A stale revision still gets the current token without rotating.
+    let stale: Value = server
+        .token(&server.amir, "personal", first["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_eq!(stale["revision"], rotated["revision"]);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"121000").unwrap();
+    let next: Value = server
+        .token(&server.amir, "personal", recent["revision"].as_str())
+        .json()
+        .unwrap();
+    assert_ne!(next["revision"], recent["revision"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        "3"
+    );
+}
+
+#[test]
+fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let launches = || {
+        std::fs::read_to_string(server.root.path().join("launch-count"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap()
+    };
+    for (index, due) in [5_000u64, 15_000, 35_000, 75_000, 135_000]
+        .into_iter()
+        .enumerate()
+    {
+        store::atomic_write(
+            &server.root.path().join("retry-clock"),
+            (due - 1).to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        assert_eq!(launches(), index as u32 + 1);
+        store::atomic_write(
+            &server.root.path().join("retry-clock"),
+            due.to_string().as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        assert_eq!(launches(), index as u32 + 2);
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"194999").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(launches(), 6);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"195000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"200000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn on_demand_recovery_never_relaunches_a_provider_rejected_refresh_owner() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"600000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
+        "1"
+    );
+}
+
+#[test]
 fn token_request_recovers_retryable_refresh_owner_with_background_recovery_off() {
     let mut server = Server::start();
     server.stop();

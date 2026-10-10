@@ -125,6 +125,7 @@ pub(super) struct Owner {
     pub(super) retry_requires_billing: bool,
     pub(super) retry_started: Option<u64>,
     pub(super) retry_failures: u8,
+    pub(super) last_rotation: Option<u64>,
     pub(super) recovery_generation: u64,
     /// Last observed or successfully published shared revision, excluding local journals.
     pub(super) shared_revision: Option<i64>,
@@ -297,8 +298,12 @@ impl Owner {
                 self.vault.import_rejected = false;
             }
         }
+        let rotated = self.vault.auth.get("tokens") != auth.get("tokens");
         self.vault.auth = auth;
         vault::save(&self.state, &self.key, &self.vault)?;
+        if rotated {
+            self.last_rotation = Some(self.retry_clock_now());
+        }
         let access_token = vault::token(&self.vault.auth)?.to_owned();
         Ok(TokenResponse {
             user_id: None,
@@ -335,6 +340,12 @@ impl Owner {
             }
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
+            }
+            if self
+                .last_rotation
+                .is_some_and(|rotated| self.retry_clock_now().saturating_sub(rotated) < 60_000)
+            {
+                return self.with_billing(current, request.billing).await;
             }
         }
         // Serialize all calls, and persist any rotated credentials even when RPC fails.
@@ -774,6 +785,7 @@ pub async fn serve(
         retry_requires_billing: false,
         retry_started: None,
         retry_failures: 0,
+        last_rotation: None,
         recovery_generation: 0,
         shared_revision: None,
         routing_refused: false,
