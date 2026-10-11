@@ -74,3 +74,27 @@ is retained. Compare recording metadata at the protocol boundary with parsing
 error strings at the logger: boundary capture preserves numeric/presence facts
 and distinguishes EOF from timeout without depending on untrusted text. It
 adds no new retries, cancellation, or persistence behavior.
+
+## Follow-up: recovery rotation proof and per-account failures
+
+HQ requested a small follow-up after #183 merged, with no deployment changes.
+
+1. Extend the p3 `/v1/token` regression to compare the access token and revision
+   across recovery, the native fixture rotation count, and both forced-refresh
+   counters. Require zero added rotations and zero machine-requested forces.
+2. Extend the existing repeated-failure/backoff HTTP regression to observe an
+   account-labelled failure counter on authenticated `/metrics`. Count failed
+   recovery probes, launches, and child/database settlement retries. Cooldown
+   refusals and the initial owner-read failure are not recovery failures.
+3. Reuse the provider-rejection metric's lowercase alias and 12-character account
+   digest labels; never publish company-user IDs or native error text. Keep this
+   counter separate from the existing aggregate request-driven recovery metric.
+   Use the existing real-PostgreSQL settlement regression for failed write retries.
+4. Run focused red-to-green tests, devbox gates and Claude autoreview; request
+   fresh exact-head Architect review. HQ owns the image and deployment.
+
+Interface choice: keeping the metric on `Owner` would make `/metrics` wait for
+an owner whose native read or settlement holds its lock. A telemetry counter
+indexed by the server-account labels exposes failed settlement retries without
+waiting for that owner, reusing the existing provider-rejection counter pattern.
+It adds no provider call, database query, retry, or persistent state.

@@ -4917,6 +4917,7 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
         .unwrap()
         .text()
         .unwrap();
+    assert!(metrics.contains("codexctl_central_owner_recovery_failed_total{account=\"personal\",account_key=\"6ba9ac331db1\"} 5\n"), "{metrics}");
     for (result, count) in [("recovered", 2), ("failed", 5), ("backoff", 6)] {
         assert!(
             metrics.contains(&format!(
@@ -4924,6 +4925,52 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
             )),
             "{metrics}"
         );
+    }
+}
+
+#[test]
+fn recovery_failure_metrics_distinguish_company_users_with_the_same_alias() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    for (user, alias, login, seat) in [
+        (&server.amir, "Personal", "amir-login", "amir-seat"),
+        (&server.alex, "personal", "alex-login", "alex-seat"),
+    ] {
+        assert_eq!(server.import(user, alias, login, seat).status(), 200);
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    for user in [&server.amir, &server.alex] {
+        assert_eq!(server.token(user, "personal", None).status(), 503);
+    }
+    store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
+    for user in [&server.amir, &server.alex] {
+        assert_eq!(server.token(user, "personal", None).status(), 503);
+    }
+    store::atomic_write(&server.root.path().join("retry-clock"), b"15000").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for (key, count) in [("6ba9ac331db1", 2), ("4d8cf7dd09fa", 1)] {
+        assert!(metrics.contains(&format!("codexctl_central_owner_recovery_failed_total{{account=\"personal\",account_key=\"{key}\"}} {count}\n")), "{metrics}");
+    }
+    for private in [
+        server.amir.as_str(),
+        server.alex.as_str(),
+        "amir-login",
+        "alex-login",
+        "synthetic-refresh",
+        "synthetic billing read failure",
+    ] {
+        assert!(!metrics.contains(private), "{metrics}");
     }
 }
 
@@ -5003,9 +5050,9 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
     // Reproduce the reported shape: a committed grant, two successful usage
     // reads, then an unmarked native failure on the third read without stderr.
     store::atomic_write(&server.root.path().join("limits-count"), b"0").unwrap();
-    for _ in 0..2 {
-        assert_eq!(server.token(&server.amir, "p3", None).status(), 200);
-    }
+    let before: Value = server.token(&server.amir, "p3", None).json().unwrap();
+    assert_eq!(server.token(&server.amir, "p3", None).status(), 200);
+    let rotations_before = std::fs::read_to_string(server.root.path().join("count")).unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
     assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
     assert_eq!(
@@ -5033,7 +5080,15 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
     store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
     assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
     store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
-    assert_eq!(server.token(&server.amir, "p3", None).status(), 200);
+    let recovered = server.token(&server.amir, "p3", None);
+    assert_eq!(recovered.status(), 200);
+    let recovered: Value = recovered.json().unwrap();
+    assert_eq!(recovered["revision"], before["revision"]);
+    assert_eq!(recovered["accessToken"], before["accessToken"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count")).unwrap(),
+        rotations_before
+    );
     assert_eq!(server.child.id(), server_pid);
     assert!(server.child.try_wait().unwrap().is_none());
     let metrics = server
@@ -5049,6 +5104,14 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
         "{metrics}"
     );
     assert!(owner_refresh_failures(&metrics).is_empty(), "{metrics}");
+    for outcome in ["refreshed", "served_recent"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_forced_refresh_total{{outcome=\"{outcome}\"}} 0\n"
+            )),
+            "{metrics}"
+        );
+    }
 }
 
 #[test]
@@ -5531,6 +5594,15 @@ fn failed_respawn_is_retried_with_a_real_launch_attempt() {
             .unwrap()
             >= 3
     );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(metrics.contains("codexctl_central_owner_recovery_failed_total{account=\"personal\",account_key=\"6ba9ac331db1\"} 1\n"), "{metrics}");
 }
 
 fn retry_import(server: &Server) -> reqwest::blocking::Response {

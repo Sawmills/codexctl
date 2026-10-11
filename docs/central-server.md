@@ -1059,6 +1059,16 @@ can recover a retryable fence through the same identity checks and settlement
 path. The first retry waits 5 seconds. Failed attempts double that delay up to
 60 seconds; success resets it. Retryable failures continue at the 60-second cap
 until recovery succeeds, without the background recovery attempt cutoff.
+`codexctl_central_owner_recovery_failed_total{account,account_key}` counts each
+failed recovery probe or launch and each failed child/database settlement retry,
+including background settlement with no further machine request. The lowercase
+alias and 12-character account digest match the provider-rejection metric, so
+company users sharing an alias have separate series. Cooldown refusals, initial
+owner-read failures, and successful recoveries do not increment it. The counter
+survives a successful recovery, resets when the server process restarts, and is
+emitted after the first failure. Scraping it does not acquire refresh-owner locks;
+a pending owner cannot block its failure count. The existing aggregate
+`codexctl_central_owner_recovery_total{result}` remains request-driven.
 Requests during the delay return
 `503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
 whole seconds, rounded up. An unmarked native error from `account/read` or
