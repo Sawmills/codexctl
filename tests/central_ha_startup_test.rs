@@ -3576,6 +3576,34 @@ async fn postgres_fast_path_refuses_stale_evidence() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_rejection_with_eof_settles_the_owner_and_releases_its_lease() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"refresh-reused-eof").unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    // The first replica must settle EOF and publish the final journal before a
+    // peer can acquire the lease. Its own provider-rejected owner stays fenced.
+    let delivered = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("provider rejection hid EOF settlement and kept the lease held");
+    assert_eq!(
+        generation(&delivered),
+        3,
+        "peer must use the published exit journal"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_failed_lease_read_clears_evidence_for_every_replica() {
     let f = enable_fast_path(login_fixture().await).await;
     let warm: Value = request(&f.http, &f.first, &f.token)

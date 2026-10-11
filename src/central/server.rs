@@ -151,11 +151,14 @@ pub(super) struct Owner {
 impl Owner {
     /// Logs and counts a failed owner refresh with the provider's bounded
     /// reason, read before the fence can stop the child.
-    pub(super) async fn refresh_failed(&self) {
+    pub(super) async fn refresh_failed(&mut self, error: Option<&anyhow::Error>) {
         let reason = match self.rpc.as_ref() {
             Some(rpc) => rpc.refresh_failure_reason().await,
             None => None,
         };
+        if let (Some(rpc), Some(error)) = (self.rpc.as_mut(), error) {
+            rpc.classify_owner_read_failure(error, reason.is_some());
+        }
         let account = self.vault.alias.to_ascii_lowercase();
         // Only a provider rejection is counted; other read failures already
         // surface as owner_unavailable.
@@ -440,12 +443,11 @@ impl Owner {
         {
             self.routing_refused = true;
         }
-        if result
-            .as_ref()
-            .is_err_and(|error| !error.is::<RoutingPolicyError>())
+        if let Err(error) = &result
+            && !error.is::<RoutingPolicyError>()
         {
             // A forced `account/read` is the normal client refresh path.
-            self.refresh_failed().await;
+            self.refresh_failed(Some(error)).await;
             self.fence(false);
         }
         if force
@@ -463,7 +465,7 @@ impl Owner {
         let current = snapshot?;
         if let Err(error) = result {
             if self.vault.verified
-                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
                 && !error.is::<RoutingPolicyError>()
             {
                 return Err(TokenFailure::Retryable(error));
@@ -518,20 +520,21 @@ impl Owner {
                         self.fence(false);
                     }
                     token = snapshot?;
+                    if let Err(error) = &result {
+                        self.refresh_failed(Some(error)).await;
+                    }
                     let limits = match result {
                         Ok(limits) => limits,
                         Err(error)
                             if self.vault.verified
-                                && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                                && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
                                 && !error.is::<RoutingPolicyError>() =>
                         {
                             self.retry_requires_billing = true;
-                            self.refresh_failed().await;
                             self.fence(true);
                             return Err(TokenFailure::Retryable(error));
                         }
                         Err(error) => {
-                            self.refresh_failed().await;
                             self.fence(false);
                             return Err(error.into());
                         }
@@ -554,11 +557,10 @@ impl Owner {
                 .call("account/read", json!({"refreshToken":false}))
                 .await;
             // This routing read can refresh too, so it reports rejections.
-            if result
-                .as_ref()
-                .is_err_and(|error| !error.is::<RoutingPolicyError>())
+            if let Err(error) = &result
+                && !error.is::<RoutingPolicyError>()
             {
-                self.refresh_failed().await;
+                self.refresh_failed(Some(error)).await;
             }
             let snapshot = self.snapshot();
             if result
@@ -579,7 +581,7 @@ impl Owner {
                 Ok(account) => account,
                 Err(error)
                     if self.vault.verified
-                        && self.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out)
+                        && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
                         && !error.is::<RoutingPolicyError>() =>
                 {
                     return Err(TokenFailure::Retryable(error));

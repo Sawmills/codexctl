@@ -103,6 +103,25 @@ impl Rpc {
         self.retryable_failure() || self.timed_out
     }
 
+    pub(super) fn retryable_owner_read(&self) -> bool {
+        !self.rejected_login && self.retryable_or_timed_out()
+    }
+
+    /// An owner read may fail without Codex attaching a retry marker. A bounded
+    /// provider rejection takes precedence over any transport or retry marker.
+    pub(super) fn classify_owner_read_failure(
+        &mut self,
+        error: &anyhow::Error,
+        provider_rejected: bool,
+    ) {
+        if provider_rejected {
+            self.rejected_login = true;
+        } else if error.is::<AppServerError>() {
+            self.healthy = false;
+            self.retryable_failure = true;
+        }
+    }
+
     pub(super) fn timed_out(&self) -> bool {
         self.timed_out
     }

@@ -28,3 +28,33 @@ The server deployment brief is `~/Code/.fleet/codexctl/briefs/server-storm-fix-d
 2. In `src/central/server.rs`, check stored access-token expiry against `fast_path::MIN_REMAINING_SECONDS` before a machine-requested forced rotation. Reuse the existing `BillingRead::Recent` path. In `src/central/refresh_control.rs`, select a bounded reason for the decision. Run the regression green.
 3. Add an HTTP case with less than one hour left. Prove one rotation and no additional rotations on retries; keep the 60-second guard and internal login/reset verification probes. Update existing rotation tests to use near-expiry credentials rather than healthy credentials. HQ confirmed that unknown expiry keeps the refresh path and 60-second guard; test missing and invalid expiry with `reason=exp_unknown` on attempted and guarded forces, counted in the existing metric.
 4. Update `docs/central-server.md`. Run formatting, Clippy, default and no-default tests, PostgreSQL tests, and the release build. Review standards and scope, run Claude autoreview, and request t5D and Architect review on the exact PR head. Merge only after both reviews and required CI pass. Do not change images or deploy.
+
+## Follow-up: unmarked native owner-read failures
+
+HQ confirmed the incident shape: a valid grant and successful refresh followed
+by three usage reads and an unmarked native error without a rejection log.
+Pod stdout for the p3 failure at 03:04:16Z was lost at the 03:25Z restart; the
+regression reproduces the reported shape with the native protocol fixture.
+
+1. Reproduce the file-mode failure through `/v1/token`, with background recovery
+   off: two successful usage reads followed by an unmarked native failure. Assert
+   the `owner_refresh/provider/unclassified` log, the cooldown, and recovery in
+   the same server process. The baseline stays at 503 after the backoff.
+2. Classify completed unmarked native owner-read errors as retryable. Keep the
+   existing identity, journal, routing, settlement, and bounded-backoff checks.
+   Explicit provider rejection must override even a native retry marker.
+3. Cover account and routing reads, repeated failures, and provider rejection.
+   Keep the RPC transport-failure predicate intact for EOF settlement; apply
+   rejection precedence only to the owner-read retry decision. Prove with real
+   PostgreSQL that rejection plus EOF publishes the final journal and releases
+   the lease before a peer serves it.
+   Run the devbox gates and Claude autoreview; request t5D and Architect review.
+   HQ owns any image pin or deployment; keep the B33 and dashboard holds.
+
+Interface choice: classifying only the native RPC error response would lose
+stderr's bounded provider-rejection evidence or make the transport own the
+account's fence policy. Instead, the refresh owner's existing failure-reporting
+boundary passes the native error and its collected provider evidence to the
+private RPC classification method before selecting the fence. Initialization
+can report rejection without an owner-read error. No response payload or raw
+provider error message is retained or logged.

@@ -4871,7 +4871,7 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
             .status(),
         200
     );
-    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let launches = || {
         std::fs::read_to_string(server.root.path().join("launch-count"))
@@ -4904,7 +4904,7 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
     assert_eq!(launches(), 6);
     store::atomic_write(&server.root.path().join("retry-clock"), b"195000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
-    store::atomic_write(&server.root.path().join("mode"), b"billing-error-marked").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"200000").unwrap();
@@ -4984,6 +4984,148 @@ fn token_request_recovers_retryable_refresh_owner_with_background_recovery_off()
     );
     store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+}
+
+#[test]
+fn token_request_recovers_unclassified_completed_usage_failure_without_restart() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    let server_pid = server.child.id();
+    assert_eq!(
+        server
+            .import(&server.amir, "p3", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    // Reproduce the reported shape: a committed grant, two successful usage
+    // reads, then an unmarked native failure on the third read without stderr.
+    store::atomic_write(&server.root.path().join("limits-count"), b"0").unwrap();
+    for _ in 0..2 {
+        assert_eq!(server.token(&server.amir, "p3", None).status(), 200);
+    }
+    store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
+    assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("limits-count")).unwrap(),
+        "3"
+    );
+    let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+    assert!(
+        stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|line| {
+                line["operation"] == "owner_refresh"
+                    && line["stage"] == "provider"
+                    && line["reason"] == "unclassified"
+                    && line["account"] == "p3"
+            }),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Failed to refresh token"), "{stderr}");
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
+    assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
+    store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
+    assert_eq!(server.token(&server.amir, "p3", None).status(), 200);
+    assert_eq!(server.child.id(), server_pid);
+    assert!(server.child.try_wait().unwrap().is_none());
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_owner_recovery_total{result=\"recovered\"} 1\n"),
+        "{metrics}"
+    );
+    assert!(owner_refresh_failures(&metrics).is_empty(), "{metrics}");
+}
+
+#[test]
+fn unclassified_account_and_routing_reads_recover_on_demand() {
+    for mode in ["unmarked-account-read-error", "unmarked-routing-read-error"] {
+        let mut server = Server::start();
+        server.stop();
+        let binary =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        (server.child, server.url) =
+            Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+        let server_pid = server.child.id();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            503,
+            "{mode}"
+        );
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        let blocked = server.token(&server.amir, "personal", None);
+        assert_eq!(blocked.status(), 503, "{mode}");
+        assert_eq!(blocked.headers().get("retry-after").unwrap(), "5");
+        store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            200,
+            "{mode}"
+        );
+        assert_eq!(server.child.id(), server_pid);
+        assert!(server.child.try_wait().unwrap().is_none());
+        let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+        assert!(
+            !stderr.contains("synthetic-private-native-error-payload"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn provider_rejection_overrides_a_native_retry_marker() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused-marked").unwrap();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("retry-clock"), b"600000").unwrap();
+    let rejected = server.token(&server.amir, "personal", None);
+    assert_eq!(rejected.status(), 503);
+    assert!(rejected.headers().get("retry-after").is_none());
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("launch-count")).unwrap(),
+        "1"
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![("personal".to_owned(), "refresh_token_reused".to_owned(), 1)]
+    );
 }
 
 #[test]
@@ -5087,7 +5229,7 @@ fn persistent_billing_failure_is_bounded_and_unavailable_during_cooldown() {
 }
 
 #[test]
-fn an_unmarked_billing_rejection_is_permanent_without_respawn() {
+fn an_explicit_billing_rejection_is_permanent_without_respawn() {
     let server = Server::start();
     assert_eq!(
         server
@@ -6861,6 +7003,17 @@ fn a_legacy_migration_retry_keeps_the_uid_learned_by_the_server() {
         503
     );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    // This unmarked owner-read failure is now retryable. Recover the committed
+    // journal after the background cooldown before retrying the legacy import.
+    store::atomic_write(&server.root.path().join("retry-clock"), b"600000").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while server.token(&server.amir, "personal", None).status() != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner did not recover"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         server
             .import_auth(&server.amir, "personal", original)
