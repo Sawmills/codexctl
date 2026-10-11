@@ -6,7 +6,7 @@ Reader: the cutover operator and the HQ that approves the window. The design and
 
 ## Attempt 4 image and window (2026-10-10)
 
-The next window is Mon 2026-10-12 17:00-18:00Z. Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:4a22377efa5b9d1a776283fef4993e77c70743d75dcc3f4efdf344d49ec5dde3` for the HA broker and both migration Jobs. [Central server image run 38072337625](https://github.com/Sawmills/codexctl/actions/runs/38072337625) succeeded on main `ac4afeb8f539ba9277fe3d9675d59f5805d62dc1`, which contains #176 and #182 as well as SAW-12484 recovery and layout 8. This digest supersedes the attempt 3 image in the historical readiness table below.
+The next window is Mon 2026-10-12 17:00-18:00Z. Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:6374438eca220c90904c3d1623dc8fd91e18f65c27908fc9c828a0d55b74979e` for the HA broker and both migration Jobs. [Central server image run 38119640814](https://github.com/Sawmills/codexctl/actions/runs/38119640814) succeeded on main `cff2988b0e4abda04367dc6cfa30a2b23dfbf139`, which contains #176, #182, #183 and #184 as well as SAW-12484 recovery and layout 8. The same digest is selected for the Sunday 2026-10-11 14:00Z canary and pin; it supersedes the attempt 3 image in the historical readiness table below.
 
 PR H (#167) and PR I (#168) stage this digest in both overlays; the migrate and backfill templates in `central-ha.md` use it too. Both Jobs retain `fsGroupChangePolicy: OnRootMismatch`. Fresh Architect approval and green checks are required on each updated PR head. Keep both PRs unmerged until the Monday window; t5D owns the Sunday canary. SAW-12757 PR 1 (#177) must remain outside this image and unmerged until HQ confirms attempt 4 closed.
 
