@@ -143,6 +143,12 @@ for line in sys.stdin:
             continue
         routing_mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         if not params.get("refreshToken") and (
+            routing_mode == "unmarked-account-read-error"
+            or (routing_mode == "unmarked-routing-read-error" and after_limits)
+        ):
+            send({"id":message["id"], "error":{"code":-32603,"message":"synthetic-private-native-error-payload"}})
+            continue
+        if not params.get("refreshToken") and (
             routing_mode == "routing-billing-change"
             or (routing_mode == "routing-billing-change-once" and not routing_rotated)
         ):
@@ -165,6 +171,8 @@ for line in sys.stdin:
                 continue
             if mode in ["error", "routing-error", "non-exportable"] or partial_failure or invalid_grant:
                 definitive_rejection = mode != "routing-error"
+                if mode == "error":
+                    print("Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
                 send({"id": message["id"], "error": {"code": -32000, "message": "synthetic upstream rejection"}})
                 continue
             if mode == "lease-loss-hold":
@@ -214,6 +222,14 @@ for line in sys.stdin:
         if mode == "billing-policy-wrong-method":
             send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
             continue
+        if mode == "billing-error-private":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic-private-message","data":{"retryable":False,"synthetic-private-key":"synthetic-private-value"}}})
+            continue
+        if mode == "billing-eof":
+            os.close(1)
+            while os.read(0, 4096):
+                pass
+            sys.exit(0)
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue
@@ -223,12 +239,24 @@ for line in sys.stdin:
         if mode == "rpc-unhealthy":
             print("{invalid", flush=True)
             sys.exit(1)
-        if mode == "refresh-reused":
+        if mode == "refresh-reused-eof":
+            print("Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
+            rotate()
+            os.close(1)
+            # EOF is visible while the child remains alive until stdin closes.
+            while os.read(0, 4096):
+                pass
+            os._exit(0)
+        if mode in ["refresh-reused", "refresh-reused-marked"]:
             # The real codex 0.161.0 stderr line (captured), then its answer.
             print("\x1b[2m2026-10-08T21:04:25.249445Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2mcodex_login::auth::manager\x1b[0m\x1b[2m:\x1b[0m Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
-            send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
+            error = {"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}
+            if mode == "refresh-reused-marked":
+                error["data"] = {"retryable":True}
+            send({"id":message["id"], "error":error})
             continue
         if mode == "billing-permanent-error":
+            print("Failed to refresh token: Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.", file=sys.stderr, flush=True)
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic permanent billing rejection"}})
             continue
         if mode in ["billing-error-once", "rpc-unhealthy-once"]:

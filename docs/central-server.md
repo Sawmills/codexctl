@@ -1033,7 +1033,12 @@ from the fixed message Codex logs on the owner child's stderr after
 A transient refresh failure (Codex logs `status=` and retries), or a failed
 refresh with no such message within 300 ms (for example a usage read error),
 logs `reason="unclassified"` and is not counted. It still reports
-`owner_unavailable`.
+`owner_unavailable`. These unclassified `owner_refresh` lines include only
+bounded failure diagnostics: `failure_class` (`native_error`, `eof`, `timeout`,
+`io`, `invalid_protocol`, or `other`), numeric `rpc_code` (null when unknown),
+and `has_data_retryable` (whether the native error contains that field, even
+when its value is false or null). They never include the native message, data
+payload, or provider keys. Each request clears earlier failure metadata.
 
 The server forwards the owner child's stderr as `owner_child` lines: at most 30
 lines a minute, each at most 300 characters, with token-shaped values replaced
@@ -1056,7 +1061,11 @@ path. The first retry waits 5 seconds. Failed attempts double that delay up to
 until recovery succeeds, without the background recovery attempt cutoff.
 Requests during the delay return
 `503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
-whole seconds, rounded up. Permanent provider rejections still require login
+whole seconds, rounded up. An unmarked native error from `account/read` or
+`account/rateLimits/read` is retryable: a missing retry marker does not prove
+that the provider rejected the grant. The `owner_refresh` log reports
+`reason=unclassified` when no bounded provider rejection was captured. A bounded
+provider rejection overrides a native retry marker and still requires login
 renewal. Explicit import remains available through the normal identity and
 verification checks. Enable background
 recovery only for a reviewed trial by setting the value to `1`, `true`, `yes`, or
