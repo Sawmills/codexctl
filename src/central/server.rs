@@ -165,11 +165,18 @@ impl Owner {
         if let Some(reason) = reason {
             super::owner_refresh::record(&account, &self.vault.user, reason);
         }
-        let reason = reason.unwrap_or("unclassified");
-        eprintln!(
-            "{}",
-            json!({"operation":"owner_refresh","stage":"provider","reason":reason,"account":account,"account_key":super::managed::account_key(&self.vault.user, &self.vault.alias)})
-        );
+        let mut log = json!({"operation":"owner_refresh","stage":"provider","reason":reason.unwrap_or("unclassified"),"account":account,"account_key":super::managed::account_key(&self.vault.user, &self.vault.alias)});
+        if reason.is_none() {
+            let failure = self
+                .rpc
+                .as_ref()
+                .map(Rpc::failure_diagnostics)
+                .unwrap_or_default();
+            log["failure_class"] = json!(failure.failure_class);
+            log["rpc_code"] = json!(failure.rpc_code);
+            log["has_data_retryable"] = json!(failure.has_data_retryable);
+        }
+        eprintln!("{log}");
     }
 
     // Shared refresh paths persist this baseline before native work. A later

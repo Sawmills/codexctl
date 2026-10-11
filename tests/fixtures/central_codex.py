@@ -222,6 +222,14 @@ for line in sys.stdin:
         if mode == "billing-policy-wrong-method":
             send({"id":message["id"], "error":{"code":-32603,"message":"workspace routing discovery missing backend origin"}})
             continue
+        if mode == "billing-error-private":
+            send({"id":message["id"], "error":{"code":-32000,"message":"synthetic-private-message","data":{"retryable":False,"synthetic-private-key":"synthetic-private-value"}}})
+            continue
+        if mode == "billing-eof":
+            os.close(1)
+            while os.read(0, 4096):
+                pass
+            sys.exit(0)
         if mode == "billing-error":
             send({"id":message["id"], "error":{"code":-32000,"message":"synthetic billing read failure"}})
             continue

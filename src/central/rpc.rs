@@ -53,6 +53,26 @@ impl RequestHandler for RejectRequests {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FailureClass {
+    NativeError,
+    Eof,
+    Timeout,
+    Io,
+    InvalidProtocol,
+    #[default]
+    Other,
+}
+
+/// Only bounded protocol metadata survives an owner read failure.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct FailureDiagnostics {
+    pub(super) failure_class: FailureClass,
+    pub(super) rpc_code: Option<i64>,
+    pub(super) has_data_retryable: bool,
+}
+
 /// A private stdio connection. Never include protocol payloads in errors or logs.
 pub struct Rpc {
     _child: Child,
@@ -62,6 +82,7 @@ pub struct Rpc {
     healthy: bool,
     retryable_failure: bool,
     timed_out: bool,
+    failure_diagnostics: FailureDiagnostics,
     outstanding: Option<(u64, bool)>,
     verified_login: bool,
     rejected_login: bool,
@@ -120,6 +141,10 @@ impl Rpc {
             self.healthy = false;
             self.retryable_failure = true;
         }
+    }
+
+    pub(super) fn failure_diagnostics(&self) -> FailureDiagnostics {
+        self.failure_diagnostics
     }
 
     pub(super) fn timed_out(&self) -> bool {
@@ -217,6 +242,7 @@ impl Rpc {
             healthy: true,
             retryable_failure: false,
             timed_out: false,
+            failure_diagnostics: FailureDiagnostics::default(),
             outstanding: None,
             verified_login: false,
             rejected_login: false,
@@ -373,13 +399,18 @@ impl Rpc {
     }
 
     pub async fn send(&mut self, value: Value) -> Result<()> {
+        let wire = serde_json::to_string(&value)?;
         let input = self.input.as_mut().context("app-server input is closed")?;
-        input
-            .write_all(serde_json::to_string(&value)?.as_bytes())
-            .await?;
-        input.write_all(b"\n").await?;
-        input.flush().await?;
-        Ok(())
+        let result = async {
+            input.write_all(wire.as_bytes()).await?;
+            input.write_all(b"\n").await?;
+            input.flush().await
+        }
+        .await;
+        if result.is_err() {
+            self.failure_diagnostics.failure_class = FailureClass::Io;
+        }
+        Ok(result?)
     }
 
     pub async fn receive(&mut self) -> Result<Value> {
@@ -391,16 +422,29 @@ impl Rpc {
 
     async fn read_wire(&mut self) -> Result<Value> {
         let mut bytes = Vec::new();
-        let count = timeout(
+        let read = timeout(
             Duration::from_secs(180),
             self.output.read_until(b'\n', &mut bytes),
         )
-        .await
-        .context("app-server notification timed out")??;
+        .await;
+        let count = match read {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => {
+                self.failure_diagnostics.failure_class = FailureClass::Io;
+                return Err(error.into());
+            }
+            Err(error) => {
+                self.failure_diagnostics.failure_class = FailureClass::Timeout;
+                return Err(error).context("app-server notification timed out");
+            }
+        };
         if count == 0 {
+            self.failure_diagnostics.failure_class = FailureClass::Eof;
             bail!("app-server closed its connection");
         }
-        serde_json::from_slice(&bytes).context("invalid app-server protocol message")
+        serde_json::from_slice(&bytes)
+            .inspect_err(|_| self.failure_diagnostics.failure_class = FailureClass::InvalidProtocol)
+            .context("invalid app-server protocol message")
     }
 
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -415,6 +459,7 @@ impl Rpc {
         handler: &mut impl RequestHandler,
         deadline: Duration,
     ) -> Result<Value> {
+        self.failure_diagnostics = FailureDiagnostics::default();
         if !self.healthy {
             bail!("app-server connection is unavailable after a protocol failure");
         }
@@ -437,6 +482,11 @@ impl Rpc {
                     self.outstanding = None;
                     self.observe_login(verifies, &response);
                     if response.get("error").is_some() {
+                        self.failure_diagnostics = FailureDiagnostics {
+                            failure_class: FailureClass::NativeError,
+                            rpc_code: response.pointer("/error/code").and_then(Value::as_i64),
+                            has_data_retryable: response.pointer("/error/data/retryable").is_some(),
+                        };
                         // Only these completed, pinned policy errors are safe
                         // refusals. Never log or retain native protocol payloads.
                         if method == "account/read"
@@ -496,6 +546,7 @@ impl Rpc {
             Err(_) => {
                 self.healthy = false;
                 self.timed_out = true;
+                self.failure_diagnostics.failure_class = FailureClass::Timeout;
                 bail!("app-server request timed out; completion is unknown");
             }
         }
@@ -533,6 +584,23 @@ mod tests {
         }
         let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
 
+        store::atomic_write(&root.path().join("mode"), b"billing-error-private").unwrap();
+        assert!(
+            rpc.call("account/rateLimits/read", json!({}))
+                .await
+                .is_err()
+        );
+        let failure = rpc.failure_diagnostics();
+        assert_eq!(json!(failure.failure_class), "native_error");
+        assert_eq!(failure.rpc_code, Some(-32000));
+        assert!(failure.has_data_retryable);
+        store::atomic_write(&root.path().join("mode"), b"slow").unwrap();
+        rpc.call("account/read", json!({"refreshToken":false}))
+            .await
+            .unwrap();
+        assert_eq!(rpc.failure_diagnostics().rpc_code, None);
+        assert!(!rpc.failure_diagnostics().has_data_retryable);
+
         let result = rpc
             .call_handled(
                 "account/read",
@@ -545,7 +613,20 @@ mod tests {
         assert!(result.is_err());
         assert!(!rpc.retryable_failure());
         assert!(rpc.timed_out());
+        let failure = rpc.failure_diagnostics();
+        assert_eq!(json!(failure.failure_class), "timeout");
+        assert_eq!(failure.rpc_code, None);
+        assert!(!failure.has_data_retryable);
         assert!(rpc._child.try_wait().unwrap().is_none());
+        assert!(
+            rpc.call("account/read", json!({"refreshToken":false}))
+                .await
+                .is_err()
+        );
+        let refused = rpc.failure_diagnostics();
+        assert_eq!(json!(refused.failure_class), "other");
+        assert_eq!(refused.rpc_code, None);
+        assert!(!refused.has_data_retryable);
         rpc.shutdown().await.unwrap();
         assert_eq!(
             std::fs::read_to_string(root.path().join("count")).unwrap(),
@@ -555,6 +636,40 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.path().join("auth.json")).unwrap()).unwrap();
         assert_eq!(auth["tokens"]["refresh_token"], "synthetic-rotated-refresh");
     }
+    #[tokio::test]
+    async fn an_exited_childs_broken_input_pipe_is_reported_as_io() {
+        let root = tempfile::tempdir().unwrap();
+        store::atomic_write(&root.path().join("mode"), b"").unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        let wrapper = root.path().join("codex");
+        let script = format!(
+            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
+            serde_json::to_string(&root.path().join("mode")).unwrap(),
+            serde_json::to_string(&fixture).unwrap(),
+        );
+        store::atomic_write(&wrapper, script.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
+        rpc._child.kill().await.unwrap();
+        let error = rpc
+            .call("account/read", json!({"refreshToken":false}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        let failure = rpc.failure_diagnostics();
+        assert_eq!(json!(failure.failure_class), "io");
+        assert_eq!(failure.rpc_code, None);
+        assert!(!failure.has_data_retryable);
+        assert!(rpc.retryable_failure());
+    }
+
     #[tokio::test]
     async fn a_client_child_stderr_is_never_read() {
         // Client sessions carry user prompts; only owner children are read.

@@ -5022,6 +5022,9 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
                     && line["stage"] == "provider"
                     && line["reason"] == "unclassified"
                     && line["account"] == "p3"
+                    && line["failure_class"] == "native_error"
+                    && line["rpc_code"] == -32000
+                    && line["has_data_retryable"] == false
             }),
         "{stderr}"
     );
@@ -5046,6 +5049,57 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
         "{metrics}"
     );
     assert!(owner_refresh_failures(&metrics).is_empty(), "{metrics}");
+}
+
+#[test]
+fn unclassified_owner_logs_distinguish_eof_and_native_errors_without_payloads() {
+    for (mode, failure_class, code, has_retryable) in [
+        ("billing-error-private", "native_error", json!(-32000), true),
+        ("billing-eof", "eof", Value::Null, false),
+        ("rpc-unhealthy", "invalid_protocol", Value::Null, false),
+    ] {
+        let mut server = Server::start();
+        server.stop();
+        let binary =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        (server.child, server.url) =
+            Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            503,
+            "{mode}"
+        );
+        let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+        let log = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| line["operation"] == "owner_refresh" && line["reason"] == "unclassified")
+            .unwrap_or_else(|| panic!("missing owner log: {stderr}"));
+        assert_eq!(log["failure_class"], failure_class, "{stderr}");
+        assert_eq!(log["rpc_code"], code, "{stderr}");
+        assert_eq!(log["has_data_retryable"], has_retryable, "{stderr}");
+        for private_text in [
+            "synthetic-private-message",
+            "synthetic-private-key",
+            "synthetic-private-value",
+        ] {
+            assert!(!stderr.contains(private_text), "{stderr}");
+        }
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            200,
+            "{mode}"
+        );
+    }
 }
 
 #[test]

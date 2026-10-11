@@ -31,10 +31,15 @@ The server deployment brief is `~/Code/.fleet/codexctl/briefs/server-storm-fix-d
 
 ## Follow-up: unmarked native owner-read failures
 
-HQ confirmed the incident shape: a valid grant and successful refresh followed
-by three usage reads and an unmarked native error without a rejection log.
-Pod stdout for the p3 failure at 03:04:16Z was lost at the 03:25Z restart; the
-regression reproduces the reported shape with the native protocol fixture.
+HQ confirmed the initial incident shape: a valid grant and successful refresh
+followed by three usage reads and an unmarked native error without a rejection
+log. Pod stdout for the p3 failure at 03:04:16Z was lost at the 03:25Z restart.
+The retained p3 Codex log at 04:50–05:00Z shows `account/read` 1969, then
+`account/rateLimits/read` 1970 at 04:57:43Z, with no response, WARN, or ERROR;
+central logged `owner_refresh/unclassified` at 04:57:47Z. That trace cannot
+prove the RPC code, presence of `data.retryable`, or EOF versus timeout.
+The protocol regressions cover both unmarked completed errors and EOF; the
+short-deadline real-child test covers timeout without changing production waits.
 
 1. Reproduce the file-mode failure through `/v1/token`, with background recovery
    off: two successful usage reads followed by an unmarked native failure. Assert
@@ -58,3 +63,14 @@ boundary passes the native error and its collected provider evidence to the
 private RPC classification method before selecting the fence. Initialization
 can report rejection without an owner-read error. No response payload or raw
 provider error message is retained or logged.
+
+Follow-up diagnostics: retain only a fixed failure class, optional numeric RPC
+code, and presence of `data.retryable` at the RPC boundary. Include them only
+on unclassified owner-refresh logs, clearing earlier metadata before each call.
+Test native errors with hostile message/data keys, EOF recovery, and timeout
+classification through real protocol children, and a broken stdin pipe after
+child exit. No native message or payload
+is retained. Compare recording metadata at the protocol boundary with parsing
+error strings at the logger: boundary capture preserves numeric/presence facts
+and distinguishes EOF from timeout without depending on untrusted text. It
+adds no new retries, cancellation, or persistence behavior.
