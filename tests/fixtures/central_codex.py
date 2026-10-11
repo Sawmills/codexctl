@@ -60,6 +60,13 @@ def tokens(auth):
     return auth.get("tokens", auth)
 
 
+def increment(counter):
+    # Background owners update counters while the HTTP test polls them.
+    temporary = counter.with_name(f"{counter.name}.{os.getpid()}.tmp")
+    temporary.write_text(str(int(counter.read_text()) + 1))
+    temporary.replace(counter)
+
+
 def rotate(plan_change=False):
     auth = json.loads(auth_path.read_text())
     old = tokens(auth)["access_token"]
@@ -94,7 +101,7 @@ def rotate(plan_change=False):
     auth_path.write_text(json.dumps(auth))
     auth_path.chmod(0o600)
     counter = pathlib.Path(os.environ["CENTRAL_TEST_REFRESH_COUNTER"])
-    counter.write_text(str(int(counter.read_text()) + 1))
+    increment(counter)
     if mode == "break-key":
         pathlib.Path(os.environ["CENTRAL_TEST_KEY_FILE"]).unlink()
 
@@ -108,7 +115,7 @@ for line in sys.stdin:
         launch_counter = os.environ.get("CENTRAL_TEST_LAUNCH_COUNTER")
         if launch_counter:
             counter = pathlib.Path(launch_counter)
-            counter.write_text(str(int(counter.read_text()) + 1))
+            increment(counter)
         mode_path = os.environ.get("CENTRAL_TEST_MODE_FILE")
         mode = pathlib.Path(mode_path).read_text() if mode_path else ""
         if mode == "respawn-launch-fail-once":
@@ -216,7 +223,7 @@ for line in sys.stdin:
     elif method == "account/rateLimits/read":
         counter = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("limits-count")
         if counter.exists():
-            counter.write_text(str(int(counter.read_text()) + 1))
+            increment(counter)
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         limits_read = True
         if mode == "billing-policy-wrong-method":

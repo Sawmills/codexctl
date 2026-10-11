@@ -1,5 +1,11 @@
-//! Bounded telemetry for refresh decisions and request-driven recovery.
-use std::sync::atomic::{AtomicU64, Ordering};
+//! Bounded telemetry for refresh decisions and owner recovery.
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use serde_json::json;
 
@@ -14,6 +20,24 @@ pub(super) enum Recovery {
 
 pub(super) fn recovery(result: Recovery) {
     RECOVERY[result as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+type AccountFailureKey = (String, String);
+
+fn account_failures() -> &'static Mutex<BTreeMap<AccountFailureKey, u64>> {
+    static FAILURES: OnceLock<Mutex<BTreeMap<AccountFailureKey, u64>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Counts failed probes, launches and settlement retries without holding an
+/// owner lock during a scrape. Labels match the provider-rejection metric.
+pub(super) fn recovery_failed(alias: &str, user: &str) {
+    let key = super::managed::account_key(user, alias);
+    let mut failures = account_failures().lock().expect("recovery metric lock");
+    let count = failures
+        .entry((alias.to_ascii_lowercase(), key[..12].to_owned()))
+        .or_default();
+    *count = count.saturating_add(1);
 }
 
 pub(super) enum Forced {
@@ -53,6 +77,18 @@ pub(super) fn metrics() -> String {
             "codexctl_central_owner_recovery_total{{result=\"{result}\"}} {}\n",
             RECOVERY[index].load(Ordering::Relaxed)
         ));
+    }
+    text.push_str("# TYPE codexctl_central_owner_recovery_failed_total counter\n");
+    for ((alias, key), count) in account_failures()
+        .lock()
+        .expect("recovery metric lock")
+        .iter()
+    {
+        let alias = alias
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
+        text.push_str(&format!("codexctl_central_owner_recovery_failed_total{{account=\"{alias}\",account_key=\"{key}\"}} {count}\n"));
     }
     text.push_str("# TYPE codexctl_central_forced_refresh_total counter\n");
     for (index, outcome) in ["refreshed", "served_recent"].into_iter().enumerate() {

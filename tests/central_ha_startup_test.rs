@@ -869,6 +869,26 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
     .expect("pending import retry blocked instead of refusing")
     .unwrap();
     assert_eq!(busy.status(), 503);
+    // Settlement keeps failing with no further request to this account. Its
+    // counter must keep increasing, and scrapes must not wait on the owner.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let metrics = timeout(Duration::from_secs(2), async {
+                let response = http.get(format!("{}/metrics", importer.url))
+                    .bearer_auth(&token).send().await.unwrap();
+                assert_eq!(response.status(), 200);
+                response.text().await.unwrap()
+            }).await.expect("unsettled owner blocked its metrics scrape");
+            let count = metrics.lines().find_map(|line| {
+                line.strip_prefix("codexctl_central_owner_recovery_failed_total{account=\"failed\",account_key=\"d7b17aa9f551\"} ")
+                    .and_then(|value| value.parse::<u64>().ok())
+            }).unwrap_or(0);
+            assert!(!metrics.contains(&token));
+            assert!(!metrics.contains("synthetic import write failure"));
+            if count >= 2 { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("repeated settlement failures were invisible per account");
     control
         .batch_execute(&format!(
             "DROP TRIGGER fail_import_write ON {schema}.central_accounts"

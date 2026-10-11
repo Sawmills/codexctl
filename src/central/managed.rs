@@ -1313,6 +1313,7 @@ async fn settle_background_recovery(
                 return;
             }
             Err(error) => {
+                super::refresh_control::recovery_failed(&before.alias, &before.user);
                 eprintln!("central child settlement retry: {error:#}");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
@@ -1366,6 +1367,7 @@ async fn settle_background_recovery(
             _ => true,
         };
         if !durable {
+            super::refresh_control::recovery_failed(&before.alias, &before.user);
             if central.is_none() && stopping.load(Ordering::Acquire) {
                 abandon_background_recovery(
                     owner_ref,
@@ -3877,8 +3879,11 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                 }
                 let probe_pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
                 let probe_ok = probe.is_ok();
-                if on_demand && (!probe_ok || !local_saved) {
-                    super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
+                if !probe_ok || !local_saved {
+                    super::refresh_control::recovery_failed(&owner.vault.alias, &owner.vault.user);
+                    if on_demand {
+                        super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
+                    }
                 }
                 if probe_pending || !local_saved || lease.is_some() {
                     if matches!(probe, Err(TokenFailure::Retryable(_))) {
@@ -4026,6 +4031,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                 }
             }
             Err(error) => {
+                super::refresh_control::recovery_failed(&owner.vault.alias, &owner.vault.user);
                 if on_demand {
                     super::refresh_control::recovery(super::refresh_control::Recovery::Failed);
                 }
