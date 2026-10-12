@@ -19,6 +19,7 @@ central-prototype = [
   "dep:axum",
   "dep:aes-gcm",
   "dep:sha2",
+  "dep:hmac",
   "dep:tempfile",
   "dep:signal-hook",
   "dep:toml_edit",
@@ -48,6 +49,7 @@ openidconnect = { version = "4", optional = true, default-features = false, feat
 axum = { version = "0.8", optional = true }
 aes-gcm = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
+hmac = { version = "0.12", optional = true }
 tempfile = { version = "3", optional = true }
 signal-hook = { version = "0.3", optional = true }
 toml_edit = { version = "0.22", optional = true }

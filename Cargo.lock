@@ -440,6 +440,7 @@ dependencies = [
  "dialoguer",
  "dirs",
  "futures",
+ "hmac 0.12.1",
  "hostname",
  "libc",
  "openidconnect",

@@ -64,3 +64,9 @@
 ## Independent review
 
 During independent code review, read [CODING_STANDARDS.md](CODING_STANDARDS.md).
+
+## Agent skills
+
+- Track work in Sawmills Linear. See `docs/agents/issue-tracker.md`.
+- Use the five default triage labels. See `docs/agents/triage-labels.md`.
+- Use one root context and root ADR directory. See `docs/agents/domain.md`.
