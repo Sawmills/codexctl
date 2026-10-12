@@ -467,6 +467,12 @@ For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/
 The commands below require operator execution approval. Stop if the database,
 role, secret, or row counts do not match the reviewed plan.
 
+**WINDOW CLOCK:** Before every planned codexctl window, record its planned end
+and success check. During the window, post a status line in
+`~/Code/.fleet/codexctl/questions.md` **and** to the guide `w9C:tC` every
+15 minutes. At the planned end, call **ROLLBACK** if the success check has not
+passed. No extension is allowed without an explicit Operator `w9C:tF` OK.
+
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
 Keep existing automated sync enabled and wait for that merge to sync. For an
