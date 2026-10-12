@@ -1,0 +1,204 @@
+# DRAFT: standalone and suspended. No Kustomization includes this Job.
+# Do not unsuspend: target/provenance review and separate HQ GO are outstanding.
+# No fence/history exceptions are approved; any such row stops the transaction.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  namespace: codexctl
+  generateName: codexctl-reset-data-
+  labels:
+    app.kubernetes.io/name: codexctl-migration
+    app.kubernetes.io/component: reset-data
+  annotations:
+    checkov.io/skip1: CKV2_K8S_6=NetworkPolicy codexctl-migration selects this pod.
+    checkov.io/skip2: CKV_K8S_35=Database credentials come from the codexctl-postgres ExternalSecret by design.
+spec:
+  suspend: true
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
+      labels:
+        app.kubernetes.io/name: codexctl-migration
+        app.kubernetes.io/component: reset-data
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: reset
+          image: postgres:16@sha256:1a6ab3f5345eb6dbe04a1349529caabdb0ab09293a09590fad07b2246bfa4b54
+          imagePullPolicy: Always
+          command: [sh, -ec]
+          args:
+            - |
+              if [ "${B33_RESET_APPROVAL:-}" != "attempt4-provenance-reviewed" ]; then
+                echo "blocked: target and provenance approval missing" >&2
+                exit 64
+              fi
+              case "${EXPECTED_STAGING_HOST:-}" in
+                ""|__*)
+                  echo "blocked: independently verified staging hostname missing" >&2
+                  exit 64 ;;
+              esac
+              if [ "${PGHOST:-}" != "$EXPECTED_STAGING_HOST" ] ||
+                 [ "${PGDATABASE:-}" != "${EXPECTED_STAGING_DATABASE:-}" ] ||
+                 [ -z "${EXPECTED_STAGING_DATABASE:-}" ]; then
+                echo "blocked: staging database target mismatch" >&2
+                exit 64
+              fi
+              psql -X -v ON_ERROR_STOP=1 <<'SQL'
+              BEGIN;
+              SET LOCAL lock_timeout = '5s';
+              SET LOCAL statement_timeout = '60s';
+              DO $inventory$
+              DECLARE actual text[];
+              BEGIN
+                SELECT array_agg(tablename::text ORDER BY tablename) INTO actual
+                  FROM pg_tables WHERE schemaname = 'public';
+                IF actual IS DISTINCT FROM ARRAY[
+                  'account_live_sessions','account_loan_audit','account_loans',
+                  'account_refresh_leases','central_account_claims',
+                  'central_account_identity_claims','central_accounts',
+                  'central_alias_tombstones','central_devices',
+                  'central_identity_migration_progress','central_login_holders',
+                  'central_login_identity_reservation_history',
+                  'central_login_identity_reservations','central_login_operations',
+                  'central_relay_rate_limits','central_schema_migrations',
+                  'central_token_evidence','central_users','enrollment_challenges'
+                ]::text[] THEN
+                  RAISE EXCEPTION 'unexpected table inventory; new review required';
+                END IF;
+              END
+              $inventory$;
+              LOCK TABLE
+                public.account_live_sessions, public.account_loan_audit,
+                public.account_loans, public.account_refresh_leases,
+                public.central_account_claims, public.central_account_identity_claims,
+                public.central_accounts, public.central_alias_tombstones,
+                public.central_devices, public.central_identity_migration_progress,
+                public.central_login_holders,
+                public.central_login_identity_reservation_history,
+                public.central_login_identity_reservations,
+                public.central_login_operations, public.central_relay_rate_limits,
+                public.central_schema_migrations, public.central_token_evidence,
+                public.central_users, public.enrollment_challenges
+              IN ACCESS EXCLUSIVE MODE;
+              DO $guard$
+              DECLARE relation text; populated boolean;
+              BEGIN
+                IF (SELECT array_agg(version ORDER BY version)
+                      FROM public.central_schema_migrations)
+                   IS DISTINCT FROM ARRAY[1,2,3,4,5,6,7,8] THEN
+                  RAISE EXCEPTION 'reset requires complete layout 8';
+                END IF;
+                IF (SELECT array_agg(stage ORDER BY stage)
+                      FROM public.central_identity_migration_progress)
+                   IS DISTINCT FROM ARRAY[
+                     'accounts','claims','operations','reservations','source_fence'
+                   ]::text[] OR EXISTS(
+                     SELECT 1 FROM public.central_identity_migration_progress
+                     WHERE NOT completed OR completed IS NULL OR deleted_at IS NOT NULL
+                   ) THEN
+                  RAISE EXCEPTION 'identity migration unfinished; preserve database';
+                END IF;
+                -- Empty allowlist: no history-row provenance has been approved.
+                -- Expired, released, deleted and terminal rows remain evidence.
+                FOREACH relation IN ARRAY ARRAY[
+                  'account_live_sessions','account_loan_audit','account_loans',
+                  'account_refresh_leases','central_account_claims',
+                  'central_account_identity_claims','central_alias_tombstones',
+                  'central_login_holders','central_login_identity_reservation_history',
+                  'central_login_identity_reservations','central_login_operations',
+                  'central_relay_rate_limits','central_token_evidence',
+                  'enrollment_challenges'
+                ] LOOP
+                  EXECUTE format('SELECT EXISTS(SELECT 1 FROM public.%I)', relation)
+                    INTO populated;
+                  IF populated THEN
+                    RAISE EXCEPTION 'unproven fence/history row; preserve database';
+                  END IF;
+                END LOOP;
+                IF EXISTS(SELECT 1 FROM public.central_accounts
+                          WHERE deleted_at IS NOT NULL) OR
+                   EXISTS(SELECT 1 FROM public.central_users
+                          WHERE deleted_at IS NOT NULL OR enabled IS NOT TRUE
+                             OR revision IS DISTINCT FROM 0) OR
+                   EXISTS(SELECT 1 FROM public.central_devices
+                          WHERE deleted_at IS NOT NULL OR revoked IS NOT FALSE
+                             OR revision IS DISTINCT FROM 0) THEN
+                  RAISE EXCEPTION 'core fence/revocation row; preserve database';
+                END IF;
+                IF (SELECT count(*) FROM public.central_accounts) <> 8 OR
+                   (SELECT count(*) FROM public.central_users) <> 4 OR
+                   (SELECT count(*) FROM public.central_devices) <> 10 THEN
+                  RAISE EXCEPTION 'attempt-4 core inventory mismatch';
+                END IF;
+              END
+              $guard$;
+              TRUNCATE TABLE
+                public.account_live_sessions, public.account_loan_audit,
+                public.account_loans, public.account_refresh_leases,
+                public.central_account_claims, public.central_account_identity_claims,
+                public.central_accounts, public.central_alias_tombstones,
+                public.central_devices, public.central_login_holders,
+                public.central_login_identity_reservation_history,
+                public.central_login_identity_reservations,
+                public.central_login_operations, public.central_relay_rate_limits,
+                public.central_token_evidence, public.central_users,
+                public.enrollment_challenges;
+              COMMIT;
+              SELECT 'reset_complete_metadata_preserved' AS result;
+              SQL
+          env:
+            - name: B33_RESET_APPROVAL
+              value: not-approved
+            - name: EXPECTED_STAGING_HOST
+              value: __INFRA_HOST_REQUIRED__
+            - name: EXPECTED_STAGING_DATABASE
+              value: codexctl
+            - name: PGHOST
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-hostname } }
+            - name: PGPORT
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-port } }
+            - name: PGDATABASE
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-name } }
+            - name: PGUSER
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-user } }
+            - name: PGPASSWORD
+              valueFrom:
+                { secretKeyRef: { name: codexctl-postgres, key: db-password } }
+            - name: PGSSLMODE
+              value: verify-full
+            - name: PGSSLROOTCERT
+              value: /etc/codexctl/rds-ca/global-bundle.pem
+            - name: PGCONNECT_TIMEOUT
+              value: "5"
+            - name: HOME
+              value: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 250m, memory: 128Mi }
+          volumeMounts:
+            - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
+            - { name: temporary, mountPath: /tmp }
+      volumes:
+        - name: rds-ca
+          configMap: { name: codexctl-rds-ca }
+        - name: temporary
+          emptyDir: {}
