@@ -761,7 +761,29 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    remain required before the B33 cutover.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
-   `/ready` database health, zero upstream refreshes and `served_recent` / `token_valid` for simultaneous forced requests when the stored token has at least one hour left; separately prove one refresh on the lease path with a reviewed disposable account holding a genuinely near-expiry token. Require no lease or ExternalSecret errors before changing traffic.
+   and `/ready` database health. Validate both token paths before changing traffic:
+   - **Normal fast path, on every pod:** choose an eligible account whose stored
+     access token has at least one hour left. Warm routing and, when requesting
+     billing, billing/usage evidence for its current credential revision; keep
+     that evidence within the 60-second freshness bound and every reported usage
+     window below 90%. Snapshot each pod's authenticated `/metrics`, then send
+     token requests **without `previousRevision`** directly to that pod. Require
+     200 responses, zero upstream refreshes, and an increase of at least one in
+     that pod's `codexctl_central_token_fast_path_total{result="served"}` counter.
+     A pre-existing nonzero count or a lease-path success is insufficient. The
+     managed broker already exports this counter (`src/central/managed.rs`,
+     `metrics`); the prototype handler in `src/central/server.rs` is a different
+     serving path. Missing series or no increase is NO-GO.
+   - **Forced/lease path:** separately send simultaneous requests to two pods
+     with `previousRevision` equal to the current revision of that valid token.
+     Require two 200 responses, `served_recent` / `token_valid`, and zero upstream
+     refreshes. This deliberately misses the fast path and does not satisfy its
+     acceptance check.
+   - **Near-expiry lease path:** separately prove one refresh for concurrent
+     requests using a reviewed disposable account holding a genuinely near-expiry
+     token. Do not alter live JWTs to manufacture expiry.
+
+   Require no lease or ExternalSecret errors before changing traffic.
    Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
    `Service/codexctl-ha` and apply the Ingress change only after validation.
 
