@@ -16,6 +16,8 @@ metadata:
 spec:
   template:
     metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
       labels:
         app.kubernetes.io/name: codexctl-migration
     spec:
@@ -131,6 +133,9 @@ spec:
         - name: projected
           secret:
             secretName: codexctl-secrets
+            items:
+              - key: vault-key
+                path: vault-key
             defaultMode: 288
         - name: keys
           emptyDir:
