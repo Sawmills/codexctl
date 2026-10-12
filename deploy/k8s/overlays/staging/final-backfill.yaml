@@ -6,6 +6,7 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: codexctl-final-backfill-a5
+  namespace: codexctl
   annotations:
     argocd.argoproj.io/sync-wave: "1"
     checkov.io/skip1: CKV2_K8S_6=NetworkPolicy codexctl-migration selects this pod.
