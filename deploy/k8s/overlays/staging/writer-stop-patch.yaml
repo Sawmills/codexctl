@@ -1,0 +1,8 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: codexctl
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+spec:
+  replicas: 0

@@ -738,7 +738,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
    ```
 
-4. **Cut over to the build-only HA overlay.** After the final backfill,
+4. **Cut over to the build-only HA overlay.** The B33 GitOps path instead uses PR H to independently keep the old StatefulSet at zero, repeat final backfill in a completion-gated Job, and then start HA; PR I routes traffic only after acceptance and HQ GO. Do not manually apply the build-only overlay to the auto-synced staging Application. The following commands are only for a separately approved manual installation. After the final backfill,
    build and apply the separately reviewed overlay (the overlay is deliberately
    not referenced by `deploy/k8s/staging-application.yaml`):
 
@@ -755,8 +755,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    remain required before the B33 cutover.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
-   `/ready` database health, one upstream refresh for a simultaneous forced
-   request, and no lease or ExternalSecret errors before changing traffic.
+   `/ready` database health, zero upstream refreshes and `served_recent` / `token_valid` for simultaneous forced requests when the stored token has at least one hour left; separately prove one refresh on the lease path with a reviewed disposable account holding a genuinely near-expiry token. Require no lease or ExternalSecret errors before changing traffic.
    Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
    `Service/codexctl-ha` and apply the Ingress change only after validation.
 
@@ -776,7 +775,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
 Run these tests against two or three real pods and a disposable PostgreSQL
 instance, then repeat the destructive cases in staging.
 
-1. **Concurrent refresh.** Seed one account with a refresh token. Send forced
+1. **Concurrent refresh.** Seed a disposable account with a genuinely near-expiry access token and its refresh token. A known token with at least one hour left must instead return `served_recent` / `token_valid` without rotation. For the near-expiry fixture, send forced
    token requests simultaneously to two pods, record upstream calls, and assert
    exactly one `refreshToken=true` call, one new refresh-token revision, and two
    successful responses. Repeat while the follower starts with an older access
