@@ -524,7 +524,7 @@ fn dashboard_credits(credits: Option<&crate::api::Credits>) -> String {
     );
     format!("<div class=\"credits\"><b>{balance}</b><span>{status}</span></div>")
 }
-fn machines(snapshot: &Snapshot) -> String {
+fn machines(snapshot: &Snapshot, form_token: Option<&str>) -> String {
     let mut rows = String::new();
     let mut revoked = String::new();
     let mut count = 0;
@@ -560,8 +560,12 @@ fn machines(snapshot: &Snapshot) -> String {
             .find(|a| a.alias == alias)
             .map(|a| escape(a.name()))
             .unwrap_or_default();
+        let action = form_token.map(|token| format!(
+            r#"<form method="post" action="/accounts/machines/revoke"><input type="hidden" name="id" value="{}"><input type="hidden" name="form_token" value="{}"><button type="submit" class="revoke" aria-label="Revoke {}">Revoke</button></form>"#,
+            escape(&m.name), escape(token), escape(&m.name)
+        )).unwrap_or_default();
         rows += &format!(
-            r#"<tr role="row" class="{class}"><td role="cell">{}</td><td role="cell" class="cell-account">{label}<span class="alias" translate="no">{}</span></td><td role="cell" class="cell-seen"><span class="seen">{seen}</span></td><td role="cell" class="cell-state"><span class="state {class}" data-seen="{}">{state}</span></td></tr>"#,
+            r#"<tr role="row" class="{class}"><td role="cell">{}</td><td role="cell" class="cell-account">{label}<span class="alias" translate="no">{}</span></td><td role="cell" class="cell-seen"><span class="seen">{seen}</span></td><td role="cell" class="cell-state"><span class="state {class}" data-seen="{}">{state}</span>{action}</td></tr>"#,
             escape(&m.name),
             escape(alias),
             m.last_seen_at.unwrap_or(0)
@@ -580,7 +584,12 @@ fn machines(snapshot: &Snapshot) -> String {
     )
 }
 
+#[cfg(test)]
 pub(super) fn overview(snapshot: &Snapshot) -> String {
+    overview_with_actions(snapshot, None)
+}
+
+pub(super) fn overview_with_actions(snapshot: &Snapshot, form_token: Option<&str>) -> String {
     let best = recommendation(&snapshot.accounts);
     let all_stale = !snapshot.accounts.is_empty() && snapshot.accounts.iter().all(Account::stale);
     // Only observations we can refresh can set the browser's next refresh.
@@ -621,7 +630,7 @@ pub(super) fn overview(snapshot: &Snapshot) -> String {
         ),
         attention = attention(&snapshot.accounts, all_stale, snapshot.server_time),
         ledger = ledger(&snapshot.accounts, best, all_stale, snapshot.server_time),
-        machines = machines(snapshot)
+        machines = machines(snapshot, form_token)
     )
 }
 

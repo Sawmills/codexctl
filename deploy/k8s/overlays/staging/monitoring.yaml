@@ -22,7 +22,7 @@ spec:
             description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlCredentialOperationFailed
-          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected|token_evidence_clear_failed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
+          expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected|token_evidence_clear_failed|browser_sessions_unavailable|dashboard_revoke_failed|dashboard_audit_failed|dashboard_guard_unavailable|dashboard_actions_unavailable|dashboard_registry_changed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
           for: 0m
           labels:
             severity: warning
@@ -30,7 +30,7 @@ spec:
             environment: staging
           annotations:
             summary: Codexctl account operation failed
-            description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+            description: Inspect the broker reason and stage in structured logs.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlRelayCapacityExhausted
           expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0

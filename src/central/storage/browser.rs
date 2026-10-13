@@ -10,6 +10,29 @@ pub(in crate::central) enum BrowserIdentity {
     Conflict,
 }
 
+#[derive(Clone, Copy)]
+pub(in crate::central) struct DashboardAudit<'a> {
+    pub actor: &'a str,
+    pub attempt: &'a str,
+}
+
+pub(in crate::central) enum MachineRevoke {
+    Revoked,
+    AlreadyRevoked,
+    NotFound,
+    RegistryChanged,
+}
+impl MachineRevoke {
+    pub(in crate::central) fn audit_result(&self) -> &'static str {
+        match self {
+            Self::Revoked => "ok",
+            Self::AlreadyRevoked => "refused:already_revoked",
+            Self::NotFound => "refused:device_not_found",
+            Self::RegistryChanged => "refused:registry_changed",
+        }
+    }
+}
+
 impl CentralStore {
     pub(in crate::central) async fn resolve_browser_identity(
         &self,
@@ -96,6 +119,66 @@ impl CentralStore {
         }).await
     }
 
+    /// Scope the CAS to the company user and commit its optional dashboard audit atomically.
+    /// API callers omit the actor and retain their idempotent response.
+    pub(in crate::central) async fn revoke_machine(
+        &self,
+        tenant: &str,
+        user: &str,
+        id: &str,
+        audit: Option<DashboardAudit<'_>>,
+    ) -> Result<MachineRevoke> {
+        let db = self.browser_store()?;
+        bounded_db(async {
+            let mut client = std::sync::Arc::try_unwrap(db.establish().await?)
+                .map_err(|_| anyhow::anyhow!("revoke transaction connection is shared"))?;
+            let tx = client.transaction().await?;
+            let row = tx.query_opt("SELECT revoked,revision FROM central_devices WHERE tenant=$1 AND user_id=$2 AND id=$3 AND deleted_at IS NULL FOR UPDATE", &[&tenant, &user, &id]).await?;
+            let outcome = match row {
+                None => MachineRevoke::NotFound,
+                Some(row) if row.get::<_,bool>(0) => MachineRevoke::AlreadyRevoked,
+                Some(row) => {
+                    let revision:i64=row.get(1);
+                    let changed=tx.execute("UPDATE central_devices SET revoked=true,revision=revision+1,updated_at=now() WHERE tenant=$1 AND user_id=$2 AND id=$3 AND revision=$4 AND deleted_at IS NULL", &[&tenant,&user,&id,&revision]).await?;
+                    if changed==1 { MachineRevoke::Revoked } else { MachineRevoke::RegistryChanged }
+                }
+            };
+            if matches!(outcome,MachineRevoke::Revoked | MachineRevoke::AlreadyRevoked) {
+                tx.execute("INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,0,clock_timestamp(),false,clock_timestamp()) ON CONFLICT(device_id) DO UPDATE SET deleted_at=COALESCE(central_relay_rate_limits.deleted_at,clock_timestamp()),updated_at=clock_timestamp()", &[&id]).await?;
+            }
+            // Unresolved request targets are digests, never arbitrary client text.
+            let target=if matches!(outcome,MachineRevoke::NotFound) { format!("unresolved:{}",vault::digest(id.as_bytes())) } else { id.to_owned() };
+            let at=chrono::Utc::now().timestamp();
+            if let Some(audit)=audit {
+                tx.execute("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'machine_revoke',$3,$4,$5)", &[&at,&audit.actor,&target,&outcome.audit_result(),&audit.attempt]).await?;
+            }
+            tx.commit().await?;
+            if let Some(audit)=audit { audit_log(at,audit.actor,&target,outcome.audit_result()); }
+            Ok(outcome)
+        }).await
+    }
+
+    pub(in crate::central) async fn dashboard_audit(
+        &self,
+        audit: DashboardAudit<'_>,
+        target: &str,
+        result: &str,
+    ) -> Result<()> {
+        let db = self.browser_store()?;
+        bounded_db(async {
+            let at=chrono::Utc::now().timestamp();
+            let client=db.client().await?;
+            let inserted=client.query_opt("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'machine_revoke',$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&target,&result,&audit.attempt]).await?;
+            // A lost COMMIT acknowledgement can have already persisted the real outcome.
+            let row=match inserted {
+                Some(row)=>row,
+                None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1 AND deleted_at IS NULL", &[&audit.attempt]).await?,
+            };
+            audit_log(row.get(0),row.get(1),row.get(2),row.get(3));
+            Ok(())
+        }).await
+    }
+
     fn browser_store(&self) -> Result<&PostgresStore> {
         match self {
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => Ok(db),
@@ -131,7 +214,7 @@ impl CentralStore {
         &self,
         token: &str,
         user: &str,
-        signed_in_at: i64,
+        signed_in_at: Option<i64>,
         ttl: Duration,
     ) -> Result<bool> {
         let db = self.browser_store()?;
@@ -143,8 +226,8 @@ impl CentralStore {
             tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),73912757))", &[]).await?;
             tx.execute("DELETE FROM browser_sessions WHERE expires_at <= now()", &[]).await?;
             let inserted = tx.execute(
-                "INSERT INTO browser_sessions(token_hash,user_id,signed_in_at,expires_at) SELECT $1,$2,to_timestamp($3::double precision),now()+($4::bigint * interval '1 second') WHERE (SELECT count(*) FROM browser_sessions WHERE expires_at > now()) < 1024",
-                &[&hash, &user, &(signed_in_at as f64), &(ttl.as_secs() as i64)],
+                "INSERT INTO browser_sessions(token_hash,user_id,signed_in_at,expires_at,auth_time_verified) SELECT $1,$2,to_timestamp($3::double precision),now()+($4::bigint * interval '1 second'),$5 WHERE (SELECT count(*) FROM browser_sessions WHERE expires_at > now()) < 1024",
+                &[&hash, &user, &(signed_in_at.unwrap_or_else(|| chrono::Utc::now().timestamp()) as f64), &(ttl.as_secs() as i64), &signed_in_at.is_some()],
             ).await?;
             tx.commit().await?;
             Ok(inserted == 1)
@@ -170,6 +253,20 @@ impl CentralStore {
         }).await
     }
 
+    pub(in crate::central) async fn browser_session_signed_in_at(
+        &self,
+        token: &str,
+    ) -> Result<Option<i64>> {
+        let db = self.browser_store()?;
+        let hash = vault::digest(token.as_bytes());
+        bounded_db(async {
+            Ok(db.client().await?.query_opt(
+                "SELECT extract(epoch FROM s.signed_in_at)::bigint FROM browser_sessions s JOIN central_users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at > now() AND s.auth_time_verified AND u.enabled AND u.deleted_at IS NULL",
+                &[&hash],
+            ).await?.map(|row| row.get(0)))
+        }).await
+    }
+
     pub(in crate::central) async fn end_browser_session(&self, token: &str) -> Result<()> {
         let db = self.browser_store()?;
         let hash = vault::digest(token.as_bytes());
@@ -182,4 +279,11 @@ impl CentralStore {
         })
         .await
     }
+}
+
+fn audit_log(at: i64, actor: &str, target: &str, result: &str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({"at":at,"actor_hash":vault::digest(actor.as_bytes()),"operation":"machine_revoke","target":target,"result":result})
+    );
 }

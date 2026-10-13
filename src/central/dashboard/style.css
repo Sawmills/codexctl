@@ -1295,3 +1295,25 @@ table:has(> tbody:empty) + .machines-note {
   font-size: var(--t-xl);
   letter-spacing: -0.02em;
 }
+
+.machines .revoke {
+  margin-top: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  font: inherit;
+  font-size: 0.75rem;
+  color: var(--ink-2);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 0.3rem;
+  cursor: pointer;
+}
+.machines .revoke:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .machines .revoke {
+    min-height: 44px;
+  }
+}

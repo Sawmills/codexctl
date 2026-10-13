@@ -3188,52 +3188,17 @@ async fn revoke_device(
     Json(input): Json<RevokeDevice>,
 ) -> Result<StatusCode, HttpError> {
     let current = broker.authorize(&headers).await?;
-    if let Some(central) = broker
-        .central
-        .as_ref()
-        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    match revoke_machine(&broker, &current.tenant, &current.user, &input.id, None)
+        .await
+        .map_err(|error| broker.error(error.status, error.reason))?
     {
-        let (_, payload, revision) = central
-            .load_device_entity_revision(&current.tenant, &input.id)
-            .await
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?
-            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
-        let mut device: vault::Device = serde_json::from_slice(&payload)
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-        if device.user != current.user {
+        RevokeOutcome::NotFound => {
             return Err(broker.error(StatusCode::NOT_FOUND, "device_not_found"));
         }
-        device.revoked = true;
-        let updated = central
-            .save_device_entity_cas(
-                &current.tenant,
-                &input.id,
-                &serde_json::to_vec(&device).map_err(|_| {
-                    broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
-                })?,
-                Some(revision),
-            )
-            .await
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-        if !updated {
+        RevokeOutcome::RegistryChanged => {
             return Err(broker.error(StatusCode::CONFLICT, "registry_changed"));
         }
-        central
-            .retire_relay_event_limiter(&input.id)
-            .await
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-    } else {
-        let _lock = vault::registry_lock(&broker.state, "devices.lock")
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
-        let mut devices = vault::devices(&broker.state)
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
-        let device = devices
-            .iter_mut()
-            .find(|d| d.id == input.id && d.user == current.user)
-            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "device_not_found"))?;
-        device.revoked = true;
-        vault::save_devices(&broker.state, &devices)
-            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        RevokeOutcome::Revoked | RevokeOutcome::AlreadyRevoked => {}
     }
     broker
         .sync_registry()
@@ -3241,6 +3206,82 @@ async fn revoke_device(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+pub(super) use super::storage::MachineRevoke as RevokeOutcome;
+
+/// Both browser and machine callers use the same scoped CAS and limiter retirement.
+/// Errors are recorded by the caller so each attempt counts once under its own reasons.
+pub(super) async fn revoke_machine(
+    broker: &Broker,
+    tenant: &str,
+    user: &str,
+    id: &str,
+    audit: Option<super::storage::DashboardAudit<'_>>,
+) -> Result<RevokeOutcome, HttpError> {
+    let error = |status, reason| HttpError {
+        retry_after: None,
+        status,
+        reason,
+        alias: None,
+    };
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|central| central.mode() != super::storage::StoreMode::File)
+    {
+        return central
+            .revoke_machine(tenant, user, id, audit)
+            .await
+            .map_err(|cause| {
+                if audit.is_some() {
+                    log_dashboard_failure("revoke_transaction", &cause);
+                }
+                error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+            });
+    }
+    let _lock = vault::registry_lock(&broker.state, "devices.lock")
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "registry_busy"))?;
+    let mut devices = vault::devices(&broker.state)
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "registry_unavailable"))?;
+    let device = devices
+        .iter_mut()
+        .find(|d| d.id == id && d.user == user && d.tenant == tenant)
+        .ok_or_else(|| error(StatusCode::NOT_FOUND, "device_not_found"))?;
+    let outcome = if device.revoked {
+        RevokeOutcome::AlreadyRevoked
+    } else {
+        RevokeOutcome::Revoked
+    };
+    device.revoked = true;
+    vault::save_devices(&broker.state, &devices)
+        .map_err(|_| error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+    Ok(outcome)
+}
+
+/// Keep database diagnostics actionable without provider messages or SQL parameters.
+pub(super) fn log_dashboard_failure(stage: &'static str, error: &anyhow::Error) {
+    let mut class = "other";
+    let mut sqlstate = None;
+    for cause in error.chain() {
+        if let Some(database) = cause.downcast_ref::<tokio_postgres::Error>() {
+            class = if database.as_db_error().is_some() {
+                "database"
+            } else {
+                "connection"
+            };
+            sqlstate = database.code().map(|code| code.code());
+            break;
+        }
+        if cause.is::<tokio::time::error::Elapsed>() {
+            class = "timeout";
+        }
+    }
+    eprintln!(
+        "{}",
+        json!({"operation":"dashboard_failure","stage":stage,"failure_class":class,"sqlstate":sqlstate})
+    );
+}
+
 async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
     if let Some(expected) = &broker.metrics_hash {
         let actual = headers

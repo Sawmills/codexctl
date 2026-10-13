@@ -70,6 +70,8 @@ impl Pod {
         if root.path().join("fast-path").exists() {
             command.env("CODEXCTL_CENTRAL_TOKEN_FAST_PATH", "1");
         }
+        let public_url = std::fs::read_to_string(root.path().join("public-url"))
+            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_owned());
         let mut child = command
             .env("CODEXCTL_CENTRAL_STORE", mode)
             .env(
@@ -82,7 +84,7 @@ impl Pod {
                 "--listen",
                 "127.0.0.1:0",
                 "--public-url",
-                "http://127.0.0.1:8787",
+                &public_url,
                 "--codex-bin",
             ])
             .arg(binary)

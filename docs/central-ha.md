@@ -54,8 +54,8 @@ only for explicit migration commands and still requires
 `CODEXCTL_CENTRAL_DUAL_ACK=1`; the server refuses dual serving.
 
 The PostgreSQL server supports shared add and renewal receipts, status, and
-cancellation. The read-only dashboard supports company sign-in, sessions,
-sign-out, and the company user's machine list across replicas. Machine
+cancellation. The dashboard supports company sign-in, sessions,
+sign-out, the company user's machine list, and Revoke across replicas. Machine
 enrollment and reset listing/redemption remain unavailable in shared mode.
 Keep those workflows on the single file-mode writer until their shared storage
 is complete.
@@ -66,6 +66,12 @@ empty or differ across replicas. Shared activity storage is outside this upgrade
 For the dashboard session upgrade, run the existing migrate Job before rolling
 the server image. Migration adds `browser_sessions` and its expiry index with
 `IF NOT EXISTS`; it keeps schema version 8, so the previous image can still run.
+
+The action upgrade also adds `dashboard_audit` and `browser_sessions.auth_time_verified`.
+It adds the nullable `dashboard_audit.deleted_at` marker to existing audit tables
+with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
+Run migrate before rolling this image. Both changes are additive and keep schema version 8.
+Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
 
 The dashboard stores only the session cookie's digest, the company-user ID,
 signed-in time, and one-hour expiry. The existing encrypted enrollment table

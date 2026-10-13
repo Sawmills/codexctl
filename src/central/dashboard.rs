@@ -1,4 +1,4 @@
-//! Read-only company-user browser view. Credentials never enter this response.
+//! Company-user browser overview and guarded actions. Saved credentials never enter responses.
 use super::{
     enrollment,
     managed::{self, Broker, HttpError},
@@ -12,48 +12,62 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+mod actions;
+pub(super) use actions::recent_sign_in;
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
-    match snapshot(&broker, &headers, Instant::elapsed).await {
-        Ok(snapshot) => document(&render::overview(&snapshot)),
-        Err(error) => {
-            let error = error.into_response();
-            if error.status() == StatusCode::UNAUTHORIZED {
-                return (
-                    [("cache-control", "no-store")],
-                    Redirect::to("/accounts/sign-in"),
-                )
-                    .into_response();
-            }
-            let mut response = document(include_str!("dashboard/error.html"));
-            *response.status_mut() = error.status();
-            // Keep the already-recorded failure marker for the HTTP observer.
-            response
-                .extensions_mut()
-                .extend(error.into_parts().0.extensions);
-            response
-        }
+    let response = match snapshot(&broker, &headers, Instant::elapsed).await {
+        Ok(snapshot) => match actions::render(&broker, &headers, &snapshot) {
+            Ok(html) => document(&html),
+            Err(error) => error_page(error),
+        },
+        Err(error) => error_page(error),
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return (
+            [("cache-control", "no-store")],
+            Redirect::to("/accounts/sign-in"),
+        )
+            .into_response();
     }
+    response
 }
+
+fn error_page(error: HttpError) -> Response {
+    let error = error.into_response();
+    let mut response = document(include_str!("dashboard/error.html"));
+    *response.status_mut() = error.status();
+    // Keep the already-recorded failure marker for the HTTP observer.
+    response
+        .extensions_mut()
+        .extend(error.into_parts().0.extensions);
+    response
+}
+
 async fn data(
     State(broker): State<Broker>,
     headers: HeaderMap,
     elapsed: fn(&Instant) -> Duration,
 ) -> Result<Response, HttpError> {
-    let snapshot = snapshot(&broker, &headers, elapsed).await?;
+    let snapshot = snapshot(&broker, &headers, elapsed).await;
     if headers.get("accept").is_some_and(|v| v == "text/html") {
-        return Ok(document(&render::overview(&snapshot)));
+        return Ok(
+            match snapshot.and_then(|snapshot| actions::render(&broker, &headers, &snapshot)) {
+                Ok(html) => document(&html),
+                Err(error) => error_page(error),
+            },
+        );
     }
     Ok((
         [
             ("cache-control", "no-store"),
             ("x-content-type-options", "nosniff"),
         ],
-        Json(snapshot),
+        Json(snapshot?),
     )
         .into_response())
 }
@@ -277,6 +291,12 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
                 .layer(axum::middleware::from_fn(enrollment::browser_errors)),
         )
         .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
+        .route(
+            "/accounts/machines/revoke",
+            post(actions::revoke)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(actions::no_store)),
+        )
 }
 
 async fn landing(
