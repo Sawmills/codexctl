@@ -408,6 +408,22 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
+SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
+
+Backfill enforces `BACKFILL_MAX_ROWS = 50000` for each imported source and target
+table, including retired loan and audit history. A count above the cap fails
+the Job; HA must stay stopped. Successful JSON receipts include per-table
+source, pre-copy target and post-copy target counts for the six imported
+tables.
+The source and existing target are capped before payload inventory. A registry
+copy can add matching rows before a later count rejects combined growth;
+retain those partial copies for inspection and keep HA stopped. Foreign-tenant
+machine counts include retained rows intentionally; known source tenants retain
+the existing active-row parity policy. No foreign identifiers are read. The 1800-second, zero-retry templates below cover the initial and
+final backfill; another Job name requires HQ approval. This does not authorize
+a window, production use,
+or changes to infra #1604 while A128 is held.
+
 For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/b33-attempt-3-cutover.md): it delivers these steps through GitOps PRs and a Claude operator that uses no codexctl token.
 
 The commands below require operator execution approval. Stop if the database,
@@ -485,6 +501,8 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    metadata:
      name: codexctl-migrate
    spec:
+     backoffLimit: 0
+     activeDeadlineSeconds: 1800
      ttlSecondsAfterFinished: 86400
      template:
        metadata:
@@ -615,6 +633,8 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    metadata:
      name: codexctl-backfill
    spec:
+     backoffLimit: 0
+     activeDeadlineSeconds: 1800
      ttlSecondsAfterFinished: 86400
      template:
        metadata:

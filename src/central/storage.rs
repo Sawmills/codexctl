@@ -23,6 +23,7 @@ pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod backfill;
 mod browser;
 pub(in crate::central) use browser::BrowserIdentity;
 mod loans;
@@ -159,6 +160,15 @@ pub struct BackfillCounts {
     pub observed_relogins: usize,
     /// Loan grants copied with their audit events.
     pub loans: usize,
+    /// Physical table counts, including retained history, before and after copy.
+    pub inventory: BTreeMap<String, BackfillTableCounts>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BackfillTableCounts {
+    pub source: usize,
+    pub target_before: usize,
+    pub target: usize,
 }
 
 /// Login journals and identity reservations that fence account `$1`. The
@@ -610,6 +620,8 @@ impl CentralStore {
             Self::Dual { postgres, .. } => postgres,
             Self::File(_) => bail!("backfill requires PostgreSQL or dual central storage"),
         };
+        let target_before = backfill::target_counts(target).await?;
+        let source = backfill::source_counts(state, key)?;
         if super::relogin::add::pending_logins(state)? {
             bail!("finish pending logins in file mode before switching storage");
         }
@@ -623,10 +635,11 @@ impl CentralStore {
             devices: 0,
             observed_relogins: 0,
             loans: 0,
+            inventory: BTreeMap::new(),
         };
         let mut account_ids = Vec::new();
         let mut user_ids = Vec::new();
-        let mut device_ids = Vec::new();
+        let mut device_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let accounts = state.join("accounts");
         if accounts.exists() {
             for entry in std::fs::read_dir(accounts)? {
@@ -722,7 +735,10 @@ impl CentralStore {
                                 device.id
                             );
                         }
-                        device_ids.push(device.id.clone());
+                        device_ids
+                            .entry(device.tenant.clone())
+                            .or_default()
+                            .push(device.id.clone());
                     }
                     counts.devices = devices.len();
                 }
@@ -744,19 +760,32 @@ impl CentralStore {
         } else {
             FileState::default()
         };
+        backfill::target_counts(target).await?;
+        backfill::verify_devices(target, &device_ids).await?;
         counts.loans = target
             .import_loans(&file_state.loans, &file_state.loan_audit)
             .await?;
+        let target_after = backfill::target_counts(target).await?;
         if let Some(extra) = target.client().await?.query_opt(
             "SELECT 'central_accounts'::text,account_id FROM central_accounts WHERE deleted_at IS NULL AND NOT(account_id=ANY($1::text[])) \
-             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) \
-             UNION ALL SELECT 'central_devices',id FROM central_devices WHERE deleted_at IS NULL AND NOT(id=ANY($3::text[])) LIMIT 1",
-            &[&account_ids, &user_ids, &device_ids],
+             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) LIMIT 1",
+            &[&account_ids, &user_ids],
         ).await? {
             let table: &str = extra.get(0);
             let id: &str = extra.get(1);
             bail!("backfill source mismatch: {table} extra row {id}");
         }
+        counts.inventory = source
+            .into_iter()
+            .map(|(table, source)| {
+                let rows = BackfillTableCounts {
+                    source,
+                    target_before: target_before[&table],
+                    target: target_after[&table],
+                };
+                (table, rows)
+            })
+            .collect();
         Ok(counts)
     }
 
