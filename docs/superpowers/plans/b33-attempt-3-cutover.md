@@ -4,11 +4,35 @@
 
 Reader: the cutover operator and the HQ that approves the window. The design and the Job manifests are in [central-ha.md section 5](../../central-ha.md#5-staging-migration-and-rollback); this runbook changes how they are delivered, not what they do.
 
+## Attempt 5 image and fresh database (2026-10-13)
+
+Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048` for the HA account server, initial migrate/backfill Jobs and
+H's frozen final-backfill Job. [Central server image run 38332773546](https://github.com/Sawmills/codexctl/actions/runs/38332773546)
+succeeded on main `d956d5489910fdad0af750449dc49a395fb180c8`, which contains
+#190's fail-closed source projection and identifier checks, plus #176, #182,
+#183, #184 and #177. Both Job templates retain `fsGroupChangePolicy: OnRootMismatch`.
+The attempt-4 image below is historical and must not run attempt 5's backfill.
+
+HQ selected a fresh empty staging database `codexctl_a5`; retain the old database
+and its history. [Infra #1604](https://github.com/Sawmills/infra/pull/1604) prepares
+component `codexctl-a5-db`; A128 currently holds all AWS plans/applies and further
+infra pushes/reruns until HQ relays the required approvals. The reset draft
+#189 is unused. The pipeline and a separately reviewed ExternalSecret repoint
+must establish the new target and empty-data receipt before any cutover window.
+
+No new window or H/I activation is authorized. H/I require fresh exact-head
+reviews and green checks, the fresh-DB receipt, and explicit HQ GO in the window.
+Backfill now refuses differing source rows and target-only identifiers. A file
+loan purged by retention between the initial and final passes can therefore
+cause a safe NO-GO. Keep the passes close together; never reset history or bypass
+the guard to make the final Job pass. Compare current stopped-source inventory
+with both receipts; attempt-4 inventory numbers below are historical evidence.
+
 ## Attempt 4 image and window (2026-10-10)
 
-Attempt 4 closed with rollback on Mon 2026-10-12 at 18:16Z. No next window is authorized; HQ must give GO in a newly announced window. Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:6374438eca220c90904c3d1623dc8fd91e18f65c27908fc9c828a0d55b74979e` for the HA broker and both migration Jobs. [Central server image run 38119640814](https://github.com/Sawmills/codexctl/actions/runs/38119640814) succeeded on main `cff2988b0e4abda04367dc6cfa30a2b23dfbf139`, which contains #176, #182, #183 and #184 as well as SAW-12484 recovery and layout 8. The same digest is selected for the Sunday 2026-10-11 14:00Z canary and pin; it supersedes the attempt 3 image in the historical readiness table below.
+Attempt 4 closed with rollback on Mon 2026-10-12 at 18:16Z. No next window is authorized; HQ must give GO in a newly announced window. Attempt 4 used `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:6374438eca220c90904c3d1623dc8fd91e18f65c27908fc9c828a0d55b74979e` for the HA broker and both migration Jobs. [Central server image run 38119640814](https://github.com/Sawmills/codexctl/actions/runs/38119640814) succeeded on main `cff2988b0e4abda04367dc6cfa30a2b23dfbf139`, which contains #176, #182, #183 and #184 as well as SAW-12484 recovery and layout 8. The same digest is selected for the Sunday 2026-10-11 14:00Z canary and pin; it supersedes the attempt 3 image in the historical readiness table below.
 
-PR H (#167) and PR I (#168) stage this digest in both overlays; the migrate and backfill templates in `central-ha.md` use it too. Both Jobs retain `fsGroupChangePolicy: OnRootMismatch`. Fresh Architect approval and green checks are required on each updated PR head. Keep both PRs unmerged until HQ gives GO during the next announced window. The Sunday canary and attempt 4 are historical evidence, not permission to deploy. SAW-12757 PR 1 (#177) must remain outside this image and unmerged until HQ confirms attempt 4 closed.
+For attempt 4, PR H (#167) and PR I (#168) staged this digest in both overlays; the migrate and backfill templates in `central-ha.md` use it too. Both Jobs retain `fsGroupChangePolicy: OnRootMismatch`. Fresh Architect approval and green checks are required on each updated PR head. Keep both PRs unmerged until HQ gives GO during the next announced window. The Sunday canary and attempt 4 are historical evidence, not permission to deploy. SAW-12757 PR 1 (#177) must remain outside this image and unmerged until HQ confirms attempt 4 closed.
 
 ## Readiness Check (2026-10-08)
 
@@ -109,7 +133,7 @@ H must not inherit its only writer-stop fence from W: W can be reverted before H
 
 This repeats section 5's final backfill even after W's initial migrate/backfill. Freeze the final Job's full image reference so later account-server image pins do not alter its immutable pod template. Keep the completed Job without a TTL and without a Sync hook: later syncs must not replay file backfill against a live HA store. A new attempt needs HQ review, a new Job name, and the same no-writer prerequisites. Do not delete the final Job while HA is running. H's `spec.replicas: 0` patch stays in Git through I and until reviewed cleanup.
 
-Before H, W still provides the quiesced archive, private-mode baseline, initial migration and backfill receipts. The mode checks and `fsGroupChangePolicy: OnRootMismatch` remain mandatory. After H, preserve the final Job log. Its JSON mixes counts: `accounts` and `loans` report copied rows, while `users` and `devices` report source inventory sizes even when CAS skips an existing row. After the successful initial backfill with no intervening writer, expect accounts 0, users 4 and devices 10 for the attempt-4 source (and loans 0), not an all-zero receipt. These values do not prove database totals. Separately run the read-only row-count Job and compare live users/accounts/devices totals with the initial receipt and stopped source inventory. Unexpected account/loan copies, changed source inventory, errors, or database total mismatches stop I and go to HQ. The immutable image is unchanged. Approval and green checks do not authorize merging H: a merge auto-deploys staging.
+Before H, W still provides the quiesced archive, private-mode baseline, initial migration and backfill receipts. The mode checks and `fsGroupChangePolicy: OnRootMismatch` remain mandatory. After H, preserve the final Job log. Its JSON mixes counts: `accounts` and `loans` report copied rows, while `users` and `devices` report source inventory sizes even when CAS skips an existing row. After the successful initial backfill with no intervening writer, expect accounts 0, users 4 and devices 10 for the attempt-4 source (and loans 0), not an all-zero receipt. These values do not prove database totals. Separately run the read-only row-count Job and compare live users/accounts/devices totals with the initial receipt and stopped source inventory. Unexpected account/loan copies, changed source inventory, errors, or database total mismatches stop I and go to HQ. Attempt 5 uses the prerequisite image above. Approval and green checks do not authorize merging H: a merge auto-deploys staging.
 
 ### Database provenance and reset hold
 
