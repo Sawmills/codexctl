@@ -191,24 +191,33 @@ Record both listings and the result on the B33 ticket. Any NO-GO goes to HQ befo
 
 No `codexctl-central` command reports row counts or lease state, so the operator runs them as one-shot Jobs (`deploy/k8s/jobs/b33-check-empty.yaml` before migration and again after step 4, `deploy/k8s/jobs/b33-check-leases.yaml` in a rollback) with a `postgres:16` image, the `codexctl-migration` label (for the egress policy), the `codexctl-postgres` Secret as `PG*` environment variables, and `PGOPTIONS=-c default_transaction_read_only=on`. The Jobs are reviewed and merged before the window; no kustomization includes them.
 
-```sql
--- Inventory (prerequisite 3): exact row count of every table that exists.
--- Before migrate: no application tables (no output rows).
--- After migrate: exact 19-table layout-8 inventory, schema_migrations=8,
--- identity_migration_progress=5, and zero rows in every other table.
-SELECT table_name,
-       (xpath('/row/c/text()',
-              query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
-                           false, true, '')))[1]::text::bigint AS row_count
-FROM information_schema.tables
-WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
-ORDER BY table_name;
+Use the inventory Job's checked-in SQL as the execution source. Its per-table
+probe is `SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 50001) s`, with
+schema and table identifiers quoted by PostgreSQL `format`. Accepted counts are
+exact and appear as `inventory table=<name> row_count=<count>` within NOTICE messages on stderr;
+retain the full Job log. The script forces NOTICE delivery and ends with
+`inventory complete tables=<count>` within a NOTICE message. Ignore psql's input-location
+prefix and severity spacing when matching these marker substrings. Reaching 50001 raises an exception
+and fails the Job without that completion marker.
+Any nonzero exit or incomplete receipt is NO-GO; never accept partial notices.
+Before migration, require successful completion, `inventory complete tables=0`
+and no table notices. After migration, require `inventory complete tables=19`
+and exactly 19 table notices: `central_schema_migrations`=8,
+`central_identity_migration_progress`=5, and zero rows in every other table, as in prerequisite 3.
 
+```sql
 -- Lease fence (rollback step 3): must return 0.
 SELECT count(*) FROM account_refresh_leases WHERE NOT released;
 ```
 
 The inventory query names no table, so it works before migration 1, when no table exists, and counts tables added later, such as the loan tables. Interpret each receipt using its pre- or post-migration rule in prerequisite 3. The lease query runs only after migration, when its table exists. No query reads the login journal across users.
+
+Local regression: with `psql` and PyYAML installed, set `B33_TEST_DATABASE_URL`
+to a disposable loopback PostgreSQL database and run
+`python3 tests/b33_check_empty_test.py`. It executes the actual Job script in
+read-only mode against empty, 50000-row and 50001-row fixtures. Without the
+variable it skips. This is an explicit local gate; hosted CI does not run it,
+and lane workflow edits are prohibited by A124.
 
 ## Done
 

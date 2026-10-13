@@ -4,6 +4,8 @@
 # at go/no-go before migrate, and creates a new instance after migrate.
 # Before migrate, require no application tables in the fresh A5 DB. Afterward,
 # require the exact layout-8 inventory with metadata-only counts per the runbook.
+# Counts are bounded at 50001 rows per table. A cap hit fails the Job; retain
+# notices from stderr as the count receipt and never proceed on partial output.
 # A rollback uses b33-check-leases.yaml.
 # Every statement runs in a read-only transaction, and the job label selects
 # the codexctl-migration egress policy.
@@ -44,13 +46,32 @@ spec:
             - |
               psql -X -v ON_ERROR_STOP=1 <<'SQL'
               \echo '== inventory (prerequisite 3): before migrate require no tables; after migrate verify layout and metadata counts per runbook'
-              SELECT table_name,
-                     (xpath('/row/c/text()',
-                            query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
-                                         false, true, '')))[1]::text::bigint AS row_count
-              FROM information_schema.tables
-              WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
-              ORDER BY table_name;
+              SET client_min_messages = notice;
+              DO $inventory$
+              DECLARE
+                inventory_table record;
+                row_count bigint;
+                table_count integer := 0;
+              BEGIN
+                FOR inventory_table IN
+                  SELECT table_schema, table_name
+                  FROM information_schema.tables
+                  WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+                  ORDER BY table_name
+                LOOP
+                  EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 50001) s',
+                                 inventory_table.table_schema, inventory_table.table_name)
+                    INTO row_count;
+                  IF row_count >= 50001 THEN
+                    RAISE EXCEPTION 'inventory table % exceeds 50000 rows; stop the window',
+                                    inventory_table.table_name;
+                  END IF;
+                  RAISE NOTICE 'inventory table=% row_count=%', inventory_table.table_name, row_count;
+                  table_count := table_count + 1;
+                END LOOP;
+                RAISE NOTICE 'inventory complete tables=%', table_count;
+              END
+              $inventory$;
               SQL
           env:
             - name: PGHOST
