@@ -1,4 +1,4 @@
-"""PostgreSQL wire fault: commit a dashboard audit, then lose its acknowledgement.
+"""PostgreSQL wire faults: delay startup or lose an audit COMMIT acknowledgement.
 
 For isolated trust/NoTLS test databases only. Forward bytes without logging them.
 """
@@ -9,6 +9,7 @@ import socketserver
 import struct
 import sys
 import threading
+import time
 
 host, port, directory = sys.argv[1], int(sys.argv[2]), pathlib.Path(sys.argv[3])
 
@@ -41,7 +42,12 @@ class Handler(socketserver.BaseRequestHandler):
         try:
             size = read_exact(self.request, 4)
             length = struct.unpack("!I", size)[0]
-            backend.sendall(size + read_exact(self.request, length - 4))
+            startup = size + read_exact(self.request, length - 4)
+            if (directory / "delay-startup").exists():
+                delay = float((directory / "delay-startup").read_text())
+                (directory / "startup-delayed").write_text("PostgreSQL startup delayed\n")
+                time.sleep(delay)
+            backend.sendall(startup)
 
             def client_to_database():
                 try:
@@ -67,6 +73,11 @@ class Handler(socketserver.BaseRequestHandler):
             forward.start()
             while True:
                 kind, payload, raw = packet(backend)
+                if (kind == b"C" and payload in (b"BEGIN\0", b"START TRANSACTION\0")
+                        and (directory / "delay-begin").exists()):
+                    delay = float((directory / "delay-begin").read_text())
+                    (directory / "begin-delayed").write_text("PostgreSQL BEGIN response delayed\n")
+                    time.sleep(delay)
                 if (kind == b"C" and payload == b"COMMIT\0" and state["audit"]
                         and state["commit"] and (directory / "lose-commit-ack").exists()):
                     try:

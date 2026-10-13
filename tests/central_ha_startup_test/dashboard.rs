@@ -109,6 +109,49 @@ impl BrowserFixture {
         Pod::spawn(database, key, root, "postgres").await
     }
 
+    async fn restart_with_database_proxy(&mut self) -> (tempfile::TempDir, Child) {
+        let database = reqwest::Url::parse(&self.database()).unwrap();
+        let proxy_root = tempfile::tempdir().unwrap();
+        let mut proxy = Command::new("python3")
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/postgres_commit_proxy.py"),
+            )
+            .arg(database.host_str().unwrap())
+            .arg(database.port_or_known_default().unwrap_or(5432).to_string())
+            .arg(proxy_root.path())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        timeout(
+            Duration::from_secs(5),
+            BufReader::new(proxy.stdout.take().unwrap()).read_line(&mut line),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let ready: Value = serde_json::from_str(&line).unwrap();
+        let mut proxied = database;
+        proxied.set_host(Some("127.0.0.1")).unwrap();
+        proxied
+            .set_port(Some(ready["port"].as_u64().unwrap() as u16))
+            .unwrap();
+        for pod in [&mut self.first, &mut self.second] {
+            pod.stop().await;
+            let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
+            *pod = Pod::spawn(
+                proxied.as_str(),
+                &self._root.path().join("key"),
+                root,
+                "postgres",
+            )
+            .await;
+        }
+        (proxy_root, proxy)
+    }
+
     async fn begin_sign_in(&self) -> (String, String) {
         self.begin_sign_in_route("/accounts/sign-in", false).await
     }
@@ -1345,6 +1388,97 @@ impl BrowserFixture {
 }
 
 #[tokio::test]
+async fn postgres_dashboard_revoke_connection_setup_has_its_own_deadline() {
+    let mut f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (proxy_root, mut proxy) = f.restart_with_database_proxy().await;
+    let (session, _) = f.sign_in().await;
+    f.machine("slow-connect-machine", "synthetic-slow-connect-token")
+        .await;
+    let token = f.form_token(&session).await;
+    // Warm the second pod's browser client before delaying new connections.
+    assert_eq!(
+        f.revoke(&session, &token, "missing-machine").await.status(),
+        404
+    );
+    store::atomic_write(&proxy_root.path().join("delay-startup"), b"3").unwrap();
+    let started = std::time::Instant::now();
+    let response = f.revoke(&session, &token, "slow-connect-machine").await;
+    assert!(proxy_root.path().join("startup-delayed").exists());
+    assert_eq!(
+        response.status(),
+        200,
+        "connection setup must not consume the transaction deadline"
+    );
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert!(response.text().await.unwrap().contains("Machine revoked"));
+    std::fs::remove_file(proxy_root.path().join("delay-startup")).unwrap();
+
+    f.machine("connect-timeout-machine", "synthetic-connect-timeout-token")
+        .await;
+    store::atomic_write(&proxy_root.path().join("delay-startup"), b"20").unwrap();
+    let response = timeout(
+        Duration::from_secs(8),
+        f.revoke(&session, &token, "connect-timeout-machine"),
+    )
+    .await
+    .expect("connection setup must have a bounded deadline");
+    assert_eq!(response.status(), 503);
+    std::fs::remove_file(proxy_root.path().join("delay-startup")).unwrap();
+
+    f.machine(
+        "transaction-timeout-machine",
+        "synthetic-transaction-timeout-token",
+    )
+    .await;
+    store::atomic_write(&proxy_root.path().join("delay-begin"), b"20").unwrap();
+    let response = timeout(
+        Duration::from_secs(4),
+        f.revoke(&session, &token, "transaction-timeout-machine"),
+    )
+    .await
+    .expect("transaction keeps its two-second deadline");
+    assert!(proxy_root.path().join("begin-delayed").exists());
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    proxy.kill().await.unwrap();
+    proxy.wait().await.unwrap();
+    for (id, revoked, result) in [
+        ("slow-connect-machine", true, "ok"),
+        (
+            "connect-timeout-machine",
+            false,
+            "failed:persistence_failed",
+        ),
+        (
+            "transaction-timeout-machine",
+            false,
+            "failed:persistence_failed",
+        ),
+    ] {
+        use sha2::Digest;
+        let unresolved = format!("unresolved:{:x}", sha2::Sha256::digest(id.as_bytes()));
+        let row = f.control.query_one(&format!(
+            "SELECT d.revoked,a.result,EXISTS(SELECT 1 FROM {0}.central_relay_rate_limits r WHERE r.device_id=d.id AND r.deleted_at IS NOT NULL),a.target FROM {0}.central_devices d JOIN {0}.dashboard_audit a ON a.target IN ($1,$2) WHERE d.id=$1 AND a.operation='machine_revoke' AND a.deleted_at IS NULL",
+            f.schema,
+        ), &[&id, &unresolved]).await.unwrap();
+        assert_eq!(row.get::<_, bool>(0), revoked, "machine state for {id}");
+        assert_eq!(row.get::<_, String>(1), result, "durable audit for {id}");
+        assert_eq!(
+            row.get::<_, bool>(2),
+            revoked,
+            "limiter retirement for {id}"
+        );
+        assert_eq!(
+            row.get::<_, String>(3),
+            if revoked { id } else { &unresolved },
+            "audit privacy for {id}"
+        );
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_dashboard_revoke_is_audited_and_duplicate_api_revoke_stays_idempotent() {
     let f = BrowserFixture::start().await;
     f.identity(Some(chrono::Utc::now().timestamp()));
@@ -1925,42 +2059,7 @@ async fn revoke_with_lost_commit_acknowledgement(deleted_audit: bool) {
             f.schema,
         )).await.unwrap();
     }
-    let database = reqwest::Url::parse(&f.database()).unwrap();
-    let proxy_root = tempfile::tempdir().unwrap();
-    let mut proxy = Command::new("python3")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/postgres_commit_proxy.py"))
-        .arg(database.host_str().unwrap())
-        .arg(database.port_or_known_default().unwrap_or(5432).to_string())
-        .arg(proxy_root.path())
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    timeout(
-        Duration::from_secs(5),
-        BufReader::new(proxy.stdout.take().unwrap()).read_line(&mut line),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    let ready: Value = serde_json::from_str(&line).unwrap();
-    let mut proxied = database;
-    proxied.set_host(Some("127.0.0.1")).unwrap();
-    proxied
-        .set_port(Some(ready["port"].as_u64().unwrap() as u16))
-        .unwrap();
-    for pod in [&mut f.first, &mut f.second] {
-        pod.stop().await;
-        let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
-        *pod = Pod::spawn(
-            proxied.as_str(),
-            &f._root.path().join("key"),
-            root,
-            "postgres",
-        )
-        .await;
-    }
+    let (proxy_root, mut proxy) = f.restart_with_database_proxy().await;
     let (session, _) = f.sign_in().await;
     f.machine(
         "ambiguous-commit-machine",
