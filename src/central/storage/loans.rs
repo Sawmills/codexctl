@@ -894,12 +894,12 @@ impl PostgresStore {
         // Count the rows this copy can add before any historical inventory read.
         // Existing grants skip their audit copy, so identical reruns stay valid.
         let projected: i64 = client.query_one(
-            "SELECT (SELECT count(*) FROM account_loans) + count(*) FROM unnest($1::text[]) AS source(id) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)",
+            &format!("SELECT ({}) + count(*) FROM unnest($1::text[]) AS source(id) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)", super::backfill::count_probe("account_loans")?),
             &[&ids],
         ).await?.get(0);
         super::backfill::check_rows("account_loans", usize::try_from(projected)?)?;
         let projected: i64 = client.query_one(
-            "SELECT ((SELECT count(*) FROM account_loan_audit) + COALESCE(sum(source.events),0))::bigint FROM unnest($1::text[],$2::bigint[]) AS source(id,events) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)",
+            &format!("SELECT (({}) + COALESCE(sum(source.events),0))::bigint FROM unnest($1::text[],$2::bigint[]) AS source(id,events) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)", super::backfill::count_probe("account_loan_audit")?),
             &[&ids,&events],
         ).await?.get(0);
         super::backfill::check_rows("account_loan_audit", usize::try_from(projected)?)?;

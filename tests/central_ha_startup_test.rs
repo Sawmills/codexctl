@@ -161,7 +161,34 @@ fn command(database: &str, state: &Path, key: &Path, operation: &str) -> Command
         .env("https_proxy", "http://127.0.0.1:1")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost");
+    if operation == "backfill" {
+        command.arg("--scan-exception").arg("b33-a5");
+    }
     command
+}
+
+async fn backfill_test_database(database: &str) -> String {
+    let mut url = reqwest::Url::parse(database).unwrap();
+    assert!(
+        matches!(
+            url.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        ),
+        "backfill fixtures require a loopback test server"
+    );
+    let (admin, connection) = tokio_postgres::connect(database, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    if let Err(error) = admin.batch_execute("CREATE DATABASE codexctl_a5").await {
+        assert!(
+            error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
+                || error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        );
+    }
+    connection.abort();
+    url.set_path("/codexctl_a5");
+    url.to_string()
 }
 
 async fn request(http: &reqwest::Client, pod: &Pod, token: &str) -> reqwest::Response {
@@ -184,6 +211,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
         eprintln!("skipping real PostgreSQL startup test: DATABASE_URL unset");
         return;
     };
+    let database = backfill_test_database(&database).await;
     let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
         .await
         .unwrap();
@@ -695,6 +723,7 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
         eprintln!("skipping real PostgreSQL startup test: DATABASE_URL unset");
         return;
     };
+    let database = backfill_test_database(&database).await;
     let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
         .await
         .unwrap();
@@ -1120,6 +1149,7 @@ async fn postgres_renewal_shares_pending_status_and_cancel_without_stopping_toke
 #[tokio::test]
 async fn postgres_backfill_refuses_legacy_device_login_journals() {
     let database = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
+    let database = backfill_test_database(&database).await;
     let root = tempfile::tempdir().unwrap();
     let state = root.path().join("state");
     let key = root.path().join("key");
@@ -1194,6 +1224,7 @@ async fn login_fixture_with_expiry(
         );
         panic!("DATABASE_URL required for HA renewal test");
     };
+    let database = backfill_test_database(&database).await;
     let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
         .await
         .unwrap();

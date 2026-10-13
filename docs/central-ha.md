@@ -430,10 +430,18 @@ An older image does not recognize `--scan-exception`; the examples are held
 until that repin. No canary or cutover may use the old digest.
 
 Backfill enforces `BACKFILL_MAX_ROWS = 50000` for each imported source and target
-table, including retired loan and audit history. A count above the cap fails
+table, including retired loan and audit history. Target counts use the fixed
+table allowlist and `SELECT count(*) FROM (SELECT 1 FROM <table> LIMIT 50001) s`.
+Source row parsing stops at the same sentinel. A count above the cap fails
 the Job; HA must stay stopped. Successful JSON receipts include per-table
 source, pre-copy target and post-copy target counts for the six imported
-tables.
+tables. These accepted counts are exact; a failed probe's 50001 is a lower
+bound, not the oversized table's full size. Private-file reads and authenticated
+ledger decryption still consume the complete file before row parsing; the row
+cap does not claim a byte bound. HQ owns the attempt-5 close-out PR: before
+2026-10-20, remove the temporary scan-exception code and the HA fixtures'
+backfill flag setup together. If authorization expires first, the HA fixtures
+fail visibly; do not silently skip their recovery coverage.
 The source and existing target are capped before payload inventory. A registry
 copy can add matching rows before a later count rejects combined growth;
 retain those partial copies for inspection and keep HA stopped. Foreign-tenant

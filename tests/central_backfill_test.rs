@@ -595,6 +595,83 @@ async fn postgres_backfill_refuses_an_oversized_source_before_reading_credential
 }
 
 #[tokio::test]
+async fn postgres_backfill_stops_the_target_probe_at_the_first_row_over_the_cap() {
+    let fixture = Fixture::in_database(true).await;
+    fixture.control.batch_execute(&format!(
+        "CREATE TABLE {0}.probe_rows(n INTEGER);\n\
+         INSERT INTO {0}.probe_rows SELECT n FROM generate_series(1,50002) n;\n\
+         CREATE SEQUENCE {0}.probe_visits;\n\
+         CREATE FUNCTION {0}.allow_probe_row() RETURNS BOOLEAN LANGUAGE plpgsql VOLATILE AS $$\n\
+         BEGIN\n\
+           IF nextval('{0}.probe_visits') > 50001 THEN RAISE EXCEPTION 'read past row probe limit'; END IF;\n\
+           RETURN true;\n\
+         END $$;\n\
+         CREATE VIEW {0}.central_users AS SELECT n FROM {0}.probe_rows WHERE {0}.allow_probe_row()",
+        fixture.schema
+    )).await.unwrap();
+    let result = fixture.backfill().await;
+    fixture.finish().await;
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    if chrono::Utc::now().date_naive() > chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap() {
+        assert!(error.contains("expired"), "{error}");
+    } else {
+        assert!(
+            error.contains("central_users") && error.contains("count 50001"),
+            "{error}"
+        );
+        assert!(!error.contains("read past row probe limit"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn postgres_backfill_stops_source_parsing_at_the_first_row_over_the_cap() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let mut source = String::from("[");
+    source.push_str(&vec!["null"; 50001].join(","));
+    source.push_str(",invalid-json-after-the-cap]");
+    store::atomic_write(&fixture.state().join("users.json"), source.as_bytes()).unwrap();
+    let result = fixture.backfill().await;
+    fixture.finish().await;
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("central_users") && error.contains("count 50001"),
+        "{error}"
+    );
+    assert!(!error.contains("invalid-json-after-the-cap"), "{error}");
+}
+
+#[tokio::test]
+async fn postgres_backfill_stops_encrypted_loan_map_parsing_at_the_row_cap() {
+    let Some(fixture) = Fixture::new().await else {
+        return;
+    };
+    let rows = (0..50001)
+        .map(|n| format!("\"{n}\":null"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let source = format!("{{\"loans\":{{{rows},invalid-json-after-the-cap}}}}");
+    let key = std::fs::read(fixture.root.path().join("key")).unwrap();
+    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let mut bytes = nonce.to_vec();
+    bytes.extend(cipher.encrypt(&nonce, source.as_bytes()).unwrap());
+    store::atomic_write(&fixture.state().join("central-storage.enc"), &bytes).unwrap();
+    let result = fixture.backfill().await;
+    fixture.finish().await;
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("account_loans") && error.contains("count 50001"),
+        "{error}"
+    );
+    assert!(!error.contains("invalid-json-after-the-cap"), "{error}");
+}
+
+#[tokio::test]
 async fn postgres_backfill_refuses_foreign_tenant_machines_with_counts_only() {
     let Some(fixture) = Fixture::new().await else {
         return;

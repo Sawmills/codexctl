@@ -7,6 +7,7 @@ const SCAN_DATABASE: &str = "codexctl_a5";
 const CANARY_SCAN_DATABASE: &str = "codexctl_a5_canary";
 const SCAN_EXPIRES: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
 const BACKFILL_MAX_ROWS: usize = 50_000;
+const PROBE_ROWS: usize = BACKFILL_MAX_ROWS + 1;
 const TABLES: [&str; 6] = [
     "central_accounts",
     "central_users",
@@ -68,6 +69,15 @@ pub(super) fn check_rows(table: &str, count: usize) -> Result<usize> {
     Ok(count)
 }
 
+pub(super) fn count_probe(table: &str) -> Result<String> {
+    if !TABLES.contains(&table) {
+        bail!("unsupported backfill count table");
+    }
+    Ok(format!(
+        "SELECT count(*) FROM (SELECT 1 FROM {table} LIMIT {PROBE_ROWS}) s"
+    ))
+}
+
 pub(super) async fn target_counts(target: &PostgresStore) -> Result<BTreeMap<String, usize>> {
     let client = target.client().await?;
     let mut counts = BTreeMap::new();
@@ -77,11 +87,7 @@ pub(super) async fn target_counts(target: &PostgresStore) -> Result<BTreeMap<Str
             .await?
             .get(0);
         let count = if exists {
-            // Table names are fixed here, never derived from file or DB values.
-            let count: i64 = client
-                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
-                .await?
-                .get(0);
+            let count: i64 = client.query_one(&count_probe(table)?, &[]).await?.get(0);
             usize::try_from(count)?
         } else {
             0
@@ -93,53 +99,61 @@ pub(super) async fn target_counts(target: &PostgresStore) -> Result<BTreeMap<Str
 
 // Counting discards row keys and values; payloads are decoded only after every
 // source and target table has passed the preflight cap.
-#[derive(Default)]
-struct Rows(usize);
-
-impl<'de> Deserialize<'de> for Rows {
-    fn deserialize<D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> std::result::Result<Self, D::Error> {
-        struct Counter;
-        impl<'de> serde::de::Visitor<'de> for Counter {
-            type Value = Rows;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a row array or map")
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut rows: A,
-            ) -> std::result::Result<Rows, A::Error> {
-                let mut count = 0;
-                while rows.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    count += 1;
-                }
-                Ok(Rows(count))
-            }
-            fn visit_map<A: serde::de::MapAccess<'de>>(
-                self,
-                mut rows: A,
-            ) -> std::result::Result<Rows, A::Error> {
-                let mut count = 0;
-                while rows
-                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
-                    .is_some()
-                {
-                    count += 1;
-                }
-                Ok(Rows(count))
-            }
+fn deserialize_rows<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+    table: &str,
+) -> std::result::Result<usize, D::Error> {
+    struct Counter<'a>(&'a str);
+    impl<'de> serde::de::Visitor<'de> for Counter<'_> {
+        type Value = usize;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a row array or map")
         }
-        deserializer.deserialize_any(Counter)
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut rows: A,
+        ) -> std::result::Result<usize, A::Error> {
+            let mut count = 0;
+            while rows.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                count = check_rows(self.0, count + 1).map_err(serde::de::Error::custom)?;
+            }
+            Ok(count)
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut rows: A,
+        ) -> std::result::Result<usize, A::Error> {
+            let mut count = 0;
+            while rows
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {
+                count = check_rows(self.0, count + 1).map_err(serde::de::Error::custom)?;
+            }
+            Ok(count)
+        }
     }
+    deserializer.deserialize_any(Counter(table))
+}
+
+fn deserialize_loans<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<usize, D::Error> {
+    deserialize_rows(deserializer, "account_loans")
+}
+
+fn deserialize_audit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<usize, D::Error> {
+    deserialize_rows(deserializer, "account_loan_audit")
 }
 
 #[derive(Default, Deserialize)]
 struct FileLoanCounts {
-    #[serde(default)]
-    loans: Rows,
-    #[serde(default)]
-    loan_audit: Rows,
+    #[serde(default, deserialize_with = "deserialize_loans")]
+    loans: usize,
+    #[serde(default, deserialize_with = "deserialize_audit")]
+    loan_audit: usize,
 }
 
 pub(super) fn source_counts(state: &Path, key: &Path) -> Result<BTreeMap<String, usize>> {
@@ -153,7 +167,7 @@ pub(super) fn source_counts(state: &Path, key: &Path) -> Result<BTreeMap<String,
         for entry in std::fs::read_dir(accounts)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() && entry.path().join("vault.enc").try_exists()? {
-                count += 1;
+                count = check_rows("central_accounts", count + 1)?;
             }
         }
         counts.insert(
@@ -168,8 +182,11 @@ pub(super) fn source_counts(state: &Path, key: &Path) -> Result<BTreeMap<String,
     ] {
         let path = state.join(file);
         if path.try_exists()? {
-            let rows: Rows = serde_json::from_slice(&vault::private_read(&path)?)?;
-            counts.insert(table.into(), check_rows(table, rows.0)?);
+            let bytes = vault::private_read(&path)?;
+            let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+            let rows = deserialize_rows(&mut deserializer, table)?;
+            deserializer.end()?;
+            counts.insert(table.into(), check_rows(table, rows)?);
         }
     }
     let path = state.join("central-storage.enc");
@@ -178,11 +195,11 @@ pub(super) fn source_counts(state: &Path, key: &Path) -> Result<BTreeMap<String,
         let rows: FileLoanCounts = serde_json::from_slice(&vault::decrypt_bytes(key, &bytes)?)?;
         counts.insert(
             "account_loans".into(),
-            check_rows("account_loans", rows.loans.0)?,
+            check_rows("account_loans", rows.loans)?,
         );
         counts.insert(
             "account_loan_audit".into(),
-            check_rows("account_loan_audit", rows.loan_audit.0)?,
+            check_rows("account_loan_audit", rows.loan_audit)?,
         );
     }
     Ok(counts)
@@ -199,7 +216,7 @@ pub(super) async fn verify_devices(
         .client()
         .await?
         .query_one(
-            "SELECT count(*) FROM central_devices WHERE NOT(tenant=ANY($1::text[]))",
+            &format!("SELECT count(*) FROM (SELECT 1 FROM central_devices WHERE NOT(tenant=ANY($1::text[])) LIMIT {PROBE_ROWS}) s"),
             &[&tenants],
         )
         .await?
