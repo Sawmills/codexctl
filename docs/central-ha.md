@@ -68,6 +68,8 @@ the server image. Migration adds `browser_sessions` and its expiry index with
 `IF NOT EXISTS`; it keeps schema version 8, so the previous image can still run.
 
 The action upgrade also adds `dashboard_audit` and `browser_sessions.auth_time_verified`.
+It adds the nullable `dashboard_audit.deleted_at` marker to existing audit tables
+with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
 Run migrate before rolling this image. Both changes are additive and keep schema version 8.
 Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
 

@@ -251,9 +251,11 @@ CREATE TABLE IF NOT EXISTS dashboard_audit (
     actor TEXT NOT NULL,
     operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke')),
     target TEXT NOT NULL,
-    result TEXT NOT NULL
+    result TEXT NOT NULL,
+    deleted_at TIMESTAMPTZ
 );
 ALTER TABLE dashboard_audit ADD COLUMN IF NOT EXISTS coalesce_key TEXT;
+ALTER TABLE dashboard_audit ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 CREATE UNIQUE INDEX IF NOT EXISTS dashboard_audit_coalesce_idx ON dashboard_audit (coalesce_key);
 CREATE INDEX IF NOT EXISTS dashboard_audit_at_idx ON dashboard_audit (at);
 CREATE INDEX IF NOT EXISTS browser_sessions_expiry_idx ON browser_sessions (expires_at);

@@ -223,6 +223,9 @@ Each attempt passing request checks gets a `dashboard_audit` row with `at`,
 the database audit. A server-generated coalescing key keeps one row per attempt
 even if the COMMIT acknowledgement is lost. A failed acknowledgement returns 503
 while preserving any committed result.
+Audit rows have a nullable `deleted_at` marker. Logical deletion retains the row
+and its coalescing key, but excludes it from committed-result recovery. No
+retention period or purge job is introduced here; follow-up work is tracked in SAW-12974.
 Revocation, relay-limiter retirement, and its audit commit in one transaction.
 An audit-write failure rolls back the revocation. Unresolved request targets
 are digests so arbitrary submitted text does not reach the audit or logs.

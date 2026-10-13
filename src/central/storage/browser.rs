@@ -172,7 +172,7 @@ impl CentralStore {
             // A lost COMMIT acknowledgement can have already persisted the real outcome.
             let row=match inserted {
                 Some(row)=>row,
-                None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1", &[&audit.attempt]).await?,
+                None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1 AND deleted_at IS NULL", &[&audit.attempt]).await?,
             };
             audit_log(row.get(0),row.get(1),row.get(2),row.get(3));
             Ok(())

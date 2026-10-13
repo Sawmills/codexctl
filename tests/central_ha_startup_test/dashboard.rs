@@ -598,6 +598,74 @@ async fn postgres_dashboard_migration_is_additive_repeatable_and_keeps_version_e
 }
 
 #[tokio::test]
+async fn postgres_dashboard_audit_migration_preserves_logically_deleted_rows() {
+    for upgrade in [false, true] {
+        let f = BrowserFixture::start().await;
+        f.control.batch_execute(&format!(
+            "INSERT INTO {}.dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES(1,'fixture','machine_revoke','machine','ok','attempt')",
+            f.schema,
+        )).await.unwrap();
+        if upgrade {
+            f.control
+                .batch_execute(&format!(
+                    "ALTER TABLE {}.dashboard_audit DROP COLUMN IF EXISTS deleted_at",
+                    f.schema,
+                ))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let result = command(
+                    &f.database(),
+                    &f._root.path().join("state"),
+                    &f._root.path().join("key"),
+                    "migrate",
+                )
+                .output()
+                .await
+                .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+        }
+        let row = f.control.query_one(&format!(
+            "SELECT result,deleted_at IS NULL FROM {}.dashboard_audit WHERE coalesce_key='attempt'",
+            f.schema,
+        ), &[]).await.unwrap();
+        assert_eq!(row.get::<_, String>(0), "ok");
+        assert!(row.get::<_, bool>(1), "new and migrated rows start live");
+        f.control
+            .batch_execute(&format!(
+                "UPDATE {}.dashboard_audit SET deleted_at=now() WHERE coalesce_key='attempt'",
+                f.schema,
+            ))
+            .await
+            .unwrap();
+        let inserted = f.control.execute(&format!(
+            "INSERT INTO {}.dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES(2,'fixture','machine_revoke','machine','failed:duplicate','attempt') ON CONFLICT(coalesce_key) DO NOTHING",
+            f.schema,
+        ), &[]).await.unwrap();
+        assert_eq!(
+            inserted, 0,
+            "logical deletion retains coalescing uniqueness"
+        );
+        let row = f.control.query_one(&format!(
+            "SELECT result,deleted_at IS NOT NULL FROM {}.dashboard_audit WHERE coalesce_key='attempt'",
+            f.schema,
+        ), &[]).await.unwrap();
+        assert_eq!(
+            row.get::<_, String>(0),
+            "ok",
+            "the original row is retained"
+        );
+        assert!(row.get::<_, bool>(1));
+        f.finish().await;
+    }
+}
+
+#[tokio::test]
 async fn postgres_dashboard_support_does_not_enable_machine_enrollment() {
     let f = BrowserFixture::start().await;
     for (path, body) in [
@@ -1840,8 +1908,23 @@ async fn postgres_dashboard_revoke_never_audits_unresolved_request_text() {
 
 #[tokio::test]
 async fn postgres_dashboard_revoke_keeps_one_audit_when_commit_acknowledgement_is_lost() {
+    revoke_with_lost_commit_acknowledgement(false).await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_cannot_recover_a_logically_deleted_audit() {
+    revoke_with_lost_commit_acknowledgement(true).await;
+}
+
+async fn revoke_with_lost_commit_acknowledgement(deleted_audit: bool) {
     let mut f = BrowserFixture::start().await;
     f.identity(Some(chrono::Utc::now().timestamp()));
+    if deleted_audit {
+        f.control.batch_execute(&format!(
+            "CREATE FUNCTION {0}.retire_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.deleted_at=clock_timestamp(); RETURN NEW; END $$; CREATE TRIGGER retire_audit BEFORE INSERT ON {0}.dashboard_audit FOR EACH ROW EXECUTE FUNCTION {0}.retire_audit()",
+            f.schema,
+        )).await.unwrap();
+    }
     let database = reqwest::Url::parse(&f.database()).unwrap();
     let proxy_root = tempfile::tempdir().unwrap();
     let mut proxy = Command::new("python3")
@@ -1915,7 +1998,10 @@ async fn postgres_dashboard_revoke_keeps_one_audit_when_commit_acknowledgement_i
     let rows = f
         .control
         .query(
-            &format!("SELECT result FROM {}.dashboard_audit", f.schema),
+            &format!(
+                "SELECT result,deleted_at IS NOT NULL FROM {}.dashboard_audit",
+                f.schema
+            ),
             &[],
         )
         .await
@@ -1929,6 +2015,28 @@ async fn postgres_dashboard_revoke_keeps_one_audit_when_commit_acknowledgement_i
         rows[0].get::<_, String>(0),
         "ok",
         "the committed result is preserved"
+    );
+    assert_eq!(rows[0].get::<_, bool>(1), deleted_audit);
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.second.url))
+        .bearer_auth("synthetic-dashboard-metrics-token-32")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let reason = if deleted_audit {
+        "dashboard_audit_failed"
+    } else {
+        "dashboard_revoke_failed"
+    };
+    assert!(
+        metrics.contains(&format!(
+            "codexctl_central_failed_requests_total{{reason=\"{reason}\"}} 1\n"
+        )),
+        "{metrics}"
     );
     f.finish().await;
     proxy.kill().await.unwrap();
