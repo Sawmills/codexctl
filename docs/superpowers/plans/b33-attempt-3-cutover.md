@@ -6,6 +6,13 @@ Reader: the cutover operator and the HQ that approves the window. The design and
 
 ## Attempt 5 image and fresh database (2026-10-13)
 
+**Image dependency hold:** the current `dd0fada7` pins below contain #190 but
+predate [#191's enforced row cap and tenant-scoped inventory](https://github.com/Sawmills/codexctl/pull/191).
+Do not activate H/I or run either backfill until #191 merges, its main image
+build succeeds, and all HA/migrate/backfill references are repinned and approved.
+The co-signed initial/final scan exception is in section 5 of central-ha.md;
+it does not waive that image dependency, a new window or A128.
+
 Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048` for the HA account server, initial migrate/backfill Jobs and
 H's frozen final-backfill Job. [Central server image run 38332773546](https://github.com/Sawmills/codexctl/actions/runs/38332773546)
 succeeded on main `d956d5489910fdad0af750449dc49a395fb180c8`, which contains

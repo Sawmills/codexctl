@@ -476,31 +476,39 @@ Keep the file writer at zero until HA has stopped and lease, mode and credential
 settlement checks pass. No extension is allowed without an explicit Operator
 `w9C:tF` OK.
 
-**HQ w5C:t41 scan exception (codexctl code owner, 2026-10-13).** This
-written authorization is from the repository owner, not the PR author:
+SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
 
-> HQ GRANTS A WRITTEN SCAN EXCEPTION as the repository owner (not the author).
-> Reason: the wave-1 final backfill is a one-time, all-tenant admin migration of
-> the stopped file store into an empty, dedicated DB (codexctl_a5); proving
-> parity needs a full read of every tenant's target rows; staging volume is
-> small (record the source row counts per table in the receipt); bounded by the
-> 1800 s deadline and HQ-gated, new-name retries. Scope: staging B33 attempt 5
-> final backfill Job only; any production use needs a new review. No code or
-> image change.
+HQ's accompanying acceptance of the initial pass, copied verbatim from the
+2026-10-13 owner handoff:
 
-This authorizes the administrative inventory of all tenants in that dedicated
-staging target, including active device IDs, loan history and audit parity; it
-is not authorization for cross-tenant runtime API reads. Keep mismatch receipts
-under operator/HQ custody; do not publish device identifiers or credential data.
-Record stopped-source counts for every imported table, target counts, Job
-start/end times and completion or failure. The deadline limits execution time,
-not table size; no measured scan cost or production capacity is claimed. Stop
-on unexpected inventory or a failed/deadline-exceeded Job; any retry needs HQ
-review and a new Job name. This exception expires after attempt 5's final
-handoff and must not be reused for a later staging attempt or production.
-The initial backfill uses the same inventory checks but is outside this grant;
-its execution remains held until HQ explicitly accepts that scan with its own
-deadline and receipt requirements. Do not begin the window while that gate is open.
+> YES, the scan exception covers the INITIAL backfill too, same terms (staging
+> codexctl_a5 only, 1800 s deadline, per-table receipts, HQ-approved new-name
+> retries, expires when attempt 5 closes).
+
+The record above preserves HQ's supplied timestamp text verbatim.
+[The published owner/co-sign receipt](https://github.com/Sawmills/codexctl/pull/167#issuecomment-6136918146)
+provides GitHub's exact UTC publication time; it is a publication receipt, not
+an invented time for the original co-sign.
+
+The exception covers initial and final administrative backfill only. Require an
+image containing [source PR #191](https://github.com/Sawmills/codexctl/pull/191),
+which enforces `BACKFILL_MAX_ROWS = 50000` for the six imported source/target
+tables, retains full loan/audit history parity, scopes machine inventory to each
+source tenant, and counts foreign tenants without reading their identifiers.
+The currently pinned `dd0fada7` image predates that guard: H/I activation remains
+held until #191 merges, its main image builds, and every HA/migrate/backfill
+image reference is repinned and re-approved. This record grants no cutover or
+infra #1604 action.
+
+Require per-table source, pre-copy target and post-copy target counts in the JSON
+receipt, including retained history, plus Job start/end times and result. A
+registry growth failure may leave matching partial copies; keep HA stopped and
+retain the target for inspection. Initial/final Jobs have a 1800-second deadline
+and no automatic retry; HQ must approve a new Job name. Keep identifier mismatch
+receipts under operator/HQ custody; do not publish machine identifiers or
+credential data. Runtime tenant boundaries and production are outside this
+authorization. The exception expires when attempt 5 closes or by 2026-10-20,
+whichever comes first.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
