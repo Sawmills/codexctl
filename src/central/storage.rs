@@ -624,6 +624,9 @@ impl CentralStore {
             observed_relogins: 0,
             loans: 0,
         };
+        let mut account_ids = Vec::new();
+        let mut user_ids = Vec::new();
+        let mut device_ids = Vec::new();
         let accounts = state.join("accounts");
         if accounts.exists() {
             for entry in std::fs::read_dir(accounts)? {
@@ -651,15 +654,26 @@ impl CentralStore {
                     vault: serde_json::to_value(value)?,
                     revision,
                 };
-                if target
+                let copy = target
                     .load_account(&record.account_id)
                     .await?
-                    .is_some_and(|existing| existing.revision >= record.revision)
-                {
-                    continue;
+                    .is_none_or(|existing| existing.revision < record.revision);
+                if copy {
+                    target.save_account(&record).await.with_context(|| {
+                        format!(
+                            "backfill write failed: central_accounts row {}",
+                            record.account_id
+                        )
+                    })?;
                 }
-                target.save_account(&record).await?;
-                counts.accounts += 1;
+                if target.load_account(&record.account_id).await?.as_ref() != Some(&record) {
+                    bail!(
+                        "backfill source mismatch: central_accounts row {}",
+                        record.account_id
+                    );
+                }
+                account_ids.push(record.account_id);
+                counts.accounts += usize::from(copy);
             }
         }
         for (name, path) in [
@@ -680,20 +694,35 @@ impl CentralStore {
                                 None,
                             )
                             .await?;
+                        let matches: bool = target.client().await?.query_one(
+                            "SELECT EXISTS(SELECT 1 FROM central_users WHERE id=$1 AND email=$2 AND enabled=$3 AND oidc_identity IS NOT DISTINCT FROM $4 AND deleted_at IS NULL)",
+                            &[&user.id, &user.email, &user.enabled, &user.oidc_identity],
+                        ).await?.get(0);
+                        if !matches {
+                            bail!("backfill source mismatch: central_users row {}", user.id);
+                        }
+                        user_ids.push(user.id.clone());
                     }
                     counts.users = users.len();
                 } else {
                     let devices =
                         serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?;
                     for device in &devices {
+                        let payload = serde_json::to_vec(device)?;
                         target
-                            .save_device_entity_cas(
-                                &device.tenant,
-                                &device.id,
-                                &serde_json::to_vec(device)?,
-                                None,
-                            )
+                            .save_device_entity_cas(&device.tenant, &device.id, &payload, None)
                             .await?;
+                        if target
+                            .load_device_entity_revision(&device.tenant, &device.id)
+                            .await?
+                            .is_none_or(|(_, stored, _)| stored != payload)
+                        {
+                            bail!(
+                                "backfill source mismatch: central_devices row {}",
+                                device.id
+                            );
+                        }
+                        device_ids.push(device.id.clone());
                     }
                     counts.devices = devices.len();
                 }
@@ -710,11 +739,23 @@ impl CentralStore {
             state: state.into(),
             key: key.into(),
         };
-        if file.path().exists() {
-            let file_state = file.read_state()?;
-            counts.loans = target
-                .import_loans(&file_state.loans, &file_state.loan_audit)
-                .await?;
+        let file_state = if file.path().exists() {
+            file.read_state()?
+        } else {
+            FileState::default()
+        };
+        counts.loans = target
+            .import_loans(&file_state.loans, &file_state.loan_audit)
+            .await?;
+        if let Some(extra) = target.client().await?.query_opt(
+            "SELECT 'central_accounts'::text,account_id FROM central_accounts WHERE deleted_at IS NULL AND NOT(account_id=ANY($1::text[])) \
+             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) \
+             UNION ALL SELECT 'central_devices',id FROM central_devices WHERE deleted_at IS NULL AND NOT(id=ANY($3::text[])) LIMIT 1",
+            &[&account_ids, &user_ids, &device_ids],
+        ).await? {
+            let table: &str = extra.get(0);
+            let id: &str = extra.get(1);
+            bail!("backfill source mismatch: {table} extra row {id}");
         }
         Ok(counts)
     }
