@@ -203,7 +203,7 @@ views keep it hidden. Revoke affects only the signed-in company user's machines;
 a foreign or unknown machine returns 404. No action refreshes an OpenAI credential.
 The machine API `/v1/devices/revoke` remains idempotent 204. A second dashboard
 attempt shows “Already revoked” with status 409. Concurrent submissions keep these
-responses: the dashboard reports the duplicate, and both machine API calls return 204. Refused browser actions return an HTML page with a link back to accounts;
+responses: the dashboard reports the duplicate, and both machine API calls return 204. Form-token and machine-lookup refusals return an HTML page with a link back to accounts;
 they do not automatically retry the action.
 
 `POST /accounts/machines/revoke` requires the configured public Origin and an
