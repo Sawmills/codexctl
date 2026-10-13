@@ -40,6 +40,7 @@ class InventoryJobTest(unittest.TestCase):
         connection_env.update(PGHOST=target.hostname, PGPORT=str(target.port or 5432),
                               PGUSER=target.username, PGDATABASE=target.path.lstrip("/"))
         schema = "b33_probe_" + uuid.uuid4().hex
+        limited_role = "b33_limited_" + uuid.uuid4().hex[:16]
         manifest = yaml.safe_load(
             (Path(__file__).resolve().parents[1] / "deploy/k8s/jobs/b33-check-empty.yaml").read_text()
         )
@@ -51,8 +52,9 @@ class InventoryJobTest(unittest.TestCase):
                 env=connection_env, check=True, capture_output=True, text=True,
             )
 
-        def inventory(database=None):
+        def inventory(database=None, user=None):
             env = dict(connection_env, PGDATABASE=database or connection_env["PGDATABASE"],
+                       PGUSER=user or connection_env["PGUSER"],
                        PGOPTIONS=f"-c search_path={schema} -c default_transaction_read_only=on -c client_min_messages=warning")
             return subprocess.run(["sh", "-ec", script], env=env,
                                   capture_output=True, text=True, timeout=30)
@@ -64,8 +66,11 @@ class InventoryJobTest(unittest.TestCase):
         sql(f"CREATE SCHEMA {schema}")
         rogue_schema = "b33_rogue_" + uuid.uuid4().hex
         try:
-            sql(f"CREATE SCHEMA {rogue_schema}; CREATE TABLE {rogue_schema}.unexpected_rows (n integer)")
-            outside_allowed = inventory()
+            sql(f"CREATE ROLE {limited_role} LOGIN; GRANT USAGE ON SCHEMA {schema} TO {limited_role}; "
+                f"CREATE SCHEMA {rogue_schema}; CREATE TABLE {rogue_schema}.unexpected_rows (n integer); "
+                f"REVOKE ALL ON SCHEMA {rogue_schema} FROM {limited_role}; "
+                f"REVOKE ALL ON {rogue_schema}.unexpected_rows FROM {limited_role}")
+            outside_allowed = inventory(user=limited_role)
             self.assertNotEqual(outside_allowed.returncode, 0, "inventory ignored a non-system schema")
             self.assertIn("outside allowed schema", outside_allowed.stderr)
             self.assertNotIn("inventory complete", outside_allowed.stderr)
@@ -88,6 +93,7 @@ class InventoryJobTest(unittest.TestCase):
         finally:
             sql(f"DROP SCHEMA IF EXISTS {rogue_schema} CASCADE")
             sql(f"DROP SCHEMA {schema} CASCADE")
+            sql(f"DROP ROLE IF EXISTS {limited_role}")
 
 
 if __name__ == "__main__":
