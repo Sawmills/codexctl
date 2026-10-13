@@ -1431,13 +1431,14 @@ async fn postgres_dashboard_revoke_connection_setup_has_its_own_deadline() {
         "synthetic-transaction-timeout-token",
     )
     .await;
-    f.control.batch_execute(&format!("CREATE FUNCTION {0}.slow_revoke() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$; CREATE TRIGGER slow_revoke BEFORE UPDATE ON {0}.central_devices FOR EACH ROW EXECUTE FUNCTION {0}.slow_revoke()", f.schema)).await.unwrap();
+    store::atomic_write(&proxy_root.path().join("delay-begin"), b"20").unwrap();
     let response = timeout(
         Duration::from_secs(4),
         f.revoke(&session, &token, "transaction-timeout-machine"),
     )
     .await
     .expect("transaction keeps its two-second deadline");
+    assert!(proxy_root.path().join("begin-delayed").exists());
     assert_eq!(response.status(), 503);
     assert_eq!(response.headers()["cache-control"], "no-store");
     proxy.kill().await.unwrap();
