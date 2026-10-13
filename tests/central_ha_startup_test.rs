@@ -429,50 +429,8 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             );
         }
         assert_eq!(pods.each_ref().map(Pod::launches), [2, 0, 0]);
-        // Fail one scheduled renewal while initialize is still unfinished.
-        // The renewer must survive the query error and retry on its next tick.
-        control
-            .batch_execute(&format!(
-                "CREATE SEQUENCE {schema}.live_renew_attempts;
-             CREATE FUNCTION {schema}.fail_live_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-               IF nextval('{schema}.live_renew_attempts') = 1 THEN
-                 RAISE EXCEPTION 'synthetic live renewal failure';
-               END IF;
-               RETURN NEW;
-             END $$;
-             CREATE TRIGGER fail_live_renewal BEFORE UPDATE ON {schema}.account_refresh_leases
-             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
-             EXECUTE FUNCTION {schema}.fail_live_renewal();"
-            ))
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(65), async {
-            loop {
-                let retried: bool = control
-                    .query_one(
-                        &format!(
-                            "SELECT is_called AND last_value >= 2 FROM {schema}.live_renew_attempts"
-                        ),
-                        &[],
-                    )
-                    .await
-                    .unwrap()
-                    .get(0);
-                if retried {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("transient renewal failure stopped the live child lease renewer");
-        control
-            .batch_execute(&format!(
-                "DROP TRIGGER fail_live_renewal ON {schema}.account_refresh_leases"
-            ))
-            .await
-            .unwrap();
+        // Healthy initialization must finish inside the native deadline.
+        // Renewal-query failure during deferred settlement is covered by the hung-child test.
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
         let mut generations = Vec::new();
         for task in same_account {
@@ -3854,17 +3812,54 @@ async fn postgres_native_timeout_keeps_the_lease_until_late_rotation_is_publishe
 async fn postgres_owner_initialize_obeys_the_native_deadline() {
     let f = login_fixture().await;
     store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
-    let refused = timeout(
-        Duration::from_secs(13),
-        request(&f.http, &f.first, &f.token),
-    )
-    .await;
+    let post = || {
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    let first = post();
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("leased initialization must start");
+    let queued = [post(), post()];
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        queued.iter().all(|task| !task.is_finished()),
+        "callers admitted during healthy initialization retain their queue position"
+    );
+    let refused = timeout(Duration::from_secs(13), first).await;
     if refused.is_err() {
         store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
         stop_fixture(f).await;
         panic!("owner initialization held the client beyond the native deadline");
     }
-    assert_eq!(refused.unwrap().status(), 503);
+    assert_eq!(refused.unwrap().unwrap().status(), 503);
+    for waiter in queued {
+        let response = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("pre-admitted callers must refuse promptly once initialization times out")
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert_eq!(
+        timeout(Duration::from_secs(2), request(&f.http, &f.first, &f.token))
+            .await
+            .expect("new arrivals must refuse during settlement")
+            .status(),
+        503
+    );
     assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
     assert_eq!(f.second.launches(), 0, "initialization retains its lease");
     store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
@@ -3927,6 +3922,25 @@ async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lea
     assert_eq!(f.first.launches(), first_launches + 1);
     assert_eq!(f.second.launches(), 0, "a peer must not overlap settlement");
     store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    // Fail the first scheduled renewal while the timed-out child is still
+    // alive. Settlement must preserve the lease and retry publication renewal.
+    f.control
+        .batch_execute(&format!(
+            "CREATE SEQUENCE {0}.live_renew_attempts;
+             CREATE FUNCTION {0}.fail_live_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF nextval('{0}.live_renew_attempts') = 1 THEN
+                 RAISE EXCEPTION 'synthetic live renewal failure';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER fail_live_renewal BEFORE UPDATE ON {0}.account_refresh_leases
+             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
+             EXECUTE FUNCTION {0}.fail_live_renewal();",
+            f.schema
+        ))
+        .await
+        .unwrap();
     let delivered = timeout(Duration::from_secs(40), async {
         loop {
             let response = request(&f.http, &f.second, &f.token).await;
@@ -3961,6 +3975,22 @@ async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lea
         "publish the killed child's final journal"
     );
     assert_eq!(delivered["billingClass"], "rate_limited");
+    let retried: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT is_called AND last_value >= 2 FROM {}.live_renew_attempts",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        retried,
+        "a renewal-query error must not strand settlement or publication"
+    );
     let metrics = f
         .http
         .get(format!("{}/metrics", f.first.url))

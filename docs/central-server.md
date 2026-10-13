@@ -1117,7 +1117,10 @@ the normal 30-second child-exit grace. Unresolved calls settle in background wor
 retained and no overlapping refresh owner. The final journal must be saved
 before releasing that lease or launching a successor. Requests waiting behind
 this work refuse promptly with `503 owner_unavailable`. Healthy requests retain
-their fair queue position. Even a proven plain fallback returns this 503 when
+their fair queue position while initialization or a native read is within its
+deadline. If that operation times out and enters deferred settlement, callers
+already queued also receive 503 and must retry after publication; new arrivals
+refuse during the same settlement barrier. Even a proven plain fallback returns this 503 when
 its failed-read child cannot stop within the foreground settlement deadline.
 The response waits for credential publication, rather than exporting an
 unpublished journal while background settlement continues. The retained lease
