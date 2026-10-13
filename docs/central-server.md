@@ -1074,14 +1074,60 @@ from the fixed message Codex logs on the owner child's stderr after
 | `other`                     | "Your access token could not be refreshed." (400 `invalid_grant`, or a 401 with another code; Codex logs both the same way) |
 
 A transient refresh failure (Codex logs `status=` and retries), or a failed
-refresh with no such message within 300 ms (for example a usage read error),
-logs `reason="unclassified"` and is not counted. It still reports
-`owner_unavailable`. These unclassified `owner_refresh` lines include only
+refresh with no permanent-rejection message within 300 ms, logs
+`reason="unclassified"`. It counts
+`codexctl_central_owner_refresh_native_errors_total{account,account_key,reason}`.
+These unclassified `owner_refresh` lines include only
 bounded failure diagnostics: `failure_class` (`native_error`, `eof`, `timeout`,
 `io`, `invalid_protocol`, or `other`), numeric `rpc_code` (null when unknown),
 and `has_data_retryable` (whether the native error contains that field, even
 when its value is false or null). They never include the native message, data
-payload, or provider keys. Each request clears earlier failure metadata.
+payload, or provider keys. `native_reason` is bounded to `upstream_429`,
+`upstream_5xx`, `upstream_4xx`, `upstream_timeout`, `app_server_internal`,
+`app_server_error`, `app_server_transport`, `app_server_protocol`, or
+`app_server_unavailable`. `http_status` appears only when a numeric 400-599
+status is known from the native response or Codex's fixed refresh stderr prefix.
+Each request clears earlier failure metadata. Transient refresh stderr lines
+are reduced to the status, without forwarding their provider detail text.
+
+An unclassified completed read retries once after 250 ms on the same child.
+The account request shares one retry budget across account, usage, and routing
+reads. A rotated journal is saved before retry, without forcing the rotation
+twice. Repeated errors can still serve a proven unexpired access token when
+its exact auth revision has native routing proof. Billing requests refuse
+when fresh evidence is unavailable. A classified provider rejection still
+fences the refresh owner; an expired token after failed retry is retryable.
+A cached fallback withdraws shared fast-path evidence until a native routing
+read succeeds again.
+
+Refresh-owner reads have a 10-second deadline. After a failed or timed-out read,
+foreground settlement waits at most one second. Clean successful reads retain
+the normal 30-second child-exit grace. Unresolved calls settle in background work with the lease
+retained and no overlapping refresh owner. The final journal must be saved
+before releasing that lease or launching a successor. Requests waiting behind
+this work refuse promptly with `503 owner_unavailable`. Healthy requests retain
+their fair queue position. A timeout is unknown
+completion, not proof that the provider rejected a grant.
+
+`CodexctlOwnerRefreshNativeError` in both staging overlays fires on a new
+positive native-error series or an increase in the last 10 minutes, grouped by
+account, account key, and reason. It uses the staging warning labels and default
+`warnings-slack` receiver (`#warning-alerts`). The fixture runner tests the real
+overlay rules firing and clearing; it does not test live Slack delivery.
+
+SAW-12986 reproduced the 503 burst with a synthetic completed `-32603`, without
+bubblewrap or a provider request. The unconditional refresh-owner fence caused
+the restart and burst. The historical upstream cause remains unproven: the
+ticket records HTTP failures at nearby times, but `-32603` alone does not identify
+429, 5xx, or an app-server fault. The bounded diagnostics now separate those cases.
+
+The missing-bubblewrap warning prints at child startup, including recovery
+after an error. It does not explain the reproduced refresh failure. Refresh
+owners only perform auth and account reads, never start user turns, and reject
+incoming tool requests. These operations do not require the tool-execution
+sandbox. This conclusion applies to refresh owners only; it does not establish
+sandbox support for user sessions. No image dependency or deployment changes
+are required for this auth path.
 
 The server forwards the owner child's stderr as `owner_child` lines: at most 30
 lines a minute, each at most 300 characters, with token-shaped values replaced

@@ -3674,6 +3674,135 @@ async fn postgres_fast_path_refuses_stale_evidence() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_failed_native_read_with_a_slow_exit_does_not_permanently_fence() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-error-slow-exit").unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.first, &f.token).await;
+            if response.status() == 200 {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["billingClass"],
+                    "rate_limited"
+                );
+                break;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unclassified error with a valid token must remain available after settlement");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_successful_native_read_waits_for_a_clean_slow_exit() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-clean-slow-exit").unwrap();
+    let response = timeout(Duration::from_secs(5), request(&f.http, &f.first, &f.token))
+        .await
+        .expect("clean child exit remains bounded");
+    assert_eq!(
+        response.status(),
+        200,
+        "healthy shutdown must not create an owner_unavailable burst"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["billingClass"],
+        "rate_limited"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cached_plain_fallback_does_not_publish_fresh_routing_evidence() {
+    let mut f = login_fixture().await;
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    f.second.stop().await;
+    store::atomic_write(&f.second.root.path().join("fast-path"), b"1").unwrap();
+    f.second = Pod::spawn(&f.database, &f.key, f.second.root, "postgres").await;
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("mode"), b"owner-internal-always").unwrap();
+    }
+    let plain = |pod: &Pod| {
+        f.http
+            .post(format!("{}/v1/token", pod.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":false}))
+    };
+    let fallback = plain(&f.first).send().await.unwrap();
+    assert_eq!(fallback.status(), 200);
+    assert_eq!(
+        fallback.json::<Value>().await.unwrap()["revision"],
+        before["revision"]
+    );
+    let peer = plain(&f.second).send().await.unwrap();
+    assert_eq!(
+        peer.status(),
+        503,
+        "cached routing proof must not become fresh lease-free evidence"
+    );
+    assert_eq!(metric(&f, &f.second, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_native_timeout_keeps_the_lease_until_late_rotation_is_published() {
+    let f = login_fixture().await;
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let first_launches = f.first.launches();
+    let peer_launches = f.second.launches();
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-native-hold").unwrap();
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    let refused = timeout(
+        Duration::from_secs(13),
+        request(&f.http, &f.first, &f.token),
+    )
+    .await
+    .expect("native timeout must not hold a client for minutes");
+    assert_eq!(refused.status(), 503);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.first.launches(), first_launches + 1);
+    assert_eq!(
+        f.second.launches(),
+        peer_launches,
+        "peer must not overlap the unresolved refresh owner"
+    );
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&f.first.root.path().join("native-release"), b"release").unwrap();
+    let delivered = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("late rotation must settle and release the retained lease");
+    assert_eq!(generation(&delivered), generation(&before) + 1);
+    assert_eq!(delivered["billingClass"], "rate_limited");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_rejection_with_eof_settles_the_owner_and_releases_its_lease() {
     let f = login_fixture().await;
     store::atomic_write(&f.first.root.path().join("mode"), b"refresh-reused-eof").unwrap();

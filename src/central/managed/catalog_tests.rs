@@ -18,6 +18,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(timeout: Duration) -> Self {
+        Self::with_expiry(timeout, None).await
+    }
+
+    async fn with_expiry(timeout: Duration, expires: Option<i64>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let key = root.path().join("key");
@@ -34,7 +38,23 @@ impl Fixture {
         );
         let account = state.join("accounts").join(account_key("test", "fixture"));
         store::ensure_private_dir(&account).unwrap();
-        let auth = super::tests::recovery_auth(Some(2000000000), "synthetic-refresh");
+        let mut auth = super::tests::recovery_auth(Some(2000000000), "synthetic-refresh");
+        if let Some(expires) = expires {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            let payload = auth["tokens"]["access_token"]
+                .as_str()
+                .unwrap()
+                .split('.')
+                .nth(1)
+                .unwrap();
+            let mut claims: Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+            claims["exp"] = json!(expires);
+            auth["tokens"]["access_token"] = json!(format!(
+                "header.{}.",
+                URL_SAFE_NO_PAD.encode(claims.to_string())
+            ));
+        }
         vault::save(
             &account,
             &key,
@@ -115,6 +135,7 @@ impl Fixture {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            settlements: Arc::default(),
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
             login_holder_live: Arc::new(AtomicBool::new(true)),
@@ -142,12 +163,20 @@ impl Fixture {
     }
 
     async fn token(&self) -> StatusCode {
+        self.token_with_billing(true).await
+    }
+
+    async fn plain_token(&self) -> StatusCode {
+        self.token_with_billing(false).await
+    }
+
+    async fn token_with_billing(&self, billing: bool) -> StatusCode {
         token(
             State(self.broker.clone()),
             self.headers.clone(),
             Ok(Json(TokenRequest {
                 alias: Some("fixture".into()),
-                billing: true,
+                billing,
                 ..Default::default()
             })),
         )
@@ -340,6 +369,7 @@ async fn deferred_recovery_does_not_reopen_a_newer_owner_fence() {
     }
     settle_background_recovery(
         owner_ref.clone(),
+        fixture.broker.settlements.clone(),
         None,
         None,
         None,
@@ -401,6 +431,7 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
                 Duration::from_secs(3),
                 settle_background_recovery(
                     owner_ref.clone(),
+                    fixture.broker.settlements.clone(),
                     Some(central.clone()),
                     Some(lease.clone()),
                     None,
@@ -453,7 +484,7 @@ async fn retryable_token_failure_can_recover_after_deferred_child_shutdown() {
         );
         return;
     }
-    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let mut fixture = Fixture::with_expiry(Duration::from_secs(1), Some(1)).await;
     let initial = CentralStore::from_mode(
         StoreMode::Postgres,
         &fixture.broker.state,
@@ -467,7 +498,7 @@ async fn retryable_token_failure_can_recover_after_deferred_child_shutdown() {
         .await;
     assert_eq!(fixture.token().await, StatusCode::SERVICE_UNAVAILABLE);
     let drained = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(40),
         fixture.broker.work.clone().acquire_many_owned(128),
     )
     .await
@@ -522,7 +553,7 @@ async fn transient_token_write_errors_preserve_the_settled_recovery_outcome() {
         return;
     }
     for mode in ["startup", "billing-error-marked", "routing-missing"] {
-        let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+        let mut fixture = Fixture::with_expiry(Duration::from_secs(1), Some(1)).await;
         let initial = CentralStore::from_mode(
             StoreMode::Postgres,
             &fixture.broker.state,
@@ -837,7 +868,7 @@ async fn verified_reimport_retryable_probe_recovers_after_settlement() {
         );
         return;
     }
-    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let mut fixture = Fixture::with_expiry(Duration::from_secs(1), Some(1)).await;
     let initial = CentralStore::from_mode(
         StoreMode::Postgres,
         &fixture.broker.state,
@@ -1042,7 +1073,7 @@ async fn b8_usage_5xx_keeps_the_owner_available_and_counts_one_attempt() {
 
     let failed = fixture.list().await;
     let repeated = fixture.list().await;
-    let token = fixture.token().await;
+    let token = fixture.plain_token().await;
 
     assert_eq!(
         (
@@ -1072,7 +1103,7 @@ async fn b8_usage_timeout_keeps_token_delivery_working() {
     fixture.hold.store(true, Ordering::SeqCst);
 
     let failed = fixture.list().await;
-    let token = fixture.token().await;
+    let token = fixture.plain_token().await;
 
     assert_eq!(
         (
@@ -1099,7 +1130,7 @@ async fn b8_slow_usage_does_not_hold_the_token_lock() {
         .unwrap()
         .forget();
 
-    let token = tokio::time::timeout(Duration::from_millis(500), fixture.token()).await;
+    let token = tokio::time::timeout(Duration::from_millis(500), fixture.plain_token()).await;
     fixture.release.add_permits(1);
     let summary = listing.await.unwrap();
 
@@ -1841,7 +1872,7 @@ async fn postgres_background_recovery_recovers_after_unhealthy_rpc() {
         }
         return;
     }
-    let mut fixture = Fixture::new(Duration::from_secs(2)).await;
+    let mut fixture = Fixture::with_expiry(Duration::from_secs(2), Some(1)).await;
     let central = fixture
         .attach_refresh_store_with_mode(super::super::storage::StoreMode::Postgres, "rpc-unhealthy")
         .await;

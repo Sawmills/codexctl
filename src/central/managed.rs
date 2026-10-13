@@ -27,7 +27,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -254,6 +254,7 @@ pub(super) struct Broker {
     pub(super) ownership_unresolved: Arc<AtomicBool>,
     pub(super) owners: Arc<RwLock<Owners>>,
     pub(super) imports: Arc<Mutex<()>>,
+    pub(super) settlements: Arc<Settlements>,
     pub sso: Option<Arc<enrollment::Sso>>,
     pub(super) browser_sessions_available: bool,
     pub(super) activity: Arc<super::activity::Activity>,
@@ -1104,6 +1105,15 @@ async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<Crede
     Ok(record)
 }
 
+async fn settle_foreground(owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        settled_owner_record(owner, before),
+    )
+    .await
+    .context("owner settlement deferred; runtime retained")?
+}
+
 fn fence_background_owner(owner: &mut Owner) {
     owner.available = false;
     owner.refresh_enabled = false;
@@ -1177,6 +1187,69 @@ async fn abandon_background_recovery(
     drop(permit);
 }
 
+#[derive(Default)]
+pub(super) struct Settlements {
+    owners: StdMutex<Vec<Weak<Mutex<Owner>>>>,
+    changed: Notify,
+}
+
+struct SettlementGuard {
+    registry: Arc<Settlements>,
+    owner: Weak<Mutex<Owner>>,
+}
+
+impl Settlements {
+    fn mark(self: &Arc<Self>, owner: &Arc<Mutex<Owner>>) -> SettlementGuard {
+        let owner = Arc::downgrade(owner);
+        self.owners
+            .lock()
+            .expect("settlement lock")
+            .push(owner.clone());
+        self.changed.notify_waiters();
+        SettlementGuard {
+            registry: self.clone(),
+            owner,
+        }
+    }
+
+    async fn admit<T>(
+        &self,
+        owner: &Arc<Mutex<Owner>>,
+        admission: impl Future<Output = T>,
+    ) -> Result<T, ()> {
+        let owner = Arc::downgrade(owner);
+        tokio::pin!(admission);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .owners
+                .lock()
+                .expect("settlement lock")
+                .iter()
+                .any(|entry| entry.ptr_eq(&owner))
+            {
+                return Err(());
+            }
+            tokio::select! {
+                biased;
+                _ = &mut changed => {},
+                result = &mut admission => return Ok(result),
+            }
+        }
+    }
+}
+
+impl Drop for SettlementGuard {
+    fn drop(&mut self) {
+        let mut owners = self.registry.owners.lock().expect("settlement lock");
+        if let Some(index) = owners.iter().position(|owner| owner.ptr_eq(&self.owner)) {
+            owners.remove(index);
+        }
+    }
+}
+
 enum SettlementRecovery {
     Available,
     Retryable,
@@ -1197,6 +1270,7 @@ struct LeaseWindow {
 #[allow(clippy::too_many_arguments)] // Recovery state is explicit at this boundary.
 async fn settle_background_recovery(
     owner_ref: Arc<Mutex<Owner>>,
+    settlements: Arc<Settlements>,
     central: Option<CentralStore>,
     lease: Option<super::storage::Lease>,
     lease_window: Option<Arc<LeaseWindow>>,
@@ -1208,6 +1282,7 @@ async fn settle_background_recovery(
     renew_task: Option<tokio::task::JoinHandle<()>>,
     stopping: Arc<AtomicBool>,
 ) {
+    let _settlement = settlements.mark(&owner_ref);
     loop {
         // Shared-store shutdown must drain the child's final rotation to the
         // database before releasing its lease and the shutdown work permit.
@@ -1472,12 +1547,20 @@ async fn token(
         // Detached work retains its permit and settles native refreshes even
         // when the requesting client disconnects.
         tokio::spawn(async move {
-            let permit =
-                worker.work.clone().acquire_owned().await.map_err(|_| {
-                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping")
-                })?;
+            let permit = worker
+                .settlements
+                .admit(&owner_ref, worker.work.clone().acquire_owned())
+                .await
+                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?
+                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
             {
-                let owner = owner_ref.lock().await;
+                let owner = worker
+                    .settlements
+                    .admit(&owner_ref, owner_ref.lock())
+                    .await
+                    .map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
                 owner
                     .validate_account_id(account_id.as_deref())
                     .map_err(|failure| worker.owner_failure(failure))?;
@@ -1543,10 +1626,10 @@ async fn token(
             }
         }
         let permit = broker
-            .work
-            .clone()
-            .acquire_owned()
+            .settlements
+            .admit(&owner, broker.work.clone().acquire_owned())
             .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
         let worker = broker.clone();
         let owner_ref = owner.clone();
@@ -1563,7 +1646,7 @@ async fn token(
         let busy = Arc::new(StdMutex::new(None::<(String, i64)>));
         let busy_slot = busy.clone();
         let attempt = tokio::spawn(async move {
-        let (import_guard, mut owner) = if worker
+        let admission = async { if worker
             .central.as_ref()
             .is_some_and(|central| central.mode() != super::storage::StoreMode::File)
         {
@@ -1584,7 +1667,9 @@ async fn token(
             }
         } else {
             (None, owner_ref.lock().await)
-        };
+        }};
+        let (import_guard, mut owner) = worker.settlements.admit(&owner_ref, admission)
+            .await.map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
         // A rename can re-key this owner while the request waits for its lock.
         // The old alias must never be served once the rename committed.
         let requested = request.alias.as_deref().unwrap_or_default().trim();
@@ -1739,19 +1824,35 @@ async fn token(
             }
         }
         let renew_lost = Arc::new(AtomicBool::new(false));
+        let lease_signal = Arc::new(Notify::new());
+        let lease_window = lease.as_ref().map(|_| Arc::new(LeaseWindow {
+            deadline: Arc::new(Mutex::new(std::time::Instant::now() + IMPORT_LEASE_TTL)),
+            lost: renew_lost.clone(),
+            signal: lease_signal.clone(),
+        }));
         let renew_task = match (worker.central.clone(), lease.clone()) {
             (Some(central), Some(lease)) => {
                 let lost = renew_lost.clone();
+                let window = lease_window.clone().expect("token lease window");
                 Some(tokio::spawn(async move {
                     loop {
+                        let remaining = window.deadline.lock().await.saturating_duration_since(std::time::Instant::now());
+                        if remaining <= IMPORT_LEASE_SAFETY_MARGIN {
+                            lost.store(true, Ordering::Release);
+                            window.signal.notify_waiters();
+                            break;
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                         match central
                             .renew(&lease, std::time::Duration::from_secs(120))
                             .await
                         {
-                            Ok(true) => {}
+                            Ok(true) => {
+                                *window.deadline.lock().await = std::time::Instant::now() + IMPORT_LEASE_TTL;
+                            }
                             Ok(false) => {
                                 lost.store(true, Ordering::Release);
+                                window.signal.notify_waiters();
                                 break;
                             }
                             Err(error) => {
@@ -1768,7 +1869,7 @@ async fn token(
         // and renew the lease before launching, then settle even a failed launch.
         let before = owner.vault.clone();
         let mut restore_after_settlement = false;
-        let result = async {
+        let native_work = async {
             if lease.is_some()
                 && let Some(import_guard) = import_guard
                 && let Err(error) = worker.ensure_refresh_owner(&mut owner, import_guard).await
@@ -1777,13 +1878,17 @@ async fn token(
                 return Err(error);
             }
             let observed_from = std::time::Instant::now();
-            let token_result = owner.tokens_for_device(request, Some(&requesting_device)).await;
+            let token_result = owner.tokens_for_device_guarded(request, Some(&requesting_device), Some(&renew_lost)).await;
+            if renew_lost.load(Ordering::Acquire) {
+                terminate_lost_import(&mut owner).await;
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_fenced"));
+            }
             // A failed native read may mean lost routing or a fenced owner.
             // Withdraw the evidence so no replica serves this account
             // lease-free until the lease path observes it again.
             // A clear that keeps failing leaves at most the 60 s evidence
             // bound; it is counted so the failure alert fires.
-            if token_result.is_err()
+            if (token_result.is_err() || !owner.routing_observed)
                 && lease.is_some()
                 && let Some(central) = worker.central.as_ref()
             {
@@ -1815,8 +1920,19 @@ async fn token(
                     owner.retry_started = Some(owner.retry_clock_now());
                 }
             }
-            let settle_required = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
+            let settle_required = owner.rpc.as_mut().is_some_and(|rpc| rpc.completion_pending() || rpc.process_exited());
             if settle_required && owner.rpc.is_some() {
+                // File-mode recovery must relaunch only after background settlement
+                // confirms exit and persists the final journal. This is a temporary
+                // serialization barrier, not a rejected refresh grant.
+                if owner.available && !owner.routing_refused {
+                    if lease.is_some() {
+                        restore_after_settlement = true;
+                    } else {
+                        owner.retryable_unavailable = true;
+                        owner.retry_started = None;
+                    }
+                }
                 let failed_rpc = owner.rpc.as_ref().is_some_and(Rpc::retryable_or_timed_out);
                 let process_exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
                 // An outstanding request may still have rotated credentials even
@@ -1843,7 +1959,7 @@ async fn token(
                     // request completion is known. This applies to timeouts and
                     // protocol failures alike.
                     retain_lease = true;
-                    match settled_owner_record(&mut owner, &before).await {
+                    match settle_foreground(&mut owner, &before).await {
                         Ok(_) => {}
                         Err(error) if failed_rpc => {
                             let exited = owner
@@ -1852,8 +1968,8 @@ async fn token(
                                 .is_some_and(|rpc| rpc.process_exited());
                             let exited = if exited {
                                 true
-                            } else if let Some(rpc) = owner.rpc.as_mut() {
-                                rpc.wait_after_eof().await
+                            } else if let Some(rpc) = owner.rpc.as_mut().filter(|rpc| !rpc.timed_out()) {
+                                tokio::time::timeout(std::time::Duration::from_millis(100), rpc.wait_after_eof()).await.unwrap_or(false)
                             } else {
                                 false
                             };
@@ -1891,13 +2007,24 @@ async fn token(
             if lease.is_some() && owner.rpc.is_some() {
                 // No refresh-capable child may outlive its lease, even after a
                 // successful cached-token read. Save any exit-time rotation.
-                if let Err(error) = settled_owner_record(&mut owner, &before).await {
-                    restore_after_settlement = token_result.is_ok()
-                        && owner.available
-                        && !owner.routing_refused;
+                let settlement = if token_result.is_ok() && owner.routing_observed {
+                    settled_owner_record(&mut owner, &before).await
+                } else {
+                    settle_foreground(&mut owner, &before).await
+                };
+                if let Err(error) = settlement {
+                    restore_after_settlement = owner.available && !owner.routing_refused;
                     eprintln!("central owner shutdown: {error:#}");
                     return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
                 }
+            }
+            let settled_file_owner = settle_required && lease.is_none() && owner.rpc.is_none();
+            if settled_file_owner && owner.available && !owner.routing_refused {
+                // Preserve a successful plain response, but reopen native reads
+                // through admission after the old child is confirmed stopped.
+                owner.available = false;
+                owner.retryable_unavailable = true;
+                owner.retry_started = token_result.is_err().then(|| owner.retry_clock_now());
             }
             let auth_changed = owner.vault.auth != before.auth;
             if auth_changed {
@@ -1940,9 +2067,7 @@ async fn token(
                                 // Preserve the token outcome until the deferred
                                 // settlement is classified below. This DB error
                                 // is not a permanent routing refusal.
-                                restore_after_settlement = token_result.is_ok()
-                                    && owner.available
-                                    && !owner.routing_refused;
+                                restore_after_settlement = owner.available && !owner.routing_refused;
                                 eprintln!("central fenced write deferred: {error:#}");
                                 return Err(worker
                                     .error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
@@ -1982,7 +2107,9 @@ async fn token(
                 Ok(token) => {
                     owner.retry_failures = 0;
                     owner.retry_started = None;
-                    owner.retryable_unavailable = false;
+                    if !settled_file_owner {
+                        owner.retryable_unavailable = false;
+                    }
                     token
                 }
                 Err(error) => {
@@ -1990,8 +2117,12 @@ async fn token(
                 }
             };
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned(), account_id.clone()))
+        };
+        let result = lease_guarded_verification(native_work, renew_lost.clone(), lease_signal).await;
+        if renew_lost.load(Ordering::Acquire) {
+            terminate_lost_import(&mut owner).await;
+            restore_after_settlement = false;
         }
-        .await;
         if retain_lease {
             let recovery = if restore_after_settlement {
                 SettlementRecovery::Available
@@ -2006,9 +2137,10 @@ async fn token(
             owner.refresh_enabled = false;
             tokio::spawn(settle_background_recovery(
                 owner_ref.clone(),
+                worker.settlements.clone(),
                 worker.central.clone(),
                 lease,
-                None,
+                lease_window,
                 before,
                 recovery,
                 recovery_generation,
@@ -2219,7 +2351,7 @@ fn observation(
 ) -> Option<fast_path::Observation> {
     let Ok(token) = token else { return None };
     let published = vault::digest(&serde_json::to_vec(&owner.vault.auth).ok()?);
-    if !token.native_routing_supported || token.revision != published {
+    if !owner.routing_observed || !token.native_routing_supported || token.revision != published {
         return None;
     }
     let billing = token.billing_class.and_then(|class| {
@@ -3150,11 +3282,13 @@ impl Broker {
             drop(owner);
             let central = self.central.clone();
             let stopping = self.stopping.clone();
+            let settlements = self.settlements.clone();
             // Keep a per-owner reservation while settlement runs independently.
             // Other accounts' token requests must not wait for this child or DB.
             tokio::spawn(async move {
                 settle_background_recovery(
                     owner_ref.clone(),
+                    settlements,
                     central,
                     verification_lease,
                     lease_window.clone(),
@@ -3622,6 +3756,8 @@ pub(super) fn prepare_owner(state: &Path, key: &Path, read_only: bool) -> Result
         refresh_enabled: !read_only,
         limits: None,
         limits_observed: None,
+        routing_revision: None,
+        routing_observed: false,
         verification_input: None,
         import_settling: false,
         #[cfg(test)]
@@ -3851,7 +3987,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
             }
         }
         owner.refresh_enabled = false;
-        if owner.retry_started.is_none() {
+        if !on_demand && owner.retry_started.is_none() {
             owner.retry_started = Some(owner.retry_clock_now());
         }
         // Reacquire in the established imports -> Owner order. Never await the
@@ -3952,6 +4088,16 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                         ..Default::default()
                     })
                     .await;
+                let probe = match probe {
+                    Err(TokenFailure::Unavailable(error))
+                        if owner.available
+                            && !owner.routing_refused
+                            && owner.rpc.as_ref().is_some_and(Rpc::retryable_owner_read) =>
+                    {
+                        Err(TokenFailure::Retryable(error))
+                    }
+                    result => result,
+                };
                 let auth_changed = owner.vault.auth != before.auth;
                 let mut local_saved = true;
                 if auth_changed {
@@ -3999,6 +4145,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                     let lease = lease.clone();
                     tokio::spawn(settle_background_recovery(
                         owner_ref,
+                        broker.settlements.clone(),
                         central,
                         lease,
                         None,
@@ -4062,6 +4209,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                         let lease = lease.clone();
                         tokio::spawn(settle_background_recovery(
                             owner_ref,
+                            broker.settlements.clone(),
                             central,
                             lease,
                             None,
@@ -4100,6 +4248,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                         let lease = lease.clone();
                         tokio::spawn(settle_background_recovery(
                             owner_ref,
+                            broker.settlements.clone(),
                             central,
                             lease,
                             None,
@@ -4138,6 +4287,7 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
                     drop(owner);
                     tokio::spawn(settle_background_recovery(
                         owner_ref.clone(),
+                        broker.settlements.clone(),
                         central.clone(),
                         lease.clone(),
                         None,
@@ -4328,6 +4478,8 @@ pub async fn serve(
                     refresh_enabled: false,
                     limits: None,
                     limits_observed: None,
+                    routing_revision: None,
+                    routing_observed: false,
                     verification_input: None,
                     import_settling: false,
                     #[cfg(test)]
@@ -4497,6 +4649,7 @@ pub async fn serve(
         recovery_stop: Arc::new(tokio::sync::Notify::new()),
         background_recovery: background_recovery_enabled(),
         relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+        settlements: Arc::default(),
         shared_login_workers: Arc::new(StdMutex::new(Default::default())),
         holder_id: holder.clone(),
         login_holder: Arc::new(StdMutex::new(holder)),
@@ -4714,6 +4867,7 @@ impl Broker {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            settlements: Arc::default(),
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: None,
             holder_id: "test-holder".into(),
@@ -4857,6 +5011,7 @@ mod tests {
             recovery_stop: Arc::new(tokio::sync::Notify::new()),
             background_recovery: false,
             relogins: Arc::new(StdMutex::new(BTreeMap::new())),
+            settlements: Arc::default(),
             shared_login_workers: Arc::new(StdMutex::new(Default::default())),
             central: Some(central),
             holder_id: "test-holder".into(),

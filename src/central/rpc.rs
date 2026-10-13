@@ -71,6 +71,26 @@ pub(super) struct FailureDiagnostics {
     pub(super) failure_class: FailureClass,
     pub(super) rpc_code: Option<i64>,
     pub(super) has_data_retryable: bool,
+    pub(super) http_status: Option<u16>,
+}
+
+impl FailureDiagnostics {
+    pub(super) fn native_reason(self) -> &'static str {
+        match self.http_status {
+            Some(429) => "upstream_429",
+            Some(408 | 504) => "upstream_timeout",
+            Some(500..=599) => "upstream_5xx",
+            Some(400..=499) => "upstream_4xx",
+            _ => match self.failure_class {
+                FailureClass::Timeout => "upstream_timeout",
+                FailureClass::NativeError if self.rpc_code == Some(-32603) => "app_server_internal",
+                FailureClass::NativeError => "app_server_error",
+                FailureClass::Eof | FailureClass::Io => "app_server_transport",
+                FailureClass::InvalidProtocol => "app_server_protocol",
+                FailureClass::Other => "app_server_unavailable",
+            },
+        }
+    }
 }
 
 /// A private stdio connection. Never include protocol payloads in errors or logs.
@@ -78,6 +98,7 @@ pub struct Rpc {
     _child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
+    wire_bytes: Vec<u8>,
     next_id: u64,
     healthy: bool,
     retryable_failure: bool,
@@ -144,7 +165,31 @@ impl Rpc {
     }
 
     pub(super) fn failure_diagnostics(&self) -> FailureDiagnostics {
-        self.failure_diagnostics
+        FailureDiagnostics {
+            http_status: self
+                .failure_diagnostics
+                .http_status
+                .or(self.refresh_reason.status()),
+            ..self.failure_diagnostics
+        }
+    }
+
+    /// A completed native error leaves the stdio protocol synchronized.
+    /// Never resume an ambiguous request, dead child, or rejected grant.
+    pub(super) fn resume_completed_native_error(&mut self) -> bool {
+        if self.outstanding.is_some()
+            || self.timed_out
+            || self.rejected_login
+            || !matches!(
+                self.failure_diagnostics.failure_class,
+                FailureClass::NativeError
+            )
+            || self.process_exited()
+        {
+            return false;
+        }
+        self.healthy = true;
+        true
     }
 
     pub(super) fn timed_out(&self) -> bool {
@@ -238,6 +283,7 @@ impl Rpc {
             _child: child,
             input: Some(input),
             output,
+            wire_bytes: Vec::new(),
             next_id: 0,
             healthy: true,
             retryable_failure: false,
@@ -421,10 +467,9 @@ impl Rpc {
     }
 
     async fn read_wire(&mut self) -> Result<Value> {
-        let mut bytes = Vec::new();
         let read = timeout(
             Duration::from_secs(180),
-            self.output.read_until(b'\n', &mut bytes),
+            self.output.read_until(b'\n', &mut self.wire_bytes),
         )
         .await;
         let count = match read {
@@ -442,6 +487,7 @@ impl Rpc {
             self.failure_diagnostics.failure_class = FailureClass::Eof;
             bail!("app-server closed its connection");
         }
+        let bytes = std::mem::take(&mut self.wire_bytes);
         serde_json::from_slice(&bytes)
             .inspect_err(|_| self.failure_diagnostics.failure_class = FailureClass::InvalidProtocol)
             .context("invalid app-server protocol message")
@@ -449,6 +495,11 @@ impl Rpc {
 
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.call_handled(method, params, &mut RejectRequests, Duration::from_secs(90))
+            .await
+    }
+
+    pub(super) async fn owner_read(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.call_handled(method, params, &mut RejectRequests, Duration::from_secs(10))
             .await
     }
 
@@ -473,6 +524,7 @@ impl Rpc {
         // A reason belongs to the call during which Codex logged it; drop any
         // earlier one so it cannot be blamed on this call.
         self.refresh_reason.take();
+        self.refresh_reason.clear_status();
         let operation = async {
             self.send(json!({"id":id,"method":method,"params":params}))
                 .await?;
@@ -486,6 +538,11 @@ impl Rpc {
                             failure_class: FailureClass::NativeError,
                             rpc_code: response.pointer("/error/code").and_then(Value::as_i64),
                             has_data_retryable: response.pointer("/error/data/retryable").is_some(),
+                            http_status: response
+                                .pointer("/error/data/http_status")
+                                .and_then(Value::as_u64)
+                                .filter(|status| (400..=599).contains(status))
+                                .map(|status| status as u16),
                         };
                         // Only these completed, pinned policy errors are safe
                         // refusals. Never log or retain native protocol payloads.

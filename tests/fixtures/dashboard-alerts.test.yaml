@@ -4,6 +4,52 @@ evaluation_interval: 1m
 tests:
   - interval: 1m
     input_series:
+      - series: codexctl_central_owner_refresh_native_errors_total{account="personal",account_key="abcdef123456",reason="upstream_5xx",pod="pod-a"}
+        values: 0 1+0x13
+      - series: codexctl_central_owner_refresh_native_errors_total{account="personal",account_key="abcdef123456",reason="upstream_5xx",pod="pod-b"}
+        values: 0+0x14
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlOwnerRefreshNativeError
+        exp_alerts:
+          - exp_labels:
+              account: personal
+              account_key: abcdef123456
+              reason: upstream_5xx
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: "Codexctl server account personal (abcdef123456) has a native refresh error (upstream_5xx)"
+              description: Inspect bounded owner_refresh diagnostics and upstream status. An unclassified failure does not revoke a valid token. Billing requests refuse when fresh evidence is unavailable. Preserve the owner journal and lease while a native call settles.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 12m
+        alertname: CodexctlOwnerRefreshNativeError
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_owner_refresh_native_errors_total{account="personal",account_key="abcdef123456",reason="upstream_timeout",pod="restarted"}
+        values: 1+0x14
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CodexctlOwnerRefreshNativeError
+        exp_alerts:
+          - exp_labels:
+              account: personal
+              account_key: abcdef123456
+              reason: upstream_timeout
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: "Codexctl server account personal (abcdef123456) has a native refresh error (upstream_timeout)"
+              description: Inspect bounded owner_refresh diagnostics and upstream status. An unclassified failure does not revoke a valid token. Billing requests refuse when fresh evidence is unavailable. Preserve the owner journal and lease while a native call settles.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 12m
+        alertname: CodexctlOwnerRefreshNativeError
+        exp_alerts: []
+  - interval: 1m
+    input_series:
       - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_revoke_failed",pod="pod-a"}
         values: >-
           0 60 60 60 60 60 60

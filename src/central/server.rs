@@ -142,6 +142,9 @@ pub(super) struct Owner {
     pub(super) refresh_enabled: bool,
     pub(super) limits: Option<Value>,
     pub(super) limits_observed: Option<(std::time::Instant, String)>,
+    /// Native routing proof is usable only for exactly this retained auth revision.
+    pub(super) routing_revision: Option<String>,
+    pub(super) routing_observed: bool,
     pub(super) verification_input: Option<Value>,
     pub(super) import_settling: bool,
     #[cfg(test)]
@@ -149,6 +152,99 @@ pub(super) struct Owner {
 }
 
 impl Owner {
+    fn cached_plain_token(&self) -> Option<TokenResponse> {
+        if !self.vault.verified
+            || self.routing_refused
+            || self.rpc.as_ref().is_some_and(Rpc::rejected_login)
+        {
+            return None;
+        }
+        let access_token = vault::token(&self.vault.auth).ok()?.to_owned();
+        if !api::token_expiry(&access_token).is_some_and(|at| at > chrono::Utc::now().timestamp()) {
+            return None;
+        }
+        let revision = vault::digest(&serde_json::to_vec(&self.vault.auth).ok()?);
+        if self.routing_revision.as_deref() != Some(revision.as_str()) {
+            return None;
+        }
+        Some(TokenResponse {
+            user_id: None,
+            chatgpt_account_id: vault::account(&self.vault.auth).ok()?,
+            chatgpt_plan_type: api::token_identity(&access_token)
+                .and_then(|identity| identity.plan),
+            access_token,
+            revision,
+            billing_class: None,
+            native_routing_supported: true,
+            statusline_usage: None,
+            label: self.vault.label.clone(),
+        })
+    }
+
+    fn native_failure(&mut self, error: anyhow::Error, billing: bool) -> TokenFailure {
+        self.retry_requires_billing = billing;
+        if error.is::<RoutingPolicyError>() {
+            return TokenFailure::UnsupportedRouting;
+        }
+        if self.rpc.as_ref().is_some_and(Rpc::rejected_login) {
+            self.fence(false);
+        } else if vault::token(&self.vault.auth)
+            .ok()
+            .and_then(api::token_expiry)
+            .is_some_and(|at| at <= chrono::Utc::now().timestamp())
+        {
+            let retryable =
+                self.vault.verified && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read);
+            self.fence(retryable);
+            if retryable {
+                return TokenFailure::Retryable(error);
+            }
+        }
+        TokenFailure::Unavailable(error)
+    }
+
+    async fn native_read(
+        &mut self,
+        method: &str,
+        mut params: Value,
+        retried: &mut bool,
+        lease_lost: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Value> {
+        loop {
+            if lease_lost.is_some_and(|lost| lost.load(std::sync::atomic::Ordering::Acquire)) {
+                anyhow::bail!("credential owner lease lost");
+            }
+            let before = self.vault.auth.clone();
+            let result = self
+                .rpc
+                .as_mut()
+                .context("missing credential owner")?
+                .owner_read(method, params.clone())
+                .await;
+            let error = match result {
+                Ok(value) => return Ok(value),
+                Err(error) if error.is::<RoutingPolicyError>() => return Err(error),
+                Err(error) => error,
+            };
+            self.refresh_failed(Some(&error)).await;
+            // Even a completed error may have rotated the owner's journal.
+            // Preserve it before retrying, and never force that rotation twice.
+            self.snapshot()?;
+            let reusable = self
+                .rpc
+                .as_mut()
+                .is_some_and(Rpc::resume_completed_native_error);
+            if *retried || !reusable {
+                return Err(error);
+            }
+            *retried = true;
+            if self.vault.auth != before && params.get("refreshToken") == Some(&json!(true)) {
+                params["refreshToken"] = json!(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// Logs and counts a failed owner refresh with the provider's bounded
     /// reason, read before the fence can stop the child.
     pub(super) async fn refresh_failed(&mut self, error: Option<&anyhow::Error>) {
@@ -160,13 +256,14 @@ impl Owner {
             rpc.classify_owner_read_failure(error, reason.is_some());
         }
         let account = self.vault.alias.to_ascii_lowercase();
-        // Only a provider rejection is counted; other read failures already
-        // surface as owner_unavailable.
         if let Some(reason) = reason {
             super::owner_refresh::record(&account, &self.vault.user, reason);
         }
         let mut log = json!({"operation":"owner_refresh","stage":"provider","reason":reason.unwrap_or("unclassified"),"account":account,"account_key":super::managed::account_key(&self.vault.user, &self.vault.alias)});
-        if reason.is_none() {
+        if reason.is_none()
+            && error.is_some()
+            && !self.rpc.as_ref().is_some_and(Rpc::rejected_login)
+        {
             let failure = self
                 .rpc
                 .as_ref()
@@ -175,6 +272,15 @@ impl Owner {
             log["failure_class"] = json!(failure.failure_class);
             log["rpc_code"] = json!(failure.rpc_code);
             log["has_data_retryable"] = json!(failure.has_data_retryable);
+            log["native_reason"] = json!(failure.native_reason());
+            if let Some(status) = failure.http_status {
+                log["http_status"] = json!(status);
+            }
+            super::owner_refresh::record_native(
+                &account,
+                &self.vault.user,
+                failure.native_reason(),
+            );
         }
         eprintln!("{log}");
     }
@@ -366,16 +472,29 @@ impl Owner {
         request: TokenRequest,
         device: Option<&str>,
     ) -> Result<TokenResponse, TokenFailure> {
+        self.tokens_for_device_guarded(request, device, None).await
+    }
+
+    pub(super) async fn tokens_for_device_guarded(
+        &mut self,
+        request: TokenRequest,
+        device: Option<&str>,
+        lease_lost: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<TokenResponse, TokenFailure> {
+        self.routing_observed = false;
         let billing = if request.billing {
             BillingRead::Live
         } else {
             BillingRead::Omit
         };
+        let mut retried = false;
         if !self.available {
             return Err(TokenFailure::Unavailable(anyhow::anyhow!(
                 "credential owner unavailable"
             )));
         }
+        self.retry_requires_billing = request.billing;
+        let allow_cached = device.is_some();
         let current = match self.snapshot() {
             Ok(current) => current,
             Err(error) => {
@@ -385,7 +504,9 @@ impl Owner {
         };
         if let Some(previous) = request.previous_revision.as_ref() {
             if previous != &current.revision {
-                return self.with_billing(current, billing).await;
+                return self
+                    .with_billing(current, billing, &mut retried, lease_lost, allow_cached)
+                    .await;
             }
             if !self.refresh_enabled {
                 return Err(TokenFailure::RefreshDisabled);
@@ -428,19 +549,23 @@ impl Owner {
                 } else {
                     BillingRead::Omit
                 };
-                return self.with_billing(current, billing).await;
+                return self
+                    .with_billing(current, billing, &mut retried, lease_lost, allow_cached)
+                    .await;
             }
         }
         // Serialize all calls, and persist any rotated credentials even when RPC fails.
         let force = request.previous_revision.is_some();
 
         let result = if self.refresh_enabled {
-            self.rpc
-                .as_mut()
-                .context("missing credential owner")?
-                .call("account/read", json!({"refreshToken":force}))
-                .await
-                .map(|_| ())
+            self.native_read(
+                "account/read",
+                json!({"refreshToken":force}),
+                &mut retried,
+                lease_lost,
+            )
+            .await
+            .map(|_| ())
         } else {
             Ok(())
         };
@@ -449,13 +574,6 @@ impl Owner {
             .is_err_and(|error| error.is::<RoutingPolicyError>())
         {
             self.routing_refused = true;
-        }
-        if let Err(error) = &result
-            && !error.is::<RoutingPolicyError>()
-        {
-            // A forced `account/read` is the normal client refresh path.
-            self.refresh_failed(Some(error)).await;
-            self.fence(false);
         }
         if force
             && !self.vault.verified
@@ -471,26 +589,33 @@ impl Owner {
         // Persistence/identity failure wins even for a completed routing refusal.
         let current = snapshot?;
         if let Err(error) = result {
-            if self.vault.verified
-                && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
+            if allow_cached
+                && !request.billing
                 && !error.is::<RoutingPolicyError>()
+                && let Some(token) = self.cached_plain_token()
             {
-                return Err(TokenFailure::Retryable(error));
+                return Ok(token);
             }
-            return Err(error.into());
+            return Err(self.native_failure(error, request.billing));
         }
-        self.with_billing(current, billing).await
+        self.with_billing(current, billing, &mut retried, lease_lost, allow_cached)
+            .await
     }
 
     async fn with_billing(
         &mut self,
         mut token: TokenResponse,
         billing: BillingRead,
+        retried: &mut bool,
+        lease_lost: Option<&std::sync::atomic::AtomicBool>,
+        allow_cached: bool,
     ) -> Result<TokenResponse, TokenFailure> {
         let requested = !matches!(billing, BillingRead::Omit);
         if self.rpc.is_none() {
             if requested {
-                token.billing_class = Some(api::BillingClass::Unknown);
+                return Err(TokenFailure::Unavailable(anyhow::anyhow!(
+                    "native billing evidence unavailable"
+                )));
             }
             return Ok(token);
         }
@@ -516,10 +641,7 @@ impl Owner {
                 } else {
                     // Rate-limit reads can refresh too. Persist on every result.
                     let result = self
-                        .rpc
-                        .as_mut()
-                        .context("missing owner")?
-                        .call("account/rateLimits/read", json!({}))
+                        .native_read("account/rateLimits/read", json!({}), retried, lease_lost)
                         .await;
                     let observed_at = std::time::Instant::now();
                     let snapshot = self.snapshot();
@@ -527,23 +649,10 @@ impl Owner {
                         self.fence(false);
                     }
                     token = snapshot?;
-                    if let Err(error) = &result {
-                        self.refresh_failed(Some(error)).await;
-                    }
                     let limits = match result {
                         Ok(limits) => limits,
-                        Err(error)
-                            if self.vault.verified
-                                && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
-                                && !error.is::<RoutingPolicyError>() =>
-                        {
-                            self.retry_requires_billing = true;
-                            self.fence(true);
-                            return Err(TokenFailure::Retryable(error));
-                        }
                         Err(error) => {
-                            self.fence(false);
-                            return Err(error.into());
+                            return Err(self.native_failure(error, true));
                         }
                     };
                     (limits, observed_at)
@@ -558,23 +667,16 @@ impl Owner {
             // The command-auth provider bypasses first-party workspace routing.
             // Re-discover after any billing refresh, before exporting credentials.
             let result = self
-                .rpc
-                .as_mut()
-                .context("missing owner")?
-                .call("account/read", json!({"refreshToken":false}))
+                .native_read(
+                    "account/read",
+                    json!({"refreshToken":false}),
+                    retried,
+                    lease_lost,
+                )
                 .await;
             // This routing read can refresh too, so it reports rejections.
-            if let Err(error) = &result
-                && !error.is::<RoutingPolicyError>()
-            {
-                self.refresh_failed(Some(error)).await;
-            }
             let snapshot = self.snapshot();
-            if result
-                .as_ref()
-                .is_err_and(|error| !error.is::<RoutingPolicyError>())
-                || snapshot.is_err()
-            {
+            if snapshot.is_err() {
                 self.fence(false);
             }
             let mut current = snapshot?;
@@ -586,14 +688,16 @@ impl Owner {
             }
             let account = match result {
                 Ok(account) => account,
-                Err(error)
-                    if self.vault.verified
-                        && self.rpc.as_ref().is_some_and(Rpc::retryable_owner_read)
-                        && !error.is::<RoutingPolicyError>() =>
-                {
-                    return Err(TokenFailure::Retryable(error));
+                Err(error) => {
+                    if allow_cached
+                        && !requested
+                        && !error.is::<RoutingPolicyError>()
+                        && let Some(token) = self.cached_plain_token()
+                    {
+                        return Ok(token);
+                    }
+                    return Err(self.native_failure(error, requested));
                 }
-                Err(error) => return Err(error.into()),
             };
             if supported_native_routing(&account) != Some(current.chatgpt_account_id.as_str()) {
                 self.routing_refused = true;
@@ -615,6 +719,8 @@ impl Owner {
             current.billing_class = token.billing_class;
             current.chatgpt_plan_type = token.chatgpt_plan_type;
             current.native_routing_supported = true;
+            self.routing_revision = Some(current.revision.clone());
+            self.routing_observed = true;
             if let Some((limits, observed_at)) = observed_limits {
                 let parsed = usage(&limits).ok();
                 current.statusline_usage =
@@ -893,6 +999,8 @@ pub async fn serve(
         refresh_enabled: !read_only,
         limits: None,
         limits_observed: None,
+        routing_revision: None,
+        routing_observed: false,
         verification_input: None,
         import_settling: false,
         #[cfg(test)]

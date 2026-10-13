@@ -156,6 +156,38 @@ for line in sys.stdin:
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
         routing_mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if routing_mode == "owner-native-slow-once":
+            marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("native-slow-started")
+            if not marker.exists():
+                marker.write_text("started")
+                time.sleep(2)
+        if routing_mode == "owner-native-hold":
+            mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            mode_file.with_name("native-started").write_text("started")
+            # Split a response across the deadline to exercise canceled reads.
+            sys.stdout.write('{"id":' + str(message["id"]) + ',"result":')
+            sys.stdout.flush()
+            while not mode_file.with_name("native-release").exists():
+                time.sleep(0.01)
+            rotate()
+            sys.stdout.write(json.dumps({"account":{"type":"chatgpt"},"workspaceRouting":{"chatgptAccountId":tokens(json.loads(auth_path.read_text()))["account_id"],"backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}}) + '}\n')
+            sys.stdout.flush()
+            continue
+        if routing_mode in ["owner-internal-once", "owner-stderr-once", "owner-rotate-error-once", "owner-internal-dead", "owner-internal-always", "owner-error-slow-exit"]:
+            marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("native-error-sent")
+            if routing_mode in ["owner-internal-always", "owner-error-slow-exit"] or not marker.exists():
+                marker.write_text("one completed native error\n")
+                if routing_mode == "owner-rotate-error-once":
+                    rotate()
+                data = {"private":"synthetic-private-native-data"}
+                if routing_mode == "owner-stderr-once":
+                    print('ERROR codex_login::auth::manager: Failed to refresh token status=503 Service Unavailable detail=synthetic-private-native-error-payload', file=sys.stderr, flush=True)
+                else:
+                    data["http_status"] = 503
+                send({"id":message["id"], "error":{"code":-32603,"message":"synthetic-private-native-error-payload","data":data}})
+                if routing_mode == "owner-internal-dead":
+                    sys.exit(1)
+                continue
         if not params.get("refreshToken") and (
             routing_mode == "unmarked-account-read-error"
             or (routing_mode == "unmarked-routing-read-error" and after_limits)
@@ -360,6 +392,9 @@ if os.environ.get("CENTRAL_TEST_EXIT_FILE"):
 
 if mode == "billing-error-slow-exit":
     time.sleep(31)
+
+if mode in ["owner-clean-slow-exit", "owner-error-slow-exit"]:
+    time.sleep(2)
 
 if mode == "billing-error-held-exit" and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat":
     while not pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("release-exit").exists():

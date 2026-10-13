@@ -328,6 +328,15 @@ impl Server {
             .send()
             .unwrap()
     }
+    fn import_expired(
+        &self,
+        token: &str,
+        alias: &str,
+        subject: &str,
+        account: &str,
+    ) -> reqwest::blocking::Response {
+        self.import_auth(token, alias, auth_with_expiry(subject, account, 1))
+    }
     fn accounts(&self, token: &str) -> Value {
         self.http
             .get(format!("{}/v1/accounts", self.url))
@@ -4082,7 +4091,7 @@ fn when_a_saved_import_failed_to_start_then_retry_reconciles_it() {
 }
 
 #[test]
-fn marked_billing_failure_stays_fenced_until_an_explicit_repair() {
+fn marked_billing_failure_keeps_valid_plain_tokens_and_requires_live_billing_evidence() {
     let server = Server::start();
     assert_eq!(
         server
@@ -4097,9 +4106,15 @@ fn marked_billing_failure_stays_fenced_until_an_explicit_repair() {
         response.json::<Value>().unwrap()["error"],
         "owner_unavailable"
     );
-    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    assert_eq!(server.accounts(&server.amir)[0]["available"], true);
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
 }
 
 #[test]
@@ -4107,7 +4122,7 @@ fn marked_billing_retry_requires_the_billing_probe_before_recovery() {
     let server = Server::start();
     assert_eq!(
         server
-            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .import_expired(&server.amir, "personal", "amir-login", "amir-seat")
             .status(),
         200
     );
@@ -4465,7 +4480,7 @@ fn served_recent_limits_expire_without_extending_the_observation_time() {
         updated.json::<Value>().unwrap()["error"],
         "owner_unavailable"
     );
-    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "2");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "3");
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("count")).unwrap(),
         "2"
@@ -4867,7 +4882,7 @@ fn on_demand_refresh_owner_backoff_doubles_caps_and_resets_after_success() {
         Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
     assert_eq!(
         server
-            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .import_expired(&server.amir, "personal", "amir-login", "amir-seat")
             .status(),
         200
     );
@@ -4939,7 +4954,10 @@ fn recovery_failure_metrics_distinguish_company_users_with_the_same_alias() {
         (&server.amir, "Personal", "amir-login", "amir-seat"),
         (&server.alex, "personal", "alex-login", "alex-seat"),
     ] {
-        assert_eq!(server.import(user, alias, login, seat).status(), 200);
+        assert_eq!(
+            server.import_expired(user, alias, login, seat).status(),
+            200
+        );
     }
     store::atomic_write(&server.root.path().join("mode"), b"billing-error").unwrap();
     for user in [&server.amir, &server.alex] {
@@ -5057,7 +5075,7 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
     assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
     assert_eq!(
         std::fs::read_to_string(server.root.path().join("limits-count")).unwrap(),
-        "3"
+        "4"
     );
     let stderr = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
     assert!(
@@ -5077,9 +5095,6 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
     );
     assert!(!stderr.contains("Failed to refresh token"), "{stderr}");
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-    store::atomic_write(&server.root.path().join("retry-clock"), b"4999").unwrap();
-    assert_eq!(server.token(&server.amir, "p3", None).status(), 503);
-    store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
     let recovered = server.token(&server.amir, "p3", None);
     assert_eq!(recovered.status(), 200);
     let recovered: Value = recovered.json().unwrap();
@@ -5100,7 +5115,7 @@ fn token_request_recovers_unclassified_completed_usage_failure_without_restart()
         .text()
         .unwrap();
     assert!(
-        metrics.contains("codexctl_central_owner_recovery_total{result=\"recovered\"} 1\n"),
+        metrics.contains("codexctl_central_owner_recovery_total{result=\"recovered\"} 0\n"),
         "{metrics}"
     );
     assert!(owner_refresh_failures(&metrics).is_empty(), "{metrics}");
@@ -5157,16 +5172,400 @@ fn unclassified_owner_logs_distinguish_eof_and_native_errors_without_payloads() 
         }
         store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
         store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
+        let recovered = server.token(&server.amir, "personal", None);
+        assert_eq!(recovered.status(), 200, "{mode}");
         assert_eq!(
-            server.token(&server.amir, "personal", None).status(),
-            200,
-            "{mode}"
+            recovered.json::<Value>().unwrap()["billingClass"],
+            "rate_limited",
+            "{mode}: recovery needs live billing evidence"
         );
     }
 }
 
 #[test]
-fn unclassified_account_and_routing_reads_recover_on_demand() {
+fn owner_native_internal_error_retries_without_a_503_or_child_restart() {
+    for mode in ["owner-internal-once", "owner-stderr-once"] {
+        let mut server = Server::start();
+        server.stop();
+        let binary =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        (server.child, server.url) =
+            Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+        let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        let response = server.token_without_billing(&server.amir, "personal");
+        assert_eq!(
+            response.status(),
+            200,
+            "completed internal error must retry without fencing"
+        );
+        let after: Value = response.json().unwrap();
+        assert_eq!(after["accessToken"], before["accessToken"]);
+        assert!(server.root.path().join("native-error-sent").exists());
+        assert_eq!(
+            std::fs::read(server.root.path().join("launch-count")).unwrap(),
+            launches
+        );
+        assert_eq!(
+            server
+                .token_without_billing(&server.amir, "personal")
+                .status(),
+            200
+        );
+        let log = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+        assert!(!log.contains("synthetic-private-native-error-payload"));
+        assert!(!log.contains("synthetic-private-native-data"));
+        let native = log
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|line| line["operation"] == "owner_refresh" && line["rpc_code"] == -32603)
+            .expect("bounded native-error diagnostic");
+        assert_eq!(native["native_reason"], "upstream_5xx");
+        assert_eq!(native["http_status"], 503);
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(
+            metrics.lines().any(|line| line
+                .starts_with("codexctl_central_owner_refresh_native_errors_total{")
+                && line.contains("account=\"personal\"")
+                && line.contains("reason=\"upstream_5xx\"")
+                && line.ends_with(" 1")),
+            "{metrics}"
+        );
+    }
+}
+
+#[test]
+fn owner_native_repeated_errors_keep_valid_plain_tokens_but_refuse_billing() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let before: Value = server
+        .token_without_billing(&server.amir, "personal")
+        .json()
+        .unwrap();
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-internal-always").unwrap();
+    for _ in 0..2 {
+        let response = server.token_without_billing(&server.amir, "personal");
+        assert_eq!(
+            response.status(),
+            200,
+            "valid token must remain available after bounded retry fails"
+        );
+        let after: Value = response.json().unwrap();
+        assert_eq!(after["accessToken"], before["accessToken"]);
+        assert_eq!(after["nativeRoutingSupported"], true);
+    }
+    let refused = server.token(&server.amir, "personal", None);
+    assert_eq!(
+        refused.status(),
+        503,
+        "live billing evidence must not be guessed"
+    );
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn owner_native_recovery_probe_does_not_count_cached_delivery_as_recovered() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"owner-internal-dead").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"owner-internal-always").unwrap();
+    let _ = server.token_without_billing(&server.amir, "personal");
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains("codexctl_central_owner_recovery_total{result=\"recovered\"} 0\n"),
+        "failed native probe must not count as recovered"
+    );
+}
+
+#[test]
+fn owner_native_completed_error_from_a_dead_child_recovers_before_the_token_expires() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"owner-internal-dead").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    let recovered = server.token(&server.amir, "personal", None);
+    assert_eq!(
+        recovered.status(),
+        200,
+        "confirmed exit must remain eligible for recovery"
+    );
+    assert_eq!(
+        recovered.json::<Value>().unwrap()["billingClass"],
+        "rate_limited"
+    );
+}
+
+#[test]
+fn owner_native_healthy_concurrent_reads_wait_without_an_admission_503() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"owner-native-slow-once").unwrap();
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| server.token_without_billing(&server.amir, "personal"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !server.root.path().join("native-slow-started").exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            server
+                .token_without_billing(&server.amir, "personal")
+                .status(),
+            200
+        );
+        assert_eq!(first.join().unwrap().status(), 200);
+    });
+}
+
+#[test]
+fn owner_native_error_after_rotation_does_not_force_the_retry_to_rotate_again() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import_expiring(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let before: Value = server.token(&server.amir, "personal", None).json().unwrap();
+    server.advance_rotation_clock();
+    let rotations: u64 = std::fs::read_to_string(server.root.path().join("count"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-rotate-error-once").unwrap();
+    let response = server.token(&server.amir, "personal", before["revision"].as_str());
+    assert_eq!(response.status(), 200);
+    let after: Value = response.json().unwrap();
+    assert_ne!(after["accessToken"], before["accessToken"]);
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("count"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap(),
+        rotations + 1
+    );
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+}
+
+#[test]
+fn owner_native_failed_retry_with_expired_token_requires_recovery() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import_auth(
+                &server.amir,
+                "personal",
+                auth_with_expiry(
+                    "amir-login",
+                    "amir-seat",
+                    chrono::Utc::now().timestamp() + 2
+                )
+            )
+            .status(),
+        200
+    );
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        200
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-internal-always").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503
+    );
+    let response = server.token_without_billing(&server.amir, "personal");
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+}
+
+#[test]
+fn owner_native_hang_answers_promptly_and_settles_late_rotation_before_restart() {
+    let mut server = Server::start();
+    server.stop();
+    let binary = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+    (server.child, server.url) =
+        Server::spawn_binary_with_recovery(&server.root, &binary, &[], None);
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    let before: Value = server
+        .token_without_billing(&server.amir, "personal")
+        .json()
+        .unwrap();
+    let launches = std::fs::read(server.root.path().join("launch-count")).unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-native-hold").unwrap();
+    let http = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(14))
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let response = http
+        .post(format!("{}/v1/token", server.url))
+        .bearer_auth(&server.amir)
+        .json(&json!({"alias":"personal","billing":false}))
+        .send();
+    assert!(
+        response.is_ok(),
+        "native hang must return before the client deadline: {response:?}"
+    );
+    let response = response.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(13));
+    assert!(matches!(response.status().as_u16(), 200 | 503));
+    if response.status() == 200 {
+        assert_eq!(
+            response.json::<Value>().unwrap()["accessToken"],
+            before["accessToken"]
+        );
+    }
+    let started = std::time::Instant::now();
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "billing must not wait behind settlement"
+    );
+    assert_eq!(
+        std::fs::read(server.root.path().join("launch-count")).unwrap(),
+        launches
+    );
+    store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&server.root.path().join("native-release"), b"release").unwrap();
+    for _ in 0..100 {
+        let response = server.token_without_billing(&server.amir, "personal");
+        if response.status() == 200 {
+            let after: Value = response.json().unwrap();
+            assert_ne!(
+                after["accessToken"], before["accessToken"],
+                "late rotation must be preserved"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "owner did not recover after the outstanding call settled: {}",
+        std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap()
+    );
+}
+
+#[test]
+fn unclassified_account_and_routing_reads_resume_without_a_cooldown() {
     for mode in ["unmarked-account-read-error", "unmarked-routing-read-error"] {
         let mut server = Server::start();
         server.stop();
@@ -5184,13 +5583,17 @@ fn unclassified_account_and_routing_reads_recover_on_demand() {
         store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
         assert_eq!(
             server.token(&server.amir, "personal", None).status(),
-            503,
+            if mode == "unmarked-routing-read-error" {
+                200
+            } else {
+                503
+            },
             "{mode}"
         );
         store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
         let blocked = server.token(&server.amir, "personal", None);
-        assert_eq!(blocked.status(), 503, "{mode}");
-        assert_eq!(blocked.headers().get("retry-after").unwrap(), "5");
+        assert_eq!(blocked.status(), 200, "{mode}");
+        assert!(blocked.headers().get("retry-after").is_none());
         store::atomic_write(&server.root.path().join("retry-clock"), b"5000").unwrap();
         assert_eq!(
             server.token(&server.amir, "personal", None).status(),
@@ -7375,6 +7778,18 @@ fn proactive_cached_login_rejection_allows_a_fresh_same_account_grant() {
             .send()
             .unwrap();
         assert_eq!(response.status(), 503);
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(
+            !metrics.contains("codexctl_central_owner_refresh_native_errors_total{"),
+            "a proven rejected login is not a native transport error"
+        );
         if restart {
             server.stop();
             server.restart();
@@ -7481,7 +7896,7 @@ fn completed_routing_policy_errors_preserve_token_and_catalog_recovery() {
 }
 
 #[test]
-fn similar_errors_without_the_pinned_routing_contract_stay_unavailable() {
+fn similar_errors_without_the_pinned_routing_contract_do_not_permanently_fence() {
     for mode in ["routing-policy-wrong-code", "billing-policy-wrong-method"] {
         let server = Server::start();
         assert_eq!(
@@ -7493,7 +7908,7 @@ fn similar_errors_without_the_pinned_routing_contract_stay_unavailable() {
         store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
         assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
         store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
-        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
     }
 }
 
@@ -10165,11 +10580,7 @@ fn connected_status_json_keeps_unavailable_accounts() {
     let server = Server::start();
     server.import(&server.amir, "personal", "server-login", "server-seat");
     let home = server.connected_home();
-    store::atomic_write(
-        &server.root.path().join("mode"),
-        b"routing-policy-wrong-code",
-    )
-    .unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"refresh-reused").unwrap();
 
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
     let output = server.cli(home.path(), &["status", "--json"]);
