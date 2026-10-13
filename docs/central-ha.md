@@ -40,6 +40,8 @@ After three failed background child settlement attempts, each bounded to
 10 seconds, the broker kills and reaps the child, publishes its final journal,
 then releases the lease. If child death cannot be confirmed or its journal stays
 unreadable, the broker retains the lease and fences that account.
+Forced termination can lose a provider-accepted rotation that has not reached
+the journal; that case can require a new login.
 Graceful shutdown waits for this work. It can
 exceed the Deployment's 60-second termination allowance; forced pod termination
 can lose an unpublished rotation. Preserve the pod and its journal for recovery

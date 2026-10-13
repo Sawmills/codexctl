@@ -1128,6 +1128,8 @@ final journal. If termination cannot be confirmed, or journal persistence or
 database publication fails, the lease stays retained. Publication failures do
 not spend the child settlement budget. A canceled protocol write retains its
 bytes and offset so settlement can finish the JSON line before closing stdin.
+Forced termination can lose a provider-accepted rotation that the child has not
+written to its journal. That case can require a new login.
 A timeout is unknown
 completion, not proof that the provider rejected a grant.
 
