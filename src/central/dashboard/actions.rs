@@ -41,9 +41,26 @@ async fn check_request(
     headers: &HeaderMap,
     input: &RevokeForm,
 ) -> Result<super::managed::User, HttpError> {
-    if headers.get("origin").and_then(|v| v.to_str().ok())
-        != Some(enrollment::browser_origin(broker)?)
-    {
+    let expected = reqwest::Url::parse(enrollment::browser_origin(broker)?).map_err(|_| {
+        broker.error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dashboard_guard_unavailable",
+        )
+    })?;
+    let origin = headers
+        .get("origin")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (_, authority) = value.split_once("://")?;
+            if authority.contains(['/', '\\', '?', '#', '@'])
+                || value.chars().any(char::is_whitespace)
+            {
+                return None;
+            }
+            reqwest::Url::parse(value).ok()
+        })
+        .map(|url| url.origin());
+    if origin != Some(expected.origin()) {
         return Err(broker.error(StatusCode::FORBIDDEN, "dashboard_origin_refused"));
     }
     let session = enrollment::browser_session_token(broker, headers)

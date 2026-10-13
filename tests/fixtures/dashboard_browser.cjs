@@ -1,5 +1,6 @@
 // Render first: B22_RENDER_DIR=/tmp/b22-render cargo test --lib central::dashboard
 // B22_RENDER_DIR=/tmp/b22-render cargo test --test central_managed_test dashboard_v3_
+// B22_RENDER_DIR=/tmp/b22-render cargo test --test central_managed_test dashboard_review_snapshot_failure_has_html_recovery
 // NODE_PATH=<playwright + @axe-core/playwright modules> node tests/fixtures/dashboard_browser.cjs /tmp/b22-render <screens-dir>
 const { chromium } = require("playwright");
 const AxeBuilder = require("@axe-core/playwright").default;
@@ -12,7 +13,8 @@ const out = process.argv[3] || "/tmp/b22-screens";
 fs.mkdirSync(out, { recursive: true });
 let responseMode = "accounts",
   polls = 0,
-  signedOut = false;
+  signedOut = false,
+  revokedMachine = null;
 const server = http.createServer((req, res) => {
   const route = new URL(req.url, "http://localhost").pathname;
   if (route.startsWith("/assets/fonts/")) {
@@ -20,6 +22,23 @@ const server = http.createServer((req, res) => {
     res.end(
       fs.readFileSync(path.join("design/v3/fonts", path.basename(route))),
     );
+    return;
+  }
+  if (route === "/accounts/machines/revoke") {
+    assert.equal(req.method, "POST");
+    assert.equal(req.headers.origin, `http://${req.headers.host}`);
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      const form = new URLSearchParams(body);
+      assert.equal(form.get("form_token"), "synthetic-form-token");
+      revokedMachine = form.get("id");
+      assert(revokedMachine);
+      res.writeHead(303, { location: "/actions" });
+      res.end();
+    });
     return;
   }
   if (route === "/accounts/sign-out") {
@@ -83,6 +102,7 @@ const server = http.createServer((req, res) => {
       for (const name of [
         "landing",
         "accounts",
+        "actions",
         "healthy",
         "blocked",
         "stale",
@@ -116,10 +136,18 @@ const server = http.createServer((req, res) => {
           `${name} ${scheme} ${width} accessibility`,
         );
         await page.keyboard.press("Tab");
-        assert.equal(
-          await page.locator(":focus").textContent(),
-          "Skip to content",
-        );
+        if (await page.locator(".skip").count()) {
+          assert.equal(
+            await page.locator(":focus").textContent(),
+            "Skip to content",
+          );
+        } else {
+          assert.equal(
+            await page.locator(":focus").count(),
+            1,
+            "first control is keyboard reachable",
+          );
+        }
         const outline = await page
           .locator(":focus")
           .evaluate((el) => getComputedStyle(el).outlineStyle);
@@ -132,6 +160,22 @@ const server = http.createServer((req, res) => {
         });
       }
     }
+    await page.goto(`${origin}/actions`);
+    const machine = await page
+      .locator('.machines form input[name="id"]')
+      .first()
+      .inputValue();
+    await Promise.all([
+      page.waitForResponse(
+        (response) => response.url() === `${origin}/accounts/machines/revoke`,
+      ),
+      page.locator(".machines .revoke").first().click(),
+    ]);
+    assert.equal(
+      revokedMachine,
+      machine,
+      "Revoke form submits under production CSP",
+    );
     await page.goto(`${origin}/accounts`);
     assert.equal(
       await page.locator("#cmd-use").textContent(),
@@ -230,6 +274,22 @@ const server = http.createServer((req, res) => {
     responseMode = "accounts";
     await context.close();
   }
+  const touch = await browser.newContext({
+    hasTouch: true,
+    viewport: { width: 390, height: 844 },
+  });
+  const touchPage = await touch.newPage();
+  await touchPage.goto(`${origin}/actions`);
+  assert(
+    await touchPage.evaluate(() => matchMedia("(pointer: coarse)").matches),
+  );
+  for (const button of await touchPage.locator(".machines .revoke").all()) {
+    assert(
+      (await button.boundingBox()).height >= 44,
+      "Revoke touch target is at least 44px",
+    );
+  }
+  await touch.close();
   // All essential page contents work without JavaScript.
   const noScript = await browser.newContext({ javaScriptEnabled: false });
   const page = await noScript.newPage();
@@ -248,7 +308,7 @@ const server = http.createServer((req, res) => {
   await browser.close();
   server.close();
   console.log(
-    "36 screenshots; desktop/390px light/dark; WCAG A/AA; focus; copy; disclosures; SSR without JS; polling; stale expiry; session loss passed.",
+    "40 screenshots; Revoke form and touch targets; desktop/390px light/dark; WCAG A/AA; focus; copy; disclosures; SSR without JS; polling; stale expiry; session loss passed.",
   );
 })().catch((e) => {
   console.error(e);

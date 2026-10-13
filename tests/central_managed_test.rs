@@ -5272,6 +5272,7 @@ fn background_recovery_recreates_an_unhealthy_owner() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+    std::fs::remove_file(server.root.path().join("counter-write-delay")).unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if server.token(&server.amir, "personal", None).status() == 200 {

@@ -1251,9 +1251,13 @@ impl BrowserFixture {
                 .contains("form-action 'self'")
         );
         let html = page.text().await.unwrap();
-        html.split("name=\"form_token\" value=\"")
-            .nth(1)
+        html.split("<input")
+            .filter_map(|element| element.split('>').next())
+            .find(|element| element.contains("name=\"form_token\""))
             .expect("Revoke form on PostgreSQL dashboard")
+            .split("value=\"")
+            .nth(1)
+            .expect("form token value")
             .split('"')
             .next()
             .unwrap()
@@ -1929,4 +1933,81 @@ async fn postgres_dashboard_revoke_keeps_one_audit_when_commit_acknowledgement_i
     f.finish().await;
     proxy.kill().await.unwrap();
     proxy.wait().await.unwrap();
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_accepts_canonical_origin() {
+    let mut f = BrowserFixture::start().await;
+    let database = f.database();
+    let key = f._root.path().join("key");
+    for pod in [&mut f.first, &mut f.second] {
+        pod.stop().await;
+        let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
+        store::atomic_write(&root.path().join("public-url"), b"http://127.0.0.1:80").unwrap();
+        *pod = Pod::spawn(&database, &key, root, "postgres").await;
+    }
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("canonical-origin-machine", "synthetic-origin-machine-token")
+        .await;
+    let token = f.form_token(&session).await;
+    for origin in ["null", "http://elsewhere.invalid", "http://127.0.0.1:81"] {
+        let response = f
+            .http
+            .post(format!("{}/accounts/machines/revoke", f.second.url))
+            .header("cookie", &session)
+            .header("origin", origin)
+            .form(&[("id", "canonical-origin-machine"), ("form_token", &token)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+    }
+    let response = f
+        .http
+        .post(format!("{}/accounts/machines/revoke", f.second.url))
+        .header("cookie", &session)
+        .header("origin", "http://127.0.0.1")
+        .form(&[("id", "canonical-origin-machine"), ("form_token", &token)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_render_failure_is_uncacheable_html() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    f.machine("render-machine", "synthetic-render-machine-token")
+        .await;
+    f.form_token(&session).await;
+    std::fs::remove_file(f._root.path().join("key")).unwrap();
+    for route in ["/accounts", "/accounts/data"] {
+        let response = f
+            .http
+            .get(format!("{}{route}", f.first.url))
+            .header("cookie", &session)
+            .header("accept", "text/html")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        assert!(response.text().await.unwrap().contains("data-load-error"));
+    }
+    f.finish().await;
 }

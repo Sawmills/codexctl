@@ -181,7 +181,9 @@ process and a synthetic OIDC issuer with RSA signatures and PKCE checks.
 To reproduce the optional browser checks on a development machine with Node:
 
 ```sh
-B16_RENDER_DIR=/tmp/b16-render cargo test --locked --test central_managed_test dashboard_pages_pin
+B22_RENDER_DIR=/tmp/b16-render cargo test --locked --lib central::dashboard
+B22_RENDER_DIR=/tmp/b16-render cargo test --locked --test central_managed_test dashboard_v3_
+B22_RENDER_DIR=/tmp/b16-render cargo test --locked --test central_managed_test dashboard_review_snapshot_failure_has_html_recovery
 npm install --prefix /tmp/b16-browser playwright @axe-core/playwright
 /tmp/b16-browser/node_modules/.bin/playwright install chromium
 NODE_PATH=/tmp/b16-browser/node_modules node tests/fixtures/dashboard_browser.cjs /tmp/b16-render
@@ -189,7 +191,8 @@ NODE_PATH=/tmp/b16-browser/node_modules node tests/fixtures/dashboard_browser.cj
 
 Install Chromium's OS libraries if needed with Playwright's `install-deps chromium`.
 The harness captures light/dark desktop and phone views, checks WCAG A/AA rules with
-axe, and exercises copy buttons, polling, hostile-looking text, and session loss.
+axe, and exercises Revoke form submission under CSP, touch targets, copy buttons,
+polling, hostile-looking text, and session loss.
 Hosted CI remains the full Rust/platform/build/audit/Trunk gate. HQ owns deployment;
 Amir approves the visual design before merge. Ship after v0.1.35.
 

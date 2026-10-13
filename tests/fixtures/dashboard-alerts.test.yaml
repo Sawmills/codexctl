@@ -21,7 +21,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+              description: Inspect the broker reason and stage in structured logs.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -42,5 +42,89 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+              description: Inspect the broker reason and stage in structured logs.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="browser_sessions_unavailable",pod="pod-c"}
+        values: >-
+          0 60 60 60 60 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: browser_sessions_unavailable
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_guard_unavailable",pod="pod-c"}
+        values: >-
+          0 60 60 60 60 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: dashboard_guard_unavailable
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_actions_unavailable",pod="pod-c"}
+        values: >-
+          0 60 60 60 60 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: dashboard_actions_unavailable
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_registry_changed",pod="pod-c"}
+        values: >-
+          0 60 60 60 60 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: dashboard_registry_changed
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []

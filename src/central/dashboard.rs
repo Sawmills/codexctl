@@ -20,45 +20,54 @@ use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 
 async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
-    match snapshot(&broker, &headers, Instant::elapsed).await {
+    let response = match snapshot(&broker, &headers, Instant::elapsed).await {
         Ok(snapshot) => match actions::render(&broker, &headers, &snapshot) {
             Ok(html) => document(&html),
-            Err(error) => error.into_response(),
+            Err(error) => error_page(error),
         },
-        Err(error) => {
-            let error = error.into_response();
-            if error.status() == StatusCode::UNAUTHORIZED {
-                return (
-                    [("cache-control", "no-store")],
-                    Redirect::to("/accounts/sign-in"),
-                )
-                    .into_response();
-            }
-            let mut response = document(include_str!("dashboard/error.html"));
-            *response.status_mut() = error.status();
-            // Keep the already-recorded failure marker for the HTTP observer.
-            response
-                .extensions_mut()
-                .extend(error.into_parts().0.extensions);
-            response
-        }
+        Err(error) => error_page(error),
+    };
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return (
+            [("cache-control", "no-store")],
+            Redirect::to("/accounts/sign-in"),
+        )
+            .into_response();
     }
+    response
 }
+
+fn error_page(error: HttpError) -> Response {
+    let error = error.into_response();
+    let mut response = document(include_str!("dashboard/error.html"));
+    *response.status_mut() = error.status();
+    // Keep the already-recorded failure marker for the HTTP observer.
+    response
+        .extensions_mut()
+        .extend(error.into_parts().0.extensions);
+    response
+}
+
 async fn data(
     State(broker): State<Broker>,
     headers: HeaderMap,
     elapsed: fn(&Instant) -> Duration,
 ) -> Result<Response, HttpError> {
-    let snapshot = snapshot(&broker, &headers, elapsed).await?;
+    let snapshot = snapshot(&broker, &headers, elapsed).await;
     if headers.get("accept").is_some_and(|v| v == "text/html") {
-        return Ok(document(&actions::render(&broker, &headers, &snapshot)?));
+        return Ok(
+            match snapshot.and_then(|snapshot| actions::render(&broker, &headers, &snapshot)) {
+                Ok(html) => document(&html),
+                Err(error) => error_page(error),
+            },
+        );
     }
     Ok((
         [
             ("cache-control", "no-store"),
             ("x-content-type-options", "nosniff"),
         ],
-        Json(snapshot),
+        Json(snapshot?),
     )
         .into_response())
 }

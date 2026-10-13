@@ -1311,3 +1311,9 @@ table:has(> tbody:empty) + .machines-note {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
+
+@media (pointer: coarse) {
+  .machines .revoke {
+    min-height: 44px;
+  }
+}
