@@ -651,15 +651,25 @@ impl CentralStore {
                     vault: serde_json::to_value(value)?,
                     revision,
                 };
-                if target
+                let copy = target
                     .load_account(&record.account_id)
                     .await?
-                    .is_some_and(|existing| existing.revision >= record.revision)
-                {
-                    continue;
+                    .is_none_or(|existing| existing.revision < record.revision);
+                if copy {
+                    target.save_account(&record).await.with_context(|| {
+                        format!(
+                            "backfill write failed: central_accounts row {}",
+                            record.account_id
+                        )
+                    })?;
                 }
-                target.save_account(&record).await?;
-                counts.accounts += 1;
+                if target.load_account(&record.account_id).await?.as_ref() != Some(&record) {
+                    bail!(
+                        "backfill source mismatch: central_accounts row {}",
+                        record.account_id
+                    );
+                }
+                counts.accounts += usize::from(copy);
             }
         }
         for (name, path) in [
@@ -680,20 +690,33 @@ impl CentralStore {
                                 None,
                             )
                             .await?;
+                        let matches: bool = target.client().await?.query_one(
+                            "SELECT EXISTS(SELECT 1 FROM central_users WHERE id=$1 AND email=$2 AND enabled=$3 AND oidc_identity IS NOT DISTINCT FROM $4 AND deleted_at IS NULL)",
+                            &[&user.id, &user.email, &user.enabled, &user.oidc_identity],
+                        ).await?.get(0);
+                        if !matches {
+                            bail!("backfill source mismatch: central_users row {}", user.id);
+                        }
                     }
                     counts.users = users.len();
                 } else {
                     let devices =
                         serde_json::from_slice::<Vec<crate::central::vault::Device>>(&bytes)?;
                     for device in &devices {
+                        let payload = serde_json::to_vec(device)?;
                         target
-                            .save_device_entity_cas(
-                                &device.tenant,
-                                &device.id,
-                                &serde_json::to_vec(device)?,
-                                None,
-                            )
+                            .save_device_entity_cas(&device.tenant, &device.id, &payload, None)
                             .await?;
+                        if target
+                            .load_device_entity_revision(&device.tenant, &device.id)
+                            .await?
+                            .is_none_or(|(_, stored, _)| stored != payload)
+                        {
+                            bail!(
+                                "backfill source mismatch: central_devices row {}",
+                                device.id
+                            );
+                        }
                     }
                     counts.devices = devices.len();
                 }

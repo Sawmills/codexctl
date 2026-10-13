@@ -600,6 +600,13 @@ impl PostgresStore {
             let _admission_timing = lock_admission(&tx).await?;
             for (user,alias,target) in aliases {
                 tx.execute("INSERT INTO central_alias_tombstones(user_id,alias,target) VALUES($1,$2,$3) ON CONFLICT(user_id,alias) DO UPDATE SET target=EXCLUDED.target",&[&user,&alias,&target]).await?;
+                let matches: bool = tx.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM central_alias_tombstones WHERE user_id=$1 AND alias=$2 AND target=$3 AND deleted_at IS NULL)",
+                    &[&user,&alias,&target],
+                ).await?.get(0);
+                if !matches {
+                    bail!("backfill source mismatch: central_alias_tombstones row {user}/{alias}");
+                }
             }
             tx.commit().await?;
             Ok(())

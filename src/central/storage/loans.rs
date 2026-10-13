@@ -11,7 +11,7 @@ use super::{CentralStore, FileStore, PostgresStore, bounded_db};
 use crate::central::loans::{
     AuditEvent, AuditKind, CredentialSubject, EndReason, Grant, RETENTION_SECONDS,
 };
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 /// Bound on history rows read for one caller.
 const READ_LIMIT: usize = 10_000;
@@ -873,7 +873,7 @@ impl PostgresStore {
     }
 
     /// Copy file-mode grants with their audit events. A grant already in the
-    /// table is skipped with its events, so a repeated backfill adds nothing.
+    /// table is skipped with its events only when the stored source fields match.
     /// Returns the number of grants copied.
     pub(super) async fn import_loans(
         &self,
@@ -933,6 +933,54 @@ impl PostgresStore {
                 )
                 .await?;
             let created: i64 = row.get(0);
+            let stored = client
+                .query_opt(
+                    concat!(
+                        "SELECT ",
+                        grant_columns!(),
+                        " FROM ",
+                        loans_table!(),
+                        " WHERE id=$1"
+                    ),
+                    &[&grant.id],
+                )
+                .await?
+                .as_ref()
+                .map(grant_from_row)
+                .transpose()?;
+            if stored.as_ref() != Some(grant) {
+                bail!("backfill source mismatch: account_loans row {}", grant.id);
+            }
+            let mut stored: Vec<AuditEvent> = client
+                .query(
+                    concat!(
+                        "SELECT ",
+                        audit_columns!(),
+                        " FROM ",
+                        audit_table!(),
+                        " WHERE grant_id=$1"
+                    ),
+                    &[&grant.id],
+                )
+                .await?
+                .iter()
+                .map(audit_from_row)
+                .collect::<Result<_>>()?;
+            for expected in events {
+                let Some(index) = stored.iter().position(|event| event == expected) else {
+                    bail!(
+                        "backfill source mismatch: account_loan_audit for grant {}",
+                        grant.id
+                    );
+                };
+                stored.swap_remove(index);
+            }
+            if !stored.is_empty() {
+                bail!(
+                    "backfill source mismatch: account_loan_audit for grant {}",
+                    grant.id
+                );
+            }
             copied += usize::try_from(created)?;
         }
         Ok(copied)
