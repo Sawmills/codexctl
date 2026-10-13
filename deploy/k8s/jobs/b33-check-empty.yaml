@@ -52,14 +52,33 @@ spec:
                 inventory_table record;
                 row_count bigint;
                 table_count integer := 0;
+                allowed_schema name := current_schema();
               BEGIN
                 IF pg_catalog.current_database() <> 'codexctl_a5' THEN
                   RAISE EXCEPTION 'inventory requires codexctl_a5';
                 END IF;
+                -- Discover every application table from catalog metadata first.
+                -- Any table outside the selected schema fails before a row probe.
                 FOR inventory_table IN
                   SELECT table_schema, table_name
                   FROM information_schema.tables
-                  WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+                  WHERE table_type = 'BASE TABLE'
+                    AND table_schema NOT IN ('pg_catalog', 'information_schema')
+                    AND table_schema NOT LIKE 'pg_toast%'
+                    AND table_schema NOT LIKE 'pg_temp%'
+                  ORDER BY table_schema, table_name
+                LOOP
+                  IF inventory_table.table_schema <> allowed_schema::text THEN
+                    RAISE EXCEPTION 'inventory table %.% outside allowed schema %',
+                                    inventory_table.table_schema,
+                                    inventory_table.table_name,
+                                    allowed_schema;
+                  END IF;
+                END LOOP;
+                FOR inventory_table IN
+                  SELECT table_schema, table_name
+                  FROM information_schema.tables
+                  WHERE table_schema = allowed_schema::text AND table_type = 'BASE TABLE'
                   ORDER BY table_name
                 LOOP
                   EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 50001) s',

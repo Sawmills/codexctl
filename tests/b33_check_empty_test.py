@@ -62,7 +62,14 @@ class InventoryJobTest(unittest.TestCase):
         self.assertIn("requires codexctl_a5", wrong_database.stderr)
         self.assertNotIn("inventory complete", wrong_database.stderr)
         sql(f"CREATE SCHEMA {schema}")
+        rogue_schema = "b33_rogue_" + uuid.uuid4().hex
         try:
+            sql(f"CREATE SCHEMA {rogue_schema}; CREATE TABLE {rogue_schema}.unexpected_rows (n integer)")
+            outside_allowed = inventory()
+            self.assertNotEqual(outside_allowed.returncode, 0, "inventory ignored a non-system schema")
+            self.assertIn("outside allowed schema", outside_allowed.stderr)
+            self.assertNotIn("inventory complete", outside_allowed.stderr)
+            sql(f"DROP SCHEMA {rogue_schema} CASCADE")
             empty = inventory()
             self.assertEqual(empty.returncode, 0, empty.stderr)
             self.assertNotIn("inventory table=", empty.stderr)
@@ -79,6 +86,7 @@ class InventoryJobTest(unittest.TestCase):
             self.assertIn("exceeds 50000 rows", refused.stderr)
             self.assertNotIn("inventory complete", refused.stderr)
         finally:
+            sql(f"DROP SCHEMA IF EXISTS {rogue_schema} CASCADE")
             sql(f"DROP SCHEMA {schema} CASCADE")
 
 
