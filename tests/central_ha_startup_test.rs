@@ -3851,6 +3851,142 @@ async fn postgres_native_timeout_keeps_the_lease_until_late_rotation_is_publishe
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
+async fn postgres_owner_initialize_obeys_the_native_deadline() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let refused = timeout(
+        Duration::from_secs(13),
+        request(&f.http, &f.first, &f.token),
+    )
+    .await;
+    if refused.is_err() {
+        store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!("owner initialization held the client beyond the native deadline");
+    }
+    assert_eq!(refused.unwrap().status(), 503);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.second.launches(), 0, "initialization retains its lease");
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["billingClass"],
+                    "rate_limited"
+                );
+                break;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initialization settlement must release the lease");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lease_release() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let first_launches = f.first.launches();
+    store::atomic_write(
+        &f.first.root.path().join("mode"),
+        b"owner-native-hung-journal",
+    )
+    .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(13),
+            request(&f.http, &f.first, &f.token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        503
+    );
+    let pid: i32 = std::fs::read_to_string(f.first.root.path().join("native-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "retain the live child during settlement"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.first.launches(), first_launches + 1);
+    assert_eq!(f.second.launches(), 0, "a peer must not overlap settlement");
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let delivered = timeout(Duration::from_secs(40), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if delivered.is_err() {
+        store::atomic_write(&f.first.root.path().join("native-release"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!(
+            "hung native child kept its lease instead of being killed after bounded settlement attempts"
+        );
+    }
+    let delivered = delivered.unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "reap the old child before a successor can serve"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert_eq!(
+        generation(&delivered),
+        generation(&before) + 1,
+        "publish the killed child's final journal"
+    );
+    assert_eq!(delivered["billingClass"], "rate_limited");
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let killed: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("codexctl_central_owner_settlement_killed_total{account=\"seat\",")
+        })
+        .collect();
+    assert_eq!(killed.len(), 1, "{metrics}");
+    assert!(
+        killed[0].ends_with("} 1"),
+        "count confirmed termination once: {metrics}"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
 async fn postgres_rejection_with_eof_settles_the_owner_and_releases_its_lease() {
     let f = login_fixture().await;
     store::atomic_write(&f.first.root.path().join("mode"), b"refresh-reused-eof").unwrap();

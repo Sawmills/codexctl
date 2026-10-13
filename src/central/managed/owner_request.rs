@@ -1,6 +1,7 @@
 //! Refresh-owner token transactions. The machine handler owns admission, lease
 //! retention, native retry, journal capture, publication and deferred settlement.
 //! Private probes use the same read policy but cannot substitute a cached token.
+#[path = "renewal.rs"]
 mod renewal;
 
 use super::*;
@@ -12,6 +13,37 @@ use crate::central::{
 const NATIVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 const FAILED_SETTLEMENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_FAILED_SETTLEMENTS: u8 = 3;
+
+pub(super) async fn initialize_owner(owner: &mut Owner) -> Result<()> {
+    owner
+        .rpc
+        .as_mut()
+        .context("missing owner")?
+        .initialize_with_deadline(NATIVE_DEADLINE)
+        .await?;
+    owner.snapshot()?;
+    if !owner.vault.verified {
+        let status = owner
+            .rpc
+            .as_mut()
+            .context("missing owner")?
+            .remember_exportable_login(NATIVE_DEADLINE)
+            .await;
+        // Even the cached-status call can refresh. Persist its journal and
+        // rejection evidence before returning any protocol or loading error.
+        owner.snapshot()?;
+        if owner.rpc.as_ref().is_some_and(|rpc| rpc.rejected_login()) {
+            owner.refresh_failed(None).await;
+        }
+        let token = status?;
+        if token != vault::token(&owner.vault.auth)? {
+            bail!("native owner exported a login that differs from its journal");
+        }
+        owner.verification_input = Some(owner.vault.auth.clone());
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy)]
 enum BillingRead {
@@ -192,6 +224,17 @@ impl NativeRead<'_> {
                 params["refreshToken"] = json!(false);
             }
             tokio::time::sleep(RETRY_BACKOFF).await;
+            if !self
+                .owner
+                .rpc
+                .as_mut()
+                .is_some_and(Rpc::resume_completed_native_error)
+            {
+                if self.owner.rpc.as_ref().is_some_and(Rpc::rejected_login) {
+                    self.owner.refresh_failed(None).await;
+                }
+                return Err(error);
+            }
         }
     }
 
@@ -285,7 +328,7 @@ impl NativeRead<'_> {
             && let Some(rpc) = self.owner.rpc.as_mut()
             && !rpc.verified_login()
         {
-            rpc.inspect_rejection().await;
+            rpc.inspect_rejection(NATIVE_DEADLINE).await;
         }
         let snapshot = self.owner.snapshot();
         if snapshot.is_err() {
@@ -449,6 +492,10 @@ async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<Crede
     {
         rpc.settle_and_stop().await?;
     }
+    stopped_owner_record(owner, before)
+}
+
+fn stopped_owner_record(owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
     owner.snapshot()?;
     if serde_json::to_value(&owner.vault)? != serde_json::to_value(before)? {
         owner.vault.revision = owner
@@ -462,6 +509,39 @@ async fn settled_owner_record(owner: &mut Owner, before: &Vault) -> Result<Crede
     owner.rpc = None;
     owner.refresh_enabled = false;
     Ok(record)
+}
+
+/// Child settlement failures spend the budget; journal or database failures
+/// retain the dead child's output and never spend a child termination budget.
+#[derive(Default)]
+struct BackgroundSettlement {
+    failed_attempts: u8,
+}
+
+impl BackgroundSettlement {
+    async fn record(&mut self, owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
+        if let Some(rpc) = owner.rpc.as_mut() {
+            if self.failed_attempts >= MAX_FAILED_SETTLEMENTS {
+                if rpc.kill_and_reap().await? {
+                    crate::central::refresh_control::settlement_killed(&before.alias, &before.user);
+                    eprintln!(
+                        "{}",
+                        json!({"operation":"owner_settlement","stage":"child","reason":"settlement_killed","account":before.alias.to_ascii_lowercase(),"account_key":account_key(&before.user, &before.alias),"failed_attempts":self.failed_attempts})
+                    );
+                }
+            } else if !rpc.process_exited() {
+                let result = tokio::time::timeout(NATIVE_DEADLINE, rpc.settle_and_stop())
+                    .await
+                    .context("owner settlement timed out; runtime retained")
+                    .and_then(|result| result);
+                if let Err(error) = result {
+                    self.failed_attempts += 1;
+                    return Err(error);
+                }
+            }
+        }
+        stopped_owner_record(owner, before)
+    }
 }
 
 async fn settle_foreground(owner: &mut Owner, before: &Vault) -> Result<CredentialRecord> {
@@ -512,6 +592,7 @@ pub(super) async fn settle_background_recovery(
     stopping: Arc<AtomicBool>,
 ) {
     let _settlement = settlements.mark(&owner_ref);
+    let mut settlement = BackgroundSettlement::default();
     loop {
         // Shared-store shutdown must drain the child's final rotation to the
         // database before releasing its lease and the shutdown work permit.
@@ -555,7 +636,7 @@ pub(super) async fn settle_background_recovery(
                 if owner.recovery_generation != recovery_generation {
                     return Ok(None);
                 }
-                settled_owner_record(&mut owner, &before).await.map(Some)
+                settlement.record(&mut owner, &before).await.map(Some)
             };
             if let Some(window) = lease_window.as_ref() {
                 let mut settle = Box::pin(settle);

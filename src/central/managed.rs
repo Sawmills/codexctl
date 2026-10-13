@@ -1,7 +1,7 @@
 //! Multi-user broker. One process and one persistent disk own every refresh token.
 mod owner_request;
 
-use owner_request::{recover_unhealthy_owners, token};
+use owner_request::{initialize_owner, recover_unhealthy_owners, token};
 // Existing authority/epoch tests exercise private implementation seams only.
 #[cfg(test)]
 use owner_request::{
@@ -2363,36 +2363,6 @@ fn spawn_owner(
         &owner.home.join("pid"),
         &serde_json::to_vec(&super::process::Process::capture(pid)?)?,
     )?;
-    Ok(())
-}
-
-async fn initialize_owner(owner: &mut Owner) -> Result<()> {
-    owner
-        .rpc
-        .as_mut()
-        .context("missing owner")?
-        .initialize()
-        .await?;
-    owner.snapshot()?;
-    if !owner.vault.verified {
-        let status = owner
-            .rpc
-            .as_mut()
-            .context("missing owner")?
-            .remember_exportable_login()
-            .await;
-        // Even the cached-status call can refresh. Persist its journal and
-        // rejection evidence before returning any protocol or loading error.
-        owner.snapshot()?;
-        if owner.rpc.as_ref().is_some_and(|rpc| rpc.rejected_login()) {
-            owner.refresh_failed(None).await;
-        }
-        let token = status?;
-        if token != vault::token(&owner.vault.auth)? {
-            bail!("native owner exported a login that differs from its journal");
-        }
-        owner.verification_input = Some(owner.vault.auth.clone());
-    }
     Ok(())
 }
 

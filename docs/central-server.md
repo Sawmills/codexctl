@@ -1103,10 +1103,15 @@ twice. Repeated errors can still serve a proven unexpired access token when
 its exact auth revision has native routing proof. Billing requests refuse
 when fresh evidence is unavailable. A classified provider rejection still
 fences the refresh owner; an expired token after failed retry is retryable.
+Completed native errors preserve protocol health even after the retry budget
+is spent, so billing can resume on the same child when the upstream recovers.
+Permanent rejection evidence is retained for that child and rechecked after
+retry backoff; a delayed stderr line cannot be discarded by the next call.
 A cached fallback withdraws shared fast-path evidence until a native routing
 read succeeds again.
 
-Refresh-owner reads have a 10-second deadline. After a failed or timed-out read,
+Refresh-owner initialization, cached-auth status and native reads each have a
+10-second deadline. After a failed or timed-out read,
 foreground settlement waits at most one second. Clean successful reads retain
 the normal 30-second child-exit grace. Unresolved calls settle in background work with the lease
 retained and no overlapping refresh owner. The final journal must be saved
@@ -1117,6 +1122,12 @@ its failed-read child cannot stop within the foreground settlement deadline.
 The response waits for credential publication, rather than exporting an
 unpublished journal while background settlement continues. The retained lease
 prevents another refresh owner; valid-token service resumes after settlement.
+Background child settlement permits three failed attempts, each bounded to
+10 seconds. It then kills and reaps the child before reading and publishing its
+final journal. If termination cannot be confirmed, or journal persistence or
+database publication fails, the lease stays retained. Publication failures do
+not spend the child settlement budget. A canceled protocol write retains its
+bytes and offset so settlement can finish the JSON line before closing stdin.
 A timeout is unknown
 completion, not proof that the provider rejected a grant.
 
@@ -1169,6 +1180,12 @@ survives a successful recovery, resets when the server process restarts, and is
 emitted after the first failure. Scraping it does not acquire refresh-owner locks;
 a pending owner cannot block its failure count. The existing aggregate
 `codexctl_central_owner_recovery_total{result}` remains request-driven.
+`codexctl_central_owner_settlement_killed_total{account,account_key}` counts a
+confirmed forced child termination once, with the same bounded account labels.
+The `owner_settlement` log records `reason=settlement_killed` and the attempt
+count. The initial timeout or owner-unavailable failure uses the existing staging
+failure alerts; the termination counter adds diagnostic evidence. The local
+process tests verify this counter, not live warning delivery.
 Requests during the delay return
 `503 owner_unavailable` with `Retry-After` set to the remaining cooldown in
 whole seconds, rounded up. An unmarked native error from `account/read` or

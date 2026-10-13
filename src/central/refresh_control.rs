@@ -29,6 +29,20 @@ fn account_failures() -> &'static Mutex<BTreeMap<AccountFailureKey, u64>> {
     FAILURES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn settlement_kills() -> &'static Mutex<BTreeMap<AccountFailureKey, u64>> {
+    static KILLS: OnceLock<Mutex<BTreeMap<AccountFailureKey, u64>>> = OnceLock::new();
+    KILLS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+pub(super) fn settlement_killed(alias: &str, user: &str) {
+    let key = super::managed::account_key(user, alias);
+    let mut kills = settlement_kills().lock().expect("settlement metric lock");
+    let count = kills
+        .entry((alias.to_ascii_lowercase(), key[..12].to_owned()))
+        .or_default();
+    *count = count.saturating_add(1);
+}
+
 /// Counts failed probes, launches and settlement retries without holding an
 /// owner lock during a scrape. Labels match the provider-rejection metric.
 pub(super) fn recovery_failed(alias: &str, user: &str) {
@@ -78,17 +92,26 @@ pub(super) fn metrics() -> String {
             RECOVERY[index].load(Ordering::Relaxed)
         ));
     }
-    text.push_str("# TYPE codexctl_central_owner_recovery_failed_total counter\n");
-    for ((alias, key), count) in account_failures()
-        .lock()
-        .expect("recovery metric lock")
-        .iter()
-    {
-        let alias = alias
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('\n', "\\n");
-        text.push_str(&format!("codexctl_central_owner_recovery_failed_total{{account=\"{alias}\",account_key=\"{key}\"}} {count}\n"));
+    for (name, counts) in [
+        (
+            "codexctl_central_owner_recovery_failed_total",
+            account_failures(),
+        ),
+        (
+            "codexctl_central_owner_settlement_killed_total",
+            settlement_kills(),
+        ),
+    ] {
+        text.push_str(&format!("# TYPE {name} counter\n"));
+        for ((alias, key), count) in counts.lock().expect("recovery metric lock").iter() {
+            let alias = alias
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            text.push_str(&format!(
+                "{name}{{account=\"{alias}\",account_key=\"{key}\"}} {count}\n"
+            ));
+        }
     }
     text.push_str("# TYPE codexctl_central_forced_refresh_total counter\n");
     for (index, outcome) in ["refreshed", "served_recent"].into_iter().enumerate() {

@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import sys
+import threading
 import time
 
 home = pathlib.Path(os.environ["CODEX_HOME"])
@@ -156,20 +157,49 @@ for line in sys.stdin:
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
         routing_mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if routing_mode == "owner-callback-write-hold":
+            mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            # Arrive after the native read deadline, during foreground settlement.
+            time.sleep(10.25)
+            callback_id = "synthetic-callback-" + "x" * 262144
+            send({"id":callback_id,"method":"synthetic/request","params":{}})
+            while not mode_file.with_name("native-release").exists():
+                time.sleep(0.01)
+            reply = json.loads(sys.stdin.readline())
+            assert reply["id"] == callback_id and reply["error"]["code"] == -32601
+            mode_file.with_name("callback-reply-complete").write_text("complete")
+            rotate()
+            send({"id":message["id"],"result":{"account":{"type":"chatgpt"},"workspaceRouting":{"chatgptAccountId":tokens(json.loads(auth_path.read_text()))["account_id"],"backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}}})
+            continue
+        if routing_mode == "owner-late-rejection":
+            mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            count = mode_file.with_name("native-read-count")
+            count.write_text(str(int(count.read_text()) + 1))
+            if int(count.read_text()) == 1:
+                def reject_later():
+                    time.sleep(0.4)
+                    print("Failed to refresh token: Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.", file=sys.stderr, flush=True)
+                threading.Thread(target=reject_later, daemon=True).start()
+                send({"id":message["id"], "error":{"code":-32603,"message":"synthetic delayed rejection evidence"}})
+                continue
         if routing_mode == "owner-native-slow-once":
             marker = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("native-slow-started")
             if not marker.exists():
                 marker.write_text("started")
                 time.sleep(2)
-        if routing_mode == "owner-native-hold":
+        if routing_mode in ["owner-native-hold", "owner-native-hung-journal"]:
             mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
             mode_file.with_name("native-started").write_text("started")
+            mode_file.with_name("native-pid").write_text(str(os.getpid()))
+            if routing_mode == "owner-native-hung-journal":
+                rotate()
             # Split a response across the deadline to exercise canceled reads.
             sys.stdout.write('{"id":' + str(message["id"]) + ',"result":')
             sys.stdout.flush()
             while not mode_file.with_name("native-release").exists():
                 time.sleep(0.01)
-            rotate()
+            if routing_mode == "owner-native-hold":
+                rotate()
             sys.stdout.write(json.dumps({"account":{"type":"chatgpt"},"workspaceRouting":{"chatgptAccountId":tokens(json.loads(auth_path.read_text()))["account_id"],"backendOrigin":"https://chatgpt.com","accountRoutingOverride":"NO_CONSTRAINT"}}) + '}\n')
             sys.stdout.flush()
             continue
@@ -249,6 +279,11 @@ for line in sys.stdin:
             result["workspaceRouting"]["backendOrigin"] = "https://regional.chatgpt.com"
     elif method == "getAuthStatus":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode == "cached-status-hold":
+            mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            mode_file.with_name("cached-status-started").write_text("started")
+            while not mode_file.with_name("native-release").exists():
+                time.sleep(0.01)
         if mode == "cached-rotation":
             rotate()
         if mode == "cached-rejection" and tokens(json.loads(auth_path.read_text())).get("refresh_token") == "synthetic-rejected-refresh":

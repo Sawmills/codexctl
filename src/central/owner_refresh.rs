@@ -34,6 +34,10 @@ pub(super) struct ReasonSlot {
 }
 
 impl ReasonSlot {
+    pub(super) fn reason(&self) -> Option<&'static str> {
+        *self.reason.lock().expect("refresh reason lock")
+    }
+
     pub(super) fn take(&self) -> Option<&'static str> {
         self.reason.lock().expect("refresh reason lock").take()
     }
