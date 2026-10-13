@@ -1090,6 +1090,12 @@ status is known from the native response or Codex's fixed refresh stderr prefix.
 Each request clears earlier failure metadata. Transient refresh stderr lines
 are reduced to the status, without forwarding their provider detail text.
 
+The `managed::owner_request` module owns the machine token transaction and
+private native probes. Its request-scoped read implementation keeps the retry
+budget, cache eligibility and lease-loss guard private. The same module owns
+foreground and background child settlement, journal publication and lease
+release, so HTTP and probe callers do not choose a native retry or deadline.
+
 An unclassified completed read retries once after 250 ms on the same child.
 The account request shares one retry budget across account, usage, and routing
 reads. A rotated journal is saved before retry, without forcing the rotation
@@ -1106,7 +1112,12 @@ the normal 30-second child-exit grace. Unresolved calls settle in background wor
 retained and no overlapping refresh owner. The final journal must be saved
 before releasing that lease or launching a successor. Requests waiting behind
 this work refuse promptly with `503 owner_unavailable`. Healthy requests retain
-their fair queue position. A timeout is unknown
+their fair queue position. Even a proven plain fallback returns this 503 when
+its failed-read child cannot stop within the foreground settlement deadline.
+The response waits for credential publication, rather than exporting an
+unpublished journal while background settlement continues. The retained lease
+prevents another refresh owner; valid-token service resumes after settlement.
+A timeout is unknown
 completion, not proof that the provider rejected a grant.
 
 `CodexctlOwnerRefreshNativeError` in both staging overlays fires on a new

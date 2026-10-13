@@ -498,8 +498,13 @@ impl Rpc {
             .await
     }
 
-    pub(super) async fn owner_read(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.call_handled(method, params, &mut RejectRequests, Duration::from_secs(10))
+    pub(super) async fn owner_read(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
+        self.call_handled(method, params, &mut RejectRequests, deadline)
             .await
     }
 
