@@ -53,6 +53,9 @@ spec:
                 row_count bigint;
                 table_count integer := 0;
               BEGIN
+                IF pg_catalog.current_database() <> 'codexctl_a5' THEN
+                  RAISE EXCEPTION 'inventory requires codexctl_a5';
+                END IF;
                 FOR inventory_table IN
                   SELECT table_schema, table_name
                   FROM information_schema.tables

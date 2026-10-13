@@ -213,9 +213,12 @@ SELECT count(*) FROM account_refresh_leases WHERE NOT released;
 The inventory query names no table, so it works before migration 1, when no table exists, and counts tables added later, such as the loan tables. Interpret each receipt using its pre- or post-migration rule in prerequisite 3. The lease query runs only after migration, when its table exists. No query reads the login journal across users.
 
 Local regression: with `psql` and PyYAML installed, set `B33_TEST_DATABASE_URL`
-to a disposable loopback PostgreSQL database and run
+to a loopback `codexctl_a5` database URL with an explicit role, no query,
+fragment or password (for example `postgres://postgres@127.0.0.1:55457/codexctl_a5`), and run
 `python3 tests/b33_check_empty_test.py`. It executes the actual Job script in
-read-only mode against empty, 50000-row and 50001-row fixtures. Without the
+read-only mode against empty, 50000-row and 50001-row fixtures in its own
+disposable schema; the actual database-name guard rejects other databases before
+inventory. Routing overrides are rejected before any connection. Without the
 variable it skips. This is an explicit local gate; hosted CI does not run it,
 and lane workflow edits are prohibited by A124.
 

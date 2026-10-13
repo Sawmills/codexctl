@@ -1,6 +1,6 @@
 """Exercise the checked-in Job script on a disposable PostgreSQL schema.
 
-Run with B33_TEST_DATABASE_URL pointing to a disposable local database.
+Run with B33_TEST_DATABASE_URL pointing to local codexctl_a5 using an explicit role.
 Requires psql and PyYAML; never uses the operator's default connection.
 """
 
@@ -9,19 +9,36 @@ from pathlib import Path
 import subprocess
 import unittest
 import uuid
+from unittest import mock
 from urllib.parse import urlparse
 
 import yaml
 
 
 class InventoryJobTest(unittest.TestCase):
+    def test_rejects_routing_overrides_before_psql(self):
+        for url in (
+            "postgresql://postgres@localhost/codexctl_a5?hostaddr=192.0.2.1",
+            "postgresql://localhost/codexctl_a5",
+        ):
+            with self.subTest(url=url), mock.patch.dict(os.environ, {"B33_TEST_DATABASE_URL": url}), mock.patch("subprocess.run") as run:
+                with self.assertRaises(ValueError):
+                    self.test_cap_boundary_and_empty_inventory()
+                run.assert_not_called()
+
     def test_cap_boundary_and_empty_inventory(self):
         url = os.environ.get("B33_TEST_DATABASE_URL")
         if not url:
             self.skipTest("Set B33_TEST_DATABASE_URL to a disposable loopback database")
         target = urlparse(url)
-        if target.hostname not in ("localhost", "127.0.0.1") or target.password:
-            raise ValueError("Use a disposable loopback PostgreSQL database without a password")
+        if (target.scheme not in ("postgres", "postgresql")
+                or target.hostname not in ("localhost", "127.0.0.1")
+                or not target.username or target.password
+                or target.query or target.fragment or target.path != "/codexctl_a5"):
+            raise ValueError("Use an explicit loopback role/codexctl_a5 URL without password, query or fragment")
+        connection_env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+        connection_env.update(PGHOST=target.hostname, PGPORT=str(target.port or 5432),
+                              PGUSER=target.username, PGDATABASE=target.path.lstrip("/"))
         schema = "b33_probe_" + uuid.uuid4().hex
         manifest = yaml.safe_load(
             (Path(__file__).resolve().parents[1] / "deploy/k8s/jobs/b33-check-empty.yaml").read_text()
@@ -30,17 +47,20 @@ class InventoryJobTest(unittest.TestCase):
 
         def sql(statement):
             subprocess.run(
-                ["psql", "-X", "-v", "ON_ERROR_STOP=1", url, "-c", statement],
-                check=True, capture_output=True, text=True,
+                ["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c", statement],
+                env=connection_env, check=True, capture_output=True, text=True,
             )
 
-        def inventory():
-            env = dict(os.environ, PGHOST=target.hostname, PGPORT=str(target.port or 5432),
-                       PGUSER=target.username or "postgres", PGDATABASE=target.path.lstrip("/"),
+        def inventory(database=None):
+            env = dict(connection_env, PGDATABASE=database or connection_env["PGDATABASE"],
                        PGOPTIONS=f"-c search_path={schema} -c default_transaction_read_only=on -c client_min_messages=warning")
             return subprocess.run(["sh", "-ec", script], env=env,
                                   capture_output=True, text=True, timeout=30)
 
+        wrong_database = inventory("postgres")
+        self.assertNotEqual(wrong_database.returncode, 0)
+        self.assertIn("requires codexctl_a5", wrong_database.stderr)
+        self.assertNotIn("inventory complete", wrong_database.stderr)
         sql(f"CREATE SCHEMA {schema}")
         try:
             empty = inventory()

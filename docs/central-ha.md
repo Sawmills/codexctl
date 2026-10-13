@@ -777,7 +777,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
            - name: keys
              emptyDir: {medium: Memory}
    YAML
-   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=10m
+   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=31m
    kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
    ```
 
