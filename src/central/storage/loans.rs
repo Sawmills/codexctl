@@ -983,6 +983,17 @@ impl PostgresStore {
             }
             copied += usize::try_from(created)?;
         }
+        let ids: Vec<_> = grants.keys().map(String::as_str).collect();
+        if let Some(extra) = client
+            .query_opt(
+                "SELECT id FROM account_loans WHERE NOT(id=ANY($1::text[])) LIMIT 1",
+                &[&ids],
+            )
+            .await?
+        {
+            let id: &str = extra.get(0);
+            bail!("backfill source mismatch: account_loans extra row {id}");
+        }
         Ok(copied)
     }
 

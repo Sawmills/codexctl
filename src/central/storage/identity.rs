@@ -598,7 +598,7 @@ impl PostgresStore {
             let mut connection=self.admission_client().await?;
             let tx=connection.transaction().await?;
             let _admission_timing = lock_admission(&tx).await?;
-            for (user,alias,target) in aliases {
+            for (user,alias,target) in &aliases {
                 tx.execute("INSERT INTO central_alias_tombstones(user_id,alias,target) VALUES($1,$2,$3) ON CONFLICT(user_id,alias) DO UPDATE SET target=EXCLUDED.target",&[&user,&alias,&target]).await?;
                 let matches: bool = tx.query_one(
                     "SELECT EXISTS(SELECT 1 FROM central_alias_tombstones WHERE user_id=$1 AND alias=$2 AND target=$3 AND deleted_at IS NULL)",
@@ -607,6 +607,16 @@ impl PostgresStore {
                 if !matches {
                     bail!("backfill source mismatch: central_alias_tombstones row {user}/{alias}");
                 }
+            }
+            let users: Vec<_> = aliases.iter().map(|(user,_,_)| user.as_str()).collect();
+            let names: Vec<_> = aliases.iter().map(|(_,alias,_)| alias.as_str()).collect();
+            if let Some(extra) = tx.query_opt(
+                "SELECT user_id,alias FROM central_alias_tombstones WHERE deleted_at IS NULL AND (user_id,alias) NOT IN (SELECT * FROM unnest($1::text[],$2::text[])) LIMIT 1",
+                &[&users,&names],
+            ).await? {
+                let user: &str = extra.get(0);
+                let alias: &str = extra.get(1);
+                bail!("backfill source mismatch: central_alias_tombstones extra row {user}/{alias}");
             }
             tx.commit().await?;
             Ok(())

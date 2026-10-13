@@ -624,6 +624,9 @@ impl CentralStore {
             observed_relogins: 0,
             loans: 0,
         };
+        let mut account_ids = Vec::new();
+        let mut user_ids = Vec::new();
+        let mut device_ids = Vec::new();
         let accounts = state.join("accounts");
         if accounts.exists() {
             for entry in std::fs::read_dir(accounts)? {
@@ -669,6 +672,7 @@ impl CentralStore {
                         record.account_id
                     );
                 }
+                account_ids.push(record.account_id);
                 counts.accounts += usize::from(copy);
             }
         }
@@ -697,6 +701,7 @@ impl CentralStore {
                         if !matches {
                             bail!("backfill source mismatch: central_users row {}", user.id);
                         }
+                        user_ids.push(user.id.clone());
                     }
                     counts.users = users.len();
                 } else {
@@ -717,6 +722,7 @@ impl CentralStore {
                                 device.id
                             );
                         }
+                        device_ids.push(device.id.clone());
                     }
                     counts.devices = devices.len();
                 }
@@ -733,11 +739,23 @@ impl CentralStore {
             state: state.into(),
             key: key.into(),
         };
-        if file.path().exists() {
-            let file_state = file.read_state()?;
-            counts.loans = target
-                .import_loans(&file_state.loans, &file_state.loan_audit)
-                .await?;
+        let file_state = if file.path().exists() {
+            file.read_state()?
+        } else {
+            FileState::default()
+        };
+        counts.loans = target
+            .import_loans(&file_state.loans, &file_state.loan_audit)
+            .await?;
+        if let Some(extra) = target.client().await?.query_opt(
+            "SELECT 'central_accounts'::text,account_id FROM central_accounts WHERE deleted_at IS NULL AND NOT(account_id=ANY($1::text[])) \
+             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) \
+             UNION ALL SELECT 'central_devices',id FROM central_devices WHERE deleted_at IS NULL AND NOT(id=ANY($3::text[])) LIMIT 1",
+            &[&account_ids, &user_ids, &device_ids],
+        ).await? {
+            let table: &str = extra.get(0);
+            let id: &str = extra.get(1);
+            bail!("backfill source mismatch: {table} extra row {id}");
         }
         Ok(counts)
     }

@@ -370,3 +370,66 @@ async fn postgres_backfill_refuses_a_source_account_older_than_postgres() {
     assert!(!error.contains("synthetic-access-do-not-log"));
     assert!(!error.contains("synthetic-refresh-do-not-log"));
 }
+
+#[tokio::test]
+async fn postgres_backfill_refuses_rows_removed_between_the_initial_and_final_pass() {
+    let mut results = Vec::new();
+    for table in [
+        "central_users",
+        "central_devices",
+        "central_accounts",
+        "account_loans",
+        "central_alias_tombstones",
+    ] {
+        let fixture = Fixture::new().await;
+        let identifier = match table {
+            "central_users" => {
+                store::atomic_write(&fixture.state().join("users.json"), b"[]").unwrap();
+                "test".to_owned()
+            }
+            "central_devices" => {
+                std::fs::remove_file(fixture.state().join("devices.json")).unwrap();
+                "test-machine".to_owned()
+            }
+            "central_accounts" => {
+                let id = fixture.write_account("Original", 7);
+                assert!(fixture.backfill().await.status.success());
+                std::fs::remove_dir_all(fixture.state().join("accounts").join(&id)).unwrap();
+                id
+            }
+            "account_loans" => {
+                fixture.seed_loan().await;
+                std::fs::remove_file(fixture.state().join("central-storage.enc")).unwrap();
+                "test-loan".to_owned()
+            }
+            _ => {
+                store::atomic_write(
+                    &fixture.state().join("renames.json"),
+                    &serde_json::to_vec(&json!([{"user":"test","from":"old-seat","to":"seat"}]))
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(fixture.backfill().await.status.success());
+                store::atomic_write(&fixture.state().join("renames.json"), b"[]").unwrap();
+                "test/old-seat".to_owned()
+            }
+        };
+        let result = fixture.backfill().await;
+        fixture.finish().await;
+        results.push((table, identifier, result));
+    }
+    for (table, identifier, result) in results {
+        assert!(
+            !result.status.success(),
+            "target-only {table} row must fail the final backfill"
+        );
+        let error = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            error.contains(table) && error.contains(&identifier),
+            "{error}"
+        );
+        assert!(!error.contains("synthetic-access-do-not-log"));
+        assert!(!error.contains("synthetic-refresh-do-not-log"));
+        assert!(!error.contains("synthetic-hash-do-not-log"));
+    }
+}
