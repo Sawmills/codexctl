@@ -471,7 +471,36 @@ role, secret, or row counts do not match the reviewed plan.
 and success check. During the window, post a status line in
 `~/Code/.fleet/codexctl/questions.md` **and** to the guide `w9C:tC` every
 15 minutes. At the planned end, call **ROLLBACK** if the success check has not
-passed. No extension is allowed without an explicit Operator `w9C:tF` OK.
+passed, using [the phased B33 rollback](superpowers/plans/b33-attempt-3-cutover.md#rollback).
+Keep the file writer at zero until HA has stopped and lease, mode and credential
+settlement checks pass. No extension is allowed without an explicit Operator
+`w9C:tF` OK.
+
+**HQ w5C:t41 scan exception (codexctl code owner, 2026-10-13).** This
+written authorization is from the repository owner, not the PR author:
+
+> HQ GRANTS A WRITTEN SCAN EXCEPTION as the repository owner (not the author).
+> Reason: the wave-1 final backfill is a one-time, all-tenant admin migration of
+> the stopped file store into an empty, dedicated DB (codexctl_a5); proving
+> parity needs a full read of every tenant's target rows; staging volume is
+> small (record the source row counts per table in the receipt); bounded by the
+> 1800 s deadline and HQ-gated, new-name retries. Scope: staging B33 attempt 5
+> final backfill Job only; any production use needs a new review. No code or
+> image change.
+
+This authorizes the administrative inventory of all tenants in that dedicated
+staging target, including active device IDs, loan history and audit parity; it
+is not authorization for cross-tenant runtime API reads. Keep mismatch receipts
+under operator/HQ custody; do not publish device identifiers or credential data.
+Record stopped-source counts for every imported table, target counts, Job
+start/end times and completion or failure. The deadline limits execution time,
+not table size; no measured scan cost or production capacity is claimed. Stop
+on unexpected inventory or a failed/deadline-exceeded Job; any retry needs HQ
+review and a new Job name. This exception expires after attempt 5's final
+handoff and must not be reused for a later staging attempt or production.
+The initial backfill uses the same inventory checks but is outside this grant;
+its execution remains held until HQ explicitly accepts that scan with its own
+deadline and receipt requirements. Do not begin the window while that gate is open.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
@@ -787,16 +816,18 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
    `Service/codexctl-ha` and apply the Ingress change only after validation.
 
-5. **Rollback.** Stop HA refreshes, mark the HA Service endpoints unready, and
-   fence their leases by allowing the TTL to expire or explicitly releasing
-   them. Restore the previous single-pod StatefulSet from the retained PVC
-   snapshot, unset PostgreSQL mode, and verify file-mode `/ready`. Because HA
-   may have rotated credentials after the snapshot, require an explicit
-   relogin for every affected account and verify a successful file-mode token
-   request before routing traffic back. Change the staging `Ingress/codexctl`
-   backend from `Service/codexctl-ha` back to `Service/codexctl` and apply the
-   Ingress change. Never run old and HA refresh writers
-   simultaneously; preserve the database and PVC receipts for reconciliation.
+5. **Rollback.** Follow [the phased B33 rollback](superpowers/plans/b33-attempt-3-cutover.md#rollback).
+   Route traffic away from HA, then use a reviewed revision to set HA replicas
+   to zero while retaining H's file-writer zero fence and the completed final
+   Job. Wait for every HA pod to exit; an expired lease alone does not prove
+   settlement. Require all refresh and login leases to be released, verify the
+   retained file modes, and reconcile every affected credential, including
+   HA-only accounts or captured candidates, through the users' authorized
+   sessions. Keep both writers stopped when any settlement is unknown; ask HQ
+   for a forward fix instead. Only after those gates pass may HQ approve
+   separate removal of HA resources, followed by a separate revision restoring
+   file mode and its traffic. Never restore the file writer in the HA-stop
+   sync or directly revert H; preserve database and PVC receipts for reconciliation.
 
 ## 6. Test and acceptance plan
 

@@ -1,8 +1,10 @@
-# B33 attempt 3: database emptiness before migrate (runbook prerequisite 3).
+# B33 database inventory before and after migrate (runbook prerequisite 3).
 # No kustomization includes this file, so nothing syncs it. The operator runs
 #   kubectl -n codexctl create -f deploy/k8s/jobs/b33-check-empty.yaml
-# at go/no-go, before the migrate Job, and reads kubectl logs. Run it only
-# against the target before migration; a rollback uses b33-check-leases.yaml.
+# at go/no-go before migrate, and creates a new instance after migrate.
+# Before migrate, require no application tables in the fresh A5 DB. Afterward,
+# require the exact layout-8 inventory with metadata-only counts per the runbook.
+# A rollback uses b33-check-leases.yaml.
 # Every statement runs in a read-only transaction, and the job label selects
 # the codexctl-migration egress policy.
 apiVersion: batch/v1
@@ -41,7 +43,7 @@ spec:
           args:
             - |
               psql -X -v ON_ERROR_STOP=1 <<'SQL'
-              \echo '== emptiness (prerequisite 3, before migrate only): no row, or 0 in every row, means empty'
+              \echo '== inventory (prerequisite 3): before migrate require no tables; after migrate verify layout and metadata counts per runbook'
               SELECT table_name,
                      (xpath('/row/c/text()',
                             query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
