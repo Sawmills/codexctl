@@ -881,6 +881,28 @@ impl PostgresStore {
         audit: &[AuditEvent],
     ) -> Result<usize> {
         let client = self.client().await?;
+        let ids: Vec<_> = grants.keys().map(String::as_str).collect();
+        let mut event_counts: std::collections::BTreeMap<&str, i64> =
+            std::collections::BTreeMap::new();
+        for event in audit {
+            *event_counts.entry(event.grant_id.as_str()).or_default() += 1;
+        }
+        let events: Vec<i64> = ids
+            .iter()
+            .map(|id| event_counts.get(id).copied().unwrap_or(0))
+            .collect();
+        // Count the rows this copy can add before any historical inventory read.
+        // Existing grants skip their audit copy, so identical reruns stay valid.
+        let projected: i64 = client.query_one(
+            &format!("SELECT ({}) + count(*) FROM unnest($1::text[]) AS source(id) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)", super::backfill::count_probe("account_loans")?),
+            &[&ids],
+        ).await?.get(0);
+        super::backfill::check_rows("account_loans", usize::try_from(projected)?)?;
+        let projected: i64 = client.query_one(
+            &format!("SELECT (({}) + COALESCE(sum(source.events),0))::bigint FROM unnest($1::text[],$2::bigint[]) AS source(id,events) WHERE NOT EXISTS(SELECT 1 FROM account_loans WHERE id=source.id)", super::backfill::count_probe("account_loan_audit")?),
+            &[&ids,&events],
+        ).await?.get(0);
+        super::backfill::check_rows("account_loan_audit", usize::try_from(projected)?)?;
         let mut copied = 0;
         for grant in grants.values() {
             let events: Vec<_> = audit.iter().filter(|e| e.grant_id == grant.id).collect();
@@ -983,7 +1005,7 @@ impl PostgresStore {
             }
             copied += usize::try_from(created)?;
         }
-        let ids: Vec<_> = grants.keys().map(String::as_str).collect();
+
         if let Some(extra) = client
             .query_opt(
                 "SELECT id FROM account_loans WHERE NOT(id=ANY($1::text[])) LIMIT 1",

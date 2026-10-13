@@ -608,6 +608,8 @@ impl PostgresStore {
                     bail!("backfill source mismatch: central_alias_tombstones row {user}/{alias}");
                 }
             }
+            let count: i64 = tx.query_one(&super::backfill::count_probe("central_alias_tombstones")?, &[]).await?.get(0);
+            super::backfill::check_rows("central_alias_tombstones", usize::try_from(count)?)?;
             let users: Vec<_> = aliases.iter().map(|(user,_,_)| user.as_str()).collect();
             let names: Vec<_> = aliases.iter().map(|(_,alias,_)| alias.as_str()).collect();
             if let Some(extra) = tx.query_opt(

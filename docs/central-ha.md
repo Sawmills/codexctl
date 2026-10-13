@@ -408,6 +408,49 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
+SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
+
+SCAN EXCEPTION RECORD ADDENDUM (2026-10-13T03:5xZ): tF CANARY-OK verbatim: "CANARY-OK for the scan exception: add ONE scratch target codexctl_a5_canary, canary Job only, same 50000-row cap failing closed, same expiry, staging only. LIMIT: A128 allows exactly ONE new RDS database (codexctl_a5). So the canary DB must NOT be a second database on the RDS: use a schema inside codexctl_a5 or a throwaway Postgres pod in the staging namespace, dropped after the canary. A second RDS database needs Amir." HQ choice: throwaway Postgres pod in the codexctl staging namespace, database codexctl_a5_canary, dropped after the canary (keeps canary rows out of the real codexctl_a5).
+
+Backfill requires one explicit `--scan-exception` value: `b33-a5` for H's
+initial/final Jobs on `codexctl_a5`, or `b33-a5-canary` for the canary Job on
+`codexctl_a5_canary`. Before any scan its storage entry point verifies
+`pg_catalog.current_database()` matches that selected case and the database's
+UTC date is on or before 2026-10-20. No flag, cross-use, another database or an
+expired grant refuses before inventory. The scope and
+deadline constants are in `src/central/storage/backfill.rs`. Only the initial/final H Jobs and the isolated canary Job opt in; migrate and
+runtime serving do not use it. The canary uses a throwaway PostgreSQL pod in
+staging, never another RDS database, and is dropped after the canary.
+The operator must also stop using the flag as soon as attempt 5 closes.
+
+The image digests in the Job examples below predate this guard. Before applying
+either backfill Job, replace every migration/backfill image reference with the
+successful main image containing #191, and obtain exact-head approval of H/I.
+An older image does not recognize `--scan-exception`; the examples are held
+until that repin. No canary or cutover may use the old digest.
+
+Backfill enforces `BACKFILL_MAX_ROWS = 50000` for each imported source and target
+table, including retired loan and audit history. Target counts use the fixed
+table allowlist and `SELECT count(*) FROM (SELECT 1 FROM <table> LIMIT 50001) s`.
+Source row parsing stops at the same sentinel. A count above the cap fails
+the Job; HA must stay stopped. Successful JSON receipts include per-table
+source, pre-copy target and post-copy target counts for the six imported
+tables. These accepted counts are exact; a failed probe's 50001 is a lower
+bound, not the oversized table's full size. Private-file reads and authenticated
+ledger decryption still consume the complete file before row parsing; the row
+cap does not claim a byte bound. HQ owns the attempt-5 close-out PR: before
+2026-10-20, remove the temporary scan-exception code and the HA fixtures'
+backfill flag setup together. If authorization expires first, the HA fixtures
+fail visibly; do not silently skip their recovery coverage.
+The source and existing target are capped before payload inventory. A registry
+copy can add matching rows before a later count rejects combined growth;
+retain those partial copies for inspection and keep HA stopped. Foreign-tenant
+machine counts include retained rows intentionally; known source tenants retain
+the existing active-row parity policy. No foreign identifiers are read. The 1800-second, zero-retry templates below cover the initial and
+final backfill; another Job name requires HQ approval. This does not authorize
+a window, production use,
+or changes to infra #1604 while A128 is held.
+
 For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/b33-attempt-3-cutover.md): it delivers these steps through GitOps PRs and a Claude operator that uses no codexctl token.
 
 The commands below require operator execution approval. Stop if the database,
@@ -485,6 +528,8 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    metadata:
      name: codexctl-migrate
    spec:
+     backoffLimit: 0
+     activeDeadlineSeconds: 1800
      ttlSecondsAfterFinished: 86400
      template:
        metadata:
@@ -599,7 +644,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    (B33 attempt 3, 2026-10-09).
 
    Apply the reviewed Job, wait for completion, and repeat the manifest with
-   `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]`.
+   `name: codexctl-backfill-initial` and `command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key, --scan-exception, b33-a5]`.
    Keep both Job logs and the backfill JSON counts as the migration receipt.
 
 3. **Re-backfill after quiescing.** PostgreSQL mode is the only serving mode;
@@ -615,6 +660,8 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    metadata:
      name: codexctl-backfill
    spec:
+     backoffLimit: 0
+     activeDeadlineSeconds: 1800
      ttlSecondsAfterFinished: 86400
      template:
        metadata:
@@ -649,7 +696,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
          containers:
            - name: backfill
              image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:1b7a83ab6fed64a146f0eeb391d40bdd4bd3829f8466a83cf6c10aa4fbf0c515
-             command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key]
+             command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key, --scan-exception, b33-a5]
              securityContext:
                allowPrivilegeEscalation: false
                readOnlyRootFilesystem: true

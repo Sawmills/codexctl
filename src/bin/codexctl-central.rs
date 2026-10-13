@@ -109,6 +109,9 @@ enum Commands {
         state: PathBuf,
         #[arg(long)]
         key_file: PathBuf,
+        /// Use the co-signed, time-limited B33 attempt-5 staging scan exception.
+        #[arg(long, value_enum)]
+        scan_exception: Option<central::storage::BackfillScanException>,
     },
     /// Serve the account API behind a private HTTPS ingress.
     Serve {
@@ -324,9 +327,18 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
                 println!("{}", serde_json::json!({"legacyLeasesReleased":released}));
             }
         }
-        Commands::Backfill { state, key_file } => {
+        Commands::Backfill {
+            state,
+            key_file,
+            scan_exception,
+        } => {
+            let Some(scan_exception) = scan_exception else {
+                anyhow::bail!("backfill requires explicit --scan-exception authorization");
+            };
             let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
-            let counts = store.backfill(&state, &key_file).await?;
+            let counts = store
+                .backfill(&state, &key_file, Some(scan_exception))
+                .await?;
             println!("{}", serde_json::to_string(&counts)?);
         }
         Commands::Serve {

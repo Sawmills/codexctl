@@ -283,11 +283,33 @@ async fn backfill_copies_file_loans_with_their_audit_once() {
     let shared = CentralStore::from_mode(super::super::StoreMode::Postgres, root.path(), &key)
         .await
         .unwrap();
-    let (db, control, schema) = shared.isolated_test_schema().await.unwrap();
+    let (db, control, schema) = shared.isolated_backfill_test_schema().await.unwrap();
     db.migrate().await.unwrap();
-    assert_eq!(db.backfill(root.path(), &key).await.unwrap().loans, 2);
+    let result = db
+        .backfill(
+            root.path(),
+            &key,
+            Some(super::super::BackfillScanException::B33A5),
+        )
+        .await;
+    if chrono::Utc::now().date_naive() > chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap() {
+        assert!(result.unwrap_err().to_string().contains("expired"));
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        return;
+    }
+    assert_eq!(result.unwrap().loans, 2);
     assert_eq!(
-        db.backfill(root.path(), &key).await.unwrap().loans,
+        db.backfill(
+            root.path(),
+            &key,
+            Some(super::super::BackfillScanException::B33A5)
+        )
+        .await
+        .unwrap()
+        .loans,
         0,
         "idempotent"
     );

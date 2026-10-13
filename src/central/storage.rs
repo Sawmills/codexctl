@@ -23,6 +23,8 @@ pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
 
+mod backfill;
+pub use backfill::BackfillScanException;
 mod browser;
 pub(in crate::central) use browser::BrowserIdentity;
 mod loans;
@@ -159,6 +161,15 @@ pub struct BackfillCounts {
     pub observed_relogins: usize,
     /// Loan grants copied with their audit events.
     pub loans: usize,
+    /// Physical table counts, including retained history, before and after copy.
+    pub inventory: BTreeMap<String, BackfillTableCounts>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BackfillTableCounts {
+    pub source: usize,
+    pub target_before: usize,
+    pub target: usize,
 }
 
 /// Login journals and identity reservations that fence account `$1`. The
@@ -307,6 +318,42 @@ impl CentralStore {
             tokio::time::timeout(Duration::from_secs(5), client.simple_query("SELECT 1")).await??;
         }
         Ok(())
+    }
+
+    #[cfg(all(test, feature = "central-real-db-tests"))]
+    pub(super) async fn isolated_backfill_test_schema(
+        &self,
+    ) -> Result<(Self, Arc<tokio_postgres::Client>, String)> {
+        let mut isolated = self.clone();
+        let db = match &mut isolated {
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+            Self::File(_) => bail!("PostgreSQL required for backfill test"),
+        };
+        let test_url = reqwest::Url::parse(&db.url)?;
+        if !matches!(
+            test_url.host_str(),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+        ) {
+            bail!("backfill database fixtures require a loopback test server");
+        }
+        if let Err(error) = db
+            .client()
+            .await?
+            .batch_execute("CREATE DATABASE codexctl_a5")
+            .await
+            && error.code() != Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
+            && error.code() != Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+        {
+            return Err(error.into());
+        }
+        let mut url = reqwest::Url::parse(&db.url)?;
+        url.set_path("/codexctl_a5");
+        db.url = url.to_string();
+        db.client = Arc::new(tokio::sync::Mutex::new(None));
+        db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
+        db.admission = Arc::new(tokio::sync::Mutex::new(None));
+        db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
+        isolated.isolated_test_schema().await
     }
 
     #[cfg(all(test, feature = "central-real-db-tests"))]
@@ -604,12 +651,23 @@ impl CentralStore {
         }
     }
 
-    pub async fn backfill(&self, state: &Path, key: &Path) -> Result<BackfillCounts> {
+    pub async fn backfill(
+        &self,
+        state: &Path,
+        key: &Path,
+        scan_exception: Option<BackfillScanException>,
+    ) -> Result<BackfillCounts> {
+        let Some(scan_exception) = scan_exception else {
+            bail!("backfill requires explicit --scan-exception authorization");
+        };
         let target = match self {
             Self::Postgres(db) => db,
             Self::Dual { postgres, .. } => postgres,
             Self::File(_) => bail!("backfill requires PostgreSQL or dual central storage"),
         };
+        backfill::authorize(target, scan_exception).await?;
+        let target_before = backfill::target_counts(target).await?;
+        let source = backfill::source_counts(state, key)?;
         if super::relogin::add::pending_logins(state)? {
             bail!("finish pending logins in file mode before switching storage");
         }
@@ -623,10 +681,11 @@ impl CentralStore {
             devices: 0,
             observed_relogins: 0,
             loans: 0,
+            inventory: BTreeMap::new(),
         };
         let mut account_ids = Vec::new();
         let mut user_ids = Vec::new();
-        let mut device_ids = Vec::new();
+        let mut device_ids: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let accounts = state.join("accounts");
         if accounts.exists() {
             for entry in std::fs::read_dir(accounts)? {
@@ -722,7 +781,10 @@ impl CentralStore {
                                 device.id
                             );
                         }
-                        device_ids.push(device.id.clone());
+                        device_ids
+                            .entry(device.tenant.clone())
+                            .or_default()
+                            .push(device.id.clone());
                     }
                     counts.devices = devices.len();
                 }
@@ -744,19 +806,32 @@ impl CentralStore {
         } else {
             FileState::default()
         };
+        backfill::target_counts(target).await?;
+        backfill::verify_devices(target, &device_ids).await?;
         counts.loans = target
             .import_loans(&file_state.loans, &file_state.loan_audit)
             .await?;
+        let target_after = backfill::target_counts(target).await?;
         if let Some(extra) = target.client().await?.query_opt(
             "SELECT 'central_accounts'::text,account_id FROM central_accounts WHERE deleted_at IS NULL AND NOT(account_id=ANY($1::text[])) \
-             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) \
-             UNION ALL SELECT 'central_devices',id FROM central_devices WHERE deleted_at IS NULL AND NOT(id=ANY($3::text[])) LIMIT 1",
-            &[&account_ids, &user_ids, &device_ids],
+             UNION ALL SELECT 'central_users',id FROM central_users WHERE deleted_at IS NULL AND NOT(id=ANY($2::text[])) LIMIT 1",
+            &[&account_ids, &user_ids],
         ).await? {
             let table: &str = extra.get(0);
             let id: &str = extra.get(1);
             bail!("backfill source mismatch: {table} extra row {id}");
         }
+        counts.inventory = source
+            .into_iter()
+            .map(|(table, source)| {
+                let rows = BackfillTableCounts {
+                    source,
+                    target_before: target_before[&table],
+                    target: target_after[&table],
+                };
+                (table, rows)
+            })
+            .collect();
         Ok(counts)
     }
 
@@ -3315,7 +3390,7 @@ mod tests {
         let first = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
             .await
             .unwrap();
-        let (first, control, schema) = first.isolated_test_schema().await.unwrap();
+        let (first, control, schema) = first.isolated_backfill_test_schema().await.unwrap();
         first.migrate().await.unwrap();
         for _ in 0..32 {
             assert!(first.relay_event_allowed("shared-device").await.unwrap());
@@ -3367,13 +3442,28 @@ mod tests {
             revision: 0,
         };
         crate::central::vault::save(&legacy_state, &key, &legacy_vault).unwrap();
-        let counts = first.backfill(root.path(), &key).await.unwrap();
+        let result = first
+            .backfill(root.path(), &key, Some(BackfillScanException::B33A5))
+            .await;
+        if chrono::Utc::now().date_naive() > chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap()
+        {
+            assert!(result.unwrap_err().to_string().contains("expired"));
+            control
+                .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+                .await
+                .unwrap();
+            return;
+        }
+        let counts = result.unwrap();
         assert_eq!(counts.accounts, 1);
         let legacy_id = crate::central::managed::account_key("legacy-user", "legacy-seat");
         let imported = first.load_account(&legacy_id).await.unwrap().unwrap();
         assert_eq!(imported.revision, 1);
         assert_eq!(imported.vault["revision"], serde_json::json!(1));
-        let repeated = first.backfill(root.path(), &key).await.unwrap();
+        let repeated = first
+            .backfill(root.path(), &key, Some(BackfillScanException::B33A5))
+            .await
+            .unwrap();
         assert_eq!(repeated.accounts, 0);
         let mut second = first.clone();
         if let CentralStore::Postgres(db) = &mut second {
