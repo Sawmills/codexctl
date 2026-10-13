@@ -1443,6 +1443,37 @@ async fn postgres_dashboard_revoke_connection_setup_has_its_own_deadline() {
     assert_eq!(response.headers()["cache-control"], "no-store");
     proxy.kill().await.unwrap();
     proxy.wait().await.unwrap();
+    for (id, revoked, result) in [
+        ("slow-connect-machine", true, "ok"),
+        (
+            "connect-timeout-machine",
+            false,
+            "failed:persistence_failed",
+        ),
+        (
+            "transaction-timeout-machine",
+            false,
+            "failed:persistence_failed",
+        ),
+    ] {
+        let target = if revoked {
+            id.to_owned()
+        } else {
+            use sha2::Digest;
+            format!("unresolved:{:x}", sha2::Sha256::digest(id.as_bytes()))
+        };
+        let row = f.control.query_one(&format!(
+            "SELECT d.revoked,a.result,EXISTS(SELECT 1 FROM {0}.central_relay_rate_limits r WHERE r.device_id=d.id AND r.deleted_at IS NOT NULL) FROM {0}.central_devices d JOIN {0}.dashboard_audit a ON a.target=$2 WHERE d.id=$1 AND a.operation='machine_revoke' AND a.deleted_at IS NULL",
+            f.schema,
+        ), &[&id, &target]).await.unwrap();
+        assert_eq!(row.get::<_, bool>(0), revoked, "machine state for {id}");
+        assert_eq!(row.get::<_, String>(1), result, "durable audit for {id}");
+        assert_eq!(
+            row.get::<_, bool>(2),
+            revoked,
+            "limiter retirement for {id}"
+        );
+    }
     f.finish().await;
 }
 
