@@ -1,4 +1,4 @@
-//! Read-only company-user browser view. Credentials never enter this response.
+//! Company-user browser overview and guarded actions. Saved credentials never enter responses.
 use super::{
     enrollment,
     managed::{self, Broker, HttpError},
@@ -12,6 +12,8 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+mod actions;
+pub(super) use actions::recent_sign_in;
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
 use sha2::{Digest, Sha256};
@@ -19,7 +21,10 @@ use std::time::{Duration, Instant};
 
 async fn page(State(broker): State<Broker>, headers: HeaderMap) -> Response {
     match snapshot(&broker, &headers, Instant::elapsed).await {
-        Ok(snapshot) => document(&render::overview(&snapshot)),
+        Ok(snapshot) => match actions::render(&broker, &headers, &snapshot) {
+            Ok(html) => document(&html),
+            Err(error) => error.into_response(),
+        },
         Err(error) => {
             let error = error.into_response();
             if error.status() == StatusCode::UNAUTHORIZED {
@@ -46,7 +51,7 @@ async fn data(
 ) -> Result<Response, HttpError> {
     let snapshot = snapshot(&broker, &headers, elapsed).await?;
     if headers.get("accept").is_some_and(|v| v == "text/html") {
-        return Ok(document(&render::overview(&snapshot)));
+        return Ok(document(&actions::render(&broker, &headers, &snapshot)?));
     }
     Ok((
         [
@@ -277,6 +282,12 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
                 .layer(axum::middleware::from_fn(enrollment::browser_errors)),
         )
         .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
+        .route(
+            "/accounts/machines/revoke",
+            post(actions::revoke)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(actions::no_store)),
+        )
 }
 
 async fn landing(

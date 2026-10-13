@@ -115,7 +115,14 @@ for line in sys.stdin:
         launch_counter = os.environ.get("CENTRAL_TEST_LAUNCH_COUNTER")
         if launch_counter:
             counter = pathlib.Path(launch_counter)
-            increment(counter)
+            delay = counter.with_name("counter-write-delay")
+            if delay.exists():
+                next_count = str(int(counter.read_text()) + 1)
+                with counter.open("w") as output:
+                    time.sleep(float(delay.read_text()))
+                    output.write(next_count)
+            else:
+                increment(counter)
         mode_path = os.environ.get("CENTRAL_TEST_MODE_FILE")
         mode = pathlib.Path(mode_path).read_text() if mode_path else ""
         if mode == "respawn-launch-fail-once":

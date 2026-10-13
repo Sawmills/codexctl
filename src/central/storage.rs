@@ -26,7 +26,7 @@ const DB_TIMEOUT: Duration = Duration::from_secs(2);
 mod backfill;
 pub use backfill::BackfillScanException;
 mod browser;
-pub(in crate::central) use browser::BrowserIdentity;
+pub(in crate::central) use browser::{BrowserIdentity, DashboardAudit, MachineRevoke};
 mod loans;
 mod migration;
 
@@ -244,6 +244,18 @@ CREATE TABLE IF NOT EXISTS browser_sessions (
     signed_in_at TIMESTAMPTZ NOT NULL,
     expires_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE browser_sessions ADD COLUMN IF NOT EXISTS auth_time_verified BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS dashboard_audit (
+    id BIGSERIAL PRIMARY KEY,
+    at BIGINT NOT NULL,
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke')),
+    target TEXT NOT NULL,
+    result TEXT NOT NULL
+);
+ALTER TABLE dashboard_audit ADD COLUMN IF NOT EXISTS coalesce_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS dashboard_audit_coalesce_idx ON dashboard_audit (coalesce_key);
+CREATE INDEX IF NOT EXISTS dashboard_audit_at_idx ON dashboard_audit (at);
 CREATE INDEX IF NOT EXISTS browser_sessions_expiry_idx ON browser_sessions (expires_at);
 CREATE TABLE IF NOT EXISTS central_users (
     id TEXT PRIMARY KEY,

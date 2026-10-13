@@ -1,0 +1,46 @@
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_revoke_failed",pod="pod-a"}
+        values: >-
+          0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_revoke_failed",pod="pod-b"}
+        values: >-
+          0 0 0 0 0 0 0
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: dashboard_revoke_failed
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_audit_failed",pod="pod-c"}
+        values: >-
+          0 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              reason: dashboard_audit_failed
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md

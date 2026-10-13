@@ -5256,17 +5256,22 @@ fn background_recovery_recreates_an_unhealthy_owner() {
     );
     store::atomic_write(&server.root.path().join("mode"), b"rpc-unhealthy").unwrap();
     assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    // Expose the fixture's truncate/write gap while the recovery observer polls.
+    store::atomic_write(&server.root.path().join("counter-write-delay"), b"0.2").unwrap();
     store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
     store::atomic_write(&server.root.path().join("retry-clock"), b"60000").unwrap();
-    std::thread::sleep(Duration::from_millis(100));
-    assert!(
-        std::fs::read_to_string(server.root.path().join("launch-count"))
-            .unwrap()
-            .parse::<u32>()
-            .unwrap()
-            >= 2,
-        "background task must relaunch before a token request"
-    );
+    let relaunch_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !std::fs::read_to_string(server.root.path().join("launch-count"))
+        .unwrap()
+        .parse::<u32>()
+        .is_ok_and(|count| count >= 2)
+    {
+        assert!(
+            std::time::Instant::now() < relaunch_deadline,
+            "background task must relaunch before a token request"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if server.token(&server.amir, "personal", None).status() == 200 {
@@ -11048,6 +11053,10 @@ fn dashboard_v3_serves_rendered_accounts_and_same_origin_fonts() {
         assert!(
             html.contains("codexctl use studio"),
             "recommendation must be server rendered"
+        );
+        assert!(
+            !html.contains("/accounts/machines/revoke"),
+            "file-mode dashboards keep action buttons hidden"
         );
         assert!(html.contains("All accounts"));
         assert!(html.contains("Needs attention"));

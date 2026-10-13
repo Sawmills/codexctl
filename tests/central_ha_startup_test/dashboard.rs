@@ -110,9 +110,13 @@ impl BrowserFixture {
     }
 
     async fn begin_sign_in(&self) -> (String, String) {
+        self.begin_sign_in_route("/accounts/sign-in", false).await
+    }
+
+    async fn begin_sign_in_route(&self, route: &str, fresh: bool) -> (String, String) {
         let start = self
             .http
-            .get(format!("{}/accounts/sign-in", self.first.url))
+            .get(format!("{}{route}", self.first.url))
             .send()
             .await
             .unwrap();
@@ -131,6 +135,15 @@ impl BrowserFixture {
             .next()
             .unwrap()
             .to_owned();
+        let location = reqwest::Url::parse(start.headers()["location"].to_str().unwrap()).unwrap();
+        if fresh {
+            assert!(
+                location
+                    .query_pairs()
+                    .any(|(k, v)| k == "max_age" && v == "600"),
+                "fresh Google sign-in asks for max_age=600"
+            );
+        }
         let authorize = self
             .http
             .get(start.headers()["location"].to_str().unwrap())
@@ -462,7 +475,7 @@ async fn postgres_dashboard_sessions_store_cookie_digests_and_signed_auth_time()
             .collect();
         assert_eq!(
             keys,
-            ["binding", "nonce"],
+            ["binding", "fresh", "nonce"],
             "never persist a PKCE verifier, even in the encrypted flow"
         );
     }
@@ -507,6 +520,8 @@ async fn postgres_dashboard_migration_is_additive_repeatable_and_keeps_version_e
     let f = BrowserFixture::start().await;
     let before = chrono::Utc::now().timestamp();
     let (session, _) = f.sign_in().await;
+    // Recreate PR1's table shape with a live session before upgrading.
+    f.control.batch_execute(&format!("ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; DROP TABLE {0}.dashboard_audit",f.schema)).await.unwrap();
     for _ in 0..2 {
         let result = command(
             &f.database(),
@@ -554,6 +569,22 @@ async fn postgres_dashboard_migration_is_additive_repeatable_and_keeps_version_e
     assert!(
         signed >= before && signed <= chrono::Utc::now().timestamp(),
         "absent auth_time uses callback time"
+    );
+    let verified: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT auth_time_verified FROM {}.browser_sessions",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !verified,
+        "legacy callback timestamps never gain fresh sign-in authority during migration"
     );
     let live = f
         .http
@@ -1150,4 +1181,752 @@ async fn postgres_dashboard_sign_in_does_not_wait_for_account_admission() {
         "a pending sign-in must not exhaust the verified callback's admission deadline"
     );
     f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_rejects_missing_or_wrong_origin_and_form_token() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    for (origin, token) in [
+        (None, None),
+        (Some("https://hostile.example.invalid"), Some("wrong")),
+        (Some("http://127.0.0.1:8787"), None),
+        (Some("http://127.0.0.1:8787"), Some("wrong")),
+    ] {
+        let mut request = f
+            .http
+            .post(format!("{}/accounts/machines/revoke", f.first.url))
+            .header("cookie", &session);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        let mut form = vec![("id", "missing-machine")];
+        if let Some(token) = token {
+            form.push(("form_token", token));
+        }
+        let response = request.form(&form).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            403,
+            "request check runs before machine lookup"
+        );
+        assert_eq!(response.headers()["cache-control"], "no-store");
+    }
+    assert_eq!(f.first.launches(), 0);
+    f.finish().await;
+}
+
+impl BrowserFixture {
+    fn identity(&self, auth_time: Option<i64>) {
+        let mut identity =
+            json!({"sub":"dashboard-company-user", "email":"dashboard@example.invalid"});
+        if let Some(time) = auth_time {
+            identity["auth_time"] = json!(time);
+        }
+        store::atomic_write(
+            &self._root.path().join("identity.json"),
+            &serde_json::to_vec(&identity).unwrap(),
+        )
+        .unwrap();
+    }
+
+    async fn machine(&self, id: &str, token: &str) {
+        self.control.execute(&format!("INSERT INTO {}.central_devices(id,tenant,user_id,token_hash,revoked) SELECT $1,'sawmills',id,$2,false FROM {}.central_users WHERE email='dashboard@example.invalid'",self.schema,self.schema), &[&id,&{ use sha2::Digest; format!("{:x}", sha2::Sha256::digest(token.as_bytes())) }]).await.unwrap();
+    }
+
+    async fn form_token(&self, session: &str) -> String {
+        let page = self
+            .http
+            .get(format!("{}/accounts", self.first.url))
+            .header("cookie", session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200);
+        assert_eq!(page.headers()["cache-control"], "no-store");
+        assert!(
+            page.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("form-action 'self'")
+        );
+        let html = page.text().await.unwrap();
+        html.split("name=\"form_token\" value=\"")
+            .nth(1)
+            .expect("Revoke form on PostgreSQL dashboard")
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn revoke(&self, session: &str, token: &str, id: &str) -> reqwest::Response {
+        self.http
+            .post(format!("{}/accounts/machines/revoke", self.second.url))
+            .header("cookie", session)
+            .header("origin", "http://127.0.0.1:8787")
+            .form(&[("id", id), ("form_token", token)])
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_is_audited_and_duplicate_api_revoke_stays_idempotent() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("target-machine", "synthetic-target-machine-token")
+        .await;
+    f.machine("caller-machine", "synthetic-caller-machine-token")
+        .await;
+    let token = f.form_token(&session).await;
+    // Keep a real synthetic refresh owner alive while all revoke paths run.
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let claims = json!({"sub":"dashboard-login","iat":2000000000_u64,"exp":4102444800_u64,
+        "https://api.openai.com/auth":{"chatgpt_account_id":"dashboard-seat","chatgpt_plan_type":"pro"}});
+    let auth = json!({"tokens":{"access_token":format!("header.{}.",URL_SAFE_NO_PAD.encode(claims.to_string())),"refresh_token":"synthetic-dashboard-refresh","account_id":"dashboard-seat"}});
+    let imported = f
+        .http
+        .post(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth("synthetic-caller-machine-token")
+        .json(&json!({"alias":"fixture-account","auth":auth}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        imported.status(),
+        200,
+        "seed a live synthetic refresh owner"
+    );
+    assert!(f.first.launches() > 0);
+    let refreshes_before = std::fs::read_to_string(f.first.root.path().join("count")).unwrap();
+    let revision_before: i64 = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT revision FROM {}.central_accounts WHERE alias='fixture-account'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let response = f.revoke(&session, &token, "target-machine").await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(response.text().await.unwrap().contains("Machine revoked"));
+    let duplicate = f.revoke(&session, &token, "target-machine").await;
+    assert_eq!(duplicate.status(), 409);
+    assert!(duplicate.text().await.unwrap().contains("Already revoked"));
+    for _ in 0..2 {
+        let api = f
+            .http
+            .post(format!("{}/v1/devices/revoke", f.first.url))
+            .bearer_auth("synthetic-caller-machine-token")
+            .header("x-codexctl-device", "caller-machine")
+            .json(&json!({"id":"target-machine"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            api.status(),
+            204,
+            "API is idempotent even after dashboard revocation"
+        );
+    }
+    let rows = f
+        .control
+        .query(
+            &format!(
+                "SELECT actor,operation,target,result FROM {}.dashboard_audit ORDER BY id",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (row, result) in rows.iter().zip(["ok", "refused:already_revoked"]) {
+        assert_eq!(
+            row.get::<_, String>(0),
+            "dashboard:dashboard@example.invalid"
+        );
+        assert_eq!(row.get::<_, String>(1), "machine_revoke");
+        assert_eq!(row.get::<_, String>(2), "target-machine");
+        assert_eq!(row.get::<_, String>(3), result);
+    }
+    let page = f
+        .http
+        .get(format!("{}/accounts/data", f.first.url))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert!(
+        page["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "target-machine" && m["status"] == "revoked")
+    );
+    assert!(
+        !page.to_string().contains(&token),
+        "JSON does not carry form credentials"
+    );
+    let log = std::fs::read_to_string(f.second.root.path().join("dashboard.log")).unwrap();
+    assert!(
+        !log.contains("dashboard@example.invalid"),
+        "application audit logs contain an actor digest; email stays in the database audit only"
+    );
+    let audits: Vec<_> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["operation"] == "machine_revoke")
+        .collect();
+    assert_eq!(audits.len(), 2);
+    for secret in [
+        &token,
+        session.split_once('=').unwrap().1,
+        "synthetic-target-machine-token",
+    ] {
+        assert!(!log.contains(secret));
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.first.root.path().join("count")).unwrap(),
+        refreshes_before,
+        "all revoke paths add zero provider refreshes"
+    );
+    let revision_after: i64 = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT revision FROM {}.central_accounts WHERE alias='fixture-account'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        revision_after, revision_before,
+        "revoke never rotates the server account"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_requires_verified_recent_auth_time_even_for_legacy_sessions() {
+    let f = BrowserFixture::start().await;
+    for auth_time in [None, Some(chrono::Utc::now().timestamp() - 700)] {
+        f.identity(auth_time);
+        let (session, _) = f.sign_in().await;
+        let id = if auth_time.is_none() {
+            "unknown-auth-time"
+        } else {
+            "old-auth-time"
+        };
+        f.machine(id, id).await;
+        let token = f.form_token(&session).await;
+        // PR1's legacy fallback could store a recent callback time. It must not prove fresh authentication.
+        if auth_time.is_none() {
+            f.control
+                .batch_execute(&format!(
+                    "UPDATE {}.browser_sessions SET signed_in_at=now()",
+                    f.schema
+                ))
+                .await
+                .unwrap();
+        }
+        let response = f.revoke(&session, &token, id).await;
+        assert_eq!(
+            response.status(),
+            303,
+            "old or unproven sign-in cannot revoke"
+        );
+        assert_eq!(
+            response.headers()["location"],
+            "/accounts/sign-in?fresh=true"
+        );
+        let revoked: bool = f
+            .control
+            .query_one(
+                &format!(
+                    "SELECT revoked FROM {}.central_devices WHERE id=$1",
+                    f.schema
+                ),
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!revoked);
+    }
+    let results: Vec<String> = f
+        .control
+        .query(
+            &format!(
+                "SELECT result FROM {}.dashboard_audit ORDER BY id",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(
+        results,
+        [
+            "refused:fresh_sign_in_required",
+            "refused:fresh_sign_in_required"
+        ]
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_fresh_sign_in_validates_signed_auth_time_with_clock_skew() {
+    let f = BrowserFixture::start().await;
+    for auth_time in [
+        None,
+        Some(chrono::Utc::now().timestamp() - 700),
+        Some(chrono::Utc::now().timestamp() + 120),
+    ] {
+        f.identity(auth_time);
+        let (binding, path) = f
+            .begin_sign_in_route("/accounts/sign-in?fresh=true", true)
+            .await;
+        let callback = f.callback(&f.second, &binding, &path).await;
+        assert_eq!(
+            callback.status(),
+            401,
+            "missing, stale or future auth_time is refused"
+        );
+        assert!(
+            callback
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .all(|v| !v.to_str().unwrap().starts_with("codexctl-session="))
+        );
+    }
+    let sessions: i64 = f
+        .control
+        .query_one(
+            &format!("SELECT count(*) FROM {}.browser_sessions", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(sessions, 0);
+    for offset in [-620, -599, 25] {
+        f.identity(Some(chrono::Utc::now().timestamp() + offset));
+        let (binding, path) = f
+            .begin_sign_in_route("/accounts/sign-in?fresh=true", true)
+            .await;
+        let callback = f.callback(&f.second, &binding, &path).await;
+        assert_eq!(
+            callback.status(),
+            303,
+            "valid auth_time within the 30s allowance"
+        );
+        let session = callback
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|h| h.to_str().ok())
+            .find(|h| h.starts_with("codexctl-session="))
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let id = format!("fresh-{offset}");
+        f.machine(&id, &id).await;
+        let token = f.form_token(&session).await;
+        assert_eq!(f.revoke(&session, &token, &id).await.status(), 200);
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_counts_each_failure_once() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("once-only", "synthetic-once-only-token").await;
+    let token = f.form_token(&session).await;
+    assert_eq!(f.revoke(&session, &token, "once-only").await.status(), 200);
+    assert_eq!(f.revoke(&session, &token, "once-only").await.status(), 409);
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.second.url))
+        .bearer_auth("synthetic-dashboard-metrics-token-32")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains(
+        "codexctl_central_failed_requests_total{reason=\"dashboard_already_revoked\"} 1\n"
+    ));
+    assert!(
+        !metrics.contains("reason=\"http_rejected\""),
+        "a recorded refusal is not counted again by HTTP middleware"
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_is_user_scoped_and_form_tokens_are_session_bound() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("own-machine", "synthetic-own-machine-token")
+        .await;
+    let token = f.form_token(&session).await;
+    let (other_session, _) = f.sign_in().await;
+    assert_eq!(
+        f.revoke(&other_session, &token, "own-machine")
+            .await
+            .status(),
+        403
+    );
+    for origin in [
+        None,
+        Some("https://hostile.example.invalid"),
+        Some("null"),
+        Some("http://127.0.0.1:8787/"),
+    ] {
+        let mut request = f
+            .http
+            .post(format!("{}/accounts/machines/revoke", f.second.url))
+            .header("cookie", &session)
+            .form(&[("id", "own-machine"), ("form_token", &token)]);
+        if let Some(origin) = origin {
+            request = request.header("origin", origin);
+        }
+        assert_eq!(request.send().await.unwrap().status(), 403);
+    }
+    let count: i64 = f
+        .control
+        .query_one(
+            &format!("SELECT count(*) FROM {}.dashboard_audit", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 0, "rejected request checks produce no audit row");
+    f.control.execute(&format!("INSERT INTO {}.central_users(id,email,enabled) VALUES('foreign-action','foreign-action@example.invalid',true)",f.schema),&[]).await.unwrap();
+    for (id, tenant, user) in [
+        ("foreign-action-machine", "sawmills", "foreign-action"),
+        ("other-tenant-action-machine", "elsewhere", "foreign-action"),
+    ] {
+        f.control.execute(&format!("INSERT INTO {}.central_devices(id,tenant,user_id,token_hash,revoked) VALUES($1,$2,$3,$1,false)",f.schema),&[&id,&tenant,&user]).await.unwrap();
+        assert_eq!(f.revoke(&session, &token, id).await.status(), 404);
+        let revoked: bool = f
+            .control
+            .query_one(
+                &format!(
+                    "SELECT revoked FROM {}.central_devices WHERE id=$1",
+                    f.schema
+                ),
+                &[&id],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert!(!revoked);
+    }
+    let rows = f
+        .control
+        .query(
+            &format!(
+                "SELECT result FROM {}.dashboard_audit ORDER BY id",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .all(|r| r.get::<_, String>(0) == "refused:device_not_found")
+    );
+    // Revocation of the session owner immediately removes action authority too.
+    f.control
+        .batch_execute(&format!(
+            "UPDATE {}.central_users SET enabled=false WHERE email='dashboard@example.invalid'",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.revoke(&session, &token, "own-machine").await.status(),
+        403
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_storage_failure_is_audited_and_alerted_without_a_refresh() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("faulted-machine", "synthetic-faulted-token")
+        .await;
+    let token = f.form_token(&session).await;
+    f.control.batch_execute(&format!("CREATE FUNCTION {0}.fail_revoke() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic revoke failure'; END $$; CREATE TRIGGER fail_revoke BEFORE UPDATE ON {0}.central_devices FOR EACH ROW EXECUTE FUNCTION {0}.fail_revoke()",f.schema)).await.unwrap();
+    let response = f.revoke(&session, &token, "faulted-machine").await;
+    assert_eq!(response.status(), 503);
+    let row = f
+        .control
+        .query_one(
+            &format!("SELECT result FROM {}.dashboard_audit", f.schema),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "failed:persistence_failed");
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.second.url))
+        .bearer_auth("synthetic-dashboard-metrics-token-32")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(metrics.contains(
+        "codexctl_central_failed_requests_total{reason=\"dashboard_revoke_failed\"} 1\n"
+    ));
+    assert!(metrics.contains(
+        "codexctl_central_last_failure_timestamp_seconds{reason=\"dashboard_revoke_failed\"}"
+    ));
+    assert!(!metrics.contains("reason=\"http_rejected\""));
+    let log = std::fs::read_to_string(f.second.root.path().join("dashboard.log")).unwrap();
+    let failure = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|v| v["operation"] == "dashboard_failure" && v["stage"] == "revoke_transaction")
+        .expect("database failure class is actionable without raw error text");
+    assert_eq!(failure["failure_class"], "database");
+    assert_eq!(failure["sqlstate"], "P0001");
+    assert!(!log.contains("synthetic revoke failure"));
+    assert_eq!(f.first.launches() + f.second.launches(), 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_does_not_commit_without_its_audit_row() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("audit-fault-machine", "synthetic-audit-fault-token")
+        .await;
+    let token = f.form_token(&session).await;
+    f.control.batch_execute(&format!("CREATE FUNCTION {0}.fail_dashboard_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic audit failure'; END $$; CREATE TRIGGER fail_dashboard_audit BEFORE INSERT ON {0}.dashboard_audit FOR EACH ROW EXECUTE FUNCTION {0}.fail_dashboard_audit()",f.schema)).await.unwrap();
+    assert_eq!(
+        f.revoke(&session, &token, "audit-fault-machine")
+            .await
+            .status(),
+        503
+    );
+    let revoked: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT revoked FROM {}.central_devices WHERE id='audit-fault-machine'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !revoked,
+        "a failed audit transaction must roll back the revoke"
+    );
+    f.control
+        .batch_execute(&format!(
+            "DROP TRIGGER fail_dashboard_audit ON {}.dashboard_audit",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        f.revoke(&session, &token, "audit-fault-machine")
+            .await
+            .status(),
+        200
+    );
+    let rows: i64 = f
+        .control
+        .query_one(
+            &format!("SELECT count(*) FROM {}.dashboard_audit", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(rows, 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_never_audits_unresolved_request_text() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("log-safe-machine", "synthetic-log-safe-token")
+        .await;
+    let token = f.form_token(&session).await;
+    let hostile = "sensitive credential injected as a machine id";
+    assert_eq!(f.revoke(&session, &token, hostile).await.status(), 404);
+    let target: String = f
+        .control
+        .query_one(
+            &format!("SELECT target FROM {}.dashboard_audit", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(target.starts_with("unresolved:"));
+    let log = std::fs::read_to_string(f.second.root.path().join("dashboard.log")).unwrap();
+    assert!(!log.contains(hostile));
+    let missing = f
+        .http
+        .post(format!("{}/accounts/machines/revoke", f.second.url))
+        .header("cookie", &session)
+        .header("origin", "http://127.0.0.1:8787")
+        .form(&Vec::<(&str, &str)>::new())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 403);
+    assert_eq!(missing.headers()["cache-control"], "no-store");
+    let oversize = f
+        .http
+        .post(format!("{}/accounts/machines/revoke", f.second.url))
+        .header("cookie", &session)
+        .header("origin", "http://127.0.0.1:8787")
+        .form(&[("id", "x".repeat(5000)), ("form_token", token)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversize.status(), 413);
+    assert_eq!(oversize.headers()["cache-control"], "no-store");
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_keeps_one_audit_when_commit_acknowledgement_is_lost() {
+    let mut f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let database = reqwest::Url::parse(&f.database()).unwrap();
+    let proxy_root = tempfile::tempdir().unwrap();
+    let mut proxy = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/postgres_commit_proxy.py"))
+        .arg(database.host_str().unwrap())
+        .arg(database.port_or_known_default().unwrap_or(5432).to_string())
+        .arg(proxy_root.path())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(5),
+        BufReader::new(proxy.stdout.take().unwrap()).read_line(&mut line),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap();
+    let mut proxied = database;
+    proxied.set_host(Some("127.0.0.1")).unwrap();
+    proxied
+        .set_port(Some(ready["port"].as_u64().unwrap() as u16))
+        .unwrap();
+    for pod in [&mut f.first, &mut f.second] {
+        pod.stop().await;
+        let root = std::mem::replace(&mut pod.root, tempfile::tempdir().unwrap());
+        *pod = Pod::spawn(
+            proxied.as_str(),
+            &f._root.path().join("key"),
+            root,
+            "postgres",
+        )
+        .await;
+    }
+    let (session, _) = f.sign_in().await;
+    f.machine(
+        "ambiguous-commit-machine",
+        "synthetic-ambiguous-commit-token",
+    )
+    .await;
+    let token = f.form_token(&session).await;
+    store::atomic_write(&proxy_root.path().join("lose-commit-ack"), b"enabled").unwrap();
+    let response = f.revoke(&session, &token, "ambiguous-commit-machine").await;
+    assert_eq!(
+        response.status(),
+        503,
+        "the failed acknowledgement cannot be reported as success"
+    );
+    assert!(
+        proxy_root.path().join("ack-dropped").exists(),
+        "the fault must happen after the actual COMMIT"
+    );
+    let revoked: bool = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT revoked FROM {}.central_devices WHERE id='ambiguous-commit-machine'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        revoked,
+        "PostgreSQL committed the revoke despite its lost response"
+    );
+    let rows = f
+        .control
+        .query(
+            &format!("SELECT result FROM {}.dashboard_audit", f.schema),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "one HTTP attempt has one durable audit even after an ambiguous COMMIT"
+    );
+    assert_eq!(
+        rows[0].get::<_, String>(0),
+        "ok",
+        "the committed result is preserved"
+    );
+    f.finish().await;
+    proxy.kill().await.unwrap();
+    proxy.wait().await.unwrap();
 }

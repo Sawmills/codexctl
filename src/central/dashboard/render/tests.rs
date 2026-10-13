@@ -221,6 +221,19 @@ async fn render_fixture_pages() {
     empty.accounts.clear();
     empty.machines.clear();
     pages.push(("empty", empty));
+    let response = super::super::document(&overview_with_actions(
+        &fixture(),
+        Some("synthetic-form-token"),
+    ));
+    let csp = response.headers()["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    std::fs::write(directory.join("actions.html"), body).unwrap();
+    std::fs::write(directory.join("actions.html.csp"), csp).unwrap();
     for (name, data) in pages {
         let response = super::super::document(&overview(&data));
         let csp = response.headers()["content-security-policy"]

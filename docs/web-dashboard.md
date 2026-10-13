@@ -9,7 +9,7 @@ The public landing page shows no account or machine data. Its status pill polls
 Installation commands pin Linux downloads to the published v0.1.34 release and
 check the release's SHA-256 file before extracting or installing.
 
-`/accounts` is a read-only overview of the signed-in company user's server accounts
+`/accounts` shows the signed-in company user's server accounts
 and registered machines. The browser polls `/accounts/data` every 60 seconds after
 the preceding request finishes. Countdown clocks and observation ages update locally
 every minute. Remaining time rounds up to a whole minute before carrying minutes
@@ -192,3 +192,43 @@ The harness captures light/dark desktop and phone views, checks WCAG A/AA rules 
 axe, and exercises copy buttons, polling, hostile-looking text, and session loss.
 Hosted CI remains the full Rust/platform/build/audit/Trunk gate. HQ owns deployment;
 Amir approves the visual design before merge. Ship after v0.1.35.
+
+## Revoke on PostgreSQL
+
+PostgreSQL dashboards show a Revoke form for each registered machine. File-mode
+views keep it hidden. Revoke affects only the signed-in company user's machines;
+a foreign or unknown machine returns 404. No action refreshes an OpenAI credential.
+The machine API `/v1/devices/revoke` remains idempotent 204. A second dashboard
+attempt shows “Already revoked” with status 409.
+
+`POST /accounts/machines/revoke` requires the configured public Origin and an
+HMAC-SHA256 form token bound to the session. The vault key signs
+`codexctl-form:` followed by the session token. Missing or wrong evidence returns
+403 before a machine lookup. The request body is limited to 4 KiB. All action
+responses use `Cache-Control: no-store`; CSP keeps `form-action 'self'`.
+
+Revoke also requires a verified OIDC `auth_time` within 10 minutes, with a
+30-second clock-skew allowance. Old or unproven sessions redirect to sign-in
+with `max_age=600`. That callback refuses missing, stale, or future `auth_time`.
+A callback timestamp without that claim does not prove freshness.
+
+Each attempt passing request checks gets a `dashboard_audit` row with `at`,
+`actor` (`dashboard:<email>`), `operation` (`machine_revoke`), `target`, and
+`result` (`ok`, `refused:<reason>`, or `failed:<reason>`), and a structured log. Application logs use an actor digest; the email stays in
+the database audit. A server-generated coalescing key keeps one row per attempt
+even if the COMMIT acknowledgement is lost. A failed acknowledgement returns 503
+while preserving any committed result.
+Revocation, relay-limiter retirement, and its audit commit in one transaction.
+An audit-write failure rolls back the revocation. Unresolved request targets
+are digests so arbitrary submitted text does not reach the audit or logs.
+Neither cookies, bearer credentials, form tokens nor user codes enter the audit.
+The database must be available to write a durable audit; failures return 503.
+
+Failures use bounded dashboard reasons in
+`codexctl_central_failed_requests_total`. Both staging overlays include
+`CodexctlCredentialOperationFailed` for operational dashboard failures in the
+last five minutes. Expected refusals (invalid form, foreign machine, or an
+already-revoked machine) count in metrics without this operational alert.
+Database diagnostics include only a bounded failure class, stage, and SQLSTATE,
+with no raw error message or query values.
+Alert routing and notification delivery require staging validation after B33.

@@ -121,7 +121,7 @@ struct Pending {
 }
 enum Destination {
     Enrollment(String),
-    Accounts(String),
+    Accounts { binding: String, fresh: bool },
 }
 struct Login {
     destination: Destination,
@@ -133,6 +133,8 @@ struct Login {
 struct SharedAccountsLogin {
     binding: String,
     nonce: String,
+    #[serde(default)]
+    fresh: bool,
 }
 struct Approval {
     device_hash: String,
@@ -516,7 +518,7 @@ async fn verify(
     begin_login(&broker, Destination::Enrollment(device_hash)).await
 }
 async fn begin_login(broker: &Broker, destination: Destination) -> Result<Response, HttpError> {
-    let sso = if matches!(destination, Destination::Accounts(_)) {
+    let sso = if matches!(destination, Destination::Accounts { .. }) {
         dashboard_sso(broker)?
     } else {
         sso(broker)?
@@ -552,6 +554,9 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
         )
         .add_scope(Scope::new("email".into()))
         .set_pkce_challenge(challenge);
+    if matches!(destination, Destination::Accounts { fresh: true, .. }) {
+        authorization = authorization.set_max_age(Duration::from_secs(600));
+    }
     if let Some(domains) = sso.config.hosted_domains() {
         // This affects Google's account chooser only. The signed claim is enforced below.
         let hint = if domains.len() == 1 {
@@ -562,12 +567,13 @@ async fn begin_login(broker: &Broker, destination: Destination) -> Result<Respon
         authorization = authorization.add_extra_param("hd", hint);
     }
     let (url, state, nonce) = authorization.url();
-    if let (Some(central), Destination::Accounts(binding)) =
+    if let (Some(central), Destination::Accounts { binding, fresh }) =
         (shared_dashboard(broker), &destination)
     {
         let payload = serde_json::to_vec(&SharedAccountsLogin {
             binding: binding.clone(),
             nonce: nonce.secret().clone(),
+            fresh: *fresh,
         })
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "enrollment_unavailable"))?;
         let inserted = central
@@ -626,7 +632,10 @@ async fn callback(
         let stored: SharedAccountsLogin = serde_json::from_slice(&payload)
             .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?;
         Login {
-            destination: Destination::Accounts(stored.binding),
+            destination: Destination::Accounts {
+                binding: stored.binding,
+                fresh: stored.fresh,
+            },
             nonce: Nonce::new(stored.nonce),
             verifier: shared_pkce_verifier(&broker, &input.state)?,
             created: Instant::now(),
@@ -639,7 +648,9 @@ async fn callback(
             .remove(&vault::digest(input.state.as_bytes()))
             .ok_or_else(|| broker.error(StatusCode::BAD_REQUEST, "invalid_sso_state"))?
     };
-    if let Destination::Accounts(expected) = &login.destination
+    if let Destination::Accounts {
+        binding: expected, ..
+    } = &login.destination
         && cookie(&headers, sso.cookie_name("login"))
             .map(|v| vault::digest(v.as_bytes()))
             .as_ref()
@@ -678,6 +689,13 @@ async fn callback(
     let claims = id
         .claims(&verifier, &login.nonce)
         .map_err(|_| broker.error(StatusCode::UNAUTHORIZED, "sso_denied"))?;
+    if matches!(login.destination, Destination::Accounts { fresh: true, .. })
+        && !claims
+            .auth_time()
+            .is_some_and(|time| super::dashboard::recent_sign_in(time.timestamp()))
+    {
+        return Err(broker.error(StatusCode::UNAUTHORIZED, "dashboard_auth_time_refused"));
+    }
     if let Some(expected) = claims.access_token_hash() {
         let actual = AccessTokenHash::from_token(
             tokens.access_token(),
@@ -731,7 +749,7 @@ async fn callback(
     };
     let device_hash = match login.destination {
         Destination::Enrollment(hash) => hash,
-        Destination::Accounts(_) => {
+        Destination::Accounts { .. } => {
             let result = if let Some(central) = shared_dashboard(&broker) {
                 central
                     .record_browser_user(&user, email)
@@ -761,9 +779,7 @@ async fn callback(
             })?;
             let token = secret();
             if let Some(central) = shared_dashboard(&broker) {
-                let signed_in_at = claims
-                    .auth_time()
-                    .map_or_else(|| chrono::Utc::now().timestamp(), |time| time.timestamp());
+                let signed_in_at = claims.auth_time().map(|time| time.timestamp());
                 let created = central
                     .create_browser_session(&token, &user, signed_in_at, SESSION_TTL)
                     .await
@@ -973,6 +989,17 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
             (key == name).then_some(value)
         })
 }
+pub(super) fn browser_session_token<'a>(
+    broker: &Broker,
+    headers: &'a HeaderMap,
+) -> Option<&'a str> {
+    let sso = broker.sso.as_deref()?;
+    cookie(headers, sso.cookie_name("session"))
+}
+pub(super) fn browser_origin(broker: &Broker) -> Result<&str, HttpError> {
+    Ok(dashboard_sso(broker)?.public_url.as_str())
+}
+
 pub(super) async fn browser_user(
     broker: &Broker,
     headers: &HeaderMap,
@@ -1069,12 +1096,24 @@ pub(super) async fn accounts_sign_out(
     Ok(response)
 }
 
-pub(super) async fn accounts_sign_in(State(broker): State<Broker>) -> Result<Response, HttpError> {
+#[derive(Deserialize, Default)]
+pub(super) struct AccountsSignIn {
+    #[serde(default)]
+    fresh: bool,
+}
+
+pub(super) async fn accounts_sign_in(
+    State(broker): State<Broker>,
+    Query(input): Query<AccountsSignIn>,
+) -> Result<Response, HttpError> {
     let sso = dashboard_sso(&broker)?;
     let binding = secret();
     let mut response = begin_login(
         &broker,
-        Destination::Accounts(vault::digest(binding.as_bytes())),
+        Destination::Accounts {
+            binding: vault::digest(binding.as_bytes()),
+            fresh: input.fresh,
+        },
     )
     .await?;
     response.headers_mut().insert(

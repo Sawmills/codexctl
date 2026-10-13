@@ -3,8 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  pull_request: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -54,6 +53,12 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --features central-real-db-tests
+
+      - name: Dashboard alert rules
+        run: |
+          python3 -m venv /tmp/dashboard-alerts-venv
+          /tmp/dashboard-alerts-venv/bin/pip install PyYAML==6.0.3
+          /tmp/dashboard-alerts-venv/bin/python tests/fixtures/check_dashboard_alerts.py
 
       - name: Central prototype
         run: |
