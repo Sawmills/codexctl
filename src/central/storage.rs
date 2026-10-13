@@ -22,6 +22,7 @@ pub(in crate::central) mod identity;
 pub(in crate::central) mod login;
 
 const DB_TIMEOUT: Duration = Duration::from_secs(2);
+const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 mod backfill;
 pub use backfill::BackfillScanException;
@@ -1625,7 +1626,7 @@ impl PostgresStore {
         }
         *slot = None;
         drop(slot);
-        let client = tokio::time::timeout(Duration::from_secs(5), self.establish())
+        let client = tokio::time::timeout(DB_CONNECT_TIMEOUT, self.establish())
             .await
             .context("central PostgreSQL connect timed out")??;
         let mut slot = cache.lock().await;

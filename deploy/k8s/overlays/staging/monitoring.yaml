@@ -30,7 +30,7 @@ spec:
             environment: staging
           annotations:
             summary: Codexctl account operation failed
-            description: Inspect the broker reason and stage in structured logs.
+            description: '{{ if match "^(dashboard_.*|browser_sessions_unavailable)$" $labels.reason }}A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.{{ else }}Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.{{ end }}'
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlRelayCapacityExhausted
           expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0

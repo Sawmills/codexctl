@@ -1,7 +1,7 @@
 //! Shared browser sign-in state and sessions. Only the cookie digest identifies sessions.
-use super::{CentralStore, PostgresStore, bounded_db, vault};
+use super::{CentralStore, DB_CONNECT_TIMEOUT, PostgresStore, bounded_db, vault};
 use crate::central::enrollment::identity::{self as browser_identity, Decision};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
 
 pub(in crate::central) enum BrowserIdentity {
@@ -129,9 +129,12 @@ impl CentralStore {
         audit: Option<DashboardAudit<'_>>,
     ) -> Result<MachineRevoke> {
         let db = self.browser_store()?;
+        let connection = tokio::time::timeout(DB_CONNECT_TIMEOUT, db.establish())
+            .await
+            .context("central PostgreSQL revoke connect timed out")??;
+        let mut client = std::sync::Arc::try_unwrap(connection)
+            .map_err(|_| anyhow::anyhow!("revoke transaction connection is shared"))?;
         bounded_db(async {
-            let mut client = std::sync::Arc::try_unwrap(db.establish().await?)
-                .map_err(|_| anyhow::anyhow!("revoke transaction connection is shared"))?;
             let tx = client.transaction().await?;
             let row = tx.query_opt("SELECT revoked,revision FROM central_devices WHERE tenant=$1 AND user_id=$2 AND id=$3 AND deleted_at IS NULL FOR UPDATE", &[&tenant, &user, &id]).await?;
             let outcome = match row {

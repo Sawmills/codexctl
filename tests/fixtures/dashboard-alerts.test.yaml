@@ -21,7 +21,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -30,7 +30,7 @@ tests:
     input_series:
       - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_audit_failed",pod="pod-c"}
         values: >-
-          0 60 60
+          0 60 60 60 60 60 60
     alert_rule_test:
       - eval_time: 2m
         alertname: CodexctlCredentialOperationFailed
@@ -42,8 +42,11 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
   - interval: 1m
     input_series:
       - series: codexctl_central_last_failure_timestamp_seconds{reason="browser_sessions_unavailable",pod="pod-c"}
@@ -60,7 +63,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -81,7 +84,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -102,7 +105,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -123,8 +126,209 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: Inspect the broker reason and stage in structured logs.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="owner_unavailable",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="catalog_owner_unavailable",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="catalog_usage_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="catalog_usage_timeout",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="catalog_task_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="live_session_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="persistence_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="registry_unavailable",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="registry_busy",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="import_unavailable",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="recovery_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="relogin_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="relogin_identity_unresolved",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="reset_read_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="reset_redeem_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="reset_rejected",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="token_evidence_clear_failed",pod="pod-owner"}
+        values: 0 60 60 60 60 60 60
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              {
+                reason: owner_unavailable,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: &owner_annotations
+              summary: Codexctl account operation failed
+              description: Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+          - exp_labels:
+              {
+                reason: catalog_owner_unavailable,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: catalog_usage_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: catalog_usage_timeout,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: catalog_task_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: live_session_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: persistence_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: registry_unavailable,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: registry_busy,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: import_unavailable,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: recovery_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: relogin_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: relogin_identity_unresolved,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: reset_read_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: reset_redeem_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: reset_rejected,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+          - exp_labels:
+              {
+                reason: token_evidence_clear_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+      - eval_time: 6m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_ownership_unresolved{reason="recovery_failed",pod="pod-owner"}
+        values: 0 0 1 1 0 0 0
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts:
+          - exp_labels:
+              {
+                reason: recovery_failed,
+                severity: warning,
+                service: codexctl,
+                environment: staging,
+              }
+            exp_annotations: *owner_annotations
+      - eval_time: 4m
         alertname: CodexctlCredentialOperationFailed
         exp_alerts: []
