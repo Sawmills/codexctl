@@ -133,7 +133,7 @@ impl CentralStore {
             let mut client = std::sync::Arc::try_unwrap(db.establish().await?)
                 .map_err(|_| anyhow::anyhow!("revoke transaction connection is shared"))?;
             let tx = client.transaction().await?;
-            let row = tx.query_opt("SELECT revoked,revision FROM central_devices WHERE tenant=$1 AND user_id=$2 AND id=$3 AND deleted_at IS NULL", &[&tenant, &user, &id]).await?;
+            let row = tx.query_opt("SELECT revoked,revision FROM central_devices WHERE tenant=$1 AND user_id=$2 AND id=$3 AND deleted_at IS NULL FOR UPDATE", &[&tenant, &user, &id]).await?;
             let outcome = match row {
                 None => MachineRevoke::NotFound,
                 Some(row) if row.get::<_,bool>(0) => MachineRevoke::AlreadyRevoked,

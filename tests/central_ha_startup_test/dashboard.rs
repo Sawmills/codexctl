@@ -2011,3 +2011,111 @@ async fn postgres_dashboard_render_failure_is_uncacheable_html() {
     }
     f.finish().await;
 }
+
+#[tokio::test]
+async fn postgres_dashboard_revoke_refusals_have_html_navigation() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("refusal-machine", "synthetic-refusal-machine-token")
+        .await;
+    let token = f.form_token(&session).await;
+    for (form_token, id, status) in [
+        ("wrong", "refusal-machine", 403),
+        (token.as_str(), "missing-machine", 404),
+    ] {
+        let response = f.revoke(&session, form_token, id).await;
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            response.headers()["content-type"]
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let html = response.text().await.unwrap();
+        assert!(html.contains("Machine could not be revoked"));
+        assert!(html.contains("href=\"/accounts\""));
+        assert!(
+            !html.contains("data-load-error=\"true\""),
+            "an action refusal must not automatically retry"
+        );
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_concurrent_revokes_keep_duplicate_response_semantics() {
+    let f = BrowserFixture::start().await;
+    f.identity(Some(chrono::Utc::now().timestamp()));
+    let (session, _) = f.sign_in().await;
+    f.machine("revoke-caller", "synthetic-concurrent-caller-token")
+        .await;
+    let token = f.form_token(&session).await;
+    for (browser, id) in [(true, "browser-target"), (false, "api-target")] {
+        f.machine(id, id).await;
+        f.control
+            .batch_execute(&format!(
+                "BEGIN; SELECT id FROM {}.central_devices WHERE id='{id}' FOR UPDATE",
+                f.schema
+            ))
+            .await
+            .unwrap();
+        let request = || {
+            if browser {
+                f.http
+                    .post(format!("{}/accounts/machines/revoke", f.second.url))
+                    .header("cookie", &session)
+                    .header("origin", "http://127.0.0.1:8787")
+                    .form(&[("id", id), ("form_token", token.as_str())])
+            } else {
+                f.http
+                    .post(format!("{}/v1/devices/revoke", f.second.url))
+                    .bearer_auth("synthetic-concurrent-caller-token")
+                    .json(&json!({"id":id}))
+            }
+            .send()
+        };
+        let release = async {
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    f.control.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+                    let waiting: i64 = f.control.query_one(
+                        "SELECT count(*) FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",
+                        &[&f.schema],
+                    ).await.unwrap().get(0);
+                    if waiting >= 2 { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("both revoke requests reached the locked machine row");
+            f.control.batch_execute("COMMIT").await.unwrap();
+        };
+        let (first, second, ()) = tokio::join!(request(), request(), release);
+        let mut responses = vec![first.unwrap(), second.unwrap()];
+        responses.sort_by_key(|response| response.status().as_u16());
+        if browser {
+            assert_eq!(responses[0].status(), 200);
+            let duplicate = responses.pop().unwrap();
+            assert_eq!(duplicate.status(), 409);
+            assert!(duplicate.text().await.unwrap().contains("Already revoked"));
+        } else {
+            assert!(responses.iter().all(|response| response.status() == 204));
+        }
+    }
+    let outcomes: Vec<String> = f
+        .control
+        .query(
+            &format!(
+                "SELECT result FROM {}.dashboard_audit ORDER BY result",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(outcomes, ["ok", "refused:already_revoked"]);
+    f.finish().await;
+}

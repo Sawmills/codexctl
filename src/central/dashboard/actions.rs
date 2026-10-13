@@ -108,7 +108,17 @@ pub(super) async fn revoke(
     let result = run_revoke(&broker, &headers, &input).await;
     let mut response = match result {
         Ok(response) => response,
-        Err(error) => error.into_response(),
+        Err(error) => {
+            let failure = error.into_response();
+            let mut response = super::document(
+                "<main id=\"main\" class=\"wrap\"><h1>Machine could not be revoked</h1><p>Return to your accounts to check the machine status or sign in again.</p><p><a href=\"/accounts\">Back to accounts</a></p></main>",
+            );
+            *response.status_mut() = failure.status();
+            response
+                .extensions_mut()
+                .extend(failure.into_parts().0.extensions);
+            response
+        }
     };
     response
         .headers_mut()
