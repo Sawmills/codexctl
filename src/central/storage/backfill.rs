@@ -1,6 +1,11 @@
 //! Preflight bounds for the stopped-file administrative backfill.
 use super::*;
 
+// SCAN EXCEPTION RECORD, docs/central-ha.md section 5: initial/final B33 A5
+// only, co-signed by codexctl HQ w5C:t41 and Operator w9C:tF.
+const SCAN_DATABASE: &str = "codexctl_a5";
+const CANARY_SCAN_DATABASE: &str = "codexctl_a5_canary";
+const SCAN_EXPIRES: chrono::NaiveDate = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
 const BACKFILL_MAX_ROWS: usize = 50_000;
 const TABLES: [&str; 6] = [
     "central_accounts",
@@ -10,6 +15,51 @@ const TABLES: [&str; 6] = [
     "account_loans",
     "account_loan_audit",
 ];
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum BackfillScanException {
+    #[value(name = "b33-a5")]
+    B33A5,
+    #[value(name = "b33-a5-canary")]
+    B33A5Canary,
+}
+
+pub(super) async fn authorize(
+    target: &PostgresStore,
+    exception: BackfillScanException,
+) -> Result<()> {
+    let row = bounded_db(async {
+        Ok(target.client().await?.query_one(
+            "SELECT pg_catalog.current_database(), pg_catalog.to_char(pg_catalog.clock_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD')",
+            &[],
+        ).await?)
+    }).await?;
+    let database: &str = row.get(0);
+    let date: &str = row.get(1);
+    check_scope(
+        exception,
+        database,
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?,
+    )
+}
+
+fn check_scope(
+    exception: BackfillScanException,
+    database: &str,
+    date: chrono::NaiveDate,
+) -> Result<()> {
+    let expected = match exception {
+        BackfillScanException::B33A5 => SCAN_DATABASE,
+        BackfillScanException::B33A5Canary => CANARY_SCAN_DATABASE,
+    };
+    if database != expected {
+        bail!("backfill scan exception requires database {expected}");
+    }
+    if date > SCAN_EXPIRES {
+        bail!("backfill scan exception expired after {SCAN_EXPIRES}");
+    }
+    Ok(())
+}
 
 pub(super) fn check_rows(table: &str, count: usize) -> Result<usize> {
     if count > BACKFILL_MAX_ROWS {
@@ -168,4 +218,41 @@ pub(super) async fn verify_devices(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_scope_refuses_other_databases_and_dates_after_the_owner_deadline() {
+        let last_day = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
+        let next_day = chrono::NaiveDate::from_ymd_opt(2026, 10, 21).unwrap();
+        for (exception, database, wrong) in [
+            (
+                BackfillScanException::B33A5,
+                "codexctl_a5",
+                "codexctl_a5_canary",
+            ),
+            (
+                BackfillScanException::B33A5Canary,
+                "codexctl_a5_canary",
+                "codexctl_a5",
+            ),
+        ] {
+            assert!(check_scope(exception, database, last_day).is_ok());
+            assert!(
+                check_scope(exception, database, next_day)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("expired")
+            );
+            assert!(
+                check_scope(exception, wrong, last_day)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires database")
+            );
+        }
+    }
 }
