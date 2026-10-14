@@ -803,6 +803,23 @@ pub(super) async fn settle_background_recovery(
     }
 }
 
+/// Preserve Tokio's fair queue and expose actual pending token admissions.
+/// The scope guard clears the activity gauge on acquisition or cancellation.
+async fn lock_token_owner(owner: &Mutex<Owner>) -> tokio::sync::MutexGuard<'_, Owner> {
+    let mut waiting = None;
+    let mut lock = std::pin::pin!(owner.lock());
+    let owner = std::future::poll_fn(|cx| match lock.as_mut().poll(cx) {
+        std::task::Poll::Ready(owner) => std::task::Poll::Ready(owner),
+        std::task::Poll::Pending => {
+            waiting.get_or_insert_with(crate::central::refresh_control::owner_waiter);
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    drop(waiting);
+    owner
+}
+
 pub(super) async fn token(
     State(broker): State<Broker>,
     headers: HeaderMap,
@@ -866,7 +883,7 @@ pub(super) async fn token(
             {
                 let owner = worker
                     .settlements
-                    .admit(&owner_ref, owner_ref.lock())
+                    .admit(&owner_ref, lock_token_owner(&owner_ref))
                     .await
                     .map_err(|_| {
                         worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
@@ -969,14 +986,14 @@ pub(super) async fn token(
                 // Never await imports with Owner held: an importer may already
                 // hold imports while waiting for this Owner.
                 drop(imports);
-                let owner = owner_ref.lock().await;
+                let owner = lock_token_owner(&owner_ref).await;
                 if let Ok(imports) = worker.imports.try_lock() {
                     break (Some(imports), owner);
                 }
                 drop(owner);
             }
         } else {
-            (None, owner_ref.lock().await)
+            (None, lock_token_owner(&owner_ref).await)
         }};
         let (import_guard, mut owner) = worker.settlements.admit(&owner_ref, admission)
             .await.map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;

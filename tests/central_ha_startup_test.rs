@@ -3834,11 +3834,19 @@ async fn postgres_owner_initialize_obeys_the_native_deadline() {
     .await
     .expect("leased initialization must start");
     let queued = [post(), post()];
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        queued.iter().all(|task| !task.is_finished()),
-        "callers admitted during healthy initialization retain their queue position"
-    );
+    let admitted = timeout(Duration::from_secs(2), async {
+        while metric(&f, &f.first, "codexctl_central_owner_request_waiters").await != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if admitted.is_err() {
+        store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!(
+            "both callers must reach the server owner-lock queue before initialization times out"
+        );
+    }
     let refused = timeout(Duration::from_secs(13), first).await;
     if refused.is_err() {
         store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
@@ -3853,6 +3861,11 @@ async fn postgres_owner_initialize_obeys_the_native_deadline() {
             .unwrap();
         assert_eq!(response.status(), 503);
     }
+    assert_eq!(
+        metric(&f, &f.first, "codexctl_central_owner_request_waiters").await,
+        0,
+        "deferred settlement cancels both queued owner-lock futures"
+    );
     assert_eq!(
         timeout(Duration::from_secs(2), request(&f.http, &f.first, &f.token))
             .await

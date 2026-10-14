@@ -1122,6 +1122,10 @@ deadline. If that operation times out and enters deferred settlement, callers
 already queued also receive 503 and must retry after publication; new arrivals
 refuse during the same settlement barrier. Even a proven plain fallback returns this 503 when
 its failed-read child cannot stop within the foreground settlement deadline.
+`codexctl_central_owner_request_waiters` counts token callers whose owner-lock
+future is pending. It has no labels, does not take an owner lock when scraped,
+and returns to zero when waiting callers acquire the lock or are canceled by
+settlement. It is an activity gauge, not a failure alert.
 The response waits for credential publication, rather than exporting an
 unpublished journal while background settlement continues. The retained lease
 prevents another refresh owner; valid-token service resumes after settlement.

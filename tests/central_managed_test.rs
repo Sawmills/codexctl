@@ -5476,21 +5476,50 @@ fn owner_native_healthy_concurrent_reads_wait_without_an_admission_503() {
             .status(),
         200
     );
-    store::atomic_write(&server.root.path().join("mode"), b"owner-native-slow-once").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-native-hold").unwrap();
+    let waiters = || {
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        metrics
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("codexctl_central_owner_request_waiters ")?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .expect("owner request waiter gauge")
+    };
     std::thread::scope(|scope| {
         let first = scope.spawn(|| server.token_without_billing(&server.amir, "personal"));
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !server.root.path().join("native-slow-started").exists() {
+        while !server.root.path().join("native-started").exists() {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            server
-                .token_without_billing(&server.amir, "personal")
-                .status(),
-            200
-        );
+        let second = scope.spawn(|| server.token_without_billing(&server.amir, "personal"));
+        let admitted_until = std::time::Instant::now() + Duration::from_secs(2);
+        while waiters() != 1 {
+            assert!(
+                std::time::Instant::now() < admitted_until,
+                "healthy caller must enter owner queue"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        store::atomic_write(&server.root.path().join("native-release"), b"release").unwrap();
         assert_eq!(first.join().unwrap().status(), 200);
+        assert_eq!(second.join().unwrap().status(), 200);
+        assert_eq!(
+            waiters(),
+            0,
+            "successful lock acquisition clears the waiter gauge"
+        );
     });
 }
 
