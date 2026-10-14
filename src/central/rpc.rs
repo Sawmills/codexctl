@@ -71,6 +71,31 @@ pub(super) struct FailureDiagnostics {
     pub(super) failure_class: FailureClass,
     pub(super) rpc_code: Option<i64>,
     pub(super) has_data_retryable: bool,
+    pub(super) http_status: Option<u16>,
+}
+
+impl FailureDiagnostics {
+    pub(super) fn native_reason(self) -> &'static str {
+        match self.http_status {
+            Some(429) => "upstream_429",
+            Some(408 | 504) => "upstream_timeout",
+            Some(500..=599) => "upstream_5xx",
+            Some(400..=499) => "upstream_4xx",
+            _ => match self.failure_class {
+                FailureClass::Timeout => "upstream_timeout",
+                FailureClass::NativeError if self.rpc_code == Some(-32603) => "app_server_internal",
+                FailureClass::NativeError => "app_server_error",
+                FailureClass::Eof | FailureClass::Io => "app_server_transport",
+                FailureClass::InvalidProtocol => "app_server_protocol",
+                FailureClass::Other => "app_server_unavailable",
+            },
+        }
+    }
+}
+
+struct PendingWrite {
+    bytes: Vec<u8>,
+    written: usize,
 }
 
 /// A private stdio connection. Never include protocol payloads in errors or logs.
@@ -78,10 +103,13 @@ pub struct Rpc {
     _child: Child,
     input: Option<ChildStdin>,
     output: BufReader<ChildStdout>,
+    wire_bytes: Vec<u8>,
+    outgoing: VecDeque<PendingWrite>,
     next_id: u64,
     healthy: bool,
     retryable_failure: bool,
     timed_out: bool,
+    kill_requested: bool,
     failure_diagnostics: FailureDiagnostics,
     outstanding: Option<(u64, bool)>,
     verified_login: bool,
@@ -116,6 +144,32 @@ impl Rpc {
         let _ = timeout(Duration::from_secs(5), self._child.wait()).await;
     }
 
+    /// Retain the RPC on failure so its lease cannot be released without proof
+    /// of child death. A later attempt can finish reaping the same killed child.
+    pub(super) async fn kill_and_reap(&mut self) -> Result<bool> {
+        if self
+            ._child
+            .try_wait()
+            .context("could not inspect owner exit")?
+            .is_none()
+        {
+            drop(self.input.take());
+            if !self.kill_requested {
+                self._child
+                    .start_kill()
+                    .context("could not kill unsettled owner; runtime retained")?;
+                self.kill_requested = true;
+            }
+            timeout(Duration::from_secs(5), self._child.wait())
+                .await
+                .context("killed owner did not exit; runtime retained")?
+                .context("could not confirm killed owner exit; runtime retained")?;
+        }
+        self.outstanding = None;
+        self.healthy = false;
+        Ok(std::mem::take(&mut self.kill_requested))
+    }
+
     pub(super) fn retryable_failure(&self) -> bool {
         self.retryable_failure
     }
@@ -138,13 +192,41 @@ impl Rpc {
         if provider_rejected {
             self.rejected_login = true;
         } else if error.is::<AppServerError>() {
-            self.healthy = false;
+            // A completed native error leaves the protocol synchronized,
+            // even when the caller has exhausted its retry budget.
             self.retryable_failure = true;
         }
     }
 
     pub(super) fn failure_diagnostics(&self) -> FailureDiagnostics {
-        self.failure_diagnostics
+        FailureDiagnostics {
+            http_status: self
+                .failure_diagnostics
+                .http_status
+                .or(self.refresh_reason.status()),
+            ..self.failure_diagnostics
+        }
+    }
+
+    /// A completed native error leaves the stdio protocol synchronized.
+    /// Never resume an ambiguous request, dead child, or rejected grant.
+    pub(super) fn resume_completed_native_error(&mut self) -> bool {
+        if self.refresh_reason.reason().is_some() {
+            self.rejected_login = true;
+        }
+        if self.outstanding.is_some()
+            || self.timed_out
+            || self.rejected_login
+            || !matches!(
+                self.failure_diagnostics.failure_class,
+                FailureClass::NativeError
+            )
+            || self.process_exited()
+        {
+            return false;
+        }
+        self.healthy = true;
+        true
     }
 
     pub(super) fn timed_out(&self) -> bool {
@@ -238,10 +320,13 @@ impl Rpc {
             _child: child,
             input: Some(input),
             output,
+            wire_bytes: Vec::new(),
+            outgoing: VecDeque::new(),
             next_id: 0,
             healthy: true,
             retryable_failure: false,
             timed_out: false,
+            kill_requested: false,
             failure_diagnostics: FailureDiagnostics::default(),
             outstanding: None,
             verified_login: false,
@@ -267,9 +352,23 @@ impl Rpc {
     }
 
     pub async fn initialize(&mut self) -> Result<()> {
-        self.call("initialize", json!({"clientInfo":{"name":"codexctl_central_prototype","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
-        self.send(json!({"method":"initialized"})).await?;
-        Ok(())
+        self.initialize_with_deadline(Duration::from_secs(90)).await
+    }
+
+    pub(super) async fn initialize_with_deadline(&mut self, deadline: Duration) -> Result<()> {
+        let result = timeout(deadline, async {
+            self.owner_read("initialize", json!({"clientInfo":{"name":"codexctl_central_prototype","version":"0.1.0"},"capabilities":{"experimentalApi":true}}), deadline).await?;
+            self.send(json!({"method":"initialized"})).await
+        }).await;
+        match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.healthy = false;
+                self.timed_out = true;
+                self.failure_diagnostics.failure_class = FailureClass::Timeout;
+                Err(error).context("app-server initialization timed out; completion is unknown")
+            }
+        }
     }
 
     pub fn pid(&self) -> Result<u32> {
@@ -301,13 +400,13 @@ impl Rpc {
         }
     }
 
-    pub(super) async fn remember_exportable_login(&mut self) -> Result<String> {
+    pub(super) async fn remember_exportable_login(&mut self, deadline: Duration) -> Result<String> {
         let status = self
             .call_handled(
                 "getAuthStatus",
                 json!({"includeToken":true,"refreshToken":false}),
                 &mut RejectRequests,
-                Duration::from_secs(10),
+                deadline,
             )
             .await?;
         let native_chatgpt = status.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
@@ -315,7 +414,7 @@ impl Rpc {
         // Pinned file-backed ChatGPT auth suppresses export on permanent refresh
         // failure, including a proactive refresh before our first status call.
         // Empty/unreadable tokens and other auth kinds report a different method.
-        self.rejected_login = native_chatgpt && status.get("authToken") == Some(&Value::Null);
+        self.rejected_login |= native_chatgpt && status.get("authToken") == Some(&Value::Null);
         self.exportable_login = native_chatgpt
             && status
                 .get("authToken")
@@ -330,10 +429,10 @@ impl Rpc {
             .to_owned())
     }
 
-    pub(super) async fn inspect_rejection(&mut self) {
+    pub(super) async fn inspect_rejection(&mut self, deadline: Duration) {
         // A completed RPC error can mean configuration or routing failure. Never
         // infer rejection from its code or message. An unfinished call stays fenced.
-        if !self.exportable_login || self.outstanding.is_some() {
+        if self.rejected_login || !self.exportable_login || self.outstanding.is_some() {
             return;
         }
         let healthy_before_inspection = self.healthy;
@@ -343,12 +442,12 @@ impl Rpc {
                 "getAuthStatus",
                 json!({"includeToken":true,"refreshToken":false}),
                 &mut RejectRequests,
-                Duration::from_secs(10),
+                deadline,
             )
             .await;
         // Require an exportable cached ChatGPT token before the force attempt.
         // Its later suppression is pinned Codex's permanent-failure evidence.
-        self.rejected_login = status.as_ref().is_ok_and(|s| {
+        self.rejected_login |= status.as_ref().is_ok_and(|s| {
             s.get("authMethod").and_then(Value::as_str) == Some("chatgpt")
                 && s.get("authToken") == Some(&Value::Null)
                 && s.get("requiresOpenaiAuth").and_then(Value::as_bool) == Some(true)
@@ -364,6 +463,9 @@ impl Rpc {
     }
 
     pub(super) async fn settle_and_stop(&mut self) -> Result<std::process::ExitStatus> {
+        // A foreground deadline can cancel a callback reply midway through its
+        // JSON line. Finish that exact write before waiting for the child.
+        self.flush_pending().await?;
         // Do not close stdin while a timed-out request can still rotate credentials.
         if let Some((id, verifies)) = self.outstanding {
             timeout(Duration::from_secs(180), async {
@@ -399,12 +501,32 @@ impl Rpc {
     }
 
     pub async fn send(&mut self, value: Value) -> Result<()> {
-        let wire = serde_json::to_string(&value)?;
+        let mut bytes = serde_json::to_vec(&value)?;
+        bytes.push(b'\n');
+        self.outgoing.push_back(PendingWrite { bytes, written: 0 });
+        self.flush_pending().await
+    }
+
+    async fn flush_pending(&mut self) -> Result<()> {
+        if self.outgoing.is_empty() {
+            return Ok(());
+        }
         let input = self.input.as_mut().context("app-server input is closed")?;
         let result = async {
-            input.write_all(wire.as_bytes()).await?;
-            input.write_all(b"\n").await?;
-            input.flush().await
+            while let Some(write) = self.outgoing.front_mut() {
+                while write.written < write.bytes.len() {
+                    // AsyncWriteExt::write is cancellation safe. Record each
+                    // completed write before another await can be canceled.
+                    let count = input.write(&write.bytes[write.written..]).await?;
+                    if count == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                    }
+                    write.written += count;
+                }
+                input.flush().await?;
+                self.outgoing.pop_front();
+            }
+            Ok(())
         }
         .await;
         if result.is_err() {
@@ -421,10 +543,9 @@ impl Rpc {
     }
 
     async fn read_wire(&mut self) -> Result<Value> {
-        let mut bytes = Vec::new();
         let read = timeout(
             Duration::from_secs(180),
-            self.output.read_until(b'\n', &mut bytes),
+            self.output.read_until(b'\n', &mut self.wire_bytes),
         )
         .await;
         let count = match read {
@@ -442,13 +563,25 @@ impl Rpc {
             self.failure_diagnostics.failure_class = FailureClass::Eof;
             bail!("app-server closed its connection");
         }
+        let bytes = std::mem::take(&mut self.wire_bytes);
         serde_json::from_slice(&bytes)
             .inspect_err(|_| self.failure_diagnostics.failure_class = FailureClass::InvalidProtocol)
             .context("invalid app-server protocol message")
     }
 
+    #[cfg(test)]
     pub async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.call_handled(method, params, &mut RejectRequests, Duration::from_secs(90))
+            .await
+    }
+
+    pub(super) async fn owner_read(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
+        self.call_handled(method, params, &mut RejectRequests, deadline)
             .await
     }
 
@@ -459,6 +592,15 @@ impl Rpc {
         handler: &mut impl RequestHandler,
         deadline: Duration,
     ) -> Result<Value> {
+        // Permanent rejection belongs to this child and grant, even if its
+        // stderr arrives after the preceding RPC reply or during retry backoff.
+        // Keep it for the owner to log and count instead of discarding evidence.
+        if self.refresh_reason.reason().is_some() {
+            self.rejected_login = true;
+        }
+        if self.rejected_login {
+            bail!("app-server login rejected by provider");
+        }
         self.failure_diagnostics = FailureDiagnostics::default();
         if !self.healthy {
             bail!("app-server connection is unavailable after a protocol failure");
@@ -466,13 +608,10 @@ impl Rpc {
         self.next_id += 1;
         let id = self.next_id;
         let verifies = method == "account/read" && params.get("refreshToken") == Some(&json!(true));
-        if verifies {
-            self.rejected_login = false;
-        }
         self.outstanding = Some((id, verifies));
-        // A reason belongs to the call during which Codex logged it; drop any
-        // earlier one so it cannot be blamed on this call.
-        self.refresh_reason.take();
+        // Transient status metadata is call-scoped. Permanent evidence above
+        // remains attached to the grant until the owner consumes it.
+        self.refresh_reason.clear_status();
         let operation = async {
             self.send(json!({"id":id,"method":method,"params":params}))
                 .await?;
@@ -486,6 +625,11 @@ impl Rpc {
                             failure_class: FailureClass::NativeError,
                             rpc_code: response.pointer("/error/code").and_then(Value::as_i64),
                             has_data_retryable: response.pointer("/error/data/retryable").is_some(),
+                            http_status: response
+                                .pointer("/error/data/http_status")
+                                .and_then(Value::as_u64)
+                                .filter(|status| (400..=599).contains(status))
+                                .map(|status| status as u16),
                         };
                         // Only these completed, pinned policy errors are safe
                         // refusals. Never log or retain native protocol payloads.

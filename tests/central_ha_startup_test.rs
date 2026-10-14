@@ -429,50 +429,8 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
             );
         }
         assert_eq!(pods.each_ref().map(Pod::launches), [2, 0, 0]);
-        // Fail one scheduled renewal while initialize is still unfinished.
-        // The renewer must survive the query error and retry on its next tick.
-        control
-            .batch_execute(&format!(
-                "CREATE SEQUENCE {schema}.live_renew_attempts;
-             CREATE FUNCTION {schema}.fail_live_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
-             BEGIN
-               IF nextval('{schema}.live_renew_attempts') = 1 THEN
-                 RAISE EXCEPTION 'synthetic live renewal failure';
-               END IF;
-               RETURN NEW;
-             END $$;
-             CREATE TRIGGER fail_live_renewal BEFORE UPDATE ON {schema}.account_refresh_leases
-             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
-             EXECUTE FUNCTION {schema}.fail_live_renewal();"
-            ))
-            .await
-            .unwrap();
-        timeout(Duration::from_secs(65), async {
-            loop {
-                let retried: bool = control
-                    .query_one(
-                        &format!(
-                            "SELECT is_called AND last_value >= 2 FROM {schema}.live_renew_attempts"
-                        ),
-                        &[],
-                    )
-                    .await
-                    .unwrap()
-                    .get(0);
-                if retried {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .expect("transient renewal failure stopped the live child lease renewer");
-        control
-            .batch_execute(&format!(
-                "DROP TRIGGER fail_live_renewal ON {schema}.account_refresh_leases"
-            ))
-            .await
-            .unwrap();
+        // Healthy initialization must finish inside the native deadline.
+        // Renewal-query failure during deferred settlement is covered by the hung-child test.
         store::atomic_write(&pods[0].root.path().join("release-initialize"), b"go").unwrap();
         let mut generations = Vec::new();
         for task in same_account {
@@ -3668,6 +3626,428 @@ async fn postgres_fast_path_refuses_stale_evidence() {
         )
         .await,
         1
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_failed_native_read_with_a_slow_exit_does_not_permanently_fence() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-error-slow-exit").unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.first, &f.token).await;
+            if response.status() == 200 {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["billingClass"],
+                    "rate_limited"
+                );
+                break;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unclassified error with a valid token must remain available after settlement");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_successful_native_read_waits_for_a_clean_slow_exit() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-clean-slow-exit").unwrap();
+    let response = timeout(Duration::from_secs(5), request(&f.http, &f.first, &f.token))
+        .await
+        .expect("clean child exit remains bounded");
+    assert_eq!(
+        response.status(),
+        200,
+        "healthy shutdown must not create an owner_unavailable burst"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["billingClass"],
+        "rate_limited"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cached_plain_fallback_with_a_slow_exit_refuses_until_settled() {
+    let f = login_fixture().await;
+    let warm: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-error-slow-exit").unwrap();
+    let plain = |pod: &Pod| {
+        f.http
+            .post(format!("{}/v1/token", pod.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":false}))
+    };
+    let response = timeout(Duration::from_secs(3), plain(&f.first).send())
+        .await
+        .expect("failed settlement must answer promptly")
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "owner_unavailable"
+    );
+    assert_eq!(plain(&f.second).send().await.unwrap().status(), 503);
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "the retained lease prevents overlap"
+    );
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let recovered = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = plain(&f.first).send().await.unwrap();
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("settlement must restore valid-token service");
+    assert_eq!(recovered["revision"], warm["revision"]);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_cached_plain_fallback_does_not_publish_fresh_routing_evidence() {
+    let mut f = login_fixture().await;
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    f.second.stop().await;
+    store::atomic_write(&f.second.root.path().join("fast-path"), b"1").unwrap();
+    f.second = Pod::spawn(&f.database, &f.key, f.second.root, "postgres").await;
+    for pod in [&f.first, &f.second] {
+        store::atomic_write(&pod.root.path().join("mode"), b"owner-internal-always").unwrap();
+    }
+    let plain = |pod: &Pod| {
+        f.http
+            .post(format!("{}/v1/token", pod.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":false}))
+    };
+    let fallback = plain(&f.first).send().await.unwrap();
+    assert_eq!(fallback.status(), 200);
+    assert_eq!(
+        fallback.json::<Value>().await.unwrap()["revision"],
+        before["revision"]
+    );
+    let peer = plain(&f.second).send().await.unwrap();
+    assert_eq!(
+        peer.status(),
+        503,
+        "cached routing proof must not become fresh lease-free evidence"
+    );
+    assert_eq!(metric(&f, &f.second, SERVED).await, 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_native_timeout_keeps_the_lease_until_late_rotation_is_published() {
+    let f = login_fixture().await;
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let first_launches = f.first.launches();
+    let peer_launches = f.second.launches();
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-native-hold").unwrap();
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    let refused = timeout(
+        Duration::from_secs(13),
+        request(&f.http, &f.first, &f.token),
+    )
+    .await
+    .expect("native timeout must not hold a client for minutes");
+    assert_eq!(refused.status(), 503);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.first.launches(), first_launches + 1);
+    assert_eq!(
+        f.second.launches(),
+        peer_launches,
+        "peer must not overlap the unresolved refresh owner"
+    );
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&f.first.root.path().join("native-release"), b"release").unwrap();
+    let delivered = timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("late rotation must settle and release the retained lease");
+    assert_eq!(generation(&delivered), generation(&before) + 1);
+    assert_eq!(delivered["billingClass"], "rate_limited");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_owner_initialize_obeys_the_native_deadline() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"startup-hold").unwrap();
+    let post = || {
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let token = f.token.clone();
+        tokio::spawn(async move {
+            http.post(format!("{url}/v1/token"))
+                .bearer_auth(token)
+                .json(&json!({"alias":"seat","billing":true}))
+                .send()
+                .await
+                .unwrap()
+        })
+    };
+    let first = post();
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("initialize-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("leased initialization must start");
+    let queued = [post(), post()];
+    let admitted = timeout(Duration::from_secs(2), async {
+        while metric(&f, &f.first, "codexctl_central_owner_request_waiters").await != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if admitted.is_err() {
+        store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!(
+            "both callers must reach the server owner-lock queue before initialization times out"
+        );
+    }
+    let refused = timeout(Duration::from_secs(13), first).await;
+    if refused.is_err() {
+        store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!("owner initialization held the client beyond the native deadline");
+    }
+    assert_eq!(refused.unwrap().unwrap().status(), 503);
+    for waiter in queued {
+        let response = timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("pre-admitted callers must refuse promptly once initialization times out")
+            .unwrap();
+        assert_eq!(response.status(), 503);
+    }
+    assert_eq!(
+        metric(&f, &f.first, "codexctl_central_owner_request_waiters").await,
+        0,
+        "deferred settlement cancels both queued owner-lock futures"
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), request(&f.http, &f.first, &f.token))
+            .await
+            .expect("new arrivals must refuse during settlement")
+            .status(),
+        503
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.second.launches(), 0, "initialization retains its lease");
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    store::atomic_write(&f.first.root.path().join("release-initialize"), b"release").unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["billingClass"],
+                    "rate_limited"
+                );
+                break;
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("initialization settlement must release the lease");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lease_release() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.second.root.path().join("mode"), b"").unwrap();
+    let before: Value = request(&f.http, &f.first, &f.token)
+        .await
+        .json()
+        .await
+        .unwrap();
+    let first_launches = f.first.launches();
+    store::atomic_write(
+        &f.first.root.path().join("mode"),
+        b"owner-native-hung-journal",
+    )
+    .unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(13),
+            request(&f.http, &f.first, &f.token)
+        )
+        .await
+        .unwrap()
+        .status(),
+        503
+    );
+    let pid: i32 = std::fs::read_to_string(f.first.root.path().join("native-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "retain the live child during settlement"
+    );
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 503);
+    assert_eq!(f.first.launches(), first_launches + 1);
+    assert_eq!(f.second.launches(), 0, "a peer must not overlap settlement");
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    // Fail the first scheduled renewal while the timed-out child is still
+    // alive. Settlement must preserve the lease and retry publication renewal.
+    f.control
+        .batch_execute(&format!(
+            "CREATE SEQUENCE {0}.live_renew_attempts;
+             CREATE FUNCTION {0}.fail_live_renewal() RETURNS trigger LANGUAGE plpgsql AS $$
+             BEGIN
+               IF nextval('{0}.live_renew_attempts') = 1 THEN
+                 RAISE EXCEPTION 'synthetic live renewal failure';
+               END IF;
+               RETURN NEW;
+             END $$;
+             CREATE TRIGGER fail_live_renewal BEFORE UPDATE ON {0}.account_refresh_leases
+             FOR EACH ROW WHEN (NEW.expires_at > OLD.expires_at)
+             EXECUTE FUNCTION {0}.fail_live_renewal();",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    // Keep vault persistence unavailable until the second scheduled renewal.
+    // Publication cannot supply the second attempt while the synthetic key is missing.
+    let key_bytes = std::fs::read(&f.key).unwrap();
+    std::fs::remove_file(&f.key).unwrap();
+    let scheduled_retry = timeout(Duration::from_secs(65), async {
+        loop {
+            let retried: bool = f
+                .control
+                .query_one(
+                    &format!(
+                        "SELECT is_called AND last_value >= 2 FROM {}.live_renew_attempts",
+                        f.schema
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if retried {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let stopped_before_publication = unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let waiting_status = request(&f.http, &f.second, &f.token).await.status();
+    let waiting_launches = f.second.launches();
+    store::atomic_write(&f.key, &key_bytes).unwrap();
+    assert_eq!(
+        waiting_status, 503,
+        "retain the lease until the stopped child's journal can be persisted"
+    );
+    assert_eq!(waiting_launches, 0);
+    scheduled_retry.expect("a transient renewal-query error must not stop the scheduled renewer");
+    assert!(
+        stopped_before_publication,
+        "confirm child death before final publication"
+    );
+    let delivered = timeout(Duration::from_secs(10), async {
+        loop {
+            let response = request(&f.http, &f.second, &f.token).await;
+            if response.status() == 200 {
+                break response.json::<Value>().await.unwrap();
+            }
+            assert_eq!(response.status(), 503);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if delivered.is_err() {
+        store::atomic_write(&f.first.root.path().join("native-release"), b"release").unwrap();
+        stop_fixture(f).await;
+        panic!(
+            "hung native child kept its lease instead of being killed after bounded settlement attempts"
+        );
+    }
+    let delivered = delivered.unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "reap the old child before a successor can serve"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert_eq!(
+        generation(&delivered),
+        generation(&before) + 1,
+        "publish the killed child's final journal"
+    );
+    assert_eq!(delivered["billingClass"], "rate_limited");
+    let metrics = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let killed: Vec<_> = metrics
+        .lines()
+        .filter(|line| {
+            line.starts_with("codexctl_central_owner_settlement_killed_total{account=\"seat\",")
+        })
+        .collect();
+    assert_eq!(killed.len(), 1, "{metrics}");
+    assert!(
+        killed[0].ends_with("} 1"),
+        "count confirmed termination once: {metrics}"
     );
     stop_fixture(f).await;
 }

@@ -32,6 +32,22 @@ spec:
             summary: Codexctl account operation failed
             description: '{{ if match "^(dashboard_.*|browser_sessions_unavailable)$" $labels.reason }}A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.{{ else }}Inspect the broker reason and stage in structured logs. Usage fetch failures do not imply token delivery failure. Check the saved owner journal before any account import retry.{{ end }}'
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+        - alert: CodexctlOwnerRefreshNativeError
+          expr: |
+            sum by (account, account_key, reason) (
+              (increase(codexctl_central_owner_refresh_native_errors_total[10m]) > 0)
+              or
+              ((codexctl_central_owner_refresh_native_errors_total > 0) unless codexctl_central_owner_refresh_native_errors_total offset 10m)
+            ) > 0
+          for: 0m
+          labels:
+            severity: warning
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: "Codexctl server account {{ $labels.account }} ({{ $labels.account_key }}) has a native refresh error ({{ $labels.reason }})"
+            description: Inspect bounded owner_refresh diagnostics and upstream status. An unclassified failure does not revoke a valid token. Billing requests refuse when fresh evidence is unavailable. Preserve the owner journal and lease while a native call settles.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlRelayCapacityExhausted
           expr: max by (kind, model, account_class) (codexctl_central_relay_capacity_event_timestamp_seconds{outcome="exhausted"} > bool (time() - 900)) > 0
           for: 0m

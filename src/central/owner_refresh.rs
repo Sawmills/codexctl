@@ -28,16 +28,41 @@ const REFRESH_FAILED: &str = "Failed to refresh token";
 
 /// The latest provider refresh reason seen on one owner child's stderr.
 #[derive(Clone, Default)]
-pub(super) struct ReasonSlot(Arc<Mutex<Option<&'static str>>>);
+pub(super) struct ReasonSlot {
+    reason: Arc<Mutex<Option<&'static str>>>,
+    status: Arc<Mutex<Option<u16>>>,
+}
 
 impl ReasonSlot {
+    pub(super) fn reason(&self) -> Option<&'static str> {
+        *self.reason.lock().expect("refresh reason lock")
+    }
+
     pub(super) fn take(&self) -> Option<&'static str> {
-        self.0.lock().expect("refresh reason lock").take()
+        self.reason.lock().expect("refresh reason lock").take()
     }
 
     fn set(&self, reason: &'static str) {
-        *self.0.lock().expect("refresh reason lock") = Some(reason);
+        *self.reason.lock().expect("refresh reason lock") = Some(reason);
     }
+
+    pub(super) fn status(&self) -> Option<u16> {
+        *self.status.lock().expect("refresh status lock")
+    }
+
+    pub(super) fn clear_status(&self) {
+        self.status.lock().expect("refresh status lock").take();
+    }
+}
+
+fn upstream_status(line: &str) -> Option<u16> {
+    let plain = strip_ansi(line);
+    let suffix = plain
+        .split_once(REFRESH_FAILED)?
+        .1
+        .strip_prefix(" status=")?;
+    let status = suffix.split_whitespace().next()?.parse().ok()?;
+    (400..=599).contains(&status).then_some(status)
 }
 
 /// Codex's fixed messages for a permanent refresh rejection, after
@@ -134,6 +159,10 @@ async fn forward_with(
         if let Some(reason) = classify(&line) {
             slot.set(reason);
         }
+        let status = upstream_status(&line);
+        if let Some(status) = status {
+            *slot.status.lock().expect("refresh status lock") = Some(status);
+        }
         if window_start.elapsed() >= WINDOW {
             if suppressed > 0 {
                 sink(&suppressed_note(suppressed));
@@ -144,10 +173,14 @@ async fn forward_with(
         }
         if forwarded < MAX_LINES_PER_WINDOW {
             forwarded += 1;
-            sink(
-                &json!({"operation":"owner_child","stage":"stderr","line":redact(&line)})
-                    .to_string(),
-            );
+            if line.contains(REFRESH_FAILED) && classify(&line).is_none() {
+                sink(&json!({"operation":"owner_child","stage":"stderr","reason":"native_refresh_failure","http_status":status}).to_string());
+            } else {
+                sink(
+                    &json!({"operation":"owner_child","stage":"stderr","line":redact(&line)})
+                        .to_string(),
+                );
+            }
         } else {
             suppressed += 1;
         }
@@ -187,6 +220,20 @@ fn failures() -> &'static Mutex<BTreeMap<FailureKey, u64>> {
     FAILURES.get_or_init(Default::default)
 }
 
+fn native_failures() -> &'static Mutex<BTreeMap<FailureKey, u64>> {
+    static FAILURES: OnceLock<Mutex<BTreeMap<FailureKey, u64>>> = OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+pub(super) fn record_native(account: &str, user: &str, reason: &'static str) {
+    let key = super::vault::digest(format!("{user}\0{}", account.to_ascii_lowercase()).as_bytes());
+    *native_failures()
+        .lock()
+        .expect("native refresh failure lock")
+        .entry((account.to_owned(), key[..12].to_owned(), reason))
+        .or_default() += 1;
+}
+
 /// Counts one rejected owner refresh. `account` is the readable alias; two
 /// company users can share it, so the series also carries the first 12
 /// characters of the same digest as `managed::account_key`. The set of server
@@ -208,17 +255,22 @@ pub(super) fn metrics() -> String {
             .replace('"', "\\\"")
             .replace('\n', "\\n")
     };
-    failures()
-        .lock()
-        .expect("refresh failure lock")
-        .iter()
-        .map(|((account, key, reason), count)| {
-            format!(
-                "codexctl_central_owner_refresh_failed_total{{account=\"{}\",account_key=\"{key}\",reason=\"{reason}\"}} {count}\n",
+    let mut output = String::new();
+    for (name, counts) in [
+        ("codexctl_central_owner_refresh_failed_total", failures()),
+        (
+            "codexctl_central_owner_refresh_native_errors_total",
+            native_failures(),
+        ),
+    ] {
+        for ((account, key, reason), count) in counts.lock().expect("refresh failure lock").iter() {
+            output.push_str(&format!(
+                "{name}{{account=\"{}\",account_key=\"{key}\",reason=\"{reason}\"}} {count}\n",
                 escape(account)
-            )
-        })
-        .collect()
+            ));
+        }
+    }
+    output
 }
 
 #[cfg(test)]

@@ -1261,7 +1261,11 @@ fn a_read_only_broker_cannot_register_a_native_provider_without_routing_proof() 
         ],
     );
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("workspace routing"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("workspace routing"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!client.home.join(".codexctl/central/remote.json").exists());
 }
 
