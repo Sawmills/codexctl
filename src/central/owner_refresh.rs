@@ -99,12 +99,37 @@ fn strip_ansi(line: &str) -> std::borrow::Cow<'_, str> {
         .replace_all(line, "")
 }
 
-/// Reduces a Codex refresh log line to a bounded reason. Only Codex's fixed
-/// permanent-rejection messages count; a transient failure (Codex logs it
-/// with `status=` and retries) and any other line return `None`.
+/// Reduces a Codex refresh log line to a bounded reason. Permanent provider
+/// codes on 400/401 and Codex's fixed rejection messages count; transient
+/// failures and unknown diagnostics return `None`.
 pub(super) fn classify(line: &str) -> Option<&'static str> {
     let line = strip_ansi(line);
-    let message = line.split_once(REFRESH_FAILED)?.1.strip_prefix(": ")?;
+    let suffix = line.split_once(REFRESH_FAILED)?.1;
+    if suffix.starts_with(" status=") {
+        static DETAIL: OnceLock<Regex> = OnceLock::new();
+        let detail = DETAIL.get_or_init(|| {
+            Regex::new(r#"^ status=(?:400|401)(?: [A-Za-z ]+)? detail=TokenErrorDetail \{ error_code: (?:Some\("([a-z_]+)"\)|None), "#)
+                .expect("valid refresh rejection regex")
+        });
+        let fields = detail.captures(suffix)?;
+        return match fields.get(1).map(|code| code.as_str()) {
+            Some("refresh_token_reused") => Some("refresh_token_reused"),
+            Some("refresh_token_expired") => Some("refresh_token_expired"),
+            Some("refresh_token_invalidated" | "refresh_token_revoked") => {
+                Some("refresh_token_invalidated")
+            }
+            Some("account_mismatch") => Some("account_mismatch"),
+            Some("invalid_grant") => Some("other"),
+            None if suffix.starts_with(" status=401 ")
+                && suffix[fields.get(0)?.end()..]
+                    .starts_with(r#"error_message: Some("Your session has ended."#) =>
+            {
+                Some("refresh_token_invalidated")
+            }
+            _ => None,
+        };
+    }
+    let message = suffix.strip_prefix(": ")?;
     REJECTIONS
         .iter()
         .find(|(text, _)| message.starts_with(text))
@@ -156,7 +181,8 @@ async fn forward_with(
     let mut handle = |line: &[u8]| {
         held(line.len());
         let line = String::from_utf8_lossy(line);
-        if let Some(reason) = classify(&line) {
+        let reason = classify(&line);
+        if let Some(reason) = reason {
             slot.set(reason);
         }
         let status = upstream_status(&line);
@@ -173,8 +199,8 @@ async fn forward_with(
         }
         if forwarded < MAX_LINES_PER_WINDOW {
             forwarded += 1;
-            if line.contains(REFRESH_FAILED) && classify(&line).is_none() {
-                sink(&json!({"operation":"owner_child","stage":"stderr","reason":"native_refresh_failure","http_status":status}).to_string());
+            if line.contains(REFRESH_FAILED) && (status.is_some() || reason.is_none()) {
+                sink(&json!({"operation":"owner_child","stage":"stderr","reason":reason.unwrap_or("native_refresh_failure"),"http_status":status}).to_string());
             } else {
                 sink(
                     &json!({"operation":"owner_child","stage":"stderr","line":redact(&line)})
