@@ -109,6 +109,7 @@ struct Streak {
     retry_at: Instant,
     attempts: u32,
     exhausted: bool,
+    after_output_cut: bool,
 }
 
 /// Failure streaks per Codex thread.
@@ -141,6 +142,23 @@ impl Streaks {
         now: Instant,
         upstream_secs: Option<u64>,
     ) -> Advice {
+        self.failure_mode(thread, kind, now, upstream_secs, false)
+    }
+
+    /// A cut leaves Codex retrying with its own potentially long stream backoff.
+    /// An idle gap therefore cannot prove this overload turn has ended.
+    pub(crate) fn overload_cut(&mut self, thread: &str, now: Instant) -> Advice {
+        self.failure_mode(thread, Kind::Overloaded, now, None, true)
+    }
+
+    fn failure_mode(
+        &mut self,
+        thread: &str,
+        kind: Kind,
+        now: Instant,
+        upstream_secs: Option<u64>,
+        after_output_cut: bool,
+    ) -> Advice {
         self.by_thread
             .retain(|_, streak| now.duration_since(streak.last_failure) < STREAK_EVICT);
         let streak = self
@@ -152,13 +170,15 @@ impl Streaks {
                 // failure belongs to a resumed turn.
                 if streak.kind != kind
                     || streak.exhausted
-                    || now.saturating_duration_since(streak.retry_at) > STREAK_IDLE
+                    || (!streak.after_output_cut
+                        && now.saturating_duration_since(streak.retry_at) > STREAK_IDLE)
                 {
                     *streak = Streak::new(kind, now);
                 }
             })
             .or_insert_with(|| Streak::new(kind, now));
         streak.last_failure = now;
+        streak.after_output_cut |= after_output_cut;
         streak.attempts += 1;
         let attempt = streak.attempts;
         let cap = BASE_DELAY_SECS
@@ -203,6 +223,18 @@ impl Streaks {
         self.by_thread.remove(thread);
     }
 
+    /// A different terminal stream failure ends an outstanding cut without
+    /// reporting recovery or changing ordinary advice-only streaks.
+    pub(crate) fn end_cut(&mut self, thread: &str) {
+        if self
+            .by_thread
+            .get(thread)
+            .is_some_and(|streak| streak.after_output_cut)
+        {
+            self.end(thread);
+        }
+    }
+
     /// A delay in `[ceil(cap / 2), cap]`, at least one second.
     fn jittered(&mut self, cap: u64) -> u64 {
         self.draws += 1;
@@ -222,6 +254,7 @@ impl Streak {
             retry_at: now,
             attempts: 0,
             exhausted: false,
+            after_output_cut: false,
         }
     }
 }

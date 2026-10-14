@@ -89,7 +89,8 @@ def scenario(args, home, script, overloaded_budget, expect_ok, expect_calls):
         [str(args.codexctl), "relay", "serve", "--listen", f"127.0.0.1:{relay_port}",
          "--upstream", f"http://127.0.0.1:{upstream.server_port}",
          "--overloaded-budget-secs", str(overloaded_budget)],
-        stderr=subprocess.PIPE, text=True)
+        stderr=subprocess.PIPE, text=True,
+        env={**os.environ, "HOME": str(home), "CODEX_HOME": str(home)})
     try:
         time.sleep(1)
         provider = (f'{{name="relaytest",base_url="http://127.0.0.1:{relay_port}/backend-api/codex",'
@@ -97,7 +98,7 @@ def scenario(args, home, script, overloaded_budget, expect_ok, expect_calls):
         result = subprocess.run(
             [args.codex, "exec", "--skip-git-repo-check", "-m", "gpt-6.1-sol",
              "-c", 'model_provider="relaytest"', "-c", f"model_providers.relaytest={provider}", "say hi"],
-            env={**os.environ, "CODEX_HOME": str(home)}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+            env={**os.environ, "HOME": str(home), "CODEX_HOME": str(home)}, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
     finally:
         relay.terminate()
         log = relay.communicate(timeout=40)[1]
@@ -127,10 +128,13 @@ def main():
         else:
             scenario(args, home, ["rate", "ok"], 600, False, ["rate"])
         scenario(args, home, ["overloaded", "overloaded", "ok"], 600, True, ["overloaded", "overloaded", "ok"])
-        scenario(args, home, ["after_output"], 600, False, ["after_output"])
+        scenario(args, home, ["after_output", "ok"], 600, True, ["after_output", "ok"])
+        scenario(args, home, ["after_output", "after_output", "ok"], 600, True,
+                 ["after_output", "after_output", "ok"])
         # A 2 s budget fits the first advice (1 to 2 s) but never the second
         # (2 s or more after at least 1 s), so Codex stops after two calls.
         scenario(args, home, ["overloaded"] * 4, 2, False, ["overloaded"] * 2)
+        scenario(args, home, ["after_output"] * 4, 2, False, ["after_output"] * 2)
 
 
 if __name__ == "__main__":

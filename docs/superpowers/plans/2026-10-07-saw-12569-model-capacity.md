@@ -2,6 +2,33 @@
 
 Linked: SAW-12544 (429 bursts). Design decision (guide + w9C:tF, 2026-10-07 19:5x PDT): codexctl retries in-request only, up to about 10 minutes, and never sends `/goal resume`. The board resumes after a stop.
 
+## Reopened scope, 2026-10-14
+
+This section supersedes the original after-output passthrough and caller-managed
+route instructions below. HQ approved the host `relay enable/disable` setting,
+shared by activated, pinned and automatic account-server launches. A durable
+intent recovers interrupted setting/config writes before a later route selection.
+Launches preserve existing identity, environment and billing guards.
+
+After-output overloads preserve prior output, release upstream, wait the existing
+jittered budget delay, and emit a transport cut. Codex retries the same turn;
+the relay performs no replay. Only `response.completed` counts as recovery.
+A different terminal failure ends a prior cut without a recovery metric; partial
+output does not reset or pause the elapsed-time budget.
+Failure and unclassified frames stay in bounded memory until finalization, with
+metadata-only normalization beyond 1 MiB. Exhaustion removes upstream advice.
+
+Evidence retains seven UTC days, bounded to 4 MiB per day and a 256-record queue.
+Only allowlisted status, error code, retry headers, model, alias, request ID,
+billing class and UTC hour persist. Public CLI/process and relay HTTP/metrics/file
+tests cover routing, transport cuts, exhaustion, sanitization and reporting.
+
+Devbox proof uses a real Codex 0.160.0 client against a fake upstream, plus one
+healthy live turn on the same pinned subscription account. No billed overflow,
+model/account fallback, or second live turn. HQ accepted devbox proof and hosted
+macOS CI before merge; HQ performs the Mac routing check after normal release and
+Homebrew install. See [the current runbook](../../relay.md) for commands and limits.
+
 ## Decision after HQ review (M1 to M6): build M3
 
 |                                         | M3: advice-only relay (built)                                                                   | A: retrying relay                                                 |

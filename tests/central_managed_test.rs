@@ -11424,6 +11424,199 @@ fn automatic_launch_refuses_when_account_selection_fails() {
 }
 
 #[test]
+fn relay_configuration_preserves_symlinked_config_and_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let config = home.path().join(".codex/config.toml");
+    let target = home.path().join("dotfiles-config.toml");
+    std::fs::rename(&config, &target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+    symlink(&target, &config).unwrap();
+    for (action, expected) in [
+        ("enable", "http://127.0.0.1:47631/backend-api/codex"),
+        ("disable", "https://chatgpt.com/backend-api/codex"),
+    ] {
+        let result = server.cli(home.path(), &["relay", action]);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            std::fs::symlink_metadata(&config)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "relay {action} must preserve the operator's config symlink"
+        );
+        assert_eq!(std::fs::read_link(&config).unwrap(), target);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let document: toml_edit::DocumentMut =
+            std::fs::read_to_string(&target).unwrap().parse().unwrap();
+        assert_eq!(
+            document["model_providers"]["codexctl-central"]["base_url"].as_str(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn interrupted_relay_configuration_recovers_on_the_next_account_launch() {
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let setting = home.path().join(".codexctl/relay.json");
+    // Force the second atomic replacement to fail after the provider write.
+    std::fs::create_dir(&setting).unwrap();
+    let enabled = server.cli(home.path(), &["relay", "enable"]);
+    assert!(!enabled.status.success());
+    std::fs::remove_dir(&setting).unwrap();
+    // A new process must finish the durable transaction before selecting a route.
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let saved: Value = serde_json::from_slice(&std::fs::read(setting).unwrap()).unwrap();
+    assert_eq!(saved["listen"], "127.0.0.1:47631");
+    let config: toml_edit::DocumentMut =
+        std::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["base_url"].as_str(),
+        Some("http://127.0.0.1:47631/backend-api/codex")
+    );
+    assert!(
+        config["model_providers"]["codexctl-central"]["http_headers"]
+            .as_inline_table()
+            .unwrap()
+            .is_empty(),
+        "the rotating active helper cannot carry a static account label"
+    );
+    assert!(!home.path().join(".codexctl/relay.pending.json").exists());
+}
+
+#[test]
+fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let enabled = server.cli(
+        home.path(),
+        &["relay", "enable", "--listen", "127.0.0.1:47631"],
+    );
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let path = home.path().join(".codex/config.toml");
+    let config: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(
+        config["model_providers"]["codexctl-central"]["stream_max_retries"]
+            .as_integer()
+            .unwrap()
+            >= 26,
+        "client retry count must outlast the default overload budget even at minimum jitter"
+    );
+    assert!(
+        config["model_providers"]["codexctl-central"]["http_headers"]
+            .as_inline_table()
+            .unwrap()
+            .is_empty(),
+        "the rotating active helper cannot carry a static account label"
+    );
+    assert_eq!(
+        config["model_providers"]["codexctl-central"]["base_url"].as_str(),
+        Some("http://127.0.0.1:47631/backend-api/codex")
+    );
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let after: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(
+        after["model_providers"]["codexctl-central"]["base_url"].as_str(),
+        config["model_providers"]["codexctl-central"]["base_url"].as_str()
+    );
+    let pointer = home.path().join(".codexctl/central/.active-account");
+    let before_pointer = std::fs::read(&pointer).unwrap();
+    let bin = home.path().join("bin");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import json, os, subprocess, sys
+values = dict(arg.split('=', 1) for arg in sys.argv[1:] if arg.startswith('model_providers.codexctl-central.') and '=' in arg)
+assert json.loads(values['model_providers.codexctl-central.base_url']) == 'http://127.0.0.1:47631/backend-api/codex'
+assert 'X-Codexctl-Account-Alias' in values['model_providers.codexctl-central.http_headers']
+assert 'X-Codexctl-Account-Class' in values['model_providers.codexctl-central.http_headers']
+assert values['model_providers.codexctl-central.requires_openai_auth'] == 'false'
+assert int(values['model_providers.codexctl-central.stream_max_retries']) == int(os.environ['EXPECTED_STREAM_RETRIES'])
+command = json.loads(values['model_providers.codexctl-central.auth.command'])
+args = json.loads(values['model_providers.codexctl-central.auth.args'])
+assert '--connection' in args and '--active' not in args
+import pathlib
+alias = json.loads(pathlib.Path(args[args.index('--connection') + 1]).read_text())['alias']
+assert json.dumps(alias) in values['model_providers.codexctl-central.http_headers']
+result = subprocess.run([command] + args, capture_output=True)
+assert result.returncode == 0
+print('RELAY-PRIVATE-AUTH-OK')
+"##).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (args, retries) in [
+        (
+            &["codex", "--account", "lane", "exec", "synthetic prompt"][..],
+            1_i64,
+        ),
+        (&["codex", "exec", "synthetic prompt"][..], 32_i64),
+    ] {
+        let mut config: toml_edit::DocumentMut =
+            std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        config["model_providers"]["codexctl-central"]["stream_max_retries"] =
+            toml_edit::value(retries);
+        store::atomic_write(&path, config.to_string().as_bytes()).unwrap();
+        let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(args)
+            .env("HOME", home.path())
+            .env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(bin.clone())
+                        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                )
+                .unwrap(),
+            )
+            .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+            .env("EXPECTED_STREAM_RETRIES", retries.max(26).to_string())
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            launched.status.success(),
+            "{}",
+            String::from_utf8_lossy(&launched.stderr)
+        );
+        assert!(String::from_utf8_lossy(&launched.stdout).contains("RELAY-PRIVATE-AUTH-OK"));
+        assert_eq!(std::fs::read(&pointer).unwrap(), before_pointer);
+    }
+    let disabled = server.cli(home.path(), &["relay", "disable"]);
+    assert!(
+        disabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    let restored: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(
+        restored["model_providers"]["codexctl-central"]["base_url"].as_str(),
+        Some("https://chatgpt.com/backend-api/codex")
+    );
+}
+
+#[test]
 fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();

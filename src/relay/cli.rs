@@ -8,6 +8,18 @@ use super::{DEFAULT_LISTEN, RelayConfig};
 
 #[derive(clap::Subcommand)]
 pub enum RelayAction {
+    /// Route every account-server launch on this host through the loopback relay.
+    Enable {
+        #[arg(long, default_value = DEFAULT_LISTEN)]
+        listen: SocketAddr,
+    },
+    /// Restore direct OpenAI routing for account-server launches on this host.
+    Disable,
+    /// Report seven-day request and capacity counts per model and UTC hour.
+    Evidence {
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the relay in the foreground; launchd or systemd keeps it running.
     Serve {
         #[arg(long, default_value = DEFAULT_LISTEN)]
@@ -41,6 +53,26 @@ pub enum UnitKind {
 
 pub fn run(action: RelayAction) -> Result<()> {
     match action {
+        RelayAction::Evidence { json } => {
+            let directory = crate::config::default_paths()?
+                .codexctl_dir()
+                .join("relay/evidence");
+            print!("{}", super::evidence::render(&directory, json)?);
+            if json {
+                println!();
+            }
+            Ok(())
+        }
+        RelayAction::Enable { listen } => {
+            crate::central::native::configure_relay(Some(listen))?;
+            println!("account-server launches use the relay at {listen}");
+            Ok(())
+        }
+        RelayAction::Disable => {
+            crate::central::native::configure_relay(None)?;
+            println!("account-server launches use direct OpenAI routing");
+            Ok(())
+        }
         RelayAction::Serve {
             listen,
             upstream,
@@ -48,6 +80,11 @@ pub fn run(action: RelayAction) -> Result<()> {
             overloaded_budget_secs,
         } => {
             let config = RelayConfig::new(&upstream)?
+                .with_evidence_dir(
+                    crate::config::default_paths()?
+                        .codexctl_dir()
+                        .join("relay/evidence"),
+                )
                 .with_budgets(
                     Duration::from_secs(rate_budget_secs),
                     Duration::from_secs(overloaded_budget_secs),

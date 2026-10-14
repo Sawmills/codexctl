@@ -18,20 +18,21 @@ error.
 
 ## Codex versions
 
-The relay helps only where Codex honors retry advice. Each row was checked live with
-`tests/relay_codex_e2e.py`.
+The relay helps only where Codex honors retry advice. Each row was checked with a
+real Codex client and the fake upstream in `tests/relay_codex_e2e.py`.
 
-| Codex           | HTTP 429                                     | Model at capacity |
-| --------------- | -------------------------------------------- | ----------------- |
-| 0.160.1         | Not covered: Codex treats every 429 as final | Covered           |
-| 0.161.0         | Covered                                      | Covered           |
-| 0.162.0-alpha.9 | Covered                                      | Covered           |
+| Codex           | HTTP 429                                     | Model at capacity               |
+| --------------- | -------------------------------------------- | ------------------------------- |
+| 0.160.0         | Not covered: Codex treats every 429 as final | Covered, including after output |
+| 0.160.1         | Not covered: Codex treats every 429 as final | Covered                         |
+| 0.161.0         | Covered                                      | Covered                         |
+| 0.162.0-alpha.9 | Covered                                      | Covered                         |
 
 Codex 0.160.1 ignores `Retry-After` on a 429 (`protocol/src/error.rs` at
-rust-v0.160.1). Codex 0.160.0 has the same rules (source check at rust-v0.160.0, not
-run live). Run `codex --version` on the lane host before you opt a lane in.
+rust-v0.160.1). Codex 0.160.0 has the same rules. Run `codex --version` on the host
+before you enable the relay.
 
-To check a lane host, run the live check with that host's Codex. For 0.160.1, add
+To check a lane host, run the fake-upstream check with that host's Codex. For 0.160.0 or 0.160.1, add
 `--rate-429 stop`, so the check expects the 429 stop and still tests the capacity cases:
 
 ```sh
@@ -49,17 +50,37 @@ the account, or the auth headers, and it never resumes a goal.
   It also sets the code to `rate_limit_exceeded` and appends "Please try again in
   Ns." to the message. Codex 0.161.0 reads only that form; newer Codex reads the
   header.
+- **Capacity event after output:** the relay retains output already delivered,
+  closes the upstream response, waits the jittered policy delay, and cuts the
+  client stream with a transport error. Codex owns the turn retry; the relay
+  does not replay the request or output. A completed response ends the failure
+  streak. Partial output alone does not reset the budget.
+  Failure frames stay in memory until classified, up to 1 MiB. Larger failure
+  frames retain bounded error and retry metadata and omit the oversized payload.
+  An unclassified frame beyond that bound becomes a terminal size refusal, even
+  if its type appears later. An oversized failure cut short by upstream EOF uses
+  valid bounded metadata rather than forwarding a discarded frame's suffix.
+  Exhaustion removes upstream retry advice. Ordinary identified output continues
+  to stream without waiting for a complete frame; no payload is spooled to disk.
 - **Usage, quota, billing, plan and flex 429s:** pass through unchanged, so the quota
   guard still sees them.
 - **Everything else:** passes through unchanged, byte for byte. This covers 401, 403
-  and 5xx, streamed rate-limit codes, and any error after output started. The relay
+  and 5xx, streamed rate-limit codes, and non-capacity errors after output. The relay
   records a bounded `stream_failure` observation for these errors.
 
 Delays double from 2 s up to 60 s, with jitter. Each Codex thread (`thread-id`
 header) has one failure streak. When a streak spends its budget, the relay passes the
 original failure through and removes any upstream `Retry-After`. Codex then stops, and
-the board resumes the lane. A new streak starts when the error kind changes, after 120 s
-without a failure, or on the first failure after a stop (that request is a resume).
+the board resumes the lane. A new streak starts when the error kind changes or on
+the first failure after exhaustion (that request is a resume). Advice-only streaks
+also restart after 120 s beyond the advised retry time. An after-output cut keeps
+the original budget across Codex's own long stream backoff; elapsed client waits
+count toward exhaustion when the next failure arrives. Abandoned streaks are
+evicted after an hour without a failure. A different terminal stream failure ends
+an outstanding cut streak without reporting recovery. Partial output does not
+pause the elapsed-time budget. A client interruption without a terminal event
+does not prove completion; reusing that thread can retain its old budget until
+exhaustion or eviction.
 
 | Error               | Default budget | Flag                       |
 | ------------------- | -------------- | -------------------------- |
@@ -84,25 +105,39 @@ is cut then is retried by Codex as a dropped stream.
 If the relay is down, an opted-in lane shows "Reconnecting... waiting for network" and
 does not stop. Run `codexctl relay status` before you start a lane on it.
 
-## Opt in one lane
+## Enable account-server routing on a host
 
-The relay is opt-in per lane. Do not change `base_url` in a shared `config.toml`. Add
-these overrides to the lane's `codex` command:
+Start the relay service first, then enable the supported host setting from an
+unpinned shell without `CODEX_HOME` or `CODEXCTL_PINNED_ALIAS`:
 
 ```sh
 codexctl relay status || exit 1
-codex ... \
-  -c 'model_providers.codexctl-central.base_url="http://127.0.0.1:47631/backend-api/codex"' \
-  -c 'model_providers.codexctl-central.stream_max_retries=20' \
-  -c 'model_providers.codexctl-central.http_headers={ChatGPT-Account-ID="<id>",X-Codexctl-Account-Class="included"}'
+codexctl relay enable --listen 127.0.0.1:47631
 ```
 
-- `stream_max_retries=20` lets the 600 s capacity budget end before Codex's own retry
-  count does.
-- `X-Codexctl-Account-Class` (`included` or `credit`) labels metrics only. The relay
-  removes it before it forwards the request.
+The setting in `~/.codexctl/relay.json` applies to the activated account-server
+provider and future pinned or automatic account-server launches. It survives
+local account selection and disconnect. Existing children keep their launch
+settings, so restart them to change routes. Only a loopback address with a nonzero
+port is accepted. Provider overrides remain rejected by pinned launches.
+Relay routes use at least 26 stream retries, preserving higher configured values.
+This gives the default 600-second budget room to stop even at the minimum local
+jitter delay. Larger custom budgets or shorter upstream retry advice can require
+a higher client limit. Disabling the route preserves the configured retry count.
+If a filesystem error interrupts the two route writes, a private pending intent
+remains. The next configuration change or account-server launch completes it
+under a route lock before selecting a URL. Fix the reported filesystem error
+and retry; a plain Codex invocation alone does not perform that recovery.
 
-To roll back, start the lane without the `base_url` override.
+Pinned and automatic launches attach the selected alias and billing class as
+relay-only metadata. The shared activated provider follows the active account
+through its token helper, so it sends no static account label; those requests
+have an unknown class and no alias. The relay removes metadata headers before
+forwarding. Routing does not select another
+account, approve billing, redeem a reset, or change the model.
+
+To restore direct routing, run `codexctl relay disable` from an unpinned shell and
+restart existing children. This does not stop the relay service.
 
 ## Observe it
 
@@ -117,7 +152,7 @@ codexctl_relay_stream_failures_total{kind,stage,model,account_class}
 
 - `kind`: `rate_429` or `overloaded`.
 - `outcome`: `advised` (one per advice), `recovered` (one per streak that ended in
-  output), `exhausted` (one per streak that spent its budget), or
+  a completed response), `exhausted` (one per streak that spent its budget), or
   `terminal_passthrough`.
 
 The relay sends the four labels for non-advised capacity outcomes to the authenticated
@@ -145,6 +180,38 @@ then one suppression summary.
 The existing central capacity endpoint accepts only its four capacity labels and does
 not have a `stream_failure` event schema. Stream-failure forwarding is therefore a
 follow-up server API change; this release keeps the observation local to the relay.
+
+`relay serve` also keeps sanitized evidence in `~/.codexctl/relay/evidence`.
+Private daily JSONL files retain the current UTC day and six previous days, with a
+4 MiB limit per day and a 256-record write queue. Request records stop at 3 MiB,
+reserving the last 1 MiB for later failures. A separate worker writes files;
+disk errors or a full queue do not delay response delivery. Records include UTC
+hour, actual HTTP status, bounded error code, validated retry headers, known
+model, validated account alias, account class, and a sanitized request ID when
+available. HTTP 429 records also keep the relay's rate/terminal decision, so
+code-less rate limits and terminal billing stops are counted correctly. Older
+records use their saved error code. Records never include bodies, messages,
+prompts, output, or credentials.
+
+```sh
+codexctl relay evidence        # counts by model and UTC hour
+codexctl relay evidence --json
+```
+
+Counts distinguish requests, overloads, rate limits and other failures. They cover
+only valid retained records. A torn append does not prevent reports: both output
+formats warn on stderr with the number of damaged lines excluded from counts.
+The warning never prints record contents. Non-regular files and oversized files
+still fail the report. `codexctl_relay_evidence_dropped_total{reason}` reports
+`queue_full`, `io`, and `daily_limit` losses. This metric has no dedicated alert;
+the existing exhausted-capacity alerts below remain unchanged. No notification
+delivery was tested for this change.
+
+The devbox routing proof used one healthy turn on a pinned subscription account.
+Recovery and exhaustion were proved with a real Codex 0.160.0 client against a
+fake upstream. Hosted macOS CI validates the change before merge. After the normal
+release and Homebrew install, HQ must run the bounded routing check on one Mac
+lane; no Mac candidate binary or Mac live result is claimed here.
 
 The staging and staging-ha Prometheus rules alert on one exhausted event in a 15-minute
 window. They intentionally exclude `advised`: that outcome means the relay is still

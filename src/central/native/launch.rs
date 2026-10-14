@@ -454,7 +454,7 @@ fn prepare_pinned_codex(
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
     connection.approved_billing_class = bills.then_some(token.billing_class).flatten();
     connection.revision = token.revision.clone();
-    let (prepared, owner) = {
+    let (prepared, owner, route) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
         let _native = native_lock(&directory)?;
@@ -475,7 +475,9 @@ fn prepare_pinned_codex(
             &serde_json::to_vec(&super::super::process::Process::capture(std::process::id())?)?,
         )?;
         save_connection(&prepared.path().join("connection.json"), &connection)?;
-        (prepared, owner)
+        let route =
+            crate::relay::central_provider(&paths, Some(&account.alias), token.billing_class)?;
+        (prepared, owner, route)
     };
     let path = prepared.path().join("connection.json");
     let helper_args = serde_json::to_string(&[
@@ -501,11 +503,16 @@ fn prepare_pinned_codex(
         // cannot compete with this launch's explicit token helper.
         "model_providers.codexctl-central={}".into(),
         "model_providers.codexctl-central.name=\"Central Codex\"".into(),
-        "model_providers.codexctl-central.base_url=\"https://chatgpt.com/backend-api/codex\""
-            .into(),
+        format!(
+            "model_providers.codexctl-central.base_url={}",
+            serde_json::to_string(&route.url)?
+        ),
         "model_providers.codexctl-central.wire_api=\"responses\"".into(),
         "model_providers.codexctl-central.requires_openai_auth=false".into(),
-        "model_providers.codexctl-central.http_headers={}".into(),
+        format!(
+            "model_providers.codexctl-central.http_headers={}",
+            route.headers
+        ),
         "model_providers.codexctl-central.env_http_headers={}".into(),
         format!(
             "model_providers.codexctl-central.request_max_retries={}",
@@ -513,7 +520,7 @@ fn prepare_pinned_codex(
         ),
         format!(
             "model_providers.codexctl-central.stream_max_retries={}",
-            retries("stream_max_retries")
+            route.stream_retries(retries("stream_max_retries"))
         ),
         format!("model_providers.codexctl-central.auth.command={helper}"),
         format!("model_providers.codexctl-central.auth.args={helper_args}"),
