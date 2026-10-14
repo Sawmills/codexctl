@@ -6046,6 +6046,162 @@ fn an_explicit_billing_rejection_is_permanent_without_respawn() {
 }
 
 #[test]
+fn an_ended_session_is_counted_once_as_a_rejected_refresh_grant() {
+    let server = Server::start();
+    assert_eq!(
+        server
+            .import(&server.amir, "personal", "amir-login", "amir-seat")
+            .status(),
+        200
+    );
+    assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+    store::atomic_write(&server.root.path().join("native-read-count"), b"0").unwrap();
+    store::atomic_write(&server.root.path().join("mode"), b"owner-session-ended").unwrap();
+    assert_eq!(
+        server
+            .token_without_billing(&server.amir, "personal")
+            .status(),
+        503,
+        "a revoked refresh grant must not deliver a cached valid access token"
+    );
+    assert_eq!(
+        std::fs::read_to_string(server.root.path().join("native-read-count")).unwrap(),
+        "1",
+        "permanent rejection must not retry the native read"
+    );
+    for _ in 0..2 {
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 503);
+    }
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .bearer_auth("synthetic-monitoring-credential-only")
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert_eq!(
+        owner_refresh_failures(&metrics),
+        vec![(
+            "personal".to_owned(),
+            "refresh_token_invalidated".to_owned(),
+            1
+        )],
+        "unavailable reads after the rejected attempt must not double count: {metrics}"
+    );
+    assert_eq!(server.accounts(&server.amir)[0]["available"], false);
+    let logs = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+    let failures: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .filter(|line: &Value| line["operation"] == "owner_refresh")
+        .collect();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert_eq!(failures[0]["reason"], "refresh_token_invalidated");
+}
+
+#[test]
+fn structured_refresh_rejections_keep_the_provider_reason_family_bounded() {
+    for (mode, reason) in [
+        ("owner-refresh-reused", "refresh_token_reused"),
+        ("owner-refresh-expired", "refresh_token_expired"),
+        ("owner-refresh-revoked", "refresh_token_invalidated"),
+        ("owner-refresh-mismatch", "account_mismatch"),
+        ("owner-refresh-invalid-grant", "other"),
+        ("owner-session-ended-message", "refresh_token_invalidated"),
+    ] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        store::atomic_write(&server.root.path().join("native-read-count"), b"0").unwrap();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            503,
+            "{mode}"
+        );
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert_eq!(
+            owner_refresh_failures(&metrics),
+            vec![("personal".to_owned(), reason.to_owned(), 1)],
+            "{mode}: {metrics}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("native-read-count")).unwrap(),
+            "1",
+            "{mode}"
+        );
+        let logs = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+        assert!(
+            !logs.contains("TokenErrorDetail"),
+            "raw provider detail must not be logged: {logs}"
+        );
+        assert!(!logs.contains("Synthetic revoked grant."), "{logs}");
+    }
+}
+
+#[test]
+fn structured_transient_or_unknown_refresh_errors_do_not_revoke_a_valid_grant() {
+    for mode in [
+        "owner-refresh-transient-code",
+        "owner-refresh-unknown-code",
+        "owner-session-ended-bad-request",
+    ] {
+        let server = Server::start();
+        assert_eq!(
+            server
+                .import(&server.amir, "personal", "amir-login", "amir-seat")
+                .status(),
+            200
+        );
+        assert_eq!(server.token(&server.amir, "personal", None).status(), 200);
+        store::atomic_write(&server.root.path().join("native-read-count"), b"0").unwrap();
+        store::atomic_write(&server.root.path().join("mode"), mode.as_bytes()).unwrap();
+        assert_eq!(
+            server
+                .token_without_billing(&server.amir, "personal")
+                .status(),
+            200,
+            "{mode}"
+        );
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        assert!(
+            owner_refresh_failures(&metrics).is_empty(),
+            "{mode}: {metrics}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(server.root.path().join("native-read-count")).unwrap(),
+            "2",
+            "{mode}"
+        );
+        store::atomic_write(&server.root.path().join("mode"), b"").unwrap();
+        assert_eq!(
+            server.token(&server.amir, "personal", None).status(),
+            200,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
 fn a_rejected_refresh_grant_is_counted_per_account_with_its_reason() {
     let server = Server::start();
     assert_eq!(

@@ -1062,18 +1062,25 @@ When the provider rejects an owner's stored refresh grant, the server logs one
 `codexctl_central_owner_refresh_failed_total{account,account_key,reason}`.
 `account` is the alias; `account_key` is the first 12 characters of the account
 digest, so two company users with the same alias stay apart. The reason comes
-from the fixed message Codex logs on the owner child's stderr after
-`Failed to refresh token: ` (color codes removed):
+from Codex's fixed terminal rejection message or a structured 400/401 refresh
+failure on the owner child's stderr (color codes removed). Structured
+`TokenErrorDetail` codes are allowlisted: `refresh_token_reused`,
+`refresh_token_expired`, `refresh_token_invalidated`, `refresh_token_revoked`,
+`account_mismatch`, and `invalid_grant`. A 401 with a missing code and the fixed
+"Your session has ended." message also counts as `refresh_token_invalidated`.
+Unknown codes and transient 429/5xx statuses do not establish a rejected grant.
+Structured provider details are reduced to the bounded reason and HTTP status
+before logging; their message and payload are never forwarded.
 
-| Reason                      | Codex message (provider answer)                                                                                             |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `refresh_token_reused`      | "…your refresh token was already used." (another holder used this grant)                                                    |
-| `refresh_token_expired`     | "…your refresh token has expired."                                                                                          |
-| `refresh_token_invalidated` | "…your refresh token was revoked."                                                                                          |
-| `account_mismatch`          | "…you have since logged out or signed in to another account."                                                               |
-| `other`                     | "Your access token could not be refreshed." (400 `invalid_grant`, or a 401 with another code; Codex logs both the same way) |
+| Reason                      | Recognized Codex rejection evidence                                                                                                             |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refresh_token_reused`      | "…your refresh token was already used." (another holder used this grant)                                                                        |
+| `refresh_token_expired`     | "…your refresh token has expired."                                                                                                              |
+| `refresh_token_invalidated` | "…your refresh token was revoked."; structured invalidated/revoked code, or a code-less 401 with "Your session has ended."                      |
+| `account_mismatch`          | "…you have since logged out or signed in to another account."                                                                                   |
+| `other`                     | Structured 400/401 `invalid_grant`, or the fixed terminal message "Your access token could not be refreshed. Please log out and sign in again." |
 
-A transient refresh failure (Codex logs `status=` and retries), or a failed
+A transient refresh failure (Codex logs a 429/5xx `status=` and retries), or a failed
 refresh with no permanent-rejection message within 300 ms, logs
 `reason="unclassified"`. It counts
 `codexctl_central_owner_refresh_native_errors_total{account,account_key,reason}`.

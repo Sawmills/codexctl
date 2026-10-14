@@ -4,6 +4,75 @@ evaluation_interval: 1m
 tests:
   - interval: 1m
     input_series:
+      - series: codexctl_central_owner_refresh_failed_total{account="personal",account_key="example-key",reason="refresh_token_invalidated",pod="pod-a"}
+        values: _ 1+0x24
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CodexctlOwnerRefreshRejected
+        exp_alerts:
+          - exp_labels:
+              account: personal
+              account_key: example-key
+              reason: refresh_token_invalidated
+              pod: pod-a
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl server account personal (example-key) lost its refresh grant (refresh_token_invalidated)
+              description: The provider rejected the stored refresh grant, so token requests for this account fail until it is renewed with a device code. Check the owner_refresh and owner_child log lines for the provider reason.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
+      - eval_time: 12m
+        alertname: CodexctlOwnerRefreshRejected
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_failed_requests_total{reason="owner_unavailable",pod="pod-a"}
+        values: 0 3 6 9 12 15 18 21 24 28 32 32+0x20
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl token requests keep failing with owner_unavailable
+              description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+      - eval_time: 26m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_failed_requests_total{reason="owner_unavailable",pod="pod-a"}
+        values: 0+0x15 5+0x15
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_failed_requests_total{reason="owner_unavailable",pod="pod-a"}
+        values: 0+0x15 6+0x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl token requests keep failing with owner_unavailable
+              description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+      - eval_time: 32m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts: []
+  - interval: 1m
+    input_series:
       - series: codexctl_central_owner_refresh_native_errors_total{account="personal",account_key="example-key",reason="upstream_5xx",pod="pod-a"}
         values: 0 1+0x13
       - series: codexctl_central_owner_refresh_native_errors_total{account="personal",account_key="example-key",reason="upstream_5xx",pod="pod-b"}

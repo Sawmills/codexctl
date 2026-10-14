@@ -157,6 +157,29 @@ for line in sys.stdin:
             send({"id":message["id"], "error":{"code":-32000,"message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}})
             continue
         routing_mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        structured_rejections = {
+            "owner-session-ended": (401, "refresh_token_invalidated", "Your session has ended. Please sign in again."),
+            "owner-refresh-reused": (401, "refresh_token_reused", "Synthetic reused grant."),
+            "owner-refresh-expired": (401, "refresh_token_expired", "Synthetic expired grant."),
+            "owner-refresh-revoked": (401, "refresh_token_revoked", "Synthetic revoked grant."),
+            "owner-refresh-mismatch": (401, "account_mismatch", "Synthetic account mismatch."),
+            "owner-refresh-invalid-grant": (400, "invalid_grant", "Synthetic invalid grant."),
+            "owner-session-ended-message": (401, None, "Your session has ended. Please sign in again."),
+            "owner-refresh-transient-code": (503, "refresh_token_invalidated", "Your session has ended. Please sign in again."),
+            "owner-refresh-unknown-code": (401, "server_error", "Your session has ended. Please sign in again."),
+            "owner-session-ended-bad-request": (400, None, "Your session has ended. Please sign in again."),
+        }
+        if routing_mode in structured_rejections:
+            # Synthetic shape of the HQ 14:56Z refresh rejection, without live data.
+            mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
+            count = mode_file.with_name("native-read-count")
+            count.write_text(str(int(count.read_text()) + 1))
+            status, code, text = structured_rejections[routing_mode]
+            error_code = "None" if code is None else f'Some("{code}")'
+            status_text = {400: "400 Bad Request", 401: "401 Unauthorized", 503: "503 Service Unavailable"}[status]
+            print(f'ERROR codex_login::auth::manager: Failed to refresh token \x1b[3mstatus\x1b[0m={status_text} detail=TokenErrorDetail {{ error_code: {error_code}, error_message: Some("{text}"), .. }}', file=sys.stderr, flush=True)
+            send({"id":message["id"], "error":{"code":-32603,"message":"synthetic refresh rejection"}})
+            continue
         if routing_mode == "owner-callback-write-hold":
             mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
             # Arrive after the native read deadline, during foreground settlement.
