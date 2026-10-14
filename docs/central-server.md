@@ -1072,13 +1072,13 @@ Unknown codes and transient 429/5xx statuses do not establish a rejected grant.
 Structured provider details are reduced to the bounded reason and HTTP status
 before logging; their message and payload are never forwarded.
 
-| Reason                      | Codex message (provider answer)                                                                                             |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `refresh_token_reused`      | "…your refresh token was already used." (another holder used this grant)                                                    |
-| `refresh_token_expired`     | "…your refresh token has expired."                                                                                          |
-| `refresh_token_invalidated` | "…your refresh token was revoked."; structured invalidated/revoked code or a code-less "Your session has ended." message    |
-| `account_mismatch`          | "…you have since logged out or signed in to another account."                                                               |
-| `other`                     | "Your access token could not be refreshed." (400 `invalid_grant`, or a 401 with another code; Codex logs both the same way) |
+| Reason                      | Recognized Codex rejection evidence                                                                                                             |
+| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `refresh_token_reused`      | "…your refresh token was already used." (another holder used this grant)                                                                        |
+| `refresh_token_expired`     | "…your refresh token has expired."                                                                                                              |
+| `refresh_token_invalidated` | "…your refresh token was revoked."; structured invalidated/revoked code, or a code-less 401 with "Your session has ended."                      |
+| `account_mismatch`          | "…you have since logged out or signed in to another account."                                                                                   |
+| `other`                     | Structured 400/401 `invalid_grant`, or the fixed terminal message "Your access token could not be refreshed. Please log out and sign in again." |
 
 A transient refresh failure (Codex logs a 429/5xx `status=` and retries), or a failed
 refresh with no permanent-rejection message within 300 ms, logs
