@@ -1,10 +1,13 @@
-use std::path::{Path, PathBuf};
+#[cfg(feature = "central-prototype")]
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
 use crate::store;
 
 /// Resolve a shared Codex configuration without replacing its symlink.
+#[cfg(feature = "central-prototype")]
 pub(crate) fn codex_config_path(home: &Path) -> Result<PathBuf> {
     let path = home.join("config.toml");
     if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -15,6 +18,7 @@ pub(crate) fn codex_config_path(home: &Path) -> Result<PathBuf> {
 }
 
 /// Atomically project configuration while preserving its existing permissions.
+#[cfg(feature = "central-prototype")]
 pub(crate) fn write_codex_config(destination: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let parent = destination
