@@ -355,6 +355,7 @@ struct Labels {
 }
 
 async fn forward(State(relay): State<Relay>, request: Request) -> Response {
+    let requested_at = Instant::now();
     let path = request
         .uri()
         .path_and_query()
@@ -395,6 +396,13 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             _ => "unknown",
         },
     };
+    if parts.method == Method::POST {
+        relay
+            .streaks
+            .lock()
+            .expect("streak lock")
+            .request(&labels.thread, requested_at);
+    }
     let mut headers = parts.headers;
     // Content-Length stays: the streamed body is byte for byte the same.
     for name in [
@@ -428,7 +436,15 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         headers.remove(name);
     }
     let request_id = header_str(&headers, "x-request-id").map(str::to_owned);
-    relay.evidence.observe(&json!({"outcome":"headers", "model":labels.model, "account_alias":labels.account_alias, "account_class":labels.account_class, "request_id":request_id, "http_status":status.as_u16(), "retry_headers":retry_headers(&headers)}));
+    relay.evidence.observe(evidence::Metadata {
+        status: status.as_u16(),
+        retry_headers: retry_headers(&headers),
+        model: &labels.model,
+        account_alias: labels.account_alias.as_deref(),
+        account_class: labels.account_class,
+        request_id: request_id.as_deref(),
+        observation: evidence::Observation::Headers,
+    });
     if status == StatusCode::TOO_MANY_REQUESTS && parts.method == Method::POST {
         return relay
             .rate_limited(upstream, headers, labels, request_id)
@@ -587,7 +603,18 @@ impl Relay {
             "account_alias": labels.account_alias,
             "retry_headers": failure_retry_headers(headers, context.event),
         });
-        self.evidence.observe(&line);
+        self.evidence.observe(evidence::Metadata {
+            status: context.http_status.unwrap_or(200),
+            retry_headers: failure_retry_headers(headers, context.event),
+            model: &labels.model,
+            account_alias: labels.account_alias.as_deref(),
+            account_class: labels.account_class,
+            request_id: context.request_id,
+            observation: evidence::Observation::Failure {
+                error_code: context.event.or(context.body).and_then(evidence_error_code),
+                rate_429: None,
+            },
+        });
         self.log_stream_failure(line);
     }
 
@@ -660,14 +687,18 @@ impl Relay {
         let body = (!oversized)
             .then(|| serde_json::from_slice::<Value>(&head.concat()).ok())
             .flatten();
-        self.evidence.observe(&json!({
-            "outcome":"failure", "model":labels.model,
-            "account_alias":labels.account_alias, "account_class":labels.account_class,
-            "request_id":request_id, "http_status":429,
-            "rate_429":class == Http429::Rate,
-            "failure":body.as_ref().map(http_failure_detail),
-            "retry_headers":retry_headers(&headers),
-        }));
+        self.evidence.observe(evidence::Metadata {
+            status: 429,
+            retry_headers: retry_headers(&headers),
+            model: &labels.model,
+            account_alias: labels.account_alias.as_deref(),
+            account_class: labels.account_class,
+            request_id: request_id.as_deref(),
+            observation: evidence::Observation::Failure {
+                error_code: body.as_ref().and_then(evidence_error_code),
+                rate_429: Some(class == Http429::Rate),
+            },
+        });
         match class {
             Http429::Terminal => {
                 // Codex stops on this; the next request is a resume.
@@ -688,13 +719,7 @@ impl Relay {
                 // counts against the budget. Other forms are replaced.
                 let upstream_secs = header_str(&headers, "retry-after")
                     .and_then(|value| value.trim().parse::<u64>().ok());
-                match self.failure(
-                    Kind::Rate429,
-                    &labels,
-                    request_id.as_deref(),
-                    upstream_secs,
-                    false,
-                ) {
+                match self.failure(Kind::Rate429, &labels, request_id.as_deref(), upstream_secs) {
                     Some(secs) => {
                         headers.insert("retry-after", HeaderValue::from(secs));
                     }
@@ -720,15 +745,10 @@ impl Relay {
         labels: &Labels,
         request_id: Option<&str>,
         upstream_secs: Option<u64>,
-        after_output: bool,
     ) -> Option<u64> {
         let advice = {
             let mut streaks = self.streaks.lock().expect("streak lock");
-            if after_output {
-                streaks.overload_cut(&labels.thread, Instant::now())
-            } else {
-                streaks.failure(&labels.thread, kind, Instant::now(), upstream_secs)
-            }
+            streaks.failure(&labels.thread, kind, Instant::now(), upstream_secs)
         };
         match advice {
             Advice::RetryAfter { secs, attempt } => {
@@ -912,7 +932,7 @@ impl StreamTrace {
     }
 }
 
-/// Adds pre-output capacity advice or schedules an after-output transport cut.
+/// Adds capacity advice while retaining output already delivered.
 /// The relay never replays a request; Codex owns retry and prior output.
 struct FrameRewriter {
     relay: Relay,
@@ -926,7 +946,6 @@ struct FrameRewriter {
     frame_search_start: usize,
     is_responses: bool,
     trace: StreamTrace,
-    cut_delay: Option<Duration>,
     http_status: u16,
     pending_kind: Option<String>,
     failure_frame_truncated: bool,
@@ -1136,7 +1155,6 @@ impl FrameRewriter {
             frame_search_start: 0,
             is_responses,
             trace: StreamTrace::new(headers_at),
-            cut_delay: None,
             http_status,
             pending_kind: None,
             failure_frame_truncated: false,
@@ -1150,35 +1168,17 @@ impl FrameRewriter {
         upstream: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     ) -> impl Stream<Item = std::io::Result<Bytes>> + Send + 'static {
         futures::stream::unfold(
-            (Some(Box::pin(upstream)), self, false),
+            (Box::pin(upstream), self, false),
             |(mut upstream, mut frames, done)| async move {
                 if done {
                     return None;
                 }
-                if let Some(delay) = frames.cut_delay.take() {
-                    // Release the provider before backoff. Codex, not the
-                    // relay, owns the turn retry and any already-seen output.
-                    upstream.take();
-                    tokio::time::sleep(delay).await;
-                    return Some((
-                        Err(std::io::Error::other("retryable capacity stream cut")),
-                        (upstream, frames, true),
-                    ));
-                }
                 loop {
-                    match upstream.as_mut().expect("live upstream").next().await {
+                    match upstream.next().await {
                         Some(Ok(chunk)) => {
                             let out = frames.push(&chunk);
                             if !out.is_empty() {
                                 return Some((Ok(Bytes::from(out)), (upstream, frames, false)));
-                            }
-                            if let Some(delay) = frames.cut_delay.take() {
-                                upstream.take();
-                                tokio::time::sleep(delay).await;
-                                return Some((
-                                    Err(std::io::Error::other("retryable capacity stream cut")),
-                                    (upstream, frames, true),
-                                ));
                             }
                         }
                         Some(Err(error)) => {
@@ -1191,16 +1191,7 @@ impl FrameRewriter {
                         None => {
                             let rest = frames.finish_eof();
                             if !rest.is_empty() {
-                                let done = frames.cut_delay.is_none();
-                                return Some((Ok(Bytes::from(rest)), (upstream, frames, done)));
-                            }
-                            if let Some(delay) = frames.cut_delay.take() {
-                                upstream.take();
-                                tokio::time::sleep(delay).await;
-                                return Some((
-                                    Err(std::io::Error::other("retryable capacity stream cut")),
-                                    (upstream, frames, true),
-                                ));
+                                return Some((Ok(Bytes::from(rest)), (upstream, frames, true)));
                             }
                             return None;
                         }
@@ -1260,14 +1251,9 @@ impl FrameRewriter {
             if forwarded < output.len() {
                 out.extend_from_slice(&output[forwarded..]);
             }
-            if self.cut_delay.is_some() {
-                self.pending.clear();
-                self.forwarded = 0;
-                return out;
-            }
         }
         // Output fragments may stream promptly. A possible failure is held
-        // until classified so its completed event cannot defeat transport retry.
+        // until classified so its advice can be changed before it is forwarded.
         let kind = self
             .partial_scanner
             .hint
@@ -1423,30 +1409,19 @@ impl FrameRewriter {
                 .streaks
                 .lock()
                 .expect("streak lock")
-                .end_cut(&self.labels.thread);
+                .end(&self.labels.thread);
         }
         if overloaded {
             let event_value = event.as_ref().expect("overload event exists");
-            let after_output = self.trace.first_output.is_some();
             output = match self.relay.failure(
                 Kind::Overloaded,
                 &self.labels,
                 self.request_id.as_deref(),
-                if after_output {
-                    None
-                } else {
-                    upstream_event_secs(event_value)
-                },
-                after_output,
+                upstream_event_secs(event_value),
             ) {
                 Some(secs) => {
                     advised = true;
-                    if after_output {
-                        self.cut_delay = Some(Duration::from_secs(secs));
-                        Vec::new()
-                    } else {
-                        with_retry_advice(&output, event_value.clone(), secs)
-                    }
+                    with_retry_advice(&output, event_value.clone(), secs)
                 }
                 None => without_retry_advice(output, event_value.clone()),
             };
@@ -1472,8 +1447,7 @@ impl FrameRewriter {
     }
 }
 
-/// Events that carry model output or a completed response. Subsequent capacity
-/// failures require a transport cut rather than a rewritten provider event.
+/// Events that carry model output or a completed response.
 fn is_output(kind: &str) -> bool {
     kind == "response.completed"
         || [
@@ -2092,19 +2066,27 @@ fn rebuild_frame(frame: &[u8], event: &Value) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn retry_headers(headers: &HeaderMap) -> Value {
-    let mut values = serde_json::Map::new();
+fn evidence_error_code(event: &Value) -> Option<&str> {
+    event
+        .pointer("/response/error/code")
+        .or_else(|| event.pointer("/error/code"))
+        .or_else(|| event.pointer("/error/type"))
+        .and_then(Value::as_str)
+}
+
+fn retry_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
     for name in ["retry-after", "retry-after-ms", "x-should-retry"] {
         if let Some(value) =
             header_str(headers, name).and_then(|value| evidence::retry_header(name, value))
         {
-            values.insert(name.into(), Value::String(value));
+            values.insert(name.into(), value);
         }
     }
-    Value::Object(values)
+    values
 }
 
-fn failure_retry_headers(headers: &HeaderMap, event: Option<&Value>) -> Value {
+fn failure_retry_headers(headers: &HeaderMap, event: Option<&Value>) -> BTreeMap<String, String> {
     let mut values = retry_headers(headers);
     if let Some(embedded) = event
         .and_then(|event| event.pointer("/response/error/headers"))
@@ -2116,7 +2098,7 @@ fn failure_retry_headers(headers: &HeaderMap, event: Option<&Value>) -> Value {
                 .as_str()
                 .and_then(|value| evidence::retry_header(&name, value))
             {
-                values[&name] = Value::String(value);
+                values.insert(name, value);
             }
         }
     }

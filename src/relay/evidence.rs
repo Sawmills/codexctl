@@ -2,7 +2,6 @@
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
@@ -19,6 +18,25 @@ const DAILY_BYTES: u64 = 4 * 1024 * 1024;
 const REQUEST_BYTES: u64 = 3 * 1024 * 1024;
 const RETAIN_DAYS: i64 = 7;
 const DROP_REASONS: [&str; 3] = ["queue_full", "io", "daily_limit"];
+
+pub(super) enum Observation<'a> {
+    Headers,
+    Failure {
+        error_code: Option<&'a str>,
+        rate_429: Option<bool>,
+    },
+}
+
+/// Only metadata crosses the persistence seam; payloads and credentials cannot.
+pub(super) struct Metadata<'a> {
+    pub status: u16,
+    pub retry_headers: BTreeMap<String, String>,
+    pub model: &'a str,
+    pub account_alias: Option<&'a str>,
+    pub account_class: &'a str,
+    pub request_id: Option<&'a str>,
+    pub observation: Observation<'a>,
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -107,62 +125,38 @@ impl Evidence {
         ))
     }
 
-    /// Reconstruct only the allowlist. The caller's diagnostics may have more
-    /// detail, but messages, bodies, thread ids and credentials never persist.
-    pub(super) fn observe(&self, line: &Value) {
+    /// Validate the allowlist before queuing a private record.
+    pub(super) fn observe(&self, metadata: Metadata<'_>) {
         let Some(sender) = &self.sender else {
             return;
         };
-        let error_code = line
-            .pointer("/failure/response/error/code")
-            .or_else(|| line.pointer("/failure/error/code"))
-            .or_else(|| line.pointer("/failure/error/type"))
-            .and_then(Value::as_str)
-            .map(error_class)
-            .map(str::to_owned);
-        let retry_headers = line
-            .get("retry_headers")
-            .and_then(Value::as_object)
-            .map(|headers| {
-                headers
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        retry_header(name, value.as_str()?).map(|value| (name.clone(), value))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let (observation, error_code, rate_429) = match metadata.observation {
+            Observation::Headers => ("headers", None, None),
+            Observation::Failure {
+                error_code,
+                rate_429,
+            } => ("failure", error_code, rate_429),
+        };
         let record = Record {
             utc_hour: Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string(),
-            rate_429: line.get("rate_429").and_then(Value::as_bool),
-            status: line
-                .get("http_status")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(200),
-            error_code,
-            retry_headers,
-            model: model(line.get("model").and_then(Value::as_str).unwrap_or("other")).into(),
-            account_alias: line
-                .get("account_alias")
-                .and_then(Value::as_str)
-                .and_then(alias),
-            account_class: match line.get("account_class").and_then(Value::as_str) {
-                Some("included") => "included",
-                Some("credit") => "credit",
+            rate_429,
+            status: metadata.status,
+            error_code: error_code.map(error_class).map(str::to_owned),
+            retry_headers: metadata
+                .retry_headers
+                .into_iter()
+                .filter_map(|(name, value)| retry_header(&name, &value).map(|value| (name, value)))
+                .collect(),
+            model: model(metadata.model).into(),
+            account_alias: metadata.account_alias.and_then(alias),
+            account_class: match metadata.account_class {
+                "included" => "included",
+                "credit" => "credit",
                 _ => "unknown",
             }
             .into(),
-            request_id: line
-                .get("request_id")
-                .and_then(Value::as_str)
-                .and_then(request_id),
-            observation: if line.get("outcome").and_then(Value::as_str) == Some("headers") {
-                "headers"
-            } else {
-                "failure"
-            }
-            .into(),
+            request_id: metadata.request_id.and_then(request_id),
+            observation: observation.into(),
         };
         if sender.try_send(record).is_err() {
             self.dropped[0].fetch_add(1, Ordering::Relaxed);

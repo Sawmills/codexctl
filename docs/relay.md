@@ -51,9 +51,10 @@ the account, or the auth headers, and it never resumes a goal.
   Ns." to the message. Codex 0.161.0 reads only that form; newer Codex reads the
   header.
 - **Capacity event after output:** the relay retains output already delivered,
-  closes the upstream response, waits the jittered policy delay, and cuts the
-  client stream with a transport error. Codex owns the turn retry; the relay
-  does not replay the request or output. A completed response ends the failure
+  sends the same advised `response.failed` as before output, and lets Codex wait
+  the jittered policy delay. Codex rebuilds the turn from history, retaining
+  completed tool calls; the relay does not replay the request or output.
+  A completed response ends the failure
   streak. Partial output alone does not reset the budget.
   Failure frames stay in memory until classified, up to 1 MiB. Larger failure
   frames retain bounded error and retry metadata and omit the oversized payload.
@@ -72,15 +73,16 @@ Delays double from 2 s up to 60 s, with jitter. Each Codex thread (`thread-id`
 header) has one failure streak. When a streak spends its budget, the relay passes the
 original failure through and removes any upstream `Retry-After`. Codex then stops, and
 the board resumes the lane. A new streak starts when the error kind changes or on
-the first failure after exhaustion (that request is a resume). Advice-only streaks
-also restart after 120 s beyond the advised retry time. An after-output cut keeps
-the original budget across Codex's own long stream backoff; elapsed client waits
-count toward exhaustion when the next failure arrives. Abandoned streaks are
-evicted after an hour without a failure. A different terminal stream failure ends
-an outstanding cut streak without reporting recovery. Partial output does not
-pause the elapsed-time budget. A client interruption without a terminal event
-does not prove completion; reusing that thread can retain its old budget until
-exhaustion or eviction.
+the first failure after exhaustion (that request is a resume). All streaks restart
+when a new request arrives 120 s beyond the advised retry time. Active streaming
+does not count as idle. Elapsed client waits count toward
+exhaustion when the next failure arrives. On each new request, entries older than
+an hour since their last failure are evicted to bound retained state. This can
+also discard a still-active, hour-long stream's streak when another request arrives.
+A different terminal stream failure ends the streak
+without reporting recovery. Partial output does not pause the elapsed-time
+budget. A client interruption without a terminal event does not prove completion;
+reusing that thread within the idle window can retain its old budget.
 
 | Error               | Default budget | Flag                       |
 | ------------------- | -------------- | -------------------------- |
@@ -120,10 +122,11 @@ provider and future pinned or automatic account-server launches. It survives
 local account selection and disconnect. Existing children keep their launch
 settings, so restart them to change routes. Only a loopback address with a nonzero
 port is accepted. Provider overrides remain rejected by pinned launches.
-Relay routes use at least 26 stream retries, preserving higher configured values.
-This gives the default 600-second budget room to stop even at the minimum local
-jitter delay. Larger custom budgets or shorter upstream retry advice can require
-a higher client limit. Disabling the route preserves the configured retry count.
+Relay routes preserve the configured stream retry count (default 12). The client
+limit can stop a turn before the relay budget is exhausted. Codex uses the same
+counter for other stream errors with uncapped exponential backoff, so the relay
+does not raise it to make a capacity streak outlast the budget. Enable, disable,
+activation and launches all preserve explicit retry settings.
 If a filesystem error interrupts the two route writes, a private pending intent
 remains. The next configuration change or account-server launch completes it
 under a route lock before selecting a URL. Fix the reported filesystem error

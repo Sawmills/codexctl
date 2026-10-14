@@ -520,7 +520,7 @@ fn prepare_pinned_codex(
         ),
         format!(
             "model_providers.codexctl-central.stream_max_retries={}",
-            route.stream_retries(retries("stream_max_retries"))
+            retries("stream_max_retries")
         ),
         format!("model_providers.codexctl-central.auth.command={helper}"),
         format!("model_providers.codexctl-central.auth.args={helper_args}"),

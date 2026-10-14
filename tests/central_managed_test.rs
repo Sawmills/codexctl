@@ -11520,12 +11520,12 @@ fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
     );
     let path = home.path().join(".codex/config.toml");
     let config: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-    assert!(
+    assert_eq!(
         config["model_providers"]["codexctl-central"]["stream_max_retries"]
             .as_integer()
-            .unwrap()
-            >= 26,
-        "client retry count must outlast the default overload budget even at minimum jitter"
+            .unwrap(),
+        12,
+        "enabling the relay must preserve the client retry limit for other stream errors"
     );
     assert!(
         config["model_providers"]["codexctl-central"]["http_headers"]
@@ -11578,6 +11578,24 @@ print('RELAY-PRIVATE-AUTH-OK')
         config["model_providers"]["codexctl-central"]["stream_max_retries"] =
             toml_edit::value(retries);
         store::atomic_write(&path, config.to_string().as_bytes()).unwrap();
+        for action in [
+            &["relay", "disable"][..],
+            &["relay", "enable"][..],
+            &["use", "host"][..],
+        ] {
+            let changed = server.cli(home.path(), action);
+            assert!(
+                changed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&changed.stderr)
+            );
+            let projected: toml_edit::DocumentMut =
+                std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(
+                projected["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+                Some(retries)
+            );
+        }
         let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
             .args(args)
             .env("HOME", home.path())
@@ -11590,7 +11608,7 @@ print('RELAY-PRIVATE-AUTH-OK')
                 .unwrap(),
             )
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
-            .env("EXPECTED_STREAM_RETRIES", retries.max(26).to_string())
+            .env("EXPECTED_STREAM_RETRIES", retries.to_string())
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .output()
@@ -11613,6 +11631,10 @@ print('RELAY-PRIVATE-AUTH-OK')
     assert_eq!(
         restored["model_providers"]["codexctl-central"]["base_url"].as_str(),
         Some("https://chatgpt.com/backend-api/codex")
+    );
+    assert_eq!(
+        restored["model_providers"]["codexctl-central"]["stream_max_retries"].as_integer(),
+        Some(32)
     );
 }
 

@@ -68,19 +68,6 @@ impl Routing {
 pub(crate) struct ProviderRoute {
     pub(crate) url: String,
     pub(crate) headers: toml_edit::InlineTable,
-    relay: bool,
-}
-
-impl ProviderRoute {
-    pub(crate) fn stream_retries(&self, configured: i64) -> i64 {
-        // At minimum jitter, 25 local overload delays total 631 seconds.
-        // Leave room for the default 600-second budget to issue its stop.
-        if self.relay {
-            configured.max(26)
-        } else {
-            configured
-        }
-    }
 }
 
 impl Routing {
@@ -104,7 +91,6 @@ impl Routing {
         Ok(ProviderRoute {
             url: self.url()?,
             headers,
-            relay: self.listen.is_some(),
         })
     }
 }
@@ -143,7 +129,7 @@ fn apply(paths: &Paths, routing: &Routing) -> Result<()> {
     // The shared --active helper can change accounts without a client restart.
     // Static identity/billing headers would then misattribute those requests.
     let route = routing.provider(None, None)?;
-    let path = crate::central::native::config_path(&paths.codex_home())?;
+    let path = crate::config::codex_config_path(&paths.codex_home())?;
     let before = match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -165,13 +151,8 @@ fn apply(paths: &Paths, routing: &Routing) -> Result<()> {
             .and_then(|providers| providers.get_mut(PROVIDER))
             .context("active account-server provider is missing")?;
         provider["base_url"] = toml_edit::value(&route.url);
-        let retries = provider
-            .get("stream_max_retries")
-            .and_then(toml_edit::Item::as_integer)
-            .unwrap_or(12);
-        provider["stream_max_retries"] = toml_edit::value(route.stream_retries(retries));
         provider["http_headers"] = toml_edit::value(route.headers);
-        crate::central::native::write_config(&path, document.to_string().as_bytes())?;
+        crate::config::write_codex_config(&path, document.to_string().as_bytes())?;
     }
     store::atomic_write(
         &paths.codexctl_dir().join("relay.json"),

@@ -1408,7 +1408,7 @@ async fn oversized_data_only_late_completed_type_does_not_create_a_false_truncat
 }
 
 #[tokio::test]
-async fn overloaded_after_output_cuts_transport_without_replaying_the_request() {
+async fn overloaded_after_output_advises_without_replaying_the_request() {
     let (gate, gate_rx) = mpsc::channel(1);
     let (closed_tx, closed_rx) = oneshot::channel();
     let h = harness(vec![Scripted::Gated(
@@ -1428,13 +1428,19 @@ async fn overloaded_after_output_cuts_transport_without_replaying_the_request() 
         REASONING_DELTA.as_bytes()
     );
     gate.send(()).await.unwrap();
-    let cut = tokio::time::timeout(Duration::from_secs(4), stream.next())
+    let advised = tokio::time::timeout(Duration::from_millis(500), stream.next())
         .await
+        .expect("the relay sends advice promptly; Codex owns the delay")
+        .unwrap()
+        .expect("after-output capacity is an advised failure, not a transport error");
+    let event = failed_event(std::str::from_utf8(&advised).unwrap());
+    assert_eq!(event["response"]["error"]["code"], "rate_limit_exceeded");
+    let delay = event["response"]["error"]["headers"]["retry-after"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
         .unwrap();
-    assert!(
-        cut.is_some_and(|result| result.is_err()),
-        "after-output capacity must be a transport error, not a provider-failure frame"
-    );
+    assert!((1..=2).contains(&delay));
     drop(stream);
     tokio::time::timeout(Duration::from_secs(2), closed_rx)
         .await
@@ -1466,7 +1472,7 @@ async fn overloaded_after_output_cuts_transport_without_replaying_the_request() 
 }
 
 #[tokio::test]
-async fn oversized_fragmented_overload_with_late_code_cuts_transport() {
+async fn oversized_fragmented_overload_with_late_code_advises_retry() {
     let prefix = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"";
     let suffix = "\",\"code\":\"server_is_overloaded\"}}}\n\n";
     let mut chunks = vec![CREATED.into(), REASONING_DELTA.into(), prefix.into()];
@@ -1478,16 +1484,17 @@ async fn oversized_fragmented_overload_with_late_code_cuts_transport() {
             .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
     );
     let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
-    assert!(
-        h.post("large-late-code").await.text().await.is_err(),
-        "a late overload code must cut the stream even after bounded frame flushes"
-    );
+    let reply = h.post("large-late-code").await.text().await.unwrap();
+    assert!(reply.starts_with(&format!("{CREATED}{REASONING_DELTA}")));
+    let event = failed_event(&reply);
+    assert_eq!(event["response"]["error"]["code"], "rate_limit_exceeded");
+    assert!(event["response"]["error"]["headers"]["retry-after"].is_string());
     assert_eq!(metric_stream(&h.metrics().await, "kind=\"overloaded\""), 1);
     assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 1);
 }
 
 #[tokio::test]
-async fn a_different_terminal_failure_ends_the_previous_cut_streak() {
+async fn a_different_terminal_failure_ends_the_previous_overload_streak() {
     let capacity = vec![
         CREATED.to_string(),
         DELTA.to_string(),
@@ -1503,7 +1510,8 @@ async fn a_different_terminal_failure_ends_the_previous_cut_streak() {
         |config| config.with_budgets(Duration::ZERO, Duration::from_secs(2)),
     )
     .await;
-    assert!(h.post("changed-failure-kind").await.text().await.is_err());
+    let advised = h.post("changed-failure-kind").await.text().await.unwrap();
+    assert!(failed_event(&advised)["response"]["error"]["headers"]["retry-after"].is_string());
     assert!(
         h.post("changed-failure-kind")
             .await
@@ -1513,8 +1521,9 @@ async fn a_different_terminal_failure_ends_the_previous_cut_streak() {
             .contains(&unavailable)
     );
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let advised = h.post("changed-failure-kind").await.text().await.unwrap();
     assert!(
-        h.post("changed-failure-kind").await.text().await.is_err(),
+        failed_event(&advised)["response"]["error"]["headers"]["retry-after"].is_string(),
         "a new capacity streak must be allowed after a different terminal failure"
     );
     let metrics = h.metrics().await;
@@ -1528,7 +1537,7 @@ async fn a_different_terminal_failure_ends_the_previous_cut_streak() {
 }
 
 #[tokio::test]
-async fn after_output_capacity_budget_survives_a_long_client_backoff() {
+async fn after_output_capacity_starts_a_new_budget_after_a_long_idle_gap() {
     let frames = vec![
         CREATED.to_string(),
         DELTA.to_string(),
@@ -1539,16 +1548,55 @@ async fn after_output_capacity_budget_survives_a_long_client_backoff() {
         |config| config.with_budgets(Duration::ZERO, Duration::from_secs(2)),
     )
     .await;
-    assert!(h.post("long-client-backoff").await.text().await.is_err());
-    // Codex 0.160.0's stream backoff can exceed the ordinary 120-second idle
-    // window. The relay must still exhaust this turn's original cut budget.
-    tokio::time::sleep(Duration::from_secs(121)).await;
-    let terminal = h.post("long-client-backoff").await.text().await.unwrap();
-    assert_eq!(terminal, frames.concat());
+    let first = h.post("long-idle-gap").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    // The client follows the advice, so a gap beyond that delay plus the
+    // ordinary 120-second idle window belongs to a new turn.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h.post("long-idle-gap").await.text().await.unwrap();
+    assert!(failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string());
     let metrics = h.metrics().await;
-    assert_eq!(metric(&metrics, "outcome=\"advised\""), 1);
-    assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 1);
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 2);
+    assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 0);
     assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0);
+}
+
+#[tokio::test]
+async fn non_responses_rate_streak_starts_a_new_budget_after_an_idle_gap() {
+    let h = harness_with(
+        vec![
+            Scripted::Status(429, vec![], RATE_429.into()),
+            Scripted::Status(429, vec![], RATE_429.into()),
+        ],
+        |config| config.with_budgets(Duration::from_secs(2), Duration::ZERO),
+    )
+    .await;
+    let url = format!("{}/backend-api/codex/other", h.relay_url);
+    let first = h
+        .client
+        .post(&url)
+        .header("thread-id", "idle-other-post")
+        .json(&json!({"model":"gpt-6.1-sol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 429);
+    assert!(first.headers().contains_key("retry-after"));
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h
+        .client
+        .post(&url)
+        .header("thread-id", "idle-other-post")
+        .json(&json!({"model":"gpt-6.1-sol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), 429);
+    assert!(
+        resumed.headers().contains_key("retry-after"),
+        "a forwarded POST outside /responses must receive a fresh idle budget too"
+    );
+    assert_eq!(metric(&h.metrics().await, "outcome=\"exhausted\""), 0);
 }
 
 #[tokio::test]
@@ -1698,18 +1746,34 @@ async fn fragmented_exhausted_overloads_remove_upstream_retry_advice() {
 
 #[tokio::test]
 async fn partial_output_does_not_reset_the_overload_budget() {
+    let (gate, rx) = mpsc::channel(1);
+    let (closed, _) = oneshot::channel();
     let frames = vec![
         CREATED.to_string(),
         REASONING_DELTA.into(),
         OVERLOADED.into(),
     ];
     let h = harness_with(
-        vec![Scripted::Sse(frames.clone()), Scripted::Sse(frames.clone())],
+        vec![
+            Scripted::Sse(frames.clone()),
+            Scripted::Gated(frames.clone(), rx, closed),
+        ],
         |config| config.with_budgets(Duration::from_secs(180), Duration::from_secs(2)),
     )
     .await;
-    assert!(h.post("same-turn-budget").await.text().await.is_err());
-    let exhausted = h.post("same-turn-budget").await.text().await.unwrap();
+    let first = h.post("same-turn-budget").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    let mut stream = h.post("same-turn-budget").await.bytes_stream();
+    let mut reply = stream.next().await.unwrap().unwrap().to_vec();
+    gate.send(()).await.unwrap();
+    reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
+    // The retry arrived promptly and is still streaming. Its eventual failure
+    // must exhaust the old budget rather than treating streaming time as idle.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    gate.send(()).await.unwrap();
+    reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
+    drop(stream);
+    let exhausted = String::from_utf8(reply).unwrap();
     assert!(
         exhausted == frames.concat(),
         "budget exhaustion must deliver the original terminal failure"

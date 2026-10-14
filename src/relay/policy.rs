@@ -13,7 +13,7 @@ use serde_json::Value;
 const BASE_DELAY_SECS: u64 = 2;
 /// Longest single delay the relay advises.
 const MAX_DELAY_SECS: u64 = 60;
-/// A failure this long after the advised retry time starts a new streak:
+/// A request this long after the advised retry time starts a new streak:
 /// Codex retries at that time, so a longer gap means a later resume.
 const STREAK_IDLE: Duration = Duration::from_secs(120);
 /// Streaks idle this long are dropped so the table stays bounded.
@@ -109,7 +109,6 @@ struct Streak {
     retry_at: Instant,
     attempts: u32,
     exhausted: bool,
-    after_output_cut: bool,
 }
 
 /// Failure streaks per Codex thread.
@@ -132,6 +131,20 @@ impl Streaks {
         }
     }
 
+    /// Idle is measured when a request arrives, not when its stream fails.
+    /// Time spent streaming output must still count against the old budget.
+    pub(crate) fn request(&mut self, thread: &str, now: Instant) {
+        self.by_thread
+            .retain(|_, streak| now.saturating_duration_since(streak.last_failure) < STREAK_EVICT);
+        if self
+            .by_thread
+            .get(thread)
+            .is_some_and(|streak| now.saturating_duration_since(streak.retry_at) > STREAK_IDLE)
+        {
+            self.end(thread);
+        }
+    }
+
     /// Records one advisable failure. `upstream_secs` is the server's own
     /// numeric advice; when present it is the delay, and it counts against
     /// the budget like the relay's own.
@@ -142,43 +155,18 @@ impl Streaks {
         now: Instant,
         upstream_secs: Option<u64>,
     ) -> Advice {
-        self.failure_mode(thread, kind, now, upstream_secs, false)
-    }
-
-    /// A cut leaves Codex retrying with its own potentially long stream backoff.
-    /// An idle gap therefore cannot prove this overload turn has ended.
-    pub(crate) fn overload_cut(&mut self, thread: &str, now: Instant) -> Advice {
-        self.failure_mode(thread, Kind::Overloaded, now, None, true)
-    }
-
-    fn failure_mode(
-        &mut self,
-        thread: &str,
-        kind: Kind,
-        now: Instant,
-        upstream_secs: Option<u64>,
-        after_output_cut: bool,
-    ) -> Advice {
-        self.by_thread
-            .retain(|_, streak| now.duration_since(streak.last_failure) < STREAK_EVICT);
         let streak = self
             .by_thread
             .entry(thread.to_owned())
             .and_modify(|streak| {
-                // A new streak when the kind changes (its own budget), after a
-                // long gap, or after exhaustion: Codex stopped then, so this
-                // failure belongs to a resumed turn.
-                if streak.kind != kind
-                    || streak.exhausted
-                    || (!streak.after_output_cut
-                        && now.saturating_duration_since(streak.retry_at) > STREAK_IDLE)
-                {
+                // A kind change gets its own budget; exhaustion means Codex
+                // stopped, so the next failure belongs to a resumed turn.
+                if streak.kind != kind || streak.exhausted {
                     *streak = Streak::new(kind, now);
                 }
             })
             .or_insert_with(|| Streak::new(kind, now));
         streak.last_failure = now;
-        streak.after_output_cut |= after_output_cut;
         streak.attempts += 1;
         let attempt = streak.attempts;
         let cap = BASE_DELAY_SECS
@@ -223,18 +211,6 @@ impl Streaks {
         self.by_thread.remove(thread);
     }
 
-    /// A different terminal stream failure ends an outstanding cut without
-    /// reporting recovery or changing ordinary advice-only streaks.
-    pub(crate) fn end_cut(&mut self, thread: &str) {
-        if self
-            .by_thread
-            .get(thread)
-            .is_some_and(|streak| streak.after_output_cut)
-        {
-            self.end(thread);
-        }
-    }
-
     /// A delay in `[ceil(cap / 2), cap]`, at least one second.
     fn jittered(&mut self, cap: u64) -> u64 {
         self.draws += 1;
@@ -254,7 +230,6 @@ impl Streak {
             retry_at: now,
             attempts: 0,
             exhausted: false,
-            after_output_cut: false,
         }
     }
 }

@@ -10,18 +10,24 @@ shared by activated, pinned and automatic account-server launches. A durable
 intent recovers interrupted setting/config writes before a later route selection.
 Launches preserve existing identity, environment and billing guards.
 
-After-output overloads preserve prior output, release upstream, wait the existing
-jittered budget delay, and emit a transport cut. Codex retries the same turn;
+HQ's 2026-10-14 review supersedes the proposed transport cut: after-output
+overloads preserve prior output and send an advised `response.failed`, using the
+same compatibility advice as before output. Codex waits the jittered budget
+delay and retries the same turn from history, retaining completed tool calls;
 the relay performs no replay. Only `response.completed` counts as recovery.
-A different terminal failure ends a prior cut without a recovery metric; partial
+A different terminal failure ends a prior streak without a recovery metric; partial
 output does not reset or pause the elapsed-time budget.
+All streaks reset when a new request arrives 120 seconds beyond the advised retry
+time; active streaming is not idle. Routes preserve
+the configured stream retry count (default 12), since Codex uses the same counter
+with uncapped exponential backoff for other stream errors.
 Failure and unclassified frames stay in bounded memory until finalization, with
 metadata-only normalization beyond 1 MiB. Exhaustion removes upstream advice.
 
 Evidence retains seven UTC days, bounded to 4 MiB per day and a 256-record queue.
 Only allowlisted status, error code, retry headers, model, alias, request ID,
 billing class and UTC hour persist. Public CLI/process and relay HTTP/metrics/file
-tests cover routing, transport cuts, exhaustion, sanitization and reporting.
+tests cover routing, advised failures, exhaustion, sanitization and reporting.
 
 Devbox proof uses a real Codex 0.160.0 client against a fake upstream, plus one
 healthy live turn on the same pinned subscription account. No billed overflow,

@@ -1,8 +1,40 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use crate::store;
+
+/// Resolve a shared Codex configuration without replacing its symlink.
+pub(crate) fn codex_config_path(home: &Path) -> Result<PathBuf> {
+    let path = home.join("config.toml");
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        Ok(std::fs::canonicalize(path)?)
+    } else {
+        Ok(path)
+    }
+}
+
+/// Atomically project configuration while preserving its existing permissions.
+pub(crate) fn write_codex_config(destination: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = destination
+        .parent()
+        .context("configuration has no parent")?;
+    let permissions = match std::fs::metadata(destination) {
+        Ok(metadata) => Some(metadata.permissions()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(bytes)?;
+    if let Some(permissions) = permissions {
+        file.as_file().set_permissions(permissions)?;
+    }
+    file.as_file().sync_all()?;
+    file.persist(destination).map_err(|e| e.error)?;
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
 
 /// All paths codexctl uses. Testable: construct with a custom root.
 #[derive(Clone)]
