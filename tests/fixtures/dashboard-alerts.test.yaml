@@ -47,9 +47,28 @@ tests:
   - interval: 1m
     input_series:
       - series: codexctl_central_failed_requests_total{reason="owner_unavailable",pod="pod-a"}
-        values: 0+0x15 4+0x15
+        values: 0+0x15 5+0x15
     alert_rule_test:
       - eval_time: 16m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_failed_requests_total{reason="owner_unavailable",pod="pod-a"}
+        values: 0+0x15 6+0x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: CodexctlOwnerUnavailableRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl token requests keep failing with owner_unavailable
+              description: More than five token requests failed with owner_unavailable in 15 minutes. Inspect native child start and settlement errors in the broker logs.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-ha.md
+      - eval_time: 32m
         alertname: CodexctlOwnerUnavailableRate
         exp_alerts: []
   - interval: 1m
