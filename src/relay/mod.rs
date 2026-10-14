@@ -371,7 +371,8 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         .or_else(|| header_str(&parts.headers, "session-id"))
         .unwrap_or("unknown")
         .to_owned();
-    let guard = policy::RequestGuard::new(&relay.streaks, &thread, requested_at);
+    let guard = (parts.method == Method::POST)
+        .then(|| policy::RequestGuard::new(&relay.streaks, &thread, requested_at));
     // Stream the request; keep only a bounded prefix for the model label.
     let mut body = body.into_data_stream();
     let mut head: Vec<Bytes> = Vec::new();

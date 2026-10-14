@@ -182,7 +182,10 @@ async fn harness_with(
     };
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
-        .route("/backend-api/codex/other", post(upstream_responses))
+        .route(
+            "/backend-api/codex/other",
+            post(upstream_responses).get(upstream_responses),
+        )
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(upstream.clone());
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1742,6 +1745,44 @@ async fn fragmented_exhausted_overloads_remove_upstream_retry_advice() {
             assert_eq!(metric(&h.metrics().await, "outcome=\"exhausted\""), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn an_open_get_does_not_keep_a_post_retry_streak_alive() {
+    let (_gate, rx) = mpsc::channel(1);
+    let (closed, closed_rx) = oneshot::channel();
+    let frames = vec![CREATED.to_string(), OVERLOADED.into()];
+    let h = harness_with(
+        vec![
+            Scripted::Sse(frames.clone()),
+            Scripted::Gated(vec![CREATED.into(), COMPLETED.into()], rx, closed),
+            Scripted::Sse(frames),
+        ],
+        |config| config.with_budgets(Duration::from_secs(180), Duration::from_secs(2)),
+    )
+    .await;
+    let first = h.post("post-only-budget").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    let mut metadata = h
+        .client
+        .get(format!("{}/backend-api/codex/other", h.relay_url))
+        .header("thread-id", "post-only-budget")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert_eq!(metadata.next().await.unwrap().unwrap(), CREATED);
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h.post("post-only-budget").await.text().await.unwrap();
+    drop(metadata);
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "an unrelated open GET must not protect an idle POST's old retry budget"
+    );
 }
 
 #[tokio::test]

@@ -19,7 +19,8 @@ A different terminal failure ends a prior streak without a recovery metric; part
 output does not reset or pause the elapsed-time budget.
 With no request in flight, a new request arriving 120 seconds beyond the advised
 retry time resets the streak; active streaming is not idle.
-Request guards retain in-flight streaks through response EOF or cancellation.
+POST request guards retain in-flight streaks through response EOF or cancellation.
+Other methods do not register or protect POST retry streaks.
 Pruning runs at most once per minute and removes only idle-expired entries outside
 their own budget, with no request in flight.
 Routes preserve the configured stream retry count (default 12), since Codex uses the same counter

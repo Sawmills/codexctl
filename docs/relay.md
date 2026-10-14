@@ -73,14 +73,15 @@ Delays double from 2 s up to 60 s, with jitter. Each Codex thread (`thread-id`
 header) has one failure streak. When a streak spends its budget, the relay passes the
 original failure through and removes any upstream `Retry-After`. Codex then stops, and
 the board resumes the lane. A new streak starts when the error kind changes or on
-the first failure after exhaustion (that request is a resume). With no request
-in flight, a new request arriving 120 s beyond the advised retry time restarts
+the first failure after exhaustion (that request is a resume). With no POST
+in flight, a new POST arriving 120 s beyond the advised retry time restarts
 the streak. Active streaming
 does not count as idle. Elapsed client waits count toward
-exhaustion when the next failure arrives. A request guard protects the thread
-until the response body ends or is dropped; overlapping requests keep that
+exhaustion when the next failure arrives. A POST request guard protects the thread
+until the response body ends or is dropped; overlapping POSTs keep that
 protection until all finish. Idle reset cannot replenish an in-flight streak.
-Global pruning runs at most once per minute on incoming requests. It removes
+Other methods do not register or protect a POST retry streak.
+Global pruning runs at most once per minute on incoming POSTs. It removes
 only streaks outside their own budget, with no request in flight and more than
 an hour of idle time since their latest activity or advised retry time.
 Between sweeps, request tracking and idle reset use keyed lookups.
