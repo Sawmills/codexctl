@@ -12482,6 +12482,7 @@ fn a_nested_plain_codex_uses_its_parent_pinned_server_account() {
     let server = Server::start();
     server.import(&server.amir, "host", "host-login", "host-seat");
     server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    server.import(&server.amir, "other", "other-login", "other-seat");
     let home = server.connected_home();
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
     let unchanged = [
@@ -12525,6 +12526,20 @@ else:
     result = subprocess.run([sys.argv[0], 'nested'], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     print(result.stdout, end='')
+    # Simulate another unpinned shell switching the shared account while this
+    # pinned parent stays alive. The nested child still receives lane-seat.
+    helper = json.loads((pathlib.Path.home() / 'nested-config.json').read_text())
+    unpinned = os.environ.copy()
+    unpinned.pop('CODEXCTL_PINNED_ALIAS', None)
+    unpinned.pop('CODEXCTL_PINNED_CONNECTION', None)
+    for alias in ['other', 'host']:
+        changed = subprocess.run([helper['command'], 'use', alias], env=unpinned, capture_output=True, text=True)
+        assert changed.returncode == 0, changed.stderr
+        pointer = pathlib.Path.home() / '.codexctl/central/.active-account'
+        assert pointer.read_text().strip() == alias
+        result = subprocess.run([sys.argv[0], 'nested'], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+    print('NESTED-PIN-SURVIVES-SWITCH')
 "##).unwrap();
     std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
     let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
@@ -12549,6 +12564,7 @@ else:
         String::from_utf8_lossy(&launched.stderr)
     );
     assert!(String::from_utf8_lossy(&launched.stdout).contains("NESTED-PIN-OK"));
+    assert!(String::from_utf8_lossy(&launched.stdout).contains("NESTED-PIN-SURVIVES-SWITCH"));
     for (path, before) in unchanged.iter().zip(before) {
         assert_eq!(std::fs::read(home.path().join(path)).ok(), before, "{path}");
     }

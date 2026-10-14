@@ -593,6 +593,7 @@ approval; a different connection, an incomplete pin, or an expired launch refuse
 without falling back to the active account. Local pinned homes still cannot use
 remote credentials. The connection variable is a private file path, not a token.
 Children must inherit both variables; removing them loses the server-account pin.
+Existing lanes need a new launch with the upgraded launcher to obtain this context.
 No static `ChatGPT-Account-ID` header is sent:
 the token workspace claim must match the selected account on every helper refresh.
 Billing approval applies only to this launch. SIGHUP and SIGTERM remove its private
