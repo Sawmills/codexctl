@@ -13,6 +13,9 @@ use tokio::{
 #[path = "central_ha_startup_test/dashboard.rs"]
 mod dashboard;
 
+#[path = "central_ha_startup_test/noinit.rs"]
+mod noinit;
+
 struct Pod {
     child: Child,
     root: tempfile::TempDir,
@@ -69,6 +72,9 @@ impl Pod {
         }
         if root.path().join("fast-path").exists() {
             command.env("CODEXCTL_CENTRAL_TOKEN_FAST_PATH", "1");
+        }
+        if root.path().join("vault-fast-path").exists() {
+            command.env("CODEXCTL_CENTRAL_TOKEN_VAULT_FAST_PATH", "1");
         }
         let public_url = std::fs::read_to_string(root.path().join("public-url"))
             .unwrap_or_else(|_| "http://127.0.0.1:8787".to_owned());
@@ -156,6 +162,7 @@ fn command(database: &str, state: &Path, key: &Path, operation: &str) -> Command
         .env("DATABASE_URL", database)
         .env("CODEXCTL_CENTRAL_STORE", "postgres")
         .env("CODEXCTL_CENTRAL_DB_TLS", "0")
+        .env_remove("CODEXCTL_CENTRAL_TOKEN_VAULT_FAST_PATH")
         .env_remove("CODEXCTL_CENTRAL_DUAL_WRITE")
         .env("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY", "0")
         // Synthetic credentials must never reach an external usage service.
@@ -164,12 +171,19 @@ fn command(database: &str, state: &Path, key: &Path, operation: &str) -> Command
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost");
     if operation == "backfill" {
-        command.arg("--scan-exception").arg("b33-a5");
+        let canary = reqwest::Url::parse(database).unwrap().path() == "/codexctl_a5_canary";
+        command
+            .arg("--scan-exception")
+            .arg(if canary { "b33-a5-canary" } else { "b33-a5" });
     }
     command
 }
 
 async fn backfill_test_database(database: &str) -> String {
+    backfill_test_database_named(database, false).await
+}
+
+async fn backfill_test_database_named(database: &str, canary: bool) -> String {
     let mut url = reqwest::Url::parse(database).unwrap();
     assert!(
         matches!(
@@ -182,14 +196,19 @@ async fn backfill_test_database(database: &str) -> String {
         .await
         .unwrap();
     let connection = tokio::spawn(async move { connection.await.unwrap() });
-    if let Err(error) = admin.batch_execute("CREATE DATABASE codexctl_a5").await {
+    let (create, name) = if canary {
+        ("CREATE DATABASE codexctl_a5_canary", "/codexctl_a5_canary")
+    } else {
+        ("CREATE DATABASE codexctl_a5", "/codexctl_a5")
+    };
+    if let Err(error) = admin.batch_execute(create).await {
         assert!(
             error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
                 || error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
         );
     }
     connection.abort();
-    url.set_path("/codexctl_a5");
+    url.set_path(name);
     url.to_string()
 }
 
@@ -1190,6 +1209,7 @@ struct LoginFixture {
     second: Pod,
     http: reqwest::Client,
     token: String,
+    seed_token: Value,
     control: tokio_postgres::Client,
     connection: tokio::task::JoinHandle<()>,
     schema: String,
@@ -1218,6 +1238,16 @@ async fn login_fixture_with_expiry(
     renamed: bool,
     expires: i64,
 ) -> LoginFixture {
+    login_fixture_in_database(legacy, foreign, renamed, expires, false).await
+}
+
+async fn login_fixture_in_database(
+    legacy: bool,
+    foreign: bool,
+    renamed: bool,
+    expires: i64,
+    canary: bool,
+) -> LoginFixture {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(
             std::env::var("CI").ok().as_deref(),
@@ -1226,7 +1256,7 @@ async fn login_fixture_with_expiry(
         );
         panic!("DATABASE_URL required for HA renewal test");
     };
-    let database = backfill_test_database(&database).await;
+    let database = backfill_test_database_named(&database, canary).await;
     let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
         .await
         .unwrap();
@@ -1370,6 +1400,7 @@ async fn login_fixture_with_expiry(
         second,
         http,
         token,
+        seed_token,
         control,
         connection,
         schema,

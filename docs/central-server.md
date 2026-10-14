@@ -820,6 +820,49 @@ Build the standard binaries with `cargo build --release --locked`.
 The central feature is enabled by default.
 `--no-default-features` builds the local account manager without central support.
 
+### Canary token reads without native initialization
+
+In PostgreSQL mode, `CODEXCTL_CENTRAL_TOKEN_VAULT_FAST_PATH=1` lets an isolated
+canary serve a verified, committed vault token with at least one hour remaining
+without starting native initialization or refreshing credentials. It does not
+need `CODEXCTL_CENTRAL_TOKEN_FAST_PATH=1`. Leave it unset on ordinary servers.
+The policy checks PostgreSQL's actual `current_database()` and refuses every
+database except `codexctl_a5_canary`, including the live `codexctl_a5` database.
+File and dual mode do not enable this path. Set it only on the throwaway canary
+Pod, never on the live StatefulSet or the H/I overlays.
+
+The existing fast-path module owns both policies: ordinary requests require
+fresh routing and billing observations; the canary policy reports
+`nativeRoutingSupported: false` and, if requested, `billingClass: "unknown"`
+when that exact revision lacks usable observations. It does not invent routing
+support or billing safety. Current Codex clients refuse unknown routing, so an
+HTTP 200 from this canary is a vault-delivery proof, not native-client acceptance.
+Both the native provider helper and `codexctl-central run` reject false routing.
+Run checks each fetched token before starting its App Server or accepting a
+refresh callback. Ordinary writable servers validate routing before a successful
+token response. An explicitly read-only standalone server returns false routing;
+Run now refuses those unverified credentials too.
+An Unknown billing observation also returns false routing, even when the routing
+observation is fresh, so it cannot reach a client's billing approval path.
+
+Machine authorization, company-user and account identity, login fences, and
+local owner fences still apply. A fence, busy owner, or database read failure
+returns 503 without falling through to native recovery. A rejected revision
+cannot force a valid token to rotate. Tokens inside the one-hour margin, or
+with unknown expiry, retain the existing lease-protected refresh path; the
+committed token is checked again before initialization in case another holder
+already refreshed it.
+Fresh routing or capacity refusals also return 503, preserving positive
+observations instead of replacing them with Unknown billing.
+
+This flag controls the token request path, not other operations that may own
+credentials. Run an isolated canary with background recovery disabled
+(`CODEXCTL_CENTRAL_BACKGROUND_RECOVERY=0`) and do not call account imports,
+relogin, reset, or live catalog endpoints. No cluster manifests enable this flag
+automatically. Restart without it to restore the ordinary token policy.
+
+### Initialize state
+
 Initialize an empty state directory:
 
 ```sh

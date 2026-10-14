@@ -2192,7 +2192,7 @@ impl PostgresStore {
         account_id: &str,
     ) -> Result<Option<super::fast_path::FastRead>> {
         let row = self.client().await?.query_opt(concat!(
-            "SELECT a.user_id,a.alias,a.revision,a.encrypted_vault,",
+            "SELECT current_database() AS database,a.user_id,a.alias,a.revision,a.encrypted_vault,",
             "EXISTS(SELECT 1 FROM central_login_operations WHERE ", login_fence!(), ") AS fenced,",
             "e.auth_revision,e.account_revision,e.routing_supported,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
@@ -2242,6 +2242,7 @@ impl PostgresStore {
             }),
         };
         Ok(Some(super::fast_path::FastRead {
+            database: row.get("database"),
             user_id: row.get("user_id"),
             alias: row.get("alias"),
             revision: row.get("revision"),

@@ -24,10 +24,14 @@ async fn fetch(
     if !response.status().is_success() {
         bail!("broker rejected token request (HTTP {})", response.status());
     }
-    response
+    let token: TokenResponse = response
         .json()
         .await
-        .context("invalid broker token response")
+        .context("invalid broker token response")?;
+    if !token.native_routing_supported {
+        bail!("server has not verified supported workspace routing for the native provider");
+    }
+    Ok(token)
 }
 
 struct TokenHandler {

@@ -421,6 +421,7 @@ fn when_two_clients_refresh_the_same_revision_then_the_owner_rotates_once() {
 #[test]
 fn registered_devices_can_complete_concurrent_local_turns_with_central_refresh() {
     let broker = BrokerTest::start();
+    assert_eq!(broker.grant()["nativeRoutingSupported"], true);
     broker.register_other("amir", "amir");
     let first = broker.run_client(&broker.root.path().join("laptop.token"));
     let second = broker.run_client(&broker.root.path().join("other.token"));
@@ -441,6 +442,44 @@ fn registered_devices_can_complete_concurrent_local_turns_with_central_refresh()
             String::from_utf8(second.stdout).unwrap()
         ),
         (true, "CENTRAL_OK\n".into())
+    );
+}
+
+#[test]
+fn run_refuses_false_routing_before_starting_an_app_server() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let broker = BrokerTest::start_with(&["--read-only"]);
+    let response = broker.token_request(&broker.token, json!({}));
+    assert_eq!(response.status(), 200);
+    let token: Value = response.json().unwrap();
+    assert_eq!(token["nativeRoutingSupported"], false);
+
+    let binary = broker.root.path().join("record-app-server-start");
+    let started = broker.root.path().join("app-server-started");
+    store::atomic_write(
+        &binary,
+        b"#!/bin/sh\n: > \"$CENTRAL_RUN_STARTED\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env("CENTRAL_RUN_STARTED", &started)
+        .args(["run", "--server", &broker.url, "--token-file"])
+        .arg(broker.root.path().join("laptop.token"))
+        .arg("--codex-bin")
+        .arg(binary)
+        .arg("synthetic prompt")
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(!started.exists(), "false routing started an App Server");
+    assert!(
+        String::from_utf8(result.stderr).unwrap().contains(
+            "server has not verified supported workspace routing for the native provider"
+        )
     );
 }
 
