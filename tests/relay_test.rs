@@ -1747,7 +1747,7 @@ async fn fragmented_exhausted_overloads_remove_upstream_retry_advice() {
 #[tokio::test]
 async fn partial_output_does_not_reset_the_overload_budget() {
     let (gate, rx) = mpsc::channel(1);
-    let (closed, _) = oneshot::channel();
+    let (closed, closed_rx) = oneshot::channel();
     let frames = vec![
         CREATED.to_string(),
         REASONING_DELTA.into(),
@@ -1757,6 +1757,9 @@ async fn partial_output_does_not_reset_the_overload_budget() {
         vec![
             Scripted::Sse(frames.clone()),
             Scripted::Gated(frames.clone(), rx, closed),
+            Scripted::Sse(frames.clone()),
+            Scripted::Sse(frames.clone()),
+            Scripted::Sse(frames.clone()),
         ],
         |config| config.with_budgets(Duration::from_secs(180), Duration::from_secs(2)),
     )
@@ -1767,19 +1770,39 @@ async fn partial_output_does_not_reset_the_overload_budget() {
     let mut reply = stream.next().await.unwrap().unwrap().to_vec();
     gate.send(()).await.unwrap();
     reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
-    // The retry arrived promptly and is still streaming. Its eventual failure
-    // must exhaust the old budget rather than treating streaming time as idle.
+    // The retry arrived promptly and is still streaming. Another request on
+    // this thread must not mistake the active response for an idle turn.
     tokio::time::sleep(Duration::from_secs(123)).await;
-    gate.send(()).await.unwrap();
-    reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
+    let exhausted = h.post("same-turn-budget").await.text().await.unwrap();
+    assert_eq!(
+        exhausted,
+        frames.concat(),
+        "the active response must protect the original budget during an overlapping request"
+    );
+    assert_eq!(
+        String::from_utf8(reply).unwrap(),
+        format!("{CREATED}{REASONING_DELTA}")
+    );
     drop(stream);
-    let exhausted = String::from_utf8(reply).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let resumed = h.post("same-turn-budget").await.text().await.unwrap();
     assert!(
-        exhausted == frames.concat(),
-        "budget exhaustion must deliver the original terminal failure"
+        failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "after the active response is dropped a resumed turn can receive fresh advice"
+    );
+    // The resumed streak has not exhausted. Unlike the preceding assertion,
+    // this idle reset can succeed only if the streamed-body guards were released.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let after_idle = h.post("same-turn-budget").await.text().await.unwrap();
+    assert!(
+        failed_event(&after_idle)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "cancellation and EOF must release protection so a non-exhausted idle streak resets"
     );
     let metrics = h.metrics().await;
-    assert_eq!(metric(&metrics, "outcome=\"advised\""), 1);
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 3);
     assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 1);
     assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0);
 }

@@ -367,6 +367,11 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (parts, body) = request.into_parts();
+    let thread = header_str(&parts.headers, "thread-id")
+        .or_else(|| header_str(&parts.headers, "session-id"))
+        .unwrap_or("unknown")
+        .to_owned();
+    let guard = policy::RequestGuard::new(&relay.streaks, &thread, requested_at);
     // Stream the request; keep only a bounded prefix for the model label.
     let mut body = body.into_data_stream();
     let mut head: Vec<Bytes> = Vec::new();
@@ -385,10 +390,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
     let labels = Labels {
         account_alias: header_str(&parts.headers, "x-codexctl-account-alias")
             .and_then(evidence::alias),
-        thread: header_str(&parts.headers, "thread-id")
-            .or_else(|| header_str(&parts.headers, "session-id"))
-            .unwrap_or("unknown")
-            .to_owned(),
+        thread,
         model: relay.model_label(&parts.headers, &prefix[..prefix.len().min(MODEL_PREFIX)]),
         account_class: match header_str(&parts.headers, ACCOUNT_CLASS_HEADER) {
             Some("included") => "included",
@@ -396,13 +398,6 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             _ => "unknown",
         },
     };
-    if parts.method == Method::POST {
-        relay
-            .streaks
-            .lock()
-            .expect("streak lock")
-            .request(&labels.thread, requested_at);
-    }
     let mut headers = parts.headers;
     // Content-Length stays: the streamed body is byte for byte the same.
     for name in [
@@ -445,42 +440,49 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         request_id: request_id.as_deref(),
         observation: evidence::Observation::Headers,
     });
-    if status == StatusCode::TOO_MANY_REQUESTS && parts.method == Method::POST {
-        return relay
+    let response = if status == StatusCode::TOO_MANY_REQUESTS && parts.method == Method::POST {
+        relay
             .rate_limited(upstream, headers, labels, request_id)
-            .await;
-    }
-    if (status.is_client_error() || status.is_server_error()) && is_responses {
-        return relay
+            .await
+    } else if (status.is_client_error() || status.is_server_error()) && is_responses {
+        relay
             .http_error(upstream, headers, labels, request_id, status, headers_at)
-            .await;
-    }
-    let is_stream = status.is_success()
-        && header_str(&headers, "content-type").is_some_and(|t| t.starts_with("text/event-stream"))
-        && headers.get("content-encoding").is_none();
-    let mut builder = Response::builder().status(status);
-    if is_stream {
-        headers.remove("content-length");
-        let frame_headers = headers.clone();
-        *builder.headers_mut().expect("fresh builder") = headers;
-        let frames = FrameRewriter::new(
-            relay,
-            labels,
-            request_id,
-            frame_headers,
-            headers_at,
-            is_responses,
-            status.as_u16(),
-        );
-        builder
-            .body(Body::from_stream(frames.wrap(upstream.bytes_stream())))
-            .expect("valid response parts")
+            .await
     } else {
-        *builder.headers_mut().expect("fresh builder") = headers;
-        builder
-            .body(Body::from_stream(upstream.bytes_stream()))
-            .expect("valid response parts")
-    }
+        let is_stream = status.is_success()
+            && header_str(&headers, "content-type")
+                .is_some_and(|t| t.starts_with("text/event-stream"))
+            && headers.get("content-encoding").is_none();
+        let mut builder = Response::builder().status(status);
+        if is_stream {
+            headers.remove("content-length");
+            let frame_headers = headers.clone();
+            *builder.headers_mut().expect("fresh builder") = headers;
+            let frames = FrameRewriter::new(
+                relay,
+                labels,
+                request_id,
+                frame_headers,
+                headers_at,
+                is_responses,
+                status.as_u16(),
+            );
+            builder
+                .body(Body::from_stream(frames.wrap(upstream.bytes_stream())))
+                .expect("valid response parts")
+        } else {
+            *builder.headers_mut().expect("fresh builder") = headers;
+            builder
+                .body(Body::from_stream(upstream.bytes_stream()))
+                .expect("valid response parts")
+        }
+    };
+    let (parts, body) = response.into_parts();
+    let body = futures::stream::unfold(
+        (body.into_data_stream(), guard),
+        |(mut body, guard)| async move { body.next().await.map(|chunk| (chunk, (body, guard))) },
+    );
+    Response::from_parts(parts, Body::from_stream(body))
 }
 
 impl Relay {

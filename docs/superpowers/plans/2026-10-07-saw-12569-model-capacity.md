@@ -17,9 +17,12 @@ delay and retries the same turn from history, retaining completed tool calls;
 the relay performs no replay. Only `response.completed` counts as recovery.
 A different terminal failure ends a prior streak without a recovery metric; partial
 output does not reset or pause the elapsed-time budget.
-All streaks reset when a new request arrives 120 seconds beyond the advised retry
-time; active streaming is not idle. Routes preserve
-the configured stream retry count (default 12), since Codex uses the same counter
+With no request in flight, a new request arriving 120 seconds beyond the advised
+retry time resets the streak; active streaming is not idle.
+Request guards retain in-flight streaks through response EOF or cancellation.
+Pruning runs at most once per minute and removes only idle-expired entries outside
+their own budget, with no request in flight.
+Routes preserve the configured stream retry count (default 12), since Codex uses the same counter
 with uncapped exponential backoff for other stream errors.
 Failure and unclassified frames stay in bounded memory until finalization, with
 metadata-only normalization beyond 1 MiB. Exhaustion removes upstream advice.
