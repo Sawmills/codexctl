@@ -7,6 +7,30 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+const PINNED_CONNECTION_ENV: &str = "CODEXCTL_PINNED_CONNECTION";
+
+/// A nested plain Codex uses the shared provider's helper, so carry the private
+/// connection separately from the outer Codex command's config overrides.
+pub(super) fn inherited_connection() -> Result<Option<PathBuf>> {
+    let Some(path) = std::env::var_os(PINNED_CONNECTION_ENV) else {
+        return Ok(None);
+    };
+    if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_none()
+        || std::env::var_os("CODEX_HOME").is_some()
+    {
+        bail!("remote credentials cannot be supplied without a matching server launch pin");
+    }
+    let path = PathBuf::from(path);
+    if path
+        .file_name()
+        .is_none_or(|name| name != "connection.json")
+        || path.parent().and_then(Path::parent) != Some(root()?.join("lanes").as_path())
+    {
+        bail!("pinned connection is not a private server launch");
+    }
+    Ok(Some(path))
+}
+
 // This exclusive lock serializes directory creation and sweeping independently
 // of the mode lease: other live server lanes must be able to keep running.
 pub(crate) fn sweep_stale_launches() -> Result<()> {
@@ -252,6 +276,22 @@ impl Drop for PinnedLaunch {
 }
 
 impl PinnedLaunch {
+    fn child_command(&self) -> Result<std::process::Command> {
+        let directory = self
+            .prepared
+            .as_ref()
+            .context("launch is no longer active")?;
+        let mut command = std::process::Command::new("codex");
+        command
+            .args(self.codex_args())
+            .env("CODEXCTL_PINNED_ALIAS", self.alias())
+            .env(
+                PINNED_CONNECTION_ENV,
+                directory.path().join("connection.json"),
+            );
+        Ok(command)
+    }
+
     pub fn alias(&self) -> &str {
         &self.alias
     }
@@ -298,11 +338,9 @@ impl PinnedLaunch {
             .write(true)
             .custom_flags(libc::O_NOCTTY)
             .open(slave)?;
-        let mut command = std::process::Command::new("codex");
+        let mut command = self.child_command()?;
         command
-            .args(self.codex_args())
             .args(pinned_arguments(args)?)
-            .env("CODEXCTL_PINNED_ALIAS", self.alias())
             .current_dir(cwd)
             .stdin(tty.try_clone()?)
             .stdout(tty.try_clone()?)
@@ -548,11 +586,8 @@ fn prepare_pinned_codex(
 pub fn run_pinned_codex(alias: &str, args: &[String], allow_billing: bool) -> Result<i32> {
     let args = pinned_arguments(args)?;
     let launch = prepare_pinned_codex(alias, allow_billing, false)?;
-    let mut command = std::process::Command::new("codex");
-    command
-        .args(launch.codex_args())
-        .args(args)
-        .env("CODEXCTL_PINNED_ALIAS", launch.alias());
+    let mut command = launch.child_command()?;
+    command.args(args);
     let signal = launch.received_signal();
     if signal != 0 {
         launch.close()?;

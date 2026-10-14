@@ -585,7 +585,15 @@ codexctl codex --account team --allow-billing resume <session-id>
 The launcher gives the child a private connection and explicit provider/token-helper
 arguments. It preserves the working directory and resumed session; the host's
 configuration, active pointer, and auth file stay unchanged. Later `codexctl use`
-switches do not move this session. No static `ChatGPT-Account-ID` header is sent:
+switches do not move this session. Nested plain `codex` processes inherit
+`CODEXCTL_PINNED_ALIAS` and `CODEXCTL_PINNED_CONNECTION`. When they use the shared
+provider's `central-token --active` helper, it serves the private launch connection
+instead of reading the active pointer. The helper checks the alias and live launch
+approval; a different connection, an incomplete pin, or an expired launch refuses
+without falling back to the active account. Local pinned homes still cannot use
+remote credentials. The connection variable is a private file path, not a token.
+Children must inherit both variables; removing them loses the server-account pin.
+No static `ChatGPT-Account-ID` header is sent:
 the token workspace claim must match the selected account on every helper refresh.
 Billing approval applies only to this launch. SIGHUP and SIGTERM remove its private
 connection before forwarding the signal to Codex; an unresponsive child is killed

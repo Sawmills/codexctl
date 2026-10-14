@@ -1218,6 +1218,11 @@ fn token_needs_refresh(path: &Path, connection: &Connection) -> Result<bool> {
 }
 
 pub fn print_token(path: &Path) -> Result<()> {
+    if let Some(pinned) = launch::inherited_connection()?
+        && pinned != path
+    {
+        bail!("remote credentials cannot be supplied from another pinned connection");
+    }
     let directory = connection_lock_directory(path, &root()?)?;
     let directory = directory.as_path();
     let connection = {
@@ -1243,6 +1248,9 @@ pub fn print_token(path: &Path) -> Result<()> {
     finish_token(path, &connection, token, None)
 }
 pub fn print_active_token() -> Result<()> {
+    if let Some(path) = launch::inherited_connection()? {
+        return print_token(&path);
+    }
     if std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some() {
         bail!("remote credentials cannot be supplied to a pinned local launch");
     }

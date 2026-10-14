@@ -12477,6 +12477,84 @@ print('RELAY-PRIVATE-AUTH-OK')
 }
 
 #[test]
+fn a_nested_plain_codex_uses_its_parent_pinned_server_account() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let unchanged = [
+        ".codex/config.toml",
+        ".codex/auth.json",
+        ".codexctl/central/.native-active.json",
+        ".codexctl/central/.active-account",
+    ];
+    let before: Vec<_> = unchanged
+        .iter()
+        .map(|path| std::fs::read(home.path().join(path)).ok())
+        .collect();
+    let shared_config: toml_edit::DocumentMut =
+        std::fs::read_to_string(home.path().join(".codex/config.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+    let helper = &shared_config["model_providers"]["codexctl-central"]["auth"];
+    let shared_helper = json!({
+        "command": helper["command"].as_str().unwrap(),
+        "args": helper["args"].as_array().unwrap().iter()
+            .map(|arg| arg.as_str().unwrap()).collect::<Vec<_>>()
+    });
+    store::atomic_write(
+        &home.path().join("nested-config.json"),
+        &serde_json::to_vec(&shared_helper).unwrap(),
+    )
+    .unwrap();
+    let bin = home.path().join("bin");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import base64, json, os, pathlib, subprocess, sys
+if sys.argv[1:] == ['nested']:
+    helper = json.loads((pathlib.Path.home() / 'nested-config.json').read_text())
+    result = subprocess.run([helper['command']] + helper['args'], capture_output=True, text=True)
+    assert result.returncode == 0, 'nested token helper refused: ' + result.stderr
+    payload = result.stdout.strip().split('.')[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+    assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat', 'nested child escaped its account pin'
+    print('NESTED-PIN-OK')
+else:
+    result = subprocess.run([sys.argv[0], 'nested'], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    print(result.stdout, end='')
+"##).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["codex", "--account", "lane", "exec", "synthetic prompt"])
+        .env("HOME", home.path())
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        launched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    assert!(String::from_utf8_lossy(&launched.stdout).contains("NESTED-PIN-OK"));
+    for (path, before) in unchanged.iter().zip(before) {
+        assert_eq!(std::fs::read(home.path().join(path)).ok(), before, "{path}");
+    }
+}
+
+#[test]
 fn b21_lane_account_launch_pins_one_child_without_switching_the_host() {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();
@@ -12517,7 +12595,7 @@ payload = token.stdout.strip().split('.')[1]
 claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
 assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat'
 active = subprocess.run([helper_command, 'central-token', '--active'], capture_output=True)
-assert active.returncode == 1
+assert active.returncode == 0 and active.stdout == token.stdout.encode(), active.stderr
 pathlib.Path(os.environ['B21_MODE']).write_text('exhausted-weekly')
 # Exercise a new native billing observation beyond the recent-token guard.
 clock = pathlib.Path(os.environ['B21_MODE']).with_name('retry-clock')
@@ -13010,6 +13088,99 @@ impl Drop for B21Lane {
             libc::kill(self.child_pid, libc::SIGKILL);
         }
     }
+}
+
+#[test]
+fn nested_helpers_refuse_mismatched_and_expired_server_launch_pins() {
+    let server = Server::start();
+    server.import(&server.amir, "host", "host-login", "host-seat");
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let mut first = B21Lane::start(home.path(), "first");
+    let mut second = B21Lane::start(home.path(), "second");
+    let helper =
+        |args: &[&str], alias: Option<&str>, pin: Option<&std::path::Path>, local: bool| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+            command
+                .args(args)
+                .env("HOME", home.path())
+                .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+                .env_remove("CODEX_HOME")
+                .env_remove("CODEXCTL_PINNED_ALIAS")
+                .env_remove("CODEXCTL_PINNED_CONNECTION");
+            if let Some(alias) = alias {
+                command.env("CODEXCTL_PINNED_ALIAS", alias);
+            }
+            if let Some(pin) = pin {
+                command.env("CODEXCTL_PINNED_CONNECTION", pin);
+            }
+            if local {
+                command.env("CODEX_HOME", home.path().join("local-home"));
+            }
+            command.output().unwrap()
+        };
+    let active = ["central-token", "--active"];
+    let token = helper(&active, Some("lane"), Some(&first.connection), false);
+    assert!(
+        token.status.success(),
+        "{}",
+        String::from_utf8_lossy(&token.stderr)
+    );
+    let claims: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(
+                std::str::from_utf8(&token.stdout)
+                    .unwrap()
+                    .trim()
+                    .split('.')
+                    .nth(1)
+                    .unwrap(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        claims["https://api.openai.com/auth"]["chatgpt_account_id"],
+        "lane-seat"
+    );
+    let missing = first.connection.with_file_name("missing.json");
+    for (alias, pin, local) in [
+        (Some("host"), Some(first.connection.as_path()), false),
+        (None, Some(first.connection.as_path()), false),
+        (Some("lane"), None, false),
+        (Some("lane"), Some(missing.as_path()), false),
+        (Some("lane"), Some(first.connection.as_path()), true),
+    ] {
+        let refused = helper(&active, alias, pin, local);
+        assert!(
+            !refused.status.success(),
+            "invalid pin returned credentials"
+        );
+        assert!(refused.stdout.is_empty(), "invalid pin printed credentials");
+    }
+    // Even another live launch of this alias has its own consent and lifetime.
+    let refused = helper(
+        &[
+            "central-token",
+            "--connection",
+            second.connection.to_str().unwrap(),
+        ],
+        Some("lane"),
+        Some(&first.connection),
+        false,
+    );
+    assert!(!refused.status.success());
+    assert!(refused.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("another pinned connection"));
+    assert_eq!(first.signal_and_wait(libc::SIGTERM).code(), Some(143));
+    let refused = helper(&active, Some("lane"), Some(&first.connection), false);
+    assert!(
+        !refused.status.success(),
+        "expired pin used the active account"
+    );
+    assert!(refused.stdout.is_empty());
+    assert_eq!(second.signal_and_wait(libc::SIGTERM).code(), Some(143));
 }
 
 #[test]
