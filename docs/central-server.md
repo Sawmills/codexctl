@@ -837,6 +837,11 @@ fresh routing and billing observations; the canary policy reports
 when that exact revision lacks usable observations. It does not invent routing
 support or billing safety. Current Codex clients refuse unknown routing, so an
 HTTP 200 from this canary is a vault-delivery proof, not native-client acceptance.
+Both the native provider helper and `codexctl-central run` reject false routing.
+Run checks each fetched token before starting its App Server or accepting a
+refresh callback. Ordinary writable servers validate routing before a successful
+token response. An explicitly read-only standalone server returns false routing;
+Run now refuses those unverified credentials too.
 An Unknown billing observation also returns false routing, even when the routing
 observation is fresh, so it cannot reach a client's billing approval path.
 

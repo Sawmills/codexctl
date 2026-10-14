@@ -29,10 +29,11 @@ Other Codex processes must not retain the same refresh token.
 The prototype does not remove or revoke existing copies.
 A dedicated server login is the safer input for a real deployment.
 
-For a compatibility experiment with an existing fresh login, use `serve --read-only`.
-This mode issues the current access token but refuses refresh.
-It starts no central Codex owner process, so that process cannot rotate the imported login.
-It does not prove that the server can maintain a live login over time.
+`serve --read-only` can inspect vault token delivery but cannot verify native routing.
+It issues the current access token with routing marked unsupported and refuses refresh.
+Both native clients refuse these credentials before starting Codex.
+It starts no central Codex owner process and cannot prove live login maintenance.
+Use the dedicated-login [native TUI workflow](#native-tui-workflow) for authorized live acceptance.
 
 Keep the key file separate from server state and encrypted backups.
 The key destination must be a new file.
@@ -139,23 +140,16 @@ The authenticated `/metrics` endpoint counts failed broker requests by reason.
 Structured failure logs include operation, stage, reason, and HTTP status.
 No monitoring collector, alert rule, or notification route exists in this local prototype.
 
-## Live End-to-End Experiment
+## Retired Read-Only Experiment
 
-```sh
-CODEXCTL_ALLOW_INSECURE_LOOPBACK=1 python3 tests/central_live_e2e.py \
-  --binary target/debug/codexctl-central \
-  --auth /absolute/path/to/fresh/auth.json
-```
+The former `tests/central_live_e2e.py` experiment has been removed. It copied a
+login into a read-only broker and ran two native clients without establishing
+workspace routing support. Run now refuses that broker's false-routing response
+before starting its App Server.
 
-This experiment imports a fresh login into a temporary encrypted vault.
-It starts a real broker and two real local Codex clients at the same time.
-It requires two exact model replies and unchanged source credentials.
-Live refresh stays disabled to protect the original login.
-The temporary broker, key, device secrets, and runtime directories are removed afterward.
-The experiment uses included account quota and needs a usable account with enough quota.
-It exercises two independent client processes on one physical machine.
-This earlier experiment does not cover a second machine or live refresh.
-The native workflow tests below cover those cases with a dedicated login.
+For authorized live acceptance, use the [native TUI workflow](#native-tui-workflow)
+below with a dedicated broker-owned login. That workflow covers native routing
+and refresh ownership.
 
 ## Sources
 
@@ -198,7 +192,7 @@ It refuses a default Codex profile that overrides the provider.
 It preserves the local login file and unrelated configuration.
 The provider supports the global ChatGPT Codex endpoint with the assigned account header.
 Regional routes and missing routing evidence refuse native activation or token delivery.
-Read-only mode supports only the earlier App Server client because it cannot verify native routing.
+Read-only mode cannot verify native routing, so both native clients refuse its credentials.
 Codex shows a custom provider instead of the standard ChatGPT account display.
 This prototype has no remote account availability ranking.
 Switching to a local profile restores the previous provider before swapping its login.
