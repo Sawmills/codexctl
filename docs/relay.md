@@ -185,7 +185,8 @@ follow-up server API change; this release keeps the observation local to the rel
 Private daily JSONL files retain the current UTC day and six previous days, with a
 4 MiB limit per day and a 256-record write queue. Request records stop at 3 MiB,
 reserving the last 1 MiB for later failures. A separate worker writes files;
-disk errors or a full queue do not delay response delivery. Records include UTC
+the same worker prunes expired files at startup and once per minute even when no
+response arrives. Disk errors or a full queue do not delay response delivery. Records include UTC
 hour, actual HTTP status, bounded error code, validated retry headers, known
 model, validated account alias, account class, and a sanitized request ID when
 available. HTTP 429 records also keep the relay's rate/terminal decision, so
@@ -201,10 +202,14 @@ codexctl relay evidence --json
 Counts distinguish requests, overloads, rate limits and other failures. They cover
 only valid retained records. A torn append does not prevent reports: both output
 formats warn on stderr with the number of damaged lines excluded from counts.
+The writer separates an unterminated crash tail before the next record, so that
+new observation remains readable.
 The warning never prints record contents. Non-regular files and oversized files
 still fail the report. `codexctl_relay_evidence_dropped_total{reason}` reports
 `queue_full`, `io`, and `daily_limit` losses. This metric has no dedicated alert;
-the existing exhausted-capacity alerts below remain unchanged. No notification
+`codexctl_relay_evidence_maintenance_failures_total` counts failed expiry passes,
+with a bounded local failure log. It has no dedicated alert either. The existing
+exhausted-capacity alerts below remain unchanged. No notification
 delivery was tested for this change.
 
 The devbox routing proof used one healthy turn on a pinned subscription account.

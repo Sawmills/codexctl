@@ -561,6 +561,116 @@ fn evidence_report_counts_valid_records_after_a_torn_append() {
 }
 
 #[tokio::test]
+async fn evidence_expiry_runs_at_startup_and_while_the_relay_is_idle() {
+    let directory = tempfile::tempdir().unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let expired = directory
+        .path()
+        .join(format!("{}.jsonl", today - chrono::Duration::days(7)));
+    let retained = directory
+        .path()
+        // Stay inside the seven-day window if UTC rolls over during the wait.
+        .join(format!("{}.jsonl", today - chrono::Duration::days(5)));
+    std::fs::write(&expired, b"").unwrap();
+    std::fs::write(&retained, b"").unwrap();
+    let h = harness_with(vec![], |config| config.with_evidence_dir(directory.path())).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while expired.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup must prune expired evidence without any response");
+    assert!(retained.exists());
+    // No response/append occurs. Maintenance must also run after startup.
+    std::fs::write(&expired, b"").unwrap();
+    tokio::time::timeout(Duration::from_secs(65), async {
+        while expired.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle maintenance must prune expired evidence within one minute");
+    assert!(retained.exists());
+    assert!(h.upstream.seen.lock().unwrap().bodies.is_empty());
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_evidence_maintenance_failures_total 0")
+    );
+}
+
+#[tokio::test]
+async fn failed_evidence_maintenance_is_visible_without_a_dropped_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    // Reject a non-file writer lock during the startup expiry pass.
+    std::fs::create_dir(directory.path().join(".write.lock")).unwrap();
+    let h = harness_with(vec![], |config| config.with_evidence_dir(directory.path())).await;
+    let metrics = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let metrics = h.metrics().await;
+            if metrics.contains("codexctl_relay_evidence_maintenance_failures_total 1") {
+                break metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed startup maintenance must expose its own failure counter");
+    assert!(metrics.contains("codexctl_relay_evidence_dropped_total{reason=\"io\"} 0"));
+    assert!(h.upstream.seen.lock().unwrap().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn evidence_keeps_the_first_observation_after_an_unterminated_tail() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    std::fs::write(&path, b"{\"utc_hour\":").unwrap();
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| config.with_evidence_dir(&directory),
+    )
+    .await;
+    h.post("evidence-after-crash").await.text().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&path).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .is_ok_and(|row| row["observation"] == "failure")
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        rows[0]["requests"], 1,
+        "the first append after restart must remain a separate valid record"
+    );
+    assert_eq!(rows[0]["rate_429"], 1);
+    assert!(String::from_utf8_lossy(&report.stderr).contains("skipped 1 invalid record"));
+}
+
+#[tokio::test]
 async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
     let home = tempfile::tempdir().unwrap();
     let directory = home.path().join(".codexctl/relay/evidence");

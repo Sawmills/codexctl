@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::{
     collections::BTreeMap,
     fs::OpenOptions,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -41,6 +41,7 @@ struct Record {
 pub(super) struct Evidence {
     sender: Option<mpsc::Sender<Record>>,
     dropped: Arc<[AtomicU64; 3]>,
+    maintenance_failed: Arc<AtomicU64>,
 }
 
 impl Evidence {
@@ -48,11 +49,13 @@ impl Evidence {
         directory: Option<PathBuf>,
     ) -> Result<(Self, Option<tokio::task::JoinHandle<()>>)> {
         let dropped = Arc::new([const { AtomicU64::new(0) }; 3]);
+        let maintenance_failed = Arc::new(AtomicU64::new(0));
         let Some(directory) = directory else {
             return Ok((
                 Self {
                     sender: None,
                     dropped,
+                    maintenance_failed,
                 },
                 None,
             ));
@@ -60,8 +63,29 @@ impl Evidence {
         crate::store::ensure_private_dir(&directory)?;
         let (sender, mut receiver) = mpsc::channel::<Record>(256);
         let errors = dropped.clone();
+        let maintenance_errors = maintenance_failed.clone();
         let worker = tokio::spawn(async move {
-            while let Some(record) = receiver.recv().await {
+            let mut maintenance = tokio::time::interval(std::time::Duration::from_secs(60));
+            maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let record = tokio::select! {
+                    // The first tick is immediate; later ticks prune even when
+                    // no response arrives. The worker owns both write paths.
+                    _ = maintenance.tick() => {
+                        let directory = directory.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let _lock = writer_lock(&directory)?;
+                            prune(&directory, Utc::now().date_naive())
+                        }).await;
+                        if !matches!(result, Ok(Ok(()))) {
+                            maintenance_errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("relay evidence maintenance failed reason=io");
+                        }
+                        continue;
+                    }
+                    record = receiver.recv() => record,
+                };
+                let Some(record) = record else { break };
                 let directory = directory.clone();
                 let result = tokio::task::spawn_blocking(move || append(&directory, &record)).await;
                 let reason = match result {
@@ -77,6 +101,7 @@ impl Evidence {
             Self {
                 sender: Some(sender),
                 dropped,
+                maintenance_failed,
             },
             Some(worker),
         ))
@@ -152,6 +177,10 @@ impl Evidence {
                 count.load(Ordering::Relaxed)
             ));
         }
+        text.push_str(&format!(
+            "# TYPE codexctl_relay_evidence_maintenance_failures_total counter\ncodexctl_relay_evidence_maintenance_failures_total {}\n",
+            self.maintenance_failed.load(Ordering::Relaxed)
+        ));
         text
     }
 }
@@ -230,7 +259,7 @@ fn day(path: &Path) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(path.file_stem()?.to_str()?, "%Y-%m-%d").ok()
 }
 
-fn append(directory: &Path, record: &Record) -> Result<bool> {
+fn writer_lock(directory: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let lock = OpenOptions::new()
         .create(true)
@@ -243,17 +272,34 @@ fn append(directory: &Path, record: &Record) -> Result<bool> {
         bail!("relay evidence lock must be a regular file");
     }
     lock.try_lock().context("relay evidence is busy")?;
-    let today = Utc::now().date_naive();
+    Ok(lock)
+}
+
+fn prune(directory: &Path, today: NaiveDate) -> Result<()> {
     let earliest = today - chrono::Duration::days(RETAIN_DAYS - 1);
+    let mut removed = false;
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
         if day(&path).is_some_and(|day| day < earliest) {
             std::fs::remove_file(path)?;
+            removed = true;
         }
     }
+    if removed {
+        std::fs::File::open(directory)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn append(directory: &Path, record: &Record) -> Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _lock = writer_lock(directory)?;
+    let today = Utc::now().date_naive();
+    prune(directory, today)?;
     let path = directory.join(format!("{today}.jsonl"));
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -261,14 +307,24 @@ fn append(directory: &Path, record: &Record) -> Result<bool> {
     if !file.metadata()?.is_file() {
         bail!("relay evidence must be a regular file");
     }
+    let length = file.metadata()?.len();
+    let mut last = *b"\n";
+    if length != 0 {
+        file.seek(SeekFrom::End(-1))?;
+        file.read_exact(&mut last)?;
+    }
     let mut bytes = serde_json::to_vec(record)?;
     bytes.push(b'\n');
+    if last[0] != b'\n' {
+        // Separate a crash-left fragment so the next observation survives.
+        bytes.insert(0, b'\n');
+    }
     let limit = if record.observation == "headers" {
         REQUEST_BYTES
     } else {
         DAILY_BYTES
     };
-    if file.metadata()?.len().saturating_add(bytes.len() as u64) > limit {
+    if length.saturating_add(bytes.len() as u64) > limit {
         return Ok(false);
     }
     file.write_all(&bytes)?;
