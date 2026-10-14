@@ -3941,7 +3941,47 @@ async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lea
         ))
         .await
         .unwrap();
-    let delivered = timeout(Duration::from_secs(40), async {
+    // Keep vault persistence unavailable until the second scheduled renewal.
+    // Publication cannot supply the second attempt while the synthetic key is missing.
+    let key_bytes = std::fs::read(&f.key).unwrap();
+    std::fs::remove_file(&f.key).unwrap();
+    let scheduled_retry = timeout(Duration::from_secs(65), async {
+        loop {
+            let retried: bool = f
+                .control
+                .query_one(
+                    &format!(
+                        "SELECT is_called AND last_value >= 2 FROM {}.live_renew_attempts",
+                        f.schema
+                    ),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if retried {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let stopped_before_publication = unsafe { libc::kill(pid, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+    let waiting_status = request(&f.http, &f.second, &f.token).await.status();
+    let waiting_launches = f.second.launches();
+    store::atomic_write(&f.key, &key_bytes).unwrap();
+    assert_eq!(
+        waiting_status, 503,
+        "retain the lease until the stopped child's journal can be persisted"
+    );
+    assert_eq!(waiting_launches, 0);
+    scheduled_retry.expect("a transient renewal-query error must not stop the scheduled renewer");
+    assert!(
+        stopped_before_publication,
+        "confirm child death before final publication"
+    );
+    let delivered = timeout(Duration::from_secs(10), async {
         loop {
             let response = request(&f.http, &f.second, &f.token).await;
             if response.status() == 200 {
@@ -3975,22 +4015,6 @@ async fn postgres_hung_native_child_is_killed_before_journal_publication_and_lea
         "publish the killed child's final journal"
     );
     assert_eq!(delivered["billingClass"], "rate_limited");
-    let retried: bool = f
-        .control
-        .query_one(
-            &format!(
-                "SELECT is_called AND last_value >= 2 FROM {}.live_renew_attempts",
-                f.schema
-            ),
-            &[],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert!(
-        retried,
-        "a renewal-query error must not strand settlement or publication"
-    );
     let metrics = f
         .http
         .get(format!("{}/metrics", f.first.url))
