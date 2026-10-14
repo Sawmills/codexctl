@@ -8,7 +8,11 @@
 //! (and removes any upstream advice) so Codex stops and the board takes over.
 
 pub mod cli;
+mod evidence;
 mod policy;
+mod routing;
+
+pub(crate) use routing::{central_provider, configure as configure_central_route};
 
 use std::{
     collections::BTreeMap,
@@ -64,6 +68,7 @@ const STREAM_FAILURE_LOG_LIMIT: u64 = 30;
 const STREAM_FAILURE_LOG_WINDOW: Duration = Duration::from_secs(60);
 const MAX_FAILURE_BODY: usize = 64 * 1024;
 const MAX_PENDING_FRAME_BYTES: usize = 64 * 1024;
+const MAX_HELD_FAILURE_BYTES: usize = 1024 * 1024;
 const MAX_PARTIAL_FAILURE_INSPECTION: usize = 256;
 const MAX_TYPE_COUNTS: usize = 64;
 const MAX_ERROR_KEYS: usize = 32;
@@ -76,6 +81,7 @@ pub struct RelayConfig {
     overloaded_budget: Duration,
     log: Log,
     central: Option<CentralReporter>,
+    evidence_dir: Option<std::path::PathBuf>,
 }
 
 impl RelayConfig {
@@ -96,6 +102,7 @@ impl RelayConfig {
             overloaded_budget: DEFAULT_OVERLOADED_BUDGET,
             log: Arc::new(|line| eprintln!("{line}")),
             central: None,
+            evidence_dir: None,
         })
     }
 
@@ -103,6 +110,12 @@ impl RelayConfig {
     pub fn with_budgets(mut self, rate: Duration, overloaded: Duration) -> Self {
         self.rate_budget = rate;
         self.overloaded_budget = overloaded;
+        self
+    }
+
+    /// Retain bounded, sanitized request evidence for seven UTC days.
+    pub fn with_evidence_dir(mut self, directory: impl Into<std::path::PathBuf>) -> Self {
+        self.evidence_dir = Some(directory.into());
         self
     }
 
@@ -213,6 +226,7 @@ struct Relay {
     log: Log,
     central_events: Option<mpsc::Sender<CapacityEvent>>,
     central_dropped: Arc<Mutex<BTreeMap<&'static str, u64>>>,
+    evidence: evidence::Evidence,
 }
 
 struct StreamFailureLogState {
@@ -280,6 +294,7 @@ pub async fn serve(
     } else {
         (None, None)
     };
+    let (evidence, evidence_worker) = evidence::Evidence::start(config.evidence_dir)?;
     let relay = Relay {
         upstream: config.upstream.into(),
         client,
@@ -293,6 +308,7 @@ pub async fn serve(
         log: config.log,
         central_events,
         central_dropped,
+        evidence,
     };
     let suppression_relay = relay.clone();
     let suppression_task = tokio::spawn(async move {
@@ -314,6 +330,14 @@ pub async fn serve(
         .context("relay stopped")?;
     suppression_task.abort();
     let _ = suppression_task.await;
+    if let Some(mut worker) = evidence_worker
+        && tokio::time::timeout(Duration::from_secs(2), &mut worker)
+            .await
+            .is_err()
+    {
+        worker.abort();
+        let _ = worker.await;
+    }
     if let Some(worker) = central_worker {
         // Capacity reporting is best effort. Do not hold relay shutdown on a
         // slow or unreachable central server while draining the queue.
@@ -327,9 +351,11 @@ struct Labels {
     thread: String,
     model: String,
     account_class: &'static str,
+    account_alias: Option<String>,
 }
 
 async fn forward(State(relay): State<Relay>, request: Request) -> Response {
+    let requested_at = Instant::now();
     let path = request
         .uri()
         .path_and_query()
@@ -341,6 +367,12 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
     let (parts, body) = request.into_parts();
+    let thread = header_str(&parts.headers, "thread-id")
+        .or_else(|| header_str(&parts.headers, "session-id"))
+        .unwrap_or("unknown")
+        .to_owned();
+    let guard = (parts.method == Method::POST)
+        .then(|| policy::RequestGuard::new(&relay.streaks, &thread, requested_at));
     // Stream the request; keep only a bounded prefix for the model label.
     let mut body = body.into_data_stream();
     let mut head: Vec<Bytes> = Vec::new();
@@ -357,10 +389,9 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
     }
     let prefix = head.concat();
     let labels = Labels {
-        thread: header_str(&parts.headers, "thread-id")
-            .or_else(|| header_str(&parts.headers, "session-id"))
-            .unwrap_or("unknown")
-            .to_owned(),
+        account_alias: header_str(&parts.headers, "x-codexctl-account-alias")
+            .and_then(evidence::alias),
+        thread,
         model: relay.model_label(&parts.headers, &prefix[..prefix.len().min(MODEL_PREFIX)]),
         account_class: match header_str(&parts.headers, ACCOUNT_CLASS_HEADER) {
             Some("included") => "included",
@@ -375,6 +406,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         "connection",
         "transfer-encoding",
         ACCOUNT_CLASS_HEADER,
+        "x-codexctl-account-alias",
     ] {
         headers.remove(name);
     }
@@ -400,41 +432,58 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         headers.remove(name);
     }
     let request_id = header_str(&headers, "x-request-id").map(str::to_owned);
-    if status == StatusCode::TOO_MANY_REQUESTS && parts.method == Method::POST {
-        return relay
+    relay.evidence.observe(evidence::Metadata {
+        status: status.as_u16(),
+        retry_headers: retry_headers(&headers),
+        model: &labels.model,
+        account_alias: labels.account_alias.as_deref(),
+        account_class: labels.account_class,
+        request_id: request_id.as_deref(),
+        observation: evidence::Observation::Headers,
+    });
+    let response = if status == StatusCode::TOO_MANY_REQUESTS && parts.method == Method::POST {
+        relay
             .rate_limited(upstream, headers, labels, request_id)
-            .await;
-    }
-    if (status.is_client_error() || status.is_server_error()) && is_responses {
-        return relay
+            .await
+    } else if (status.is_client_error() || status.is_server_error()) && is_responses {
+        relay
             .http_error(upstream, headers, labels, request_id, status, headers_at)
-            .await;
-    }
-    let is_stream = status.is_success()
-        && header_str(&headers, "content-type").is_some_and(|t| t.starts_with("text/event-stream"))
-        && headers.get("content-encoding").is_none();
-    let mut builder = Response::builder().status(status);
-    if is_stream {
-        headers.remove("content-length");
-        let frame_headers = headers.clone();
-        *builder.headers_mut().expect("fresh builder") = headers;
-        let frames = FrameRewriter::new(
-            relay,
-            labels,
-            request_id,
-            frame_headers,
-            headers_at,
-            is_responses,
-        );
-        builder
-            .body(Body::from_stream(frames.wrap(upstream.bytes_stream())))
-            .expect("valid response parts")
+            .await
     } else {
-        *builder.headers_mut().expect("fresh builder") = headers;
-        builder
-            .body(Body::from_stream(upstream.bytes_stream()))
-            .expect("valid response parts")
-    }
+        let is_stream = status.is_success()
+            && header_str(&headers, "content-type")
+                .is_some_and(|t| t.starts_with("text/event-stream"))
+            && headers.get("content-encoding").is_none();
+        let mut builder = Response::builder().status(status);
+        if is_stream {
+            headers.remove("content-length");
+            let frame_headers = headers.clone();
+            *builder.headers_mut().expect("fresh builder") = headers;
+            let frames = FrameRewriter::new(
+                relay,
+                labels,
+                request_id,
+                frame_headers,
+                headers_at,
+                is_responses,
+                status.as_u16(),
+            );
+            builder
+                .body(Body::from_stream(frames.wrap(upstream.bytes_stream())))
+                .expect("valid response parts")
+        } else {
+            *builder.headers_mut().expect("fresh builder") = headers;
+            builder
+                .body(Body::from_stream(upstream.bytes_stream()))
+                .expect("valid response parts")
+        }
+    };
+    let (parts, body) = response.into_parts();
+    let body = futures::stream::unfold(
+        (body.into_data_stream(), guard),
+        |(mut body, guard)| async move { body.next().await.map(|chunk| (chunk, (body, guard))) },
+    );
+    Response::from_parts(parts, Body::from_stream(body))
 }
 
 impl Relay {
@@ -554,6 +603,20 @@ impl Relay {
             "truncated": trace.truncated,
             "failure": context.event.map(failure_detail).or_else(|| context.body.map(http_failure_detail)),
             "http_status": context.http_status,
+            "account_alias": labels.account_alias,
+            "retry_headers": failure_retry_headers(headers, context.event),
+        });
+        self.evidence.observe(evidence::Metadata {
+            status: context.http_status.unwrap_or(200),
+            retry_headers: failure_retry_headers(headers, context.event),
+            model: &labels.model,
+            account_alias: labels.account_alias.as_deref(),
+            account_class: labels.account_class,
+            request_id: context.request_id,
+            observation: evidence::Observation::Failure {
+                error_code: context.event.or(context.body).and_then(evidence_error_code),
+                rate_429: None,
+            },
         });
         self.log_stream_failure(line);
     }
@@ -624,6 +687,21 @@ impl Relay {
         } else {
             policy::classify_429(&head.concat())
         };
+        let body = (!oversized)
+            .then(|| serde_json::from_slice::<Value>(&head.concat()).ok())
+            .flatten();
+        self.evidence.observe(evidence::Metadata {
+            status: 429,
+            retry_headers: retry_headers(&headers),
+            model: &labels.model,
+            account_alias: labels.account_alias.as_deref(),
+            account_class: labels.account_class,
+            request_id: request_id.as_deref(),
+            observation: evidence::Observation::Failure {
+                error_code: body.as_ref().and_then(evidence_error_code),
+                rate_429: Some(class == Http429::Rate),
+            },
+        });
         match class {
             Http429::Terminal => {
                 // Codex stops on this; the next request is a resume.
@@ -671,12 +749,10 @@ impl Relay {
         request_id: Option<&str>,
         upstream_secs: Option<u64>,
     ) -> Option<u64> {
-        let advice = self.streaks.lock().expect("streak lock").failure(
-            &labels.thread,
-            kind,
-            Instant::now(),
-            upstream_secs,
-        );
+        let advice = {
+            let mut streaks = self.streaks.lock().expect("streak lock");
+            streaks.failure(&labels.thread, kind, Instant::now(), upstream_secs)
+        };
         match advice {
             Advice::RetryAfter { secs, attempt } => {
                 self.event(
@@ -859,9 +935,8 @@ impl StreamTrace {
     }
 }
 
-/// Passes a Responses event stream through and, before any output, adds retry
-/// advice to a capacity `response.failed` event. It keeps scanning event types
-/// after output so failures are observable without changing forwarded bytes.
+/// Adds capacity advice while retaining output already delivered.
+/// The relay never replays a request; Codex owns retry and prior output.
 struct FrameRewriter {
     relay: Relay,
     labels: Labels,
@@ -871,102 +946,191 @@ struct FrameRewriter {
     forwarded: usize,
     partial_scanner: PartialTypeScanner,
     partial_scanned: usize,
+    frame_search_start: usize,
     is_responses: bool,
     trace: StreamTrace,
+    http_status: u16,
+    pending_kind: Option<String>,
+    failure_frame_truncated: bool,
+}
+
+#[derive(Default)]
+struct JsonContainer {
+    via: Option<String>,
+    key: Option<String>,
+    expecting_key: bool,
+    array: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Capture {
+    Key,
+    Kind,
+    Code,
+    RetryAfter,
+    RetryAfterMs,
+    ShouldRetry,
+    Skip,
 }
 
 #[derive(Default)]
 struct PartialTypeScanner {
-    depth: usize,
     started: bool,
-    expecting_key: bool,
-    key_is_type: bool,
-    expecting_type_value: bool,
-    capture_value: Option<bool>,
+    containers: Vec<JsonContainer>,
+    overflow_depth: usize,
+    capture_value: Option<Capture>,
     capture: Vec<u8>,
+    capture_truncated: bool,
     hint: Option<String>,
-    in_string: bool,
+    code: Option<String>,
+    retry_headers: BTreeMap<String, String>,
     string_escape: bool,
 }
 
 impl PartialTypeScanner {
     fn feed(&mut self, bytes: &[u8]) {
         for &byte in bytes {
-            if let Some(is_type_value) = self.capture_value {
-                if byte == b'\\' && self.capture.last() != Some(&b'\\') {
-                    self.capture.push(byte);
-                    continue;
-                }
-                if byte == b'"' && self.capture.last() != Some(&b'\\') {
-                    if is_type_value {
-                        if let Ok(value) = String::from_utf8(self.capture.clone()) {
-                            self.hint = Some(value);
+            if let Some(mode) = self.capture_value {
+                if byte == b'"' && !self.string_escape {
+                    let value = (!self.capture_truncated && mode != Capture::Skip)
+                        .then(|| {
+                            let mut quoted = Vec::with_capacity(self.capture.len() + 2);
+                            quoted.push(b'"');
+                            quoted.extend_from_slice(&self.capture);
+                            quoted.push(b'"');
+                            serde_json::from_slice::<String>(&quoted).ok()
+                        })
+                        .flatten();
+                    match mode {
+                        Capture::Key => {
+                            if let Some(container) = self.containers.last_mut() {
+                                container.key = value;
+                                container.expecting_key = false;
+                            }
                         }
-                        self.expecting_type_value = false;
-                        self.key_is_type = false;
-                    } else {
-                        self.key_is_type = self.capture == b"type";
-                        self.expecting_key = false;
+                        Capture::Kind => self.hint = value,
+                        Capture::Code => self.code = value,
+                        Capture::RetryAfter | Capture::RetryAfterMs | Capture::ShouldRetry => {
+                            let name = match mode {
+                                Capture::RetryAfter => "retry-after",
+                                Capture::RetryAfterMs => "retry-after-ms",
+                                _ => "x-should-retry",
+                            };
+                            if let Some(value) =
+                                value.and_then(|value| evidence::retry_header(name, &value))
+                            {
+                                self.retry_headers.insert(name.into(), value);
+                            }
+                        }
+                        Capture::Skip => {}
                     }
                     self.capture_value = None;
                     self.capture.clear();
-                } else if self.capture.len() < 64 {
-                    self.capture.push(byte);
+                    self.capture_truncated = false;
+                    continue;
                 }
-                continue;
-            }
-            if self.in_string {
+                if mode != Capture::Skip {
+                    if self.capture.len() < 64 {
+                        self.capture.push(byte);
+                    } else {
+                        self.capture_truncated = true;
+                    }
+                }
                 if self.string_escape {
                     self.string_escape = false;
                 } else if byte == b'\\' {
                     self.string_escape = true;
-                } else if byte == b'"' {
-                    self.in_string = false;
                 }
                 continue;
             }
             if !self.started {
                 if byte == b'{' {
                     self.started = true;
-                    self.depth = 1;
-                    self.expecting_key = true;
+                    self.containers.push(JsonContainer {
+                        expecting_key: true,
+                        ..JsonContainer::default()
+                    });
                 }
                 continue;
             }
             match byte {
-                b'"' if self.depth == 1 && self.expecting_type_value => {
-                    self.capture_value = Some(true);
+                b'"' => {
+                    let container = self.containers.last();
+                    let mode = if self.overflow_depth != 0 {
+                        Capture::Skip
+                    } else if container
+                        .is_some_and(|container| container.expecting_key && !container.array)
+                    {
+                        Capture::Key
+                    } else if self.containers.len() == 1
+                        && container.and_then(|container| container.key.as_deref()) == Some("type")
+                    {
+                        Capture::Kind
+                    } else if self.containers.len() == 3
+                        && self.containers[1].via.as_deref() == Some("response")
+                        && self.containers[2].via.as_deref() == Some("error")
+                        && container.and_then(|container| container.key.as_deref()) == Some("code")
+                    {
+                        Capture::Code
+                    } else if self.containers.len() == 4
+                        && self.containers[1].via.as_deref() == Some("response")
+                        && self.containers[2].via.as_deref() == Some("error")
+                        && self.containers[3].via.as_deref() == Some("headers")
+                    {
+                        match container
+                            .and_then(|container| container.key.as_deref())
+                            .map(str::to_ascii_lowercase)
+                            .as_deref()
+                        {
+                            Some("retry-after") => Capture::RetryAfter,
+                            Some("retry-after-ms") => Capture::RetryAfterMs,
+                            Some("x-should-retry") => Capture::ShouldRetry,
+                            _ => Capture::Skip,
+                        }
+                    } else {
+                        Capture::Skip
+                    };
+                    self.capture_value = Some(mode);
                     self.capture.clear();
+                    self.capture_truncated = false;
                 }
-                b'"' if self.depth == 1 && self.expecting_key => {
-                    self.capture_value = Some(false);
-                    self.capture.clear();
-                }
-                b'"' => self.in_string = true,
                 b'{' | b'[' => {
-                    self.depth += 1;
+                    if self.overflow_depth > 0 || self.containers.len() == 64 {
+                        self.overflow_depth += 1;
+                    } else {
+                        let via = self
+                            .containers
+                            .last()
+                            .filter(|container| !container.array)
+                            .and_then(|container| container.key.clone());
+                        self.containers.push(JsonContainer {
+                            via,
+                            array: byte == b'[',
+                            expecting_key: byte == b'{',
+                            ..JsonContainer::default()
+                        });
+                    }
                 }
                 b'}' | b']' => {
-                    self.depth = self.depth.saturating_sub(1);
+                    if self.overflow_depth > 0 {
+                        self.overflow_depth -= 1;
+                    } else {
+                        self.containers.pop();
+                    }
                 }
-                b':' if self.depth == 1 => {
-                    self.expecting_type_value = self.key_is_type;
-                    self.expecting_key = false;
-                }
-                b',' if self.depth == 1 => {
-                    self.expecting_key = true;
-                    self.key_is_type = false;
-                    self.expecting_type_value = false;
+                b',' if self.overflow_depth == 0 => {
+                    if let Some(container) = self.containers.last_mut() {
+                        container.expecting_key = !container.array;
+                        container.key = None;
+                    }
                 }
                 _ => {}
             }
         }
     }
-
     fn take_hint(&mut self) -> Option<String> {
         self.hint.take()
     }
-
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -980,6 +1144,7 @@ impl FrameRewriter {
         headers: HeaderMap,
         headers_at: Instant,
         is_responses: bool,
+        http_status: u16,
     ) -> Self {
         Self {
             relay,
@@ -990,8 +1155,12 @@ impl FrameRewriter {
             forwarded: 0,
             partial_scanner: PartialTypeScanner::default(),
             partial_scanned: 0,
+            frame_search_start: 0,
             is_responses,
             trace: StreamTrace::new(headers_at),
+            http_status,
+            pending_kind: None,
+            failure_frame_truncated: false,
         }
     }
 
@@ -1023,16 +1192,11 @@ impl FrameRewriter {
                             ));
                         }
                         None => {
-                            frames.finish_truncated();
-                            let rest = if frames.forwarded < frames.pending.len() {
-                                frames.pending[frames.forwarded..].to_vec()
-                            } else {
-                                Vec::new()
-                            };
-                            frames.pending.clear();
-                            frames.forwarded = 0;
-                            return (!rest.is_empty())
-                                .then(|| (Ok(Bytes::from(rest)), (upstream, frames, true)));
+                            let rest = frames.finish_eof();
+                            if !rest.is_empty() {
+                                return Some((Ok(Bytes::from(rest)), (upstream, frames, true)));
+                            }
+                            return None;
                         }
                     }
                 }
@@ -1045,40 +1209,89 @@ impl FrameRewriter {
     fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.pending.extend_from_slice(chunk);
         let mut out = Vec::new();
-        if self.trace.first_output.is_some() {
-            out.extend_from_slice(&self.pending[self.forwarded..]);
-            self.forwarded = self.pending.len();
-        }
         loop {
-            let Some(end) = find_frame_end(&self.pending) else {
+            let Some(end) = find_frame_end(&self.pending[self.frame_search_start..])
+                .map(|end| end + self.frame_search_start)
+            else {
+                self.frame_search_start = self.pending.len().saturating_sub(3);
                 self.scan_partial_pending();
+                if self.pending_kind.is_none() {
+                    self.pending_kind = scan_sse_event_name(&self.pending);
+                }
                 break;
             };
             self.scan_partial_pending_until(end);
-            let frame: Vec<u8> = self.pending.drain(..end).collect();
+            let mut frame: Vec<u8> = self.pending.drain(..end).collect();
+            self.frame_search_start = 0;
             self.partial_scanned = self.partial_scanned.saturating_sub(end);
             let hinted_kind = self.partial_scanner.take_hint();
-            self.partial_scanner.reset();
-            let was_forwarded = self.forwarded >= end;
-            if was_forwarded {
-                self.forwarded -= end;
-                self.frame(frame, hinted_kind);
-            } else {
-                out.extend_from_slice(&self.frame(frame, hinted_kind));
+            let hinted_code = self.partial_scanner.code.take();
+            if self.failure_frame_truncated
+                || (frame.len() > MAX_HELD_FAILURE_BYTES
+                    && hinted_kind
+                        .as_deref()
+                        .or(self.pending_kind.as_deref())
+                        .is_none_or(|kind| {
+                            matches!(kind, "response.failed" | "error" | "response.incomplete")
+                        }))
+            {
+                let mut event = partial_failure_event(
+                    "response.failed",
+                    hinted_code
+                        .clone()
+                        .or_else(|| Some("relay_frame_too_large".into())),
+                );
+                event["response"]["error"]["headers"] = json!(self.partial_scanner.retry_headers);
+                frame = format!("event: response.failed\ndata: {event}\n\n").into_bytes();
+                self.failure_frame_truncated = false;
+                self.trace.truncated = true;
             }
-            if self.trace.first_output.is_some() && self.forwarded < self.pending.len() {
-                out.extend_from_slice(&self.pending[self.forwarded..]);
-                self.forwarded = self.pending.len();
+            self.partial_scanner.reset();
+            let forwarded = self.forwarded.min(end);
+            self.forwarded = self.forwarded.saturating_sub(end);
+            let output = self.frame(frame, hinted_kind, hinted_code);
+            self.pending_kind = None;
+            if forwarded < output.len() {
+                out.extend_from_slice(&output[forwarded..]);
             }
         }
-        if self.trace.first_output.is_some() && self.pending.len() > MAX_PENDING_FRAME_BYTES {
+        // Output fragments may stream promptly. A possible failure is held
+        // until classified so its advice can be changed before it is forwarded.
+        let kind = self
+            .partial_scanner
+            .hint
+            .as_deref()
+            .map(str::to_owned)
+            .or_else(|| self.pending_kind.clone())
+            .or_else(|| scan_sse_event_name(&self.pending));
+        let ordinary = !self.failure_frame_truncated
+            && kind.as_deref().is_some_and(|kind| {
+                !matches!(kind, "response.failed" | "error" | "response.incomplete")
+            });
+        if ordinary {
+            out.extend_from_slice(&self.pending[self.forwarded..]);
+            self.forwarded = self.pending.len();
+        }
+        if ordinary && self.pending.len() > MAX_PENDING_FRAME_BYTES {
             self.scan_partial_pending();
             let flush = self.pending.len() - MAX_PENDING_FRAME_BYTES;
-            let prefix = self.pending[..flush.min(MAX_PARTIAL_FAILURE_INSPECTION)].to_vec();
-            self.observe_partial_failure(&prefix);
+            if self.forwarded < flush {
+                out.extend_from_slice(&self.pending[self.forwarded..flush]);
+                self.forwarded = flush;
+            }
             self.pending.drain(..flush);
             self.forwarded = self.forwarded.saturating_sub(flush);
             self.partial_scanned = self.partial_scanned.saturating_sub(flush);
+            self.frame_search_start = self.frame_search_start.saturating_sub(flush);
+        } else if !ordinary && self.pending.len() > MAX_HELD_FAILURE_BYTES {
+            // Never forward a failure prefix: advice may precede a late code.
+            // Keep only delimiter lookbehind and bounded metadata. No disk spool.
+            let discard = self.pending.len().saturating_sub(4);
+            self.pending.drain(..discard);
+            self.forwarded = self.forwarded.saturating_sub(discard);
+            self.partial_scanned = self.partial_scanned.saturating_sub(discard);
+            self.frame_search_start = self.frame_search_start.saturating_sub(discard);
+            self.failure_frame_truncated = true;
         }
         out
     }
@@ -1093,40 +1306,6 @@ impl FrameRewriter {
                 .feed(&self.pending[self.partial_scanned..end]);
             self.partial_scanned = end;
         }
-    }
-
-    fn observe_partial_failure(&mut self, prefix: &[u8]) {
-        if self.trace.failure_recorded {
-            return;
-        }
-        let Some(kind) = scan_event_type(prefix).or_else(|| scan_sse_event_name(prefix)) else {
-            return;
-        };
-        if kind == "response.completed" {
-            return;
-        }
-        self.trace.record_type(&kind, Instant::now());
-        if !matches!(
-            kind.as_str(),
-            "response.failed" | "error" | "response.incomplete"
-        ) {
-            return;
-        }
-        let event = partial_failure_event(&kind, scan_failure_code(prefix));
-        self.trace.failure_recorded = true;
-        self.relay.stream_failure(
-            &self.trace,
-            &self.labels,
-            failure_kind(&kind, Some(&event)),
-            &self.headers,
-            StreamFailureContext {
-                advised: false,
-                event: Some(&event),
-                request_id: self.request_id.as_deref(),
-                http_status: None,
-                body: None,
-            },
-        );
     }
 
     fn finish_truncated(&mut self) {
@@ -1145,14 +1324,43 @@ impl FrameRewriter {
                     advised: false,
                     event: None,
                     request_id: self.request_id.as_deref(),
-                    http_status: None,
+                    http_status: Some(self.http_status),
                     body: None,
                 },
             );
         }
     }
 
-    fn frame(&mut self, frame: Vec<u8>, hinted_kind: Option<String>) -> Vec<u8> {
+    fn finish_eof(&mut self) -> Vec<u8> {
+        let rest = if self.failure_frame_truncated {
+            let code = self
+                .partial_scanner
+                .code
+                .take()
+                .or_else(|| Some("relay_frame_too_large".into()));
+            let mut event = partial_failure_event("response.failed", code.clone());
+            event["response"]["error"]["headers"] = json!(self.partial_scanner.retry_headers);
+            self.trace.truncated = true;
+            self.frame(
+                format!("event: response.failed\ndata: {event}\n\n").into_bytes(),
+                Some("response.failed".into()),
+                code,
+            )
+        } else {
+            self.finish_truncated();
+            self.pending[self.forwarded..].to_vec()
+        };
+        self.pending.clear();
+        self.forwarded = 0;
+        rest
+    }
+
+    fn frame(
+        &mut self,
+        frame: Vec<u8>,
+        hinted_kind: Option<String>,
+        hinted_code: Option<String>,
+    ) -> Vec<u8> {
         let Some(kind) = scan_event_type(&frame)
             .or_else(|| scan_sse_event_name(&frame))
             .or(hinted_kind)
@@ -1171,7 +1379,9 @@ impl FrameRewriter {
         let now = Instant::now();
         self.trace.record_type(&kind, now);
         if is_output(&kind) {
-            self.relay.success(&self.labels);
+            if kind == "response.completed" {
+                self.relay.success(&self.labels);
+            }
             return frame;
         }
         if !matches!(
@@ -1180,7 +1390,7 @@ impl FrameRewriter {
         ) {
             return frame;
         }
-        let parsed_event = if self.trace.first_output.is_none() || frame.len() <= MAX_FAILURE_BODY {
+        let parsed_event = if frame.len() <= MAX_HELD_FAILURE_BYTES {
             frame_data(&frame)
         } else {
             None
@@ -1188,17 +1398,23 @@ impl FrameRewriter {
         let event = parsed_event.as_ref().cloned().or_else(|| {
             Some(partial_failure_event(
                 &kind,
-                scan_failure_code(&frame[..frame.len().min(MAX_PARTIAL_FAILURE_INSPECTION)]),
+                hinted_code.or_else(|| {
+                    scan_failure_code(&frame[..frame.len().min(MAX_PARTIAL_FAILURE_INSPECTION)])
+                }),
             ))
         });
         let mut advised = false;
         let mut output = frame;
-        if kind == "response.failed"
-            && self.trace.first_output.is_none()
-            && parsed_event
-                .as_ref()
-                .is_some_and(policy::is_overloaded_failure)
-        {
+        let overloaded =
+            kind == "response.failed" && event.as_ref().is_some_and(policy::is_overloaded_failure);
+        if !overloaded {
+            self.relay
+                .streaks
+                .lock()
+                .expect("streak lock")
+                .end(&self.labels.thread);
+        }
+        if overloaded {
             let event_value = event.as_ref().expect("overload event exists");
             output = match self.relay.failure(
                 Kind::Overloaded,
@@ -1225,7 +1441,7 @@ impl FrameRewriter {
                     advised,
                     event: event.as_ref(),
                     request_id: self.request_id.as_deref(),
-                    http_status: None,
+                    http_status: Some(self.http_status),
                     body: None,
                 },
             );
@@ -1234,8 +1450,7 @@ impl FrameRewriter {
     }
 }
 
-/// Events that carry model output, or a completed response. Once one passes,
-/// retry advice would repeat output, so failures are observed without rewriting.
+/// Events that carry model output or a completed response.
 fn is_output(kind: &str) -> bool {
     kind == "response.completed"
         || [
@@ -1313,13 +1528,18 @@ fn scan_event_type(frame: &[u8]) -> Option<String> {
 }
 
 fn scan_sse_event_name(frame: &[u8]) -> Option<String> {
-    frame.split(|byte| *byte == b'\n').find_map(|line| {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let name = line.strip_prefix(b"event:")?.trim_ascii();
-        (!name.is_empty())
-            .then(|| std::str::from_utf8(name).ok().map(str::to_owned))
-            .flatten()
-    })
+    frame
+        .split_inclusive(|byte| *byte == b'\n')
+        .find_map(|line| {
+            // A chunk can stop midway through a name. Only a complete line proves
+            // that this frame is ordinary output rather than response.failed.
+            let line = line.strip_suffix(b"\n")?;
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let name = line.strip_prefix(b"event:")?.trim_ascii();
+            (!name.is_empty())
+                .then(|| std::str::from_utf8(name).ok().map(str::to_owned))
+                .flatten()
+        })
 }
 
 fn scan_top_level_type(data: &[u8]) -> Option<String> {
@@ -1809,7 +2029,11 @@ fn without_retry_advice(frame: Vec<u8>, mut event: Value) -> Vec<u8> {
         .and_then(|headers| {
             let names: Vec<String> = headers
                 .keys()
-                .filter(|name| name.eq_ignore_ascii_case("retry-after"))
+                .filter(|name| {
+                    ["retry-after", "retry-after-ms", "x-should-retry"]
+                        .iter()
+                        .any(|known| name.eq_ignore_ascii_case(known))
+                })
                 .cloned()
                 .collect();
             names.iter().for_each(|name| {
@@ -1845,6 +2069,45 @@ fn rebuild_frame(frame: &[u8], event: &Value) -> Vec<u8> {
     out.into_bytes()
 }
 
+fn evidence_error_code(event: &Value) -> Option<&str> {
+    event
+        .pointer("/response/error/code")
+        .or_else(|| event.pointer("/error/code"))
+        .or_else(|| event.pointer("/error/type"))
+        .and_then(Value::as_str)
+}
+
+fn retry_headers(headers: &HeaderMap) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    for name in ["retry-after", "retry-after-ms", "x-should-retry"] {
+        if let Some(value) =
+            header_str(headers, name).and_then(|value| evidence::retry_header(name, value))
+        {
+            values.insert(name.into(), value);
+        }
+    }
+    values
+}
+
+fn failure_retry_headers(headers: &HeaderMap, event: Option<&Value>) -> BTreeMap<String, String> {
+    let mut values = retry_headers(headers);
+    if let Some(embedded) = event
+        .and_then(|event| event.pointer("/response/error/headers"))
+        .and_then(Value::as_object)
+    {
+        for (name, value) in embedded {
+            let name = name.to_ascii_lowercase();
+            if let Some(value) = value
+                .as_str()
+                .and_then(|value| evidence::retry_header(&name, value))
+            {
+                values.insert(name, value);
+            }
+        }
+    }
+    values
+}
+
 async fn metrics(State(relay): State<Relay>) -> Response {
     let counts = relay.counts.lock().expect("metric lock");
     let mut out = String::from("# TYPE codexctl_relay_capacity_events_total counter\n");
@@ -1853,6 +2116,7 @@ async fn metrics(State(relay): State<Relay>) -> Response {
             "codexctl_relay_capacity_events_total{{kind=\"{kind}\",model=\"{model}\",account_class=\"{account_class}\",outcome=\"{outcome}\"}} {count}\n"
         ));
     }
+    out.push_str(&relay.evidence.metrics());
     out.push_str("# TYPE codexctl_relay_stream_failures_total counter\n");
     for ((kind, stage, model, account_class), count) in relay
         .stream_failures
@@ -1910,11 +2174,13 @@ mod tests {
             log: Arc::new(|_| {}),
             central_events: Some(sender),
             central_dropped: dropped.clone(),
+            evidence: evidence::Evidence::start(None).unwrap().0,
         };
         let labels = Labels {
             thread: "thread".into(),
             model: "gpt-6.1-sol".into(),
             account_class: "included",
+            account_alias: None,
         };
 
         for _ in 0..=CENTRAL_EVENT_QUEUE_CAPACITY {
@@ -1954,6 +2220,7 @@ mod tests {
             log: Arc::new(move |line| sink.lock().expect("test log lock").push(line.to_owned())),
             central_events: None,
             central_dropped: Arc::default(),
+            evidence: evidence::Evidence::start(None).unwrap().0,
         };
         relay
             .stream_log
@@ -1982,17 +2249,27 @@ mod tests {
             log: Arc::new(|_| {}),
             central_events: None,
             central_dropped: Arc::default(),
+            evidence: evidence::Evidence::start(None).unwrap().0,
         };
         let labels = Labels {
             thread: "thread".into(),
             model: "gpt-6.1-sol".into(),
             account_class: "included",
+            account_alias: None,
         };
-        let mut frames =
-            FrameRewriter::new(relay, labels, None, HeaderMap::new(), Instant::now(), true);
+        let mut frames = FrameRewriter::new(
+            relay,
+            labels,
+            None,
+            HeaderMap::new(),
+            Instant::now(),
+            true,
+            200,
+        );
         frames.push(b"data: {\"type\":\"response.created\"}\n\n");
         frames.push(b"data: {\"type\":\"response.output_text.delta\"}\n\n");
-        let partial = vec![b'x'; MAX_PENDING_FRAME_BYTES * 2];
+        let mut partial = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"".to_vec();
+        partial.extend(std::iter::repeat_n(b'x', MAX_PENDING_FRAME_BYTES * 2));
         let forwarded = frames.push(&partial);
         assert!(frames.pending.len() <= MAX_PENDING_FRAME_BYTES);
         assert_eq!(forwarded.len(), partial.len());

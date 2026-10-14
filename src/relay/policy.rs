@@ -4,6 +4,7 @@
 use std::{
     collections::HashMap,
     hash::{BuildHasher, Hasher},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -13,11 +14,13 @@ use serde_json::Value;
 const BASE_DELAY_SECS: u64 = 2;
 /// Longest single delay the relay advises.
 const MAX_DELAY_SECS: u64 = 60;
-/// A failure this long after the advised retry time starts a new streak:
+/// A request this long after the advised retry time starts a new streak:
 /// Codex retries at that time, so a longer gap means a later resume.
 const STREAK_IDLE: Duration = Duration::from_secs(120);
 /// Streaks idle this long are dropped so the table stays bounded.
 const STREAK_EVICT: Duration = Duration::from_secs(3600);
+/// Amortize the global expiry scan across incoming requests.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Codex treats these as final (`codex-api/src/api_bridge.rs` 429 branch and
 /// `sse/responses_error.rs`). A retry would hide a usage, billing or plan stop
@@ -104,7 +107,8 @@ pub(crate) struct Recovered {
 struct Streak {
     kind: Kind,
     started: Instant,
-    last_failure: Instant,
+    budget: Duration,
+    last_activity: Instant,
     /// When Codex is expected to retry.
     retry_at: Instant,
     attempts: u32,
@@ -116,6 +120,8 @@ pub(crate) struct Streaks {
     rate_budget: Duration,
     overloaded_budget: Duration,
     by_thread: HashMap<String, Streak>,
+    in_flight: HashMap<String, usize>,
+    last_pruned: Option<Instant>,
     jitter: std::collections::hash_map::RandomState,
     draws: u64,
 }
@@ -126,9 +132,56 @@ impl Streaks {
             rate_budget,
             overloaded_budget,
             by_thread: HashMap::new(),
+            in_flight: HashMap::new(),
+            last_pruned: None,
             jitter: std::collections::hash_map::RandomState::new(),
             draws: 0,
         }
+    }
+
+    /// Idle is measured when a request arrives, not when its stream fails.
+    /// Time spent streaming output must still count against the old budget.
+    fn request(&mut self, thread: &str, now: Instant) {
+        self.prune(now);
+        if !self.in_flight.contains_key(thread)
+            && self
+                .by_thread
+                .get(thread)
+                .is_some_and(|streak| now.saturating_duration_since(streak.retry_at) > STREAK_IDLE)
+        {
+            self.end(thread);
+        }
+        if let Some(streak) = self.by_thread.get_mut(thread) {
+            streak.last_activity = streak.last_activity.max(now);
+        }
+        *self.in_flight.entry(thread.to_owned()).or_default() += 1;
+    }
+
+    fn finish_request(&mut self, thread: &str, now: Instant) {
+        let count = self.in_flight.get_mut(thread).expect("request registered");
+        *count -= 1;
+        if *count == 0 {
+            self.in_flight.remove(thread);
+            if let Some(streak) = self.by_thread.get_mut(thread) {
+                streak.last_activity = streak.last_activity.max(now);
+            }
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        if self
+            .last_pruned
+            .is_some_and(|last| now.saturating_duration_since(last) < PRUNE_INTERVAL)
+        {
+            return;
+        }
+        self.last_pruned = Some(now);
+        self.by_thread.retain(|thread, streak| {
+            self.in_flight.contains_key(thread)
+                || now.saturating_duration_since(streak.started) < streak.budget
+                || now.saturating_duration_since(streak.last_activity.max(streak.retry_at))
+                    <= STREAK_EVICT
+        });
     }
 
     /// Records one advisable failure. `upstream_secs` is the server's own
@@ -141,33 +194,27 @@ impl Streaks {
         now: Instant,
         upstream_secs: Option<u64>,
     ) -> Advice {
-        self.by_thread
-            .retain(|_, streak| now.duration_since(streak.last_failure) < STREAK_EVICT);
+        let budget = match kind {
+            Kind::Rate429 => self.rate_budget,
+            Kind::Overloaded => self.overloaded_budget,
+        };
         let streak = self
             .by_thread
             .entry(thread.to_owned())
             .and_modify(|streak| {
-                // A new streak when the kind changes (its own budget), after a
-                // long gap, or after exhaustion: Codex stopped then, so this
-                // failure belongs to a resumed turn.
-                if streak.kind != kind
-                    || streak.exhausted
-                    || now.saturating_duration_since(streak.retry_at) > STREAK_IDLE
-                {
-                    *streak = Streak::new(kind, now);
+                // A kind change gets its own budget; exhaustion means Codex
+                // stopped, so the next failure belongs to a resumed turn.
+                if streak.kind != kind || streak.exhausted {
+                    *streak = Streak::new(kind, now, budget);
                 }
             })
-            .or_insert_with(|| Streak::new(kind, now));
-        streak.last_failure = now;
+            .or_insert_with(|| Streak::new(kind, now, budget));
+        streak.last_activity = streak.last_activity.max(now);
         streak.attempts += 1;
         let attempt = streak.attempts;
         let cap = BASE_DELAY_SECS
             .saturating_mul(1u64 << (attempt - 1).min(16))
             .min(MAX_DELAY_SECS);
-        let budget = match kind {
-            Kind::Rate429 => self.rate_budget,
-            Kind::Overloaded => self.overloaded_budget,
-        };
         let started = streak.started;
         let secs = upstream_secs.unwrap_or_else(|| self.jittered(cap));
         let streak = self
@@ -214,11 +261,12 @@ impl Streaks {
 }
 
 impl Streak {
-    fn new(kind: Kind, now: Instant) -> Self {
+    fn new(kind: Kind, now: Instant, budget: Duration) -> Self {
         Self {
             kind,
             started: now,
-            last_failure: now,
+            budget,
+            last_activity: now,
             retry_at: now,
             attempts: 0,
             exhausted: false,
@@ -226,9 +274,110 @@ impl Streak {
     }
 }
 
+/// Holds the request's lifetime, including its streamed response and cancellation.
+pub(super) struct RequestGuard {
+    streaks: Arc<Mutex<Streaks>>,
+    thread: String,
+}
+
+impl RequestGuard {
+    pub(super) fn new(streaks: &Arc<Mutex<Streaks>>, thread: &str, now: Instant) -> Self {
+        streaks.lock().expect("streak lock").request(thread, now);
+        Self {
+            streaks: streaks.clone(),
+            thread: thread.to_owned(),
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.streaks
+            .lock()
+            .expect("streak lock")
+            .finish_request(&self.thread, Instant::now());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pruning_preserves_live_streaks_and_removes_expired_streaks() {
+        let start = Instant::now();
+        let policy = Arc::new(Mutex::new(Streaks::new(
+            Duration::from_secs(10),
+            Duration::from_secs(7200),
+        )));
+        {
+            let mut streaks = policy.lock().unwrap();
+            streaks.failure("expired", Kind::Rate429, start, None);
+            streaks.failure("cancelled", Kind::Rate429, start, None);
+            streaks.failure("in-flight", Kind::Rate429, start, None);
+            streaks.failure("within-budget", Kind::Overloaded, start, None);
+        }
+        let in_flight = RequestGuard::new(&policy, "in-flight", start + Duration::from_secs(1));
+        let sibling = RequestGuard::new(&policy, "in-flight", start + Duration::from_secs(2));
+        drop(sibling);
+        let cancelled = RequestGuard::new(&policy, "cancelled", start + Duration::from_secs(1));
+        drop(cancelled);
+        {
+            let mut streaks = policy.lock().unwrap();
+            for thread in ["until-next-sweep", "before-next-sweep"] {
+                streaks.failure(thread, Kind::Rate429, start + Duration::from_secs(30), None);
+            }
+        }
+
+        // More than one hour after even the maximum first advice (2 seconds).
+        let later = start + Duration::from_secs(3603);
+        let unrelated = RequestGuard::new(&policy, "unrelated", later);
+        let mut streaks = policy.lock().unwrap();
+        assert_eq!(
+            streaks.failure("in-flight", Kind::Rate429, later, None),
+            Advice::Exhausted { attempt: 2 },
+            "a live stream must exhaust its original budget rather than get attempt 1"
+        );
+        assert_eq!(
+            streaks.success("expired"),
+            None,
+            "an idle expired streak was pruned"
+        );
+        assert_eq!(
+            streaks.success("cancelled"),
+            None,
+            "dropping a request releases its protection"
+        );
+        assert_eq!(
+            streaks.success("within-budget"),
+            Some(Recovered {
+                kind: Kind::Overloaded,
+                attempts: 1,
+            }),
+            "a streak inside its own budget must survive pruning"
+        );
+        drop(streaks);
+        drop(unrelated);
+
+        let next = RequestGuard::new(&policy, "unrelated", start + Duration::from_secs(3633));
+        assert_eq!(
+            policy.lock().unwrap().success("before-next-sweep"),
+            Some(Recovered {
+                kind: Kind::Rate429,
+                attempts: 1,
+            }),
+            "an intervening request must not run another full sweep"
+        );
+        drop(next);
+        let next = RequestGuard::new(&policy, "unrelated", start + Duration::from_secs(3664));
+        assert_eq!(
+            policy.lock().unwrap().success("until-next-sweep"),
+            None,
+            "the next scheduled sweep removes entries that became idle-expired"
+        );
+        drop(next);
+        drop(in_flight);
+    }
 
     #[test]
     fn delays_double_with_jitter_and_stop_at_the_cap() {

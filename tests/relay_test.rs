@@ -182,7 +182,10 @@ async fn harness_with(
     };
     let app = Router::new()
         .route("/backend-api/codex/responses", post(upstream_responses))
-        .route("/backend-api/codex/other", post(upstream_responses))
+        .route(
+            "/backend-api/codex/other",
+            post(upstream_responses).get(upstream_responses),
+        )
         .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(upstream.clone());
     let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -474,6 +477,367 @@ fn retry_after(response: &reqwest::Response) -> Option<u64> {
         .map(|value| value.to_str().unwrap().parse().unwrap())
 }
 
+#[tokio::test]
+async fn evidence_reader_refuses_special_files_promptly() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    let fifo = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if result.is_err() {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    assert!(
+        result.is_ok_and(|status| !status.success()),
+        "a non-regular evidence file must fail promptly"
+    );
+}
+
+#[test]
+fn evidence_report_counts_valid_records_after_a_torn_append() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    let record = json!({
+        "utc_hour": chrono::Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string(),
+        "status": 200, "error_code": "server_is_overloaded", "retry_headers": {},
+        "model": "gpt-6.1-sol", "account_alias": null, "account_class": "unknown",
+        "request_id": null, "observation": "failure"
+    });
+    // A failed short write leaves a fragment; the next append joins that line.
+    let contents = format!("{record}\n{{\"utc_hour\":{record}\n{record}\n");
+    std::fs::write(
+        directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive())),
+        contents,
+    )
+    .unwrap();
+    for args in [
+        vec!["relay", "evidence"],
+        vec!["relay", "evidence", "--json"],
+    ] {
+        let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+            .args(&args)
+            .env("HOME", home.path())
+            .env_remove("CODEX_HOME")
+            .env_remove("CODEXCTL_PINNED_ALIAS")
+            .output()
+            .unwrap();
+        assert!(
+            report.status.success(),
+            "{}",
+            String::from_utf8_lossy(&report.stderr)
+        );
+        assert!(String::from_utf8_lossy(&report.stderr).contains("skipped 1 invalid record"));
+        if args.contains(&"--json") {
+            let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+            assert_eq!(rows[0]["overloaded"], 2);
+            assert_eq!(rows[0]["requests"], 0);
+        } else {
+            assert!(String::from_utf8_lossy(&report.stdout).contains("gpt-6.1-sol"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn evidence_expiry_runs_at_startup_and_while_the_relay_is_idle() {
+    let directory = tempfile::tempdir().unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let expired = directory
+        .path()
+        .join(format!("{}.jsonl", today - chrono::Duration::days(7)));
+    let retained = directory
+        .path()
+        // Stay inside the seven-day window if UTC rolls over during the wait.
+        .join(format!("{}.jsonl", today - chrono::Duration::days(5)));
+    std::fs::write(&expired, b"").unwrap();
+    std::fs::write(&retained, b"").unwrap();
+    let h = harness_with(vec![], |config| config.with_evidence_dir(directory.path())).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while expired.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup must prune expired evidence without any response");
+    assert!(retained.exists());
+    // No response/append occurs. Maintenance must also run after startup.
+    std::fs::write(&expired, b"").unwrap();
+    tokio::time::timeout(Duration::from_secs(65), async {
+        while expired.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("idle maintenance must prune expired evidence within one minute");
+    assert!(retained.exists());
+    assert!(h.upstream.seen.lock().unwrap().bodies.is_empty());
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_evidence_maintenance_failures_total 0")
+    );
+}
+
+#[tokio::test]
+async fn failed_evidence_maintenance_is_visible_without_a_dropped_observation() {
+    let directory = tempfile::tempdir().unwrap();
+    // Reject a non-file writer lock during the startup expiry pass.
+    std::fs::create_dir(directory.path().join(".write.lock")).unwrap();
+    let h = harness_with(vec![], |config| config.with_evidence_dir(directory.path())).await;
+    let metrics = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let metrics = h.metrics().await;
+            if metrics.contains("codexctl_relay_evidence_maintenance_failures_total 1") {
+                break metrics;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("failed startup maintenance must expose its own failure counter");
+    assert!(metrics.contains("codexctl_relay_evidence_dropped_total{reason=\"io\"} 0"));
+    assert!(h.upstream.seen.lock().unwrap().bodies.is_empty());
+}
+
+#[tokio::test]
+async fn evidence_keeps_the_first_observation_after_an_unterminated_tail() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    std::fs::write(&path, b"{\"utc_hour\":").unwrap();
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| config.with_evidence_dir(&directory),
+    )
+    .await;
+    h.post("evidence-after-crash").await.text().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&path).is_ok_and(|text| {
+                text.lines().any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .is_ok_and(|row| row["observation"] == "failure")
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        rows[0]["requests"], 1,
+        "the first append after restart must remain a separate valid record"
+    );
+    assert_eq!(rows[0]["rate_429"], 1);
+    assert!(String::from_utf8_lossy(&report.stderr).contains("skipped 1 invalid record"));
+}
+
+#[tokio::test]
+async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    let h = harness_with(
+        vec![
+            Scripted::Status(429, vec![], String::new()),
+            Scripted::Status(
+                429,
+                vec![],
+                r#"{"error":{"code":null,"type":"rate_limit_exceeded"}}"#.into(),
+            ),
+            Scripted::Status(
+                429,
+                vec![],
+                r#"{"error":{"code":"rate_limit_exceeded","type":"usage_limit_reached"}}"#.into(),
+            ),
+        ],
+        |config| config.with_evidence_dir(&directory),
+    )
+    .await;
+    for advised in [true, true, false] {
+        let response = h.post("evidence-rate-class").await;
+        assert_eq!(response.status(), 429);
+        assert_eq!(retry_after(&response).is_some(), advised);
+        response.text().await.unwrap();
+    }
+    let path = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_to_string(&path).is_ok_and(|text| text.lines().count() == 6) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(rows[0]["rate_429"], 2);
+    assert_eq!(rows[0]["other_failures"], 1);
+    assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 2);
+    assert_eq!(
+        metric(&h.metrics().await, "outcome=\"terminal_passthrough\""),
+        1
+    );
+}
+
+#[tokio::test]
+async fn capacity_evidence_is_sanitized_retained_and_counted_by_model_hour() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let directory = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&directory).unwrap();
+    let today = chrono::Utc::now().date_naive();
+    let old = directory.join(format!("{}.jsonl", today - chrono::Duration::days(8)));
+    let yesterday = directory.join(format!("{}.jsonl", today - chrono::Duration::days(1)));
+    std::fs::write(&old, b"").unwrap();
+    std::fs::write(&yesterday, b"").unwrap();
+    let secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut event = failed_event(OVERLOADED);
+    event["response"]["error"]["message"] = json!(secret);
+    event["response"]["error"]["headers"] = json!({"retry-after":"7", "retry-after-ms":"7500", "authorization":secret, "x-should-retry":"true"});
+    let failure = format!("event: response.failed\ndata: {event}\n\n");
+    let body = format!("{CREATED}{failure}");
+    let h = harness_with(
+        vec![Scripted::Status(
+            201,
+            vec![
+                ("content-type", "text/event-stream".into()),
+                ("x-request-id", "req-evidence-test".into()),
+                ("retry-after", "3".into()),
+            ],
+            body,
+        )],
+        |config| config.with_evidence_dir(&directory),
+    )
+    .await;
+    h.client
+        .post(format!("{}/backend-api/codex/responses", h.relay_url))
+        .header("thread-id", "evidence-thread")
+        .header("x-codexctl-account-alias", "amir+p4@sawmills.ai")
+        .header("x-codexctl-account-class", "included")
+        .bearer_auth(secret)
+        .json(&json!({"model":"gpt-6.1-sol", "input":"NEVER_PERSIST_THIS_PROMPT"}))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let path = directory.join(format!("{today}.jsonl"));
+    let evidence = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && text.contains("server_is_overloaded")
+            {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("capacity observation must be durably written");
+    assert!(!old.exists(), "only seven UTC days are retained");
+    assert!(yesterday.exists(), "evidence lasts longer than one day");
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!evidence.contains(secret));
+    assert!(!evidence.contains("NEVER_PERSIST_THIS_PROMPT"));
+    let rows: Vec<Value> = evidence
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let failure = rows
+        .iter()
+        .find(|row| row["error_code"] == "server_is_overloaded")
+        .unwrap();
+    assert_eq!(failure["status"], 201);
+    assert_eq!(failure["account_alias"], "amir+p4@sawmills.ai");
+    assert_eq!(failure["model"], "gpt-6.1-sol");
+    assert_eq!(failure["request_id"], "req-evidence-test");
+    assert_eq!(failure["retry_headers"]["retry-after"], "7");
+    assert_eq!(failure["retry_headers"]["retry-after-ms"], "7500");
+    assert_eq!(failure["retry_headers"]["x-should-retry"], "true");
+    assert!(failure["utc_hour"].as_str().unwrap().ends_with(":00:00Z"));
+    assert!(failure["failure"].is_null() && failure["message"].is_null());
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let counts: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(counts[0]["model"], "gpt-6.1-sol");
+    assert_eq!(counts[0]["requests"], 1);
+    assert_eq!(counts[0]["overloaded"], 1);
+    assert!(
+        h.upstream.seen.lock().unwrap().headers[0]
+            .get("x-codexctl-account-alias")
+            .is_none(),
+        "relay metadata never leaves the host"
+    );
+}
+
 fn failed_event(body: &str) -> Value {
     let data = body
         .split("\n\n")
@@ -682,7 +1046,10 @@ async fn stream_failure_type_trace_is_bounded() {
         ));
     }
     frames.push(OVERLOADED.into());
-    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    let h = harness_with(vec![Scripted::Sse(frames.clone())], |config| {
+        config.with_budgets(Duration::ZERO, Duration::ZERO)
+    })
+    .await;
     assert_eq!(
         h.post("bounded").await.text().await.unwrap(),
         frames.concat()
@@ -809,7 +1176,10 @@ async fn oversized_post_output_failure_is_recorded_before_partial_flush() {
         suffix.to_owned(),
     ];
     let expected = frames.concat();
-    let h = harness(vec![Scripted::Chunked(200, frames)]).await;
+    let h = harness_with(vec![Scripted::Chunked(200, frames)], |config| {
+        config.with_budgets(Duration::ZERO, Duration::ZERO)
+    })
+    .await;
     assert_eq!(
         h.post("oversized-after-output").await.text().await.unwrap(),
         expected
@@ -863,7 +1233,10 @@ async fn oversized_post_output_failure_with_late_type_is_not_truncated() {
         padding,
         suffix.to_owned(),
     ];
-    let h = harness(vec![Scripted::Chunked(200, frames)]).await;
+    let h = harness_with(vec![Scripted::Chunked(200, frames)], |config| {
+        config.with_budgets(Duration::ZERO, Duration::ZERO)
+    })
+    .await;
     h.post("oversized-late-type").await.text().await.unwrap();
     assert!(!h.logs.lock().unwrap().iter().any(|line| {
         serde_json::from_str::<Value>(line)
@@ -909,11 +1282,14 @@ async fn oversized_complete_failure_is_recorded_without_parsing_the_body() {
         "response": {"error": {"code": "server_is_overloaded", "message": padding}}
     });
     let failure = format!("event: response.failed\ndata: {event}\n\n");
-    let h = harness(vec![Scripted::Sse(vec![
-        CREATED.into(),
-        REASONING_DELTA.into(),
-        failure.clone(),
-    ])])
+    let h = harness_with(
+        vec![Scripted::Sse(vec![
+            CREATED.into(),
+            REASONING_DELTA.into(),
+            failure.clone(),
+        ])],
+        |config| config.with_budgets(Duration::ZERO, Duration::ZERO),
+    )
     .await;
     assert_eq!(
         h.post("oversized-complete").await.text().await.unwrap(),
@@ -1035,16 +1411,49 @@ async fn oversized_data_only_late_completed_type_does_not_create_a_false_truncat
 }
 
 #[tokio::test]
-async fn overloaded_after_output_passes_through_byte_for_byte() {
-    let frames = vec![
-        CREATED.to_string(),
-        REASONING_DELTA.into(),
-        REASONING_DELTA.into(),
-        REASONING_DELTA.into(),
-        OVERLOADED.into(),
-    ];
-    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
-    assert_eq!(h.post("t1").await.text().await.unwrap(), frames.concat());
+async fn overloaded_after_output_advises_without_replaying_the_request() {
+    let (gate, gate_rx) = mpsc::channel(1);
+    let (closed_tx, closed_rx) = oneshot::channel();
+    let h = harness(vec![Scripted::Gated(
+        vec![CREATED.into(), REASONING_DELTA.into(), OVERLOADED.into()],
+        gate_rx,
+        closed_tx,
+    )])
+    .await;
+    let mut stream = h.post("t1").await.bytes_stream();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap().as_ref(),
+        CREATED.as_bytes()
+    );
+    gate.send(()).await.unwrap();
+    assert_eq!(
+        stream.next().await.unwrap().unwrap().as_ref(),
+        REASONING_DELTA.as_bytes()
+    );
+    gate.send(()).await.unwrap();
+    let advised = tokio::time::timeout(Duration::from_millis(500), stream.next())
+        .await
+        .expect("the relay sends advice promptly; Codex owns the delay")
+        .unwrap()
+        .expect("after-output capacity is an advised failure, not a transport error");
+    let event = failed_event(std::str::from_utf8(&advised).unwrap());
+    assert_eq!(event["response"]["error"]["code"], "rate_limit_exceeded");
+    let delay = event["response"]["error"]["headers"]["retry-after"]
+        .as_str()
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!((1..=2).contains(&delay));
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        h.upstream.seen.lock().unwrap().bodies.len(),
+        1,
+        "the relay must not replay partial output or the request"
+    );
     let failure = h
         .logs
         .lock()
@@ -1055,14 +1464,495 @@ async fn overloaded_after_output_passes_through_byte_for_byte() {
         .expect("post-output failure is recorded");
     assert_eq!(failure["kind"], "overloaded");
     assert_eq!(failure["stage"], "after_output");
-    assert_eq!(failure["advised"], false);
+    assert_eq!(failure["advised"], true);
     assert_eq!(failure["types"][0], json!(["response.created", 1]));
     assert_eq!(
         failure["types"][1],
-        json!(["response.reasoning_summary_text.delta", 3])
+        json!(["response.reasoning_summary_text.delta", 1])
     );
     assert_eq!(failure["types"][2], json!(["response.failed", 1]));
     assert!(failure["ms_to_first_output"].is_number());
+}
+
+#[tokio::test]
+async fn oversized_fragmented_overload_with_late_code_advises_retry() {
+    let prefix = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"";
+    let suffix = "\",\"code\":\"server_is_overloaded\"}}}\n\n";
+    let mut chunks = vec![CREATED.into(), REASONING_DELTA.into(), prefix.into()];
+    chunks.extend((0..400).map(|_| "x".repeat(256)));
+    chunks.extend(
+        suffix
+            .as_bytes()
+            .chunks(3)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+    );
+    let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
+    let reply = h.post("large-late-code").await.text().await.unwrap();
+    assert!(reply.starts_with(&format!("{CREATED}{REASONING_DELTA}")));
+    let event = failed_event(&reply);
+    assert_eq!(event["response"]["error"]["code"], "rate_limit_exceeded");
+    assert!(event["response"]["error"]["headers"]["retry-after"].is_string());
+    assert_eq!(metric_stream(&h.metrics().await, "kind=\"overloaded\""), 1);
+    assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 1);
+}
+
+#[tokio::test]
+async fn a_different_terminal_failure_ends_the_previous_overload_streak() {
+    let capacity = vec![
+        CREATED.to_string(),
+        DELTA.to_string(),
+        OVERLOADED.to_string(),
+    ];
+    let unavailable = OVERLOADED.replace("server_is_overloaded", "model_unavailable");
+    let h = harness_with(
+        vec![
+            Scripted::Sse(capacity.clone()),
+            Scripted::Sse(vec![CREATED.into(), DELTA.into(), unavailable.clone()]),
+            Scripted::Sse(capacity),
+        ],
+        |config| config.with_budgets(Duration::ZERO, Duration::from_secs(2)),
+    )
+    .await;
+    let advised = h.post("changed-failure-kind").await.text().await.unwrap();
+    assert!(failed_event(&advised)["response"]["error"]["headers"]["retry-after"].is_string());
+    assert!(
+        h.post("changed-failure-kind")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains(&unavailable)
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let advised = h.post("changed-failure-kind").await.text().await.unwrap();
+    assert!(
+        failed_event(&advised)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "a new capacity streak must be allowed after a different terminal failure"
+    );
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 2);
+    assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 0);
+    assert_eq!(
+        metric(&metrics, "outcome=\"recovered\""),
+        0,
+        "ending a failed streak is not successful recovery"
+    );
+}
+
+#[tokio::test]
+async fn after_output_capacity_starts_a_new_budget_after_a_long_idle_gap() {
+    let frames = vec![
+        CREATED.to_string(),
+        DELTA.to_string(),
+        OVERLOADED.to_string(),
+    ];
+    let h = harness_with(
+        vec![Scripted::Sse(frames.clone()), Scripted::Sse(frames.clone())],
+        |config| config.with_budgets(Duration::ZERO, Duration::from_secs(2)),
+    )
+    .await;
+    let first = h.post("long-idle-gap").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    // The client follows the advice, so a gap beyond that delay plus the
+    // ordinary 120-second idle window belongs to a new turn.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h.post("long-idle-gap").await.text().await.unwrap();
+    assert!(failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string());
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 2);
+    assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 0);
+    assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0);
+}
+
+#[tokio::test]
+async fn non_responses_rate_streak_starts_a_new_budget_after_an_idle_gap() {
+    let h = harness_with(
+        vec![
+            Scripted::Status(429, vec![], RATE_429.into()),
+            Scripted::Status(429, vec![], RATE_429.into()),
+        ],
+        |config| config.with_budgets(Duration::from_secs(2), Duration::ZERO),
+    )
+    .await;
+    let url = format!("{}/backend-api/codex/other", h.relay_url);
+    let first = h
+        .client
+        .post(&url)
+        .header("thread-id", "idle-other-post")
+        .json(&json!({"model":"gpt-6.1-sol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 429);
+    assert!(first.headers().contains_key("retry-after"));
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h
+        .client
+        .post(&url)
+        .header("thread-id", "idle-other-post")
+        .json(&json!({"model":"gpt-6.1-sol"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resumed.status(), 429);
+    assert!(
+        resumed.headers().contains_key("retry-after"),
+        "a forwarded POST outside /responses must receive a fresh idle budget too"
+    );
+    assert_eq!(metric(&h.metrics().await, "outcome=\"exhausted\""), 0);
+}
+
+#[tokio::test]
+async fn a_fragmented_event_name_cannot_forward_a_failure_prefix() {
+    for after_output in [false, true] {
+        let (gate, rx) = mpsc::channel(1);
+        let (closed, _) = oneshot::channel();
+        let mut frames = vec![CREATED.to_string()];
+        if after_output {
+            frames.push(DELTA.to_string());
+        }
+        frames.extend(["event: response.f".into(), "ailed\ndata: {\"ty".into(), "pe\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"headers\":{\"retry-after\":\"30\"}}}}\n\n".into()]);
+        let h = harness_with(vec![Scripted::Gated(frames, rx, closed)], |config| {
+            if after_output {
+                config.with_budgets(Duration::ZERO, Duration::ZERO)
+            } else {
+                config
+            }
+        })
+        .await;
+        let mut stream = h.post("fragmented-event-name").await.bytes_stream();
+        let mut reply = stream.next().await.unwrap().unwrap().to_vec();
+        if after_output {
+            gate.send(()).await.unwrap();
+            reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
+        }
+        gate.send(()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err(),
+            "a partial event name must be held until it is complete"
+        );
+        gate.send(()).await.unwrap();
+        gate.send(()).await.unwrap();
+        let terminal = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        reply.extend_from_slice(&terminal);
+        drop(stream);
+        let text = String::from_utf8(reply).unwrap();
+        let terminal = failed_event(&text);
+        if after_output {
+            assert_eq!(
+                terminal["response"]["error"]["code"],
+                "server_is_overloaded"
+            );
+            assert!(!text.contains("retry-after"));
+        } else {
+            assert_eq!(terminal["response"]["error"]["code"], "rate_limit_exceeded");
+            assert!(terminal["response"]["error"]["headers"]["retry-after"].is_string());
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_large_output_frame_keeps_its_classification_after_prefix_flush() {
+    let frame = format!(
+        "event: response.output_text.delta\ndata: {{\"padding\":\"{}\",\"type\":\"response.output_text.delta\",\"delta\":\"synthetic\"}}\n\n",
+        "x".repeat(2 * 1024 * 1024)
+    );
+    let mut chunks = vec![CREATED.to_string(), DELTA.to_string()];
+    chunks.extend(
+        frame
+            .as_bytes()
+            .chunks(4093)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+    );
+    chunks.push(COMPLETED.to_string());
+    let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
+    let reply = h.post("large-late-output-type").await.text().await.unwrap();
+    assert!(
+        reply == format!("{CREATED}{DELTA}{frame}{COMPLETED}"),
+        "known output must preserve every byte across bounded buffer flushes"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_failure_without_a_delimiter_stops_with_valid_metadata() {
+    let failure = format!(
+        "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{\"code\":\"server_is_overloaded\",\"message\":\"{}",
+        "x".repeat(2 * 1024 * 1024)
+    );
+    let h = harness_with(
+        vec![Scripted::Chunked(
+            200,
+            vec![CREATED.into(), REASONING_DELTA.into(), failure],
+        )],
+        |config| config.with_budgets(Duration::ZERO, Duration::ZERO),
+    )
+    .await;
+    let reply = h.post("oversized-eof").await.text().await.unwrap();
+    assert_eq!(
+        failed_event(&reply)["response"]["error"]["code"],
+        "server_is_overloaded"
+    );
+    assert!(!reply.contains("retry-after"));
+    assert_eq!(metric(&h.metrics().await, "outcome=\"exhausted\""), 1);
+}
+
+#[tokio::test]
+async fn fragmented_exhausted_overloads_remove_upstream_retry_advice() {
+    for size in [100, 100 * 1024, 2 * 1024 * 1024] {
+        for headers_first in [false, true] {
+            let code = "\"code\":\"server_is_overloaded\"";
+            let headers = "\"headers\":{\"retry-after\":\"30\",\"retry-after-ms\":\"30000\",\"x-should-retry\":\"true\"}";
+            let message = format!("\"message\":\"{}\"", "x".repeat(size));
+            let fields = if headers_first {
+                format!("{headers},{message},{code}")
+            } else {
+                format!("{code},{message},{headers}")
+            };
+            let failure = format!(
+                "event: response.failed\ndata: {{\"type\":\"response.failed\",\"response\":{{\"error\":{{{fields}}}}}}}\n\n"
+            );
+            let mut chunks = vec![CREATED.to_string(), REASONING_DELTA.to_string()];
+            chunks.extend(
+                failure
+                    .as_bytes()
+                    .chunks(127)
+                    .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+            );
+            let h = harness_with(vec![Scripted::Chunked(200, chunks)], |config| {
+                config.with_budgets(Duration::ZERO, Duration::ZERO)
+            })
+            .await;
+            let reply = h.post("exhausted-advice").await.text().await.unwrap();
+            assert!(
+                reply.starts_with(&format!("{CREATED}{REASONING_DELTA}")),
+                "prior output is preserved"
+            );
+            let terminal = failed_event(&reply);
+            assert_eq!(
+                terminal["response"]["error"]["code"],
+                "server_is_overloaded"
+            );
+            assert!(
+                !reply.contains("retry-after") && !reply.contains("x-should-retry"),
+                "exhausted fragmented advice must not invite another retry (size={size}, headers_first={headers_first})"
+            );
+            assert_eq!(metric(&h.metrics().await, "outcome=\"exhausted\""), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_open_get_does_not_keep_a_post_retry_streak_alive() {
+    let (_gate, rx) = mpsc::channel(1);
+    let (closed, closed_rx) = oneshot::channel();
+    let frames = vec![CREATED.to_string(), OVERLOADED.into()];
+    let h = harness_with(
+        vec![
+            Scripted::Sse(frames.clone()),
+            Scripted::Gated(vec![CREATED.into(), COMPLETED.into()], rx, closed),
+            Scripted::Sse(frames),
+        ],
+        |config| config.with_budgets(Duration::from_secs(180), Duration::from_secs(2)),
+    )
+    .await;
+    let first = h.post("post-only-budget").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    let mut metadata = h
+        .client
+        .get(format!("{}/backend-api/codex/other", h.relay_url))
+        .header("thread-id", "post-only-budget")
+        .send()
+        .await
+        .unwrap()
+        .bytes_stream();
+    assert_eq!(metadata.next().await.unwrap().unwrap(), CREATED);
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let resumed = h.post("post-only-budget").await.text().await.unwrap();
+    drop(metadata);
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "an unrelated open GET must not protect an idle POST's old retry budget"
+    );
+}
+
+#[tokio::test]
+async fn partial_output_does_not_reset_the_overload_budget() {
+    let (gate, rx) = mpsc::channel(1);
+    let (closed, closed_rx) = oneshot::channel();
+    let frames = vec![
+        CREATED.to_string(),
+        REASONING_DELTA.into(),
+        OVERLOADED.into(),
+    ];
+    let h = harness_with(
+        vec![
+            Scripted::Sse(frames.clone()),
+            Scripted::Gated(frames.clone(), rx, closed),
+            Scripted::Sse(frames.clone()),
+            Scripted::Sse(frames.clone()),
+            Scripted::Sse(frames.clone()),
+        ],
+        |config| config.with_budgets(Duration::from_secs(180), Duration::from_secs(2)),
+    )
+    .await;
+    let first = h.post("same-turn-budget").await.text().await.unwrap();
+    assert!(failed_event(&first)["response"]["error"]["headers"]["retry-after"].is_string());
+    let mut stream = h.post("same-turn-budget").await.bytes_stream();
+    let mut reply = stream.next().await.unwrap().unwrap().to_vec();
+    gate.send(()).await.unwrap();
+    reply.extend_from_slice(&stream.next().await.unwrap().unwrap());
+    // The retry arrived promptly and is still streaming. Another request on
+    // this thread must not mistake the active response for an idle turn.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let exhausted = h.post("same-turn-budget").await.text().await.unwrap();
+    assert_eq!(
+        exhausted,
+        frames.concat(),
+        "the active response must protect the original budget during an overlapping request"
+    );
+    assert_eq!(
+        String::from_utf8(reply).unwrap(),
+        format!("{CREATED}{REASONING_DELTA}")
+    );
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(2), closed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let resumed = h.post("same-turn-budget").await.text().await.unwrap();
+    assert!(
+        failed_event(&resumed)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "after the active response is dropped a resumed turn can receive fresh advice"
+    );
+    // The resumed streak has not exhausted. Unlike the preceding assertion,
+    // this idle reset can succeed only if the streamed-body guards were released.
+    tokio::time::sleep(Duration::from_secs(123)).await;
+    let after_idle = h.post("same-turn-budget").await.text().await.unwrap();
+    assert!(
+        failed_event(&after_idle)["response"]["error"]["headers"]["retry-after"].is_string(),
+        "cancellation and EOF must release protection so a non-exhausted idle streak resets"
+    );
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 3);
+    assert_eq!(metric(&metrics, "outcome=\"exhausted\""), 1);
+    assert_eq!(metric(&metrics, "outcome=\"recovered\""), 0);
+}
+
+#[tokio::test]
+async fn quoted_overload_code_in_a_large_message_is_not_a_capacity_error() {
+    let mut failure = json!({"type":"response.failed", "response":{"error":{"message":format!("{}{}", r#"{"response":{"error":{"code":"server_is_overloaded"}}}"#, "x".repeat(100 * 1024)), "code":"model_unavailable"}}}).to_string();
+    failure = format!("event: response.failed\ndata: {failure}\n\n");
+    let mut chunks = vec![CREATED.to_string(), REASONING_DELTA.to_string()];
+    chunks.extend(
+        failure
+            .as_bytes()
+            .chunks(127)
+            .map(|bytes| String::from_utf8(bytes.to_vec()).unwrap()),
+    );
+    let expected = chunks.concat();
+    let h = harness(vec![Scripted::Chunked(200, chunks)]).await;
+    let result = h.post("quoted-code").await.text().await.unwrap();
+    assert!(
+        result == expected,
+        "quoted payload content must not cause a transport cut or alter bytes"
+    );
+    assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 0);
+}
+
+#[tokio::test]
+async fn evidence_reserves_daily_space_for_later_capacity_failures() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory
+        .path()
+        .join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    std::fs::write(&path, vec![b'\n'; 3 * 1024 * 1024]).unwrap();
+    let h = harness_with(vec![Scripted::Sse(vec![OVERLOADED.into()])], |config| {
+        config.with_evidence_dir(directory.path())
+    })
+    .await;
+    h.post("evidence-reserved").await.text().await.unwrap();
+    let evidence = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let text = std::fs::read_to_string(&path).unwrap();
+            if text.contains("server_is_overloaded") {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let rows: Vec<Value> = evidence
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "request observations must leave reserved space for failures"
+    );
+    assert_eq!(rows[0]["error_code"], "server_is_overloaded");
+    assert!(std::fs::metadata(path).unwrap().len() <= 4 * 1024 * 1024);
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_evidence_dropped_total{reason=\"daily_limit\"} 1")
+    );
+}
+
+#[tokio::test]
+async fn evidence_daily_bound_does_not_block_response_delivery() {
+    let directory = tempfile::tempdir().unwrap();
+    let h = harness_with(
+        vec![
+            Scripted::Sse(vec![CREATED.into(), COMPLETED.into()]),
+            Scripted::Sse(vec![CREATED.into(), OVERLOADED.into()]),
+        ],
+        |config| config.with_evidence_dir(directory.path()),
+    )
+    .await;
+    h.post("evidence-bound").await.text().await.unwrap();
+    let path = directory
+        .path()
+        .join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !std::fs::read(&path).is_ok_and(|bytes| bytes.ends_with(b"\n")) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    std::fs::write(&path, vec![b'\n'; 4 * 1024 * 1024]).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), h.post("evidence-bound"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(failed_event(&reply)["response"]["error"]["headers"]["retry-after"].is_string());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !h
+            .metrics()
+            .await
+            .contains("codexctl_relay_evidence_dropped_total{reason=\"daily_limit\"} 2")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 4 * 1024 * 1024);
 }
 
 #[tokio::test]
@@ -1072,7 +1962,10 @@ data: {"type":"response.audio.delta","delta":"abc"}
 
 "#;
     let frames = vec![CREATED.to_string(), audio.to_owned(), OVERLOADED.to_owned()];
-    let h = harness(vec![Scripted::Sse(frames.clone())]).await;
+    let h = harness_with(vec![Scripted::Sse(frames.clone())], |config| {
+        config.with_budgets(Duration::ZERO, Duration::ZERO)
+    })
+    .await;
     assert_eq!(
         h.post("audio-output").await.text().await.unwrap(),
         frames.concat()
@@ -1311,7 +2204,8 @@ async fn responses_stream_and_client_disconnect_cancels_upstream() {
 async fn post_output_partial_frames_forward_without_waiting_for_the_delimiter() {
     let (gate, gate_rx) = mpsc::channel(1);
     let (closed_tx, closed_rx) = oneshot::channel();
-    let partial = "event: response.failed\ndata: {\"type\":\"response.failed\"";
+    let partial =
+        "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\"";
     let h = harness(vec![Scripted::Gated(
         vec![CREATED.into(), DELTA.into(), partial.into()],
         gate_rx,

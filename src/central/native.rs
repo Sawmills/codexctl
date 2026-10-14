@@ -4,6 +4,7 @@ use super::{
     server::{TokenRequest, TokenResponse},
     vault,
 };
+use crate::config::{codex_config_path as config_path, write_codex_config as write_config};
 use crate::{api, config, store};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -372,44 +373,6 @@ pub(super) fn native_lock(directory: &Path) -> Result<vault::Lock> {
             Err(error) => return Err(error),
         }
     }
-}
-fn config_path(home: &Path) -> Result<PathBuf> {
-    let path = home.join("config.toml");
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-        Ok(std::fs::canonicalize(path)?)
-    } else {
-        Ok(path)
-    }
-}
-fn write_config(destination: &Path, bytes: &[u8]) -> Result<()> {
-    write_config_with(destination, bytes, |parent| {
-        std::fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })
-}
-fn write_config_with(
-    destination: &Path,
-    bytes: &[u8],
-    sync_parent: impl FnOnce(&Path) -> Result<()>,
-) -> Result<()> {
-    use std::io::Write;
-    let parent = destination
-        .parent()
-        .context("configuration has no parent")?;
-    let permissions = match std::fs::metadata(destination) {
-        Ok(metadata) => Some(metadata.permissions()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(bytes)?;
-    if let Some(permissions) = permissions {
-        file.as_file().set_permissions(permissions)?;
-    }
-    file.as_file().sync_all()?;
-    file.persist(destination).map_err(|e| e.error)?;
-    sync_parent(parent)?;
-    Ok(())
 }
 fn restore_active_pointer(pointer: &Path, previous_pointer: Option<&[u8]>) -> Result<()> {
     let current = read_optional_file(pointer)?;
@@ -1309,6 +1272,21 @@ fn document(home: &Path) -> Result<DocumentMut> {
     }
 }
 
+/// Change the host relay route without touching account or billing selection.
+pub fn configure_relay(listen: Option<std::net::SocketAddr>) -> Result<()> {
+    if std::env::var_os("CODEX_HOME").is_some()
+        || std::env::var_os("CODEXCTL_PINNED_ALIAS").is_some()
+    {
+        bail!("relay routing cannot be changed from an inherited or pinned Codex home");
+    }
+    let paths = config::default_paths()?;
+    paths.ensure_dirs()?;
+    let _native = native_lock(&root()?)?;
+    let _store = store::try_lock(&paths)?
+        .context("local account store is busy; retry relay configuration")?;
+    crate::relay::configure_central_route(&paths, listen)
+}
+
 /// Resolve explicit unmigrated local names without requiring an online catalog.
 pub fn known_local_alias(alias: &str) -> Result<bool> {
     if AccountRef::parse(alias)?.is_borrowed() {
@@ -1587,8 +1565,15 @@ pub fn activate(
         .and_then(|providers| providers.get(PROVIDER))
         .cloned();
     let mut provider = Table::new();
+    let route = crate::relay::central_provider(&paths, None, None)?;
+    let stream_retries = existing_provider
+        .as_ref()
+        .and_then(|item| item.get("stream_max_retries"))
+        .and_then(Item::as_integer)
+        .unwrap_or(12);
     provider["name"] = value("Central Codex");
-    provider["base_url"] = value("https://chatgpt.com/backend-api/codex");
+    provider["base_url"] = value(route.url);
+    provider["http_headers"] = value(route.headers);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(false);
     provider["auth"]["command"] = value(helper.to_str().context("helper path must be UTF-8")?);
@@ -1603,17 +1588,14 @@ pub fn activate(
     // These limits cover 5xx responses, dropped streams and network errors.
     // Codex does not retry an HTTP 429 or a "model at capacity" stop unless
     // the server sends retry advice; `codexctl relay` adds that advice.
-    // Preserve an operator's explicit values when an active provider is rewritten.
+    // Preserve stream limits: Codex also uses them for unrelated failures
+    // whose client backoff is unbounded.
     provider["request_max_retries"] = existing_provider
         .as_ref()
         .and_then(|item| item.get("request_max_retries"))
         .cloned()
         .unwrap_or_else(|| value(12));
-    provider["stream_max_retries"] = existing_provider
-        .as_ref()
-        .and_then(|item| item.get("stream_max_retries"))
-        .cloned()
-        .unwrap_or_else(|| value(12));
+    provider["stream_max_retries"] = value(stream_retries);
     if let Some(inline) = doc.get("model_providers").and_then(Item::as_inline_table) {
         doc["model_providers"] = Item::Table(inline.clone().into_table());
     } else if doc.get("model_providers").is_none() {
