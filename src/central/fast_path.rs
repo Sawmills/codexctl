@@ -1,6 +1,7 @@
 //! Valid-token fast path. In PostgreSQL mode a pod can serve a committed
-//! credential without the account lease or a native child, when fresh evidence
-//! for that exact credential revision proves billing and routing.
+//! credential without the account lease or a native child. Ordinary clients
+//! require fresh evidence for that revision's billing and routing. The opt-in
+//! canary policy can return the token with those facts explicitly unknown.
 use super::server::{TokenRequest, TokenResponse};
 use crate::api;
 use serde_json::Value;
@@ -50,6 +51,8 @@ pub(super) struct Observation {
 
 /// The committed record and its evidence, read without a lease.
 pub(super) struct FastRead {
+    /// Actual PostgreSQL database, not a caller-supplied connection label.
+    pub database: String,
     pub user_id: Option<String>,
     pub alias: String,
     pub revision: i64,
@@ -63,6 +66,7 @@ pub(super) struct FastRead {
 
 /// The committed credential as PostgreSQL holds it.
 pub(super) struct Candidate<'a> {
+    pub database: &'a str,
     pub auth: &'a Value,
     pub account_revision: i64,
     pub label: Option<String>,
@@ -78,6 +82,29 @@ pub(super) fn enabled() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var("CODEXCTL_CENTRAL_TOKEN_FAST_PATH").is_ok_and(|value| value == "1")
     })
+}
+
+/// The canary can export a valid vault token without discovering routing or
+/// billing through native. Ordinary clients still require that evidence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Policy {
+    Observed,
+    Vault,
+}
+
+impl Policy {
+    pub(super) fn configured() -> Self {
+        static POLICY: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
+        *POLICY.get_or_init(|| {
+            if std::env::var("CODEXCTL_CENTRAL_TOKEN_VAULT_FAST_PATH")
+                .is_ok_and(|value| value == "1")
+            {
+                Self::Vault
+            } else {
+                Self::Observed
+            }
+        })
+    }
 }
 
 const RESULTS: [&str; 12] = [
@@ -251,7 +278,11 @@ impl Miss {
 pub(super) fn decide(
     candidate: &Candidate<'_>,
     request: &TokenRequest,
+    policy: Policy,
 ) -> Result<TokenResponse, Miss> {
+    if policy == Policy::Vault && candidate.database != "codexctl_a5_canary" {
+        return Err(Miss::Disabled);
+    }
     let auth = candidate.auth;
     let access_token = super::vault::token(auth).map_err(|_| Miss::Identity)?;
     let expires = api::token_expiry(access_token).ok_or(Miss::Expiring)?;
@@ -260,12 +291,48 @@ pub(super) fn decide(
         return Err(Miss::Expiring);
     }
     let revision = super::vault::digest(&serde_json::to_vec(auth).map_err(|_| Miss::Identity)?);
-    // Equal means the client saw this exact token rejected.
-    if request.previous_revision.as_deref() == Some(revision.as_str()) {
+    // The vault policy never lets a rejected revision force a healthy token
+    // through native initialization. It makes no new routing or billing claim.
+    if policy == Policy::Observed && request.previous_revision.as_deref() == Some(revision.as_str())
+    {
         return Err(Miss::Forced);
     }
+    let token = TokenResponse {
+        user_id: None,
+        chatgpt_account_id: super::vault::account(auth).map_err(|_| Miss::Identity)?,
+        chatgpt_plan_type: api::token_identity(access_token).and_then(|identity| identity.plan),
+        revision,
+        access_token: access_token.to_owned(),
+        billing_class: request.billing.then_some(api::BillingClass::Unknown),
+        native_routing_supported: false,
+        statusline_usage: None,
+        label: candidate.label.clone(),
+    };
+    let observed = observed(candidate, request, token.clone());
+    match (policy, observed) {
+        // Even fresh Unknown billing must not open the client's explicit
+        // billing-approval path. Its routing gate rejects this canary response.
+        (Policy::Vault, Ok(observed))
+            if observed.billing_class == Some(api::BillingClass::Unknown) =>
+        {
+            Ok(token)
+        }
+        (_, Ok(token)) => Ok(token),
+        // Only absent or stale evidence is unknown. Positive routing/capacity
+        // refusals remain refusals, even for a vault-only read.
+        (Policy::Vault, Err(Miss::EvidenceMissing | Miss::EvidenceStale)) => Ok(token),
+        (_, Err(miss)) => Err(miss),
+    }
+}
+
+fn observed(
+    candidate: &Candidate<'_>,
+    request: &TokenRequest,
+    mut token: TokenResponse,
+) -> Result<TokenResponse, Miss> {
     let evidence = candidate.evidence.ok_or(Miss::EvidenceMissing)?;
-    if evidence.auth_revision != revision || evidence.account_revision != candidate.account_revision
+    if evidence.auth_revision != token.revision
+        || evidence.account_revision != candidate.account_revision
     {
         return Err(Miss::EvidenceStale);
     }
@@ -275,17 +342,7 @@ pub(super) fn decide(
     if !evidence.routing_supported {
         return Err(Miss::Routing);
     }
-    let mut token = TokenResponse {
-        user_id: None,
-        chatgpt_account_id: super::vault::account(auth).map_err(|_| Miss::Identity)?,
-        chatgpt_plan_type: api::token_identity(access_token).and_then(|identity| identity.plan),
-        revision,
-        access_token: access_token.to_owned(),
-        billing_class: None,
-        native_routing_supported: true,
-        statusline_usage: None,
-        label: candidate.label.clone(),
-    };
+    token.native_routing_supported = true;
     if request.billing {
         let billing = evidence.billing.as_ref().ok_or(Miss::EvidenceMissing)?;
         if billing.age > EVIDENCE_MAX_AGE {
@@ -335,6 +392,10 @@ mod tests {
     use serde_json::json;
 
     const NOW: i64 = 2_000_000_000;
+
+    fn decide(candidate: &Candidate<'_>, request: &TokenRequest) -> Result<TokenResponse, Miss> {
+        super::decide(candidate, request, Policy::Observed)
+    }
 
     // TokenResponse carries an access token, so it has no Debug.
     fn miss(result: Result<TokenResponse, Miss>) -> Miss {
@@ -405,6 +466,7 @@ mod tests {
 
     fn candidate<'a>(auth: &'a Value, evidence: Option<&'a Evidence>) -> Candidate<'a> {
         Candidate {
+            database: "codexctl_a5",
             auth,
             account_revision: 7,
             label: Some("Seat".into()),

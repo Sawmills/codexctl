@@ -1457,7 +1457,15 @@ async fn token(
         Some(borrowed) => borrowed.owner.clone(),
         None => broker.owner(&device, alias).await?,
     };
-    if broker.on_demand_recovery() {
+    let policy = fast_path::Policy::configured();
+    let vault_fast = policy == fast_path::Policy::Vault
+        && broker
+            .central
+            .as_ref()
+            .is_some_and(|central| central.mode() == StoreMode::Postgres);
+    // Canary reads must see a local fence as a refusal, never a reason to
+    // initialize native during on-demand recovery.
+    if !vault_fast && broker.on_demand_recovery() {
         let worker = broker.clone();
         let owner_ref = owner.clone();
         let account_id = request.account_id.clone();
@@ -1486,7 +1494,7 @@ async fn token(
     }
     // The fast path and the lease wait run only behind the flag, in
     // PostgreSQL mode. Dual and file mode keep today's path.
-    let fast_on = fast_path::enabled()
+    let fast_on = (fast_path::enabled() || vault_fast)
         && broker
             .central
             .as_ref()
@@ -1517,6 +1525,7 @@ async fn token(
                 &fast_user,
                 &fast_alias,
                 &template,
+                policy,
             )
             .await;
             fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
@@ -1526,6 +1535,9 @@ async fn token(
                         fast_path::Wait::Committed.record(started.elapsed());
                     }
                     break (token, alias, fast_account.clone());
+                }
+                Err(miss) if vault_fast && miss != fast_path::Miss::Expiring => {
+                    return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
                 }
                 Err(miss) => busy_owner = miss == fast_path::Miss::Busy,
             }
@@ -1545,8 +1557,8 @@ async fn token(
         let mut request = template.clone();
         let requesting_device = device.id.clone();
         // A request that found the owner busy re-checks under its lock.
-        let fast_locked =
-            busy_owner.then(|| (fast_account.clone(), fast_user.clone(), fast_alias.clone()));
+        let fast_locked = (busy_owner || vault_fast)
+            .then(|| (fast_account.clone(), fast_user.clone(), fast_alias.clone()));
         busy_owner = false;
         let busy = Arc::new(StdMutex::new(None::<(String, i64)>));
         let busy_slot = busy.clone();
@@ -1620,16 +1632,19 @@ async fn token(
         {
             let result = fast_token(
                 &worker,
-                LocalOwner::Locked,
+                LocalOwner::Locked(&owner),
                 fast_account,
                 fast_user,
                 fast_alias,
                 &request,
+                policy,
             )
             .await;
             fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
             if let Ok((token, alias)) = result {
                 return Ok((token, alias, account_id));
+            } else if vault_fast && !matches!(result, Err(fast_path::Miss::Expiring)) {
+                return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
             }
         }
         // `account/read` may refresh even without a forced request. Every
@@ -1697,6 +1712,31 @@ async fn token(
         };
         if reconciled {
             request.previous_revision = None;
+        }
+        // A different lease holder may have refreshed while this request
+        // waited. Recheck the committed token before initializing native.
+        if vault_fast {
+            let result = fast_token(
+                &worker,
+                LocalOwner::Locked(&owner),
+                &account_id,
+                &owner.vault.user,
+                &owner.vault.alias,
+                &request,
+                policy,
+            ).await;
+            match result {
+                Err(fast_path::Miss::Expiring) => {}
+                result => {
+                    if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
+                        central.release_lease(lease).await.map_err(|_| {
+                            worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                        })?;
+                    }
+                    return result.map(|(token, alias)| (token, alias, account_id))
+                        .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
+                }
+            }
         }
         let renew_lost = Arc::new(AtomicBool::new(false));
         let renew_task = match (worker.central.clone(), lease.clone()) {
@@ -2110,8 +2150,8 @@ async fn token(
 enum LocalOwner<'a> {
     /// Probe it without waiting; a busy owner hides its fence, so it misses.
     Probe(&'a Arc<Mutex<Owner>>),
-    /// The caller holds the owner lock and has checked its fence.
-    Locked,
+    /// The caller holds the owner lock; the read still checks its local fence.
+    Locked(&'a Owner),
 }
 
 async fn fast_token(
@@ -2121,6 +2161,7 @@ async fn fast_token(
     user: &str,
     alias: &str,
     request: &TokenRequest,
+    policy: fast_path::Policy,
 ) -> Result<(TokenResponse, String), fast_path::Miss> {
     use fast_path::Miss;
     let central = broker.central.as_ref().ok_or(Miss::Disabled)?;
@@ -2144,17 +2185,19 @@ async fn fast_token(
     {
         return Err(Miss::Identity);
     }
-    if let LocalOwner::Probe(owner) = local {
-        let fenced = owner
+    let fenced = match local {
+        LocalOwner::Probe(owner) => owner
             .try_lock()
             .map(|owner| !owner.available || owner.routing_refused)
-            .map_err(|_| Miss::Busy)?;
-        if fenced {
-            return Err(Miss::Fenced);
-        }
+            .map_err(|_| Miss::Busy)?,
+        LocalOwner::Locked(owner) => !owner.available || owner.routing_refused,
+    };
+    if fenced {
+        return Err(Miss::Fenced);
     }
     let token = fast_path::decide(
         &fast_path::Candidate {
+            database: &read.database,
             auth: &vault.auth,
             account_revision: read.revision,
             label: vault.label.clone(),
@@ -2162,6 +2205,7 @@ async fn fast_token(
             evidence: read.evidence.as_ref(),
         },
         request,
+        policy,
     )?;
     Ok((token, read.alias))
 }

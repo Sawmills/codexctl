@@ -87,7 +87,7 @@ def rotate(plan_change=False):
         payload["sub"] = "different-login"
     if plan_change:
         payload["https://api.openai.com/auth"]["chatgpt_plan_type"] = "business"
-    if mode == "refresh-extends-expiry":
+    if mode == "refresh-extends-expiry" or (mode == "canary-routing-fence" and tokens(auth)["account_id"] == "synthetic-seat"):
         payload["exp"] = 4102444800
     payload["generation"] = payload.get("generation", 0) + 1
     payload["iat"] = 2000000000 + payload["generation"]
@@ -132,7 +132,7 @@ for line in sys.stdin:
                 sys.exit(1)
         if os.environ.get("CENTRAL_TEST_OWNER_CWD_FILE"):
             pathlib.Path(os.environ["CENTRAL_TEST_OWNER_CWD_FILE"]).write_text(os.getcwd())
-        if mode == "add-startup-hold" or (mode in ["startup-hold", "startup-hold-error"] and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat"):
+        if mode == "add-startup-hold" or (mode in ["startup-hold", "startup-hold-error"] and tokens(json.loads(auth_path.read_text()))["account_id"] == "synthetic-seat") or (mode == "canary-routing-fence" and tokens(json.loads(auth_path.read_text()))["account_id"] == "control-seat"):
             pathlib.Path(mode_path).with_name("initialize-started").write_text("started")
             deadline = time.monotonic() + 75
             while not pathlib.Path(mode_path).with_name("release-initialize").exists():
@@ -213,6 +213,8 @@ for line in sys.stdin:
             result["workspaceRouting"]["backendOrigin"] = "https://regional.chatgpt.com"
         if mode == "routing-missing":
             result["workspaceRouting"] = None
+        if mode == "canary-routing-fence" and after_limits and account_id == "synthetic-seat":
+            result["workspaceRouting"]["backendOrigin"] = "https://regional.chatgpt.com"
     elif method == "getAuthStatus":
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
         if mode == "cached-rotation":
@@ -296,6 +298,8 @@ for line in sys.stdin:
         auth = json.loads(auth_path.read_text())
         payload = json.loads(base64.urlsafe_b64decode(tokens(auth)["access_token"].split(".")[1] + "=="))
         mode = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text()
+        if mode == "canary-routing-fence" and tokens(auth)["account_id"] == "synthetic-seat":
+            rotate()
         result = {"rateLimits": {"planType":payload["https://api.openai.com/auth"].get("chatgpt_plan_type"), "primary":{"usedPercent":0,"windowDurationMins":300,"resetsAt":4102444800}, "credits":{"hasCredits": mode == "credits", "unlimited":False, "balance":"10" if mode == "credits" else "0"}}}
         if mode in ["closed-spend-cap", "open-spend-cap"]:
             result["rateLimits"]["spendControlReached"] = mode == "closed-spend-cap"
