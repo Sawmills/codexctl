@@ -2,7 +2,7 @@
 
 use std::{net::SocketAddr, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use super::{DEFAULT_LISTEN, RelayConfig};
 
@@ -33,7 +33,7 @@ pub enum RelayAction {
         #[arg(long, default_value_t = super::DEFAULT_OVERLOADED_BUDGET.as_secs())]
         overloaded_budget_secs: u64,
     },
-    /// Exit 0 only when the relay answers on its loopback address.
+    /// Exit 0 only when the relay proves its loopback listener identity.
     Status {
         #[arg(long, default_value = DEFAULT_LISTEN)]
         listen: SocketAddr,
@@ -99,16 +99,10 @@ pub fn run(action: RelayAction) -> Result<()> {
             })
         }
         RelayAction::Status { listen } => {
-            let url = format!("http://{listen}/healthz");
-            let response = reqwest::blocking::Client::builder()
-                .timeout(Duration::from_secs(2))
-                .build()?
-                .get(&url)
-                .send()
-                .with_context(|| format!("relay is not answering at {listen}"))?;
-            if !response.status().is_success() {
-                bail!("relay at {listen} answered {}", response.status());
-            }
+            super::identity::require_listener(
+                &crate::config::default_paths()?.codexctl_dir(),
+                listen,
+            )?;
             println!("relay ok at {listen}");
             Ok(())
         }

@@ -10,7 +10,7 @@ use crate::{config::Paths, store};
 const DIRECT: &str = "https://chatgpt.com/backend-api/codex";
 const PROVIDER: &str = "codexctl-central";
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Routing {
     listen: Option<SocketAddr>,
@@ -19,6 +19,24 @@ struct Routing {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
+    routing: Routing,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RouteState {
+    relay: FileState,
+    pending: FileState,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum FileState {
+    Missing,
+    Bytes(Vec<u8>),
+    Other(std::io::ErrorKind),
+}
+
+pub(crate) struct RouteProof {
+    state: RouteState,
     routing: Routing,
 }
 
@@ -39,6 +57,28 @@ fn lock(paths: &Paths) -> Result<std::fs::File> {
     Ok(file)
 }
 
+fn route_state(paths: &Paths) -> Result<RouteState> {
+    fn read_optional(path: std::path::PathBuf) -> Result<FileState> {
+        match std::fs::read(path) {
+            Ok(bytes) => Ok(FileState::Bytes(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileState::Missing),
+            Err(error) => Ok(FileState::Other(error.kind())),
+        }
+    }
+
+    Ok(RouteState {
+        relay: read_optional(paths.codexctl_dir().join("relay.json"))?,
+        pending: read_optional(paths.codexctl_dir().join("relay.pending.json"))?,
+    })
+}
+
+fn unchanged(paths: &Paths, expected: &RouteState) -> Result<()> {
+    if route_state(paths)? != *expected {
+        bail!("relay routing changed during listener proof; retry")
+    }
+    Ok(())
+}
+
 fn recover(paths: &Paths) -> Result<()> {
     let pending = paths.codexctl_dir().join("relay.pending.json");
     if !pending.try_exists()? {
@@ -54,6 +94,13 @@ fn recover(paths: &Paths) -> Result<()> {
 }
 
 impl Routing {
+    fn require_listener(&self, paths: &Paths) -> Result<()> {
+        if let Some(listen) = self.listen {
+            super::identity::require_listener(&paths.codexctl_dir(), listen)?;
+        }
+        Ok(())
+    }
+
     fn url(&self) -> Result<String> {
         match self.listen {
             Some(listen) if listen.ip().is_loopback() && listen.port() != 0 => {
@@ -95,12 +142,50 @@ impl Routing {
     }
 }
 
+/// Prove the route selected by the current durable state before taking any
+/// native, store, or relay locks. The state is checked again by the caller
+/// while those locks are held before it is applied or returned.
+pub(crate) fn preflight_route(paths: &Paths) -> Result<RouteProof> {
+    let state = route_state(paths)?;
+    let routing = if let FileState::Bytes(bytes) = &state.pending {
+        serde_json::from_slice::<Pending>(bytes)?.routing
+    } else if let FileState::Bytes(bytes) = &state.relay {
+        serde_json::from_slice::<Routing>(bytes)?
+    } else if matches!(&state.pending, FileState::Missing)
+        && matches!(&state.relay, FileState::Missing)
+    {
+        Routing::default()
+    } else {
+        bail!("relay routing state is not a readable regular file")
+    };
+    routing.require_listener(paths)?;
+    Ok(RouteProof { state, routing })
+}
+
+/// Validate a requested configuration before taking any native, store, or
+/// relay locks. `None` intentionally skips listener proof so direct disable
+/// remains available during rollback from a bad pending enable intent.
+pub(crate) fn preflight_configuration(
+    paths: &Paths,
+    listen: Option<SocketAddr>,
+) -> Result<RouteProof> {
+    let state = route_state(paths)?;
+    let routing = Routing { listen };
+    routing.url()?;
+    if listen.is_some() {
+        routing.require_listener(paths)?;
+    }
+    Ok(RouteProof { state, routing })
+}
+
 pub(crate) fn central_provider(
     paths: &Paths,
     alias: Option<&str>,
     billing: Option<crate::api::BillingClass>,
+    proof: &RouteProof,
 ) -> Result<ProviderRoute> {
     let _lock = lock(paths)?;
+    unchanged(paths, &proof.state)?;
     recover(paths)?;
     let path = paths.codexctl_dir().join("relay.json");
     let routing = if path.try_exists()? {
@@ -108,20 +193,27 @@ pub(crate) fn central_provider(
     } else {
         Routing::default()
     };
+    if routing.listen != proof.routing.listen {
+        bail!("relay routing changed during listener proof; retry");
+    }
     routing.provider(alias, billing)
 }
 
 /// A durable intent is rolled forward before any later route is selected. Both
 /// projections use one route lock; unrelated Codex config fields are preserved.
-pub(crate) fn configure(paths: &Paths, listen: Option<SocketAddr>) -> Result<()> {
-    let routing = Routing { listen };
-    routing.url()?;
+pub(crate) fn configure(paths: &Paths, proof: &RouteProof) -> Result<()> {
     let _lock = lock(paths)?;
-    recover(paths)?;
-    store::atomic_write(
-        &paths.codexctl_dir().join("relay.pending.json"),
-        &serde_json::to_vec(&Pending { routing })?,
-    )?;
+    unchanged(paths, &proof.state)?;
+    // This explicit intent supersedes any unfinished intent. Recovery remains
+    // on route selection, where the selected listener is proved before apply.
+    let pending_path = paths.codexctl_dir().join("relay.pending.json");
+    let result = store::atomic_write(
+        &pending_path,
+        &serde_json::to_vec(&Pending {
+            routing: proof.routing.clone(),
+        })?,
+    );
+    result?;
     recover(paths)
 }
 

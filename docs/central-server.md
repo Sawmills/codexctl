@@ -614,6 +614,29 @@ Exit status is the child's status (including `128 + signal` on Unix), 1 for laun
 or policy failures, and 2 for invalid CLI options. Herdr pane management stays outside
 codexctl: stop the intended lane, then run the pinned launch in that lane.
 
+### Relay listener identity
+
+The relay creates one random 256-bit identity key per exact loopback listener under
+`~/.codexctl/relay/identity/`. The service creates a missing key with a private regular
+file in private directories. Clients only read it. `relay status`, `relay enable`, and
+central account-server route selection send a fresh nonce challenge to `/healthz` and
+require a versioned HMAC proof that includes the exact listener address. The check has
+a two-second bound, no proxy or redirect, and a bounded response. A plain `200 ok`, a
+wrong or replayed proof, a stale listener, an unsafe file, and a missing or replaced
+key fail closed. Direct `relay disable` remains available for rollback.
+
+Existing directories and keys must already have the required owner and private modes;
+the identity path never repairs unsafe filesystem state. A relay root created by an
+older build may need an operator to verify ownership and set `~/.codexctl/relay/`
+and its ancestors to `0700` before restarting the upgraded service.
+
+This is a point-in-time check. It proves that the listener answering the challenge has
+the private key at that moment. It does not authenticate later bearer-bearing HTTP
+connections, a proof-forwarding proxy, or an independently started Codex that does not
+run the codexctl-managed preflight. Authenticated receiver transport remains a separate
+decision. Existing relay services need the normal upgrade and fresh launch to create
+the identity context; this change does not enable or restart a host service.
+
 ### Live-session observations
 
 The account server counts token sessions seen in the last ten minutes. The

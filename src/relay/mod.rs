@@ -9,10 +9,14 @@
 
 pub mod cli;
 mod evidence;
+mod identity;
 mod policy;
 mod routing;
 
-pub(crate) use routing::{central_provider, configure as configure_central_route};
+pub(crate) use routing::{
+    central_provider, configure as configure_central_route, preflight_configuration,
+    preflight_route,
+};
 
 use std::{
     collections::BTreeMap,
@@ -25,7 +29,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     body::{Body, Bytes},
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, RawQuery, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -82,6 +86,7 @@ pub struct RelayConfig {
     log: Log,
     central: Option<CentralReporter>,
     evidence_dir: Option<std::path::PathBuf>,
+    identity_root: std::path::PathBuf,
 }
 
 impl RelayConfig {
@@ -103,7 +108,14 @@ impl RelayConfig {
             log: Arc::new(|line| eprintln!("{line}")),
             central: None,
             evidence_dir: None,
+            identity_root: crate::config::default_paths()?.codexctl_dir(),
         })
+    }
+
+    /// Sets the private codexctl store root used for listener identity.
+    pub fn with_identity_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.identity_root = root.into();
+        self
     }
 
     /// Sets how long a 429 streak and a capacity streak may keep advising.
@@ -264,6 +276,7 @@ pub async fn serve(
     if !address.ip().is_loopback() {
         bail!("relay binds only to loopback, not {address}");
     }
+    let identity = Arc::new(identity::Identity::open(&config.identity_root, address)?);
     // No overall timeout: a Responses stream can run for many minutes, and
     // Codex owns its own idle timeout.
     let client = reqwest::Client::builder()
@@ -319,7 +332,13 @@ pub async fn serve(
         }
     });
     let app = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/healthz",
+            get(move |RawQuery(query): RawQuery| {
+                let identity = identity.clone();
+                async move { identity.health(query.as_deref()) }
+            }),
+        )
         .route("/metrics", get(metrics))
         .fallback(forward)
         .layer(DefaultBodyLimit::disable())

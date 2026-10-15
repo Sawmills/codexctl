@@ -134,6 +134,7 @@ fn sse(body: Body) -> Response {
 }
 
 struct Harness {
+    _identity: tempfile::TempDir,
     relay_url: String,
     upstream: Upstream,
     logs: Arc<Mutex<Vec<String>>>,
@@ -194,9 +195,11 @@ async fn harness_with(
 
     let logs = Arc::new(Mutex::new(Vec::new()));
     let sink = logs.clone();
+    let identity = tempfile::tempdir().unwrap();
     let config = configure(
         RelayConfig::new(&upstream_url)
             .unwrap()
+            .with_identity_root(identity.path().join("store"))
             .with_log(move |line| sink.lock().unwrap().push(line.to_string())),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -210,6 +213,7 @@ async fn harness_with(
         .unwrap()
     });
     Harness {
+        _identity: identity,
         relay_url,
         upstream,
         logs,

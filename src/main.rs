@@ -269,7 +269,13 @@ fn main() {
     // Informational commands must work in a read-only or empty home. Clap
     // exits while parsing help, version, and invalid commands, and shell
     // completion generation does not need the profile store.
-    let needs_store = !matches!(&cli.command, Commands::Completions { .. });
+    let needs_store = match &cli.command {
+        Commands::Completions { .. } => false,
+        // Relay clients must not create keys or repair permissions before proof.
+        #[cfg(feature = "central-prototype")]
+        Commands::Relay { .. } => false,
+        _ => true,
+    };
     if needs_store && let Err(e) = config::ensure_dirs() {
         eprintln!("error: {e:#}");
         std::process::exit(1);
