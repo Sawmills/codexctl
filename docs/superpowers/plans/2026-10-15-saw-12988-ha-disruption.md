@@ -14,7 +14,7 @@ HQ approved this plan at 2026-10-15T14:0xZ. At its 13:35Z submission, no source/
 
 HQ's deployment disposition is merge + Argo roll as soon as exact-head Architect, HQ and CI gates pass; t56 runs acceptance (at least two Ready during roll, final 3/3 Ready in three zones, public `/ready` 200, ten minutes without errors and a Mac turn). This disposition supersedes the proposed two-hour recurrence observation as a release gate. Longer observation remains useful but does not delay this approved rollout. HQ supplied the previously blocked metadata: default NodePool `expireAfter: 336h`, no `terminationGracePeriod`, consolidation after 1800 seconds, budget one node; live Argo e48dc23b Synced/Healthy and three named pods in three zones. HQ explicitly accepted the expiry/drain caveat documented below; no NodePool mutation is authorized.
 
-Use one PR on `amiri/saw-12988-ha-disruption`, from main `e48dc23b332d2e98ecf449c27d8d3c8abbd1cc21`. Worktree: `/home/amir/Code/codexctl/.worktrees/SAW-12988`. Preserve the existing deferred Job items in SAW-12988; this PR covers only the newly assigned lifecycle/disruption work. The historical schema-inventory item was addressed during H/I rounds; do not reopen or modify the completed cutover Jobs here.
+Use one PR on `amiri/saw-12988-ha-disruption`, from main `e48dc23b332d2e98ecf449c27d8d3c8abbd1cc21`. Preserve the existing deferred Job items in SAW-12988; this PR covers only the newly assigned lifecycle/disruption work. The historical schema-inventory item was addressed during H/I rounds; do not reopen or modify the completed cutover Jobs here.
 
 ## Evidence and diagnosis
 
@@ -31,15 +31,15 @@ Read-only observation on 2026-10-15, approximately 13:25–13:35Z:
 
 **Reproduced cause:** preStop sends TERM before finishing its own sleep. When PID 1 finishes shutdown quickly, the container runtime kills the remaining hook process in that PID namespace. The hook reports failure despite successful server exit. The local reproduction executes the actual checked-in hook with UID/GID 10001, all capabilities dropped, read-only filesystem and no network, against a synthetic TERM-handling PID 1 in the runtime's cached Node base image `b26b04c123d9`.
 
-Diagnostic command already run:
+The portable regression command, run before and after the manifest fix from the repository root:
 
 ```sh
-python3 /home/amir/Code/.fleet/codexctl/receipts/saw-12988/prestop-repro.py
+python3 tests/ha_lifecycle_test.py -v
 ```
 
 It fails the hook-success assertion: hook exit **137** in ~0.04 s, server exit **0**, settlement marker present, stderr empty. With a 250 ms settlement delay: hook exit **137**, server exit **0**. A candidate hook containing only `sleep 5`, followed by kubelet-style TERM after hook completion, returns hook **0** and server **0** for both settlement speeds. This reproduces the lifecycle defect; it does not prove the unavailable exit code of each historical pod.
 
-Receipts: `/home/amir/Code/.fleet/codexctl/receipts/saw-12988/` (`prestop-repro.py`, `current-fast.txt`, `current-delayed.txt`, `candidate-fast.txt`, `candidate-delayed.txt`, `current-log-counts.json`). No live state or credentials enter these tests.
+The [PR validation receipt](https://github.com/Sawmills/codexctl/pull/204#issuecomment-6194227167) records each before/after case, the final test output and render comparison. The [checked-in regression](../../../tests/ha_lifecycle_test.py) runs the actual rendered hook with its pinned base image and documents prerequisites. No live state or credentials enter these tests.
 
 ## Proposed change
 
