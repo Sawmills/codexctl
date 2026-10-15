@@ -146,6 +146,11 @@ impl Fixture {
     }
 
     async fn seed_loan(&self) {
+        self.write_loan().await;
+        assert!(self.backfill().await.status.success());
+    }
+
+    async fn write_loan(&self) {
         let file = central::storage::CentralStore::from_mode(
             central::storage::StoreMode::File,
             &self.state(),
@@ -176,7 +181,6 @@ impl Fixture {
             deleted_at: None,
         };
         assert!(file.create_loan(&grant).await.unwrap());
-        assert!(self.backfill().await.status.success());
     }
 
     async fn backfill(&self) -> Output {
@@ -212,6 +216,140 @@ impl Fixture {
             .await
             .unwrap();
         self.connection.abort();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux user/mount namespaces and disposable loopback PostgreSQL"]
+async fn postgres_backfill_preserves_a_readonly_source_with_and_without_locks() {
+    use std::{collections::BTreeMap, os::unix::fs::MetadataExt, path::Path};
+
+    #[derive(PartialEq, Eq)]
+    struct SourceEntry {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        modified: std::time::SystemTime,
+        content: Vec<u8>,
+    }
+
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, SourceEntry> {
+        let mut entries = BTreeMap::new();
+        let mut pending = vec![root.to_owned()];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            let content = if metadata.is_dir() {
+                pending.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                Vec::new()
+            } else {
+                std::fs::read(&path).unwrap()
+            };
+            entries.insert(
+                path.strip_prefix(root).unwrap().to_owned(),
+                SourceEntry {
+                    mode: metadata.mode(),
+                    uid: metadata.uid(),
+                    gid: metadata.gid(),
+                    modified: metadata.modified().unwrap(),
+                    content,
+                },
+            );
+        }
+        entries
+    }
+
+    // This manual proof must not silently pass after the scan authorization ends.
+    assert!(
+        chrono::Utc::now().date_naive() <= chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+        "B33 scan authorization expired; a new proof requires separate authorization"
+    );
+    for existing_locks in [false, true] {
+        let fixture = Fixture::in_database(true).await;
+        fixture.write_account("Read-only source", 7);
+        fixture.write_loan().await;
+        store::atomic_write(
+            &fixture.state().join("renames.json"),
+            br#"[{"user":"test","from":"old-seat","to":"seat"}]"#,
+        )
+        .unwrap();
+        // Loan setup creates this lock. Exercise both a retained lock and a
+        // source with no lock at all, without allowing backfill to create one.
+        std::fs::remove_file(fixture.state().join("central-storage.lock")).unwrap();
+        if existing_locks {
+            store::atomic_write(&fixture.state().join("central-storage.lock"), b"").unwrap();
+            store::atomic_write(&fixture.state().join("import.lock"), b"").unwrap();
+        }
+        let before = snapshot(&fixture.state());
+        for pass in 0..2 {
+            // The mount exists only in this child's private user/mount namespace.
+            // Both create and overwrite probes must fail on the read-only bind.
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                Command::new("unshare")
+                    .args(["--user", "--map-root-user", "--mount", "sh", "-ec"])
+                    .arg(
+                        r#"
+                        mount --bind "$1" "$1"
+                        mount -o remount,bind,ro "$1"
+                        if touch "$1/.write-probe" 2>/dev/null; then exit 90; fi
+                        if (printf x >> "$1/users.json") 2>/dev/null; then exit 91; fi
+                        shift
+                        exec "$@"
+                    "#,
+                    )
+                    .arg("readonly-backfill")
+                    .arg(fixture.state())
+                    .arg(env!("CARGO_BIN_EXE_codexctl-central"))
+                    .arg("backfill")
+                    .arg("--state")
+                    .arg(fixture.state())
+                    .arg("--key-file")
+                    .arg(fixture.root.path().join("key"))
+                    .args(["--scan-exception", "b33-a5"])
+                    .env("DATABASE_URL", &fixture.database)
+                    .env("CODEXCTL_CENTRAL_STORE", "postgres")
+                    .env("CODEXCTL_CENTRAL_DB_TLS", "0")
+                    .env_remove("CODEXCTL_CENTRAL_DUAL_WRITE")
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await
+            .expect("read-only backfill deadline")
+            .unwrap();
+            assert!(
+                result.status.success(),
+                "read-only backfill (locks={existing_locks}, pass={pass}): {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+            for table in [
+                "central_accounts",
+                "central_users",
+                "central_devices",
+                "central_alias_tombstones",
+                "account_loans",
+                "account_loan_audit",
+            ] {
+                assert_eq!(
+                    receipt["inventory"][table],
+                    json!({
+                        "source": 1, "target_before": pass, "target": 1,
+                    }),
+                    "{table}"
+                );
+            }
+            assert_eq!(receipt["accounts"], usize::from(pass == 0));
+            assert_eq!(receipt["loans"], usize::from(pass == 0));
+            // Compare without Debug output: even synthetic credential bytes
+            // should not appear in a failed assertion's diagnostic payload.
+            assert!(
+                before == snapshot(&fixture.state()),
+                "source evidence changed"
+            );
+        }
+        fixture.finish().await;
     }
 }
 
