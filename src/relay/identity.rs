@@ -87,7 +87,16 @@ fn directory(root: &Path, create: bool) -> Result<File> {
             }
         }
         directory = open_at(&directory, name, libc::O_RDONLY | DIRECTORY_FLAGS)?;
-        private(&directory, true)?;
+        if name == c"relay" {
+            // Older relays created this shared evidence parent as 0755.
+            // Only identity/ and keys need to be unreadable by other users.
+            let metadata = directory.metadata()?;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+                bail!("relay parent must be same-user and not writable by group or others");
+            }
+        } else {
+            private(&directory, true)?;
+        }
     }
     Ok(directory)
 }
