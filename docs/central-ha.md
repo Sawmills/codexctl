@@ -870,9 +870,11 @@ instance, then repeat the destructive cases in staging.
    provider call is still unresolved. Keep the old owner fenced and assert that
    no successor calls the provider until the old child is settled or confirmed
    stopped and its rotated credential is reconciled.
-4. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
-   keeps one ready pod, topology rules place replacements on another node and
-   zone, and token requests recover within 60 seconds. Check that no RWO
+4. **Node drain.** In an approved disruption drill, drain the node hosting the
+   refresh holder. Starting with three healthy replicas, confirm the PDB keeps
+   two Ready pods (`disruptionsAllowed` at most 1), topology rules place the
+   replacement on another node and restore three zones, and token requests
+   recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
 5. **Enrollment and renewal.** Assert that enrollment returns `503`. For renewal, assert cross-pod
    status/cancel, completed-request retries, continued token service during
