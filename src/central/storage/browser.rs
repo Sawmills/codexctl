@@ -223,7 +223,7 @@ impl CentralStore {
         let db = self.browser_store()?;
         let hash = vault::digest(token.as_bytes());
         bounded_db(async {
-            let mut connection = db.admission_client().await?;
+            let mut connection = db.transaction_client(&db.browser_sessions).await?;
             let tx = connection.transaction().await?;
             // Serialize the count and insertion across replicas, not just this connection.
             tx.query_one("SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),73912757))", &[]).await?;
@@ -289,4 +289,64 @@ fn audit_log(at: i64, actor: &str, target: &str, result: &str) {
         "{}",
         serde_json::json!({"at":at,"actor_hash":vault::digest(actor.as_bytes()),"operation":"machine_revoke","target":target,"result":result})
     );
+}
+
+#[cfg(all(test, feature = "central-real-db-tests"))]
+mod tests {
+    use super::*;
+    use crate::central::storage::StoreMode;
+
+    #[tokio::test]
+    async fn browser_session_creation_does_not_wait_for_account_admission() {
+        if std::env::var("DATABASE_URL").is_err() {
+            assert_ne!(std::env::var("CI").as_deref(), Ok("true"));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[9; 32]).unwrap();
+        let store = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (store, control, schema) = store.isolated_test_schema().await.unwrap();
+        store.migrate().await.unwrap();
+        let mut replica = store.clone();
+        let CentralStore::Postgres(replica_db) = &mut replica else {
+            unreachable!()
+        };
+        replica_db.client = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        assert!(
+            store
+                .record_browser_user("company-user", "person@example.invalid")
+                .await
+                .unwrap()
+        );
+        let CentralStore::Postgres(db) = &store else {
+            unreachable!()
+        };
+        let admission = db.admission_client().await.unwrap();
+        let created = store
+            .create_browser_session(
+                "synthetic-cookie",
+                "company-user",
+                None,
+                Duration::from_secs(60),
+            )
+            .await;
+        let session = replica
+            .browser_session_user("synthetic-cookie")
+            .await
+            .unwrap();
+        drop(admission);
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert!(
+            created.expect(
+                "browser sessions must not exhaust their deadline behind account admission"
+            )
+        );
+        assert_eq!(session.unwrap().id, "company-user");
+    }
 }

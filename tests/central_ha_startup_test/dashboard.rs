@@ -836,6 +836,73 @@ async fn postgres_missing_browser_table_fails_only_the_dashboard_at_startup() {
 }
 
 #[tokio::test]
+async fn postgres_browser_session_failures_log_bounded_database_causes() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    let (binding, path) = f.begin_sign_in().await;
+    f.control.batch_execute(&format!(
+        "CREATE FUNCTION {0}.fail_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'sensitive synthetic session detail'; END $$; CREATE TRIGGER fail_session BEFORE INSERT ON {0}.browser_sessions FOR EACH STATEMENT EXECUTE FUNCTION {0}.fail_session()", f.schema,
+    )).await.unwrap();
+    let create = f.callback(&f.second, &binding, &path).await;
+    assert_eq!(create.status(), 503);
+    assert_eq!(
+        create.json::<Value>().await.unwrap()["error"],
+        "browser_sessions_unavailable"
+    );
+    f.control.batch_execute(&format!(
+        "DROP TRIGGER fail_session ON {0}.browser_sessions; CREATE TRIGGER fail_session BEFORE DELETE ON {0}.browser_sessions FOR EACH STATEMENT EXECUTE FUNCTION {0}.fail_session()", f.schema,
+    )).await.unwrap();
+    let read = f
+        .http
+        .get(format!("{}/accounts/data", f.second.url))
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 503);
+    assert_eq!(
+        read.json::<Value>().await.unwrap()["error"],
+        "browser_sessions_unavailable"
+    );
+    let end = f
+        .http
+        .post(format!("{}/accounts/sign-out", f.second.url))
+        .header("cookie", &session)
+        .header("origin", "http://127.0.0.1:8787")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(end.status(), 503);
+    assert_eq!(
+        end.json::<Value>().await.unwrap()["error"],
+        "browser_sessions_unavailable"
+    );
+    let log = std::fs::read_to_string(f.second.root.path().join("dashboard.log")).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    for stage in [
+        "browser_session_create",
+        "browser_session_read",
+        "browser_session_end",
+    ] {
+        let failure = events
+            .iter()
+            .find(|event| event["operation"] == "dashboard_failure" && event["stage"] == stage)
+            .unwrap_or_else(|| panic!("missing bounded cause event for {stage}"));
+        assert_eq!(
+            failure,
+            &json!({"operation":"dashboard_failure","stage":stage,"failure_class":"database","sqlstate":"P0001"})
+        );
+    }
+    assert!(!log.contains("sensitive synthetic session detail"));
+    assert!(!log.contains(&session));
+    assert_eq!(f.first.launches() + f.second.launches(), 0);
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_dashboard_startup_probe_failure_preserves_the_database_cause() {
     let f = BrowserFixture::start().await;
     // Scope the fault to this schema and this probe; other startup queries still work.

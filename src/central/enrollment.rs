@@ -783,7 +783,8 @@ async fn callback(
                 let created = central
                     .create_browser_session(&token, &user, signed_in_at, SESSION_TTL)
                     .await
-                    .map_err(|_| {
+                    .map_err(|cause| {
+                        managed::log_dashboard_failure("browser_session_create", &cause);
                         broker.error(
                             StatusCode::SERVICE_UNAVAILABLE,
                             "browser_sessions_unavailable",
@@ -1024,7 +1025,8 @@ pub(super) async fn browser_user(
         return Ok(None);
     };
     if let Some(central) = shared_dashboard(broker) {
-        let user = central.browser_session_user(token).await.map_err(|_| {
+        let user = central.browser_session_user(token).await.map_err(|cause| {
+            managed::log_dashboard_failure("browser_session_read", &cause);
             broker.error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "browser_sessions_unavailable",
@@ -1065,7 +1067,8 @@ pub(super) async fn accounts_sign_out(
     }
     if let Some(token) = cookie(&headers, sso.cookie_name("session")) {
         if let Some(central) = shared_dashboard(&broker) {
-            central.end_browser_session(token).await.map_err(|_| {
+            central.end_browser_session(token).await.map_err(|cause| {
+                managed::log_dashboard_failure("browser_session_end", &cause);
                 broker.error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "browser_sessions_unavailable",

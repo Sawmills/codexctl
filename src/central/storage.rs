@@ -140,6 +140,7 @@ pub struct PostgresStore {
     observation_client: Arc<tokio::sync::Mutex<Option<Arc<tokio_postgres::Client>>>>,
     admission: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
     browser_logins: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
+    browser_sessions: Arc<tokio::sync::Mutex<Option<tokio_postgres::Client>>>,
     key: PathBuf,
 }
 
@@ -368,6 +369,7 @@ impl CentralStore {
         db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
         db.admission = Arc::new(tokio::sync::Mutex::new(None));
         db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
+        db.browser_sessions = Arc::new(tokio::sync::Mutex::new(None));
         isolated.isolated_test_schema().await
     }
 
@@ -396,6 +398,7 @@ impl CentralStore {
         db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
         db.admission = Arc::new(tokio::sync::Mutex::new(None));
         db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
+        db.browser_sessions = Arc::new(tokio::sync::Mutex::new(None));
         let control = db.establish().await?;
         Ok((isolated, control, schema))
     }
@@ -1515,6 +1518,7 @@ impl PostgresStore {
             observation_client: Arc::new(tokio::sync::Mutex::new(None)),
             admission: Arc::new(tokio::sync::Mutex::new(None)),
             browser_logins: Arc::new(tokio::sync::Mutex::new(None)),
+            browser_sessions: Arc::new(tokio::sync::Mutex::new(None)),
             key: key.into(),
         };
         let _ = store.client().await?;
@@ -3427,6 +3431,7 @@ mod tests {
             db.client = Arc::new(tokio::sync::Mutex::new(None));
             db.admission = Arc::new(tokio::sync::Mutex::new(None));
             db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
+            db.browser_sessions = Arc::new(tokio::sync::Mutex::new(None));
         }
         assert!(
             !replica.relay_event_allowed("shared-device").await.unwrap(),
@@ -3487,6 +3492,7 @@ mod tests {
             db.observation_client = Arc::new(tokio::sync::Mutex::new(None));
             db.admission = Arc::new(tokio::sync::Mutex::new(None));
             db.browser_logins = Arc::new(tokio::sync::Mutex::new(None));
+            db.browser_sessions = Arc::new(tokio::sync::Mutex::new(None));
         }
         let id = format!(
             "test-{}",
