@@ -159,13 +159,21 @@ includes it. Do not add it to Argo or apply/unsuspend it as routine cleanup.
 Execution needs a separate HQ GO, a fresh unique Job name, the stopped-writer
 and no-refresh-owner gates, a reviewed image and target, and a valid scan
 authorization. The B33 a5 window has ended; this template does not renew its
-scan grant or authorize any database operation. Keep private file modes and
-`fsGroupChangePolicy: OnRootMismatch`; read-only does not replace the mode check.
+scan grant or authorize any database operation. This manual Job omits `fsGroup`
+and `fsGroupChangePolicy` so kubelet does not recursively change the retained
+PVC's ownership or modes before exposing the read-only mount. UID/GID 10001
+reads the existing UID-10001 private state directly. Keep the per-path private
+mode/ownership check; do not repair the retained source through this Job.
+Only the non-root `prepare-secrets` init container uses group 0 to read the
+root-owned `0440` projected key and copy it as UID 10001 mode `0600`; it has no
+PVC mount, and the backfill remains UID/GID 10001 without `fsGroup`.
 
 Manual regression checks (no hosted workflow changes):
 
-- `python3 tests/b33_readonly_backfill_test.py -v` requires PyYAML and `kubectl`
-  for local Kustomize rendering. It checks the read-only mount and verifies that
+- `python3 tests/b33_readonly_backfill_test.py -v` requires PyYAML, `kubectl`
+  for local Kustomize rendering, Docker and the Job's cached pinned BusyBox
+  image. It checks the read-only mount, isolated init group and key-copy
+  permissions using synthetic files without network access, and verifies that
   every checked-in overlay excludes the manual successor.
 - On Linux, run the command below. This explicitly ignored test needs
   user/mount namespaces, `unshare`, `mount`, and
