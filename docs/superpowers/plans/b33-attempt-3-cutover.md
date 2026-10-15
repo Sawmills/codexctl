@@ -1,5 +1,13 @@
 # Runbook: B33 Attempt 3, Staging Cutover from File Mode to PostgreSQL HA
 
+**Historical runbook:** B33 attempt 5 completed on 2026-10-15 at 06:26Z.
+Before preparing another window, apply the
+[a5 retrospective's required checks](b33-a5-retrospective.md#findings-and-required-checks).
+The W/migrate/initial-backfill sequence below describes earlier attempts;
+a5 used H's writer-stop → final backfill (migration first) → HA waves, then I.
+The retained instructions and scan-exception records grant no new execution
+authority. Use a newly reviewed plan for any future cutover.
+
 **Decision.** Deliver cutover as four GitOps PRs to `deploy/k8s/overlays/staging` plus initial migrate/backfill Jobs and H's final-backfill Job, driven by one Claude Code operator that never uses a codexctl token. Do not start before SAW-12484 PR1, PR2, and PR3 are merged and shipped in one image. Rollback must stop HA and prove settlement while keeping the file writer at zero before a separate revision restores file mode; after the first HA pod is Ready, a return to file mode also needs a relogin of every account whose refresh token rotated (see [Rollback](#rollback)).
 
 Reader: the cutover operator and the HQ that approves the window. The design and the Job manifests are in [central-ha.md section 5](../../central-ha.md#5-staging-migration-and-rollback); this runbook changes how they are delivered, not what they do.

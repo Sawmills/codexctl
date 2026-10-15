@@ -445,6 +445,14 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
+**B33 a5 closed successfully at 2026-10-15 06:26Z.** The scan grants and Job
+examples below are historical; the attempt's backfill exception has ended.
+Before planning another window, use the
+[a5 retrospective and required window checks](superpowers/plans/b33-a5-retrospective.md).
+They cover independent drivers, I's post-H rebase, PR ownership, relay upgrade
+permissions and watcher log-read recovery. Preserve the old writer at zero and
+the original PVC; further execution requires a newly reviewed plan and owner GO.
+
 SCAN EXCEPTION RECORD ADDENDUM 2 (2026-10-13T12:5xZ): HQ w5C:t41 grants as codexctl code owner; tF CO-SIGN-INV verbatim: "b33-check-empty inventory Job, staging codexctl_a5 only, read-only, LIMIT 50001 per table failing closed above 50000, expiry 2026-10-20, no prod. Conditions: the DB guard refuses other DB names and libpq hostaddr or routing overrides (one test each); logs counts only; no new DB or schema." HQ order for #167 H round 11 of 12: fix both live blockers (Job bound to codexctl_a5 with the DB guard; local test cannot route destructive setup or cleanup to a remote host), add the two tests, push ONCE, post this addendum verbatim on #167 and in docs/central-ha.md section 5, one Architect rerequest via t27. APPROVED needed by 17:00Z (10:00 PDT).
 
 SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
