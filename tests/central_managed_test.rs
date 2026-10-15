@@ -17,6 +17,8 @@ struct Server {
     alex: String,
 }
 
+#[path = "fixtures/readiness.rs"]
+mod readiness;
 #[path = "fixtures/relay.rs"]
 mod relay_fixture;
 
@@ -3331,29 +3333,29 @@ impl EnrollmentServer {
         Self::with_sso(identity, json!({}))
     }
     fn with_sso(identity: Value, extra: Value) -> Self {
-        Self::with_setup(identity, extra, |_| {})
+        Self::with_setup(identity, extra, |_, _| {})
     }
-    fn with_setup(identity: Value, extra: Value, setup: impl FnOnce(&Server)) -> Self {
+    fn with_setup(identity: Value, extra: Value, setup: impl FnOnce(&Server, u32)) -> Self {
         let mut server = Server::start();
         server.stop();
-        setup(&server);
         store::atomic_write(
             &server.root.path().join("identity.json"),
             &serde_json::to_vec(&identity).unwrap(),
         )
         .unwrap();
-        let mut issuer = Command::new("python3")
-            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/company_oidc.py"))
-            .arg(server.root.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(issuer.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let ready: Value = serde_json::from_str(&line).unwrap();
+        let issuer = readiness::ReadyChild::start(
+            Command::new("python3")
+                .arg(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/company_oidc.py"),
+                )
+                .arg(server.root.path()),
+            &server.root.path().join("oidc-startup.log"),
+            Duration::from_secs(20),
+        )
+        .unwrap_or_else(|error| panic!("OIDC issuer must start: {error}"));
+        setup(&server, issuer.pid());
+        let ready = &issuer.ready;
         let secret = server.root.path().join("oidc.secret");
         store::atomic_write(&secret, b"synthetic-company-client-secret").unwrap();
         let mut configuration = json!({"issuer":ready["issuer"],"client_id":"codexctl-test","client_secret_file":secret,"allowed_domains":["sawmills.ai"]});
@@ -3364,17 +3366,42 @@ impl EnrollmentServer {
         let sso = server.root.path().join("sso.json");
         store::atomic_write(&sso, &serde_json::to_vec(&configuration).unwrap()).unwrap();
         Self::spawn_broker(&mut server);
-        Self { server, issuer }
+        Self {
+            server,
+            issuer: issuer.into_child(),
+        }
     }
     fn spawn_broker(server: &mut Server) {
-        let sso = server.root.path().join("sso.json");
-        let mut line = String::new();
         let address = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
+        Self::spawn_broker_at(server, address);
+    }
+    fn spawn_broker_at(server: &mut Server, mut address: std::net::SocketAddr) {
+        for attempt in 1..=3 {
+            match Self::try_spawn_broker_at(server, address) {
+                Ok(()) => return,
+                Err(error) => {
+                    if !error.bind_conflict() || attempt == 3 {
+                        panic!("SSO server must start: {error}");
+                    }
+                    address = std::net::TcpListener::bind("127.0.0.1:0")
+                        .unwrap()
+                        .local_addr()
+                        .unwrap();
+                }
+            }
+        }
+    }
+    fn try_spawn_broker_at(
+        server: &mut Server,
+        address: std::net::SocketAddr,
+    ) -> Result<(), readiness::StartupFailure> {
+        let sso = server.root.path().join("sso.json");
         let url = format!("http://{address}");
-        let mut child = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl-central"));
+        command
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(server.root.path().join("state"))
@@ -3399,24 +3426,15 @@ impl EnrollmentServer {
             .env(
                 "CENTRAL_TEST_REFRESH_COUNTER",
                 server.root.path().join("count"),
-            )
-            .stdout(Stdio::piped())
-            .stderr(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(server.root.path().join("sso-audit.log"))
-                    .unwrap(),
-            )
-            .spawn()
-            .unwrap();
-        line.clear();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let _: Value = serde_json::from_str(&line).expect("SSO server must start");
-        server.child = child;
+            );
+        let started = readiness::ReadyChild::start(
+            &mut command,
+            &server.root.path().join("sso-audit.log"),
+            Duration::from_secs(20),
+        )?;
+        server.child = started.into_child();
         server.url = url;
+        Ok(())
     }
     fn challenge(&self) -> Value {
         self.server
@@ -3471,6 +3489,199 @@ impl Drop for EnrollmentServer {
 fn company_identity() -> Value {
     json!({"sub":"company-amir","email":"amir@sawmills.ai"})
 }
+
+#[test]
+fn sso_startup_preserves_the_reason_when_its_selected_port_is_occupied() {
+    let mut issuer = EnrollmentServer::start(company_identity());
+    issuer.server.stop();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let failure =
+        EnrollmentServer::try_spawn_broker_at(&mut issuer.server, occupied.local_addr().unwrap())
+            .expect_err("an occupied listener must refuse startup");
+    assert!(
+        failure.bind_conflict(),
+        "startup lost the bind failure: {failure}"
+    );
+    assert!(failure.status.is_some_and(|status| !status.success()));
+    assert_startup_child_reaped(failure.pid);
+}
+
+#[test]
+fn sso_startup_recovers_when_another_listener_takes_its_selected_port() {
+    let mut issuer = EnrollmentServer::start(company_identity());
+    issuer.server.stop();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = occupied.local_addr().unwrap();
+    EnrollmentServer::spawn_broker_at(&mut issuer.server, address);
+    assert_ne!(issuer.server.url, format!("http://{address}"));
+    let challenge = issuer.challenge();
+    let page = issuer.browser(challenge["verificationUrl"].as_str().unwrap());
+    assert_eq!(page.status(), 200);
+    assert_eq!(issuer.approve(&page.text().unwrap()).status(), 200);
+    assert_eq!(issuer.poll(&challenge).status(), 200);
+}
+
+#[test]
+fn sso_startup_does_not_retry_invalid_configuration_after_an_old_bind_failure() {
+    let mut issuer = EnrollmentServer::start(company_identity());
+    issuer.server.stop();
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let previous =
+        EnrollmentServer::try_spawn_broker_at(&mut issuer.server, occupied.local_addr().unwrap())
+            .unwrap_err();
+    assert!(previous.bind_conflict());
+    let config = issuer.server.root.path().join("sso.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
+    value["allowed_domains"] = json!([]);
+    store::atomic_write(&config, &serde_json::to_vec(&value).unwrap()).unwrap();
+    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        EnrollmentServer::spawn_broker(&mut issuer.server);
+    }))
+    .expect_err("invalid SSO configuration must refuse startup");
+    let message = error.downcast_ref::<String>().unwrap();
+    assert!(message.contains("SSO requires allowed company email domains"));
+    let audit = std::fs::read_to_string(issuer.server.root.path().join("sso-audit.log")).unwrap();
+    assert_eq!(
+        audit
+            .matches("SSO requires allowed company email domains")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn sso_startup_deadline_reaps_a_child_with_partial_readiness() {
+    let root = tempfile::tempdir().unwrap();
+    let started = std::time::Instant::now();
+    let error = readiness::ReadyChild::start(
+        Command::new("python3")
+            .args([
+                "-c",
+                "import pathlib,sys,time; sys.stdout.write('{'); sys.stdout.flush(); pathlib.Path(sys.argv[1]).write_text('written'); time.sleep(60)",
+            ])
+            .arg(root.path().join("partial-written")),
+        &root.path().join("startup.log"),
+        Duration::from_secs(3),
+    )
+    .err()
+    .expect("a partial readiness line must not bypass the deadline");
+    assert_eq!(error.reason, "deadline");
+    assert!(root.path().join("partial-written").exists());
+    assert!(started.elapsed() < Duration::from_secs(6));
+    assert_startup_child_reaped(error.pid);
+}
+
+#[test]
+fn sso_startup_keeps_only_current_exit_diagnostics_without_echoing_stdout() {
+    let root = tempfile::tempdir().unwrap();
+    let log = root.path().join("startup.log");
+    std::fs::write(&log, b"Address already in use (old attempt)\n").unwrap();
+    let error = readiness::ReadyChild::start(
+        Command::new("python3").args([
+            "-c",
+            "import sys; sys.stderr.write('synthetic startup fault'); sys.stdout.write('synthetic-secret-readiness-payload'); sys.exit(7)",
+        ]),
+        &log,
+        Duration::from_secs(3),
+    )
+    .err()
+    .expect("an early exit must fail readiness");
+    assert_eq!(error.reason, "eof");
+    assert_eq!(error.status.and_then(|status| status.code()), Some(7));
+    assert_eq!(error.stderr, "synthetic startup fault");
+    assert!(
+        !error.bind_conflict(),
+        "old stderr must not authorize a retry"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("synthetic-secret-readiness-payload")
+    );
+    assert_startup_child_reaped(error.pid);
+}
+
+#[test]
+fn sso_startup_reaps_a_ready_issuer_when_later_setup_panics() {
+    let mut pid = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        EnrollmentServer::with_setup(
+            company_identity(),
+            json!({"allowed_domains": []}),
+            |_, issuer_pid| pid = issuer_pid,
+        );
+    }));
+    assert!(result.is_err());
+    assert!(pid > 0);
+    assert_startup_child_reaped(pid);
+}
+
+#[test]
+fn sso_startup_rejects_a_dead_real_issuer_and_reaps_the_broker() {
+    let mut issuer = EnrollmentServer::start(company_identity());
+    issuer.server.stop();
+    issuer.issuer.kill().unwrap();
+    issuer.issuer.wait().unwrap();
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let error = EnrollmentServer::try_spawn_broker_at(&mut issuer.server, address).unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(
+        error.stderr.contains("company SSO discovery failed"),
+        "{error}"
+    );
+    assert!(!error.bind_conflict());
+    assert_startup_child_reaped(error.pid);
+}
+
+#[test]
+fn sso_startup_bounds_the_stderr_of_an_early_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let error = readiness::ReadyChild::start(
+        Command::new("python3").args([
+            "-c",
+            "import sys; sys.stderr.write('x'*10000+'synthetic startup fault'); sys.exit(7)",
+        ]),
+        &root.path().join("startup.log"),
+        Duration::from_secs(3),
+    )
+    .err()
+    .expect("an early exit must fail readiness");
+    assert!(error.stderr.len() <= 4096);
+    assert!(error.stderr.ends_with("synthetic startup fault"));
+    assert_startup_child_reaped(error.pid);
+}
+
+#[test]
+fn sso_startup_preserves_the_os_cause_of_a_log_open_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let error = readiness::ReadyChild::start(
+        Command::new("python3").arg("--version"),
+        root.path(),
+        Duration::from_secs(3),
+    )
+    .err()
+    .expect("a directory cannot be used as the stderr file");
+    assert_eq!(error.reason, "stderr_open");
+    assert_eq!(error.io_error.unwrap().raw_os_error(), Some(libc::EISDIR));
+    assert_eq!(error.pid, 0, "the log failure must precede child spawn");
+}
+
+fn assert_startup_child_reaped(pid: u32) {
+    assert_eq!(
+        unsafe { libc::kill(pid as i32, 0) },
+        -1,
+        "startup child must no longer exist"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+}
+
 #[test]
 fn enrollment_pages_allow_only_their_bundled_styles_and_escape_device_names() {
     use base64::engine::general_purpose::STANDARD;
@@ -3703,7 +3914,7 @@ fn google_migration_server(identity: Value) -> EnrollmentServer {
                 "users": [{"user_id": clerk_user_id(), "email": "amir@sawmills.ai"}]
             }
         }),
-        |server| {
+        |server, _issuer_pid| {
             // Synthetic legacy registry, including a machine credential issued before cutover.
             let state = server.root.path().join("state");
             let mut users: Value =
