@@ -150,6 +150,38 @@ H must not inherit its only writer-stop fence from W: W can be reverted before H
 
 This repeats section 5's final backfill even after W's initial migrate/backfill. Freeze the final Job's full image reference so later account-server image pins do not alter its immutable pod template. Keep the completed Job without a TTL and without a Sync hook: later syncs must not replay file backfill against a live HA store. A new attempt needs HQ review, a new Job name, and the same no-writer prerequisites. Do not delete the final Job while HA is running. H's `spec.replicas: 0` patch stays in Git through I and until reviewed cleanup.
 
+**Future manual backfill only (SAW-12988).** The retained
+`codexctl-final-backfill-a5` Job and its synced template are historical evidence;
+do not edit their Pod template, delete them, or replay backfill against live HA.
+The [manual successor](../../../deploy/k8s/jobs/final-backfill-readonly.yaml)
+mounts the retained source read-only and starts suspended. No Kustomization
+includes it. Do not add it to Argo or apply/unsuspend it as routine cleanup.
+Execution needs a separate HQ GO, a fresh unique Job name, the stopped-writer
+and no-refresh-owner gates, a reviewed image and target, and a valid scan
+authorization. The B33 a5 window has ended; this template does not renew its
+scan grant or authorize any database operation. Keep private file modes and
+`fsGroupChangePolicy: OnRootMismatch`; read-only does not replace the mode check.
+
+Manual regression checks (no hosted workflow changes):
+
+- `python3 tests/b33_readonly_backfill_test.py -v` requires PyYAML and `kubectl`
+  for local Kustomize rendering. It checks the read-only mount and verifies that
+  every checked-in overlay excludes the manual successor.
+- On Linux, run the command below. This explicitly ignored test needs
+  user/mount namespaces, `unshare`, `mount`, and
+  `DATABASE_URL` pointing to disposable loopback PostgreSQL. It imports all six
+  source tables, repeats the copy with and without lock files, proves that
+  writes fail on an OS-enforced read-only bind mount, and checks source bytes,
+  modes, ownership and modification times. It refuses an expired B33 scan
+  authorization; do not extend the grant to make a test pass.
+
+  ```sh
+  CARGO_BUILD_JOBS=2 ~/Code/.p122/testslot.sh cargo test -j 2 \
+    --features central-real-db-tests --test central_backfill_test \
+    postgres_backfill_preserves_a_readonly_source_with_and_without_locks \
+    -- --ignored --exact
+  ```
+
 Before H, W still provides the quiesced archive, private-mode baseline, initial migration and backfill receipts. The mode checks and `fsGroupChangePolicy: OnRootMismatch` remain mandatory. After H, preserve the final Job log. Its JSON mixes counts: `accounts` and `loans` report copied rows, while `users` and `devices` report source inventory sizes even when CAS skips an existing row. After the successful initial backfill with no intervening writer, expect accounts 0, users 4 and devices 10 for the attempt-4 source (and loans 0), not an all-zero receipt. These values do not prove database totals. Separately run the read-only row-count Job and compare live users/accounts/devices totals with the initial receipt and stopped source inventory. Unexpected account/loan copies, changed source inventory, errors, or database total mismatches stop I and go to HQ. Attempt 5 uses the prerequisite image above. Approval and green checks do not authorize merging H: a merge auto-deploys staging.
 
 ### Database provenance and reset hold
