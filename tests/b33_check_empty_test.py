@@ -52,10 +52,11 @@ class InventoryJobTest(unittest.TestCase):
                 env=connection_env, check=True, capture_output=True, text=True,
             )
 
-        def inventory(database=None, user=None):
+        def inventory(database=None, user=None, search_path=None):
+            selected_schema = schema if search_path is None else search_path
             env = dict(connection_env, PGDATABASE=database or connection_env["PGDATABASE"],
                        PGUSER=user or connection_env["PGUSER"],
-                       PGOPTIONS=f"-c search_path={schema} -c default_transaction_read_only=on -c client_min_messages=warning")
+                       PGOPTIONS=f"-c search_path={selected_schema} -c default_transaction_read_only=on -c client_min_messages=warning")
             return subprocess.run(["sh", "-ec", script], env=env,
                                   capture_output=True, text=True, timeout=30)
 
@@ -74,6 +75,10 @@ class InventoryJobTest(unittest.TestCase):
             self.assertNotEqual(outside_allowed.returncode, 0, "inventory ignored a non-system schema")
             self.assertIn("outside allowed schema", outside_allowed.stderr)
             self.assertNotIn("inventory complete", outside_allowed.stderr)
+            unresolved_schema = inventory(search_path="")
+            self.assertNotEqual(unresolved_schema.returncode, 0, "inventory accepted an unresolved schema")
+            self.assertIn("inventory requires a resolvable schema", unresolved_schema.stderr)
+            self.assertNotIn("inventory complete", unresolved_schema.stderr)
             sql(f"DROP SCHEMA {rogue_schema} CASCADE")
             empty = inventory()
             self.assertEqual(empty.returncode, 0, empty.stderr)

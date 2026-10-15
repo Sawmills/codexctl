@@ -57,6 +57,9 @@ spec:
                 IF pg_catalog.current_database() <> 'codexctl_a5' THEN
                   RAISE EXCEPTION 'inventory requires codexctl_a5';
                 END IF;
+                IF allowed_schema IS NULL THEN
+                  RAISE EXCEPTION 'inventory requires a resolvable schema';
+                END IF;
                 -- Discover every application table from catalog metadata first.
                 -- Any table outside the selected schema fails before a row probe.
                 FOR inventory_table IN
