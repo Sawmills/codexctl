@@ -118,6 +118,13 @@ lane keeps its current child settings, but a new launch or activation refuses un
 the listener proves identity. Use `codexctl relay disable` to roll back to direct
 routing while the service is repaired.
 
+The relay accepts the same-user `0755` shared `~/.codexctl/relay/` directory created
+by v0.1.51. Its `identity/` directory stays private (`0700`) and keys stay `0600`;
+group- or other-writable parents are refused without changing permissions. If you
+remain on v0.1.52, verify the shared directory's owner and run
+`chmod 700 ~/.codexctl/relay` before restarting that version: v0.1.52 incorrectly
+requires the shared parent to be `0700` too.
+
 ## Enable account-server routing on a host
 
 Start or restart the upgraded relay service first, then enable the supported host setting from an

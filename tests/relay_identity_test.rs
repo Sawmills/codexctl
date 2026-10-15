@@ -6,7 +6,7 @@ use std::{
     net::TcpListener,
     path::Path,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[path = "fixtures/relay.rs"]
@@ -54,7 +54,7 @@ fn a_service_creates_private_identity_and_status_verifies_its_proof() {
 }
 
 #[test]
-fn service_refuses_an_unsafe_known_relay_directory_mode() {
+fn service_upgrades_a_legacy_0755_relay_parent_without_changing_it() {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
     let relay_dir = home.path().join(".codexctl/relay/evidence");
@@ -69,27 +69,36 @@ fn service_refuses_an_unsafe_known_relay_directory_mode() {
         std::fs::Permissions::from_mode(0o755),
     )
     .unwrap();
-    std::fs::set_permissions(&relay_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    drop(listener);
-    let status = Command::new(env!("CARGO_BIN_EXE_codexctl"))
-        .env("HOME", home.path())
-        .args([
-            "relay",
-            "serve",
-            "--listen",
-            &address,
-            "--upstream",
-            "http://127.0.0.1:9",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .unwrap();
+    std::fs::set_permissions(&relay_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let evidence_file = relay_dir.join("old-observation.jsonl");
+    std::fs::write(&evidence_file, b"retained evidence\n").unwrap();
+    let relay = Relay::start(home.path());
+    let address = relay.address.clone();
+    let key = key_files(home.path()).pop().unwrap();
+    let bytes = std::fs::read(&key).unwrap();
+    assert_eq!(bytes.len(), 32);
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(key.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    drop(relay);
+    let _restarted = Relay::start_at(home.path(), &address);
+    assert_eq!(std::fs::read(key).unwrap(), bytes);
     assert!(
-        !status.success(),
-        "service repaired an unsafe identity directory"
+        cli(home.path())
+            .args(["relay", "enable", "--listen", &address])
+            .output()
+            .unwrap()
+            .status
+            .success()
     );
     assert_eq!(
         std::fs::metadata(home.path().join(".codexctl/relay"))
@@ -101,8 +110,55 @@ fn service_refuses_an_unsafe_known_relay_directory_mode() {
     );
     assert_eq!(
         std::fs::metadata(&relay_dir).unwrap().permissions().mode() & 0o777,
-        0o755
+        0o700
     );
+    assert_eq!(
+        std::fs::read(evidence_file).unwrap(),
+        b"retained evidence\n"
+    );
+}
+
+#[test]
+fn service_refuses_writable_relay_parents_without_repair() {
+    use std::os::unix::fs::PermissionsExt;
+    for mode in [0o770, 0o777] {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".codexctl");
+        let parent = root.join("relay");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(mode)).unwrap();
+        let mut child = cli(home.path())
+            .args([
+                "relay",
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--upstream",
+                "http://127.0.0.1:9",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("relay started with writable parent mode {mode:o}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("relay parent"));
+        assert_eq!(
+            std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            mode
+        );
+        assert!(!parent.join("identity").exists());
+    }
 }
 
 #[test]
@@ -271,7 +327,8 @@ fn unsafe_key_and_parent_modes_are_refused_without_repair() {
     for (path, mode, restore) in [
         (key.clone(), 0o644, 0o600),
         (home.path().join(".codexctl/relay/identity"), 0o755, 0o700),
-        (home.path().join(".codexctl/relay"), 0o755, 0o700),
+        (home.path().join(".codexctl/relay"), 0o770, 0o700),
+        (home.path().join(".codexctl/relay"), 0o777, 0o700),
         (home.path().join(".codexctl"), 0o755, 0o700),
     ] {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -324,6 +381,24 @@ fn symlinked_identity_files_and_directories_are_not_followed() {
     );
     assert_eq!(
         std::fs::read(moved.join(key.file_name().unwrap())).unwrap(),
+        original
+    );
+    std::fs::remove_file(&directory).unwrap();
+    std::fs::rename(&moved, &directory).unwrap();
+    let parent = home.path().join(".codexctl/relay");
+    let saved_parent = home.path().join("saved-relay");
+    std::fs::rename(&parent, &saved_parent).unwrap();
+    symlink(&saved_parent, &parent).unwrap();
+    assert!(
+        !cli(home.path())
+            .args(["relay", "status", "--listen", &relay.address])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(
+        std::fs::read(saved_parent.join("identity").join(key.file_name().unwrap())).unwrap(),
         original
     );
 }
