@@ -51,12 +51,17 @@ class ReadonlyBackfillJobTest(unittest.TestCase):
                 "printf synthetic-key >/projected/vault-key; chmod 0440 /projected/vault-key",
             )
             self.assertEqual(setup.returncode, 0, setup.stderr)
-            copied = docker(
-                "--user", identity(init), "--cap-drop", "ALL",
+            init_args = [
+                "--cap-drop", "ALL",
                 "--security-opt", "no-new-privileges",
                 "--volume", f"{projected}:/projected:ro", "--volume", f"{keys}:/keys",
                 init["image"], *init["command"][1:], *init["args"],
-            )
+            ]
+            denied = docker("--user", "10001:10001", *init_args)
+            self.assertNotEqual(denied.returncode, 0, "projection must enforce private read access")
+            self.assertIn("Permission denied", denied.stderr)
+            (keys / "vault-key").unlink(missing_ok=True)
+            copied = docker("--user", identity(init), *init_args)
             self.assertEqual(copied.returncode, 0, copied.stderr)
             readable = docker(
                 "--user", identity(backfill), "--cap-drop", "ALL",
