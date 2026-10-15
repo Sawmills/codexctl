@@ -9,12 +9,19 @@ metadata:
     checkov.io/skip3: CKV_K8S_43=The build-only image tag is replaced by the release overlay process.
 spec:
   replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: codexctl
       app.kubernetes.io/component: broker-ha
   template:
     metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
       labels:
         app.kubernetes.io/name: codexctl
         app.kubernetes.io/component: broker-ha
@@ -172,7 +179,6 @@ spec:
                   - sh
                   - -ec
                   - |
-                    kill -TERM 1
                     sleep 5
           securityContext:
             {

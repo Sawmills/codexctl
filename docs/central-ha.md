@@ -48,6 +48,14 @@ can lose an unpublished rotation. Preserve the pod and its journal for recovery
 when settlement errors persist. This change does not provide durable recovery
 from forced pod loss during an unfinished refresh.
 
+The HA preStop hook waits five seconds for endpoint removal to propagate, then
+returns. Kubelet subsequently sends TERM to the account server, which stops
+admission and drains work through the existing graceful-shutdown path. The hook
+must not send TERM itself: a quickly exiting PID 1 tears down the container and
+kills a still-sleeping hook, reporting `FailedPreStopHook` even when the server
+exited successfully. The hook consumes five seconds of the same 60-second grace
+period, leaving approximately 55 seconds for the server's drain.
+
 The HA Deployment allows up to five minutes for startup through `/health` before
 liveness checks begin. This allowance covers database hydration and registry setup.
 
@@ -401,8 +409,24 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
   `kubernetes.io/hostname`, `maxSkew: 1`, `whenUnsatisfiable: DoNotSchedule`,
   and the broker label as the selector. Add required pod anti-affinity on the
   hostname so a scheduler cannot co-locate all replicas on one node.
-- Add a `PodDisruptionBudget` with `minAvailable: 1`. It protects one serving
-  pod during a drain while allowing a controlled handoff.
+- Use `PodDisruptionBudget.maxUnavailable: 1` and an explicit Deployment
+  `RollingUpdate` strategy with integer `maxSurge: 0`, `maxUnavailable: 1`.
+  The PDB allows one eviction at a time; the Deployment separately bounds its
+  roll to two available replicas while each replacement becomes Ready. Zero
+  surge avoids placing a fourth replica across the three zones. These budgets
+  do not protect against simultaneous unrelated node failures. Verify final
+  placement is three Ready replicas on three nodes in three zones.
+- Set `karpenter.sh/do-not-disrupt: "true"` on the HA Pod template to block
+  voluntary consolidation and avoid needless refresh-lease handovers. It does
+  not prevent interruption, forceful termination, or every drift/expiry path.
+  HQ's staging readback on 2026-10-15 found NodePool `default` has
+  `expireAfter: 336h` and **no `terminationGracePeriod`**. Expiry still initiates
+  node draining; with no NodePool termination bound, an annotated pod can block
+  that drain indefinitely and retain a partially drained, billable node. HQ
+  accepted this tradeoff for this workload's consolidation protection. Coordinate
+  expiry/maintenance with HQ and the infra owner: arrange a controlled replacement
+  or an explicitly approved annotation removal rather than force-deleting the
+  pod. This workload change does not modify the NodePool.
 - Keep `/health` as process liveness. Make `/ready` verify database reachability,
   readable catalog/device rows, and the serving mode. A follower is ready for
   read-only/token-cache traffic. If an endpoint is configured to require the
@@ -410,9 +434,11 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
   return 503 until it holds the lease; it must never advertise readiness while
   accepting an unsafe write. The current probes and semantics are
   `deploy/k8s/base/statefulset.yaml` and the probes in `deploy/k8s/overlays/staging-ha/deployment.yaml`.
-- Use a short `preStop` drain: stop accepting new refresh acquisitions, finish
-  in-flight persistence, release the account lease, and then terminate. A pod
-  that loses the lease or database connection must fail readiness immediately.
+- Use a delay-only `preStop` (`sh -ec 'sleep 5'`), followed by kubelet TERM.
+  The delay allows endpoint removal; the server then stops admission, finishes
+  in-flight persistence and settles refresh leases before exiting. It is not
+  an HTTP drain endpoint or a new lease protocol. A pod that loses the lease
+  or database connection must fail readiness immediately.
 - Remove the per-replica RWO claim from the broker. If a temporary compatibility
   release still mounts the old PVC, run exactly one writer and keep followers
   read-only; do not attach the RWO claim to multiple pods.
@@ -844,9 +870,11 @@ instance, then repeat the destructive cases in staging.
    provider call is still unresolved. Keep the old owner fenced and assert that
    no successor calls the provider until the old child is settled or confirmed
    stopped and its rotated credential is reconciled.
-4. **Node drain.** Drain the node hosting the refresh holder. Confirm the PDB
-   keeps one ready pod, topology rules place replacements on another node and
-   zone, and token requests recover within 60 seconds. Check that no RWO
+4. **Node drain.** In an approved disruption drill, drain the node hosting the
+   refresh holder. Starting with three healthy replicas, confirm the PDB keeps
+   two Ready pods (`disruptionsAllowed` at most 1), topology rules place the
+   replacement on another node and restore three zones, and token requests
+   recover within 60 seconds. Check that no RWO
    Multi-Attach event is possible because broker pods have no shared RWO claim.
 5. **Enrollment and renewal.** Assert that enrollment returns `503`. For renewal, assert cross-pod
    status/cancel, completed-request retries, continued token service during
