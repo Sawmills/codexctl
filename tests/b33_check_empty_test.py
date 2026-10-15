@@ -6,6 +6,7 @@ Requires psql and PyYAML; never uses the operator's default connection.
 
 import os
 from pathlib import Path
+import secrets
 import subprocess
 import unittest
 import uuid
@@ -41,6 +42,7 @@ class InventoryJobTest(unittest.TestCase):
                               PGUSER=target.username, PGDATABASE=target.path.lstrip("/"))
         schema = "b33_probe_" + uuid.uuid4().hex
         limited_role = "b33_limited_" + uuid.uuid4().hex[:16]
+        limited_password = secrets.token_hex(32)
         manifest = yaml.safe_load(
             (Path(__file__).resolve().parents[1] / "deploy/k8s/jobs/b33-check-empty.yaml").read_text()
         )
@@ -57,6 +59,8 @@ class InventoryJobTest(unittest.TestCase):
             env = dict(connection_env, PGDATABASE=database or connection_env["PGDATABASE"],
                        PGUSER=user or connection_env["PGUSER"],
                        PGOPTIONS=f"-c search_path={selected_schema} -c default_transaction_read_only=on -c client_min_messages=warning")
+            if user == limited_role:
+                env["PGPASSWORD"] = limited_password
             return subprocess.run(["sh", "-ec", script], env=env,
                                   capture_output=True, text=True, timeout=30)
 
@@ -67,7 +71,7 @@ class InventoryJobTest(unittest.TestCase):
         sql(f"CREATE SCHEMA {schema}")
         rogue_schema = "b33_rogue_" + uuid.uuid4().hex
         try:
-            sql(f"CREATE ROLE {limited_role} LOGIN; GRANT USAGE ON SCHEMA {schema} TO {limited_role}; "
+            sql(f"CREATE ROLE {limited_role} LOGIN PASSWORD '{limited_password}'; GRANT USAGE ON SCHEMA {schema} TO {limited_role}; "
                 f"CREATE SCHEMA {rogue_schema}; CREATE TABLE {rogue_schema}.unexpected_rows (n integer); "
                 f"REVOKE ALL ON SCHEMA {rogue_schema} FROM {limited_role}; "
                 f"REVOKE ALL ON {rogue_schema}.unexpected_rows FROM {limited_role}")

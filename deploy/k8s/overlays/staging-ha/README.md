@@ -1,10 +1,12 @@
 # Codexctl staging HA overlay
 
-This overlay is a build-only phase 3 artifact. It is not referenced by
-`deploy/k8s/staging-application.yaml` and must not be applied until HQ confirms
-the fresh `codexctl_a5` provisioning receipt (infra#1604), the separately
-reviewed ExternalSecret repoint (infra#1605), and `codexctl-postgres` Ready
-on that target. Preserve the old database and its history.
+This overlay is a render-only phase 3 artifact and must never be applied manually.
+It is not referenced by `deploy/k8s/staging-application.yaml`. Deploy staging HA
+through Argo CD's tracked `deploy/k8s/overlays/staging` overlay and the
+[B33 runbook](../../../../docs/superpowers/plans/b33-attempt-3-cutover.md), after
+HQ confirms the fresh `codexctl_a5` provisioning receipt (infra#1604), the
+separately reviewed ExternalSecret repoint (infra#1605), and `codexctl-postgres`
+Ready on that target. Preserve the old database and its history.
 
 It runs three stateless broker pods in PostgreSQL mode. Pods spread across zones
 and hostnames, require hostname anti-affinity, use only `emptyDir` volumes, and
@@ -25,4 +27,4 @@ Build it with:
 kubectl kustomize deploy/k8s/overlays/staging-ha
 ```
 
-Do not apply this overlay as part of normal staging reconciliation.
+Use this overlay only for render validation; deployment uses the tracked staging overlay.
