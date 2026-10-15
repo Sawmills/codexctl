@@ -1,8 +1,12 @@
-# B33 attempt 3: database emptiness before migrate (runbook prerequisite 3).
+# B33 database inventory before and after migrate (runbook prerequisite 3).
 # No kustomization includes this file, so nothing syncs it. The operator runs
 #   kubectl -n codexctl create -f deploy/k8s/jobs/b33-check-empty.yaml
-# at go/no-go, before the migrate Job, and reads kubectl logs. Run it only
-# against the target before migration; a rollback uses b33-check-leases.yaml.
+# at go/no-go before migrate, and creates a new instance after migrate.
+# Before migrate, require no application tables in the fresh A5 DB. Afterward,
+# require the exact layout-8 inventory with metadata-only counts per the runbook.
+# Counts are bounded at 50001 rows per table. A cap hit fails the Job; retain
+# notices from stderr as the count receipt and never proceed on partial output.
+# A rollback uses b33-check-leases.yaml.
 # Every statement runs in a read-only transaction, and the job label selects
 # the codexctl-migration egress policy.
 apiVersion: batch/v1
@@ -41,14 +45,61 @@ spec:
           args:
             - |
               psql -X -v ON_ERROR_STOP=1 <<'SQL'
-              \echo '== emptiness (prerequisite 3, before migrate only): no row, or 0 in every row, means empty'
-              SELECT table_name,
-                     (xpath('/row/c/text()',
-                            query_to_xml(format('SELECT count(*) AS c FROM %I.%I', table_schema, table_name),
-                                         false, true, '')))[1]::text::bigint AS row_count
-              FROM information_schema.tables
-              WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
-              ORDER BY table_name;
+              \echo '== inventory (prerequisite 3): before migrate require no tables; after migrate verify layout and metadata counts per runbook'
+              SET client_min_messages = notice;
+              DO $inventory$
+              DECLARE
+                inventory_table record;
+                row_count bigint;
+                table_count integer := 0;
+                allowed_schema name := current_schema();
+              BEGIN
+                IF pg_catalog.current_database() <> 'codexctl_a5' THEN
+                  RAISE EXCEPTION 'inventory requires codexctl_a5';
+                END IF;
+                IF allowed_schema IS NULL THEN
+                  RAISE EXCEPTION 'inventory requires a resolvable schema';
+                END IF;
+                -- Discover every application table from catalog metadata first.
+                -- Any table outside the selected schema fails before a row probe.
+                FOR inventory_table IN
+                  SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind
+                  FROM pg_catalog.pg_class AS c
+                  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                  WHERE c.relkind IN ('r', 'p', 'f', 'm', 'v')
+                    AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+                    AND n.nspname NOT LIKE 'pg_toast%'
+                    AND n.nspname NOT LIKE 'pg_temp%'
+                  ORDER BY n.nspname, c.relname
+                LOOP
+                  IF inventory_table.table_schema <> allowed_schema::text THEN
+                    RAISE EXCEPTION 'inventory table %.% outside allowed schema %',
+                                    inventory_table.table_schema,
+                                    inventory_table.table_name,
+                                    allowed_schema;
+                  END IF;
+                END LOOP;
+                FOR inventory_table IN
+                  SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind
+                  FROM pg_catalog.pg_class AS c
+                  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+                  WHERE c.relkind IN ('r', 'p', 'f')
+                    AND n.nspname = allowed_schema::text
+                  ORDER BY c.relname
+                LOOP
+                  EXECUTE format('SELECT count(*) FROM (SELECT 1 FROM %I.%I LIMIT 50001) s',
+                                 inventory_table.table_schema, inventory_table.table_name)
+                    INTO row_count;
+                  IF row_count >= 50001 THEN
+                    RAISE EXCEPTION 'inventory table % exceeds 50000 rows; stop the window',
+                                    inventory_table.table_name;
+                  END IF;
+                  RAISE NOTICE 'inventory table=% row_count=%', inventory_table.table_name, row_count;
+                  table_count := table_count + 1;
+                END LOOP;
+                RAISE NOTICE 'inventory complete tables=%', table_count;
+              END
+              $inventory$;
               SQL
           env:
             - name: PGHOST

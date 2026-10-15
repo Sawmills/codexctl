@@ -419,6 +419,8 @@ disruption. The Service remains ClusterIP, as today (`docs/central-server.md:380
 
 ## 5. Staging migration and rollback
 
+SCAN EXCEPTION RECORD ADDENDUM 2 (2026-10-13T12:5xZ): HQ w5C:t41 grants as codexctl code owner; tF CO-SIGN-INV verbatim: "b33-check-empty inventory Job, staging codexctl_a5 only, read-only, LIMIT 50001 per table failing closed above 50000, expiry 2026-10-20, no prod. Conditions: the DB guard refuses other DB names and libpq hostaddr or routing overrides (one test each); logs counts only; no new DB or schema." HQ order for #167 H round 11 of 12: fix both live blockers (Job bound to codexctl_a5 with the DB guard; local test cannot route destructive setup or cleanup to a remote host), add the two tests, push ONCE, post this addendum verbatim on #167 and in docs/central-ha.md section 5, one Architect rerequest via t27. APPROVED needed by 17:00Z (10:00 PDT).
+
 SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
 
 SCAN EXCEPTION RECORD ADDENDUM (2026-10-13T03:5xZ): tF CANARY-OK verbatim: "CANARY-OK for the scan exception: add ONE scratch target codexctl_a5_canary, canary Job only, same 50000-row cap failing closed, same expiry, staging only. LIMIT: A128 allows exactly ONE new RDS database (codexctl_a5). So the canary DB must NOT be a second database on the RDS: use a schema inside codexctl_a5 or a throwaway Postgres pod in the staging namespace, dropped after the canary. A second RDS database needs Amir." HQ choice: throwaway Postgres pod in the codexctl staging namespace, database codexctl_a5_canary, dropped after the canary (keeps canary rows out of the real codexctl_a5).
@@ -434,11 +436,11 @@ runtime serving do not use it. The canary uses a throwaway PostgreSQL pod in
 staging, never another RDS database, and is dropped after the canary.
 The operator must also stop using the flag as soon as attempt 5 closes.
 
-The image digests in the Job examples below predate this guard. Before applying
-either backfill Job, replace every migration/backfill image reference with the
-successful main image containing #191, and obtain exact-head approval of H/I.
-An older image does not recognize `--scan-exception`; the examples are held
-until that repin. No canary or cutover may use the old digest.
+The Job examples and H/I workloads pin the manifest from
+[image run 38382816458](https://github.com/Sawmills/codexctl/actions/runs/38382816458),
+built from main `0c6180006d7948cb6e283e21d978ad25afd75d1e` containing #191.
+Require exact-head approval of H/I and HQ's window GO before execution.
+No canary or cutover may substitute an older digest without this guard.
 
 Backfill enforces `BACKFILL_MAX_ROWS = 50000` for each imported source and target
 table, including retired loan and audit history. Target counts use the fixed
@@ -460,12 +462,37 @@ machine counts include retained rows intentionally; known source tenants retain
 the existing active-row parity policy. No foreign identifiers are read. The 1800-second, zero-retry templates below cover the initial and
 final backfill; another Job name requires HQ approval. This does not authorize
 a window, production use,
-or changes to infra #1604 while A128 is held.
+or further infrastructure changes beyond the separate A128 authorization.
 
 For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/b33-attempt-3-cutover.md): it delivers these steps through GitOps PRs and a Claude operator that uses no codexctl token.
 
 The commands below require operator execution approval. Stop if the database,
 role, secret, or row counts do not match the reviewed plan.
+
+**WINDOW CLOCK:** Before every planned codexctl window, record its planned end
+and success check. During the window, post a status line in
+`~/Code/.fleet/codexctl/questions.md` **and** to the guide `w9C:tC` every
+15 minutes. At the planned end, call **ROLLBACK** if the success check has not
+passed, using [the phased B33 rollback](superpowers/plans/b33-attempt-3-cutover.md#rollback).
+Keep the file writer at zero until HA has stopped and lease, mode and credential
+settlement checks pass. No extension is allowed without an explicit Operator
+`w9C:tF` OK.
+
+HQ's accompanying acceptance of the initial pass, copied verbatim from the
+2026-10-13 owner handoff:
+
+> YES, the scan exception covers the INITIAL backfill too, same terms (staging
+> codexctl_a5 only, 1800 s deadline, per-table receipts, HQ-approved new-name
+> retries, expires when attempt 5 closes).
+
+The record above preserves HQ's supplied timestamp text verbatim.
+[The published owner/co-sign receipt](https://github.com/Sawmills/codexctl/pull/167#issuecomment-6136918146)
+provides GitHub's exact UTC publication time; it is a publication receipt, not
+an invented time for the original co-sign.
+
+Keep per-table receipts and Job start/end times under operator/HQ custody;
+do not publish machine identifiers or credential data. Runtime tenant boundaries
+and production are outside this authorization.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
@@ -500,7 +527,10 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    Keep `codexctl-state-backup.tar.gz` and its checksum together. Restore from
    that archive, not from a second live copy.
 
-2. **Provision and migrate.** After infra#1513 is merged and applied, stop the
+2. **Provision and migrate.** For attempt 5, require the fresh `codexctl_a5`
+   provisioning receipt from infra#1604 and the separately reviewed
+   ExternalSecret repoint in infra#1605. Confirm the new target and empty-data
+   receipt before proceeding. Then stop the
    file-mode writer and wait for `codexctl-0` to terminate before attaching its
    ReadWriteOncePod claim to a migration Job. Then wait for
    `externalsecret/codexctl-postgres` to be Ready. Run the explicit schema
@@ -574,7 +604,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - { name: keys, mountPath: /keys }
          containers:
            - name: migrate
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:1b7a83ab6fed64a146f0eeb391d40bdd4bd3829f8466a83cf6c10aa4fbf0c515
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
              command:
                [
                  codexctl-central,
@@ -706,7 +736,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - {name: keys, mountPath: /keys}
          containers:
            - name: backfill
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:1b7a83ab6fed64a146f0eeb391d40bdd4bd3829f8466a83cf6c10aa4fbf0c515
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key, --scan-exception, b33-a5]
              securityContext:
                allowPrivilegeEscalation: false
@@ -734,11 +764,11 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
            - name: keys
              emptyDir: {medium: Memory}
    YAML
-   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=10m
+   kubectl --context plat-staging -n codexctl wait --for=condition=complete job/codexctl-backfill --timeout=31m
    kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
    ```
 
-4. **Cut over to the build-only HA overlay.** After the final backfill,
+4. **Cut over to the build-only HA overlay.** The B33 GitOps path instead uses PR H to independently keep the old StatefulSet at zero, repeat final backfill in a completion-gated Job, and then start HA; PR I routes traffic only after acceptance and HQ GO. Do not manually apply the build-only overlay to the auto-synced staging Application. The following commands are only for a separately approved manual installation. After the final backfill,
    build and apply the separately reviewed overlay (the overlay is deliberately
    not referenced by `deploy/k8s/staging-application.yaml`):
 
@@ -755,28 +785,51 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    remain required before the B33 cutover.
 
    Verify three ready pods on separate hostnames/zones, no broker PVC mounts,
-   `/ready` database health, one upstream refresh for a simultaneous forced
-   request, and no lease or ExternalSecret errors before changing traffic.
+   and `/ready` database health. Validate both token paths before changing traffic:
+   - **Normal fast path, on every pod:** choose an eligible account whose stored
+     access token has at least one hour left. Warm routing and, when requesting
+     billing, billing/usage evidence for its current credential revision; keep
+     that evidence within the 60-second freshness bound and every reported usage
+     window below 90%. Snapshot each pod's authenticated `/metrics`, then send
+     token requests **without `previousRevision`** directly to that pod. Require
+     200 responses, zero upstream refreshes, and an increase of at least one in
+     that pod's `codexctl_central_token_fast_path_total{result="served"}` counter.
+     A pre-existing nonzero count or a lease-path success is insufficient. The
+     managed broker already exports this counter (`src/central/managed.rs`,
+     `metrics`); the prototype handler in `src/central/server.rs` is a different
+     serving path. Missing series or no increase is NO-GO.
+   - **Forced/lease path:** separately send simultaneous requests to two pods
+     with `previousRevision` equal to the current revision of that valid token.
+     Require two 200 responses, `served_recent` / `token_valid`, and zero upstream
+     refreshes. This deliberately misses the fast path and does not satisfy its
+     acceptance check.
+   - **Near-expiry lease path:** separately prove one refresh for concurrent
+     requests using a reviewed disposable account holding a genuinely near-expiry
+     token. Do not alter live JWTs to manufacture expiry.
+
+   Require no lease or ExternalSecret errors before changing traffic.
    Change the staging `Ingress/codexctl` backend from `Service/codexctl` to
    `Service/codexctl-ha` and apply the Ingress change only after validation.
 
-5. **Rollback.** Stop HA refreshes, mark the HA Service endpoints unready, and
-   fence their leases by allowing the TTL to expire or explicitly releasing
-   them. Restore the previous single-pod StatefulSet from the retained PVC
-   snapshot, unset PostgreSQL mode, and verify file-mode `/ready`. Because HA
-   may have rotated credentials after the snapshot, require an explicit
-   relogin for every affected account and verify a successful file-mode token
-   request before routing traffic back. Change the staging `Ingress/codexctl`
-   backend from `Service/codexctl-ha` back to `Service/codexctl` and apply the
-   Ingress change. Never run old and HA refresh writers
-   simultaneously; preserve the database and PVC receipts for reconciliation.
+5. **Rollback.** Follow [the phased B33 rollback](superpowers/plans/b33-attempt-3-cutover.md#rollback).
+   Route traffic away from HA, then use a reviewed revision to set HA replicas
+   to zero while retaining H's file-writer zero fence and the completed final
+   Job. Wait for every HA pod to exit; an expired lease alone does not prove
+   settlement. Require all refresh and login leases to be released, verify the
+   retained file modes, and reconcile every affected credential, including
+   HA-only accounts or captured candidates, through the users' authorized
+   sessions. Keep both writers stopped when any settlement is unknown; ask HQ
+   for a forward fix instead. Only after those gates pass may HQ approve
+   separate removal of HA resources, followed by a separate revision restoring
+   file mode and its traffic. Never restore the file writer in the HA-stop
+   sync or directly revert H; preserve database and PVC receipts for reconciliation.
 
 ## 6. Test and acceptance plan
 
 Run these tests against two or three real pods and a disposable PostgreSQL
 instance, then repeat the destructive cases in staging.
 
-1. **Concurrent refresh.** Seed one account with a refresh token. Send forced
+1. **Concurrent refresh.** Seed a disposable account with a genuinely near-expiry access token and its refresh token. A known token with at least one hour left must instead return `served_recent` / `token_valid` without rotation. For the near-expiry fixture, send forced
    token requests simultaneously to two pods, record upstream calls, and assert
    exactly one `refreshToken=true` call, one new refresh-token revision, and two
    successful responses. Repeat while the follower starts with an older access

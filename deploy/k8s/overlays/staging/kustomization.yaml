@@ -9,11 +9,23 @@ resources:
   - sso.yaml
   - monitoring.yaml
   - migration-networkpolicy.yaml
+  - ha-deployment.yaml
+  - ha-service.yaml
+  - ha-metrics-service.yaml
+  - ha-pdb.yaml
+  - ha-networkpolicy.yaml
+  - final-backfill.yaml
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
-    digest: sha256:6374438eca220c90904c3d1623dc8fd91e18f65c27908fc9c828a0d55b74979e
+    digest: sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
 patches:
+  - path: writer-stop-patch.yaml
+    target:
+      group: apps
+      version: v1
+      kind: StatefulSet
+      name: codexctl
   - path: codexctl-restart-patch.yaml
     target:
       group: apps

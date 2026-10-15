@@ -1,0 +1,7 @@
+# H owns this fence independently of W's replica transformer.
+- op: add
+  path: /metadata/annotations/argocd.argoproj.io~1sync-wave
+  value: "0"
+- op: replace
+  path: /spec/replicas
+  value: 0

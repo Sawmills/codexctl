@@ -18,8 +18,8 @@ spec:
             service: codexctl
             environment: staging
           annotations:
-            summary: Codexctl token server is unavailable
-            description: Check the pod, SSO configuration, and persistent credential journal. Preserve the journal before recovery.
+            summary: Codexctl account-server scrape target is unavailable
+            description: A configured replica is down or all scrape targets are absent. Other HA replicas may still serve requests. Target gaps are expected during the announced cutover outage. Check the affected pod and preserve its credential journal before recovery.
             runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
         - alert: CodexctlCredentialOperationFailed
           expr: time() - max by (reason) (codexctl_central_last_failure_timestamp_seconds{reason=~"owner_unavailable|catalog_owner_unavailable|catalog_usage_failed|catalog_usage_timeout|catalog_task_failed|live_session_failed|persistence_failed|registry_unavailable|registry_busy|import_unavailable|recovery_failed|relogin_failed|relogin_identity_unresolved|reset_read_failed|reset_redeem_failed|reset_rejected|token_evidence_clear_failed|browser_sessions_unavailable|dashboard_revoke_failed|dashboard_audit_failed|dashboard_guard_unavailable|dashboard_actions_unavailable|dashboard_registry_changed"} > 0) < 300 or max by (reason) (codexctl_central_ownership_unresolved == 1)
@@ -121,8 +121,14 @@ spec:
     credentials:
       name: codexctl-secrets
       key: metrics-token
-  staticConfigs:
-    - targets: [codexctl.codexctl.svc.cluster.local:80]
-      labels:
-        namespace: codexctl
-        service: codexctl
+  # B33 attempt 4, PR H: one target per HA pod. The labels keep the existing
+  # alert expressions valid.
+  dnsSDConfigs:
+    - names: [codexctl-ha-pods.codexctl.svc.cluster.local]
+      type: A
+      port: 8787
+  relabelings:
+    - targetLabel: namespace
+      replacement: codexctl
+    - targetLabel: service
+      replacement: codexctl
