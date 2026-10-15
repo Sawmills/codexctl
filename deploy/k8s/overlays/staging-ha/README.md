@@ -10,8 +10,15 @@ Ready on that target. Preserve the old database and its history.
 
 It runs three stateless broker pods in PostgreSQL mode. Pods spread across zones
 and hostnames, require hostname anti-affinity, use only `emptyDir` volumes, and
-keep `PodDisruptionBudget.minAvailable: 1`. The overlay has no
-`karpenter.sh/do-not-disrupt` annotation. The `codexctl-secrets`
+use `PodDisruptionBudget.maxUnavailable: 1` and integer RollingUpdate
+`maxSurge: 0` / `maxUnavailable: 1`. The Pod template carries
+`karpenter.sh/do-not-disrupt: "true"` to block voluntary consolidation. The
+five-second preStop only delays; kubelet sends TERM after the hook returns,
+leaving approximately 55 seconds of the 60-second grace for server settlement.
+Staging's NodePool expires after 336 hours with no NodePool termination grace;
+the annotation can block expiry drain indefinitely. Coordinate maintenance with
+HQ and the infra owner; see [Kubernetes shape](../../../../docs/central-ha.md#4-kubernetes-shape).
+The `codexctl-secrets`
 ExternalSecret supplies the vault key, SSO secret, and metrics token. The infra
 repository owns `codexctl-postgres`; infra#1605 repoints its five SSM references
 to `/rds/quota-manager/codexctl-a5/`. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
@@ -28,3 +35,10 @@ kubectl kustomize deploy/k8s/overlays/staging-ha
 ```
 
 Use this overlay only for render validation; deployment uses the tracked staging overlay.
+
+Run the lifecycle/availability regression locally with
+`python3 tests/ha_lifecycle_test.py -v` from the repository root. It needs PyYAML,
+`kubectl` for local rendering, Docker, and cached
+`node@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4`
+(the runtime base image). The test uses synthetic PID 1 processes in read-only,
+network-isolated containers; it never reads a live account or contacts Kubernetes.
