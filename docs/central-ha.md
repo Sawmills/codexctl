@@ -860,6 +860,28 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    file mode and its traffic. Never restore the file writer in the HA-stop
    sync or directly revert H; preserve database and PVC receipts for reconciliation.
 
+### Schema migration table-lock budget
+
+`codexctl-central migrate` serializes schema DDL under the existing admission
+lock. After admission, its DDL transaction sets `lock_timeout` to 100 ms while
+retaining the overall 2-second database budget. Even an idempotent `ALTER TABLE`
+can queue an exclusive lock ahead of serving queries; the shorter table-lock
+wait makes a contended migration fail closed instead of stalling other brokers
+for the full budget. Earlier DDL in that transaction rolls back on failure.
+
+A table-lock timeout emits a fixed JSON diagnostic with operation
+`schema_migration`, stage `ddl`, failure class `lock_timeout` and SQLSTATE
+`55P03`; it includes no SQL text, parameters or account identifiers. The command
+exits nonzero and does not retry internally. An operator or a future HA init
+container may run a new attempt after contention clears. Maintenance requiring
+drained writers still requires that separate procedure and approval.
+
+Applying schema before HA serve is a separate deployment change: first build
+the image containing this timeout, then review the initializer and matching pin
+in both overlays. Do not enable that rollout on an older image. Avoiding all
+repeat DDL with an applied-schema fingerprint is a follow-up under SAW-12757;
+the schema version alone cannot distinguish additive migrations within layout 8.
+
 ## 6. Test and acceptance plan
 
 Run these tests against two or three real pods and a disposable PostgreSQL

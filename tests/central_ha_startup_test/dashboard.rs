@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "migration.rs"]
+mod migration;
+
 struct BrowserFixture {
     first: Pod,
     second: Pod,
