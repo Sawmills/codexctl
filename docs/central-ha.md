@@ -768,13 +768,15 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    kubectl --context plat-staging -n codexctl logs job/codexctl-backfill
    ```
 
-4. **Cut over to the build-only HA overlay.** The B33 GitOps path instead uses PR H to independently keep the old StatefulSet at zero, repeat final backfill in a completion-gated Job, and then start HA; PR I routes traffic only after acceptance and HQ GO. Do not manually apply the build-only overlay to the auto-synced staging Application. The following commands are only for a separately approved manual installation. After the final backfill,
-   build and apply the separately reviewed overlay (the overlay is deliberately
-   not referenced by `deploy/k8s/staging-application.yaml`):
+4. **Activate HA through the Argo-tracked staging overlay.** Follow the
+   [B33 runbook](superpowers/plans/b33-attempt-3-cutover.md): PR H keeps the old
+   StatefulSet at zero, repeats final backfill in a completion-gated Job, and
+   then starts HA; PR I routes traffic only after acceptance and HQ GO.
+   Deploy through Argo CD's tracked `deploy/k8s/overlays/staging` overlay.
+   `deploy/k8s/overlays/staging-ha` is render-only and must never be applied
+   manually. After H reconciles, observe the rollout:
 
    ```sh
-   kustomize build deploy/k8s/overlays/staging-ha
-   kubectl --context plat-staging apply -k deploy/k8s/overlays/staging-ha
    kubectl --context plat-staging -n codexctl rollout status deployment/codexctl-ha
    ```
 
