@@ -146,3 +146,4 @@ If Ready drops below two, public PostgreSQL readiness fails, a new token-error b
 - HQ approved delay-only preStop, annotation **and** tighter PDB, and integer `0/1` strategy as one PR.
 - Metadata readbacks supplied by HQ at 14:0xZ as recorded above. The particular `Forceful Termination` cause and deleted-pod exit/drain completion remain unknown unless an executor has retained receipts.
 - Deployment gate and t56 acceptance ownership confirmed by HQ; obtain the exact-head reviews/checks and coordinate the rollout start before merging.
+- Held workflow-owner follow-up on SAW-12988: run the Python rendered-manifest/lifecycle regression in CI with its documented prerequisites. Until that wiring lands, the check is manual and must not be described as enforced by Cargo or required hosted checks. A124 prohibits lane workflow edits, so this PR makes none.

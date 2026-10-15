@@ -42,3 +42,6 @@ Run the lifecycle/availability regression locally with
 `node@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4`
 (the runtime base image). The test uses synthetic PID 1 processes in read-only,
 network-isolated containers; it never reads a live account or contacts Kubernetes.
+This is a manual regression check: Cargo and the hosted CI workflow do not run
+Python tests. CI wiring is a held workflow-owner follow-up on SAW-12988; lane
+commits cannot edit `.github/workflows` under A124.
