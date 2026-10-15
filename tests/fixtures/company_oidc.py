@@ -9,6 +9,7 @@ import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 root = pathlib.Path(sys.argv[1])
@@ -74,7 +75,13 @@ class Handler(BaseHTTPRequestHandler):
         token = signing_input.decode() + "." + b64(signature)
         self.output(200, {"access_token": "synthetic-company-access", "token_type": "Bearer", "expires_in": 300, "id_token": token})
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer resolves its name before readiness; loopback needs no DNS.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address
+
+server = LoopbackHTTPServer(("127.0.0.1", 0), Handler)
 issuer = "http://127.0.0.1:" + str(server.server_address[1])
 print(json.dumps({"issuer": issuer}), flush=True)
 server.serve_forever()

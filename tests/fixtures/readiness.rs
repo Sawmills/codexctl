@@ -1,10 +1,12 @@
 //! JSON readiness and owned cleanup for synthetic test processes only.
 use std::{
+    cell::OnceCell,
     fs::{File, OpenOptions},
     io::{Read, Seek, SeekFrom},
     os::fd::AsRawFd,
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -46,6 +48,8 @@ impl std::fmt::Display for StartupFailure {
 pub struct ReadyChild {
     child: Option<Child>,
     pub ready: Value,
+    /// Set only by an owned wait, including cleanup during unwinding.
+    pub reaped_status: Rc<OnceCell<ExitStatus>>,
 }
 
 impl ReadyChild {
@@ -89,6 +93,7 @@ impl ReadyChild {
         let mut running = Self {
             child: Some(child),
             ready: Value::Null,
+            reaped_status: Rc::default(),
         };
         let mut output = running.child.as_mut().unwrap().stdout.take().unwrap();
         let flags = unsafe { libc::fcntl(output.as_raw_fd(), libc::F_GETFL) };
@@ -153,10 +158,6 @@ impl ReadyChild {
         self.child.take().unwrap()
     }
 
-    pub fn pid(&self) -> u32 {
-        self.child.as_ref().unwrap().id()
-    }
-
     fn failure(&mut self, reason: &'static str, log: &Path, offset: u64) -> StartupFailure {
         let child = self.child.as_mut().unwrap();
         let pid = child.id();
@@ -177,6 +178,9 @@ impl ReadyChild {
                 }
             }
         };
+        if let Some(status) = status {
+            let _ = self.reaped_status.set(status);
+        }
         self.child.take();
         let stderr = (|| -> std::io::Result<Vec<u8>> {
             let mut file = File::open(log)?;
@@ -211,7 +215,9 @@ impl Drop for ReadyChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
-            let _ = child.wait();
+            if let Ok(status) = child.wait() {
+                let _ = self.reaped_status.set(status);
+            }
         }
     }
 }

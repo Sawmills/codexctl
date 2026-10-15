@@ -3335,7 +3335,11 @@ impl EnrollmentServer {
     fn with_sso(identity: Value, extra: Value) -> Self {
         Self::with_setup(identity, extra, |_, _| {})
     }
-    fn with_setup(identity: Value, extra: Value, setup: impl FnOnce(&Server, u32)) -> Self {
+    fn with_setup(
+        identity: Value,
+        extra: Value,
+        setup: impl FnOnce(&Server, &readiness::ReadyChild),
+    ) -> Self {
         let mut server = Server::start();
         server.stop();
         store::atomic_write(
@@ -3354,7 +3358,7 @@ impl EnrollmentServer {
             Duration::from_secs(20),
         )
         .unwrap_or_else(|error| panic!("OIDC issuer must start: {error}"));
-        setup(&server, issuer.pid());
+        setup(&server, &issuer);
         let ready = &issuer.ready;
         let secret = server.root.path().join("oidc.secret");
         store::atomic_write(&secret, b"synthetic-company-client-secret").unwrap();
@@ -3503,7 +3507,7 @@ fn sso_startup_preserves_the_reason_when_its_selected_port_is_occupied() {
         "startup lost the bind failure: {failure}"
     );
     assert!(failure.status.is_some_and(|status| !status.success()));
-    assert_startup_child_reaped(failure.pid);
+    assert_startup_failure_reaped(&failure);
 }
 
 #[test]
@@ -3550,6 +3554,55 @@ fn sso_startup_does_not_retry_invalid_configuration_after_an_old_bind_failure() 
 }
 
 #[test]
+fn sso_startup_real_issuer_is_ready_without_reverse_dns() {
+    let root = tempfile::tempdir().unwrap();
+    let result = readiness::ReadyChild::start(
+        Command::new("python3")
+            .args([
+                "-c",
+                r#"import pathlib, runpy, socket, sys, time
+def stalled_dns(*args):
+    pathlib.Path(sys.argv[1], 'dns-entered').write_text('entered')
+    time.sleep(60)
+socket.getfqdn = stalled_dns
+script = sys.argv.pop(1)
+runpy.run_path(script, run_name='__main__')"#,
+            ])
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/company_oidc.py"))
+            .arg(root.path()),
+        &root.path().join("startup.log"),
+        Duration::from_secs(20),
+    );
+    let issuer = result.unwrap_or_else(|error| {
+        panic!(
+            "OIDC issuer must start without reverse DNS (resolver entered: {}): {error}",
+            root.path().join("dns-entered").exists()
+        )
+    });
+    let url = issuer.ready["issuer"].as_str().unwrap();
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let discovery: Value = http
+        .get(format!("{url}/.well-known/openid-configuration"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(discovery["issuer"], url);
+    let keys: Value = http
+        .get(format!("{url}/keys"))
+        .send()
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(keys["keys"][0]["kty"], "RSA");
+    assert!(!root.path().join("dns-entered").exists());
+}
+
+#[test]
 fn sso_startup_deadline_reaps_a_child_with_partial_readiness() {
     let root = tempfile::tempdir().unwrap();
     let started = std::time::Instant::now();
@@ -3568,7 +3621,7 @@ fn sso_startup_deadline_reaps_a_child_with_partial_readiness() {
     assert_eq!(error.reason, "deadline");
     assert!(root.path().join("partial-written").exists());
     assert!(started.elapsed() < Duration::from_secs(6));
-    assert_startup_child_reaped(error.pid);
+    assert_startup_failure_reaped(&error);
 }
 
 #[test]
@@ -3598,22 +3651,25 @@ fn sso_startup_keeps_only_current_exit_diagnostics_without_echoing_stdout() {
             .to_string()
             .contains("synthetic-secret-readiness-payload")
     );
-    assert_startup_child_reaped(error.pid);
+    assert_startup_failure_reaped(&error);
 }
 
 #[test]
 fn sso_startup_reaps_a_ready_issuer_when_later_setup_panics() {
-    let mut pid = 0;
+    let mut reaped_status = None;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         EnrollmentServer::with_setup(
             company_identity(),
             json!({"allowed_domains": []}),
-            |_, issuer_pid| pid = issuer_pid,
+            |_, issuer| reaped_status = Some(issuer.reaped_status.clone()),
         );
     }));
     assert!(result.is_err());
-    assert!(pid > 0);
-    assert_startup_child_reaped(pid);
+    let reaped_status = reaped_status.expect("setup must have received a ready issuer");
+    assert!(
+        reaped_status.get().is_some(),
+        "the owned issuer must be waited on during unwinding"
+    );
 }
 
 #[test]
@@ -3634,7 +3690,7 @@ fn sso_startup_rejects_a_dead_real_issuer_and_reaps_the_broker() {
         "{error}"
     );
     assert!(!error.bind_conflict());
-    assert_startup_child_reaped(error.pid);
+    assert_startup_failure_reaped(&error);
 }
 
 #[test]
@@ -3652,7 +3708,7 @@ fn sso_startup_bounds_the_stderr_of_an_early_exit() {
     .expect("an early exit must fail readiness");
     assert!(error.stderr.len() <= 4096);
     assert!(error.stderr.ends_with("synthetic startup fault"));
-    assert_startup_child_reaped(error.pid);
+    assert_startup_failure_reaped(&error);
 }
 
 #[test]
@@ -3670,15 +3726,11 @@ fn sso_startup_preserves_the_os_cause_of_a_log_open_failure() {
     assert_eq!(error.pid, 0, "the log failure must precede child spawn");
 }
 
-fn assert_startup_child_reaped(pid: u32) {
-    assert_eq!(
-        unsafe { libc::kill(pid as i32, 0) },
-        -1,
-        "startup child must no longer exist"
-    );
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
+fn assert_startup_failure_reaped(failure: &readiness::StartupFailure) {
+    // ReadyChild obtains this status only from its owned Child::wait/try_wait.
+    assert!(
+        failure.pid > 0 && failure.status.is_some(),
+        "startup failure must retain a successful owned wait: {failure}"
     );
 }
 
@@ -3914,7 +3966,7 @@ fn google_migration_server(identity: Value) -> EnrollmentServer {
                 "users": [{"user_id": clerk_user_id(), "email": "amir@sawmills.ai"}]
             }
         }),
-        |server, _issuer_pid| {
+        |server, _issuer| {
             // Synthetic legacy registry, including a machine credential issued before cutover.
             let state = server.root.path().join("state");
             let mut users: Value =
