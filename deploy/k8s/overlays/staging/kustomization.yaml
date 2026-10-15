@@ -18,7 +18,7 @@ resources:
 images:
   - name: codexctl-central
     newName: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central
-    digest: sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048
+    digest: sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
 patches:
   - path: writer-stop-patch.yaml
     target:

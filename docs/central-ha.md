@@ -436,11 +436,11 @@ runtime serving do not use it. The canary uses a throwaway PostgreSQL pod in
 staging, never another RDS database, and is dropped after the canary.
 The operator must also stop using the flag as soon as attempt 5 closes.
 
-The image digests in the Job examples below predate this guard. Before applying
-either backfill Job, replace every migration/backfill image reference with the
-successful main image containing #191, and obtain exact-head approval of H/I.
-An older image does not recognize `--scan-exception`; the examples are held
-until that repin. No canary or cutover may use the old digest.
+The Job examples and H/I workloads pin the manifest from
+[image run 38382816458](https://github.com/Sawmills/codexctl/actions/runs/38382816458),
+built from main `0c6180006d7948cb6e283e21d978ad25afd75d1e` containing #191.
+Require exact-head approval of H/I and HQ's window GO before execution.
+No canary or cutover may substitute an older digest without this guard.
 
 Backfill enforces `BACKFILL_MAX_ROWS = 50000` for each imported source and target
 table, including retired loan and audit history. Target counts use the fixed
@@ -462,7 +462,7 @@ machine counts include retained rows intentionally; known source tenants retain
 the existing active-row parity policy. No foreign identifiers are read. The 1800-second, zero-retry templates below cover the initial and
 final backfill; another Job name requires HQ approval. This does not authorize
 a window, production use,
-or changes to infra #1604 while A128 is held.
+or further infrastructure changes beyond the separate A128 authorization.
 
 For the staging attempt 3, follow [the B33 attempt 3 runbook](superpowers/plans/b33-attempt-3-cutover.md): it delivers these steps through GitOps PRs and a Claude operator that uses no codexctl token.
 
@@ -478,8 +478,6 @@ Keep the file writer at zero until HA has stopped and lease, mode and credential
 settlement checks pass. No extension is allowed without an explicit Operator
 `w9C:tF` OK.
 
-SCAN EXCEPTION RECORD (B33 attempt 5, codexctl#167 and its source follow-up), 2026-10-13T02:3xZ: Accepting owner: codexctl HQ w5C:t41 (codexctl code owner), co-signed by Operator w9C:tF. tF CO-SIGN verbatim: "CO-SIGN #167 scan exception, with conditions: staging codexctl_a5 initial + final backfill only; the 50000-rows-per-table cap fails CLOSED (stop, no partial cutover) when hit; expires when attempt 5 closes or by 10-20, whichever is first; no prod use. This co-sign does not touch A128 or the #1604 hold."
-
 HQ's accompanying acceptance of the initial pass, copied verbatim from the
 2026-10-13 owner handoff:
 
@@ -492,25 +490,9 @@ The record above preserves HQ's supplied timestamp text verbatim.
 provides GitHub's exact UTC publication time; it is a publication receipt, not
 an invented time for the original co-sign.
 
-The exception covers initial and final administrative backfill only. Require an
-image containing [source PR #191](https://github.com/Sawmills/codexctl/pull/191),
-which enforces `BACKFILL_MAX_ROWS = 50000` for the six imported source/target
-tables, retains full loan/audit history parity, scopes machine inventory to each
-source tenant, and counts foreign tenants without reading their identifiers.
-The currently pinned `dd0fada7` image predates that guard: H/I activation remains
-held until #191 merges, its main image builds, and every HA/migrate/backfill
-image reference is repinned and re-approved. This record grants no cutover or
-infra #1604 action.
-
-Require per-table source, pre-copy target and post-copy target counts in the JSON
-receipt, including retained history, plus Job start/end times and result. A
-registry growth failure may leave matching partial copies; keep HA stopped and
-retain the target for inspection. Initial/final Jobs have a 1800-second deadline
-and no automatic retry; HQ must approve a new Job name. Keep identifier mismatch
-receipts under operator/HQ custody; do not publish machine identifiers or
-credential data. Runtime tenant boundaries and production are outside this
-authorization. The exception expires when attempt 5 closes or by 2026-10-20,
-whichever comes first.
+Keep per-table receipts and Job start/end times under operator/HQ custody;
+do not publish machine identifiers or credential data. Runtime tenant boundaries
+and production are outside this authorization.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
@@ -545,7 +527,10 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
    Keep `codexctl-state-backup.tar.gz` and its checksum together. Restore from
    that archive, not from a second live copy.
 
-2. **Provision and migrate.** After infra#1513 is merged and applied, stop the
+2. **Provision and migrate.** For attempt 5, require the fresh `codexctl_a5`
+   provisioning receipt from infra#1604 and the separately reviewed
+   ExternalSecret repoint in infra#1605. Confirm the new target and empty-data
+   receipt before proceeding. Then stop the
    file-mode writer and wait for `codexctl-0` to terminate before attaching its
    ReadWriteOncePod claim to a migration Job. Then wait for
    `externalsecret/codexctl-postgres` to be Ready. Run the explicit schema
@@ -619,7 +604,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - { name: keys, mountPath: /keys }
          containers:
            - name: migrate
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
              command:
                [
                  codexctl-central,
@@ -751,7 +736,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
                - {name: keys, mountPath: /keys}
          containers:
            - name: backfill
-             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048
+             image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c
              command: [codexctl-central, backfill, --state, /data/state, --key-file, /keys/vault-key, --scan-exception, b33-a5]
              securityContext:
                allowPrivilegeEscalation: false

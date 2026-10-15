@@ -6,26 +6,27 @@ Reader: the cutover operator and the HQ that approves the window. The design and
 
 ## Attempt 5 image and fresh database (2026-10-13)
 
-**Image dependency hold:** the current `dd0fada7` pins below contain #190 but
-predate [#191's enforced row cap and tenant-scoped inventory](https://github.com/Sawmills/codexctl/pull/191).
-Do not activate H/I or run either backfill until #191 merges, its main image
-build succeeds, and all HA/migrate/backfill references are repinned and approved.
+**Image dependency satisfied:** the pins below contain
+[#191's enforced row cap, tenant-scoped inventory and scan-scope guard](https://github.com/Sawmills/codexctl/pull/191).
+Do not activate H/I or run either backfill until their new exact heads are approved.
 The co-signed initial/final scan exception is in section 5 of central-ha.md;
 it does not waive that image dependency, a new window or A128.
 
-Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:dd0fada761c61bee03604573ec4a0e2903d949e2b1b995bde540422652d93048` for the HA account server, initial migrate/backfill Jobs and
-H's frozen final-backfill Job. [Central server image run 38332773546](https://github.com/Sawmills/codexctl/actions/runs/38332773546)
-succeeded on main `d956d5489910fdad0af750449dc49a395fb180c8`, which contains
-#190's fail-closed source projection and identifier checks, plus #176, #182,
+Use `767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b00059975ef670e17bdc83b6abd34a0cc7e3ab1b8957107bf2a150bbfe6b859c` for the HA account server, initial migrate/backfill Jobs and
+H's frozen final-backfill Job. [Central server image run 38382816458](https://github.com/Sawmills/codexctl/actions/runs/38382816458)
+succeeded on main `0c6180006d7948cb6e283e21d978ad25afd75d1e`, which contains
+#191's bounded scope checks, #190's fail-closed parity, plus #176, #182,
 #183, #184 and #177. Both Job templates retain `fsGroupChangePolicy: OnRootMismatch`.
 The attempt-4 image below is historical and must not run attempt 5's backfill.
 
 HQ selected a fresh empty staging database `codexctl_a5`; retain the old database
 and its history. [Infra #1604](https://github.com/Sawmills/infra/pull/1604) prepares
-component `codexctl-a5-db`; A128 currently holds all AWS plans/applies and further
-infra pushes/reruns until HQ relays the required approvals. The reset draft
-#189 is unused. The pipeline and a separately reviewed ExternalSecret repoint
-must establish the new target and empty-data receipt before any cutover window.
+component `codexctl-a5-db`. The approved create-only provisioning receipt
+records 13 creates, zero changes and zero destroys, with no application tables.
+[Infra #1605](https://github.com/Sawmills/infra/pull/1605) separately repoints the
+ExternalSecret to `/rds/quota-manager/codexctl-a5/`. Require its reconciled target
+and a fresh empty-data receipt before migration; a merged PR is not a readiness
+receipt. The reset draft #189 remains unused, and the old database is preserved.
 
 No new window or H/I activation is authorized. H/I require fresh exact-head
 reviews and green checks, the fresh-DB receipt, and explicit HQ GO in the window.
@@ -103,11 +104,11 @@ Never send the canary token request with `codexctl central-token`. That command 
 
 All canary objects are in namespace `codexctl` with names that start with `codexctl-canary-`, so the copy and the vault key never leave the cluster.
 
-1. **Scratch database and policy.** Start pod `codexctl-canary-pg` (`postgres:16`, label `app.kubernetes.io/name: codexctl-canary-pg`, `emptyDir` data) and a ClusterIP `Service/codexctl-canary-pg` that selects that label on port 5432. Create `Secret/codexctl-canary-db` with the keys that the Jobs read from `Secret/codexctl-postgres`: `db-hostname` = the ClusterIP of `Service/codexctl-canary-pg` (read it with `kubectl -n codexctl get svc codexctl-canary-pg`), `db-port` = `5432`, `db-name`, `db-user`, and a random `db-password` that matches the scratch pod. Create `NetworkPolicy/codexctl-canary` as described above. Run `kubectl -n codexctl get networkpolicy -o yaml` and confirm that no other policy selects the `codexctl-canary` label.
+1. **Scratch database and policy.** Start pod `codexctl-canary-pg` (`postgres:16`, label `app.kubernetes.io/name: codexctl-canary-pg`, `emptyDir` data) and a ClusterIP `Service/codexctl-canary-pg` that selects that label on port 5432. Create `Secret/codexctl-canary-db` with the keys that the Jobs read from `Secret/codexctl-postgres`: `db-hostname` = the ClusterIP of `Service/codexctl-canary-pg` (read it with `kubectl -n codexctl get svc codexctl-canary-pg`), `db-port` = `5432`, `db-name` = `codexctl_a5_canary` (also set `POSTGRES_DB=codexctl_a5_canary` in the scratch pod), `db-user`, and a random `db-password` that matches the scratch pod. Create `NetworkPolicy/codexctl-canary` as described above. Run `kubectl -n codexctl get networkpolicy -o yaml` and confirm that no other policy selects the `codexctl-canary` label.
 2. **Scratch claim.** Create PVC `codexctl-canary-state` with access mode `ReadWriteOncePod`. Only one pod mounts it at a time: delete each claim pod (loader, register, Jobs, serve) and wait until it is gone before the next one starts. A loader pod (image busybox as in the attempt 3 backup reader, label `codexctl-canary`, user and group 10001, no `fsGroup`) receives the archive with `kubectl cp` and unpacks it into `/data/state` with `tar -xpzf`, which keeps the modes. It then creates `/data/canary` with mode 700 for the device token in step 4 and deletes the archive file from the claim. Compare mode, owner, and group with the archive listing as in the [pre-window check](#window); any mismatch stops the canary. The copy is the attempt 3 restore archive (`codexctl-state-quiesced.tar.gz`, sha256 `fb9cf4b9…`, 8684 entries) unless HQ names a newer copy.
 3. **Egress proof.** Before the copy is mounted, start a probe pod from the window image with the `codexctl-canary` label and the guard v2 settings, and no claim. Check four results. `auth.openai.com`, `chatgpt.com`, and `api.openai.com` must not resolve, and a `node` `fetch` to each over HTTPS must fail (for example `EAI_AGAIN`). The RDS endpoint name (the host that `Secret/codexctl-postgres` names) must not resolve. TCP to the `codexctl-canary-pg` ClusterIP on port 5432 must succeed. If any result differs, stop: the guard does not hold. Delete the probe pod.
 4. **Canary device.** In a pod from the window image (label `codexctl-canary`, the canary claim, user 10001), read only the `tenant` and `user` fields of one existing device of the user who owns `<alias>` (step 6) from `/data/state/devices.json`, for example with a `node` one-liner. Then run `codexctl-central register --state /data/state --device codexctl-canary --tenant <tenant> --user <user> --token-file /data/canary/device-token`. The token file sits outside the state directory, in the directory from step 2. No real device credential is used, and the token never leaves the claim.
-5. **Migrate and backfill.** Write two canary Jobs, `codexctl-canary-migrate` and `codexctl-canary-backfill`, from the `central-ha.md` section 5 manifests with the window digest and `fsGroupChangePolicy: OnRootMismatch`. Change five things: the pod label to `codexctl-canary`, every database `secretKeyRef` to `codexctl-canary-db`, the claim to `codexctl-canary-state`, `CODEXCTL_CENTRAL_DB_TLS=0` (the scratch database has no TLS), and the guard v2 settings in each Job pod template (the base templates have none). Before each apply, `grep -cE 'codexctl-postgres|state-codexctl-0|codexctl-migration'` on the manifest must print 0, and both Job pod templates must pass the per-pod guard check above before the Job is unsuspended. Record the migrate stages and the backfill JSON. Backfill must report the file counts plus the canary device (attempt 3: 4 users, 8 accounts, 11 devices).
+5. **Migrate and backfill.** Write two canary Jobs, `codexctl-canary-migrate` and `codexctl-canary-backfill`, from the `central-ha.md` section 5 manifests with the window digest and `fsGroupChangePolicy: OnRootMismatch`. Change six things: the backfill command's scan scope to `--scan-exception b33-a5-canary` (never H's `b33-a5` scope), the pod label to `codexctl-canary`, every database `secretKeyRef` to `codexctl-canary-db`, the claim to `codexctl-canary-state`, `CODEXCTL_CENTRAL_DB_TLS=0` (the scratch database has no TLS), and the guard v2 settings in each Job pod template (the base templates have none). Before each apply, `grep -cE 'codexctl-postgres|state-codexctl-0|codexctl-migration'` on the manifest must print 0, and both Job pod templates must pass the per-pod guard check above before the Job is unsuspended. Record the migrate stages and the backfill JSON. Backfill must report the file counts plus the canary device (attempt 3: 4 users, 8 accounts, 11 devices).
 6. **One token request.** Start pod `codexctl-canary-serve` (label `codexctl-canary`, the canary claim, the same `codexctl-canary-db` references) running `codexctl-central serve --state /data/state --key-file /keys/vault-key`. Copy the vault key setup from the canary Jobs: the `prepare-secrets` init container and the `keys` volume. Set `CODEXCTL_CENTRAL_STORE=postgres`, `CODEXCTL_CENTRAL_TOKEN_FAST_PATH=1`, `CODEXCTL_CENTRAL_DB_TLS=0`, and the `DB_*` variables from `Secret/codexctl-canary-db`, as in the Jobs. Leave `CODEXCTL_CENTRAL_BACKGROUND_RECOVERY` unset, and apply the guard v2 settings (no resolver, the four proxy variables, no service account token). Keep the default loopback `--listen 127.0.0.1:8787` and pass a placeholder `--public-url`. Send the request from inside that pod with `kubectl exec` and a short `node` script: `POST http://127.0.0.1:8787/v1/token` with the header `Authorization: Bearer <contents of /data/canary/device-token>` and the body `{"alias":"<alias>"}` only, with no `billing` and no `previousRevision`. The script prints only the status, the latency, and the token expiry; it never prints the bearer or the response body. Pick the alias whose auth file the copy wrote last (the newest `auth.json` time in the archive listing). Expect `503 owner_unavailable`: with no resolver, Codex `account/read` fails with JSON-RPC `-32603` (seen on 2026-10-11 with image `6374438e`, tokens valid for 7 more days). The request still proves that the server starts on the migrated store and that no refresh leaves the pod. Do not call `GET /v1/accounts` on the copy; it runs a usage read for every account.
 7. **Pass.** The canary passes when all of these hold:
    - migrate reports every stage, and backfill reports the expected counts (step 5);
