@@ -103,19 +103,24 @@ launchctl load ~/Library/LaunchAgents/ai.sawmills.codexctl-relay.plist
 # devbox
 codexctl relay unit systemd > ~/.config/systemd/user/codexctl-relay.service
 systemctl --user daemon-reload && systemctl --user enable --now codexctl-relay
-codexctl relay status   # exit 0 only when the relay answers
+codexctl relay status   # exit 0 only when the relay proves its listener identity
 ```
 
 The service manager restarts the relay when it exits. A bind failure is fatal. On stop,
 the relay stops accepting and drains open streams for up to 30 s. An open stream that
 is cut then is retried by Codex as a dropped stream.
 
-If the relay is down, an opted-in lane shows "Reconnecting... waiting for network" and
-does not stop. Run `codexctl relay status` before you start a lane on it.
+`relay status` performs a bounded HMAC challenge against the exact listener. A plain
+`200 ok`, an old relay binary, a missing or unsafe identity file, a replaced listener,
+or a stopped relay fails closed. After upgrading codexctl, restart the service so it
+creates or loads the identity key before enabling account-server routing. An existing
+lane keeps its current child settings, but a new launch or activation refuses until
+the listener proves identity. Use `codexctl relay disable` to roll back to direct
+routing while the service is repaired.
 
 ## Enable account-server routing on a host
 
-Start the relay service first, then enable the supported host setting from an
+Start or restart the upgraded relay service first, then enable the supported host setting from an
 unpinned shell without `CODEX_HOME` or `CODEXCTL_PINNED_ALIAS`:
 
 ```sh

@@ -1288,11 +1288,14 @@ pub fn configure_relay(listen: Option<std::net::SocketAddr>) -> Result<()> {
         bail!("relay routing cannot be changed from an inherited or pinned Codex home");
     }
     let paths = config::default_paths()?;
+    // Prove a requested listener before taking native/store locks. The route
+    // state is compared again by the locked writer before it is applied.
+    let route_proof = crate::relay::preflight_configuration(&paths, listen)?;
     paths.ensure_dirs()?;
     let _native = native_lock(&root()?)?;
     let _store = store::try_lock(&paths)?
         .context("local account store is busy; retry relay configuration")?;
-    crate::relay::configure_central_route(&paths, listen)
+    crate::relay::configure_central_route(&paths, &route_proof)
 }
 
 /// Resolve explicit unmigrated local names without requiring an online catalog.
@@ -1495,11 +1498,14 @@ pub fn activate(
         }
     }
     let approve_billing = usage_based && !redeem_reset;
+    let paths = config::default_paths()?;
+    // Listener proof performs network I/O. Do it before native/store locks;
+    // central_provider rechecks this exact route state under its relay lock.
+    let route_proof = crate::relay::preflight_route(&paths)?;
     let _lock = native_lock(&root()?)?;
     if let Some(catalog) = catalog.as_ref() {
         super::remote::require_current_connection(&catalog.connection)?;
     }
-    let paths = config::default_paths()?;
     // Migration takes store then native. Never wait for the store while holding native.
     let _store =
         store::try_lock(&paths)?.context("local account store is busy; retry selection")?;
@@ -1573,7 +1579,7 @@ pub fn activate(
         .and_then(|providers| providers.get(PROVIDER))
         .cloned();
     let mut provider = Table::new();
-    let route = crate::relay::central_provider(&paths, None, None)?;
+    let route = crate::relay::central_provider(&paths, None, None, &route_proof)?;
     let stream_retries = existing_provider
         .as_ref()
         .and_then(|item| item.get("stream_max_retries"))

@@ -492,6 +492,9 @@ fn prepare_pinned_codex(
     connection.approved_billing_plan = bills.then(|| token.chatgpt_plan_type.clone()).flatten();
     connection.approved_billing_class = bills.then_some(token.billing_class).flatten();
     connection.revision = token.revision.clone();
+    // Listener proof performs network I/O. Do it before store/native locks;
+    // central_provider rechecks this exact route state under its relay lock.
+    let route_proof = crate::relay::preflight_route(&paths)?;
     let (prepared, owner, route) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
@@ -513,8 +516,12 @@ fn prepare_pinned_codex(
             &serde_json::to_vec(&super::super::process::Process::capture(std::process::id())?)?,
         )?;
         save_connection(&prepared.path().join("connection.json"), &connection)?;
-        let route =
-            crate::relay::central_provider(&paths, Some(&account.alias), token.billing_class)?;
+        let route = crate::relay::central_provider(
+            &paths,
+            Some(&account.alias),
+            token.billing_class,
+            &route_proof,
+        )?;
         (prepared, owner, route)
     };
     let path = prepared.path().join("connection.json");

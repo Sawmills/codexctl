@@ -17,6 +17,9 @@ struct Server {
     alex: String,
 }
 
+#[path = "fixtures/relay.rs"]
+mod relay_fixture;
+
 #[test]
 fn readiness_reports_file_mode_and_registry_health() {
     let server = Server::start();
@@ -12268,16 +12271,24 @@ fn relay_configuration_preserves_symlinked_config_and_permissions() {
     server.import(&server.amir, "host", "host-login", "host-seat");
     let home = server.connected_home();
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let relay = relay_fixture::TestRelay::start(home.path());
+    let relay_url = format!("http://{}/backend-api/codex", relay.address);
     let config = home.path().join(".codex/config.toml");
     let target = home.path().join("dotfiles-config.toml");
     std::fs::rename(&config, &target).unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
     symlink(&target, &config).unwrap();
-    for (action, expected) in [
-        ("enable", "http://127.0.0.1:47631/backend-api/codex"),
-        ("disable", "https://chatgpt.com/backend-api/codex"),
+    for (args, expected) in [
+        (
+            vec!["relay", "enable", "--listen", relay.address.as_str()],
+            relay_url.as_str(),
+        ),
+        (
+            vec!["relay", "disable"],
+            "https://chatgpt.com/backend-api/codex",
+        ),
     ] {
-        let result = server.cli(home.path(), &["relay", action]);
+        let result = server.cli(home.path(), &args);
         assert!(
             result.status.success(),
             "{}",
@@ -12288,7 +12299,7 @@ fn relay_configuration_preserves_symlinked_config_and_permissions() {
                 .unwrap()
                 .file_type()
                 .is_symlink(),
-            "relay {action} must preserve the operator's config symlink"
+            "relay configuration must preserve the operator's config symlink"
         );
         assert_eq!(std::fs::read_link(&config).unwrap(), target);
         assert_eq!(
@@ -12310,16 +12321,21 @@ fn interrupted_relay_configuration_recovers_on_the_next_account_launch() {
     server.import(&server.amir, "host", "host-login", "host-seat");
     let home = server.connected_home();
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let relay = relay_fixture::TestRelay::start(home.path());
+    let relay_url = format!("http://{}/backend-api/codex", relay.address);
     let setting = home.path().join(".codexctl/relay.json");
     // Force the second atomic replacement to fail after the provider write.
     std::fs::create_dir(&setting).unwrap();
-    let enabled = server.cli(home.path(), &["relay", "enable"]);
+    let enabled = server.cli(
+        home.path(),
+        &["relay", "enable", "--listen", &relay.address],
+    );
     assert!(!enabled.status.success());
     std::fs::remove_dir(&setting).unwrap();
     // A new process must finish the durable transaction before selecting a route.
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
     let saved: Value = serde_json::from_slice(&std::fs::read(setting).unwrap()).unwrap();
-    assert_eq!(saved["listen"], "127.0.0.1:47631");
+    assert_eq!(saved["listen"], relay.address);
     let config: toml_edit::DocumentMut =
         std::fs::read_to_string(home.path().join(".codex/config.toml"))
             .unwrap()
@@ -12327,7 +12343,7 @@ fn interrupted_relay_configuration_recovers_on_the_next_account_launch() {
             .unwrap();
     assert_eq!(
         config["model_providers"]["codexctl-central"]["base_url"].as_str(),
-        Some("http://127.0.0.1:47631/backend-api/codex")
+        Some(relay_url.as_str())
     );
     assert!(
         config["model_providers"]["codexctl-central"]["http_headers"]
@@ -12347,9 +12363,11 @@ fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
     server.import(&server.amir, "lane", "lane-login", "lane-seat");
     let home = server.connected_home();
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
+    let relay = relay_fixture::TestRelay::start(home.path());
+    let relay_url = format!("http://{}/backend-api/codex", relay.address);
     let enabled = server.cli(
         home.path(),
-        &["relay", "enable", "--listen", "127.0.0.1:47631"],
+        &["relay", "enable", "--listen", &relay.address],
     );
     assert!(
         enabled.status.success(),
@@ -12374,7 +12392,7 @@ fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
     );
     assert_eq!(
         config["model_providers"]["codexctl-central"]["base_url"].as_str(),
-        Some("http://127.0.0.1:47631/backend-api/codex")
+        Some(relay_url.as_str())
     );
     assert!(server.cli(home.path(), &["use", "host"]).status.success());
     let after: toml_edit::DocumentMut = std::fs::read_to_string(&path).unwrap().parse().unwrap();
@@ -12388,7 +12406,7 @@ fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
     store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
 import json, os, subprocess, sys
 values = dict(arg.split('=', 1) for arg in sys.argv[1:] if arg.startswith('model_providers.codexctl-central.') and '=' in arg)
-assert json.loads(values['model_providers.codexctl-central.base_url']) == 'http://127.0.0.1:47631/backend-api/codex'
+assert json.loads(values['model_providers.codexctl-central.base_url']) == os.environ['EXPECTED_RELAY_URL']
 assert 'X-Codexctl-Account-Alias' in values['model_providers.codexctl-central.http_headers']
 assert 'X-Codexctl-Account-Class' in values['model_providers.codexctl-central.http_headers']
 assert values['model_providers.codexctl-central.requires_openai_auth'] == 'false'
@@ -12418,7 +12436,7 @@ print('RELAY-PRIVATE-AUTH-OK')
         store::atomic_write(&path, config.to_string().as_bytes()).unwrap();
         for action in [
             &["relay", "disable"][..],
-            &["relay", "enable"][..],
+            &["relay", "enable", "--listen", relay.address.as_str()][..],
             &["use", "host"][..],
         ] {
             let changed = server.cli(home.path(), action);
@@ -12447,6 +12465,7 @@ print('RELAY-PRIVATE-AUTH-OK')
             )
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .env("EXPECTED_STREAM_RETRIES", retries.to_string())
+            .env("EXPECTED_RELAY_URL", &relay_url)
             .env_remove("CODEX_HOME")
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .output()
@@ -12459,6 +12478,18 @@ print('RELAY-PRIVATE-AUTH-OK')
         assert!(String::from_utf8_lossy(&launched.stdout).contains("RELAY-PRIVATE-AUTH-OK"));
         assert_eq!(std::fs::read(&pointer).unwrap(), before_pointer);
     }
+    drop(relay);
+    let refused = server.cli(home.path(), &["use", "host"]);
+    assert!(
+        !refused.status.success(),
+        "activation used a relay that no longer proved identity"
+    );
+    let after_stop: toml_edit::DocumentMut =
+        std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(
+        after_stop["model_providers"]["codexctl-central"]["base_url"].as_str(),
+        Some(relay_url.as_str())
+    );
     let disabled = server.cli(home.path(), &["relay", "disable"]);
     assert!(
         disabled.status.success(),
