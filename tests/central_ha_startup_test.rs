@@ -2613,19 +2613,56 @@ async fn postgres_unidentified_login_does_not_fence_another_company_user() {
 }
 
 #[cfg(target_os = "linux")]
+fn parent_bound_exited(stat: std::io::Result<String>) -> bool {
+    match stat {
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            true
+        }
+        Ok(stat) => stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z"),
+        Err(error) => panic!("child liveness: {error}"),
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn parent_bound_exit_accepts_esrch_from_a_reaped_process() {
+    use std::io::Read;
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("10")
+        .spawn()
+        .unwrap();
+    let mut stat = std::fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let mut text = String::new();
+    let error = stat.read_to_string(&mut text).unwrap_err();
+    assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+    assert!(parent_bound_exited(Err(error)));
+    assert!(parent_bound_exited(Err(std::io::Error::from(
+        std::io::ErrorKind::NotFound
+    ))));
+    assert!(parent_bound_exited(Ok("1 (synthetic process) Z 0".into())));
+    assert!(!parent_bound_exited(Ok("1 (synthetic process) S 0".into())));
+    assert!(
+        std::panic::catch_unwind(|| {
+            parent_bound_exited(Err(std::io::Error::from_raw_os_error(libc::EACCES)))
+        })
+        .is_err()
+    );
+}
+
+#[cfg(target_os = "linux")]
 async fn wait_parent_bound_exit(pid: u32) {
     timeout(Duration::from_secs(8), async {
         loop {
-            match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Ok(stat)
-                    if stat.rsplit_once(')').unwrap().1.split_whitespace().next() == Some("Z") =>
-                {
-                    break;
-                }
-                Err(error) => panic!("child liveness: {error}"),
-                _ => tokio::time::sleep(Duration::from_millis(25)).await,
+            if parent_bound_exited(std::fs::read_to_string(format!("/proc/{pid}/stat"))) {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
