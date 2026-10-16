@@ -698,6 +698,63 @@ async fn postgres_dashboard_reset_button_requires_gate_and_exhaustion() {
     }
 }
 
+#[tokio::test]
+async fn postgres_dashboard_reset_reuses_one_usage_observation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let usage_calls = Arc::new(AtomicUsize::new(0));
+    let counted = usage_calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app=Router::new().route("/usage",get(move || {
+        counted.fetch_add(1,Ordering::SeqCst);
+        async {Json(json!({"plan_type":"pro","rate_limit":{"primary_window":{"used_percent":100,"limit_window_seconds":18000,"reset_at":4102444800_i64}},"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":1}}))}
+    })).route("/credits",get(||async {Json(json!({"available_count":1,"credits":[{"id":"only","status":"available","expires_at":"2036-07-26T00:00:00Z"}]}))}));
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for clear_native in [false, true] {
+        let (mut fixture, control, schema) = postgres_fixture(&base).await;
+        fixture.broker.browser_resets_enabled = true;
+        if clear_native {
+            for (_, owner) in fixture.broker.owners.read().await.values() {
+                let mut owner = owner.lock().await;
+                owner.limits = None;
+                owner.limits_observed = None;
+            }
+        }
+        let (url, server) = browser_server(&mut fixture, &base).await;
+        usage_calls.store(0, Ordering::SeqCst);
+        let http = reqwest::Client::new();
+        let mut snapshots = Vec::new();
+        for _ in 0..2 {
+            let response = http
+                .get(format!("{url}/accounts/data"))
+                .header("cookie", "codexctl-session=synthetic-session")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            snapshots.push(response.json::<Value>().await.unwrap());
+        }
+        let calls = usage_calls.load(Ordering::SeqCst);
+        server.abort();
+        fixture.stop().await;
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        for snapshot in snapshots {
+            assert_eq!(
+                snapshot["accounts"][0]["banked_resets"]["redeemable_now"], 1,
+                "one shared observation still provides applicability: {snapshot}"
+            );
+        }
+        assert_eq!(
+            calls, 1,
+            "dashboard and reset inventory must share usage (clear_native={clear_native})"
+        );
+    }
+    upstream.abort();
+}
+
 async fn concurrent_upstream(
     answer: Value,
 ) -> (
@@ -990,6 +1047,56 @@ async fn postgres_reset_concurrent_unknown_result_stays_terminal_on_retry() {
         "a terminal rejection must never replay as success"
     );
     assert_eq!(calls.len(), 1);
+}
+
+#[tokio::test]
+async fn postgres_reset_contention_reports_busy_to_renewal() {
+    let (base, _, started, release, upstream) =
+        concurrent_upstream(json!({"code":"reset","windows_reset":1})).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    fixture
+        .broker
+        .central
+        .as_ref()
+        .unwrap()
+        .login_register_holder(&fixture.broker.login_holder())
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::central::managed::api_routes().with_state(fixture.broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (reset, renewal) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(fixture.redeem("held-during-renew"), async {
+            started.notified().await;
+            let response = reqwest::Client::new()
+                .post(format!("{url}/v1/relogin/start"))
+                .headers(fixture.headers.clone())
+                .json(&json!({"alias":"personal","id":"a".repeat(64)}))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            release.notify_one();
+            (status, body)
+        })
+    })
+    .await
+    .expect("stage: renewal refuses promptly while reset provider work is held");
+    server.abort();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(reset.0, StatusCode::OK);
+    assert_eq!(renewal.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        renewal.1["error"], "reset_in_progress",
+        "Renew must preserve the actual busy reason"
+    );
 }
 
 #[tokio::test]
