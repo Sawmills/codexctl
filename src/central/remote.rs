@@ -28,7 +28,7 @@ fn at_switch_threshold(account: &Account) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct Connection {
     pub server: String,
-    pub token_file: PathBuf,
+    pub token_file: super::service_account::MachineCredential,
     pub user_id: String,
 }
 fn root() -> Result<PathBuf> {
@@ -47,15 +47,14 @@ fn registration(path: &Path) -> Result<Option<Connection>> {
     Ok(Some(serde_json::from_slice(&vault::private_read(path)?)?))
 }
 pub fn connection() -> Result<Option<Connection>> {
+    if let Some(connection) = super::service_account::connection()? {
+        return Ok(Some(connection));
+    }
     registration(&path()?)
 }
 pub(crate) fn secret(connection: &Connection) -> Result<String> {
     transport::origin(&connection.server)?;
-    Ok(
-        String::from_utf8(vault::private_read(&connection.token_file)?)?
-            .trim()
-            .into(),
-    )
+    connection.token_file.read_for(&connection.server)
 }
 fn check(response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response> {
     if !response.status().is_success() {
@@ -696,13 +695,13 @@ pub(crate) fn install(server: &str, token: &str) -> Result<()> {
     ));
     let connection = Connection {
         server: server.trim_end_matches('/').into(),
-        token_file,
+        token_file: token_file.into(),
         user_id,
     };
     let registration = serde_json::to_vec(&connection)?;
     // Allocate cleanup evidence before any credential can appear on disk.
     store::atomic_write(&pending_path()?, &registration)?;
-    vault::create_secret(&connection.token_file, token.as_bytes())?;
+    vault::create_secret(connection.token_file.file()?, token.as_bytes())?;
     store::sync_directory(&directory)?;
     store::atomic_write(&path()?, &registration)?;
     std::fs::remove_file(pending_path()?)?;
@@ -796,6 +795,9 @@ pub fn resets() -> Result<Option<ResetInventory>> {
 
 /// Retain the operation ID until its result is known, including across CLI restarts.
 pub fn redeem_reset(alias: &str) -> Result<api::ConsumeResetResponse> {
+    if super::service_account::enabled()? {
+        bail!("service jobs cannot redeem banked resets");
+    }
     let alias = super::managed::normalize_alias(alias)?;
     let connection = connection()?.context("run codexctl connect first")?;
     let identity = vault::digest(&serde_json::to_vec(&(
@@ -1349,6 +1351,9 @@ pub fn devices(revoke: Option<&str>) -> Result<()> {
     Ok(())
 }
 pub fn disconnect(forget: bool) -> Result<()> {
+    if super::service_account::enabled()? {
+        bail!("service jobs have no saved machine connection to disconnect");
+    }
     // Cleanup must remain available while migration waits on the server.
     // The native lock serializes provider restoration with activation.
     let _lock = native::native_lock(&root()?)?;
@@ -1366,7 +1371,7 @@ pub fn disconnect(forget: bool) -> Result<()> {
             }
             // Keep the connection as a durable cleanup reference until its credential
             // is gone. A retry after either removal must tolerate a missing token.
-            match std::fs::remove_file(&connection.token_file) {
+            match std::fs::remove_file(connection.token_file.file()?) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
@@ -1374,6 +1379,7 @@ pub fn disconnect(forget: bool) -> Result<()> {
             store::sync_directory(
                 connection
                     .token_file
+                    .file()?
                     .parent()
                     .context("missing token directory")?,
             )?;
@@ -1419,6 +1425,7 @@ pub fn migrate(all: bool, exclusive_owner: bool) -> Result<()> {
     }
     require_stopped_owners(&paths)?;
     let connection = connection()?.context("run codexctl connect first")?;
+    connection.token_file.file()?;
     // Reject an unsafe persisted origin before any credential is retired.
     transport::origin(&connection.server)?;
     let _store = store::lock(&paths)?;
