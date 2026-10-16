@@ -1459,7 +1459,9 @@ pub(super) async fn account_catalog(
                 let seed = owner
                     .limits_observed
                     .as_ref()
-                    .filter(|(_, observed)| observed == &revision)
+                    // Native samples omit reset applicability. When the browser
+                    // action is enabled, use the catalog's complete HTTP sample.
+                    .filter(|(_, observed)| !broker.browser_resets_enabled && observed == &revision)
                     .and_then(|(at, _)| {
                         Some((super::server::usage(owner.limits.as_ref()?).ok()?, *at))
                     });

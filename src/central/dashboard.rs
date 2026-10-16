@@ -174,13 +174,7 @@ async fn account_snapshot(
     let observed = if account.available && !pending {
         broker
             .reset_reader
-            .dashboard_expiry(
-                &key,
-                &revision,
-                access.as_deref(),
-                &account.account_id,
-                broker.browser_resets_enabled,
-            )
+            .dashboard_expiry(&key, &revision, access.as_deref(), &account.account_id)
             .await
     } else {
         super::resets::ResetObservation {
@@ -235,7 +229,11 @@ async fn account_snapshot(
         usage_error: account.usage_error,
         banked_resets: Resets {
             count,
-            redeemable_now: observed.applicable.or(redeemable),
+            redeemable_now: redeemable.map(
+                |count| {
+                    if observed.qualifying_credit { count } else { 0 }
+                },
+            ),
             nearest_expiry: expiry,
             stale: reset_stale || account.usage_stale,
         },

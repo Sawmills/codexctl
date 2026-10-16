@@ -27,7 +27,7 @@ struct CachedExpiry {
 #[derive(Clone, Default)]
 pub(super) struct ResetObservation {
     pub count: Option<i64>,
-    pub applicable: Option<i64>,
+    pub qualifying_credit: bool,
     pub nearest_expiry: Option<i64>,
     pub stale: bool,
 }
@@ -97,7 +97,6 @@ impl Reader {
         revision: &str,
         token: Option<&str>,
         account: &str,
-        read_applicability: bool,
     ) -> ResetObservation {
         let entry = self
             .expiry_entries
@@ -123,50 +122,20 @@ impl Reader {
             .attempted
             .is_none_or(|at| at.elapsed() >= super::catalog::TTL)
         {
-            let result = async {
-                let usage = if read_applicability {
-                    Some(
-                        api::fetch_usage_at(
-                            &self.client,
-                            &self.usage_url,
-                            token.unwrap_or_default(),
-                            Some(account),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                let details = api::fetch_reset_credits_at(
-                    &self.client,
-                    &self.credits_url,
-                    token.unwrap_or_default(),
-                    Some(account),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((details, usage))
-            }
+            let result = api::fetch_reset_credits_at(
+                &self.client,
+                &self.credits_url,
+                token.unwrap_or_default(),
+                Some(account),
+            )
             .await;
             entry.attempted = Some(Instant::now());
             match result {
-                Ok((details, usage)) => {
+                Ok(details) => {
                     let now = chrono::Utc::now().timestamp();
-                    entry.observation.count = Some(
-                        details.available_count.max(
-                            usage
-                                .as_ref()
-                                .map_or(0, api::RateLimitResponse::reset_credits_available),
-                        ),
-                    );
-                    let qualifying = details.credits.iter().any(|c| {
+                    entry.observation.count = Some(details.available_count);
+                    entry.observation.qualifying_credit = details.credits.iter().any(|c| {
                         c.is_available() && c.expires_at_timestamp().is_none_or(|at| at > now)
-                    });
-                    entry.observation.applicable = usage.as_ref().map(|u| {
-                        if qualifying {
-                            u.reset_credits_applicable()
-                        } else {
-                            0
-                        }
                     });
                     entry.observation.nearest_expiry = details
                         .credits

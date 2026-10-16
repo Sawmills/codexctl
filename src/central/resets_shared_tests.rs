@@ -1050,6 +1050,119 @@ async fn postgres_reset_concurrent_unknown_result_stays_terminal_on_retry() {
 }
 
 #[tokio::test]
+async fn postgres_reset_nonconsumption_preserves_token_evidence() {
+    for (code, consumed) in [
+        ("nothing_to_reset", false),
+        ("no_credit", false),
+        ("new_unrecognized_code", false),
+        ("reset", true),
+        ("already_redeemed", true),
+    ] {
+        let (base, _, _, release, upstream) =
+            concurrent_upstream(json!({"code":code,"windows_reset":i64::from(consumed)})).await;
+        let (fixture, control, schema) = postgres_fixture(&base).await;
+        let central = fixture.broker.central.as_ref().unwrap();
+        let id = account_key("test-user", "personal");
+        assert!(
+            central
+                .fast_token_read(&id)
+                .await
+                .unwrap()
+                .unwrap()
+                .evidence
+                .is_some()
+        );
+        release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(10), fixture.redeem("evidence"))
+            .await
+            .expect("stage: provider settlement returns");
+        let evidence = central
+            .fast_token_read(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .evidence;
+        fixture.stop().await;
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        upstream.abort();
+        assert_eq!(
+            response.0,
+            if code == "new_unrecognized_code" {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::OK
+            },
+            "provider result {code}: {}",
+            response.1
+        );
+        assert_eq!(
+            evidence.is_none(),
+            consumed,
+            "only actual consumption invalidates token evidence ({code})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_reset_completed_receipts_are_bounded_and_keep_the_newest_retry() {
+    let (base, received, _, release, upstream) =
+        concurrent_upstream(json!({"code":"nothing_to_reset","windows_reset":0})).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    let central = fixture.broker.central.as_ref().unwrap();
+    let id = account_key("test-user", "personal");
+    // Reverse lexical order catches pruning by request ID instead of completion.
+    let latest = "request-0000";
+    let (journal, replay) = tokio::time::timeout(Duration::from_secs(45), async {
+        for number in (0..260).rev() {
+            release.notify_one();
+            let result = fixture.redeem(&format!("request-{number:04}")).await;
+            assert_eq!(
+                result.0,
+                StatusCode::OK,
+                "settlement {number}: {}",
+                result.1
+            );
+        }
+        let (_, journal) = central.reset_journal("test-user", &id).await.unwrap();
+        let replay = fixture.redeem(latest).await;
+        (journal, replay)
+    })
+    .await
+    .expect("stage: bounded completed history and latest receipt replay");
+    let calls = received.lock().unwrap().len();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    let completed = journal["completed"].as_object().unwrap();
+    assert_eq!(
+        completed.len(),
+        256,
+        "completed request receipts must be bounded"
+    );
+    assert!(journal["pending"].is_null());
+    assert!(
+        completed.contains_key(latest),
+        "the newest receipt survives regardless of ID order"
+    );
+    assert!(
+        !completed.contains_key("request-0259"),
+        "oldest receipt expires first"
+    );
+    assert_eq!(replay.0, StatusCode::OK);
+    assert_eq!(replay.1["code"], "nothing_to_reset");
+    assert_eq!(
+        calls, 260,
+        "latest retry replays without another provider call"
+    );
+}
+
+#[tokio::test]
 async fn postgres_reset_contention_reports_busy_to_renewal() {
     let (base, _, started, release, upstream) =
         concurrent_upstream(json!({"code":"reset","windows_reset":1})).await;
