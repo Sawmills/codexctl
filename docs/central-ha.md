@@ -70,6 +70,18 @@ removal does not permit another identity to reuse them. No retention or purge
 is added. Run one version across serving replicas and fix forward. This feature
 adds no mixed-version or rollback compatibility path.
 
+Keep Remove off until its separate rollout review records the retained account
+row count (including tombstones), expected row growth and Manage GET rate, and
+the owner's latency budget. Startup's 10,000-active-account limit does not bound
+retained rows. Manage looks up `(user_id, lower(alias))`; the checked-in schema
+has no index for that lookup. The database operation has a two-second deadline,
+which is a failure bound, not a latency target or proof of an efficient plan.
+Capture the staged catalog and `EXPLAIN (ANALYZE, BUFFERS)` for this metadata-only
+lookup with representative retained rows. No staged plan or traffic budget is
+established by this PR. If the plan exceeds the agreed budget, deploy and
+validate a partial index on `(user_id, lower(alias)) WHERE deleted_at IS NULL`
+before enabling Remove. Record that evidence in the activation PR.
+
 Shared-store imports also renew their lease through verification and child exit.
 An import retry reads the latest committed credential under that lease. Failed
 verification settles and persists its rotation before another import can retry.
@@ -133,10 +145,11 @@ Existing sessions remain valid for observations, but need fresh sign-in before R
 
 ### Dashboard Add rollout
 
-Dashboard Add and Renew are implemented but disabled by default. Both overlays explicitly
-set `CODEXCTL_CENTRAL_BROWSER_LOGINS=0`. Merging or rolling the binary does not
-authorize enabling them. Browser Remove remains a separate follow-up change;
-existing machine Add and login renewal keep their current behavior.
+Dashboard Add and Renew are disabled by default in the binary. HQ authorized both
+staging HA overlays to set `CODEXCTL_CENTRAL_BROWSER_LOGINS=1` with the image from
+main `8f666bcd` on 2026-10-16. Browser Remove is implemented behind the independent
+`CODEXCTL_CENTRAL_BROWSER_REMOVE` gate, which stays off until its separate rollout
+GO. Existing machine Add and login renewal keep their current behavior.
 
 Run migrate before rolling the new binary. The additive, idempotent migration
 adds nullable `central_login_operations.browser_session_hash` without changing
@@ -146,13 +159,12 @@ ID, with an empty legacy machine field. It never creates a fake machine.
 Only that session can read or cancel the receipt. Machine receipts and browser
 receipts cannot be read across authority kinds.
 
-Keep starts off until **all serving and worker replicas** run the new decoder
-and authority checks. Then obtain a separate HQ rollout GO before setting the
-switch to `1`. This is a protocol gate: the previous machine-only decoder cannot
-safely process retained browser receipts, even though the DDL is additive.
-Rollback means disabling starts, stopping and settling active operations, and
-keeping their receipts and unresolved evidence. Use a decoder-compatible binary;
-do not roll back to the old machine-only binary after browser starts exist.
+Use one version and fix forward. HQ authorized the image and browser-login switch
+in one staging rollout under Amir's no backward compatibility policy. Do not start
+browser logins during the rolling update; t56 verifies all replicas and observes
+errors for 300 seconds before the live Add/Renew proof. Old pods refusing a new
+receipt during this brief roll are an accepted staging limitation. Retain session
+and authority-isolation checks and preserve receipts and unresolved evidence.
 
 Browser Add and Renew use the existing device sign-in and cached native credential and
 workspace checks. Renew validates the candidate against the retained account identity,
@@ -167,8 +179,8 @@ uncertain verification keeps its evidence reserved for recovery.
 Renew is offered on each owned account row and has a confirmation page that works
 without JavaScript. Start conflict discovery is read-only: a browser start does
 not expire or recover a machine receipt, even when that receipt's lease has ended.
-Its machine retains the existing recovery path. During rollback, a machine start
-can settle stale browser polling under company-user authority and create its own
+Its machine retains the existing recovery path. With browser starts disabled,
+a machine start can settle stale browser polling under company-user authority and create its own
 receipt; it cannot read or cancel the browser receipt.
 
 Add, Renew, status recovery, cancellation and sign-out require the configured Origin

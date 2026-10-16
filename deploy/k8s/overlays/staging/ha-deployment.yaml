@@ -98,7 +98,7 @@ spec:
             - { name: projected, mountPath: /projected, readOnly: true }
             - { name: keys, mountPath: /keys }
         - name: initialize
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b1b1cc38ab45e882db4a25f71a171f203938da3e329372a2d1ac90b10fa2822f
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:ee27eb797fc2f38daa44dbabeb49bdc0ecefe718714629bfa3345e7bdc6c6dc1
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
@@ -140,7 +140,7 @@ spec:
             limits: { cpu: "1", memory: 256Mi }
       containers:
         - name: broker
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b1b1cc38ab45e882db4a25f71a171f203938da3e329372a2d1ac90b10fa2822f
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:ee27eb797fc2f38daa44dbabeb49bdc0ecefe718714629bfa3345e7bdc6c6dc1
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
@@ -152,9 +152,8 @@ spec:
             - name: CODEXCTL_CENTRAL_STORE
               value: postgres
             # Every replica runs layout 8 from its first start (B33 attempt 4).
-            # Enable browser logins only after a separate HQ rollout GO.
             - name: CODEXCTL_CENTRAL_BROWSER_LOGINS
-              value: "0"
+              value: "1"
             - name: CODEXCTL_CENTRAL_TOKEN_FAST_PATH
               value: "1"
             - {
