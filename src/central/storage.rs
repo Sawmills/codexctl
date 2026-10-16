@@ -99,6 +99,12 @@ pub struct CredentialRecord {
     pub revision: i64,
 }
 
+/// An active server account's display alias, without credential access or
+/// workspace/login identity proof. Renew admission still loads its credentials.
+pub(in crate::central) struct ActiveAccountAlias {
+    pub alias: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
     pub account_id: String,
@@ -898,6 +904,20 @@ impl CentralStore {
             Self::Dual { file, postgres, .. } => Ok(bounded_db(postgres.load_account(account_id))
                 .await?
                 .or(file.load_account(account_id)?)),
+        }
+    }
+
+    pub(in crate::central) async fn lookup_active_account_alias(
+        &self,
+        user_id: &str,
+        alias: &str,
+    ) -> Result<Option<ActiveAccountAlias>> {
+        match self {
+            Self::File(_) => Ok(None),
+            Self::Postgres(db) => bounded_db(db.lookup_active_account_alias(user_id, alias)).await,
+            Self::Dual { postgres, .. } => {
+                bounded_db(postgres.lookup_active_account_alias(user_id, alias)).await
+            }
         }
     }
 
@@ -2071,6 +2091,21 @@ impl PostgresStore {
             .await?;
         let count: i64 = row.get(0);
         usize::try_from(count).context("live session count overflow")
+    }
+
+    async fn lookup_active_account_alias(
+        &self,
+        user_id: &str,
+        alias: &str,
+    ) -> Result<Option<ActiveAccountAlias>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT alias FROM central_accounts WHERE user_id=$1 AND lower(alias)=lower($2) AND deleted_at IS NULL",
+                &[&user_id, &alias],
+            )
+            .await?;
+        Ok(row.map(|row| ActiveAccountAlias { alias: row.get(0) }))
     }
 
     async fn load_account_by_alias(

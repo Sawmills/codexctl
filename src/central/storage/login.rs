@@ -142,6 +142,10 @@ pub(in crate::central) enum LoginKind {
     Renewal,
     Add,
 }
+pub(in crate::central) enum StartLookup<'a> {
+    Id(&'a str),
+    Alias(&'a str),
+}
 impl LoginKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -691,6 +695,34 @@ impl CentralStore {
         }).await
     }
 
+    /// Start conflict discovery must not expire another authority's receipt.
+    pub(in crate::central) async fn login_start_lookup(
+        &self,
+        user: &str,
+        lookup: StartLookup<'_>,
+    ) -> Result<Option<LoginOperation>> {
+        let db = self.login_db()?;
+        let (query, value) = match lookup {
+            StartLookup::Id(id) => (
+                "SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND id=$2",
+                id,
+            ),
+            StartLookup::Alias(alias) => (
+                "SELECT *,expires_at<=clock_timestamp() AS lease_expired FROM central_login_operations WHERE user_id=$1 AND lower(alias)=lower($2) AND (phase NOT IN ('completed','failed','canceled','rejected','replica_lost') OR (phase='replica_lost' AND selected_reserved)) ORDER BY (phase='replica_lost'), id LIMIT 1",
+                alias,
+            ),
+        };
+        bounded_db(async {
+            db.client()
+                .await?
+                .query_opt(query, &[&user, &value])
+                .await?
+                .map(|row| db.login_row(row))
+                .transpose()
+        })
+        .await
+    }
+
     pub(in crate::central) async fn login_get(
         &self,
         user: &str,
@@ -947,7 +979,7 @@ impl CentralStore {
             })?,
         )?;
         let claims = identity::Claims::from_record(record)?;
-        bounded_db(async {
+        let audited = bounded_db(async {
             let mut connection = db.admission_client().await?;
             let client = connection.transaction().await?;
             let _admission_timing = identity::lock_admission(&client).await?;
@@ -956,7 +988,7 @@ impl CentralStore {
                 "WITH fence AS MATERIALIZED (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$2 AND epoch=$3 AND expires_at>clock_timestamp() FOR UPDATE), operation AS MATERIALIZED (SELECT user_id,id,repair_evidence FROM central_login_operations WHERE user_id=$4 AND id=$5 AND holder_id=$6 AND epoch=$7 AND sequence=$8 AND phase='verifying' AND NOT cancel_requested AND expires_at>clock_timestamp() AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$6 AND deleted_at IS NULL AND expires_at>clock_timestamp()) AND account_id IN (SELECT account_id FROM fence) FOR UPDATE), credential AS (UPDATE central_accounts SET encrypted_vault=$9,revision=$10,workspace=$13,login=$14,updated_at=clock_timestamp() WHERE account_id=$1 AND revision=$11 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM operation) RETURNING account_id), receipt AS (UPDATE central_login_operations SET phase='completed',encrypted_payload=$12,sequence=sequence+1,completed_revision=$10 WHERE user_id=$4 AND id=$5 AND EXISTS (SELECT 1 FROM credential) RETURNING id), repair AS (UPDATE central_login_operations SET selected_reserved=CASE WHEN account_id=$1 THEN false ELSE selected_reserved END, candidate_workspace=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_workspace END, candidate_login=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_login END,candidate_claims=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN '{}'::jsonb ELSE candidate_claims END,candidate_uid=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_uid END,candidate_sub=CASE WHEN central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1) THEN NULL ELSE candidate_sub END WHERE phase='rejected' AND EXISTS (SELECT 1 FROM receipt) AND (account_id=$1 OR (central_login_identity_agrees(candidate_workspace,candidate_uid,candidate_sub,$1))) AND EXISTS (SELECT 1 FROM operation WHERE operation.repair_evidence @> jsonb_build_array(jsonb_build_array(central_login_operations.user_id,central_login_operations.id,central_login_operations.sequence))) RETURNING user_id,id), released_claims AS (UPDATE central_login_identity_reservations SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))), released_history AS (UPDATE central_login_identity_reservation_history SET deleted_at=clock_timestamp() WHERE deleted_at IS NULL AND EXISTS (SELECT 1 FROM receipt) AND ((user_id=$4 AND id=$5) OR (user_id,id) IN (SELECT user_id,id FROM repair))) SELECT count(*) FROM receipt",
                 &[&lease.account_id,&lease.holder_id,&lease.epoch,&op.user,&op.id,&op.holder,&op.epoch,&op.sequence,&vault,&record.revision,&previous,&payload,&record.workspace,&record.login]).await?;
             if row.get::<_,i64>(0)!=1 { bail!("login completion fenced"); }
-            audit_login(&client, op, "terminal", "ok:completed").await?;
+            let audited = audit_login(&client, op, "terminal", "ok:completed").await?;
             if let Some(claims)=claims.as_ref() {identity::record_claims(&client,op.account()?,claims).await?;}
             // Row locks serialize sign-out and disablement, but time can pass
             // while credential publication waits on another database lock.
@@ -964,9 +996,11 @@ impl CentralStore {
                 && !authority_live(&client, &op.user, &op.authority).await?
             { bail!("login authority expired during publication"); }
             client.commit().await?;
-            Ok(())
+            Ok(audited)
         }).await?;
-        log_login_audit(op, "terminal", "ok:completed");
+        if audited {
+            log_login_audit(op, "terminal", "ok:completed");
+        }
         op.phase = LoginPhase::Completed;
         op.sequence += 1;
         op.payload = LoginPayload {

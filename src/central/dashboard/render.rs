@@ -417,7 +417,13 @@ fn attention(accounts: &[Account], all_stale: bool, now: i64) -> String {
         }
     )
 }
-fn ledger(accounts: &[Account], best: Option<&Account>, all_stale: bool, now: i64) -> String {
+fn ledger(
+    accounts: &[Account],
+    best: Option<&Account>,
+    all_stale: bool,
+    now: i64,
+    can_renew: bool,
+) -> String {
     let mut rows = String::new();
     let mut sorted: Vec<_> = accounts.iter().collect();
     sorted.sort_by_key(|a| {
@@ -484,8 +490,17 @@ fn ledger(accounts: &[Account], best: Option<&Account>, all_stale: bool, now: i6
         } else {
             state
         };
+        let renew = if can_renew {
+            format!(
+                r#"<form method="get" action="/accounts/renew"><input type="hidden" name="alias" value="{}"><button class="button small" aria-label="Renew login for {}">Renew login</button></form>"#,
+                escape(&a.alias),
+                escape(&a.alias)
+            )
+        } else {
+            String::new()
+        };
         rows += &format!(
-            r#"<tr role="row" class="{class}"><td role="cell" class="cell-account"><div class="account-name"><strong>{}</strong><span class="line"><span class="alias" translate="no">{}</span>{plan}</span><span class="note {}">{note}</span></div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-credits"><span class="cell-label" aria-hidden="true">Credits</span>{}</td><td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>{count}</b>{expiry}{redeemable}{inventory}</div></td><td role="cell" class="cell-state"><div class="status"><span class="state {state_class}">{state}</span><span class="status-detail" data-age="{}">Last observed {}</span></div></td></tr>"#,
+            r#"<tr role="row" class="{class}"><td role="cell" class="cell-account"><div class="account-name"><strong>{}</strong><span class="line"><span class="alias" translate="no">{}</span>{plan}</span><span class="note {}">{note}</span>{renew}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-credits"><span class="cell-label" aria-hidden="true">Credits</span>{}</td><td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>{count}</b>{expiry}{redeemable}{inventory}</div></td><td role="cell" class="cell-state"><div class="status"><span class="state {state_class}">{state}</span><span class="status-detail" data-age="{}">Last observed {}</span></div></td></tr>"#,
             escape(a.name()),
             escape(&a.alias),
             if pick { "pick" } else { "billing" },
@@ -633,7 +648,13 @@ pub(super) fn overview_with_actions(
             .then_some("cmd-live"),
         ),
         attention = attention(&snapshot.accounts, all_stale, snapshot.server_time),
-        ledger = ledger(&snapshot.accounts, best, all_stale, snapshot.server_time),
+        ledger = ledger(
+            &snapshot.accounts,
+            best,
+            all_stale,
+            snapshot.server_time,
+            browser_logins_enabled && form_token.is_some()
+        ),
         machines = machines(snapshot, form_token),
         login_actions = if browser_logins_enabled && form_token.is_some() {
             r#"<a class="button small" href="/accounts/add">Add account</a>"#

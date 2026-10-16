@@ -289,6 +289,13 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
                 .layer(axum::middleware::from_fn(login::errors)),
         )
         .route(
+            "/accounts/renew",
+            get(login::renew_page)
+                .post(login::renew)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(login::errors)),
+        )
+        .route(
             "/accounts/login",
             get(login::page).layer(axum::middleware::from_fn(login::errors)),
         )
