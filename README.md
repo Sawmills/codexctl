@@ -341,6 +341,14 @@ A reset only clears an _already-exhausted_ window — the backend reports zero r
 until an account actually hits 100%, and codexctl refuses to redeem before that rather than waste
 one. When several credits qualify, it always spends the one closest to expiring.
 
+The PostgreSQL account server also supports reset inventory and explicit
+redemption. Its dashboard offers **Apply reset** when the operator enables
+`CODEXCTL_CENTRAL_BROWSER_RESETS=1` (off by default). Each account shows its banked
+count and expiry; the action stays disabled until the provider reports a reset
+applicable to an exhausted window. Confirming requires recent company sign-in.
+Retries keep the same selected reset and provider key across replicas. Reset
+approval is separate from billing approval.
+
 `--claim` sweeps the whole fleet and redeems credits that are about to lapse (default: within three
 days) on accounts that are already at 100%. Those credits are the ones with nothing left to lose:
 the account cannot be used right now anyway, and the credit is about to evaporate. Note the flip

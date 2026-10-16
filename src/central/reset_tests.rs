@@ -1,6 +1,10 @@
 use super::*;
 use axum::body::to_bytes;
 
+#[cfg(feature = "central-real-db-tests")]
+#[path = "resets_shared_tests.rs"]
+mod shared;
+
 struct Fixture {
     _root: tempfile::TempDir,
     broker: Broker,
@@ -47,6 +51,7 @@ impl Fixture {
             browser_sessions_available: true,
             browser_logins_enabled: false,
             browser_remove_enabled: false,
+            browser_resets_enabled: false,
             activity: Arc::default(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             reset_reader: crate::central::resets::Reader::with_base(base),

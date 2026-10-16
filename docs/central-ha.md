@@ -125,10 +125,9 @@ only for explicit migration commands and still requires
 
 The PostgreSQL server supports shared add and renewal receipts, status, and
 cancellation. The dashboard supports company sign-in, sessions,
-sign-out, the company user's machine list, and Revoke across replicas. Machine
-enrollment and reset listing/redemption remain unavailable in shared mode.
-Keep those workflows on the single file-mode writer until their shared storage
-is complete.
+sign-out, the company user's machine list, and Revoke across replicas. Reset
+listing and explicit redemption also use PostgreSQL. Machine enrollment remains
+unavailable in shared mode; keep it on the single file-mode writer.
 Machine rows are shared, but last-seen time and last-used alias reflect only
 token deliveries handled by the responding pod. These activity fields can be
 empty or differ across replicas. Shared activity storage is outside this upgrade.
@@ -142,6 +141,37 @@ It adds the nullable `dashboard_audit.deleted_at` marker to existing audit table
 with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
 Run migrate before rolling this image. Both changes are additive and keep schema version 8.
 Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
+
+### Dashboard banked resets
+
+`CODEXCTL_CENTRAL_BROWSER_RESETS` defaults to off; only `1` enables it. It is
+independent of the Add/Renew and Remove gates. This change enables no overlay.
+Run the normal migrate Job before rolling the binary. Migration adds
+`account_reset_journals` and permits `account_reset` audit events. It preserves
+existing receipts and is safe to repeat. Run one version and fix forward.
+
+When enabled, each owned account has an Apply reset confirmation page with its
+count and nearest expiry. The action stays disabled without fresh applicability
+evidence. Gate-on inventory reads the provider's applicability summary within
+the existing 60-second observation cooldown; native usage samples can omit that
+summary. A positive applicable count is the provider's proof of an exhausted
+window. POST reads it again and selects the available unexpired reset closest
+to expiry. Browser approval requires a live session, exact Origin, session form
+token and the same recent verified sign-in as Revoke. It approves only this
+reset; billing and account selection are unchanged.
+
+Shared reset operations read committed saved credentials without starting a
+native refresh or billing probe. A pending operation records its selected credit
+and provider idempotency key before the provider call. Retries and other replicas
+reuse that credit and key, including after an uncertain response. The completed
+receipt and browser audit commit together. A disconnected browser does not cancel
+that settlement. Expired foreign refresh custody remains a refusal until it is
+released. Credentials and raw session tokens never enter the page or audit.
+
+The existing `/v1/resets` and `/v1/resets/redeem` machine routes now support
+PostgreSQL. Machine and browser transports keep their own authority checks;
+neither treats the other's credential as its own. The browser gate does not grant
+CLI reset approval. Enable the browser gate only with a separate rollout GO.
 
 ### Dashboard Add rollout
 
@@ -930,7 +960,8 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
 
    The HA service accepts token, registry, add, and login renewal operations.
    Login status and cancellation use shared PostgreSQL journals and identity
-   reservations. Enrollment and reset redemption remain unavailable. PR3 adds
+   reservations. Enrollment remains unavailable; reset listing and explicit
+   redemption now use shared journals. PR3 adds
    Linux login recovery, but live crash/takeover acceptance and rollout approval
    remain required before the B33 cutover.
 

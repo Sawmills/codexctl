@@ -31,6 +31,7 @@ pub(in crate::central) use browser::{
     BrowserIdentity, DashboardAudit, DashboardOperation, MachineRevoke,
 };
 mod loans;
+pub(in crate::central) mod resets;
 pub(in crate::central) use removal::{RemovalAction, RemovalResult, RemovalTarget};
 mod migration;
 
@@ -290,7 +291,7 @@ CREATE TABLE IF NOT EXISTS dashboard_audit (
     id BIGSERIAL PRIMARY KEY,
     at BIGINT NOT NULL,
     actor TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke')),
+    operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke','account_reset')),
     target TEXT NOT NULL,
     result TEXT NOT NULL,
     deleted_at TIMESTAMPTZ
@@ -1815,10 +1816,11 @@ impl PostgresStore {
                 .await?;
             client
                 .batch_execute(&format!(
-                    "{SCHEMA}{}{}{}",
+                    "{SCHEMA}{}{}{}{}",
                     login::LOGIN_SCHEMA,
                     loans::SCHEMA,
-                    migration::SCHEMA
+                    migration::SCHEMA,
+                    resets::SCHEMA
                 ))
                 .await
                 .context("migrate central PostgreSQL schema")?;

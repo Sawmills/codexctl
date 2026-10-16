@@ -16,6 +16,7 @@ pub(in crate::central) enum DashboardOperation {
     AccountAdd,
     AccountRenew,
     AccountRemove,
+    AccountReset,
 }
 impl DashboardOperation {
     pub(super) fn as_str(self) -> &'static str {
@@ -24,6 +25,7 @@ impl DashboardOperation {
             Self::AccountAdd => "account_add",
             Self::AccountRenew => "account_renew",
             Self::AccountRemove => "account_remove",
+            Self::AccountReset => "account_reset",
         }
     }
 }
