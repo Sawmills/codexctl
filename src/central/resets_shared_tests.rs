@@ -120,6 +120,104 @@ async fn postgres_reset_migration_keeps_the_existing_dashboard_audit_contract() 
 }
 
 #[tokio::test]
+async fn postgres_reset_inventory_runs_eight_accounts_without_starting_a_ninth() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let started = Arc::new(AtomicUsize::new(0));
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (requests, running, maximum, permits) = (
+        started.clone(),
+        active.clone(),
+        peak.clone(),
+        release.clone(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().route("/usage", get(move || {
+        let (requests, running, maximum, permits) = (requests.clone(), running.clone(), maximum.clone(), permits.clone());
+        async move {
+            maximum.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            requests.fetch_add(1, Ordering::SeqCst);
+            permits.acquire().await.unwrap().forget();
+            running.fetch_sub(1, Ordering::SeqCst);
+            Json(json!({"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":1}}))
+        }
+    })).route("/credits", get(|| async { Json(json!({"available_count":1,"credits":[]})) }));
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    let central = fixture.broker.central.as_ref().unwrap();
+    let original = central
+        .load_account_by_alias("test-user", "personal")
+        .await
+        .unwrap()
+        .unwrap();
+    for n in 1..9 {
+        let mut record = original.clone();
+        record.alias = format!("inventory-{n}");
+        record.account_id = account_key("test-user", &record.alias);
+        record.login = Some(format!("inventory-login-{n}"));
+        record.vault["alias"] = json!(record.alias);
+        let claims = json!({"sub":record.login,"iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+        record.vault["auth"]["tokens"]["access_token"] = json!(format!(
+            "header.{}.",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+        central.save_account(&record).await.unwrap();
+        let revision = vault::digest(&serde_json::to_vec(&record.vault["auth"]).unwrap());
+        control.execute("INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at) VALUES($1,$2,$3,true,clock_timestamp())", &[&record.account_id,&record.revision,&revision]).await.unwrap();
+    }
+    let (inventory, (held, ninth)) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(fixture.list(), async {
+            let eight = tokio::time::timeout(Duration::from_secs(5), async {
+                while started.load(Ordering::SeqCst) < 8 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok();
+            let held = started.load(Ordering::SeqCst);
+            release.add_permits(1);
+            let ninth = eight
+                && tokio::time::timeout(Duration::from_secs(5), async {
+                    while started.load(Ordering::SeqCst) < 9 {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .is_ok();
+            release.add_permits(9);
+            (held, ninth)
+        })
+    })
+    .await
+    .expect("stage: inventory concurrency and released provider requests finish");
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(
+        held, 8,
+        "exactly eight account reads start while provider responses are held"
+    );
+    assert!(ninth, "the ninth account starts after a slot is released");
+    assert_eq!(peak.load(Ordering::SeqCst), 8);
+    assert_eq!(inventory.1["accounts"].as_array().unwrap().len(), 9);
+    assert!(
+        inventory.1["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a.get("error").is_none()),
+        "all owned accounts remain in the inventory: {}",
+        inventory.1
+    );
+}
+
+#[tokio::test]
 async fn postgres_reset_inventory_lists_owned_accounts_without_spending() {
     let (base, received, upstream) = redemption_upstream(0).await;
     let (fixture, control, schema) = postgres_fixture(&base).await;
