@@ -295,6 +295,7 @@ fn audit_log(at: i64, actor: &str, target: &str, result: &str) {
 mod tests {
     use super::*;
     use crate::central::storage::StoreMode;
+    use crate::central::storage::test_support::bootstrap;
 
     #[tokio::test]
     async fn browser_session_creation_does_not_wait_for_account_admission() {
@@ -309,7 +310,7 @@ mod tests {
             .await
             .unwrap();
         let (store, control, schema) = store.isolated_test_schema().await.unwrap();
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         let mut replica = store.clone();
         let CentralStore::Postgres(replica_db) = &mut replica else {
             unreachable!()
