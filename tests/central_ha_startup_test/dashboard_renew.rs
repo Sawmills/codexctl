@@ -2,6 +2,89 @@
 use super::*;
 
 #[tokio::test]
+async fn postgres_dashboard_renew_confirmation_does_not_decrypt_credentials() {
+    let mut f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    f.machine("confirmation-renew", "synthetic-confirmation-renew-token")
+        .await;
+    let alias = "Renew & Metadata";
+    store::atomic_write(&f.first.root.path().join("mode"), b"").unwrap();
+    let seeded = f.http.post(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth("synthetic-confirmation-renew-token")
+        .json(&json!({"alias":alias,"auth":add_grant("confirmation-workspace",Some("confirmation-login"),None)}))
+        .send().await.unwrap();
+    assert_eq!(seeded.status(), 200);
+    f.enable_browser_logins().await;
+    // Keep the server key valid for session/form guards, but make this account's
+    // synthetic vault impossible to decrypt. A confirmation needs metadata only.
+    assert_eq!(
+        f.control
+            .execute(
+                &format!(
+                    "UPDATE {}.central_accounts SET encrypted_vault=$2 WHERE alias=$1",
+                    f.schema
+                ),
+                &[&alias, &vec![0u8]],
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let page = f
+        .http
+        .get(format!("{}/accounts/renew", f.first.url))
+        .query(&[("alias", "renew & metadata")])
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        page.status(),
+        200,
+        "confirmation must not decrypt vault bytes"
+    );
+    assert_eq!(page.headers()["cache-control"], "no-store");
+    let html = page.text().await.unwrap();
+    assert!(
+        html.contains("Renew &amp; Metadata"),
+        "use the stored alias"
+    );
+    assert!(html.contains("name=\"form_token\""));
+    f.control.batch_execute(&format!(
+        "INSERT INTO {s}.central_users(id,email,enabled) VALUES('foreign-confirmation','foreign@example.invalid',true); \
+         UPDATE {s}.central_accounts SET user_id='foreign-confirmation' WHERE alias='Renew & Metadata'", s=f.schema
+    )).await.unwrap();
+    let foreign = f
+        .http
+        .get(format!("{}/accounts/renew", f.first.url))
+        .query(&[("alias", alias)])
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        foreign.status(),
+        404,
+        "another company user's account stays hidden"
+    );
+    f.control.batch_execute(&format!(
+        "UPDATE {s}.central_accounts SET user_id=(SELECT id FROM {s}.central_users WHERE email='dashboard@example.invalid'), \
+         deleted_at=clock_timestamp() WHERE alias='Renew & Metadata'", s=f.schema
+    )).await.unwrap();
+    let deleted = f
+        .http
+        .get(format!("{}/accounts/renew", f.first.url))
+        .query(&[("alias", alias)])
+        .header("cookie", &session)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), 404, "a deleted account stays hidden");
+    assert!(!f.first.root.path().join("login-pid").exists());
+    f.finish().await;
+}
+
+#[tokio::test]
 async fn postgres_dashboard_renew_is_owned_by_its_browser_session() {
     let mut f = BrowserFixture::start().await;
     let (session, _) = f.sign_in().await;

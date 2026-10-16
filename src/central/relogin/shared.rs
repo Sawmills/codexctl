@@ -270,7 +270,7 @@ pub(in crate::central) async fn browser_renew_alias(
     let alias = managed::normalize_alias(alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
     database(broker)?
-        .load_account_by_alias(&caller.user, alias)
+        .lookup_active_account_alias(&caller.user, alias)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
         .map(|record| record.alias)
