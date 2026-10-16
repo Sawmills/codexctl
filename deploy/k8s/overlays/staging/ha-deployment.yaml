@@ -136,8 +136,8 @@ spec:
             - { name: state, mountPath: /data }
             - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
           resources:
-            requests: { cpu: 10m, memory: 32Mi }
-            limits: { cpu: 100m, memory: 64Mi }
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
       containers:
         - name: broker
           image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b1b1cc38ab45e882db4a25f71a171f203938da3e329372a2d1ac90b10fa2822f

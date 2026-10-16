@@ -131,8 +131,8 @@ spec:
             - { name: state, mountPath: /data }
             - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
           resources:
-            requests: { cpu: 10m, memory: 32Mi }
-            limits: { cpu: 100m, memory: 64Mi }
+            requests: { cpu: 100m, memory: 64Mi }
+            limits: { cpu: "1", memory: 256Mi }
       containers:
         - name: broker
           image: codexctl-central:staging

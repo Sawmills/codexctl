@@ -71,6 +71,10 @@ class HaLifecycleTest(unittest.TestCase):
                 pod = deployment["spec"]["template"]["spec"]
                 init = next(c for c in pod["initContainers"] if c["name"] == "initialize")
                 broker = next(c for c in pod["containers"] if c["name"] == "broker")
+                self.assertEqual(init["resources"], {
+                    "requests": {"cpu": "100m", "memory": "64Mi"},
+                    "limits": {"cpu": "1", "memory": "256Mi"},
+                })
                 self.assertEqual(init["image"], broker["image"])
                 expected = {e["name"]: e for e in broker["env"]
                             if e["name"] == "CODEXCTL_CENTRAL_STORE"

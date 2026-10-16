@@ -890,6 +890,12 @@ uses the broker's image, PostgreSQL Secret references, vault key and read-only R
 CA bundle. Both the tracked staging overlay and render-only `staging-ha` overlay
 carry this ordering. `serve` itself does not apply schema changes.
 
+The initializer requests 100m CPU and 64Mi memory, with limits of 1 CPU and
+256Mi memory in both overlays. Migration now includes the TLS connection and
+catalog/DDL work inside the 2-second database budget; the former 100m CPU and
+64Mi memory limits could throttle or exhaust it during startup. These resources
+give initialization headroom without increasing the database deadline.
+
 Migration runs even when local state exists or schema version 8 is already
 recorded: additive upgrades such as `browser_sessions.auth_time_verified` and
 `dashboard_audit` intentionally retain version 8. DDL is transactional and
