@@ -5,6 +5,8 @@ mod client;
 mod dashboard;
 pub mod enrollment;
 mod fast_path;
+#[cfg(all(test, target_os = "linux"))]
+mod launcher_test_support;
 pub mod loans;
 pub mod managed;
 pub mod native;

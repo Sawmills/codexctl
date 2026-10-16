@@ -703,6 +703,44 @@ mod tests {
     use crate::store;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
+    fn fixture(home: &Path) -> std::path::PathBuf {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
+        store::atomic_write(
+            &home.join("rpc-fixture.json"),
+            &serde_json::to_vec(&json!({
+                "mode_file": home.join("mode"),
+                "refresh_counter": home.join("count"),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fixture
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rpc_fixture_starts_while_a_fork_holds_the_old_wrapper_writable() {
+        let root = tempfile::tempdir().unwrap();
+        store::atomic_write(&root.path().join("mode"), b"forced-refresh-invalid-grant").unwrap();
+        let binary = fixture(root.path());
+        let temporary_script = root.path().join("codex");
+        // Retain the legacy inode even after the fixture uses an immutable launcher.
+        if !temporary_script.exists() {
+            store::atomic_write(&temporary_script, b"#!/bin/sh\nexit 0\n").unwrap();
+        }
+        let _holder = crate::central::launcher_test_support::WriterHolder::hold(&temporary_script);
+        let mut rpc = Rpc::start(&binary, root.path())
+            .await
+            .expect("RPC fixture must start while the fork holds the old wrapper writable");
+        assert!(
+            rpc.call("account/read", json!({"refreshToken":true}))
+                .await
+                .is_err()
+        );
+        assert_eq!(rpc.refresh_failure_reason().await, None);
+        rpc.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn when_a_refresh_times_out_then_the_process_stays_alive_to_finish_its_write() {
         let root = tempfile::tempdir().unwrap();
@@ -711,21 +749,7 @@ mod tests {
         store::atomic_write(&root.path().join("auth.json"), &serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic"}})).unwrap()).unwrap();
         store::atomic_write(&root.path().join("mode"), b"slow").unwrap();
         store::atomic_write(&root.path().join("count"), b"0").unwrap();
-        // Each fixture process gets its own environment through an executable wrapper.
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
-        let wrapper = root.path().join("codex");
-        let script = format!(
-            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nos.environ['CENTRAL_TEST_REFRESH_COUNTER'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
-            serde_json::to_string(&root.path().join("mode")).unwrap(),
-            serde_json::to_string(&root.path().join("count")).unwrap(),
-            serde_json::to_string(&fixture).unwrap(),
-        );
-        store::atomic_write(&wrapper, script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let wrapper = fixture(root.path());
         let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
 
         store::atomic_write(&root.path().join("mode"), b"billing-error-private").unwrap();
@@ -784,19 +808,7 @@ mod tests {
     async fn an_exited_childs_broken_input_pipe_is_reported_as_io() {
         let root = tempfile::tempdir().unwrap();
         store::atomic_write(&root.path().join("mode"), b"").unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
-        let wrapper = root.path().join("codex");
-        let script = format!(
-            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
-            serde_json::to_string(&root.path().join("mode")).unwrap(),
-            serde_json::to_string(&fixture).unwrap(),
-        );
-        store::atomic_write(&wrapper, script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let wrapper = fixture(root.path());
         let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
         rpc._child.kill().await.unwrap();
         let error = rpc
@@ -822,19 +834,7 @@ mod tests {
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"sub":"synthetic-user"})).unwrap());
         store::atomic_write(&root.path().join("auth.json"), &serde_json::to_vec(&json!({"tokens":{"access_token":format!("header.{payload}."),"refresh_token":"synthetic"}})).unwrap()).unwrap();
         store::atomic_write(&root.path().join("mode"), b"forced-refresh-invalid-grant").unwrap();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
-        let wrapper = root.path().join("codex");
-        let script = format!(
-            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
-            serde_json::to_string(&root.path().join("mode")).unwrap(),
-            serde_json::to_string(&fixture).unwrap(),
-        );
-        store::atomic_write(&wrapper, script.as_bytes()).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        let wrapper = fixture(root.path());
         let mut rpc = Rpc::start(&wrapper, root.path()).await.unwrap();
         assert!(
             rpc.call("account/read", json!({"refreshToken":true}))

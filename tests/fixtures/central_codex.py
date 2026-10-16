@@ -9,11 +9,12 @@ import threading
 import time
 
 home = pathlib.Path(os.environ["CODEX_HOME"])
-catalog_settings = home.parent / "catalog-fixture.json"
-if catalog_settings.exists():
-    # Catalog tests keep mutable launch data beside the retained owner home;
-    # executing this checked-in file needs no writable temporary launcher.
-    settings = json.loads(catalog_settings.read_text())
+settings_path = home / "rpc-fixture.json"
+if not settings_path.exists():
+    settings_path = home.parent / "catalog-fixture.json"
+if settings_path.exists():
+    # Mutable fixture data stays private; the executable is checked in.
+    settings = json.loads(settings_path.read_text())
     os.environ["CENTRAL_TEST_MODE_FILE"] = settings["mode_file"]
     os.environ["CENTRAL_TEST_REFRESH_COUNTER"] = settings["refresh_counter"]
 auth_path = home / "auth.json"
