@@ -1,5 +1,6 @@
 use super::*;
 use crate::central::server::TokenResponse;
+use crate::central::storage::test_support::bootstrap;
 use std::{sync::atomic::AtomicUsize, time::Duration};
 
 struct Fixture {
@@ -601,7 +602,7 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
             .await
             .unwrap();
             let (central, control, schema) = initial.isolated_test_schema().await.unwrap();
-            central.migrate().await.unwrap();
+            bootstrap(&central).await.unwrap();
             let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
             let (before, record) = {
                 let owner = owner_ref.lock().await;
@@ -1788,7 +1789,7 @@ impl Fixture {
         mode: &str,
     ) -> CentralStore {
         let store_mode = central.mode();
-        central.migrate().await.unwrap();
+        bootstrap(&central).await.unwrap();
         self.broker.central = Some(central.clone());
         self.broker.read_only = false;
         if store_mode != super::super::storage::StoreMode::File {

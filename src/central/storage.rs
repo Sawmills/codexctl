@@ -31,6 +31,9 @@ pub(in crate::central) use browser::{BrowserIdentity, DashboardAudit, MachineRev
 mod loans;
 mod migration;
 
+#[cfg(test)]
+pub(in crate::central) mod test_support;
+
 async fn bounded_db<T>(future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
     tokio::time::timeout(DB_TIMEOUT, future)
         .await
@@ -2426,6 +2429,7 @@ pub async fn migrate(state: &Path, key: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::central::storage::test_support::bootstrap;
 
     fn record(id: &str, revision: i64) -> CredentialRecord {
         CredentialRecord {
@@ -2451,7 +2455,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared.save_account(&record("a", 1)).await.unwrap();
         let lease = shared
             .acquire_lease("a", "holder", Duration::from_secs(60))
@@ -2643,7 +2647,7 @@ mod tests {
             state: root.path().into(),
             key: key.clone(),
         });
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         store.save_account(&record("a", 1)).await.unwrap();
         let first = store
             .acquire_lease("a", "one", Duration::from_secs(60))
@@ -2681,7 +2685,7 @@ mod tests {
             key: key.clone(),
         });
         let second = first.clone();
-        first.migrate().await.unwrap();
+        bootstrap(&first).await.unwrap();
         first
             .save_account(&record("lease-account", 1))
             .await
@@ -2706,7 +2710,7 @@ mod tests {
             key: key.clone(),
         });
         let restarted = first.clone();
-        first.migrate().await.unwrap();
+        bootstrap(&first).await.unwrap();
         first
             .save_account(&record("restart-account", 1))
             .await
@@ -2732,7 +2736,7 @@ mod tests {
             state: root.path().into(),
             key: key.clone(),
         });
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         let mut first = record("user-a/seat", 10);
         first.user_id = Some("user-a".into());
         first.workspace = Some("shared-workspace".into());
@@ -2754,7 +2758,7 @@ mod tests {
             state: root.path().into(),
             key: key.clone(),
         });
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         store.save_account(&record("skewed", 200)).await.unwrap();
         store.save_account(&record("skewed", 100)).await.unwrap();
         assert_eq!(
@@ -2790,7 +2794,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut original = record("original", 1);
         original.workspace = Some("claim-workspace".into());
         original.login = Some("stable-sub".into());
@@ -2804,7 +2808,7 @@ mod tests {
             )
             .await
             .unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         original.revision = 2;
         original.vault = serde_json::json!({"auth":claims_auth(Some("stable-sub"),None)});
         shared.save_account(&original).await.unwrap();
@@ -2836,7 +2840,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut original = record("original", 1);
         original.workspace = Some("claim-workspace".into());
         original.login = Some("stable-sub".into());
@@ -2853,8 +2857,8 @@ mod tests {
             .batch_execute("DROP TABLE IF EXISTS central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress")
             .await
             .unwrap();
-        shared.migrate().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        bootstrap(&shared).await.unwrap();
         control
             .execute(
                 "DELETE FROM central_accounts WHERE account_id='original'",
@@ -2887,7 +2891,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut original = record("original", 1);
         original.workspace = Some("claim-workspace".into());
         original.login = Some("stable-sub".into());
@@ -2932,7 +2936,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut saved = record("deleted-seat", 1);
         saved.workspace = Some("claim-workspace".into());
         saved.login = Some("stable-sub".into());
@@ -2974,9 +2978,9 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         control.batch_execute("DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress; ALTER TABLE central_login_operations ALTER COLUMN account_id SET NOT NULL; CREATE FUNCTION fail_schema_version() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.version=6 THEN RAISE EXCEPTION 'synthetic schema version failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_schema_version BEFORE INSERT ON central_schema_migrations FOR EACH ROW EXECUTE FUNCTION fail_schema_version()").await.unwrap();
-        assert!(shared.migrate().await.is_err());
+        assert!(bootstrap(&shared).await.is_err());
         let unchanged = control.query_one("SELECT (SELECT max(version) FROM central_schema_migrations), (SELECT attnotnull FROM pg_attribute WHERE attrelid='central_login_operations'::regclass AND attname='account_id'), to_regclass('central_identity_migration_progress') IS NULL", &[]).await.unwrap();
         assert_eq!(unchanged.get::<_, i32>(0), 3);
         assert!(unchanged.get::<_, bool>(1), "failed layout must roll back");
@@ -2988,7 +2992,7 @@ mod tests {
             .batch_execute("DROP TRIGGER fail_schema_version ON central_schema_migrations")
             .await
             .unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared.require_identity_ready().await.unwrap();
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -3006,7 +3010,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         for index in 0..100 {
             let mut saved = record(&format!("batch-{index:03}"), 1);
             saved.workspace = Some("claim-workspace".into());
@@ -3017,8 +3021,7 @@ mod tests {
         // Simulate the supported legacy database before migration readiness.
         control.batch_execute("TRUNCATE central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE IF EXISTS central_identity_migration_progress").await.unwrap();
         control.batch_execute("CREATE TABLE batch_observations(xid BIGINT PRIMARY KEY,claim_writes INTEGER NOT NULL); CREATE FUNCTION check_batch_bound() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE writes INTEGER; BEGIN INSERT INTO batch_observations VALUES(txid_current(),1) ON CONFLICT(xid) DO UPDATE SET claim_writes=batch_observations.claim_writes+1 RETURNING claim_writes INTO writes; IF writes>64 THEN RAISE EXCEPTION 'migration transaction exceeded bounded claim work'; END IF; RETURN NEW; END $$; CREATE TRIGGER check_batch_bound BEFORE INSERT ON central_account_identity_claims FOR EACH ROW EXECUTE FUNCTION check_batch_bound()").await.unwrap();
-        shared
-            .migrate()
+        bootstrap(&shared)
             .await
             .expect("migration must commit bounded batches rather than the entire inventory");
         let observed = control
@@ -3045,7 +3048,7 @@ mod tests {
             retained, 200,
             "all UID and subject facts survive the bounded copy"
         );
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         assert_eq!(
             control
                 .query_one("SELECT count(*) FROM central_account_identity_claims", &[])
@@ -3070,7 +3073,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         for index in 0..50 {
             let mut saved = record(&format!("resume-{index:03}"), 1);
             saved.workspace = Some("claim-workspace".into());
@@ -3079,7 +3082,7 @@ mod tests {
             shared.save_account(&saved).await.unwrap();
         }
         control.batch_execute("TRUNCATE central_account_identity_claims; DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress; CREATE FUNCTION fail_second_batch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.claim='resume-sub-040' THEN RAISE EXCEPTION 'synthetic migration interruption'; END IF; RETURN NEW; END $$; CREATE TRIGGER fail_second_batch BEFORE INSERT ON central_account_identity_claims FOR EACH ROW EXECUTE FUNCTION fail_second_batch()").await.unwrap();
-        assert!(shared.migrate().await.is_err());
+        assert!(bootstrap(&shared).await.is_err());
         assert!(
             shared.require_identity_ready().await.is_err(),
             "a partial migration must not enable serving"
@@ -3116,7 +3119,7 @@ mod tests {
             .batch_execute("DROP TRIGGER fail_second_batch ON central_account_identity_claims")
             .await
             .unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared.require_identity_ready().await.unwrap();
         control
             .batch_execute("SET search_path TO pg_catalog")
@@ -3161,7 +3164,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut saved = record("legacy-seat", 1);
         saved.workspace = Some("claim-workspace".into());
         saved.login = Some("stable-sub".into());
@@ -3175,8 +3178,8 @@ mod tests {
         .unwrap();
         control.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,sequence,holder_id,epoch,expires_at,encrypted_payload,candidate_workspace,candidate_login) VALUES('user','legacy-operation','legacy-seat','seat','machine','rejected',42,'old-holder',7,clock_timestamp()-interval '1 second',$1,'claim-workspace','stable-sub')",&[&payload]).await.unwrap();
         control.batch_execute("INSERT INTO central_login_identity_reservations(workspace,namespace,claim,user_id,id) VALUES('claim-workspace','uid','candidate-uid','user','legacy-operation'),('claim-workspace','sub','stable-sub','user','legacy-operation'); DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress").await.unwrap();
-        shared.migrate().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let migrated = shared
             .login_get("user", "legacy-operation")
             .await
@@ -3218,13 +3221,12 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared.save_account(&record("guard-seat", 1)).await.unwrap();
         let payload = vault::encrypt_bytes(&key, b"{}").unwrap();
         control.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload) SELECT 'user',lpad(to_hex(i),64,'0'),'guard-seat','seat','machine','completed','old-holder',clock_timestamp(),$1 FROM generate_series(1,5001) i",&[&payload]).await.unwrap();
         control.batch_execute("DELETE FROM central_schema_migrations WHERE version>=4; DROP TABLE central_identity_migration_progress").await.unwrap();
-        let error = shared
-            .migrate()
+        let error = bootstrap(&shared)
             .await
             .expect_err("over-budget source inventory must refuse");
         assert!(
@@ -3261,7 +3263,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let mut original = record("original", 1);
         original.workspace = Some("claim-workspace".into());
         original.login = Some("stable-sub".into());
@@ -3320,7 +3322,7 @@ mod tests {
             .await
             .unwrap();
         let (store, control, schema) = store.isolated_test_schema().await.unwrap();
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         let CentralStore::Postgres(db) = &store else {
             unreachable!();
         };
@@ -3350,7 +3352,7 @@ mod tests {
             .await
             .unwrap();
         let (store, control, schema) = store.isolated_test_schema().await.unwrap();
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         assert!(store.relay_event_allowed("retired-device").await.unwrap());
         store
             .retire_relay_event_limiter("retired-device")
@@ -3426,7 +3428,7 @@ mod tests {
             .await
             .unwrap();
         let (first, control, schema) = first.isolated_backfill_test_schema().await.unwrap();
-        first.migrate().await.unwrap();
+        bootstrap(&first).await.unwrap();
         for _ in 0..32 {
             assert!(first.relay_event_allowed("shared-device").await.unwrap());
         }
@@ -3456,7 +3458,7 @@ mod tests {
             let client = db.client().await.unwrap();
             let query = "SELECT oid FROM pg_constraint WHERE conrelid='account_live_sessions'::regclass AND conname='account_live_sessions_account_id_fkey'";
             let before: u32 = client.query_one(query, &[]).await.unwrap().get(0);
-            first.migrate().await.unwrap();
+            bootstrap(&first).await.unwrap();
             let after: u32 = client.query_one(query, &[]).await.unwrap().get(0);
             assert_eq!(
                 before, after,

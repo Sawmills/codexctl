@@ -758,6 +758,7 @@ impl CentralStore {
 #[cfg(all(test, feature = "central-real-db-tests"))]
 mod tests {
     use super::*;
+    use crate::central::storage::test_support::bootstrap;
 
     #[tokio::test]
     async fn failed_unresolved_transition_preserves_its_intended_phase() {
@@ -768,7 +769,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared
             .save_account(&CredentialRecord {
                 account_id: "seat".into(),
@@ -833,7 +834,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared
             .save_account(&CredentialRecord {
                 account_id: "seat".into(),
@@ -896,7 +897,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared
             .save_account(&CredentialRecord {
                 account_id: "seat".into(),
@@ -975,7 +976,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared
             .save_account(&CredentialRecord {
                 account_id: "seat".into(),
@@ -1081,7 +1082,7 @@ mod tests {
             .await
             .unwrap();
         let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
         shared
             .save_account(&CredentialRecord {
                 account_id: "seat".into(),
@@ -1095,8 +1096,8 @@ mod tests {
             .await
             .unwrap();
         control.batch_execute("ALTER TABLE account_refresh_leases DROP COLUMN released, DROP COLUMN legacy_handoff; INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES('seat','legacy',41,clock_timestamp()-interval '1 second');").await.unwrap();
-        shared.migrate().await.unwrap();
-        shared.migrate().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        bootstrap(&shared).await.unwrap();
         let lease = shared
             .acquire_lease("seat", "new-owner", Duration::from_secs(60))
             .await

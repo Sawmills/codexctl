@@ -1,5 +1,6 @@
 use super::*;
 use crate::central::loans::{AuditKind, RETENTION_SECONDS};
+use crate::central::storage::test_support::bootstrap;
 
 fn grant(id: &str, account: &str, ends_at: i64) -> Grant {
     Grant {
@@ -172,7 +173,7 @@ async fn file_store_keeps_loans_in_the_encrypted_state() {
     let key = root.path().join("key");
     crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
     let store = CentralStore::file(root.path(), &key);
-    store.migrate().await.unwrap();
+    bootstrap(&store).await.unwrap();
     scenario(&store, "file").await;
     let raw = FileStore {
         state: root.path().into(),
@@ -243,7 +244,7 @@ async fn postgres_and_dual_stores_keep_loans_in_tables() {
             .await
             .unwrap();
         let (store, control, schema) = shared.isolated_test_schema().await.unwrap();
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         scenario(&store, &mode.to_string()).await;
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -284,7 +285,7 @@ async fn backfill_copies_file_loans_with_their_audit_once() {
         .await
         .unwrap();
     let (db, control, schema) = shared.isolated_backfill_test_schema().await.unwrap();
-    db.migrate().await.unwrap();
+    bootstrap(&db).await.unwrap();
     let result = db
         .backfill(
             root.path(),
@@ -355,7 +356,7 @@ async fn a_retried_end_repairs_a_missed_dual_mirror() {
         .await
         .unwrap();
     let (dual, control, schema) = shared.isolated_test_schema().await.unwrap();
-    dual.migrate().await.unwrap();
+    bootstrap(&dual).await.unwrap();
     assert!(
         dual.create_loan(&grant("missed", "a", i64::MAX / 2))
             .await
@@ -411,7 +412,7 @@ async fn a_token_issue_succeeds_only_while_the_grant_is_active() {
     let key = root.path().join("key");
     crate::central::vault::create_secret(&key, &[9; 32]).unwrap();
     let store = CentralStore::file(root.path(), &key);
-    store.migrate().await.unwrap();
+    bootstrap(&store).await.unwrap();
     let now = chrono::Utc::now().timestamp();
     assert!(
         store
@@ -460,7 +461,7 @@ async fn postgres_token_issue_succeeds_only_while_the_grant_is_active() {
             .await
             .unwrap();
         let (store, control, schema) = shared.isolated_test_schema().await.unwrap();
-        store.migrate().await.unwrap();
+        bootstrap(&store).await.unwrap();
         let now = chrono::Utc::now().timestamp();
         assert!(
             store
