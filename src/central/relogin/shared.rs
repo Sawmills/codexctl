@@ -2,12 +2,26 @@
 use super::*;
 use crate::central::storage::{
     CentralStore,
-    login::{AddAdmission, LoginKind, LoginOperation, LoginPayload, LoginPhase},
+    login::{AddAdmission, LoginAuthority, LoginKind, LoginOperation, LoginPayload, LoginPhase},
 };
 use std::{process::Stdio, time::Duration};
 #[cfg(target_os = "linux")]
 use tokio::io::AsyncWriteExt;
 use tokio::{io::AsyncReadExt, process::Command};
+
+pub(in crate::central) struct Caller {
+    pub user: String,
+    pub authority: LoginAuthority,
+    pub dashboard_actor: Option<String>,
+}
+async fn machine(broker: &Broker, headers: &HeaderMap) -> Result<Caller, HttpError> {
+    let device = broker.authorize(headers).await?;
+    Ok(Caller {
+        user: device.user,
+        authority: LoginAuthority::Machine(device.id),
+        dashboard_actor: None,
+    })
+}
 
 type Body = Result<Json<Request>, axum::extract::rejection::JsonRejection>;
 fn failure(broker: &Broker) -> HttpError {
@@ -39,14 +53,23 @@ fn view(op: &LoginOperation) -> Response {
 }
 fn owned(
     broker: &Broker,
-    device: &vault::Device,
+    device: &Caller,
     request: &Request,
     op: &LoginOperation,
 ) -> Result<(), HttpError> {
-    if op.user != device.user || !op.alias.eq_ignore_ascii_case(request.alias.trim()) {
+    if op.user != device.user
+        || (!(request.alias.is_empty() && matches!(device.authority, LoginAuthority::Browser(_)))
+            && !op.alias.eq_ignore_ascii_case(request.alias.trim()))
+    {
         return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
     }
-    if op.device != device.id {
+    if std::mem::discriminant(&op.authority) != std::mem::discriminant(&device.authority) {
+        return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+    }
+    if op.authority != device.authority {
+        if matches!(device.authority, LoginAuthority::Browser(_)) {
+            return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+        }
         return Err(broker.error(StatusCode::CONFLICT, "login_belongs_to_another_device"));
     }
     Ok(())
@@ -91,11 +114,11 @@ async fn record_login_failure(
     }
     Ok(())
 }
-async fn recover(
-    broker: &Broker,
-    headers: &HeaderMap,
-    op: &mut LoginOperation,
-) -> Result<(), HttpError> {
+async fn recover(broker: &Broker, op: &mut LoginOperation) -> Result<(), HttpError> {
+    database(broker)?
+        .login_audit_terminal(op)
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "dashboard_audit_failed"))?;
     let holder_id = broker.login_holder();
     if matches!(op.phase, LoginPhase::Rejected | LoginPhase::Unresolved)
         || (op.phase == LoginPhase::ReplicaLost && !op.polling_clear)
@@ -150,7 +173,7 @@ async fn recover(
             .await
             .map_err(|_| failure(broker))?
     {
-        spawn_claimed_worker(broker.clone(), headers.clone(), op.clone(), permit, guard);
+        spawn_claimed_worker(broker.clone(), op.clone(), permit, guard);
     }
     Ok(())
 }
@@ -160,7 +183,7 @@ async fn lookup(
     body: Body,
     kind: LoginKind,
 ) -> Result<LoginOperation, HttpError> {
-    let device = broker.authorize(headers).await?;
+    let device = machine(broker, headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
     let db = database(broker)?;
@@ -179,13 +202,146 @@ async fn lookup(
     owned(broker, &device, &request, &op)?;
     Ok(op)
 }
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::central) struct BrowserView {
+    pub id: String,
+    pub alias: String,
+    pub status: &'static str,
+    pub verification_url: Option<&'static str>,
+    pub user_code: Option<String>,
+    pub landed_alias: Option<String>,
+    pub error: Option<String>,
+}
+impl From<&LoginOperation> for BrowserView {
+    fn from(op: &LoginOperation) -> Self {
+        let expired_polling =
+            op.lease_expired && matches!(op.phase, LoginPhase::Starting | LoginPhase::Pending);
+        Self {
+            id: op.id.clone(),
+            alias: op.alias.clone(),
+            status: if expired_polling {
+                "expired"
+            } else {
+                match op.phase {
+                    LoginPhase::Candidate | LoginPhase::Verifying => "verifying",
+                    LoginPhase::Unresolved | LoginPhase::Rejected => "failed",
+                    LoginPhase::ReplicaLost => "expired",
+                    phase => phase.as_str(),
+                }
+            },
+            verification_url: (op.phase == LoginPhase::Pending && !expired_polling).then_some(URL),
+            user_code: if op.phase == LoginPhase::Pending && !expired_polling {
+                op.payload.code.clone()
+            } else {
+                None
+            },
+            landed_alias: op.payload.landed.clone(),
+            error: op.payload.error.clone(),
+        }
+    }
+}
+pub(in crate::central) enum BrowserAction {
+    Read,
+    Poll,
+    Cancel,
+}
+pub(in crate::central) async fn browser_start(
+    broker: Broker,
+    caller: Caller,
+    request: Request,
+    label: Option<String>,
+) -> Result<BrowserView, HttpError> {
+    if !matches!(caller.authority, LoginAuthority::Browser(_)) {
+        return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+    }
+    let actor = caller.dashboard_actor.clone().ok_or_else(|| {
+        broker.error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dashboard_guard_unavailable",
+        )
+    })?;
+    let target = format!("unresolved:{}", vault::digest(request.alias.as_bytes()));
+    let result = if broker.browser_logins_enabled {
+        start_for(broker.clone(), caller, request, LoginKind::Add, label).await
+    } else {
+        Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "dashboard_login_disabled"))
+    };
+    match result {
+        Ok(op) => Ok(BrowserView::from(&op)),
+        Err(error) => {
+            let attempt = format!(
+                "login-refusal:{}",
+                vault::digest(&crate::central::enrollment::random_bytes())
+            );
+            let result = format!(
+                "{}:{}",
+                if error.status.is_client_error() || error.reason == "dashboard_login_disabled" {
+                    "refused"
+                } else {
+                    "failed"
+                },
+                error.reason
+            );
+            database(&broker)?
+                .dashboard_audit(
+                    crate::central::storage::DashboardAudit {
+                        operation: crate::central::storage::DashboardOperation::AccountAdd,
+                        actor: &actor,
+                        attempt: &attempt,
+                    },
+                    &target,
+                    &result,
+                )
+                .await
+                .map_err(|cause| {
+                    managed::log_dashboard_failure("login_audit", &cause);
+                    broker.error(StatusCode::SERVICE_UNAVAILABLE, "dashboard_audit_failed")
+                })?;
+            Err(error)
+        }
+    }
+}
+
+pub(in crate::central) async fn browser_receipt(
+    broker: &Broker,
+    caller: &Caller,
+    request: &Request,
+    action: BrowserAction,
+) -> Result<BrowserView, HttpError> {
+    let db = database(broker)?;
+    let LoginAuthority::Browser(session) = &caller.authority else {
+        return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+    };
+    let mut op = db
+        .login_browser_get(&caller.user, session, &request.id)
+        .await
+        .map_err(|_| failure(broker))?
+        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
+    owned(broker, caller, request, &op)?;
+    if !matches!(action, BrowserAction::Read) {
+        op = db
+            .login_get(&caller.user, &request.id)
+            .await
+            .map_err(|_| failure(broker))?
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
+    }
+    if matches!(action, BrowserAction::Cancel) {
+        db.login_cancel(&op).await.map_err(|_| failure(broker))?;
+    }
+    if !matches!(action, BrowserAction::Read) {
+        recover(broker, &mut op).await?;
+    }
+    Ok(BrowserView::from(&op))
+}
+
 pub(super) async fn status(
     broker: Broker,
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, HttpError> {
     let mut op = lookup(&broker, &headers, body, LoginKind::Renewal).await?;
-    recover(&broker, &headers, &mut op).await?;
+    recover(&broker, &mut op).await?;
     Ok(view(&op))
 }
 pub(super) async fn cancel(
@@ -213,7 +369,7 @@ pub(super) async fn add_status(
     body: Body,
 ) -> Result<Response, HttpError> {
     let mut op = lookup(&broker, &headers, body, LoginKind::Add).await?;
-    recover(&broker, &headers, &mut op).await?;
+    recover(&broker, &mut op).await?;
     Ok(view(&op))
 }
 pub(super) async fn add_cancel(
@@ -235,11 +391,29 @@ pub(super) async fn start_kind(
     kind: LoginKind,
     label: Option<String>,
 ) -> Result<Response, HttpError> {
-    let device = broker.authorize(&headers).await?;
+    let device = machine(&broker, &headers).await?;
     let Json(request) =
         body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let op = start_for(broker, device, request, kind, label).await?;
+    Ok(view(&op))
+}
+
+async fn start_for(
+    broker: Broker,
+    device: Caller,
+    request: Request,
+    kind: LoginKind,
+    label: Option<String>,
+) -> Result<LoginOperation, HttpError> {
     validate_id(&request.id)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+    let label = label
+        .as_deref()
+        .map(store::validate_label)
+        .transpose()
+        .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_label"))?
+        .flatten()
+        .map(str::to_owned);
     let db = database(&broker)?;
     // Receipts precede availability and alias checks, including completed retries.
     if let Some(mut op) = db
@@ -251,8 +425,8 @@ pub(super) async fn start_kind(
             return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
         }
         owned(&broker, &device, &request, &op)?;
-        recover(&broker, &headers, &mut op).await?;
-        return Ok(view(&op));
+        recover(&broker, &mut op).await?;
+        return Ok(op);
     }
     if broker.read_only
         || broker.stopping.load(Ordering::Acquire)
@@ -274,11 +448,16 @@ pub(super) async fn start_kind(
         if active.phase == LoginPhase::ReplicaLost {
             // A fresh request belongs to its caller. Cleanup uses company-user
             // authorization and does not expose another machine's old receipt.
-            recover(&broker, &headers, &mut active).await?;
+            recover(&broker, &mut active).await?;
         } else {
+            if std::mem::discriminant(&active.authority)
+                != std::mem::discriminant(&device.authority)
+            {
+                return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
+            }
             owned(&broker, &device, &request, &active)?;
-            recover(&broker, &headers, &mut active).await?;
-            return Ok(view(&active));
+            recover(&broker, &mut active).await?;
+            return Ok(active);
         }
     }
     if kind == LoginKind::Add
@@ -323,12 +502,13 @@ pub(super) async fn start_kind(
         id: request.id.clone(),
         account_id: account.clone(),
         alias: alias.into(),
-        device: device.id.clone(),
+        authority: device.authority.clone(),
         phase: LoginPhase::Starting,
         sequence: 0,
         holder: broker.login_holder(),
         epoch: 1,
         payload: LoginPayload {
+            dashboard_actor: device.dashboard_actor.clone(),
             label,
             ..Default::default()
         },
@@ -336,7 +516,13 @@ pub(super) async fn start_kind(
         lease_expired: false,
         failure_reported: false,
     };
-    if !db.login_create(&op).await.map_err(|_| failure(&broker))? {
+    if !db.login_create(&op).await.map_err(|error| {
+        if error.is::<crate::central::storage::login::LoginAuthorityEnded>() {
+            broker.error(StatusCode::UNAUTHORIZED, "login_authority_ended")
+        } else {
+            failure(&broker)
+        }
+    })? {
         let existing = db
             .login_get(&device.user, &request.id)
             .await
@@ -363,9 +549,9 @@ pub(super) async fn start_kind(
             return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
         }
         owned(&broker, &device, &request, &existing)?;
-        return Ok(view(&existing));
+        return Ok(existing);
     }
-    spawn_worker(broker.clone(), headers.clone(), op.clone(), permit)?;
+    spawn_worker(broker.clone(), op.clone(), permit)?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let current = db
@@ -374,8 +560,14 @@ pub(super) async fn start_kind(
             .map_err(|_| failure(&broker))?
             .ok_or_else(|| failure(&broker))?;
         if current.phase != LoginPhase::Starting || tokio::time::Instant::now() >= deadline {
-            broker.authorize(&headers).await?;
-            return Ok(view(&current));
+            if !db
+                .login_authority_live(&current)
+                .await
+                .map_err(|_| failure(&broker))?
+            {
+                return Err(broker.error(StatusCode::UNAUTHORIZED, "login_authority_ended"));
+            }
+            return Ok(current);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -409,12 +601,11 @@ impl Drop for WorkerGuard {
 }
 fn spawn_worker(
     worker: Broker,
-    worker_headers: HeaderMap,
     worker_op: LoginOperation,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), HttpError> {
     if let Some(guard) = WorkerGuard::claim(&worker, &worker_op)? {
-        spawn_claimed_worker(worker, worker_headers, worker_op, permit, guard);
+        spawn_claimed_worker(worker, worker_op, permit, guard);
     }
     Ok(())
 }
@@ -429,7 +620,6 @@ async fn report_worker_failure(broker: &Broker, op: &mut LoginOperation, grantle
 }
 fn spawn_claimed_worker(
     worker: Broker,
-    worker_headers: HeaderMap,
     mut worker_op: LoginOperation,
     permit: tokio::sync::OwnedSemaphorePermit,
     guard: WorkerGuard,
@@ -437,7 +627,7 @@ fn spawn_claimed_worker(
     tokio::spawn(async move {
         let _permit = permit;
         let _guard = guard;
-        if let Err(error) = run(&worker, &worker_headers, &mut worker_op).await {
+        if let Err(error) = run(&worker, &mut worker_op).await {
             let mut detail = format!("{error:#}");
             if let Some(auth) = worker_op.payload.candidate.as_ref() {
                 crate::central::resets::redact_auth_strings(auth, &mut detail);
@@ -450,6 +640,7 @@ fn spawn_claimed_worker(
             if matches!(
                 worker_op.phase,
                 LoginPhase::Completed
+                    | LoginPhase::Failed
                     | LoginPhase::Canceled
                     | LoginPhase::Rejected
                     | LoginPhase::ReplicaLost
@@ -504,10 +695,10 @@ fn spawn_claimed_worker(
         }
     });
 }
-async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> Result<()> {
+async fn run(broker: &Broker, op: &mut LoginOperation) -> Result<()> {
     let db = database(broker).map_err(|_| anyhow::anyhow!("shared store unavailable"))?;
     if op.phase == LoginPhase::Candidate {
-        return continue_candidate(broker, headers, op).await;
+        return continue_candidate(broker, op).await;
     }
     let root = std::fs::canonicalize(&broker.state)?
         .join("shared-logins")
@@ -590,7 +781,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    let canceled = db.login_heartbeat(op).await? || broker.stopping.load(Ordering::Acquire) || broker.login_machine_revoked(headers).await?;
+                    let canceled = db.login_heartbeat(op).await? || broker.stopping.load(Ordering::Acquire) || !db.login_authority_live(op).await?;
                     if canceled { return Ok(false); }
                     #[cfg(target_os = "linux")]
                     if let Err(error) = heartbeat.as_mut().context("polling heartbeat pipe missing")?.write_all(b"H").await {
@@ -624,6 +815,15 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             }
         }
     }.await;
+    #[cfg(target_os = "linux")]
+    let result =
+        if matches!(op.authority, LoginAuthority::Browser(_)) && matches!(result, Ok(false)) {
+            // The supervisor must distinguish a requested stop from a lost parent
+            // when it commits the browser's grantless terminal outcome.
+            db.login_cancel(op).await.map(|()| false)
+        } else {
+            result
+        };
     // Await exit even on DB loss. A dropped RPC future alone is not settlement.
     if !matches!(result, Ok(true))
         && let Err(error) = async {
@@ -675,7 +875,7 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
             {
                 return Err(error.into());
             }
-            return continue_candidate(broker, headers, op).await;
+            return continue_candidate(broker, op).await;
         }
         let settled: Result<()> = async {
             // A durable absence receipt also covers spawn failure and exit
@@ -742,13 +942,9 @@ async fn run(broker: &Broker, headers: &HeaderMap, op: &mut LoginOperation) -> R
         db.login_save(op, LoginPhase::Candidate).await?;
     }
     std::fs::remove_dir_all(&home)?;
-    continue_candidate(broker, headers, op).await
+    continue_candidate(broker, op).await
 }
-async fn continue_candidate(
-    broker: &Broker,
-    headers: &HeaderMap,
-    op: &mut LoginOperation,
-) -> Result<()> {
+async fn continue_candidate(broker: &Broker, op: &mut LoginOperation) -> Result<()> {
     let db = database(broker).map_err(|_| anyhow::anyhow!("shared store unavailable"))?;
     if op.kind == LoginKind::Add
         && op.account_id.is_none()
@@ -778,5 +974,5 @@ async fn continue_candidate(
         }
         return Ok(());
     }
-    broker.verify_shared_renewal(headers, op).await
+    broker.verify_shared_renewal(op).await
 }

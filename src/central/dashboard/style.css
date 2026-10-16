@@ -299,6 +299,37 @@ main {
   margin-top: var(--s7);
 }
 
+/* Login pages use the same colors and spacing as the account overview. */
+.login {
+  padding-block: var(--s6);
+}
+.login-fields {
+  display: grid;
+  gap: var(--s4);
+  max-inline-size: 30rem;
+  margin-block: var(--s5);
+}
+.login-fields label {
+  display: grid;
+  gap: var(--s2);
+}
+.login-fields input {
+  min-inline-size: 0;
+  inline-size: 100%;
+  padding: var(--s3);
+  border: 1px solid var(--ink-3);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+}
+.login form:not(.login-fields) {
+  margin-block: var(--s3);
+}
+.login code {
+  overflow-wrap: anywhere;
+}
+
 /* Buttons */
 .button {
   display: inline-flex;

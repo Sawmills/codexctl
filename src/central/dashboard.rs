@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 mod actions;
+mod login;
 pub(super) use actions::recent_sign_in;
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
@@ -280,6 +281,29 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
             "/assets/fonts/jetbrains-mono.woff2",
             get(|| async { font(include_bytes!("../../design/v3/fonts/jetbrains-mono.woff2")) }),
         )
+        .route(
+            "/accounts/add",
+            get(login::add_page)
+                .post(login::add)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(login::errors)),
+        )
+        .route(
+            "/accounts/login",
+            get(login::page).layer(axum::middleware::from_fn(login::errors)),
+        )
+        .route(
+            "/accounts/login/cancel",
+            post(login::cancel)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(login::errors)),
+        )
+        .route(
+            "/accounts/login/status",
+            post(login::status)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(login::errors)),
+        )
         .route("/accounts", get(page))
         .route(
             "/accounts/data",
@@ -290,7 +314,12 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
             get(enrollment::accounts_sign_in)
                 .layer(axum::middleware::from_fn(enrollment::browser_errors)),
         )
-        .route("/accounts/sign-out", post(enrollment::accounts_sign_out))
+        .route(
+            "/accounts/sign-out",
+            post(actions::sign_out)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(actions::no_store)),
+        )
         .route(
             "/accounts/machines/revoke",
             post(actions::revoke)
@@ -336,19 +365,23 @@ fn document(content: &str) -> Response {
     let script = concat!(
         include_str!("dashboard/copy.js"),
         "\n",
-        include_str!("dashboard/script.js")
+        include_str!("dashboard/script.js"),
+        "\n",
+        include_str!("dashboard/login.js")
     );
     let style_hash = STANDARD.encode(Sha256::digest(styles.as_bytes()));
     let script_hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
     let policy = format!(
         "default-src 'none'; style-src 'sha256-{style_hash}'; script-src 'sha256-{script_hash}'; font-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
     );
-    let refresh =
-        if content.contains("data-has-accounts") || content.contains("data-load-error=\"true\"") {
-            r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#
-        } else {
-            ""
-        };
+    let refresh = if content.contains("data-login-active") {
+        r#"<noscript><meta http-equiv="refresh" content="2"></noscript>"#
+    } else if content.contains("data-has-accounts") || content.contains("data-load-error=\"true\"")
+    {
+        r#"<noscript><meta http-equiv="refresh" content="60"></noscript>"#
+    } else {
+        ""
+    };
     let html = include_str!("dashboard/page.html")
         .replace("<!-- ACCOUNT_REFRESH -->", refresh)
         .replace("<!-- STYLES -->", &format!("<style>{styles}</style>"))

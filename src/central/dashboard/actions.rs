@@ -36,11 +36,11 @@ fn form_mac(broker: &Broker, session: &str) -> Result<Hmac<Sha256>, HttpError> {
     Ok(mac)
 }
 
-async fn check_request(
+fn check_form(
     broker: &Broker,
     headers: &HeaderMap,
-    input: &RevokeForm,
-) -> Result<super::managed::User, HttpError> {
+    form_token: Option<&str>,
+) -> Result<(), HttpError> {
     let expected = reqwest::Url::parse(enrollment::browser_origin(broker)?).map_err(|_| {
         broker.error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -65,17 +65,30 @@ async fn check_request(
     }
     let session = enrollment::browser_session_token(broker, headers)
         .ok_or_else(|| broker.error(StatusCode::FORBIDDEN, "dashboard_form_refused"))?;
-    let signature = input
-        .form_token
-        .as_deref()
+    let signature = form_token
         .and_then(|v| URL_SAFE_NO_PAD.decode(v).ok())
         .ok_or_else(|| broker.error(StatusCode::FORBIDDEN, "dashboard_form_refused"))?;
     form_mac(broker, session)?
         .verify_slice(&signature)
         .map_err(|_| broker.error(StatusCode::FORBIDDEN, "dashboard_form_refused"))?;
+    Ok(())
+}
+
+pub(super) async fn check_request(
+    broker: &Broker,
+    headers: &HeaderMap,
+    form_token: Option<&str>,
+) -> Result<super::managed::User, HttpError> {
+    check_form(broker, headers, form_token)?;
     enrollment::browser_user(broker, headers)
         .await?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))
+}
+
+pub(super) fn form_token(broker: &Broker, headers: &HeaderMap) -> Result<String, HttpError> {
+    let session = enrollment::browser_session_token(broker, headers)
+        .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
+    Ok(URL_SAFE_NO_PAD.encode(form_mac(broker, session)?.finalize().into_bytes()))
 }
 
 pub(super) fn render(
@@ -97,6 +110,7 @@ pub(super) fn render(
     Ok(super::render::overview_with_actions(
         snapshot,
         token.as_deref(),
+        broker.browser_logins_enabled,
     ))
 }
 
@@ -137,12 +151,38 @@ pub(super) async fn no_store(
     response
 }
 
+#[derive(Deserialize)]
+pub(super) struct SignOutForm {
+    form_token: Option<String>,
+}
+
+pub(super) async fn sign_out(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    input: Result<Form<SignOutForm>, axum::extract::rejection::FormRejection>,
+) -> Result<Response, HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == crate::central::storage::StoreMode::Postgres)
+        && enrollment::browser_session_token(&broker, &headers).is_some()
+    {
+        let input = input.ok();
+        check_form(
+            &broker,
+            &headers,
+            input.as_ref().and_then(|v| v.form_token.as_deref()),
+        )?;
+    }
+    enrollment::accounts_sign_out(State(broker), headers).await
+}
+
 async fn run_revoke(
     broker: &Broker,
     headers: &HeaderMap,
     input: &RevokeForm,
 ) -> Result<Response, HttpError> {
-    let user = check_request(broker, headers, input).await?;
+    let user = check_request(broker, headers, input.form_token.as_deref()).await?;
     let attempt = vault::digest(&enrollment::random_bytes());
     let central = broker
         .central
@@ -186,6 +226,7 @@ async fn run_revoke(
         &user.id,
         &input.id,
         Some(crate::central::storage::DashboardAudit {
+            operation: crate::central::storage::DashboardOperation::MachineRevoke,
             actor: &actor,
             attempt: &attempt,
         }),
@@ -249,6 +290,7 @@ async fn audit(
         .expect("action checked PostgreSQL")
         .dashboard_audit(
             crate::central::storage::DashboardAudit {
+                operation: crate::central::storage::DashboardOperation::MachineRevoke,
                 actor: &actor,
                 attempt,
             },

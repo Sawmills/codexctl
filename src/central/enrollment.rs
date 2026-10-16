@@ -327,7 +327,7 @@ fn page(html: String) -> Response {
         .into_response()
 }
 /// True when the Accept header lists `text/html` without rejecting it through `q=0`.
-fn accepts_html(accept: &str) -> bool {
+pub(super) fn accepts_html(accept: &str) -> bool {
     accept.split(',').any(|range| {
         let mut parts = range.split(';').map(str::trim);
         parts

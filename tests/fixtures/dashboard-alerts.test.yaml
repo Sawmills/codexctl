@@ -136,7 +136,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -157,7 +157,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -178,7 +178,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -199,7 +199,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -220,7 +220,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -241,7 +241,7 @@ tests:
               environment: staging
             exp_annotations:
               summary: Codexctl account operation failed
-              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke.
+              description: A dashboard operation failed. Inspect the dashboard reason and stage in structured logs, database health, and browser-session storage. Check machine status before retrying Revoke, or the retained login receipt and native journal before retrying Add.
               runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/central-server.md
       - eval_time: 6m
         alertname: CodexctlCredentialOperationFailed
@@ -445,5 +445,17 @@ tests:
               }
             exp_annotations: *owner_annotations
       - eval_time: 4m
+        alertname: CodexctlCredentialOperationFailed
+        exp_alerts: []
+
+  # Browser starts are intentionally off until the separate rollout GO.
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_last_failure_timestamp_seconds{reason="dashboard_login_disabled",pod="pod-browser"}
+        values: 0 60 60 60 60 60 60
+      - series: codexctl_central_failed_requests_total{reason="dashboard_login_disabled",pod="pod-browser"}
+        values: 0+10x6
+    alert_rule_test:
+      - eval_time: 2m
         alertname: CodexctlCredentialOperationFailed
         exp_alerts: []

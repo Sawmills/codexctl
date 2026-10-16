@@ -156,6 +156,9 @@ for line in sys.stdin:
             continue
         result = {"userAgent": "synthetic-codex"}
     elif method == "account/read":
+        force_counter = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).with_name("forced-refresh-count")
+        if params.get("refreshToken") and force_counter.exists():
+            increment(force_counter)
         after_limits, limits_read = limits_read, False
         if not params.get("refreshToken") and after_limits and pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"]).read_text() == "routing-read-reused":
             # Only the routing read right after a usage read fails: it can
@@ -217,7 +220,7 @@ for line in sys.stdin:
             if not marker.exists():
                 marker.write_text("started")
                 time.sleep(2)
-        if routing_mode in ["owner-native-hold", "owner-native-hung-journal"]:
+        if routing_mode in ["owner-native-hold", "owner-native-hung-journal", "browser-verification-hold"]:
             mode_file = pathlib.Path(os.environ["CENTRAL_TEST_MODE_FILE"])
             mode_file.with_name("native-started").write_text("started")
             mode_file.with_name("native-pid").write_text(str(os.getpid()))

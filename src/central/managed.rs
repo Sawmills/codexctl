@@ -265,6 +265,7 @@ pub(super) struct Broker {
     pub(super) settlements: Arc<Settlements>,
     pub sso: Option<Arc<enrollment::Sso>>,
     pub(super) browser_sessions_available: bool,
+    pub(super) browser_logins_enabled: bool,
     pub(super) activity: Arc<super::activity::Activity>,
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
@@ -880,14 +881,21 @@ impl Broker {
         device: &vault::Device,
         alias: &str,
     ) -> Result<Arc<Mutex<Owner>>, HttpError> {
-        self.resolve_alias(&device.user, alias)
+        self.owner_for_company_user(&device.user, alias).await
+    }
+    pub(super) async fn owner_for_company_user(
+        &self,
+        user: &str,
+        alias: &str,
+    ) -> Result<Arc<Mutex<Owner>>, HttpError> {
+        self.resolve_alias(user, alias)
             .await?
             .map(|(_, refresh)| refresh)
             .ok_or_else(|| {
                 if self.ownership_unresolved.load(Ordering::Acquire) {
                     self.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed")
                 } else {
-                    super::rename::renamed_error(self, &device.user, alias)
+                    super::rename::renamed_error(self, user, alias)
                         .unwrap_or_else(|| self.error(StatusCode::NOT_FOUND, "account_not_found"))
                 }
             })
@@ -2683,6 +2691,8 @@ pub async fn serve(
         imports,
         sso,
         browser_sessions_available,
+        browser_logins_enabled: std::env::var("CODEXCTL_CENTRAL_BROWSER_LOGINS")
+            .is_ok_and(|v| v == "1"),
         reset_reader: super::resets::Reader::new()?,
         catalog: Arc::new(catalog::Reader::new()?),
         failures: Arc::new(StdMutex::new(
@@ -2920,6 +2930,7 @@ impl Broker {
             imports: Arc::new(Mutex::new(())),
             sso: None,
             browser_sessions_available: true,
+            browser_logins_enabled: false,
             activity: Arc::default(),
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
@@ -3064,6 +3075,7 @@ mod tests {
             imports: Arc::new(Mutex::new(())),
             sso: None,
             browser_sessions_available: true,
+            browser_logins_enabled: false,
             activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),

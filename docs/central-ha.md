@@ -86,6 +86,52 @@ with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
 Run migrate before rolling this image. Both changes are additive and keep schema version 8.
 Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
 
+### Dashboard Add rollout
+
+Dashboard Add is implemented but disabled by default. Both overlays explicitly
+set `CODEXCTL_CENTRAL_BROWSER_LOGINS=0`. Merging or rolling the binary does not
+authorize enabling it. Browser Renew and Remove are separate follow-up changes;
+existing machine Add and login renewal keep their current behavior.
+
+Run migrate before rolling the new binary. The additive, idempotent migration
+adds nullable `central_login_operations.browser_session_hash` without changing
+schema version 8. A null value decodes as the existing machine authority in
+`device_id`. A browser receipt stores the exact session digest and company-user
+ID, with an empty legacy machine field. It never creates a fake machine.
+Only that session can read or cancel the receipt. Machine receipts and browser
+receipts cannot be read across authority kinds.
+
+Keep starts off until **all serving and worker replicas** run the new decoder
+and authority checks. Then obtain a separate HQ rollout GO before setting the
+switch to `1`. This is a protocol gate: the previous machine-only decoder cannot
+safely process retained browser receipts, even though the DDL is additive.
+Rollback means disabling starts, stopping and settling active operations, and
+keeping their receipts and unresolved evidence. Use a decoder-compatible binary;
+do not roll back to the old machine-only binary after browser starts exist.
+
+Browser Add uses the existing device sign-in and cached native credential and
+workspace checks. It does not request forced refresh, billing evidence, resets,
+or usage-based account selection. Session expiry, sign-out and company-user
+disablement stop the worker without requiring a browser poll. Publication checks
+session authority inside the transaction and again before commit. A lost or
+uncertain verification keeps its evidence reserved for recovery.
+
+Add, status recovery, cancellation and sign-out require the configured Origin
+and session form token. Receipt GETs are read-only. Pages and errors are no-store;
+the login routes use a same-origin referrer policy and `noreferrer` on the
+provider link. This blocks external referrers while preserving the Origin
+header on browser form POSTs, including without JavaScript. The owning browser sees only the fixed
+provider link, temporary code and safe receipt fields. No credential payload or
+raw session token belongs in pages, logs or audit rows.
+
+One accepted start and one terminal audit row use distinct durable coalescing
+keys. Failures use the existing `relogin_failed`, `relogin_identity_unresolved`,
+`recovery_failed` and `dashboard_audit_failed` alert paths in both overlays.
+Check the retained receipt and native journal before retrying a failed Add.
+An intentional `dashboard_login_disabled` refusal is not an operational alert.
+Promtool fixtures verify the alert expressions; they do not prove notification
+delivery or provider-login acceptance.
+
 The dashboard stores only the session cookie's digest, the company-user ID,
 signed-in time, and one-hour expiry. The existing encrypted enrollment table
 holds one-time sign-in state for five minutes. Pending sign-ins share a

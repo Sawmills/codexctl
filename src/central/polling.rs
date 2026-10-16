@@ -44,9 +44,11 @@ pub async fn supervise_login(state: &Path, key: &Path, binary: &Path) -> Result<
         if home.join("auth.json").try_exists()? {
             bail!("unexpected pre-launch grant");
         }
-        db.login_record_polling_absence(&op).await?;
-        db.login_save(&mut op, storage::login::LoginPhase::Canceled)
-            .await?;
+        db.login_record_polling_absence(&mut op, true).await?;
+        if op.phase != storage::login::LoginPhase::Canceled {
+            db.login_save(&mut op, storage::login::LoginPhase::Canceled)
+                .await?;
+        }
         return Ok(());
     }
     let mut command = Command::new(binary);
@@ -67,7 +69,7 @@ pub async fn supervise_login(state: &Path, key: &Path, binary: &Path) -> Result<
             if home.join("auth.json").try_exists()? {
                 bail!("unexpected grant after failed polling spawn");
             }
-            db.login_record_polling_absence(&op).await?;
+            db.login_record_polling_absence(&mut op, false).await?;
             return Err(error.into());
         }
     };
@@ -174,7 +176,10 @@ pub async fn supervise_login(state: &Path, key: &Path, binary: &Path) -> Result<
     let success = success && !canceled && live;
     match captured {
         Ok(None) => {
-            db.login_record_polling_absence(&op).await?;
+            db.login_record_polling_absence(&mut op, canceled).await?;
+            if op.phase == storage::login::LoginPhase::Canceled {
+                return Ok(());
+            }
             if canceled && live {
                 op.payload.code = None;
                 db.login_save(&mut op, storage::login::LoginPhase::Canceled)
