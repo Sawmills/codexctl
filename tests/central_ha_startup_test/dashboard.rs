@@ -72,20 +72,7 @@ impl BrowserFixture {
         let secret = root.path().join("oidc.secret");
         store::atomic_write(&secret, b"synthetic-company-client-secret").unwrap();
         let config = serde_json::to_vec(&json!({"issuer":ready["issuer"],"client_id":"codexctl-test","client_secret_file":secret,"allowed_domains":["example.invalid"]})).unwrap();
-        let output = command(
-            database.as_str(),
-            &root.path().join("state"),
-            &key,
-            "migrate",
-        )
-        .output()
-        .await
-        .unwrap();
-        assert!(
-            output.status.success(),
-            "migrate: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        storage_fixture::migrate(database.as_str(), &root.path().join("state"), &key).await;
         if let Some(overlay) = overlay {
             control
                 .batch_execute(&format!(
@@ -1020,20 +1007,12 @@ async fn postgres_dashboard_migration_is_additive_repeatable_and_keeps_version_e
     // Recreate PR1's table shape with a live session before upgrading.
     f.control.batch_execute(&format!("ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; DROP TABLE {0}.dashboard_audit",f.schema)).await.unwrap();
     for _ in 0..2 {
-        let result = command(
+        storage_fixture::migrate(
             &f.database(),
             &f._root.path().join("state"),
             &f._root.path().join("key"),
-            "migrate",
         )
-        .output()
-        .await
-        .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        .await;
     }
     let version: i64 = f
         .control
@@ -1111,20 +1090,12 @@ async fn postgres_dashboard_audit_migration_preserves_logically_deleted_rows() {
                 .await
                 .unwrap();
             for _ in 0..2 {
-                let result = command(
+                storage_fixture::migrate(
                     &f.database(),
                     &f._root.path().join("state"),
                     &f._root.path().join("key"),
-                    "migrate",
                 )
-                .output()
-                .await
-                .unwrap();
-                assert!(
-                    result.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&result.stderr)
-                );
+                .await;
             }
         }
         let row = f.control.query_one(&format!(

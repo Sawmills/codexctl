@@ -16,6 +16,9 @@ mod dashboard;
 #[path = "central_ha_startup_test/noinit.rs"]
 mod noinit;
 
+#[path = "central_ha_startup_test/storage_fixture.rs"]
+mod storage_fixture;
+
 struct Pod {
     child: Child,
     root: tempfile::TempDir,
@@ -293,17 +296,7 @@ async fn three_postgres_servers_start_without_refresh_children_and_launch_only_u
     let seed_token: Value = request(&http, &seed, &token).await.json().await.unwrap();
     assert_eq!(generation(&seed_token), 1);
     seed.stop().await;
-    for operation in ["migrate", "backfill"] {
-        let output = command(database.as_str(), &state, &key, operation)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{operation}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    storage_fixture::prepare(database.as_str(), &state, &key).await;
 
     let (first, second, third) = tokio::join!(
         Pod::start(database.as_str(), &key),
@@ -744,17 +737,7 @@ async fn postgres_import_settles_refresh_children_before_releasing_its_lease() {
         .build()
         .unwrap();
 
-    for operation in ["migrate", "backfill"] {
-        let output = command(database.as_str(), &state, &key, operation)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{operation}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    storage_fixture::prepare(database.as_str(), &state, &key).await;
     let mut importer = Pod::start(database.as_str(), &key).await;
     let mut peer = Pod::start(database.as_str(), &key).await;
     let auth = |account: &str| {
@@ -1339,17 +1322,7 @@ async fn login_fixture_in_database(
         .unwrap();
     }
 
-    for operation in ["migrate", "backfill"] {
-        let output = command(database.as_str(), &state, &key, operation)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{operation}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    storage_fixture::prepare(database.as_str(), &state, &key).await;
 
     let first = Pod::start(database.as_str(), &key).await;
     let second = Pod::start(database.as_str(), &key).await;
@@ -5403,20 +5376,12 @@ async fn postgres_legacy_lease_upgrade_requires_settled_owner_handoff_before_ren
         .await
         .unwrap();
     f.control.execute(&format!("INSERT INTO {}.account_refresh_leases(account_id,holder_id,epoch,expires_at) VALUES($1,'legacy-holder',41,clock_timestamp()-interval '1 second') ON CONFLICT(account_id) DO UPDATE SET holder_id='legacy-holder',epoch=41,expires_at=clock_timestamp()-interval '1 second'",f.schema), &[&account_key("test","seat")]).await.unwrap();
-    let output = command(
+    storage_fixture::migrate(
         &f.database,
         f._seed.root.path().join("state").as_path(),
         &f.key,
-        "migrate",
     )
-    .output()
-    .await
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "plain migration: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    .await;
     let row = f
         .control
         .query_one(
@@ -5432,22 +5397,12 @@ async fn postgres_legacy_lease_upgrade_requires_settled_owner_handoff_before_ren
         !row.get::<_, bool>(0),
         "expiry alone must not prove old owner settlement"
     );
-    let output = command(
+    let receipt = storage_fixture::confirm_legacy_owners_settled(
         &f.database,
         f._seed.root.path().join("state").as_path(),
         &f.key,
-        "migrate",
     )
-    .arg("--confirm-legacy-owners-settled")
-    .output()
-    .await
-    .unwrap();
-    assert!(
-        output.status.success(),
-        "confirmed legacy handoff: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    .await;
     assert_eq!(receipt["legacyLeasesReleased"], 1);
     f.first = Pod::start(&f.database, &f.key).await;
     f.second = Pod::start(&f.database, &f.key).await;
