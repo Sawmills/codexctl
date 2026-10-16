@@ -105,9 +105,9 @@ Existing sessions remain valid for observations, but need fresh sign-in before R
 
 ### Dashboard Add rollout
 
-Dashboard Add and Renew are implemented but disabled by default. Both overlays explicitly
-set `CODEXCTL_CENTRAL_BROWSER_LOGINS=0`. Merging or rolling the binary does not
-authorize enabling them. Browser Remove remains a separate follow-up change;
+Dashboard Add and Renew are disabled by default in the binary. HQ authorized both
+staging HA overlays to set `CODEXCTL_CENTRAL_BROWSER_LOGINS=1` with the image from
+main `8f666bcd` on 2026-10-16. Browser Remove remains a separate follow-up change;
 existing machine Add and login renewal keep their current behavior.
 
 Run migrate before rolling the new binary. The additive, idempotent migration
@@ -118,13 +118,12 @@ ID, with an empty legacy machine field. It never creates a fake machine.
 Only that session can read or cancel the receipt. Machine receipts and browser
 receipts cannot be read across authority kinds.
 
-Keep starts off until **all serving and worker replicas** run the new decoder
-and authority checks. Then obtain a separate HQ rollout GO before setting the
-switch to `1`. This is a protocol gate: the previous machine-only decoder cannot
-safely process retained browser receipts, even though the DDL is additive.
-Rollback means disabling starts, stopping and settling active operations, and
-keeping their receipts and unresolved evidence. Use a decoder-compatible binary;
-do not roll back to the old machine-only binary after browser starts exist.
+Use one version and fix forward. HQ authorized the image and browser-login switch
+in one staging rollout under Amir's no backward compatibility policy. Do not start
+browser logins during the rolling update; t56 verifies all replicas and observes
+errors for 300 seconds before the live Add/Renew proof. Old pods refusing a new
+receipt during this brief roll are an accepted staging limitation. Retain session
+and authority-isolation checks and preserve receipts and unresolved evidence.
 
 Browser Add and Renew use the existing device sign-in and cached native credential and
 workspace checks. Renew validates the candidate against the retained account identity,
