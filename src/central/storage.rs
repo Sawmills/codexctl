@@ -1754,24 +1754,6 @@ impl PostgresStore {
     }
 
     async fn renew(&self, lease: &Lease, ttl: Duration) -> Result<bool> {
-        // Removed is definitive loss of authority, not a transient DB error.
-        // Preserve the lease API's false outcome so existing keepers stop work.
-        let row = self
-            .client()
-            .await?
-            .query_opt(
-                "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
-                &[&lease.account_id],
-            )
-            .await?;
-        let lifecycle = match row {
-            Some(row) if row.get::<_, bool>(0) => AccountState::Removed,
-            Some(_) => AccountState::Active(()),
-            None => AccountState::Missing,
-        };
-        if !matches!(lifecycle, AccountState::Active(())) {
-            return Ok(false);
-        }
         let client = self.client().await?;
         let changed = client
             .execute(
@@ -2292,27 +2274,33 @@ impl PostgresStore {
             &login_epoch,
             &refresh_holder,
         ];
-        // All claims serialize with removal and login admission. No process work
-        // happens inside this short transaction.
-        let mut connection = self.admission_client().await?;
-        let tx = connection.transaction().await?;
-        let _timing = identity::lock_admission(&tx).await?;
-        let row = tx
-            .query_opt(
-                "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
-                &[&account_id],
-            )
-            .await?;
-        let lifecycle = match row {
-            Some(row) if row.get::<_, bool>(0) => AccountState::Removed,
-            Some(_) => AccountState::Active(()),
-            None => AccountState::Missing,
+        let row = if login.is_some() {
+            // Candidate claims retain their existing login epoch ordering.
+            let mut connection = self.admission_client().await?;
+            let tx = connection.transaction().await?;
+            let _timing = identity::lock_admission(&tx).await?;
+            let row = tx.query_opt(CLAIM, &params).await?;
+            tx.commit().await?;
+            row
+        } else {
+            // Ordinary refreshes must not queue behind login admission.
+            self.client().await?.query_opt(CLAIM, &params).await?
         };
-        if lifecycle.active()?.is_none() {
-            return Ok(None);
+        if row.is_none() {
+            // CLAIM itself rejects removal. Only a rejected claim needs an
+            // additional read to distinguish durable removal from contention.
+            let state = self
+                .client()
+                .await?
+                .query_opt(
+                    "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await?;
+            if state.is_some_and(|row| row.get::<_, bool>(0)) {
+                bail!(AccountRemoved);
+            }
         }
-        let row = tx.query_opt(CLAIM, &params).await?;
-        tx.commit().await?;
         Ok(row.map(|row| Lease {
             account_id: account_id.into(),
             holder_id: holder_id.into(),
@@ -2613,6 +2601,52 @@ mod tests {
             vault: serde_json::json!({"refresh":"secret"}),
             revision,
         }
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_refresh_claim_does_not_wait_on_login_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[45; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared
+            .save_account(&record("active-seat", 1))
+            .await
+            .unwrap();
+        let CentralStore::Postgres(db) = &shared else {
+            unreachable!()
+        };
+        let admission = db.admission_client().await.unwrap();
+        control
+            .batch_execute(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),12484))",
+            )
+            .await
+            .unwrap();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(1),
+            shared.acquire_lease(
+                "active-seat",
+                "independent-refresh",
+                Duration::from_secs(60),
+            ),
+        )
+        .await;
+        control.batch_execute("ROLLBACK").await.unwrap();
+        drop(admission);
+        let lease = claimed
+            .expect("normal refresh claim must not wait for login admission connection or lock")
+            .unwrap();
+        assert!(shared.release_lease(&lease).await.unwrap());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "central-real-db-tests")]

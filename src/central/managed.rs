@@ -1355,7 +1355,23 @@ pub(super) async fn account_catalog(
             .list_account_aliases(user)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        // Warm, unique owners are checked by the batch below. Keep resolution
+        // for hydration and ambiguous historical aliases without one authority
+        // round trip per cached account.
+        let mut cached = BTreeMap::<String, usize>::new();
+        for (identity, _) in broker.owners.read().await.values() {
+            if identity.user == user {
+                *cached
+                    .entry(identity.alias.to_ascii_lowercase())
+                    .or_default() += 1;
+            }
+        }
         for alias in aliases {
+            let normalized = normalize_alias(&alias)
+                .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
+            if cached.get(&normalized.to_ascii_lowercase()).copied() == Some(1) {
+                continue;
+            }
             match broker.resolve_alias(user, &alias).await {
                 // Removal can commit after the alias-list snapshot. Omit only
                 // that account; database failures must still fail the listing.
@@ -1402,9 +1418,28 @@ pub(super) async fn account_catalog(
             .account_lifecycles(&ids)
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
-        owners.retain(|(id, _, _)| {
-            !matches!(states.get(id), Some(super::storage::AccountState::Removed))
-        });
+        let mut active = Vec::with_capacity(owners.len());
+        for entry in owners {
+            if matches!(
+                states.get(&entry.0),
+                Some(super::storage::AccountState::Removed)
+            ) {
+                if let Ok(mut held) = entry.1.try_lock()
+                    && stop_removed_owner(&mut held).await.is_err()
+                {
+                    // Keep the evidence and retry stopping on later requests,
+                    // but never hide unrelated accounts behind this failure.
+                    broker.record_failure(
+                        "catalog_owner_unavailable",
+                        "catalog_removed_stop",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                }
+            } else {
+                active.push(entry);
+            }
+        }
+        owners = active;
     }
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));

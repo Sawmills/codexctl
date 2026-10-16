@@ -852,7 +852,14 @@ impl CentralStore {
         let db = self.login_db()?;
         bounded_db(async {
             let client = db.client().await?;
-            let row = client.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase IN ('starting','pending','candidate','verifying') AND expires_at>clock_timestamp() AND (deadline>clock_timestamp() OR phase IN ('candidate','verifying')) AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
+            let row = client.query_opt("UPDATE central_login_operations SET expires_at=clock_timestamp()+interval '30 seconds' WHERE user_id=$1 AND id=$2 AND holder_id=$3 AND epoch=$4 AND phase IN ('starting','pending','candidate','verifying') AND expires_at>clock_timestamp() AND (deadline>clock_timestamp() OR phase IN ('candidate','verifying')) AND EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$3 AND deleted_at IS NULL AND expires_at>clock_timestamp()) AND (account_id IS NULL OR EXISTS(SELECT 1 FROM central_accounts a WHERE a.account_id=central_login_operations.account_id AND a.user_id=$1 AND a.deleted_at IS NULL)) RETURNING cancel_requested", &[&op.user,&op.id,&op.holder,&op.epoch]).await?;
+            if row.is_none() && let Some(account) = op.account_id.as_ref() {
+                let state = client.query_opt(
+                    "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1 AND user_id=$2",
+                    &[account, &op.user],
+                ).await?;
+                if state.is_some_and(|row| row.get::<_,bool>(0)) { bail!(super::AccountRemoved); }
+            }
             let canceled: bool = row.context("login lease lost")?.get(0);
             let session_ended = matches!(op.authority, LoginAuthority::Browser(_))
                 && !authority_live(&*client, &op.user, &op.authority).await?;

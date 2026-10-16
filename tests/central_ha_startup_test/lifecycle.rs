@@ -2,6 +2,127 @@
 use super::*;
 
 #[tokio::test]
+async fn postgres_warm_catalog_batches_lifecycle_reads_and_refuses_database_errors() {
+    let f = login_fixture().await;
+    // Listing and the cached physical alias may differ only in ASCII case.
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET alias='SeAt' WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    // Count evaluated deletion metadata through the real PostgreSQL projection,
+    // without coupling the assertion to SQL text or private storage methods.
+    f.control.batch_execute(&format!(r#"
+        CREATE SEQUENCE {s}.lifecycle_reads;
+        CREATE FUNCTION {s}.count_lifecycle(d TIMESTAMPTZ) RETURNS TIMESTAMPTZ LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM nextval('{s}.lifecycle_reads');
+            RETURN d;
+        END $$;
+        ALTER TABLE {s}.central_accounts RENAME TO stored_accounts;
+        CREATE VIEW {s}.central_accounts AS SELECT account_id,user_id,alias,workspace,login,
+            encrypted_vault,revision,{s}.count_lifecycle(deleted_at) AS deleted_at,updated_at
+            FROM {s}.stored_accounts;
+    "#,s=f.schema)).await.unwrap();
+    let response = f
+        .http
+        .get(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let accounts: Vec<Value> = response.json().await.unwrap();
+    assert_eq!(accounts.len(), 2);
+    let reads: i64 = f
+        .control
+        .query_one(
+            &format!("SELECT last_value FROM {}.lifecycle_reads", f.schema),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        reads, 4,
+        "two accounts need one active-alias scan and one batched lifecycle scan"
+    );
+
+    f.control.batch_execute(&format!(r#"
+        CREATE OR REPLACE FUNCTION {s}.count_lifecycle(d TIMESTAMPTZ) RETURNS TIMESTAMPTZ LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'synthetic lifecycle read outage'; END $$;
+    "#,s=f.schema)).await.unwrap();
+    let response = f
+        .http
+        .get(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        503,
+        "warm caches cannot hide lifecycle database errors"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "persistence_failed"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_removal_after_renewal_start_stops_native_polling_without_a_client_poll() {
+    let f = login_fixture().await;
+    let id = "bf".repeat(32);
+    assert_eq!(
+        login_request(&f, &f.first, "start", &id).await["status"],
+        "pending"
+    );
+    let pid: i32 = std::fs::read_to_string(f.first.root.path().join("login-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(unsafe { libc::kill(pid, 0) }, 0);
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stage: removal after admission must stop the native login child");
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 404);
+    let other = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"other","billing":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 200);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
 async fn postgres_catalog_keeps_other_accounts_when_removal_commits_after_alias_listing() {
     let f = login_fixture().await;
     // Preserve the list statement's MVCC snapshot while removal commits. A
@@ -262,42 +383,33 @@ async fn postgres_lifecycle_outage_cannot_keep_an_unsettled_child_past_lease_cus
 }
 
 #[tokio::test]
-async fn postgres_removal_during_admission_refuses_token_and_renewal_without_starting_a_child() {
-    for renewal in [false, true] {
-        let f = login_fixture().await;
-        f.control
-            .batch_execute(&format!(
-                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
-                f.schema
-            ))
-            .await
-            .unwrap();
-        let blocker: i32 = f
-            .control
-            .query_one("SELECT pg_backend_pid()", &[])
+async fn postgres_removal_during_renewal_admission_refuses_without_starting_a_child() {
+    let f = login_fixture().await;
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let blocker: i32 = f
+        .control
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let bearer = f.token.clone();
+    let pending = tokio::spawn(async move {
+        http.post(format!("{url}/v1/relogin/start"))
+            .bearer_auth(bearer)
+            .json(&json!({"alias":"seat","id":"bc".repeat(32)}))
+            .send()
             .await
             .unwrap()
-            .get(0);
-        let http = f.http.clone();
-        let url = f.first.url.clone();
-        let bearer = f.token.clone();
-        let pending = tokio::spawn(async move {
-            let (path, body) = if renewal {
-                (
-                    "/v1/relogin/start",
-                    json!({"alias":"seat","id":"bc".repeat(32)}),
-                )
-            } else {
-                ("/v1/token", json!({"alias":"seat","billing":true}))
-            };
-            http.post(format!("{url}{path}"))
-                .bearer_auth(bearer)
-                .json(&body)
-                .send()
-                .await
-                .unwrap()
-        });
-        timeout(Duration::from_secs(4), async {
+    });
+    timeout(Duration::from_secs(4), async {
             loop {
                 let waiting: bool = f.control.query_one(
                     "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)))", &[&blocker]
@@ -306,26 +418,21 @@ async fn postgres_removal_during_admission_refuses_token_and_renewal_without_sta
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.expect("stage: request must reach shared admission before removal");
-        f.control.batch_execute(&format!(
+    f.control.batch_execute(&format!(
             "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'; COMMIT", f.schema
         )).await.unwrap();
-        let response = timeout(Duration::from_secs(4), pending)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            404,
-            "removal must win admission, renewal={renewal}"
-        );
-        assert_eq!(
-            response.json::<Value>().await.unwrap()["error"],
-            "account_removed"
-        );
-        assert_eq!(f.first.launches(), 0);
-        assert!(!f.first.root.path().join("login-pid").exists());
-        stop_fixture(f).await;
-    }
+    let response = timeout(Duration::from_secs(4), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), 404, "removal must win renewal admission");
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    assert_eq!(f.first.launches(), 0);
+    assert!(!f.first.root.path().join("login-pid").exists());
+    stop_fixture(f).await;
 }
 
 #[tokio::test]
@@ -598,6 +705,15 @@ async fn postgres_removed_account_refuses_both_committed_token_fast_paths() {
 async fn postgres_removed_account_is_hidden_from_warm_catalog_and_stale_local_restart() {
     let mut f = login_fixture().await;
     assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let stopped_evidence = std::fs::read(
+        f.first
+            .root
+            .path()
+            .join("state/accounts")
+            .join(account_key("test", "seat"))
+            .join("runtime/pid"),
+    )
+    .unwrap();
     f.control
         .execute(
             &format!(
@@ -608,8 +724,23 @@ async fn postgres_removed_account_is_hidden_from_warm_catalog_and_stale_local_re
         )
         .await
         .unwrap();
-    for stage in ["warm", "stopped restart", "unproven restart"] {
-        if stage != "warm" {
+    for stage in [
+        "warm",
+        "warm unproven",
+        "stopped restart",
+        "unproven restart",
+    ] {
+        if stage == "warm unproven" {
+            let home = f
+                .first
+                .root
+                .path()
+                .join("state/accounts")
+                .join(account_key("test", "seat"))
+                .join("runtime");
+            store::atomic_write(&home.join("pid"), b"unreadable process evidence").unwrap();
+        }
+        if stage.ends_with("restart") {
             f.first.stop().await;
             if stage == "unproven restart" {
                 let home = f
@@ -644,7 +775,7 @@ async fn postgres_removed_account_is_hidden_from_warm_catalog_and_stale_local_re
             "removed account leaked from catalog, stage={stage}"
         );
         assert!(accounts.iter().any(|a| a["alias"] == "other"));
-        if stage == "unproven restart" {
+        if matches!(stage, "warm unproven" | "unproven restart") {
             let pid = f
                 .first
                 .root
@@ -653,6 +784,18 @@ async fn postgres_removed_account_is_hidden_from_warm_catalog_and_stale_local_re
                 .join(account_key("test", "seat"))
                 .join("runtime/pid");
             assert_eq!(std::fs::read(pid).unwrap(), b"unreadable process evidence");
+            if stage == "warm unproven" {
+                // Remove this stage's injected corruption so the next stage
+                // still proves a restart with clean stopped-process evidence.
+                let pid = f
+                    .first
+                    .root
+                    .path()
+                    .join("state/accounts")
+                    .join(account_key("test", "seat"))
+                    .join("runtime/pid");
+                store::atomic_write(&pid, &stopped_evidence).unwrap();
+            }
         }
     }
     let row = f
