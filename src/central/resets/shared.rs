@@ -2,6 +2,7 @@
 use super::*;
 use crate::central::{managed::HttpError, storage::CentralStore, vault};
 use crate::central::{relogin::shared::Caller, storage::resets::ResetWrite};
+use serde_json::Value;
 
 pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Response, HttpError> {
     let device = broker.authorize(headers).await?;
@@ -17,13 +18,16 @@ pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Respons
     for alias in aliases {
         let outcome = match credential(central, &device.user, &alias).await {
             Ok(saved) => {
-                broker
-                    .reset_reader
-                    .read(
-                        vault::token(&saved.auth).unwrap_or_default(),
-                        &vault::account(&saved.auth).unwrap_or_default(),
-                    )
-                    .await
+                let result = async {
+                    let token = vault::token(&saved.auth)?;
+                    let account = vault::account(&saved.auth)?;
+                    broker.reset_reader.read(token, &account).await
+                }
+                .await;
+                if let Err(error) = &result {
+                    log_error("inventory", error, &saved.auth);
+                }
+                result
             }
             Err(error) => Err(error),
         }
@@ -51,7 +55,18 @@ async fn credential(central: &CentralStore, user: &str, alias: &str) -> Result<v
         .load_account_by_alias(user, alias)
         .await?
         .ok_or_else(|| anyhow::anyhow!("account unavailable"))?;
-    let saved: vault::Vault = serde_json::from_value(record.vault)?;
+    let result = checked_credential(&record, user);
+    if let Err(error) = &result {
+        log_error("credential", error, &record.vault);
+    }
+    result
+}
+
+fn checked_credential(
+    record: &crate::central::storage::CredentialRecord,
+    user: &str,
+) -> Result<vault::Vault> {
+    let saved: vault::Vault = serde_json::from_value(record.vault.clone())?;
     anyhow::ensure!(
         saved.user == user && saved.verified,
         "account is not verified"
@@ -63,6 +78,19 @@ async fn credential(central: &CentralStore, user: &str, alias: &str) -> Result<v
     );
     vault::account(&saved.auth)?;
     Ok(saved)
+}
+
+fn log_error(stage: &'static str, error: &anyhow::Error, secrets: &Value) {
+    let mut detail = format!("{error:#}");
+    redact_auth_strings(secrets, &mut detail);
+    let detail: String = detail.chars().take(4096).collect();
+    let status = error
+        .downcast_ref::<api::ResetRejected>()
+        .map(|error| error.0.as_u16());
+    eprintln!(
+        "{}",
+        serde_json::json!({"operation":"reset_redemption","stage":stage,"error":detail,"provider_status":status})
+    );
 }
 
 pub(in crate::central) struct ResetView {
@@ -136,19 +164,32 @@ pub(in crate::central) async fn apply(
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "server_stopping"))?;
     let worker = broker.clone();
     tokio::spawn(async move {
-        let _permit=permit;
-        run(&worker,&caller,&request).await.map_err(|error| {
-            if let Some(refusal)=error.downcast_ref::<Refusal>() {
-                let status=match refusal.0 {"account_not_found"=>StatusCode::NOT_FOUND,"reset_authority_ended"=>StatusCode::UNAUTHORIZED,"refresh_in_progress"=>StatusCode::SERVICE_UNAVAILABLE,_=>StatusCode::CONFLICT};
-                worker.error(status,refusal.0)
-            } else if error.is::<TerminalRejection>() {
-                worker.error(StatusCode::UNPROCESSABLE_ENTITY,"reset_rejected")
-            } else {
-                eprintln!("{}",serde_json::json!({"operation":"reset_redemption","stage":"shared","reason":"reset_redeem_failed"}));
-                worker.error(StatusCode::BAD_GATEWAY,"reset_redeem_failed")
-            }
-        })
-    }).await.map_err(|_|broker.error(StatusCode::SERVICE_UNAVAILABLE,"reset_redeem_failed"))?
+        let _permit = permit;
+        let mut secrets = Value::Null;
+        run(&worker, &caller, &request, &mut secrets)
+            .await
+            .map_err(|error| {
+                if let Some(refusal) = error.downcast_ref::<Refusal>() {
+                    let status = match refusal.0 {
+                        "account_not_found" => StatusCode::NOT_FOUND,
+                        "reset_authority_ended" => StatusCode::UNAUTHORIZED,
+                        "refresh_in_progress"
+                        | "login_pending"
+                        | "reset_in_progress"
+                        | "reset_custody_lost" => StatusCode::SERVICE_UNAVAILABLE,
+                        _ => StatusCode::CONFLICT,
+                    };
+                    worker.error(status, refusal.0)
+                } else if error.is::<TerminalRejection>() {
+                    worker.error(StatusCode::UNPROCESSABLE_ENTITY, "reset_rejected")
+                } else {
+                    log_error("shared", &error, &secrets);
+                    worker.error(StatusCode::BAD_GATEWAY, "reset_redeem_failed")
+                }
+            })
+    })
+    .await
+    .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_redeem_failed"))?
 }
 
 fn receipt(
@@ -174,6 +215,7 @@ async fn run(
     broker: &Broker,
     caller: &Caller,
     request: &Redemption,
+    secrets: &mut Value,
 ) -> Result<api::ConsumeResetResponse> {
     let central = broker
         .central
@@ -184,7 +226,51 @@ async fn run(
         .load_account_by_alias(&caller.user, &request.alias)
         .await?
         .ok_or(Refusal("account_not_found"))?;
-    let saved = credential(central, &caller.user, &request.alias).await?;
+    // Replaying a receipt requires live caller authority and account scope, but
+    // performs no provider work and must survive saved credential expiry.
+    let (_, value) = central.reset_journal(&record.account_id).await?;
+    let journal: Journal = serde_json::from_value(value)?;
+    if let Some(completed) = journal.completed.get(&request.redeem_request_id) {
+        return receipt(completed, true);
+    }
+    let owner = broker
+        .owners
+        .read()
+        .await
+        .get(&record.account_id)
+        .map(|(_, owner)| owner.clone());
+    let local = owner
+        .as_ref()
+        .map(|owner| owner.try_lock())
+        .transpose()
+        .map_err(|_| Refusal("refresh_in_progress"))?;
+    if local.as_ref().is_some_and(|owner| owner.import_settling) {
+        return Err(Refusal("refresh_in_progress").into());
+    }
+    let custody = central.reset_custody(&record.account_id).await?;
+    let current = central
+        .load_account_by_alias(&caller.user, &request.alias)
+        .await?
+        .ok_or(Refusal("account_not_found"))?;
+    *secrets = current.vault.clone();
+    if current.account_id != record.account_id {
+        return Err(Refusal("account_changed").into());
+    }
+    tokio::select! {
+        biased;
+        _ = custody.lost() => Err(Refusal("reset_custody_lost").into()),
+        result = execute(broker,central,caller,request,&current) => result,
+    }
+}
+
+async fn execute(
+    broker: &Broker,
+    central: &CentralStore,
+    caller: &Caller,
+    request: &Redemption,
+    record: &crate::central::storage::CredentialRecord,
+) -> Result<api::ConsumeResetResponse> {
+    let saved = checked_credential(record, &caller.user)?;
     let token = vault::token(&saved.auth)?;
     let workspace = vault::account(&saved.auth)?;
     let reader = &broker.reset_reader;
@@ -264,10 +350,13 @@ async fn run(
     .await
     {
         Ok(response) => response,
-        Err(error) if error.is::<api::ResetRejected>() => api::ConsumeResetResponse {
-            code: api::ConsumeResetCode::Unknown,
-            windows_reset: 0,
-        },
+        Err(error) if error.is::<api::ResetRejected>() => {
+            log_error("provider_rejected", &error, &record.vault);
+            api::ConsumeResetResponse {
+                code: api::ConsumeResetCode::Unknown,
+                windows_reset: 0,
+            }
+        }
         Err(error) => return Err(error),
     };
     for _ in 0..8 {

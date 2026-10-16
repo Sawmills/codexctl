@@ -57,6 +57,7 @@ impl CentralStore {
             let tx=client.transaction().await?;
             let _admission=identity::lock_admission(&tx).await?;
             if let Err(reason)=authorize(&tx,caller).await? {return Ok(Err(reason));}
+            if !resets::mutation_allowed(&tx,&request.account_id).await? {return Ok(Err("reset_in_progress"));}
             let row=tx.query_opt("SELECT alias,revision,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1 AND user_id=$2 FOR UPDATE", &[&request.account_id,&caller.user]).await?;
             let Some(row)=row else { return Ok(Err("account_not_found")); };
             let alias:String=row.get(0); let revision:i64=row.get(1); let removed:bool=row.get(2);

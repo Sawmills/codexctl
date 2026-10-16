@@ -819,6 +819,9 @@ impl CentralStore {
             // Renewal admission must not start native polling for a removed
             // account. Add intentionally has no selected account yet.
             if let Some(account) = op.account_id.as_ref() {
+                if !super::resets::mutation_allowed(&tx, account).await? {
+                    return Err(crate::central::resets::Refusal("reset_in_progress").into());
+                }
                 let row = tx.query_opt(
                     "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1 AND user_id=$2 FOR SHARE",
                     &[account, &op.user],

@@ -168,6 +168,16 @@ receipt and browser audit commit together. A disconnected browser does not cance
 that settlement. Expired foreign refresh custody remains a refusal until it is
 released. Credentials and raw session tokens never enter the page or audit.
 
+Active redemption holds the local owner mutex and an account-scoped PostgreSQL
+session advisory lock on a dedicated connection. Refresh claims, Renew admission
+and Remove take nonblocking shared transaction locks on that account, so they
+refuse promptly while the provider call runs. No transaction spans provider I/O;
+ordinary refresh still avoids schema admission. The execution connection closes
+on exit, while an ambiguous pending credit/key stays in the journal. Renew can
+repair expired credentials before a later retry. Losing the database session
+cancels further local work and retains the unknown outcome; it cannot cancel a
+provider request already accepted upstream.
+
 The existing `/v1/resets` and `/v1/resets/redeem` machine routes now support
 PostgreSQL. Machine and browser transports keep their own authority checks;
 neither treats the other's credential as its own. The browser gate does not grant

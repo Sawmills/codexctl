@@ -28,6 +28,28 @@ pub(in crate::central) enum ResetWrite<'a> {
     },
 }
 
+/// Dropping this dedicated client closes the session and releases execution
+/// custody. The journal remains intact when a remote outcome is unknown.
+pub(in crate::central) struct ResetCustody(Arc<tokio_postgres::Client>);
+
+impl ResetCustody {
+    pub(in crate::central) async fn lost(&self) {
+        while !self.0.is_closed() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+pub(super) async fn mutation_allowed<C: tokio_postgres::GenericClient + Sync>(
+    client: &C,
+    account: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(concat!("SELECT ", reset_mutation_guard!()), &[&account])
+        .await?
+        .get(0))
+}
+
 async fn authorize<C: tokio_postgres::GenericClient + Sync>(
     client: &C,
     caller: &Caller,
@@ -45,6 +67,23 @@ async fn authorize<C: tokio_postgres::GenericClient + Sync>(
 }
 
 impl CentralStore {
+    pub(in crate::central) async fn reset_custody(&self, account: &str) -> Result<ResetCustody> {
+        let db = self.browser_store()?;
+        bounded_db(async {
+            // Never put a session lock on a pooled or cached client.
+            let client = db.establish().await?;
+            let acquired: bool = client.query_one(
+                "SELECT pg_try_advisory_lock(hashtextextended(current_schema()||':'||$1,13322))",
+                &[&account],
+            ).await?.get(0);
+            if !acquired {
+                return Err(Refusal("reset_in_progress").into());
+            }
+            Ok(ResetCustody(client))
+        })
+        .await
+    }
+
     pub(in crate::central) async fn authorize_reset(&self, caller: &Caller) -> Result<()> {
         let db = self.browser_store()?;
         bounded_db(async { authorize(&*db.client().await?, caller).await }).await
@@ -72,10 +111,15 @@ impl CentralStore {
             let mut client=Arc::try_unwrap(db.establish().await?).map_err(|_| anyhow::anyhow!("reset connection is shared"))?;
             let tx=client.transaction().await?;
             if let ResetWrite::Reserve{caller,account_revision,holder}=stage {
+                let _admission=identity::lock_admission(&tx).await?;
                 authorize(&tx,caller).await?;
-                let row=tx.query_opt("SELECT revision FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR SHARE", &[&account,&caller.user]).await?;
+                let row=tx.query_opt("SELECT revision FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE", &[&account,&caller.user]).await?;
                 let row=row.ok_or(Refusal("account_not_found"))?;
                 if row.get::<_,i64>(0)!=account_revision {return Err(Refusal("account_changed").into());}
+                let login_query=concat!("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE ",login_fence!()," OR (account_id=$1 AND phase IN ('starting','pending')) OR (user_id=$2 AND phase IN ('starting','pending') AND kind='add'))");
+                if tx.query_one(login_query, &[&account,&caller.user]).await?.get::<_,bool>(0) {
+                    return Err(Refusal("login_pending").into());
+                }
                 if tx.query_one("SELECT EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND NOT released AND holder_id<>$2)", &[&account,&holder]).await?.get::<_,bool>(0) {
                     return Err(Refusal("refresh_in_progress").into());
                 }
