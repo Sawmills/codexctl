@@ -188,8 +188,10 @@ impl Broker {
                 initialize_owner(owner).await?;
                 let revision = owner.snapshot()?.revision;
                 let browser = matches!(op.authority, LoginAuthority::Browser(_));
-                // Browser login proves the loaded credential and workspace with
-                // cached native reads. It never requests rotation or billing.
+                // Browser verification uses the candidate's checked identity claims
+                // plus a cached native read matching the expected routing account.
+                // This is its intended proof: verified_login requires forced refresh,
+                // so Browser never uses it or requests rotation or billing reads.
                 let request = if browser {
                     TokenRequest::default()
                 } else {

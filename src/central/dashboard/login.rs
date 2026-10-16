@@ -108,11 +108,48 @@ pub(super) async fn add(
     let op = shared::browser_start(
         broker,
         caller,
-        relogin::Request {
+        shared::BrowserStart::Add {
+            request: relogin::Request {
+                alias: input.alias,
+                id: input.id,
+            },
+            label: input.label,
+        },
+    )
+    .await?;
+    Ok(Redirect::to(&format!("/accounts/login?id={}", op.id)).into_response())
+}
+
+pub(super) async fn renew_page(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    Query(input): Query<Input>,
+) -> Result<Response, HttpError> {
+    let caller = caller(&broker, &headers).await?;
+    require_starts(&broker)?;
+    let alias = shared::browser_renew_alias(&broker, &caller, &input.alias).await?;
+    let alias = enrollment::escape(&alias);
+    let token = actions::form_token(&broker, &headers)?;
+    let id = crate::central::vault::digest(&enrollment::random_bytes());
+    Ok(document(&format!(
+        r#"<main id="main" class="wrap login"><h1>Renew a server account login</h1><p>Sign in to the same OpenAI account again for <strong>{alias}</strong>.</p><form class="login-fields" method="post" action="/accounts/renew"><input type="hidden" name="alias" value="{alias}"><input type="hidden" name="id" value="{id}"><input type="hidden" name="form_token" value="{token}"><button class="button">Renew login</button></form><p><a href="/accounts">Back to accounts</a></p></main>"#
+    )))
+}
+
+pub(super) async fn renew(
+    State(broker): State<Broker>,
+    headers: HeaderMap,
+    Form(input): Form<Input>,
+) -> Result<Response, HttpError> {
+    actions::check_request(&broker, &headers, input.form_token.as_deref()).await?;
+    let caller = caller(&broker, &headers).await?;
+    let op = shared::browser_start(
+        broker,
+        caller,
+        shared::BrowserStart::Renew(relogin::Request {
             alias: input.alias,
             id: input.id,
-        },
-        input.label,
+        }),
     )
     .await?;
     Ok(Redirect::to(&format!("/accounts/login?id={}", op.id)).into_response())
@@ -170,9 +207,13 @@ fn render_view(
     let fields = format!(
         r#"<input type="hidden" name="id" value="{id}"><input type="hidden" name="form_token" value="{token}">"#
     );
+    let title = match op.kind {
+        crate::central::storage::login::LoginKind::Add => "Add a server account",
+        crate::central::storage::login::LoginKind::Renewal => "Renew a server account login",
+    };
     let content = format!(
         r#"<main id="main" class="wrap login" data-browser-login data-status="{}" {}>
-<h1>Add a server account</h1><p id="login-state" role="status">{status}</p>
+<h1>{title}</h1><p id="login-state" role="status">{status}</p>
 <p id="login-result">{result}</p>
 <section id="login-challenge" {}><p>Open this link and enter the one-time code:</p><p><a href="https://auth.openai.com/codex/device" rel="noreferrer">Sign in to OpenAI</a></p><p><code id="login-code" translate="no">{code}</code></p></section>
 <form id="login-status-form" method="post" action="/accounts/login/status">{fields}<button class="button small">Check status</button></form>

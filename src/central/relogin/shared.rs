@@ -2,7 +2,10 @@
 use super::*;
 use crate::central::storage::{
     CentralStore,
-    login::{AddAdmission, LoginAuthority, LoginKind, LoginOperation, LoginPayload, LoginPhase},
+    login::{
+        AddAdmission, LoginAuthority, LoginKind, LoginOperation, LoginPayload, LoginPhase,
+        StartLookup,
+    },
 };
 use std::{process::Stdio, time::Duration};
 #[cfg(target_os = "linux")]
@@ -115,6 +118,13 @@ async fn record_login_failure(
     Ok(())
 }
 async fn recover(broker: &Broker, op: &mut LoginOperation) -> Result<(), HttpError> {
+    if op.lease_expired && matches!(op.phase, LoginPhase::Starting | LoginPhase::Pending) {
+        *op = database(broker)?
+            .login_get(&op.user, &op.id)
+            .await
+            .map_err(|_| failure(broker))?
+            .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "relogin_not_found"))?;
+    }
     database(broker)?
         .login_audit_terminal(op)
         .await
@@ -207,6 +217,8 @@ async fn lookup(
 pub(in crate::central) struct BrowserView {
     pub id: String,
     pub alias: String,
+    #[serde(skip)]
+    pub kind: LoginKind,
     pub status: &'static str,
     pub verification_url: Option<&'static str>,
     pub user_code: Option<String>,
@@ -220,6 +232,7 @@ impl From<&LoginOperation> for BrowserView {
         Self {
             id: op.id.clone(),
             alias: op.alias.clone(),
+            kind: op.kind,
             status: if expired_polling {
                 "expired"
             } else {
@@ -246,11 +259,35 @@ pub(in crate::central) enum BrowserAction {
     Poll,
     Cancel,
 }
+pub(in crate::central) async fn browser_renew_alias(
+    broker: &Broker,
+    caller: &Caller,
+    alias: &str,
+) -> Result<String, HttpError> {
+    if !matches!(caller.authority, LoginAuthority::Browser(_)) {
+        return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
+    }
+    let alias = managed::normalize_alias(alias)
+        .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
+    database(broker)?
+        .load_account_by_alias(&caller.user, alias)
+        .await
+        .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+        .map(|record| record.alias)
+        .ok_or_else(|| broker.error(StatusCode::NOT_FOUND, "account_not_found"))
+}
+
+pub(in crate::central) enum BrowserStart {
+    Add {
+        request: Request,
+        label: Option<String>,
+    },
+    Renew(Request),
+}
 pub(in crate::central) async fn browser_start(
     broker: Broker,
     caller: Caller,
-    request: Request,
-    label: Option<String>,
+    start: BrowserStart,
 ) -> Result<BrowserView, HttpError> {
     if !matches!(caller.authority, LoginAuthority::Browser(_)) {
         return Err(broker.error(StatusCode::NOT_FOUND, "relogin_not_found"));
@@ -261,9 +298,17 @@ pub(in crate::central) async fn browser_start(
             "dashboard_guard_unavailable",
         )
     })?;
+    let (request, kind, label) = match start {
+        BrowserStart::Add { request, label } => (request, LoginKind::Add, label),
+        BrowserStart::Renew(request) => (request, LoginKind::Renewal, None),
+    };
+    let operation = match kind {
+        LoginKind::Add => crate::central::storage::DashboardOperation::AccountAdd,
+        LoginKind::Renewal => crate::central::storage::DashboardOperation::AccountRenew,
+    };
     let target = format!("unresolved:{}", vault::digest(request.alias.as_bytes()));
     let result = if broker.browser_logins_enabled {
-        start_for(broker.clone(), caller, request, LoginKind::Add, label).await
+        start_for(broker.clone(), caller, request, kind, label).await
     } else {
         Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "dashboard_login_disabled"))
     };
@@ -286,7 +331,7 @@ pub(in crate::central) async fn browser_start(
             database(&broker)?
                 .dashboard_audit(
                     crate::central::storage::DashboardAudit {
-                        operation: crate::central::storage::DashboardOperation::AccountAdd,
+                        operation,
                         actor: &actor,
                         attempt: &attempt,
                     },
@@ -417,7 +462,7 @@ async fn start_for(
     let db = database(&broker)?;
     // Receipts precede availability and alias checks, including completed retries.
     if let Some(mut op) = db
-        .login_get(&device.user, &request.id)
+        .login_start_lookup(&device.user, StartLookup::Id(&request.id))
         .await
         .map_err(|_| failure(&broker))?
     {
@@ -438,21 +483,29 @@ async fn start_for(
     let alias = managed::normalize_alias(&request.alias)
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_alias"))?;
     if let Some(mut active) = db
-        .login_active_alias(&device.user, alias)
+        .login_start_lookup(&device.user, StartLookup::Alias(alias))
         .await
         .map_err(|_| failure(&broker))?
     {
         if active.kind != kind {
             return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
         }
-        if active.phase == LoginPhase::ReplicaLost {
+        let different_authority_kind =
+            std::mem::discriminant(&active.authority) != std::mem::discriminant(&device.authority);
+        // Browser starts leave machine evidence untouched. Machine starts keep
+        // company-user cleanup of stale polling receipts during rollback.
+        if different_authority_kind && matches!(device.authority, LoginAuthority::Browser(_)) {
+            return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
+        }
+        if active.phase == LoginPhase::ReplicaLost
+            || (active.lease_expired
+                && matches!(active.phase, LoginPhase::Starting | LoginPhase::Pending))
+        {
             // A fresh request belongs to its caller. Cleanup uses company-user
             // authorization and does not expose another machine's old receipt.
             recover(&broker, &mut active).await?;
         } else {
-            if std::mem::discriminant(&active.authority)
-                != std::mem::discriminant(&device.authority)
-            {
+            if different_authority_kind {
                 return Err(broker.error(StatusCode::CONFLICT, "relogin_reserved"));
             }
             owned(&broker, &device, &request, &active)?;
@@ -524,13 +577,13 @@ async fn start_for(
         }
     })? {
         let existing = db
-            .login_get(&device.user, &request.id)
+            .login_start_lookup(&device.user, StartLookup::Id(&request.id))
             .await
             .map_err(|_| failure(&broker))?;
         let existing = match existing {
             Some(op) => Some(op),
             None => db
-                .login_active_alias(&device.user, alias)
+                .login_start_lookup(&device.user, StartLookup::Alias(alias))
                 .await
                 .map_err(|_| failure(&broker))?,
         };

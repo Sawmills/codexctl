@@ -6,6 +6,9 @@ mod migration;
 #[path = "dashboard_login.rs"]
 mod login;
 
+#[path = "dashboard_renew.rs"]
+mod renew;
+
 struct BrowserFixture {
     first: Pod,
     second: Pod,

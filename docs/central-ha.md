@@ -88,9 +88,9 @@ Existing sessions remain valid for observations, but need fresh sign-in before R
 
 ### Dashboard Add rollout
 
-Dashboard Add is implemented but disabled by default. Both overlays explicitly
+Dashboard Add and Renew are implemented but disabled by default. Both overlays explicitly
 set `CODEXCTL_CENTRAL_BROWSER_LOGINS=0`. Merging or rolling the binary does not
-authorize enabling it. Browser Renew and Remove are separate follow-up changes;
+authorize enabling them. Browser Remove remains a separate follow-up change;
 existing machine Add and login renewal keep their current behavior.
 
 Run migrate before rolling the new binary. The additive, idempotent migration
@@ -109,14 +109,24 @@ Rollback means disabling starts, stopping and settling active operations, and
 keeping their receipts and unresolved evidence. Use a decoder-compatible binary;
 do not roll back to the old machine-only binary after browser starts exist.
 
-Browser Add uses the existing device sign-in and cached native credential and
-workspace checks. It does not request forced refresh, billing evidence, resets,
+Browser Add and Renew use the existing device sign-in and cached native credential and
+workspace checks. Renew validates the candidate against the retained account identity,
+then confirms its expected routing account with a cached native read. It keeps the
+same server account and alias. A different login is refused. These actions do not
+request forced refresh, billing evidence, resets,
 or usage-based account selection. Session expiry, sign-out and company-user
 disablement stop the worker without requiring a browser poll. Publication checks
 session authority inside the transaction and again before commit. A lost or
 uncertain verification keeps its evidence reserved for recovery.
 
-Add, status recovery, cancellation and sign-out require the configured Origin
+Renew is offered on each owned account row and has a confirmation page that works
+without JavaScript. Start conflict discovery is read-only: a browser start does
+not expire or recover a machine receipt, even when that receipt's lease has ended.
+Its machine retains the existing recovery path. During rollback, a machine start
+can settle stale browser polling under company-user authority and create its own
+receipt; it cannot read or cancel the browser receipt.
+
+Add, Renew, status recovery, cancellation and sign-out require the configured Origin
 and session form token. Receipt GETs are read-only. Pages and errors are no-store;
 the login routes use a same-origin referrer policy and `noreferrer` on the
 provider link. This blocks external referrers while preserving the Origin
@@ -125,7 +135,8 @@ provider link, temporary code and safe receipt fields. No credential payload or
 raw session token belongs in pages, logs or audit rows.
 
 One accepted start and one terminal audit row use distinct durable coalescing
-keys. Failures use the existing `relogin_failed`, `relogin_identity_unresolved`,
+keys. Completion emits a success log only when it inserts the terminal audit row;
+recovery retains a terminal row that already exists. Failures use the existing `relogin_failed`, `relogin_identity_unresolved`,
 `recovery_failed` and `dashboard_audit_failed` alert paths in both overlays.
 Check the retained receipt and native journal before retrying a failed Add.
 An intentional `dashboard_login_disabled` refusal is not an operational alert.
