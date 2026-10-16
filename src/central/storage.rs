@@ -2260,8 +2260,12 @@ impl PostgresStore {
         // can replace its own replica's refresh lease because its worker settles
         // that child. The login holder rotates after an outage; the refresh
         // holder does not, so match the lease by the refresh holder.
+        // Hold this account's row through the claim, without schema admission.
+        // Removal must take FOR UPDATE on the same account before tombstoning
+        // it; FOR SHARE rechecks deleted_at after an in-flight writer commits.
+        // Writers that also need schema admission take it before account/lease.
         const CLAIM: &str = concat!(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL) AND ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR SHARE) AND ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
             login_fence!(),
             " AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch"
         );
@@ -2330,8 +2334,9 @@ impl PostgresStore {
         let mut connection = self.admission_client().await?;
         let client = connection.transaction().await?;
         let _admission_timing = identity::lock_admission(&client).await?;
+        // Claims lock account then lease; publication must use that order too.
         let changed = client.execute(
-            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
+            "WITH active_account AS MATERIALIZED (SELECT account_id FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR UPDATE), valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id IN (SELECT account_id FROM active_account) AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
@@ -2605,6 +2610,99 @@ mod tests {
 
     #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
+    async fn postgres_refresh_claim_and_publication_share_account_first_lock_order() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[46; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared.save_account(&record("seat", 1)).await.unwrap();
+        let lease = shared
+            .acquire_lease("seat", "publisher", Duration::from_secs(60))
+            .await
+            .unwrap();
+        // Pause the contender after its account read but before its lease row
+        // lock. Publication must not take the lease while waiting on that read.
+        control
+            .batch_execute(
+                r#"
+            CREATE FUNCTION hold_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(hashtextextended(current_schema(),13276));
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER hold_claim BEFORE INSERT ON account_refresh_leases
+                FOR EACH ROW EXECUTE FUNCTION hold_claim();
+        "#,
+            )
+            .await
+            .unwrap();
+        control
+            .batch_execute(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),13276))",
+            )
+            .await
+            .unwrap();
+        let blocker: i32 = control
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let claimant = shared.clone();
+        let claim = tokio::spawn(async move {
+            claimant
+                .acquire_lease("seat", "contender", Duration::from_secs(60))
+                .await
+        });
+        let claim_pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = control.query_opt(
+                    "SELECT pid FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)) LIMIT 1", &[&blocker]
+                ).await.unwrap() { break row.get(0); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stage: contender reaches lease insertion gate");
+        let publisher = shared.clone();
+        let publication =
+            tokio::spawn(async move { publisher.fenced_write(&lease, &record("seat", 2)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = control.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)))", &[&claim_pid]
+                ).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stage: publication waits for contender's account read");
+        control.batch_execute("COMMIT").await.unwrap();
+        let published = tokio::time::timeout(Duration::from_secs(5), publication)
+            .await
+            .expect("stage: publication finishes after claim gate releases")
+            .unwrap();
+        assert!(
+            matches!(published, Ok(true)),
+            "publication must avoid lock inversion: {published:?}"
+        );
+        let claimed = tokio::time::timeout(Duration::from_secs(5), claim)
+            .await
+            .expect("stage: contending claim finishes")
+            .unwrap();
+        let error = claimed.expect_err("live publisher keeps its lease");
+        assert!(
+            format!("{error:#}").contains("refresh lease is held"),
+            "claim must report contention, not deadlock: {error:?}"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
     async fn postgres_refresh_claim_does_not_wait_on_login_admission() {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("key");
@@ -2618,13 +2716,16 @@ mod tests {
             .save_account(&record("active-seat", 1))
             .await
             .unwrap();
+        let mut unrelated = record("unrelated-seat", 1);
+        unrelated.alias = "other-seat".into();
+        shared.save_account(&unrelated).await.unwrap();
         let CentralStore::Postgres(db) = &shared else {
             unreachable!()
         };
         let admission = db.admission_client().await.unwrap();
         control
             .batch_execute(
-                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),12484))",
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),12484)); SELECT account_id FROM central_accounts WHERE account_id='unrelated-seat' FOR UPDATE",
             )
             .await
             .unwrap();
@@ -2640,7 +2741,9 @@ mod tests {
         control.batch_execute("ROLLBACK").await.unwrap();
         drop(admission);
         let lease = claimed
-            .expect("normal refresh claim must not wait for login admission connection or lock")
+            .expect(
+                "normal refresh claim must not wait for login admission or another account's row",
+            )
             .unwrap();
         assert!(shared.release_lease(&lease).await.unwrap());
         control

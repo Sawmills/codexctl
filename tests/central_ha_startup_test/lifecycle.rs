@@ -383,56 +383,82 @@ async fn postgres_lifecycle_outage_cannot_keep_an_unsettled_child_past_lease_cus
 }
 
 #[tokio::test]
-async fn postgres_removal_during_renewal_admission_refuses_without_starting_a_child() {
-    let f = login_fixture().await;
-    f.control
+async fn postgres_removal_during_admission_refuses_token_and_renewal_without_starting_a_child() {
+    for renewal in [false, true] {
+        let f = login_fixture().await;
+        // Exercise replacement of an existing lease too: an INSERT's foreign
+        // key check alone does not protect the ON CONFLICT update path.
+        f.control.batch_execute(&format!(
+            "INSERT INTO {s}.account_refresh_leases(account_id,holder_id,epoch,expires_at,released) SELECT account_id,'prior-refresh',1,clock_timestamp()-interval '1 second',true FROM {s}.central_accounts WHERE alias='seat' ON CONFLICT(account_id) DO UPDATE SET expires_at=clock_timestamp()-interval '1 second',released=true",
+            s=f.schema
+        )).await.unwrap();
+        f.control
         .batch_execute(&format!(
-            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
-            f.schema
+            "BEGIN; SELECT account_id FROM {s}.central_accounts WHERE alias='seat' FOR UPDATE; UPDATE {s}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+            s=f.schema
         ))
         .await
         .unwrap();
-    let blocker: i32 = f
-        .control
-        .query_one("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap()
-        .get(0);
-    let http = f.http.clone();
-    let url = f.first.url.clone();
-    let bearer = f.token.clone();
-    let pending = tokio::spawn(async move {
-        http.post(format!("{url}/v1/relogin/start"))
-            .bearer_auth(bearer)
-            .json(&json!({"alias":"seat","id":"bc".repeat(32)}))
-            .send()
+        let blocker: i32 = f
+            .control
+            .query_one("SELECT pg_backend_pid()", &[])
             .await
             .unwrap()
-    });
-    timeout(Duration::from_secs(4), async {
+            .get(0);
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let bearer = f.token.clone();
+        let pending = tokio::spawn(async move {
+            let (path, body) = if renewal {
+                (
+                    "/v1/relogin/start",
+                    json!({"alias":"seat","id":"bc".repeat(32)}),
+                )
+            } else {
+                ("/v1/token", json!({"alias":"seat","billing":false}))
+            };
+            http.post(format!("{url}{path}"))
+                .bearer_auth(bearer)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        });
+        timeout(Duration::from_secs(4), async {
             loop {
+                assert_eq!(f.first.launches(), 0, "native refresh started before removal committed, renewal={renewal}");
+                assert!(!f.first.root.path().join("login-pid").exists(), "native login started before removal committed");
                 let waiting: bool = f.control.query_one(
                     "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)))", &[&blocker]
                 ).await.unwrap().get(0);
                 if waiting { break; }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        }).await.expect("stage: request must reach shared admission before removal");
-    f.control.batch_execute(&format!(
-            "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'; COMMIT", f.schema
-        )).await.unwrap();
-    let response = timeout(Duration::from_secs(4), pending)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(response.status(), 404, "removal must win renewal admission");
-    assert_eq!(
-        response.json::<Value>().await.unwrap()["error"],
-        "account_removed"
-    );
-    assert_eq!(f.first.launches(), 0);
-    assert!(!f.first.root.path().join("login-pid").exists());
-    stop_fixture(f).await;
+        }).await.expect("stage: request must wait for the same-account removal row before native work");
+        assert_eq!(
+            f.first.launches(),
+            0,
+            "pending removal must fence native refresh, renewal={renewal}"
+        );
+        assert!(!f.first.root.path().join("login-pid").exists());
+        f.control.batch_execute("COMMIT").await.unwrap();
+        let response = timeout(Duration::from_secs(4), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "removal must win admission, renewal={renewal}"
+        );
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "account_removed"
+        );
+        assert_eq!(f.first.launches(), 0);
+        assert!(!f.first.root.path().join("login-pid").exists());
+        stop_fixture(f).await;
+    }
 }
 
 #[tokio::test]
