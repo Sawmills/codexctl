@@ -14,6 +14,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 mod actions;
 mod login;
+mod remove;
 pub(super) use actions::recent_sign_in;
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
@@ -312,6 +313,16 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
                 .layer(axum::middleware::from_fn(login::errors)),
         )
         .route("/accounts", get(page))
+        .route(
+            "/accounts/manage",
+            get(remove::page).layer(axum::middleware::from_fn(remove::errors)),
+        )
+        .route(
+            "/accounts/remove",
+            post(remove::submit)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(remove::errors)),
+        )
         .route(
             "/accounts/data",
             get(move |state, headers| data(state, headers, elapsed)),

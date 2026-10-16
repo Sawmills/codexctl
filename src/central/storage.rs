@@ -31,6 +31,7 @@ pub(in crate::central) use browser::{
     BrowserIdentity, DashboardAudit, DashboardOperation, MachineRevoke,
 };
 mod loans;
+pub(in crate::central) use removal::{RemovalAction, RemovalResult, RemovalTarget};
 mod migration;
 
 #[cfg(test)]
@@ -217,6 +218,8 @@ macro_rules! login_fence {
         "(((phase='unresolved' OR (phase='replica_lost' AND NOT polling_clear)) AND candidate_workspace IS NULL AND user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) OR (account_id=$1 AND selected_reserved) OR ((kind<>'add' OR account_id IS NOT NULL OR user_id=(SELECT user_id FROM central_accounts WHERE account_id=$1)) AND central_login_identity_matches(candidate_workspace,candidate_uid,candidate_sub,$1))) AND (phase IN ('candidate','verifying','unresolved','rejected') OR (phase='replica_lost' AND NOT polling_clear))"
     };
 }
+
+mod removal;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS central_schema_migrations (

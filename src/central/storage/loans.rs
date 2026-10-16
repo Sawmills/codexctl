@@ -712,11 +712,11 @@ impl PostgresStore {
         let changed = client
             .execute(
                 concat!(
-                    "WITH created AS (INSERT INTO ",
+                    "WITH active_account AS MATERIALIZED (SELECT account_id FROM central_accounts WHERE account_id=$2 AND deleted_at IS NULL FOR SHARE), created AS (INSERT INTO ",
                     loans_table!(),
                     "(",
                     grant_columns!(),
-                    ") VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULL,NULL,NULL,NULL) ON CONFLICT DO NOTHING RETURNING id) INSERT INTO ",
+                    ") SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULL,NULL,NULL,NULL FROM active_account ON CONFLICT DO NOTHING RETURNING id) INSERT INTO ",
                     audit_table!(),
                     "(",
                     audit_columns!(),

@@ -266,6 +266,7 @@ pub(super) struct Broker {
     pub sso: Option<Arc<enrollment::Sso>>,
     pub(super) browser_sessions_available: bool,
     pub(super) browser_logins_enabled: bool,
+    pub(super) browser_remove_enabled: bool,
     pub(super) activity: Arc<super::activity::Activity>,
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
@@ -1025,7 +1026,7 @@ impl Broker {
     }
 }
 
-async fn stop_removed_owner(owner: &mut Owner) -> Result<()> {
+pub(super) async fn stop_removed_owner(owner: &mut Owner) -> Result<()> {
     owner_request::fence_background_owner(owner);
     owner.retryable_unavailable = false;
     if let Some(rpc) = owner.rpc.as_mut() {
@@ -2633,7 +2634,7 @@ pub async fn serve(
         let inventory =
             relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
         let journal_conflicts = inventory.journal_conflicts();
-        let stopped = inventory.runtime == relogin::ProcessState::Stopped;
+        let mut stopped = inventory.runtime == relogin::ProcessState::Stopped;
         match inventory.candidates {
             Ok(candidates) => conflicting_journals.extend(candidates.into_iter().map(|c| c.auth)),
             Err(_) => {
@@ -2645,6 +2646,11 @@ pub async fn serve(
             startup_lifecycles.get(entry.file_name().to_string_lossy().as_ref()),
             Some(super::storage::AccountState::Removed)
         ) {
+            if !stopped {
+                stopped = super::removal::stop_retained_runtime(&entry.path().join("runtime"))
+                    .await
+                    .is_ok();
+            }
             // Exclusion is not proof that retained login or journal evidence
             // cannot overlap another account. Keep incomplete inventory fenced.
             if !stopped || journal_conflicts {
@@ -2858,6 +2864,8 @@ pub async fn serve(
         sso,
         browser_sessions_available,
         browser_logins_enabled: std::env::var("CODEXCTL_CENTRAL_BROWSER_LOGINS")
+            .is_ok_and(|v| v == "1"),
+        browser_remove_enabled: std::env::var("CODEXCTL_CENTRAL_BROWSER_REMOVE")
             .is_ok_and(|v| v == "1"),
         reset_reader: super::resets::Reader::new()?,
         catalog: Arc::new(catalog::Reader::new()?),
@@ -3097,6 +3105,7 @@ impl Broker {
             sso: None,
             browser_sessions_available: true,
             browser_logins_enabled: false,
+            browser_remove_enabled: false,
             activity: Arc::default(),
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
@@ -3242,6 +3251,7 @@ mod tests {
             sso: None,
             browser_sessions_available: true,
             browser_logins_enabled: false,
+            browser_remove_enabled: false,
             activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),

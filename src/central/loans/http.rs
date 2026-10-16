@@ -613,6 +613,22 @@ async fn lend(
         .await
         .map_err(|error| broker.loan_failure("create", error))?
     {
+        if let Some(central) = broker
+            .central
+            .as_ref()
+            .filter(|s| s.mode() != crate::central::storage::StoreMode::File)
+        {
+            let states = central
+                .account_lifecycles(std::slice::from_ref(&account_id))
+                .await
+                .map_err(|error| broker.loan_failure("create", error))?;
+            if matches!(
+                states.get(&account_id),
+                Some(crate::central::storage::AccountState::Removed)
+            ) {
+                return Err(broker.error(StatusCode::NOT_FOUND, "account_removed"));
+            }
+        }
         return Err(broker.error(StatusCode::CONFLICT, "loan_exists"));
     }
     broker.retire_loans().await;

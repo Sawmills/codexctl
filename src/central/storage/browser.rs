@@ -15,6 +15,7 @@ pub(in crate::central) enum DashboardOperation {
     MachineRevoke,
     AccountAdd,
     AccountRenew,
+    AccountRemove,
 }
 impl DashboardOperation {
     pub(super) fn as_str(self) -> &'static str {
@@ -22,6 +23,7 @@ impl DashboardOperation {
             Self::MachineRevoke => "machine_revoke",
             Self::AccountAdd => "account_add",
             Self::AccountRenew => "account_renew",
+            Self::AccountRemove => "account_remove",
         }
     }
 }
@@ -189,17 +191,18 @@ impl CentralStore {
             let at=chrono::Utc::now().timestamp();
             let client=db.client().await?;
             let inserted=client.query_opt("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,$6,$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&target,&result,&audit.attempt,&audit.operation.as_str()]).await?;
+            let new=inserted.is_some();
             // A lost COMMIT acknowledgement can have already persisted the real outcome.
             let row=match inserted {
                 Some(row)=>row,
                 None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1 AND deleted_at IS NULL", &[&audit.attempt]).await?,
             };
-            audit_log(row.get(0),row.get(1),row.get(2),row.get(3),audit.operation.as_str());
+            if new { audit_log(row.get(0),row.get(1),row.get(2),row.get(3),audit.operation.as_str()); }
             Ok(())
         }).await
     }
 
-    fn browser_store(&self) -> Result<&PostgresStore> {
+    pub(super) fn browser_store(&self) -> Result<&PostgresStore> {
         match self {
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => Ok(db),
             Self::File(_) => bail!("shared browser sessions require PostgreSQL"),
@@ -301,7 +304,7 @@ impl CentralStore {
     }
 }
 
-fn audit_log(at: i64, actor: &str, target: &str, result: &str, operation: &str) {
+pub(super) fn audit_log(at: i64, actor: &str, target: &str, result: &str, operation: &str) {
     eprintln!(
         "{}",
         serde_json::json!({"at":at,"actor_hash":vault::digest(actor.as_bytes()),"operation":operation,"target":target,"result":result})

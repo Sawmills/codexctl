@@ -423,6 +423,7 @@ fn ledger(
     all_stale: bool,
     now: i64,
     can_renew: bool,
+    can_remove: bool,
 ) -> String {
     let mut rows = String::new();
     let mut sorted: Vec<_> = accounts.iter().collect();
@@ -499,6 +500,16 @@ fn ledger(
         } else {
             String::new()
         };
+        let manage = if can_remove {
+            format!(
+                r#"<form method="get" action="/accounts/manage"><input type="hidden" name="alias" value="{}"><button class="button small" aria-label="Manage {}">Manage account</button></form>"#,
+                escape(&a.alias),
+                escape(&a.alias)
+            )
+        } else {
+            String::new()
+        };
+        let renew = format!("{renew}{manage}");
         rows += &format!(
             r#"<tr role="row" class="{class}"><td role="cell" class="cell-account"><div class="account-name"><strong>{}</strong><span class="line"><span class="alias" translate="no">{}</span>{plan}</span><span class="note {}">{note}</span>{renew}</div></td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-usage">{}</td><td role="cell" class="cell-credits"><span class="cell-label" aria-hidden="true">Credits</span>{}</td><td role="cell" class="cell-banked"><span class="cell-label" aria-hidden="true">Banked resets</span><div class="banked"><b>{count}</b>{expiry}{redeemable}{inventory}</div></td><td role="cell" class="cell-state"><div class="status"><span class="state {state_class}">{state}</span><span class="status-detail" data-age="{}">Last observed {}</span></div></td></tr>"#,
             escape(a.name()),
@@ -601,13 +612,14 @@ fn machines(snapshot: &Snapshot, form_token: Option<&str>) -> String {
 
 #[cfg(test)]
 pub(super) fn overview(snapshot: &Snapshot) -> String {
-    overview_with_actions(snapshot, None, false)
+    overview_with_actions(snapshot, None, false, false)
 }
 
 pub(super) fn overview_with_actions(
     snapshot: &Snapshot,
     form_token: Option<&str>,
     browser_logins_enabled: bool,
+    browser_remove_enabled: bool,
 ) -> String {
     let best = recommendation(&snapshot.accounts);
     let all_stale = !snapshot.accounts.is_empty() && snapshot.accounts.iter().all(Account::stale);
@@ -653,7 +665,8 @@ pub(super) fn overview_with_actions(
             best,
             all_stale,
             snapshot.server_time,
-            browser_logins_enabled && form_token.is_some()
+            browser_logins_enabled && form_token.is_some(),
+            browser_remove_enabled && form_token.is_some()
         ),
         machines = machines(snapshot, form_token),
         login_actions = if browser_logins_enabled && form_token.is_some() {

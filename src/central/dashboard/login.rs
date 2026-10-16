@@ -58,7 +58,7 @@ pub(super) struct Input {
     label: Option<String>,
 }
 
-async fn caller(broker: &Broker, headers: &HeaderMap) -> Result<Caller, HttpError> {
+pub(super) async fn caller(broker: &Broker, headers: &HeaderMap) -> Result<Caller, HttpError> {
     if !broker
         .central
         .as_ref()
