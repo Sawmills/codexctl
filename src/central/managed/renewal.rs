@@ -2,30 +2,11 @@
 use super::*;
 use crate::central::storage::{
     identity::CandidateIdentityMismatch,
-    login::{LoginKind, LoginOperation, LoginPhase},
+    login::{LoginAuthority, LoginKind, LoginOperation, LoginPhase},
 };
 
 impl Broker {
-    /// Revocation is a decision; a failed registry read is an unavailable authority.
-    pub(in crate::central) async fn login_machine_revoked(
-        &self,
-        headers: &HeaderMap,
-    ) -> Result<bool> {
-        match self.authorize(headers).await {
-            Ok(_) => Ok(false),
-            Err(error)
-                if matches!(
-                    error.status,
-                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-                ) =>
-            {
-                Ok(true)
-            }
-            Err(_) => bail!("machine authorization unavailable"),
-        }
-    }
-
-    async fn check_login_authority(&self, headers: &HeaderMap, op: &LoginOperation) -> Result<()> {
+    async fn check_login_authority(&self, op: &LoginOperation) -> Result<()> {
         let central = self
             .central
             .as_ref()
@@ -33,7 +14,7 @@ impl Broker {
         if central.login_heartbeat(op).await? || self.stopping.load(Ordering::Acquire) {
             bail!("login canceled");
         }
-        if self.login_machine_revoked(headers).await? {
+        if !central.login_authority_live(op).await? {
             bail!("machine revoked");
         }
         Ok(())
@@ -41,20 +22,13 @@ impl Broker {
 
     pub(in crate::central) async fn verify_shared_renewal(
         &self,
-        headers: &HeaderMap,
         op: &mut LoginOperation,
     ) -> Result<()> {
         let central = self
             .central
             .as_ref()
             .context("shared renewal needs PostgreSQL")?;
-        let device = self.authorize(headers).await.map_err(|error| {
-            anyhow::anyhow!(if error.status.is_server_error() {
-                "machine authorization unavailable"
-            } else {
-                "machine revoked"
-            })
-        })?;
+        self.check_login_authority(op).await?;
         // Reject a wrong login before waiting on reservations that it may itself
         // have created for another renewal's selected account.
         let shared = central
@@ -76,11 +50,11 @@ impl Broker {
             return Ok(());
         }
         let owner_ref = self
-            .owner(&device, op.payload.landed.as_deref().unwrap_or(&op.alias))
+            .owner_for_company_user(&op.user, op.payload.landed.as_deref().unwrap_or(&op.alias))
             .await
             .map_err(|_| anyhow::anyhow!("renewal account missing"))?;
         let (imports, mut held_owner, lease) = loop {
-            self.check_login_authority(headers, op).await?;
+            self.check_login_authority(op).await?;
             let Ok(imports) =
                 tokio::time::timeout(std::time::Duration::from_secs(1), self.imports.lock()).await
             else {
@@ -117,7 +91,7 @@ impl Broker {
                 if !central.renew(&lease, IMPORT_LEASE_TTL).await? {
                     bail!("renewal refresh lease lost");
                 }
-                if self.login_machine_revoked(headers).await? {
+                if !central.login_authority_live(&authority).await? {
                     bail!("machine revoked");
                 }
             }
@@ -213,15 +187,28 @@ impl Broker {
                 drop(imports);
                 initialize_owner(owner).await?;
                 let revision = owner.snapshot()?.revision;
-                owner
-                    .tokens(TokenRequest {
+                let browser = matches!(op.authority, LoginAuthority::Browser(_));
+                // Browser login proves the loaded credential and workspace with
+                // cached native reads. It never requests rotation or billing.
+                let request = if browser {
+                    TokenRequest::default()
+                } else {
+                    TokenRequest {
                         previous_revision: Some(revision),
                         billing: true,
                         ..Default::default()
-                    })
+                    }
+                };
+                let observed = owner
+                    .tokens(request)
                     .await
                     .map_err(|_| anyhow::anyhow!("renewal verification failed"))?;
-                if !owner.rpc.as_ref().is_some_and(Rpc::verified_login) {
+                let verified = if browser {
+                    observed.native_routing_supported && owner.routing_observed
+                } else {
+                    owner.rpc.as_ref().is_some_and(Rpc::verified_login)
+                };
+                if !verified {
                     bail!("renewal login not verified");
                 }
                 owner.vault.verified = true;
@@ -229,13 +216,7 @@ impl Broker {
                 Ok::<_, anyhow::Error>(record)
             };
             let record = verification.await?;
-            self.authorize(headers).await.map_err(|error| {
-                anyhow::anyhow!(if error.status.is_server_error() {
-                    "machine authorization unavailable"
-                } else {
-                    "machine revoked"
-                })
-            })?;
+            self.check_login_authority(op).await?;
             central
                 .login_complete(op, &lease, &record, committed_revision)
                 .await?;

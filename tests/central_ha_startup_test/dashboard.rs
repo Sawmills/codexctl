@@ -3,6 +3,9 @@ use super::*;
 #[path = "migration.rs"]
 mod migration;
 
+#[path = "dashboard_login.rs"]
+mod login;
+
 struct BrowserFixture {
     first: Pod,
     second: Pod,
@@ -133,6 +136,19 @@ impl BrowserFixture {
         )
         .unwrap();
         Pod::spawn(database, key, root, "postgres").await
+    }
+
+    async fn enable_browser_logins(&mut self) {
+        self.first.stop().await;
+        let root = std::mem::replace(&mut self.first.root, tempfile::tempdir().unwrap());
+        store::atomic_write(&root.path().join("browser-logins"), b"1").unwrap();
+        self.first = Pod::spawn(
+            &self.database(),
+            &self._root.path().join("key"),
+            root,
+            "postgres",
+        )
+        .await;
     }
 
     async fn restart_with_database_proxy(&mut self) -> (tempfile::TempDir, Child) {
@@ -819,11 +835,13 @@ async fn postgres_dashboard_sign_out_on_one_pod_ends_the_session_everywhere() {
         .await
         .unwrap();
     assert_eq!(still_live.status(), 200);
+    let token = f.form_token(&session).await;
     let ended = f
         .http
         .post(format!("{}/accounts/sign-out", f.second.url))
         .header("cookie", &session)
         .header("origin", "http://127.0.0.1:8787")
+        .form(&[("form_token", &token)])
         .send()
         .await
         .unwrap();
@@ -1264,6 +1282,7 @@ async fn postgres_missing_browser_table_fails_only_the_dashboard_at_startup() {
 async fn postgres_browser_session_failures_log_bounded_database_causes() {
     let f = BrowserFixture::start().await;
     let (session, _) = f.sign_in().await;
+    let token = f.form_token(&session).await;
     let (binding, path) = f.begin_sign_in().await;
     f.control.batch_execute(&format!(
         "CREATE FUNCTION {0}.fail_session() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'sensitive synthetic session detail'; END $$; CREATE TRIGGER fail_session BEFORE INSERT ON {0}.browser_sessions FOR EACH STATEMENT EXECUTE FUNCTION {0}.fail_session()", f.schema,
@@ -1294,6 +1313,7 @@ async fn postgres_browser_session_failures_log_bounded_database_causes() {
         .post(format!("{}/accounts/sign-out", f.second.url))
         .header("cookie", &session)
         .header("origin", "http://127.0.0.1:8787")
+        .form(&[("form_token", &token)])
         .send()
         .await
         .unwrap();

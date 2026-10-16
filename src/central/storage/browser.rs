@@ -11,7 +11,24 @@ pub(in crate::central) enum BrowserIdentity {
 }
 
 #[derive(Clone, Copy)]
+pub(in crate::central) enum DashboardOperation {
+    MachineRevoke,
+    AccountAdd,
+    AccountRenew,
+}
+impl DashboardOperation {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::MachineRevoke => "machine_revoke",
+            Self::AccountAdd => "account_add",
+            Self::AccountRenew => "account_renew",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
 pub(in crate::central) struct DashboardAudit<'a> {
+    pub operation: DashboardOperation,
     pub actor: &'a str,
     pub attempt: &'a str,
 }
@@ -156,7 +173,7 @@ impl CentralStore {
                 tx.execute("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'machine_revoke',$3,$4,$5)", &[&at,&audit.actor,&target,&outcome.audit_result(),&audit.attempt]).await?;
             }
             tx.commit().await?;
-            if let Some(audit)=audit { audit_log(at,audit.actor,&target,outcome.audit_result()); }
+            if let Some(audit)=audit { audit_log(at,audit.actor,&target,outcome.audit_result(),audit.operation.as_str()); }
             Ok(outcome)
         }).await
     }
@@ -171,13 +188,13 @@ impl CentralStore {
         bounded_db(async {
             let at=chrono::Utc::now().timestamp();
             let client=db.client().await?;
-            let inserted=client.query_opt("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'machine_revoke',$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&target,&result,&audit.attempt]).await?;
+            let inserted=client.query_opt("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,$6,$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&target,&result,&audit.attempt,&audit.operation.as_str()]).await?;
             // A lost COMMIT acknowledgement can have already persisted the real outcome.
             let row=match inserted {
                 Some(row)=>row,
                 None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1 AND deleted_at IS NULL", &[&audit.attempt]).await?,
             };
-            audit_log(row.get(0),row.get(1),row.get(2),row.get(3));
+            audit_log(row.get(0),row.get(1),row.get(2),row.get(3),audit.operation.as_str());
             Ok(())
         }).await
     }
@@ -284,10 +301,10 @@ impl CentralStore {
     }
 }
 
-fn audit_log(at: i64, actor: &str, target: &str, result: &str) {
+fn audit_log(at: i64, actor: &str, target: &str, result: &str, operation: &str) {
     eprintln!(
         "{}",
-        serde_json::json!({"at":at,"actor_hash":vault::digest(actor.as_bytes()),"operation":"machine_revoke","target":target,"result":result})
+        serde_json::json!({"at":at,"actor_hash":vault::digest(actor.as_bytes()),"operation":operation,"target":target,"result":result})
     );
 }
 

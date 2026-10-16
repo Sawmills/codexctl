@@ -27,7 +27,7 @@ use tokio::sync::Mutex;
 pub(super) mod add;
 mod http;
 mod inventory;
-mod shared;
+pub(super) mod shared;
 pub(super) use inventory::{
     AdmissionDenied, AdmissionKind, ClearedIdentity, ProcessState, clear_registry,
     clear_shared_registry, identity_inventory,
@@ -40,6 +40,7 @@ use recover::*;
 pub(super) use recover::{
     needs_verification, recover, retire_reservations, verifier_parent_exited, verify_replacement,
 };
+pub(in crate::central) use state::Request;
 use state::*;
 #[cfg(target_os = "linux")]
 pub(super) use worker::challenge;

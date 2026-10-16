@@ -586,10 +586,14 @@ fn machines(snapshot: &Snapshot, form_token: Option<&str>) -> String {
 
 #[cfg(test)]
 pub(super) fn overview(snapshot: &Snapshot) -> String {
-    overview_with_actions(snapshot, None)
+    overview_with_actions(snapshot, None, false)
 }
 
-pub(super) fn overview_with_actions(snapshot: &Snapshot, form_token: Option<&str>) -> String {
+pub(super) fn overview_with_actions(
+    snapshot: &Snapshot,
+    form_token: Option<&str>,
+    browser_logins_enabled: bool,
+) -> String {
     let best = recommendation(&snapshot.accounts);
     let all_stale = !snapshot.accounts.is_empty() && snapshot.accounts.iter().all(Account::stale);
     // Only observations we can refresh can set the browser's next refresh.
@@ -630,7 +634,18 @@ pub(super) fn overview_with_actions(snapshot: &Snapshot, form_token: Option<&str
         ),
         attention = attention(&snapshot.accounts, all_stale, snapshot.server_time),
         ledger = ledger(&snapshot.accounts, best, all_stale, snapshot.server_time),
-        machines = machines(snapshot, form_token)
+        machines = machines(snapshot, form_token),
+        login_actions = if browser_logins_enabled && form_token.is_some() {
+            r#"<a class="button small" href="/accounts/add">Add account</a>"#
+        } else {
+            ""
+        },
+        sign_out_token = form_token
+            .map(|token| format!(
+                r#"<input type="hidden" name="form_token" value="{}">"#,
+                escape(token)
+            ))
+            .unwrap_or_default()
     )
 }
 

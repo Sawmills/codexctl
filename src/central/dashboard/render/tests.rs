@@ -224,6 +224,7 @@ async fn render_fixture_pages() {
     let response = super::super::document(&overview_with_actions(
         &fixture(),
         Some("synthetic-form-token"),
+        false,
     ));
     let csp = response.headers()["content-security-policy"]
         .to_str()

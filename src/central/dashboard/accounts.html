@@ -17,11 +17,13 @@
       <div class="identity" id="browser-identity">
         <span class="email" translate="no" id="identity-email">{email}</span>
         <form action="/accounts/sign-out" method="post">
+          {sign_out_token}
           <button class="link-button" type="submit">Sign out</button>
         </form>
       </div>
     </div>
   </header>
+  <div class="wrap">{login_actions}</div>
   <main id="main" class="wrap">
     <div class="notice" id="connection" role="status" {notice_hidden}>
       <p id="connection-text">{notice}</p>

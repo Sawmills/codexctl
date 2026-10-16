@@ -27,7 +27,9 @@ const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 mod backfill;
 pub use backfill::BackfillScanException;
 mod browser;
-pub(in crate::central) use browser::{BrowserIdentity, DashboardAudit, MachineRevoke};
+pub(in crate::central) use browser::{
+    BrowserIdentity, DashboardAudit, DashboardOperation, MachineRevoke,
+};
 mod loans;
 mod migration;
 
