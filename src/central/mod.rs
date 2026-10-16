@@ -20,6 +20,7 @@ mod refresh_control;
 pub use polling::supervise_login;
 mod relogin;
 pub mod remote;
+mod removal;
 mod rename;
 pub(crate) mod resets;
 mod rpc;

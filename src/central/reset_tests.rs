@@ -46,6 +46,7 @@ impl Fixture {
             sso: None,
             browser_sessions_available: true,
             browser_logins_enabled: false,
+            browser_remove_enabled: false,
             activity: Arc::default(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             reset_reader: crate::central::resets::Reader::with_base(base),

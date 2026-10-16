@@ -2,6 +2,51 @@ use super::*;
 use crate::central::loans::{AuditKind, RETENTION_SECONDS};
 use crate::central::storage::test_support::bootstrap;
 
+#[cfg(feature = "central-real-db-tests")]
+#[tokio::test]
+async fn loan_creation_waits_for_removal_and_refuses_the_committed_tombstone() {
+    let root = tempfile::tempdir().unwrap();
+    let key = root.path().join("key");
+    crate::central::vault::create_secret(&key, &[18; 32]).unwrap();
+    let shared = CentralStore::from_mode(super::super::StoreMode::Postgres, root.path(), &key)
+        .await
+        .unwrap();
+    let (store, control, schema) = shared.isolated_test_schema().await.unwrap();
+    bootstrap(&store).await.unwrap();
+    control.batch_execute("INSERT INTO central_accounts(account_id,user_id,alias,encrypted_vault,revision) VALUES('removed-loan','lender','seat','\\x00',1)").await.unwrap();
+    control.batch_execute("BEGIN; UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='removed-loan'").await.unwrap();
+    let request = grant("remove-race", "removed-loan", i64::MAX / 2);
+    let mut create = Box::pin(store.create_loan(&request));
+    let first = tokio::time::timeout(std::time::Duration::from_millis(200), create.as_mut()).await;
+    let waited = first.is_err();
+    control.batch_execute("COMMIT").await.unwrap();
+    let created = match first {
+        Ok(result) => result.unwrap(),
+        Err(_) => create.await.unwrap(),
+    };
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    assert!(
+        waited,
+        "loan creation must wait on the same account row as removal"
+    );
+    assert!(
+        !created,
+        "a committed tombstone must refuse the queued loan"
+    );
+}
+
+async fn seed_account(store: &CentralStore, account: &str) {
+    let db = match store {
+        CentralStore::File(_) => return,
+        CentralStore::Postgres(db) | CentralStore::Dual { postgres: db, .. } => db,
+    };
+    // Loan storage needs active account metadata; this fixture never reads auth.
+    db.client().await.unwrap().execute("INSERT INTO central_accounts(account_id,user_id,alias,encrypted_vault,revision) VALUES($1,'lender',$1,'\\x00',1) ON CONFLICT DO NOTHING", &[&account]).await.unwrap();
+}
+
 fn grant(id: &str, account: &str, ends_at: i64) -> Grant {
     Grant {
         id: id.into(),
@@ -27,6 +72,7 @@ fn grant(id: &str, account: &str, ends_at: i64) -> Grant {
 async fn scenario(store: &CentralStore, prefix: &str) {
     let id = |name: &str| format!("{prefix}-{name}");
     let account = id("account");
+    seed_account(store, &account).await;
     assert!(
         store
             .create_loan(&grant(&id("one"), &account, 5_000))
@@ -87,6 +133,7 @@ async fn scenario(store: &CentralStore, prefix: &str) {
         .await
         .unwrap();
     let other = id("other-account");
+    seed_account(store, &other).await;
     assert!(
         store
             .create_loan(&grant(&id("past"), &other, 4_000))
@@ -357,6 +404,7 @@ async fn a_retried_end_repairs_a_missed_dual_mirror() {
         .unwrap();
     let (dual, control, schema) = shared.isolated_test_schema().await.unwrap();
     bootstrap(&dual).await.unwrap();
+    seed_account(&dual, "a").await;
     assert!(
         dual.create_loan(&grant("missed", "a", i64::MAX / 2))
             .await
@@ -462,6 +510,8 @@ async fn postgres_token_issue_succeeds_only_while_the_grant_is_active() {
             .unwrap();
         let (store, control, schema) = shared.isolated_test_schema().await.unwrap();
         bootstrap(&store).await.unwrap();
+        seed_account(&store, "a").await;
+        seed_account(&store, "b").await;
         let now = chrono::Utc::now().timestamp();
         assert!(
             store

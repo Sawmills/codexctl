@@ -30,7 +30,7 @@ claim statement. They wait for an uncommitted writer of that account and
 recheck `deleted_at` after it commits. Ordinary claims use the plain client;
 they do not take schema admission or wait on another account's row lock.
 Renewal admission also holds the selected account row through its transaction.
-The removal writer in PR B must take `FOR UPDATE` on that same account row
+The removal writer takes `FOR UPDATE` on that same account row
 before setting `deleted_at`, then coordinate the lease rows in that order.
 If removal also needs schema admission for identity work, take admission before
 the account row: admission, account, lease. Ordinary claims take no admission.
@@ -39,8 +39,36 @@ order: their materialized account read takes `FOR UPDATE` before the lease read.
 This prevents a claim's shared account lock from cycling with publication's
 exclusive lease lock. All these locks stay inside short database statements.
 The claim fence covers admission only. Keep the regular token lease's first
-renewal check at 30 seconds; post-commit lifecycle checks and PR B's explicit
+renewal check at 30 seconds; post-commit lifecycle checks and the explicit
 stop path handle removal of a refresh owner that has already started.
+
+### Dashboard account removal
+
+`CODEXCTL_CENTRAL_BROWSER_REMOVE` defaults to off. Set it to `1` to expose
+Manage and Remove in the PostgreSQL dashboard. It is independent of the
+Add/Renew gate. This change does not enable either gate in an overlay.
+
+Removal requires a live company-user browser session, a verified sign-in within
+the same ten-minute policy as Revoke, an exact Origin and session form token,
+and the exact stored alias. Manage reads scoped metadata, without decrypting
+the vault. Its machine count describes token deliveries in the last five
+minutes, not running client sessions.
+
+The removal owner first checks active loans, pending or unresolved login work
+and refresh custody. It refuses foreign unreleased custody even after lease
+expiry. It stops and reaps its local runtime before the short final transaction,
+then rechecks authority and confirmation under admission, account and lease
+locks. The account tombstone and success audit commit together. An exact retry
+returns the durable success without another deletion or audit. A browser
+disconnect does not abandon a started settlement. Startup also stops a retained
+runtime for a removed account; an unproven stop keeps the ownership fence set.
+
+Removal stops this account server from serving or refreshing the account. It
+does not revoke OpenAI credentials or tokens already delivered to machines.
+Encrypted credentials, journals, identity claims and alias fences remain;
+removal does not permit another identity to reuse them. No retention or purge
+is added. Run one version across serving replicas and fix forward. This feature
+adds no mixed-version or rollback compatibility path.
 
 Shared-store imports also renew their lease through verification and child exit.
 An import retry reads the latest committed credential under that lease. Failed

@@ -68,14 +68,23 @@ impl Pod {
             store::atomic_write(&root.path().join(name), b"0").unwrap();
         }
         let mut command = command(database, &state, key, "serve");
-        command.env(
-            "CODEXCTL_CENTRAL_BROWSER_LOGINS",
-            if root.path().join("browser-logins").exists() {
-                "1"
-            } else {
-                "0"
-            },
-        );
+        command
+            .env(
+                "CODEXCTL_CENTRAL_BROWSER_REMOVE",
+                if root.path().join("browser-remove").exists() {
+                    "1"
+                } else {
+                    "0"
+                },
+            )
+            .env(
+                "CODEXCTL_CENTRAL_BROWSER_LOGINS",
+                if root.path().join("browser-logins").exists() {
+                    "1"
+                } else {
+                    "0"
+                },
+            );
         if root.path().join("sso.json").exists() {
             command
                 .arg("--sso-config")

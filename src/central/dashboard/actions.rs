@@ -111,6 +111,7 @@ pub(super) fn render(
         snapshot,
         token.as_deref(),
         broker.browser_logins_enabled,
+        broker.browser_remove_enabled,
     ))
 }
 

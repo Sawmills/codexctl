@@ -9,6 +9,9 @@ mod login;
 #[path = "dashboard_renew.rs"]
 mod renew;
 
+#[path = "dashboard_remove.rs"]
+mod remove;
+
 struct BrowserFixture {
     first: Pod,
     second: Pod,
@@ -145,6 +148,19 @@ impl BrowserFixture {
         self.first.stop().await;
         let root = std::mem::replace(&mut self.first.root, tempfile::tempdir().unwrap());
         store::atomic_write(&root.path().join("browser-logins"), b"1").unwrap();
+        self.first = Pod::spawn(
+            &self.database(),
+            &self._root.path().join("key"),
+            root,
+            "postgres",
+        )
+        .await;
+    }
+
+    async fn enable_browser_remove(&mut self) {
+        self.first.stop().await;
+        let root = std::mem::replace(&mut self.first.root, tempfile::tempdir().unwrap());
+        store::atomic_write(&root.path().join("browser-remove"), b"1").unwrap();
         self.first = Pod::spawn(
             &self.database(),
             &self._root.path().join("key"),

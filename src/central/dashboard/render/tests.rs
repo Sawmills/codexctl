@@ -225,6 +225,7 @@ async fn render_fixture_pages() {
         &fixture(),
         Some("synthetic-form-token"),
         false,
+        false,
     ));
     let csp = response.headers()["content-security-policy"]
         .to_str()
