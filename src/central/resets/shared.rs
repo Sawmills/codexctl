@@ -322,9 +322,7 @@ async fn execute(
             return receipt(completed, true);
         }
         if let Some(pending) = journal.pending.as_mut() {
-            pending
-                .joined_requests
-                .insert(request.redeem_request_id.clone());
+            pending.join(&request.redeem_request_id)?;
             if pending.actor.is_none() {
                 pending.actor = caller.dashboard_actor.clone();
             }
@@ -419,27 +417,23 @@ async fn execute(
             actor,
             attempt: &audit_key,
         });
-        let result = match response.code {
-            api::ConsumeResetCode::Reset => "ok:reset",
-            api::ConsumeResetCode::AlreadyRedeemed => "ok:already_redeemed",
-            api::ConsumeResetCode::NothingToReset => "refused:nothing_to_reset",
-            api::ConsumeResetCode::NoCredit => "refused:no_credit",
-            api::ConsumeResetCode::Unknown => "failed:reset_rejected",
-        };
-        for id in current
-            .joined_requests
-            .into_iter()
-            .chain([current.request_id])
-        {
-            journal.completed.insert(id, response.clone());
-        }
+        journal.complete(
+            current
+                .joined_requests
+                .into_iter()
+                .chain([current.request_id]),
+            &response,
+        )?;
         if central
             .write_reset_journal(
                 &caller.user,
                 &record.account_id,
                 version,
                 &serde_json::to_value(&journal)?,
-                ResetWrite::Settle { audit, result },
+                ResetWrite::Settle {
+                    audit,
+                    code: response.code,
+                },
             )
             .await?
         {

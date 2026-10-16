@@ -1,7 +1,7 @@
 //! Reset inventory and durable redemption. Credentials remain with the refresh owner.
 use super::{managed::Broker, server::TokenRequest};
 use crate::api;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json,
     extract::State,
@@ -423,10 +423,56 @@ struct Pending {
     #[serde(default)]
     joined_requests: std::collections::BTreeSet<String>,
 }
+const RECEIPT_LIMIT: usize = 256;
+
+impl Pending {
+    fn join(&mut self, request: &str) -> Result<bool> {
+        if request == self.request_id || self.joined_requests.contains(request) {
+            return Ok(false);
+        }
+        // Reserve a receipt for the original request and every accepted join.
+        if self.joined_requests.len() >= RECEIPT_LIMIT - 1 {
+            return Err(Refusal("reset_busy").into());
+        }
+        Ok(self.joined_requests.insert(request.into()))
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
     pending: Option<Pending>,
     completed: std::collections::BTreeMap<String, api::ConsumeResetResponse>,
+    #[serde(default)]
+    completed_order: std::collections::VecDeque<String>,
+}
+impl Journal {
+    fn complete(
+        &mut self,
+        requests: impl IntoIterator<Item = String>,
+        response: &api::ConsumeResetResponse,
+    ) -> Result<()> {
+        // Receipts written before completion order was recorded predate new ones.
+        if self.completed_order.is_empty() {
+            self.completed_order.extend(self.completed.keys().cloned());
+        }
+        for request in requests {
+            if self
+                .completed
+                .insert(request.clone(), response.clone())
+                .is_none()
+            {
+                self.completed_order.push_back(request);
+            }
+        }
+        while self.completed.len() > RECEIPT_LIMIT {
+            let oldest = self
+                .completed_order
+                .pop_front()
+                .context("reset receipt order missing")?;
+            self.completed.remove(&oldest);
+        }
+        Ok(())
+    }
 }
 impl Reader {
     async fn redeem(
@@ -456,9 +502,7 @@ impl Reader {
         // An authorized machine may resolve another machine's uncertain attempt,
         // but it must reuse that attempt's credit and provider key.
         if let Some(pending) = journal.pending.as_mut()
-            && pending
-                .joined_requests
-                .insert(request.redeem_request_id.clone())
+            && pending.join(&request.redeem_request_id)?
         {
             crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
         }
@@ -562,15 +606,17 @@ impl Reader {
                     }
                     Err(error) => return Err(error),
                 };
-                for joined in &pending.joined_requests {
-                    journal.completed.insert(joined.clone(), response.clone());
-                }
-                let original_request = pending.request_id.clone();
-                journal.completed.insert(original_request, response.clone());
-                journal
-                    .completed
-                    .insert(request.redeem_request_id.clone(), response.clone());
-                journal.pending = None;
+                let completed = journal
+                    .pending
+                    .take()
+                    .context("missing redemption journal")?;
+                journal.complete(
+                    completed
+                        .joined_requests
+                        .into_iter()
+                        .chain([completed.request_id, request.redeem_request_id.clone()]),
+                    &response,
+                )?;
                 crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
                 if let Some(reason) = rejection {
                     return Err(TerminalRejection(reason).into());

@@ -896,7 +896,7 @@ async fn postgres_reset_journal_refuses_a_foreign_company_user() {
             &journal,
             ResetWrite::Settle {
                 audit: None,
-                result: "failed:test",
+                code: crate::api::ConsumeResetCode::Unknown,
             },
         )
         .await;
@@ -972,7 +972,7 @@ async fn postgres_reset_removal_retains_and_tombstones_its_journal() {
             &journal,
             ResetWrite::Settle {
                 audit: None,
-                result: "failed:test",
+                code: crate::api::ConsumeResetCode::Unknown,
             },
         )
         .await;
@@ -1159,6 +1159,66 @@ async fn postgres_reset_completed_receipts_are_bounded_and_keep_the_newest_retry
     assert_eq!(
         calls, 260,
         "latest retry replays without another provider call"
+    );
+}
+
+#[tokio::test]
+async fn postgres_reset_retains_every_joined_receipt_within_the_history_budget() {
+    use crate::central::storage::resets::ResetWrite;
+    let (base, received, upstream) = redemption_upstream(1).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    assert_eq!(fixture.redeem("original").await.0, StatusCode::BAD_GATEWAY);
+    let central = fixture.broker.central.as_ref().unwrap();
+    let id = account_key("test-user", "personal");
+    let (version, mut journal) = central.reset_journal("test-user", &id).await.unwrap();
+    let joined: Vec<_> = (0..255).map(|n| format!("joined-{n:03}")).collect();
+    journal["pending"]["joined_requests"] = json!(joined);
+    // Prepare an ambiguous operation at its receipt budget through the DAL seam.
+    assert!(
+        central
+            .write_reset_journal(
+                "test-user",
+                &id,
+                version,
+                &journal,
+                ResetWrite::Settle {
+                    audit: None,
+                    code: crate::api::ConsumeResetCode::NothingToReset
+                }
+            )
+            .await
+            .unwrap()
+    );
+    let overflow = fixture.redeem("one-too-many").await;
+    let original = fixture.redeem("original").await;
+    let joined_retry = fixture.redeem("joined-000").await;
+    let (_, final_journal) = central.reset_journal("test-user", &id).await.unwrap();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(
+        overflow.0,
+        StatusCode::CONFLICT,
+        "a full pending operation refuses new joins: {}",
+        overflow.1
+    );
+    assert_eq!(overflow.1["error"], "reset_busy");
+    assert_eq!(original.0, StatusCode::OK);
+    assert_eq!(joined_retry.0, StatusCode::OK);
+    assert_eq!(joined_retry.1["code"], "already_redeemed");
+    assert_eq!(final_journal["completed"].as_object().unwrap().len(), 256);
+    assert!(
+        joined
+            .iter()
+            .all(|key| final_journal["completed"].get(key).is_some())
+    );
+    assert_eq!(
+        received.lock().unwrap().len(),
+        2,
+        "original provider key is retried exactly once"
     );
 }
 

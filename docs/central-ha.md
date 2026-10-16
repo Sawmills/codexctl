@@ -168,7 +168,15 @@ native refresh or billing probe. A pending operation records its selected credit
 and provider idempotency key before the provider call. Retries and other replicas
 reuse that credit and key, including after an uncertain response. The completed
 receipt and browser audit commit together. A disconnected browser does not cancel
-that settlement. Expired foreign refresh custody remains a refusal until it is
+that settlement. Only a consumed or already-redeemed reset invalidates shared
+token evidence; nothing-to-reset, no-credit and rejected outcomes preserve it.
+Completed receipts retain the newest 256 request IDs in completion order.
+The pending credit/key is never trimmed. A pending operation accepts at most
+256 participant IDs, including its original request; a new join at that limit
+returns `reset_busy`, while existing participants can finish and replay.
+Receipt replay covers the retained history; an evicted receipt does not prove
+that an old request was never applied.
+Expired foreign refresh custody remains a refusal until it is
 released. Credentials and raw session tokens never enter the page or audit.
 Shared inventory/confirmation reads and new redemptions require positive workspace-routing
 evidence for the exact saved auth and account revision, observed within 60 seconds.

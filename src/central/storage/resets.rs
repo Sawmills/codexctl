@@ -1,5 +1,6 @@
 //! Short account-fenced reset journal transactions. Provider I/O stays outside these locks.
 use super::*;
+use crate::api::ConsumeResetCode;
 use crate::central::{relogin::shared::Caller, resets::Refusal};
 
 pub(super) const SCHEMA: &str = "
@@ -46,7 +47,7 @@ pub(in crate::central) enum ResetWrite<'a> {
     },
     Settle {
         audit: Option<ResetAudit<'a>>,
-        result: &'a str,
+        code: ConsumeResetCode,
     },
 }
 
@@ -166,8 +167,17 @@ impl CentralStore {
                 tx.execute("UPDATE account_reset_journals SET revision=revision+1,journal=$3::text::jsonb WHERE account_id=$1 AND revision=$2 AND deleted_at IS NULL", &[&account,&expected,&payload]).await?
             };
             let mut audit_log=None;
-            if changed==1 && let ResetWrite::Settle{audit,result}=stage {
-                tx.execute("UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&account]).await?;
+            if changed==1 && let ResetWrite::Settle{audit,code}=stage {
+                let result=match code {
+                    ConsumeResetCode::Reset => "ok:reset",
+                    ConsumeResetCode::AlreadyRedeemed => "ok:already_redeemed",
+                    ConsumeResetCode::NothingToReset => "refused:nothing_to_reset",
+                    ConsumeResetCode::NoCredit => "refused:no_credit",
+                    ConsumeResetCode::Unknown => "failed:reset_rejected",
+                };
+                if matches!(code,ConsumeResetCode::Reset|ConsumeResetCode::AlreadyRedeemed) {
+                    tx.execute("UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&account]).await?;
+                }
                 if let Some(audit)=audit {
                     let at=chrono::Utc::now().timestamp();
                     audit_log=tx.query_opt("INSERT INTO reset_audit(at,user_id,actor,operation,target,result,coalesce_key) VALUES($1,$6,$2,'account_reset',$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&account,&result,&audit.attempt,&user]).await?;
