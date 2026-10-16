@@ -294,14 +294,31 @@ impl Server {
             .spawn()
             .unwrap();
         let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap())
+        let listening = BufReader::new(child.stdout.take().unwrap())
             .read_line(&mut line)
-            .unwrap();
-        let ready: Value = serde_json::from_str(&line).expect("managed server must start");
-        (
-            child,
-            format!("http://{}", ready["listening"].as_str().unwrap()),
-        )
+            .map_err(|error| format!("stdout_read ({:?})", error.kind()))
+            .and_then(|_| {
+                serde_json::from_str::<Value>(&line).map_err(|_| "invalid_json".to_owned())
+            })
+            .and_then(|ready| {
+                ready["listening"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "missing_listening".to_owned())
+            });
+        let listening = match listening {
+            Ok(listening) => listening,
+            Err(reason) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!(
+                    "server.stderr (sanitized tail):\n{}",
+                    Self::stderr_tail(root.path())
+                );
+                panic!("managed server must start ({reason})");
+            }
+        };
+        (child, format!("http://{listening}"))
     }
     fn import(
         &self,
@@ -393,6 +410,102 @@ impl Server {
             .parse()
             .unwrap();
         store::atomic_write(&path, (now + 61_000).to_string().as_bytes()).unwrap();
+    }
+
+    fn stderr_tail(root: &std::path::Path) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let read_tail = || -> std::io::Result<(u64, Vec<u8>)> {
+            let mut file = std::fs::File::open(root.join("server.stderr"))?;
+            let start = file.metadata()?.len().saturating_sub(4096);
+            file.seek(SeekFrom::Start(start))?;
+            let mut bytes = Vec::new();
+            file.take(4096).read_to_end(&mut bytes)?;
+            Ok((start, bytes))
+        };
+        let Ok((start, bytes)) = read_tail() else {
+            return "[stderr unavailable]".into();
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        let text = if start > 0 {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &text
+        };
+        let mut lines: Vec<_> = text.lines().rev().take(16).collect();
+        lines.reverse();
+        let mut output = Vec::new();
+        for line in lines {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                output.push("[unstructured stderr omitted]".into());
+                continue;
+            };
+            let mut safe = serde_json::Map::new();
+            // Only fixed diagnostic vocabulary may reach CI; credentials and
+            // arbitrary detail strings are never copied from the log.
+            for key in ["operation", "stage", "reason", "failure_class", "sqlstate"] {
+                if let Some(value) = record.get(key).and_then(Value::as_str) {
+                    const DIAGNOSTIC_VALUES: &str = "
+                        55P03
+                        abandoned_release_failed account_already_owned account_catalog account_changed
+                        account_import_retained account_login_unavailable account_mismatch account_not_found
+                        account_reconcile account_rename_unavailable account_renamed account_unavailable
+                        acquire_lease admission alias_exists alias_identity_conflict alias_renamed alias_required
+                        ambiguous_alias backfill borrowed borrowed_usage borrower_ambiguous broker broker_request
+                        browser_sessions browser_sessions_probe_failed browser_sessions_unavailable
+                        browser_sign_in_required catalog_task_failed catalog_usage central_store_mirror child
+                        cleanup clear clear_failed company_identity_required connect_timeout consume_enrollment
+                        dashboard_actions_unavailable dashboard_already_revoked dashboard_audit_failed
+                        dashboard_auth_time_refused dashboard_failure dashboard_form_refused
+                        dashboard_guard_unavailable dashboard_machine_not_found dashboard_origin_refused
+                        dashboard_registry_changed db_error ddl deadline device_not_found device_polling
+                        enrollment_capacity enrollment_expired enrollment_unavailable failed fenced_write
+                        forbidden forced_refresh heartbeat http http_rejected identity_link_refused
+                        identity_migration import_unavailable initialize invalid_alias invalid_approval
+                        invalid_auth invalid_browser_login invalid_browser_origin invalid_device_name
+                        invalid_label invalid_relay_event invalid_request invalid_session_id invalid_sso_state
+                        journal_identity_unresolved lease_lost lease_recovered lease_recovery_retry
+                        lease_renewal_retry live_session live_session_failed live_session_queue loan loan_ended
+                        loan_exists loan_not_found loan_paused loan_retire_failed loan_store_failed lock_timeout
+                        login_add login_belongs_to_another_device login_failure_report login_holder login_pending
+                        login_polling login_recovery login_settlement machine_revoke metrics_unauthorized native
+                        owner owner_child owner_refresh owner_settlement owner_unavailable persistence_failed
+                        polling_settlement provider recovery_failed redeem refresh refresh_disabled refresh_failed
+                        refresh_fenced refresh_in_progress registry_busy registry_changed registry_unavailable
+                        relay_event_rate_limited relay_rate_limiter_unavailable relogin relogin_add_admission
+                        relogin_commit_pending relogin_failed relogin_identity_unresolved relogin_not_found
+                        relogin_reserved relogin_stopped relogin_unavailable rename rename_blocked_by_loan
+                        rename_relaunch_failed renew replica_lost report_unavailable reset_auth_rejected
+                        reset_read_failed reset_redeem_failed reset_redemption reset_rejected reset_unavailable
+                        resets retire save_account save_unavailable schema_migration server_busy server_stopping
+                        session_capacity settlement settlement_killed shared_revision_unreadable slow_down
+                        sso_denied sso_unavailable startup statement_timeout stderr terminal_save token_evidence
+                        token_evidence_clear_failed token_request unauthorized unsupported_workspace_routing
+                        user_disabled user_unavailable verification verification_requires_refresh
+                    ";
+                    let value = if DIAGNOSTIC_VALUES
+                        .split_ascii_whitespace()
+                        .any(|known| known == value)
+                    {
+                        value
+                    } else {
+                        "[redacted]"
+                    };
+                    safe.insert(key.into(), json!(value));
+                }
+            }
+            if let Some(status @ 100..=599) = record.get("status").and_then(Value::as_u64) {
+                safe.insert("status".into(), json!(status));
+            }
+            output.push(if safe.is_empty() {
+                "[stderr record omitted]".into()
+            } else {
+                Value::Object(safe).to_string()
+            });
+        }
+        let mut output = output.join("\n");
+        output.truncate(output.len().min(4096));
+        output
     }
 
     fn stop(&mut self) {
@@ -2323,6 +2436,102 @@ impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if std::thread::panicking() {
+            eprintln!(
+                "server.stderr (sanitized tail):\n{}",
+                Self::stderr_tail(self.root.path())
+            );
+        }
+    }
+}
+
+#[test]
+fn server_failure_diagnostics_probe() {
+    use std::io::Write;
+
+    let Ok(mode) = std::env::var("CENTRAL_TEST_FAILURE_DIAGNOSTICS") else {
+        return;
+    };
+    if mode == "startup" {
+        let root = tempfile::tempdir().unwrap();
+        central::managed::setup(&root.path().join("state"), &root.path().join("key")).unwrap();
+        Server::spawn_binary_with_flags(
+            &root,
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py"),
+            &["--invalid-startup-diagnostic-flag"],
+        );
+        panic!("startup must refuse the invalid flag");
+    }
+    let server = Server::start();
+    if mode == "http" {
+        assert_eq!(
+            server
+                .http
+                .get(format!("{}/missing-for-diagnostics", server.url))
+                .send()
+                .unwrap()
+                .status(),
+            404
+        );
+        panic!("controlled rejected HTTP request");
+    }
+    let mut log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(server.root.path().join("server.stderr"))
+        .unwrap();
+    for _ in 0..256 {
+        writeln!(log, "old-diagnostic-line {}", "x".repeat(128)).unwrap();
+    }
+    writeln!(log, "Authorization: Bearer synthetic-opaque-credential").unwrap();
+    writeln!(log, "{}", json!({"reason":"synthetic-unclassified-secret"})).unwrap();
+    writeln!(log, "{}", json!({"reason":"synthetic_opaque_credential"})).unwrap();
+    writeln!(log, "{}", json!({"operation":"schema_migration","stage":"ddl","failure_class":"lock_timeout","sqlstate":"55P03"})).unwrap();
+    writeln!(log, "{}", json!({"operation":"broker_request","stage":"live_session","reason":"live_session_failed","status":503,"access_token":"synthetic-access-credential","detail":"eyJhbGciOiJub25lIn0.synthetic.signature","unknown":"synthetic-unclassified-secret"})).unwrap();
+    drop(log);
+    assert_eq!(mode, "success", "controlled fixture failure");
+}
+
+#[test]
+fn server_failure_diagnostics_print_only_a_bounded_sanitized_tail() {
+    for mode in ["failure", "http", "startup", "success"] {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "server_failure_diagnostics_probe", "--nocapture"])
+            .env("CENTRAL_TEST_FAILURE_DIAGNOSTICS", mode)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), mode == "success");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if mode == "success" {
+            assert!(!stderr.contains("server.stderr"));
+            continue;
+        }
+        assert!(stderr.contains("server.stderr (sanitized tail)"));
+        if mode == "startup" {
+            assert!(stderr.contains("unstructured stderr omitted"));
+            assert!(stderr.contains("managed server must start (invalid_json)"));
+        } else if mode == "http" {
+            assert!(stderr.contains("http_rejected"));
+            assert!(stderr.contains("\"stage\":\"http\""));
+            assert!(stderr.contains("404"));
+        } else {
+            assert!(stderr.contains("live_session_failed"));
+            assert!(stderr.contains("503"));
+            assert!(stderr.contains("\"sqlstate\":\"55P03\""));
+        }
+        assert!(!stderr.contains("old-diagnostic-line"));
+        for secret in [
+            "synthetic-opaque-credential",
+            "synthetic-access-credential",
+            "eyJhbGciOiJub25lIn0.synthetic.signature",
+            "synthetic-unclassified-secret",
+            "synthetic_opaque_credential",
+        ] {
+            assert!(
+                !stderr.contains(secret),
+                "stderr must exclude synthetic secrets"
+            );
+        }
+        assert!(stderr.len() < 8192);
     }
 }
 
