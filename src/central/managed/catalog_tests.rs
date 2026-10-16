@@ -196,6 +196,198 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn refresh_fixture_restarts_while_a_fork_holds_a_temporary_script_writable() {
+    use std::{
+        io::{Read, Write},
+        os::{
+            fd::AsRawFd,
+            unix::{fs::PermissionsExt, net::UnixStream},
+        },
+    };
+
+    struct WriterHolder {
+        pid: libc::pid_t,
+        pipe: UnixStream,
+    }
+    impl Drop for WriterHolder {
+        fn drop(&mut self) {
+            let _ = self.pipe.write_all(&[1]);
+            let mut status = 0;
+            loop {
+                let result = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if result >= 0
+                    || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    break;
+                }
+            }
+        }
+    }
+    let mut fixture = Fixture::new(Duration::from_secs(1)).await;
+    let temporary_script = fixture._root.path().join("codex");
+    store::atomic_write(&temporary_script, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&temporary_script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture.attach_refresh_store("refresh-only").await;
+    let owner_ref = fixture.broker.owners.read().await["fixture"].1.clone();
+    let home = {
+        let mut owner = owner_ref.lock().await;
+        owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+        owner.rpc = None;
+        owner.home.clone()
+    };
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&temporary_script)
+        .unwrap();
+    let writer_fd = writer.as_raw_fd();
+    let flags = unsafe { libc::fcntl(writer_fd, libc::F_GETFD) };
+    assert!(
+        flags >= 0 && flags & libc::FD_CLOEXEC != 0,
+        "CLOEXEC must not hide the inherited-writer case"
+    );
+    let (parent, child) = UnixStream::pair().unwrap();
+    let child_fd = child.as_raw_fd();
+    let (mut unrelated_reader, unrelated_writer) = UnixStream::pair().unwrap();
+    let fd_limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    assert!(fd_limit > 0);
+    let low = writer_fd.min(child_fd) as u32;
+    let high = writer_fd.max(child_fd) as u32;
+    let pid = unsafe { libc::fork() };
+    assert!(pid >= 0, "controlled fork must start");
+    if pid == 0 {
+        // Only async-signal-safe syscalls after fork; no Rust teardown.
+        unsafe {
+            // Do not retain sibling tests' writable launchers or pipe ends.
+            for (start, end) in [(0, low), (low + 1, high), (high + 1, u32::MAX)] {
+                if start < end && libc::syscall(libc::SYS_close_range, start, end - 1, 0) != 0 {
+                    // Older kernels lack close_range; retain the same isolation.
+                    for fd in start..end.min(fd_limit as u32) {
+                        libc::close(fd as libc::c_int);
+                    }
+                }
+            }
+            let ready = [1_u8];
+            if libc::write(child_fd, ready.as_ptr().cast(), 1) != 1 {
+                libc::_exit(2);
+            }
+            let mut release = [0_u8];
+            libc::read(child_fd, release.as_mut_ptr().cast(), 1);
+            libc::_exit(0);
+        }
+    }
+    let mut holder = WriterHolder { pid, pipe: parent };
+    drop(child);
+    drop(writer); // The parent has closed its writer, like atomic_write does.
+    holder
+        .pipe
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut ready = [0];
+    holder.pipe.read_exact(&mut ready).unwrap();
+    assert_eq!(ready, [1]);
+    drop(unrelated_writer);
+    unrelated_reader
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(
+        unrelated_reader.read(&mut [0]).unwrap(),
+        0,
+        "the holder must not keep unrelated test descriptors alive"
+    );
+    let started = Rpc::start(&fixture.broker.binary, &home).await;
+    let mut rpc = started.expect("fixture restart must not execute a writable temporary inode");
+    rpc.call("account/read", json!({"refreshToken":true}))
+        .await
+        .unwrap();
+    drop(holder);
+    rpc.shutdown().await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture._root.path().join("count")).unwrap(),
+        "1"
+    );
+}
+
+#[tokio::test]
+async fn refresh_fixture_modes_and_counters_stay_private_across_restart() {
+    let (mut first, mut second) = tokio::join!(
+        Fixture::new(Duration::from_secs(1)),
+        Fixture::new(Duration::from_secs(1)),
+    );
+    tokio::join!(
+        first.attach_refresh_store("routing-us"),
+        second.attach_refresh_store("routing-us_cr")
+    );
+    let first_ref = first.broker.owners.read().await["fixture"].1.clone();
+    let second_ref = second.broker.owners.read().await["fixture"].1.clone();
+    let mut first_owner = first_ref.lock().await;
+    let mut second_owner = second_ref.lock().await;
+    let (first_result, second_result) = tokio::join!(
+        first_owner
+            .rpc
+            .as_mut()
+            .unwrap()
+            .call("account/read", json!({"refreshToken":true})),
+        second_owner
+            .rpc
+            .as_mut()
+            .unwrap()
+            .call("account/read", json!({"refreshToken":true})),
+    );
+    assert_eq!(
+        first_result.unwrap()["workspaceRouting"]["accountRoutingOverride"],
+        "us"
+    );
+    assert_eq!(
+        second_result.unwrap()["workspaceRouting"]["accountRoutingOverride"],
+        "us_cr"
+    );
+    assert_eq!(
+        std::fs::read_to_string(first._root.path().join("count")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second._root.path().join("count")).unwrap(),
+        "1"
+    );
+
+    store::atomic_write(&first._root.path().join("mode"), b"routing-regional").unwrap();
+    first_owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+    let home = first_owner.home.clone();
+    first_owner.rpc = Some(Rpc::start(&first.broker.binary, &home).await.unwrap());
+    let (first_result, second_result) = tokio::join!(
+        first_owner
+            .rpc
+            .as_mut()
+            .unwrap()
+            .call("account/read", json!({"refreshToken":true})),
+        second_owner
+            .rpc
+            .as_mut()
+            .unwrap()
+            .call("account/read", json!({"refreshToken":false})),
+    );
+    assert_eq!(
+        first_result.unwrap()["workspaceRouting"]["backendOrigin"],
+        "https://regional.chatgpt.com"
+    );
+    assert_eq!(
+        second_result.unwrap()["workspaceRouting"]["accountRoutingOverride"],
+        "us_cr"
+    );
+    assert_eq!(
+        std::fs::read_to_string(first._root.path().join("count")).unwrap(),
+        "2"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second._root.path().join("count")).unwrap(),
+        "1"
+    );
+    first_owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+    second_owner.rpc.as_mut().unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn lease_loss_terminates_import_verification_before_provider_rotation() {
     let mut fixture = Fixture::new(Duration::from_secs(1)).await;
     fixture.attach_refresh_store("lease-loss-hold").await;
@@ -1595,7 +1787,6 @@ impl Fixture {
         central: CentralStore,
         mode: &str,
     ) -> CentralStore {
-        use std::os::unix::fs::PermissionsExt;
         let store_mode = central.mode();
         central.migrate().await.unwrap();
         self.broker.central = Some(central.clone());
@@ -1642,16 +1833,16 @@ impl Fixture {
         let root = self._root.path();
         store::atomic_write(&root.join("mode"), mode.as_bytes()).unwrap();
         store::atomic_write(&root.join("count"), b"0").unwrap();
-        let binary = root.join("codex");
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
-        let script = format!(
-            "#!/usr/bin/env python3\nimport os, runpy\nos.environ['CENTRAL_TEST_MODE_FILE'] = {}\nos.environ['CENTRAL_TEST_REFRESH_COUNTER'] = {}\nrunpy.run_path({}, run_name='__main__')\n",
-            serde_json::to_string(&root.join("mode")).unwrap(),
-            serde_json::to_string(&root.join("count")).unwrap(),
-            serde_json::to_string(&fixture).unwrap(),
-        );
-        store::atomic_write(&binary, script.as_bytes()).unwrap();
-        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        store::atomic_write(
+            &owner.state.join("catalog-fixture.json"),
+            &serde_json::to_vec(&json!({
+                "mode_file": root.join("mode"),
+                "refresh_counter": root.join("count"),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let binary = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/central_codex.py");
         self.broker.binary = binary.clone();
         owner.rpc = Some(Rpc::start(&binary, &owner.home).await.unwrap());
         owner.refresh_enabled = true;

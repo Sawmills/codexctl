@@ -9,6 +9,13 @@ import threading
 import time
 
 home = pathlib.Path(os.environ["CODEX_HOME"])
+catalog_settings = home.parent / "catalog-fixture.json"
+if catalog_settings.exists():
+    # Catalog tests keep mutable launch data beside the retained owner home;
+    # executing this checked-in file needs no writable temporary launcher.
+    settings = json.loads(catalog_settings.read_text())
+    os.environ["CENTRAL_TEST_MODE_FILE"] = settings["mode_file"]
+    os.environ["CENTRAL_TEST_REFRESH_COUNTER"] = settings["refresh_counter"]
 auth_path = home / "auth.json"
 access = None
 waiting = False
