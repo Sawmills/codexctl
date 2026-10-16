@@ -9,10 +9,49 @@ static ADMISSION: Semaphore = Semaphore::const_new(1);
 
 pub(super) async fn prepare(database: &str, state: &Path, key: &Path) {
     execute(vec![
-        ("migrate", command(database, state, key, "migrate")),
-        ("backfill", command(database, state, key, "backfill")),
+        (
+            "migrate",
+            preparation_command(database, state, key, "migrate"),
+        ),
+        (
+            "backfill",
+            preparation_command(database, state, key, "backfill"),
+        ),
     ])
     .await;
+}
+
+fn preparation_command(database: &str, state: &Path, key: &Path, operation: &str) -> Command {
+    let real = command(database, state, key, operation);
+    let observer = state.join(".fixture-cli-observer");
+    if !observer.is_dir() {
+        return real;
+    }
+    observed_command(
+        &real,
+        "printf '%s\\n' \"$$\" > \"$1\"; while test -e \"$2\"; do sleep 0.01; done; shift 2; exec \"$@\"",
+        &[
+            &observer.join(format!("{operation}.started")),
+            &observer.join(format!("{operation}.hold")),
+        ],
+    )
+}
+
+fn observed_command(real: &Command, script: &str, paths: &[&Path]) -> Command {
+    let mut observed = Command::new("sh");
+    observed
+        .args(["-c", script, "fixture-cli"])
+        .args(paths)
+        .arg(real.as_std().get_program())
+        .args(real.as_std().get_args());
+    for (name, value) in real.as_std().get_envs() {
+        if let Some(value) = value {
+            observed.env(name, value);
+        } else {
+            observed.env_remove(name);
+        }
+    }
+    observed
 }
 
 pub(super) async fn migrate(database: &str, state: &Path, key: &Path) {
@@ -111,24 +150,11 @@ mod tests {
 
     fn observed_migrate(case: &Case, pid_file: &Path) -> Command {
         let real = command(&case.database, &case.state, &case.key, "migrate");
-        let mut observed = Command::new("sh");
-        observed
-            .args([
-                "-c",
-                "printf '%s\\n' \"$$\" > \"$1\"; shift; exec \"$@\"",
-                "fixture-cli",
-            ])
-            .arg(pid_file)
-            .arg(real.as_std().get_program())
-            .args(real.as_std().get_args());
-        for (name, value) in real.as_std().get_envs() {
-            if let Some(value) = value {
-                observed.env(name, value);
-            } else {
-                observed.env_remove(name);
-            }
-        }
-        observed
+        observed_command(
+            &real,
+            "printf '%s\\n' \"$$\" > \"$1\"; shift; exec \"$@\"",
+            &[pid_file],
+        )
     }
 
     #[tokio::test]
@@ -172,25 +198,40 @@ mod tests {
         let database = super::super::backfill_test_database_named(&database, true).await;
         let first = Case::new(&database).await;
         let next = Case::new(&database).await;
-        prepare(&first.database, &first.state, &first.key).await;
-        first.control.batch_execute("CREATE TABLE fixture_delays(elapsed INTERVAL NOT NULL); CREATE FUNCTION slow_fixture_migration() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE started TIMESTAMPTZ; BEGIN IF NEW.version=1 THEN started=clock_timestamp(); PERFORM pg_sleep(1); INSERT INTO fixture_delays VALUES(clock_timestamp()-started); END IF; RETURN NEW; END $$; CREATE TRIGGER slow_fixture_migration BEFORE INSERT ON central_schema_migrations FOR EACH ROW EXECUTE FUNCTION slow_fixture_migration()").await.unwrap();
-        tokio::join!(
-            prepare(&first.database, &first.state, &first.key),
-            prepare(&next.database, &next.state, &next.key)
-        );
-        let slow: bool = first
-            .control
-            .query_one(
-                "SELECT max(elapsed)>interval '100 milliseconds' FROM fixture_delays",
-                &[],
-            )
-            .await
-            .unwrap()
-            .get(0);
+        let first_observer = first.state.join(".fixture-cli-observer");
+        let next_observer = next.state.join(".fixture-cli-observer");
+        std::fs::create_dir(&first_observer).unwrap();
+        std::fs::create_dir(&next_observer).unwrap();
+        let hold = first_observer.join("backfill.hold");
+        std::fs::write(&hold, b"hold first preparation").unwrap();
+        let mut first_call = Box::pin(prepare(&first.database, &first.state, &first.key));
+        let observation = async {
+            while !first_observer.join("backfill.started").exists() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            _ = first_call.as_mut() => panic!("first preparation completed before the controlled hold"),
+            _ = observation => {}
+        }
+        assert!(first_observer.join("migrate.started").exists());
+        let mut next_call = Box::pin(prepare(&next.database, &next.state, &next.key));
         assert!(
-            slow,
-            "actual DDL exceeded the unchanged production lock timeout"
+            timeout(Duration::from_millis(2100), async {
+                tokio::join!(first_call.as_mut(), next_call.as_mut());
+            })
+            .await
+            .is_err(),
+            "first preparation must remain held"
         );
+        assert!(
+            !next_observer.join("migrate.started").exists(),
+            "second real CLI started before the first preparation released admission"
+        );
+        std::fs::remove_file(hold).unwrap();
+        tokio::join!(first_call, next_call);
+        assert!(next_observer.join("migrate.started").exists());
+        assert!(next_observer.join("backfill.started").exists());
         first.finish().await;
         next.finish().await;
     }
