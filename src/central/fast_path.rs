@@ -107,7 +107,7 @@ impl Policy {
     }
 }
 
-const RESULTS: [&str; 12] = [
+const RESULTS: [&str; 13] = [
     "served",
     "disabled",
     "expiring",
@@ -120,8 +120,9 @@ const RESULTS: [&str; 12] = [
     "identity",
     "read_failed",
     "busy",
+    "removed",
 ];
-static RESULT_COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static RESULT_COUNTS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
 /// Count one fast-path decision by its bounded result label.
 pub(super) fn record(result: Result<(), Miss>) {
@@ -193,6 +194,7 @@ pub(super) enum Seen {
     Committed,
     Released,
     Timeout,
+    Removed,
 }
 
 /// Poll the account revision with jittered backoff until the holder commits,
@@ -212,12 +214,10 @@ pub(super) async fn wait_for_holder(
         }
         tokio::time::sleep(jittered(backoff).min(deadline - now)).await;
         backoff = (backoff * 2).min(Duration::from_secs(1));
-        if central
-            .account_revision(account_id)
-            .await
-            .is_ok_and(|current| current.is_some_and(|current| current != revision))
-        {
-            return Seen::Committed;
+        match central.account_revision(account_id).await {
+            Err(error) if error.is::<super::storage::AccountRemoved>() => return Seen::Removed,
+            Ok(Some(current)) if current != revision => return Seen::Committed,
+            _ => {}
         }
         if !central
             .lease_held_elsewhere(account_id, holder_id)
@@ -252,6 +252,7 @@ pub(super) enum Miss {
     Fenced,
     Identity,
     ReadFailed,
+    Removed,
     /// The local owner was busy, so its fence could not be read.
     Busy,
 }
@@ -269,6 +270,7 @@ impl Miss {
             Self::Fenced => "fenced",
             Self::Identity => "identity",
             Self::ReadFailed => "read_failed",
+            Self::Removed => "removed",
             Self::Busy => "busy",
         }
     }

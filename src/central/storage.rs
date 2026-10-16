@@ -99,6 +99,31 @@ pub struct CredentialRecord {
     pub revision: i64,
 }
 
+/// Shared account authority; absence never stands in for a durable removal.
+pub(in crate::central) enum AccountState<T> {
+    Active(T),
+    Removed,
+    Missing,
+}
+
+#[derive(Debug)]
+pub(in crate::central) struct AccountRemoved;
+impl std::fmt::Display for AccountRemoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("account was removed")
+    }
+}
+impl std::error::Error for AccountRemoved {}
+impl<T> AccountState<T> {
+    pub(in crate::central) fn active(self) -> Result<Option<T>> {
+        match self {
+            Self::Active(value) => Ok(Some(value)),
+            Self::Missing => Ok(None),
+            Self::Removed => Err(AccountRemoved.into()),
+        }
+    }
+}
+
 /// An active server account's display alias, without credential access or
 /// workspace/login identity proof. Renew admission still loads its credentials.
 pub(in crate::central) struct ActiveAccountAlias {
@@ -748,8 +773,9 @@ impl CentralStore {
                     revision,
                 };
                 let copy = target
-                    .load_account(&record.account_id)
+                    .account_state(&record.account_id)
                     .await?
+                    .active()?
                     .is_none_or(|existing| existing.revision < record.revision);
                 if copy {
                     target.save_account(&record).await.with_context(|| {
@@ -759,7 +785,13 @@ impl CentralStore {
                         )
                     })?;
                 }
-                if target.load_account(&record.account_id).await?.as_ref() != Some(&record) {
+                if target
+                    .account_state(&record.account_id)
+                    .await?
+                    .active()?
+                    .as_ref()
+                    != Some(&record)
+                {
                     bail!(
                         "backfill source mismatch: central_accounts row {}",
                         record.account_id
@@ -898,13 +930,51 @@ impl CentralStore {
     }
 
     pub async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
+        Ok(match self.account_state(account_id).await? {
+            AccountState::Active(record) => Some(record),
+            AccountState::Removed | AccountState::Missing => None,
+        })
+    }
+
+    pub(in crate::central) async fn account_state(
+        &self,
+        account_id: &str,
+    ) -> Result<AccountState<CredentialRecord>> {
         match self {
-            Self::File(file) => file.load_account(account_id),
-            Self::Postgres(db) => bounded_db(db.load_account(account_id)).await,
-            Self::Dual { file, postgres, .. } => Ok(bounded_db(postgres.load_account(account_id))
-                .await?
-                .or(file.load_account(account_id)?)),
+            Self::File(file) => Ok(file
+                .load_account(account_id)?
+                .map_or(AccountState::Missing, AccountState::Active)),
+            Self::Postgres(db) => bounded_db(db.account_state(account_id)).await,
+            Self::Dual { file, postgres, .. } => {
+                match bounded_db(postgres.account_state(account_id)).await? {
+                    AccountState::Missing => Ok(file
+                        .load_account(account_id)?
+                        .map_or(AccountState::Missing, AccountState::Active)),
+                    state => Ok(state),
+                }
+            }
         }
+    }
+
+    /// Batch authority metadata without reading credential bytes. Unknown keys
+    /// stay Missing; a tombstone is never replaced with local fallback data.
+    pub(in crate::central) async fn account_lifecycles(
+        &self,
+        ids: &[String],
+    ) -> Result<BTreeMap<String, AccountState<()>>> {
+        let db = match self {
+            Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
+            Self::File(_) => bail!("shared lifecycle lookup requires PostgreSQL"),
+        };
+        bounded_db(async {
+            let mut states=ids.iter().map(|id|(id.clone(),AccountState::Missing)).collect::<BTreeMap<_,_>>();
+            for row in db.client().await?.query(
+                "SELECT account_id,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=ANY($1)",&[&ids],
+            ).await? {
+                states.insert(row.get(0),if row.get::<_,bool>(1) {AccountState::Removed} else {AccountState::Active(())});
+            }
+            Ok(states)
+        }).await
     }
 
     pub(in crate::central) async fn lookup_active_account_alias(
@@ -926,11 +996,22 @@ impl CentralStore {
         user_id: &str,
         alias: &str,
     ) -> Result<Option<CredentialRecord>> {
+        Ok(match self.account_by_alias_state(user_id, alias).await? {
+            AccountState::Active(record) => Some(record),
+            AccountState::Removed | AccountState::Missing => None,
+        })
+    }
+
+    pub(in crate::central) async fn account_by_alias_state(
+        &self,
+        user_id: &str,
+        alias: &str,
+    ) -> Result<AccountState<CredentialRecord>> {
         match self {
-            Self::File(_) => Ok(None),
-            Self::Postgres(db) => bounded_db(db.load_account_by_alias(user_id, alias)).await,
+            Self::File(_) => Ok(AccountState::Missing),
+            Self::Postgres(db) => bounded_db(db.account_by_alias_state(user_id, alias)).await,
             Self::Dual { postgres, .. } => {
-                bounded_db(postgres.load_account_by_alias(user_id, alias)).await
+                bounded_db(postgres.account_by_alias_state(user_id, alias)).await
             }
         }
     }
@@ -1087,15 +1168,19 @@ impl CentralStore {
             Self::Postgres(db) | Self::Dual { postgres: db, .. } => db,
         };
         bounded_db(async {
-            Ok(db
+            let row=db
                 .client()
                 .await?
                 .query_opt(
-                    "SELECT revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL",
+                    "SELECT revision,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
                     &[&account_id],
                 )
-                .await?
-                .map(|row| row.get(0)))
+                .await?;
+            match row {
+                Some(row) if row.get::<_,bool>(1)=>AccountState::Removed,
+                Some(row)=>AccountState::Active(row.get::<_,i64>(0)),
+                None=>AccountState::Missing,
+            }.active()
         })
         .await
     }
@@ -1672,7 +1757,7 @@ impl PostgresStore {
         let client = self.client().await?;
         let changed = client
             .execute(
-                "UPDATE account_refresh_leases SET expires_at=now()+($3::bigint * interval '1 second') WHERE account_id=$1 AND holder_id=$2 AND epoch=$4 AND expires_at > now()",
+                "UPDATE account_refresh_leases SET expires_at=now()+($3::bigint * interval '1 second') WHERE account_id=$1 AND holder_id=$2 AND epoch=$4 AND expires_at > now() AND EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL)",
                 &[&lease.account_id, &lease.holder_id, &(ttl.as_secs() as i64), &lease.epoch],
             )
             .await?;
@@ -1758,6 +1843,16 @@ impl PostgresStore {
         let mut connection = self.admission_client().await?;
         let client = connection.transaction().await?;
         let _admission_timing = identity::lock_admission(&client).await?;
+        if client
+            .query_opt(
+                "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
+                &[&record.account_id],
+            )
+            .await?
+            .is_some_and(|row| row.get::<_, bool>(0))
+        {
+            bail!(AccountRemoved);
+        }
         if let Some(claims) = claims.as_ref() {
             identity::check_claims(&client, &record.account_id, claims).await?;
         }
@@ -1773,7 +1868,7 @@ impl PostgresStore {
                 )
                 .await?;
             if current.as_ref().is_some_and(|row| row.get::<_, bool>(1)) {
-                bail!("central account is tombstoned");
+                bail!(AccountRemoved);
             }
             if current.is_none_or(|row| {
                 let stored: Vec<u8> = row.get(0);
@@ -2001,22 +2096,25 @@ impl PostgresStore {
         Ok(changed == 1)
     }
 
-    async fn load_account(&self, account_id: &str) -> Result<Option<CredentialRecord>> {
+    async fn account_state(&self, account_id: &str) -> Result<AccountState<CredentialRecord>> {
         let client = self.client().await?;
-        let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL", &[&account_id]).await?;
-        row.map(|row| {
-            let vault_bytes: Vec<u8> = row.get(4);
-            Ok(CredentialRecord {
-                account_id: account_id.into(),
-                user_id: row.get(0),
-                alias: row.get(1),
-                workspace: row.get(2),
-                login: row.get(3),
-                vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &vault_bytes)?)?,
-                revision: row.get(5),
-            })
-        })
-        .transpose()
+        let row = client.query_opt("SELECT user_id,alias,workspace,login,encrypted_vault,revision,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1", &[&account_id]).await?;
+        let Some(row) = row else {
+            return Ok(AccountState::Missing);
+        };
+        if row.get::<_, bool>(6) {
+            return Ok(AccountState::Removed);
+        }
+        let vault_bytes: Vec<u8> = row.get(4);
+        Ok(AccountState::Active(CredentialRecord {
+            account_id: account_id.into(),
+            user_id: row.get(0),
+            alias: row.get(1),
+            workspace: row.get(2),
+            login: row.get(3),
+            vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &vault_bytes)?)?,
+            revision: row.get(5),
+        }))
     }
 
     async fn list_accounts(&self) -> Result<Vec<CredentialRecord>> {
@@ -2108,28 +2206,31 @@ impl PostgresStore {
         Ok(row.map(|row| ActiveAccountAlias { alias: row.get(0) }))
     }
 
-    async fn load_account_by_alias(
+    async fn account_by_alias_state(
         &self,
         user_id: &str,
         alias: &str,
-    ) -> Result<Option<CredentialRecord>> {
+    ) -> Result<AccountState<CredentialRecord>> {
         let client = self.client().await?;
         let row = client
-            .query_opt("SELECT account_id,alias,workspace,login,encrypted_vault,revision FROM central_accounts WHERE user_id=$1 AND lower(alias)=lower($2) AND deleted_at IS NULL", &[&user_id, &alias])
+            .query_opt("SELECT account_id,alias,workspace,login,encrypted_vault,revision,deleted_at IS NOT NULL FROM central_accounts WHERE user_id=$1 AND lower(alias)=lower($2)", &[&user_id, &alias])
             .await?;
-        row.map(|row| {
-            let encrypted: Vec<u8> = row.get(4);
-            Ok(CredentialRecord {
-                account_id: row.get(0),
-                user_id: Some(user_id.into()),
-                alias: row.get(1),
-                workspace: row.get(2),
-                login: row.get(3),
-                vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
-                revision: row.get(5),
-            })
-        })
-        .transpose()
+        let Some(row) = row else {
+            return Ok(AccountState::Missing);
+        };
+        if row.get::<_, bool>(6) {
+            return Ok(AccountState::Removed);
+        }
+        let encrypted: Vec<u8> = row.get(4);
+        Ok(AccountState::Active(CredentialRecord {
+            account_id: row.get(0),
+            user_id: Some(user_id.into()),
+            alias: row.get(1),
+            workspace: row.get(2),
+            login: row.get(3),
+            vault: serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?,
+            revision: row.get(5),
+        }))
     }
 
     async fn acquire_lease(
@@ -2159,8 +2260,12 @@ impl PostgresStore {
         // can replace its own replica's refresh lease because its worker settles
         // that child. The login holder rotates after an outage; the refresh
         // holder does not, so match the lease by the refresh holder.
+        // Hold this account's row through the claim, without schema admission.
+        // Removal must take FOR UPDATE on the same account before tombstoning
+        // it; FOR SHARE rechecks deleted_at after an in-flight writer commits.
+        // Writers that also need schema admission take it before account/lease.
         const CLAIM: &str = concat!(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
+            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR SHARE) AND ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
             login_fence!(),
             " AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch"
         );
@@ -2174,8 +2279,7 @@ impl PostgresStore {
             &refresh_holder,
         ];
         let row = if login.is_some() {
-            // Serialize candidate epoch claims and account-lease admission. A
-            // late request from an older epoch must not acquire a refresh lease.
+            // Candidate claims retain their existing login epoch ordering.
             let mut connection = self.admission_client().await?;
             let tx = connection.transaction().await?;
             let _timing = identity::lock_admission(&tx).await?;
@@ -2183,8 +2287,24 @@ impl PostgresStore {
             tx.commit().await?;
             row
         } else {
+            // Ordinary refreshes must not queue behind login admission.
             self.client().await?.query_opt(CLAIM, &params).await?
         };
+        if row.is_none() {
+            // CLAIM itself rejects removal. Only a rejected claim needs an
+            // additional read to distinguish durable removal from contention.
+            let state = self
+                .client()
+                .await?
+                .query_opt(
+                    "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1",
+                    &[&account_id],
+                )
+                .await?;
+            if state.is_some_and(|row| row.get::<_, bool>(0)) {
+                bail!(AccountRemoved);
+            }
+        }
         Ok(row.map(|row| Lease {
             account_id: account_id.into(),
             holder_id: holder_id.into(),
@@ -2214,8 +2334,9 @@ impl PostgresStore {
         let mut connection = self.admission_client().await?;
         let client = connection.transaction().await?;
         let _admission_timing = identity::lock_admission(&client).await?;
+        // Claims lock account then lease; publication must use that order too.
         let changed = client.execute(
-            "WITH valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id=$1 AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
+            "WITH active_account AS MATERIALIZED (SELECT account_id FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR UPDATE), valid_lease AS (SELECT account_id FROM account_refresh_leases WHERE account_id IN (SELECT account_id FROM active_account) AND holder_id=$8 AND epoch=$9 AND expires_at > clock_timestamp() FOR UPDATE) UPDATE central_accounts SET user_id=$2,alias=$3,workspace=$4,login=$5,encrypted_vault=$6,revision=$7,updated_at=clock_timestamp() WHERE central_accounts.account_id=$1 AND central_accounts.deleted_at IS NULL AND central_accounts.revision < $7 AND EXISTS (SELECT 1 FROM valid_lease WHERE valid_lease.account_id=central_accounts.account_id)",
             &[&record.account_id, &record.user_id, &record.alias, &record.workspace, &record.login, &encrypted, &record.revision, &lease.holder_id, &lease.epoch],
         ).await?;
         if changed == 1 {
@@ -2251,7 +2372,7 @@ impl PostgresStore {
         account_id: &str,
     ) -> Result<Option<super::fast_path::FastRead>> {
         let row = self.client().await?.query_opt(concat!(
-            "SELECT current_database() AS database,a.user_id,a.alias,a.revision,a.encrypted_vault,",
+            "SELECT current_database() AS database,a.user_id,a.alias,a.revision,a.encrypted_vault,a.deleted_at IS NOT NULL AS removed,",
             "EXISTS(SELECT 1 FROM central_login_operations WHERE ", login_fence!(), ") AS fenced,",
             "e.auth_revision,e.account_revision,e.routing_supported,",
             "EXTRACT(EPOCH FROM clock_timestamp()-e.routing_observed_at)::float8 AS routing_age,",
@@ -2260,9 +2381,16 @@ impl PostgresStore {
             "EXTRACT(EPOCH FROM clock_timestamp()-e.billing_observed_at)::float8 AS billing_age,",
             "EXTRACT(EPOCH FROM clock_timestamp())::bigint AS now ",
             "FROM central_accounts a LEFT JOIN central_token_evidence e ON e.account_id=a.account_id AND e.deleted_at IS NULL ",
-            "WHERE a.account_id=$1 AND a.deleted_at IS NULL"
+            "WHERE a.account_id=$1"
         ), &[&account_id]).await?;
-        let Some(row) = row else { return Ok(None) };
+        let state = match row {
+            Some(row) if row.get::<_, bool>("removed") => AccountState::Removed,
+            Some(row) => AccountState::Active(row),
+            None => AccountState::Missing,
+        };
+        let Some(row) = state.active()? else {
+            return Ok(None);
+        };
         let encrypted: Vec<u8> = row.get("encrypted_vault");
         let vault = serde_json::from_slice(&vault::decrypt_bytes(&self.key, &encrypted)?)?;
         let age = |seconds: f64| Duration::from_secs_f64(seconds.max(0.0));
@@ -2482,6 +2610,251 @@ mod tests {
 
     #[cfg(feature = "central-real-db-tests")]
     #[tokio::test]
+    async fn postgres_refresh_claim_and_publication_share_account_first_lock_order() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[46; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared.save_account(&record("seat", 1)).await.unwrap();
+        let lease = shared
+            .acquire_lease("seat", "publisher", Duration::from_secs(60))
+            .await
+            .unwrap();
+        // Pause the contender after its account read but before its lease row
+        // lock. Publication must not take the lease while waiting on that read.
+        control
+            .batch_execute(
+                r#"
+            CREATE FUNCTION hold_claim() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(hashtextextended(current_schema(),13276));
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER hold_claim BEFORE INSERT ON account_refresh_leases
+                FOR EACH ROW EXECUTE FUNCTION hold_claim();
+        "#,
+            )
+            .await
+            .unwrap();
+        control
+            .batch_execute(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),13276))",
+            )
+            .await
+            .unwrap();
+        let blocker: i32 = control
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let claimant = shared.clone();
+        let claim = tokio::spawn(async move {
+            claimant
+                .acquire_lease("seat", "contender", Duration::from_secs(60))
+                .await
+        });
+        let claim_pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(row) = control.query_opt(
+                    "SELECT pid FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)) LIMIT 1", &[&blocker]
+                ).await.unwrap() { break row.get(0); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stage: contender reaches lease insertion gate");
+        let publisher = shared.clone();
+        let publication =
+            tokio::spawn(async move { publisher.fenced_write(&lease, &record("seat", 2)).await });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = control.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)))", &[&claim_pid]
+                ).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stage: publication waits for contender's account read");
+        control.batch_execute("COMMIT").await.unwrap();
+        let published = tokio::time::timeout(Duration::from_secs(5), publication)
+            .await
+            .expect("stage: publication finishes after claim gate releases")
+            .unwrap();
+        assert!(
+            matches!(published, Ok(true)),
+            "publication must avoid lock inversion: {published:?}"
+        );
+        let claimed = tokio::time::timeout(Duration::from_secs(5), claim)
+            .await
+            .expect("stage: contending claim finishes")
+            .unwrap();
+        let error = claimed.expect_err("live publisher keeps its lease");
+        assert!(
+            format!("{error:#}").contains("refresh lease is held"),
+            "claim must report contention, not deadlock: {error:?}"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_refresh_claim_does_not_wait_on_login_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[45; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared
+            .save_account(&record("active-seat", 1))
+            .await
+            .unwrap();
+        let mut unrelated = record("unrelated-seat", 1);
+        unrelated.alias = "other-seat".into();
+        shared.save_account(&unrelated).await.unwrap();
+        let CentralStore::Postgres(db) = &shared else {
+            unreachable!()
+        };
+        let admission = db.admission_client().await.unwrap();
+        control
+            .batch_execute(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended(current_schema(),12484)); SELECT account_id FROM central_accounts WHERE account_id='unrelated-seat' FOR UPDATE",
+            )
+            .await
+            .unwrap();
+        let claimed = tokio::time::timeout(
+            Duration::from_secs(1),
+            shared.acquire_lease(
+                "active-seat",
+                "independent-refresh",
+                Duration::from_secs(60),
+            ),
+        )
+        .await;
+        control.batch_execute("ROLLBACK").await.unwrap();
+        drop(admission);
+        let lease = claimed
+            .expect(
+                "normal refresh claim must not wait for login admission or another account's row",
+            )
+            .unwrap();
+        assert!(shared.release_lease(&lease).await.unwrap());
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_removed_account_never_decrypts_or_falls_back_to_a_stale_file_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[44; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared
+            .save_account(&record("removed-seat", 1))
+            .await
+            .unwrap();
+        let file = FileStore {
+            state: root.path().into(),
+            key,
+        };
+        file.save_account(&record("removed-seat", 1)).unwrap();
+        let CentralStore::Postgres(postgres) = &shared else {
+            unreachable!()
+        };
+        let dual = CentralStore::Dual {
+            file,
+            postgres: postgres.clone(),
+            mirror_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        control.execute(
+            "UPDATE central_accounts SET deleted_at=clock_timestamp(),encrypted_vault=decode('00','hex') WHERE account_id='removed-seat'", &[]
+        ).await.unwrap();
+        for store in [&shared, &dual] {
+            assert!(matches!(
+                store.account_state("removed-seat").await.unwrap(),
+                AccountState::Removed
+            ));
+            assert!(matches!(
+                store.account_by_alias_state("user", "seat").await.unwrap(),
+                AccountState::Removed
+            ));
+            assert!(store.load_account("removed-seat").await.unwrap().is_none());
+            assert!(
+                store
+                    .save_account(&record("removed-seat", 2))
+                    .await
+                    .err()
+                    .unwrap()
+                    .is::<AccountRemoved>()
+            );
+            assert!(matches!(
+                store.account_state("never-saved").await.unwrap(),
+                AccountState::Missing
+            ));
+        }
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
+    async fn postgres_removed_account_cannot_keep_or_acquire_refresh_custody() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("key");
+        vault::create_secret(&key, &[43; 32]).unwrap();
+        let shared = CentralStore::from_mode(StoreMode::Postgres, root.path(), &key)
+            .await
+            .unwrap();
+        let (shared, control, schema) = shared.isolated_test_schema().await.unwrap();
+        bootstrap(&shared).await.unwrap();
+        shared
+            .save_account(&record("removed-seat", 1))
+            .await
+            .unwrap();
+        let lease = shared
+            .acquire_lease("removed-seat", "first", Duration::from_secs(60))
+            .await
+            .unwrap();
+        control.execute("UPDATE central_accounts SET deleted_at=clock_timestamp() WHERE account_id='removed-seat'",&[]).await.unwrap();
+        assert!(
+            !shared.renew(&lease, Duration::from_secs(60)).await.unwrap(),
+            "a removed account cannot extend refresh custody"
+        );
+        assert!(
+            shared.release_lease(&lease).await.unwrap(),
+            "custody can still be safely released"
+        );
+        assert!(
+            shared
+                .acquire_lease("removed-seat", "second", Duration::from_secs(60))
+                .await
+                .is_err(),
+            "a removed account cannot acquire refresh custody"
+        );
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+    }
+
+    #[cfg(feature = "central-real-db-tests")]
+    #[tokio::test]
     async fn token_evidence_follows_the_lease_and_the_credential_revision() {
         use super::super::fast_path::{Billing, Observation};
         use crate::api;
@@ -2668,7 +3041,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(shared.fast_token_read("a").await.unwrap().is_none());
+        assert!(
+            shared
+                .fast_token_read("a")
+                .await
+                .err()
+                .unwrap()
+                .is::<AccountRemoved>()
+        );
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
             .await

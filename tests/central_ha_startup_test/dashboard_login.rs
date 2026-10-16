@@ -1572,7 +1572,7 @@ async fn browser_expiry_during_credential_write(admission: bool) {
     timeout(Duration::from_secs(8), async {
         loop {
             let waiting: bool = f.control.query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event='advisory' AND query LIKE $2)", &[&f.schema, &if admission { "INSERT INTO central_accounts%" } else { "WITH fence AS MATERIALIZED%" }]
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event='advisory' AND pg_backend_pid()=ANY(pg_blocking_pids(pid)))", &[&f.schema]
             ).await.unwrap().get(0);
             if waiting { break; }
             tokio::time::sleep(Duration::from_millis(5)).await;

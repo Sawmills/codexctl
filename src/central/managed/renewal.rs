@@ -32,8 +32,9 @@ impl Broker {
         // Reject a wrong login before waiting on reservations that it may itself
         // have created for another renewal's selected account.
         let shared = central
-            .load_account(op.account()?)
+            .account_state(op.account()?)
             .await?
+            .active()?
             .context("renewal account missing")?;
         let _: Vault = serde_json::from_value(shared.vault)?;
         let identity = central.validate_login_candidate(op).await;
@@ -138,8 +139,9 @@ impl Broker {
             // PostgreSQL. Keep that evidence for settlement, but compare the
             // final commit against the shared revision read under this lease.
             let committed_revision = central
-                .load_account(op.account()?)
+                .account_state(op.account()?)
                 .await?
+                .active()?
                 .context("renewal account missing")?
                 .revision;
             let identities = central.retained_identities().await?;

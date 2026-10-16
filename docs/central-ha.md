@@ -25,6 +25,23 @@ newer credential, fences the owner and releases the lease and shutdown permit.
 Transient database errors retain the journal and retry, including during shutdown.
 File-mode startup keeps its existing refresh owners.
 
+Refresh claims take `FOR SHARE` on the active account row inside the lease
+claim statement. They wait for an uncommitted writer of that account and
+recheck `deleted_at` after it commits. Ordinary claims use the plain client;
+they do not take schema admission or wait on another account's row lock.
+Renewal admission also holds the selected account row through its transaction.
+The removal writer in PR B must take `FOR UPDATE` on that same account row
+before setting `deleted_at`, then coordinate the lease rows in that order.
+If removal also needs schema admission for identity work, take admission before
+the account row: admission, account, lease. Ordinary claims take no admission.
+Credential publication and login completion follow the same account-before-lease
+order: their materialized account read takes `FOR UPDATE` before the lease read.
+This prevents a claim's shared account lock from cycling with publication's
+exclusive lease lock. All these locks stay inside short database statements.
+The claim fence covers admission only. Keep the regular token lease's first
+renewal check at 30 seconds; post-commit lifecycle checks and PR B's explicit
+stop path handle removal of a refresh owner that has already started.
+
 Shared-store imports also renew their lease through verification and child exit.
 An import retry reads the latest committed credential under that lease. Failed
 verification settles and persists its rotation before another import can retry.
