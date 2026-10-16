@@ -15,6 +15,10 @@ struct BrowserFixture {
 
 impl BrowserFixture {
     async fn start() -> Self {
+        Self::start_with_rollout(None).await
+    }
+
+    async fn start_with_rollout(overlay: Option<&str>) -> Self {
         let database = std::env::var("DATABASE_URL").expect("DATABASE_URL for dashboard HA tests");
         let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
             .await
@@ -82,6 +86,38 @@ impl BrowserFixture {
             "migrate: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        if let Some(overlay) = overlay {
+            control
+                .batch_execute(&format!(
+                    "ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; \
+                 DROP TABLE {0}.dashboard_audit; \
+                 INSERT INTO {0}.browser_sessions(token_hash,user_id,signed_in_at,expires_at) \
+                 VALUES('legacy-session','legacy-user',now(),now()+interval '1 hour')",
+                    schema
+                ))
+                .await
+                .unwrap();
+            let initialized = futures::future::join_all((0..3).map(|_| async {
+                initializer(
+                    overlay,
+                    database.as_str(),
+                    &root.path().join("state"),
+                    &key,
+                    None,
+                )
+                .output()
+                .await
+                .unwrap()
+            }))
+            .await;
+            for output in initialized {
+                assert!(
+                    output.status.success(),
+                    "initialize: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
         let first = Self::pod(database.as_str(), &key, &config).await;
         let second = Self::pod(database.as_str(), &key, &config).await;
         Self {
@@ -264,6 +300,421 @@ impl BrowserFixture {
             .append_pair("application_name", &self.schema);
         url.to_string()
     }
+}
+
+// Read the manifest's JSON-form args rather than copying its initialization logic.
+fn initializer(
+    overlay: &str,
+    database: &str,
+    state: &Path,
+    key: &Path,
+    serve_marker: Option<&Path>,
+) -> Command {
+    let manifest = match overlay {
+        "staging" => include_str!("../../deploy/k8s/overlays/staging/ha-deployment.yaml"),
+        "staging-ha" => include_str!("../../deploy/k8s/overlays/staging-ha/deployment.yaml"),
+        _ => panic!("unknown HA overlay"),
+    };
+    let section = manifest.split_once("- name: initialize\n").unwrap().1;
+    let section = section.split_once("      containers:").unwrap().0;
+    assert!(section.contains("command: [sh, -ec]"));
+    let args = section.split_once("args:").unwrap().1.trim_start();
+    let args = args
+        .strip_prefix('[')
+        .expect("initialize args flow array")
+        .trim_start();
+    let mut values = serde_json::Deserializer::from_str(args).into_iter::<String>();
+    let script = values.next().expect("initialize shell script").unwrap();
+    let rest = args[values.byte_offset()..].trim_start();
+    assert!(
+        rest.strip_prefix(',')
+            .unwrap_or(rest)
+            .trim_start()
+            .starts_with(']'),
+        "exactly one initialize argument"
+    );
+    let quote = |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+    let mut script = script
+        .replace("/data/state", &quote(state))
+        .replace("/keys/vault-key", &quote(key))
+        .replace(
+            "codexctl-central ",
+            &format!(
+                "{} ",
+                quote(Path::new(env!("CARGO_BIN_EXE_codexctl-central")))
+            ),
+        );
+    if let Some(marker) = serve_marker {
+        script.push_str(&format!("; printf started > {}", quote(marker)));
+    }
+    let environment = command(database, state, key, "migrate");
+    let mut shell = Command::new("sh");
+    for (name, value) in environment.as_std().get_envs() {
+        if let Some(value) = value {
+            shell.env(name, value);
+        } else {
+            shell.env_remove(name);
+        }
+    }
+    shell.args(["-ec", &script]).kill_on_drop(true);
+    shell
+}
+
+#[tokio::test]
+async fn postgres_ha_rollout_upgrades_old_schema_before_sign_in_and_revoke() {
+    for overlay in ["staging", "staging-ha"] {
+        let f = BrowserFixture::start_with_rollout(Some(overlay)).await;
+        f.identity(Some(chrono::Utc::now().timestamp()));
+        let (binding, callback) = f.begin_sign_in().await;
+        let response = f.callback(&f.second, &binding, &callback).await;
+        let log = std::fs::read_to_string(f.second.root.path().join("dashboard.log")).unwrap();
+        assert_eq!(
+            response.status(),
+            303,
+            "{overlay} callback after initialize; diagnostics: {log}"
+        );
+        let (session, _) = f.sign_in().await;
+        f.machine("upgrade-target", "synthetic-upgrade-target-token")
+            .await;
+        f.machine("upgrade-caller", "synthetic-upgrade-caller-token")
+            .await;
+        let token = f.form_token(&session).await;
+        assert_eq!(
+            f.revoke(&session, &token, "upgrade-target").await.status(),
+            200
+        );
+        assert_eq!(
+            f.revoke(&session, &token, "upgrade-target").await.status(),
+            409
+        );
+        for _ in 0..2 {
+            let response = f
+                .http
+                .post(format!("{}/v1/devices/revoke", f.first.url))
+                .bearer_auth("synthetic-upgrade-caller-token")
+                .header("x-codexctl-device", "upgrade-caller")
+                .json(&json!({"id":"upgrade-target"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 204);
+        }
+        let rows = f
+            .control
+            .query(
+                &format!(
+                    "SELECT actor,operation,target,result FROM {}.dashboard_audit ORDER BY id",
+                    f.schema
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, result) in rows.iter().zip(["ok", "refused:already_revoked"]) {
+            assert_eq!(
+                row.get::<_, String>(0),
+                "dashboard:dashboard@example.invalid"
+            );
+            assert_eq!(row.get::<_, String>(1), "machine_revoke");
+            assert_eq!(row.get::<_, String>(2), "upgrade-target");
+            assert_eq!(row.get::<_, String>(3), result);
+        }
+        assert!(
+            f.control
+                .query_one(
+                    &format!(
+                        "SELECT revoked FROM {}.central_devices WHERE id='upgrade-target'",
+                        f.schema
+                    ),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0)
+        );
+        let legacy = f.control.query_one(&format!("SELECT auth_time_verified FROM {}.browser_sessions WHERE token_hash='legacy-session'", f.schema), &[]).await.unwrap();
+        assert!(!legacy.get::<_, bool>(0));
+        for pod in [&f.first, &f.second] {
+            assert_eq!(
+                pod.launches(),
+                0,
+                "rollout/sign-in/Revoke never launches a native owner"
+            );
+            assert_eq!(
+                std::fs::read_to_string(pod.root.path().join("count")).unwrap(),
+                "0"
+            );
+        }
+        f.finish().await;
+    }
+}
+
+async fn old_pods_serve(f: &BrowserFixture, session: &str) {
+    for pod in [&f.first, &f.second] {
+        assert_eq!(
+            f.http
+                .get(format!("{}/ready", pod.url))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+        assert_eq!(
+            f.http
+                .get(format!("{}/accounts/data", pod.url))
+                .header("cookie", session)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_ha_rollout_three_current_initializers_finish_inside_database_budget() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    for overlay in ["staging", "staging-ha"] {
+        let roots: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+        // First start and repeat with users.json already present must both migrate.
+        for attempt in 0..2 {
+            let finished = std::cell::Cell::new(false);
+            let inits = async {
+                let results = futures::future::join_all(roots.iter().map(|root| async {
+                    let started = std::time::Instant::now();
+                    let output = initializer(
+                        overlay,
+                        &f.database(),
+                        &root.path().join("state"),
+                        &f._root.path().join("key"),
+                        None,
+                    )
+                    .output()
+                    .await
+                    .unwrap();
+                    (output, started.elapsed())
+                }))
+                .await;
+                finished.set(true);
+                results
+            };
+            let traffic = async {
+                let mut reads = 0;
+                loop {
+                    old_pods_serve(&f, &session).await;
+                    reads += 1;
+                    if finished.get() {
+                        return reads;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            let (results, reads) = tokio::join!(inits, traffic);
+            assert!(reads > 0);
+            for (output, elapsed) in results {
+                assert!(
+                    output.status.success(),
+                    "{overlay} initialize: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!("{overlay} current-schema init attempt {attempt}: {elapsed:?}");
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "current-schema init exceeds database budget: {elapsed:?}"
+                );
+            }
+            let ready = f.control.query_one(&format!("SELECT completed FROM {}.central_identity_migration_progress WHERE stage='source_fence'", f.schema), &[]).await.unwrap().get::<_, bool>(0);
+            assert!(
+                ready,
+                "repeated migration must not re-fence identity writers"
+            );
+            old_pods_serve(&f, &session).await;
+        }
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_ha_rollout_failed_initializer_leaves_two_old_pods_serving() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    for overlay in ["staging", "staging-ha"] {
+        for failure in ["admission_lock", "future_schema"] {
+            // Dashboard reads use sessions, not this action-only audit table.
+            // Its absence makes an accidental partial migration observable.
+            f.control
+                .batch_execute(&format!("DROP TABLE {}.dashboard_audit", f.schema))
+                .await
+                .unwrap();
+            if failure == "admission_lock" {
+                f.control
+                    .batch_execute(&format!(
+                        "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
+                        f.schema
+                    ))
+                    .await
+                    .unwrap();
+            } else {
+                f.control
+                    .execute(
+                        &format!(
+                            "INSERT INTO {}.central_schema_migrations(version) VALUES(9)",
+                            f.schema
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+            }
+            let root = tempfile::tempdir().unwrap();
+            let marker = root.path().join("serve-started");
+            let finished = std::cell::Cell::new(false);
+            let init = async {
+                let output = timeout(
+                    Duration::from_secs(10),
+                    initializer(
+                        overlay,
+                        &f.database(),
+                        &root.path().join("state"),
+                        &f._root.path().join("key"),
+                        Some(&marker),
+                    )
+                    .output(),
+                )
+                .await;
+                finished.set(true);
+                output.unwrap().unwrap()
+            };
+            let traffic = async {
+                loop {
+                    old_pods_serve(&f, &session).await;
+                    if finished.get() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            };
+            let (output, ()) = tokio::join!(init, traffic);
+            assert!(!output.status.success(), "{overlay} must reject {failure}");
+            let cause = String::from_utf8_lossy(&output.stderr);
+            let audit_present: bool = f
+                .control
+                .query_one(
+                    "SELECT to_regclass($1) IS NOT NULL",
+                    &[&format!("{}.dashboard_audit", f.schema)],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                !audit_present,
+                "failed initializer must not partially add schema"
+            );
+            if failure == "admission_lock" {
+                assert!(
+                    cause.contains("timed out") || cause.contains("statement timeout"),
+                    "{cause}"
+                );
+                f.control.batch_execute("ROLLBACK").await.unwrap();
+            } else {
+                assert!(cause.contains("newer than this binary"), "{cause}");
+                f.control
+                    .execute(
+                        &format!(
+                            "DELETE FROM {}.central_schema_migrations WHERE version=9",
+                            f.schema
+                        ),
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(!marker.exists(), "failed init must block its broker start");
+            old_pods_serve(&f, &session).await;
+            let recovered = initializer(
+                overlay,
+                &f.database(),
+                &root.path().join("state"),
+                &f._root.path().join("key"),
+                Some(&marker),
+            )
+            .output()
+            .await
+            .unwrap();
+            assert!(
+                recovered.status.success(),
+                "{}",
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            assert!(marker.exists(), "a later successful init permits startup");
+            let audit_present: bool = f
+                .control
+                .query_one(
+                    "SELECT to_regclass($1) IS NOT NULL",
+                    &[&format!("{}.dashboard_audit", f.schema)],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert!(
+                audit_present,
+                "successful retry installs missing audit table"
+            );
+            old_pods_serve(&f, &session).await;
+        }
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+async fn postgres_ha_rollout_contended_table_does_not_stall_old_pods() {
+    let f = BrowserFixture::start().await;
+    let (session, _) = f.sign_in().await;
+    // A normal serving read can retain ACCESS SHARE until its transaction ends.
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM {}.browser_sessions",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let init = initializer(
+        "staging",
+        &f.database(),
+        &root.path().join("state"),
+        &f._root.path().join("key"),
+        None,
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = f.control.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE relation=$1::text::regclass AND mode='AccessExclusiveLock' AND NOT granted)",
+                &[&format!("{}.browser_sessions", f.schema)]
+            ).await.unwrap().get(0);
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.expect("initializer reached the serving table lock");
+    let started = std::time::Instant::now();
+    old_pods_serve(&f, &session).await;
+    let elapsed = started.elapsed();
+    let output = init.wait_with_output().await.unwrap();
+    f.control.batch_execute("ROLLBACK").await.unwrap();
+    f.finish().await;
+    assert!(!output.status.success(), "contended init must fail closed");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "failed init stalled old serving pods for {elapsed:?}"
+    );
 }
 
 #[tokio::test]

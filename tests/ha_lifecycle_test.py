@@ -63,6 +63,37 @@ class HaLifecycleTest(unittest.TestCase):
                                     and c["labelSelector"]["matchLabels"].items() <= labels.items()
                                     for c in anti_affinity))
 
+    def test_initialize_uses_broker_database_and_ca_before_serving(self):
+        for overlay, resources in self.overlays.items():
+            with self.subTest(overlay=overlay):
+                deployment = next(r for r in resources if r["kind"] == "Deployment"
+                                  and r["metadata"]["name"] == "codexctl-ha")
+                pod = deployment["spec"]["template"]["spec"]
+                init = next(c for c in pod["initContainers"] if c["name"] == "initialize")
+                broker = next(c for c in pod["containers"] if c["name"] == "broker")
+                self.assertEqual(init["resources"], {
+                    "requests": {"cpu": "100m", "memory": "64Mi"},
+                    "limits": {"cpu": "1", "memory": "256Mi"},
+                })
+                self.assertEqual(init["image"], broker["image"])
+                expected = {e["name"]: e for e in broker["env"]
+                            if e["name"] == "CODEXCTL_CENTRAL_STORE"
+                            or e["name"].startswith("DB_")
+                            or e["name"] == "CODEXCTL_CENTRAL_DB_CA_FILE"}
+                self.assertEqual({e["name"]: e for e in init["env"]}, expected)
+                ca = next(m for m in broker["volumeMounts"] if m["name"] == "rds-ca")
+                self.assertIn(ca, init["volumeMounts"])
+                self.assertTrue(ca["readOnly"])
+                self.assertEqual(init["command"], ["sh", "-ec"])
+                manifest = ROOT / "deploy/k8s/overlays" / overlay / (
+                    "ha-deployment.yaml" if overlay == "staging" else "deployment.yaml")
+                source = yaml.safe_load(manifest.read_text())
+                source_init = next(c for c in source["spec"]["template"]["spec"]["initContainers"]
+                                   if c["name"] == "initialize")
+                self.assertEqual(init["args"], source_init["args"])
+                self.assertIn("fi; codexctl-central migrate --state /data/state --key-file /keys/vault-key",
+                              init["args"][0])
+
     def test_hook_returns_before_kubelet_term_and_shutdown_settles(self):
         for overlay, resources in self.overlays.items():
             deployment = next(r for r in resources if r["kind"] == "Deployment"
