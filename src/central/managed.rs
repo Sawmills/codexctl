@@ -749,11 +749,25 @@ impl Broker {
             return Ok(());
         };
         let account_id = account_key(&owner.vault.user, &owner.vault.alias);
-        if let Some(record) = central.load_account(&account_id).await? {
+        let record = match central.account_state(&account_id).await? {
+            super::storage::AccountState::Active(record) => Some(record),
+            super::storage::AccountState::Missing => None,
+            super::storage::AccountState::Removed => {
+                stop_removed_owner(owner).await?;
+                return Err(super::storage::AccountRemoved.into());
+            }
+        };
+        if let Some(record) = record {
             if central.mode() == super::storage::StoreMode::Postgres {
                 reconcile_owner_from_central(self, owner, &account_id)
                     .await
-                    .map_err(|_| anyhow::anyhow!("cannot reconcile shared account"))?;
+                    .map_err(|error| {
+                        if error.reason == "account_removed" {
+                            anyhow::Error::new(super::storage::AccountRemoved)
+                        } else {
+                            anyhow::anyhow!("cannot reconcile shared account")
+                        }
+                    })?;
                 return Ok(());
             }
             if record.revision > owner.vault.revision {
@@ -923,6 +937,25 @@ impl Broker {
             }
         }
         drop(entries);
+        if let Some((id, owner)) = &selected
+            && let Some(central) = self
+                .central
+                .as_ref()
+                .filter(|store| store.mode() != super::storage::StoreMode::File)
+        {
+            let states = central
+                .account_lifecycles(std::slice::from_ref(id))
+                .await
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+            if matches!(states.get(id), Some(super::storage::AccountState::Removed)) {
+                if let Ok(mut held) = owner.try_lock() {
+                    stop_removed_owner(&mut held).await.map_err(|_| {
+                        self.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
+                }
+                return Err(self.error(StatusCode::NOT_FOUND, "account_removed"));
+            }
+        }
         if selected.is_none()
             && let Some(central) = self
                 .central
@@ -930,9 +963,11 @@ impl Broker {
                 .filter(|central| central.mode() != super::storage::StoreMode::File)
         {
             let record = central
-                .load_account_by_alias(user, alias)
+                .account_by_alias_state(user, alias)
                 .await
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
+                .active()
+                .map_err(|error| self.storage_admission_failure(error))?;
             if let Some(record) = record {
                 let account_state = self
                     .state
@@ -990,6 +1025,35 @@ impl Broker {
     }
 }
 
+async fn stop_removed_owner(owner: &mut Owner) -> Result<()> {
+    owner_request::fence_background_owner(owner);
+    owner.retryable_unavailable = false;
+    if let Some(rpc) = owner.rpc.as_mut() {
+        rpc.kill_and_reap().await?;
+        owner.snapshot()?;
+        owner.rpc = None;
+    }
+    previous_owner_exited(&owner.home)?;
+    Ok(())
+}
+
+/// Refuse durable deletion without loading credentials or treating a query
+/// failure as absence. The owner keeps its journal and process evidence.
+async fn stop_if_removed(central: &CentralStore, owner: &mut Owner) -> Result<bool> {
+    if central.mode() == super::storage::StoreMode::File {
+        return Ok(false);
+    }
+    let id = account_key(&owner.vault.user, &owner.vault.alias);
+    let states = central
+        .account_lifecycles(std::slice::from_ref(&id))
+        .await?;
+    if matches!(states.get(&id), Some(super::storage::AccountState::Removed)) {
+        stop_removed_owner(owner).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 async fn reconcile_owner_from_central(
     broker: &Broker,
     owner: &mut Owner,
@@ -1002,12 +1066,19 @@ async fn reconcile_owner_from_central(
     else {
         return Ok(false);
     };
-    let Some(record) = central
-        .load_account(account_id)
+    let record = match central
+        .account_state(account_id)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
-    else {
-        return Ok(false);
+    {
+        super::storage::AccountState::Active(record) => record,
+        super::storage::AccountState::Missing => return Ok(false),
+        super::storage::AccountState::Removed => {
+            stop_removed_owner(owner)
+                .await
+                .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"))?;
+            return Err(broker.error(StatusCode::NOT_FOUND, "account_removed"));
+        }
     };
     // Failed startup preparation has no trustworthy revision baseline. Keep
     // its retained evidence quarantined instead of repairing it through a token request.
@@ -1184,7 +1255,13 @@ async fn fast_token(
     let read = central
         .fast_token_read(account_id)
         .await
-        .map_err(|_| Miss::ReadFailed)?
+        .map_err(|error| {
+            if error.is::<super::storage::AccountRemoved>() {
+                Miss::Removed
+            } else {
+                Miss::ReadFailed
+            }
+        })?
         .ok_or(Miss::Identity)?;
     if read.fenced {
         return Err(Miss::Fenced);
@@ -1279,7 +1356,14 @@ pub(super) async fn account_catalog(
             .await
             .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
         for alias in aliases {
-            let _ = broker.resolve_alias(user, &alias).await?;
+            match broker.resolve_alias(user, &alias).await {
+                // Removal can commit after the alias-list snapshot. Omit only
+                // that account; database failures must still fail the listing.
+                Err(error) if error.reason == "account_removed" => {}
+                result => {
+                    let _ = result?;
+                }
+            }
         }
     }
     let mut owners: Vec<_> = broker
@@ -1305,6 +1389,23 @@ pub(super) async fn account_catalog(
     }
     // Borrowed entries count too: a borrower with no owned account can still
     // list a healthy loan while an unrelated account awaits recovery.
+    if let Some(central) = broker
+        .central
+        .as_ref()
+        .filter(|store| store.mode() != super::storage::StoreMode::File)
+    {
+        let ids = owners
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect::<Vec<_>>();
+        let states = central
+            .account_lifecycles(&ids)
+            .await
+            .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+        owners.retain(|(id, _, _)| {
+            !matches!(states.get(id), Some(super::storage::AccountState::Removed))
+        });
+    }
     if owners.is_empty() && broker.ownership_unresolved.load(Ordering::Acquire) {
         return Err(broker.error(StatusCode::SERVICE_UNAVAILABLE, "recovery_failed"));
     }
@@ -1461,6 +1562,9 @@ async fn import(
 }
 impl Broker {
     fn storage_admission_failure(&self, error: anyhow::Error) -> HttpError {
+        if error.is::<super::storage::AccountRemoved>() {
+            return self.error(StatusCode::NOT_FOUND, "account_removed");
+        }
         match error.downcast_ref::<super::storage::identity::IdentityDenied>() {
             Some(denied) => self.error(StatusCode::CONFLICT, denied.reason()),
             None => self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"),
@@ -2452,6 +2556,14 @@ pub async fn serve(
     let mut replacements_blocked = false;
     let mut conflicting_journals = Vec::new();
     let mut repairing = std::collections::BTreeSet::new();
+    let startup_lifecycles = if let Some(central) = central.as_ref() {
+        let ids = std::fs::read_dir(state.join("accounts"))?
+            .map(|entry| entry.map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        central.account_lifecycles(&ids).await?
+    } else {
+        BTreeMap::new()
+    };
     // Finish interrupted renames first: the inventory below requires each
     // directory name to match its vault alias.
     if super::rename::recover(state, key).is_err() {
@@ -2460,7 +2572,14 @@ pub async fn serve(
     }
     // Resolve all durable commits before inventorying quarantines from other accounts.
     for entry in std::fs::read_dir(state.join("accounts"))? {
-        if relogin::recover(&entry?.path(), key).is_err() {
+        let entry = entry?;
+        if matches!(
+            startup_lifecycles.get(entry.file_name().to_string_lossy().as_ref()),
+            Some(super::storage::AccountState::Removed)
+        ) {
+            continue;
+        }
+        if relogin::recover(&entry.path(), key).is_err() {
             replacements_blocked = true;
             ownership_unresolved = true;
         }
@@ -2480,6 +2599,18 @@ pub async fn serve(
             relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
         let journal_conflicts = inventory.journal_conflicts();
         let stopped = inventory.runtime == relogin::ProcessState::Stopped;
+        if matches!(
+            startup_lifecycles.get(entry.file_name().to_string_lossy().as_ref()),
+            Some(super::storage::AccountState::Removed)
+        ) {
+            // Retain the entire runtime/journal. An unproven old child can still
+            // overlap another identity, so it fences replacements globally.
+            if !stopped {
+                replacements_blocked = true;
+                ownership_unresolved = true;
+            }
+            continue;
+        }
         match inventory.candidates {
             Ok(candidates) => conflicting_journals.extend(candidates.into_iter().map(|c| c.auth)),
             Err(_) => {

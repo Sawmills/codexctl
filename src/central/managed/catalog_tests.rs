@@ -564,18 +564,28 @@ async fn rejected_shared_settlement_releases_lease_and_shutdown_permit() {
             );
             assert!(renew_done.load(Ordering::Acquire));
             assert_eq!(work.available_permits(), 1, "shutdown work must drain");
+            let released: bool = control.query_one(
+                "SELECT released AND expires_at<=clock_timestamp() FROM account_refresh_leases WHERE account_id=$1",
+                &[&record.account_id],
+            ).await.unwrap().get(0);
             assert!(
-                !central
-                    .renew(&lease, Duration::from_secs(120))
-                    .await
-                    .unwrap(),
-                "rejected lease must be released"
+                released,
+                "rejected lease must be released even after removal"
             );
             let successor = central
                 .acquire_lease(&record.account_id, "successor", Duration::from_secs(120))
-                .await
-                .unwrap();
-            central.release_lease(&successor).await.unwrap();
+                .await;
+            if rejection.starts_with("deleted_at") {
+                assert!(
+                    successor
+                        .err()
+                        .unwrap()
+                        .is::<super::super::storage::AccountRemoved>(),
+                    "a stopped removed account must never gain a successor"
+                );
+            } else {
+                central.release_lease(&successor.unwrap()).await.unwrap();
+            }
             control
                 .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
                 .await

@@ -594,19 +594,8 @@ pub(super) async fn settle_background_recovery(
     let _settlement = settlements.mark(&owner_ref);
     let mut settlement = BackgroundSettlement::default();
     loop {
-        // Shared-store shutdown must drain the child's final rotation to the
-        // database before releasing its lease and the shutdown work permit.
-        if central.is_none() && stopping.load(Ordering::Acquire) {
-            abandon_background_recovery(
-                owner_ref,
-                recovery_generation,
-                renew_done,
-                renew_task,
-                permit,
-            )
-            .await;
-            return;
-        }
+        // Authority reads can fail for an entire outage. Custody expiry must
+        // still terminate an unsettled child before retrying those reads.
         if let Some(window) = lease_window.as_ref() {
             let remaining = window
                 .deadline
@@ -629,6 +618,55 @@ pub(super) async fn settle_background_recovery(
                 .await;
                 return;
             }
+        }
+        if let Some(central) = central.as_ref() {
+            let removed = {
+                let mut owner = owner_ref.lock().await;
+                if owner.recovery_generation != recovery_generation {
+                    Ok(false)
+                } else {
+                    stop_if_removed(central, &mut owner).await
+                }
+            };
+            match removed {
+                Ok(true) => {
+                    // Only a positively stopped child releases custody. A
+                    // failed stop keeps the lease and retained evidence.
+                    if let Some(lease) = lease.as_ref() {
+                        let _ = central.release_lease(lease).await;
+                    }
+                    abandon_background_recovery(
+                        owner_ref,
+                        recovery_generation,
+                        renew_done,
+                        renew_task,
+                        permit,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("central settlement lifecycle retry: {error:#}");
+                    // Unknown authority still permits stopping our own child.
+                    // Never let a read outage skip bounded settlement, including
+                    // recovery callers without a foreground lease window.
+                    // Publication below still requires renewal and a fenced write.
+                }
+            }
+        }
+        // Shared-store shutdown must drain the child's final rotation to the
+        // database before releasing its lease and the shutdown work permit.
+        if central.is_none() && stopping.load(Ordering::Acquire) {
+            abandon_background_recovery(
+                owner_ref,
+                recovery_generation,
+                renew_done,
+                renew_task,
+                permit,
+            )
+            .await;
+            return;
         }
         let record = {
             let settle = async {
@@ -733,6 +771,14 @@ pub(super) async fn settle_background_recovery(
                     }
                 },
                 Ok(false) => {
+                    // Removal may have committed after the loop's first read.
+                    let mut owner = owner_ref.lock().await;
+                    if owner.recovery_generation == recovery_generation
+                        && stop_if_removed(central, &mut owner).await.unwrap_or(false)
+                    {
+                        let _ = central.release_lease(lease).await;
+                    }
+                    drop(owner);
                     abandon_background_recovery(
                         owner_ref,
                         recovery_generation,
@@ -940,6 +986,17 @@ pub(super) async fn token(
             .await;
             fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
             match result {
+                Err(fast_path::Miss::Removed) => {
+                    if let Ok(mut held) = owner.try_lock() {
+                        // No lease is acquired and no new native work is admitted.
+                        // A busy leased operation observes the same tombstone via
+                        // its renewal/write fences before publishing a response.
+                        stop_removed_owner(&mut held).await.map_err(|_| {
+                            broker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                        })?;
+                    }
+                    return Err(broker.error(StatusCode::NOT_FOUND, "account_removed"));
+                }
                 Ok((token, alias)) => {
                     if let Some((started, _)) = wait {
                         fast_path::Wait::Committed.record(started.elapsed());
@@ -1053,7 +1110,12 @@ pub(super) async fn token(
             )
             .await;
             fast_path::record(result.as_ref().map(|_| ()).map_err(|miss| *miss));
-            if let Ok((token, alias)) = result {
+            if matches!(result, Err(fast_path::Miss::Removed)) {
+                stop_removed_owner(&mut owner).await.map_err(|_| {
+                    worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                })?;
+                return Err(worker.error(StatusCode::NOT_FOUND, "account_removed"));
+            } else if let Ok((token, alias)) = result {
                 return Ok((token, alias, account_id));
             } else if vault_fast && !matches!(result, Err(fast_path::Miss::Expiring)) {
                 return Err(worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable"));
@@ -1068,7 +1130,7 @@ pub(super) async fn token(
             worker
                 .ensure_owner_record(&mut owner)
                 .await
-                .map_err(|_| worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+                .map_err(|error| worker.storage_admission_failure(error))?;
             match central
                 .acquire_lease(
                     &account_id,
@@ -1078,6 +1140,12 @@ pub(super) async fn token(
                 .await
             {
                 Ok(lease) => Some(lease),
+                Err(error) if error.is::<crate::central::storage::AccountRemoved>() => {
+                    stop_removed_owner(&mut owner).await.map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
+                    return Err(worker.storage_admission_failure(error));
+                }
                 Err(_) => {
                     // A lease loser drops its locks and permit and waits for
                     // the holder outside this task. It counts no failure yet.
@@ -1139,6 +1207,15 @@ pub(super) async fn token(
             ).await;
             match result {
                 Err(fast_path::Miss::Expiring) => {}
+                Err(fast_path::Miss::Removed) => {
+                    stop_removed_owner(&mut owner).await.map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "owner_unavailable")
+                    })?;
+                    if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
+                        let _ = central.release_lease(lease).await;
+                    }
+                    return Err(worker.error(StatusCode::NOT_FOUND, "account_removed"));
+                }
                 result => {
                     if let (Some(central), Some(lease)) = (worker.central.as_ref(), lease.as_ref()) {
                         central.release_lease(lease).await.map_err(|_| {
@@ -1415,6 +1492,14 @@ pub(super) async fn token(
                 true
             };
             if !written || renew_lost.load(Ordering::Acquire) {
+                if let Some(central) = worker.central.as_ref()
+                    && stop_if_removed(central, &mut owner).await.map_err(|_| {
+                        worker.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed")
+                    })?
+                {
+                    retain_lease = false;
+                    return Err(worker.error(StatusCode::NOT_FOUND, "account_removed"));
+                }
                 retain_lease = true;
                 owner.available = false;
                 owner.routing_refused = true;
@@ -1445,10 +1530,20 @@ pub(super) async fn token(
             };
             Ok::<_, HttpError>((token, owner.vault.alias.trim().to_owned(), account_id.clone()))
         };
-        let result = lease_guarded_verification(native_work, renew_lost.clone(), lease_signal).await;
+        let mut result = lease_guarded_verification(native_work, renew_lost.clone(), lease_signal).await;
         if renew_lost.load(Ordering::Acquire) {
             terminate_lost_import(&mut owner).await;
             restore_after_settlement = false;
+        }
+        if result.is_err() && let Some(central) = worker.central.as_ref() {
+            match stop_if_removed(central, &mut owner).await {
+                Ok(true) => {
+                    retain_lease = false;
+                    result = Err(worker.error(StatusCode::NOT_FOUND, "account_removed"));
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("central token lifecycle: {error:#}"),
+            }
         }
         if retain_lease {
             let recovery = if restore_after_settlement {
@@ -1519,6 +1614,10 @@ pub(super) async fn token(
         )
         .await
         {
+            fast_path::Seen::Removed => {
+                fast_path::Wait::Refused.record(started.elapsed());
+                return Err(broker.error(StatusCode::NOT_FOUND, "account_removed"));
+            }
             fast_path::Seen::Committed => try_fast = true,
             fast_path::Seen::Released => try_fast = false,
             fast_path::Seen::Timeout => {
@@ -1715,7 +1814,7 @@ impl Broker {
         {
             self.ensure_owner_record(&mut owner)
                 .await
-                .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?;
+                .map_err(|error| self.storage_admission_failure(error))?;
             Some(
                 central
                     .acquire_lease(
@@ -1724,8 +1823,12 @@ impl Broker {
                         IMPORT_LEASE_TTL,
                     )
                     .await
-                    .map_err(|_| {
-                        self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                    .map_err(|error| {
+                        if error.is::<crate::central::storage::AccountRemoved>() {
+                            self.storage_admission_failure(error)
+                        } else {
+                            self.error(StatusCode::SERVICE_UNAVAILABLE, "refresh_in_progress")
+                        }
                     })?,
             )
         } else {
@@ -1922,6 +2025,28 @@ impl Broker {
             terminate_lost_import(&mut owner).await;
             renew_done.store(true, Ordering::Release);
         }
+        // Both a failed fenced publication and lease-loss cancellation can be
+        // definitive removal. Classify after stopping the old native work, and
+        // release custody only when that stop is positively proved.
+        let removed = if verification.is_err() {
+            match self.central.as_ref() {
+                Some(central) => match stop_if_removed(central, &mut owner).await {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        eprintln!("central migration lifecycle: {error:#}");
+                        verification =
+                            Err(self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"));
+                        false
+                    }
+                },
+                None => false,
+            }
+        } else {
+            false
+        };
+        if removed {
+            verification = Err(self.error(StatusCode::NOT_FOUND, "account_removed"));
+        }
         let restore_after_settlement = before.verified
             && !owner.routing_refused
             && !owner.rpc.as_ref().is_some_and(Rpc::rejected_login);
@@ -1935,7 +2060,7 @@ impl Broker {
         } else {
             SettlementRecovery::Fenced
         };
-        if verification.is_err() {
+        if verification.is_err() && !removed {
             owner.available = false;
             if verification_required {
                 // A failed import remains reserved for its original alias. It
@@ -1953,7 +2078,7 @@ impl Broker {
                 owner.retry_failures = 0;
             }
         }
-        if verification.is_err() && verification_lease.is_some() && !lease_lost {
+        if verification.is_err() && verification_lease.is_some() && !lease_lost && !removed {
             fence_background_owner(&mut owner);
             owner.import_settling = true;
             drop(owner);
@@ -1980,7 +2105,7 @@ impl Broker {
                 .await;
                 owner_ref.lock().await.import_settling = false;
             });
-        } else if lease_lost {
+        } else if lease_lost && !removed {
             // The lease is no longer live, so deferred settlement must not
             // retain or persist a child under the expired epoch.
             drop(owner);
@@ -2043,6 +2168,16 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
             return;
         }
         let mut owner = owner_ref.lock().await;
+        if let Some(central) = broker.central.as_ref() {
+            match stop_if_removed(central, &mut owner).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("central recovery lifecycle: {error:#}");
+                    continue;
+                }
+            }
+        }
         let pending = owner.rpc.as_ref().is_some_and(Rpc::completion_pending);
         let exited = owner.rpc.as_mut().is_some_and(Rpc::process_exited);
         if !owner.vault.verified
@@ -2087,6 +2222,9 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
             {
                 Ok(lease) => Some(lease),
                 Err(error) => {
+                    if error.is::<crate::central::storage::AccountRemoved>() {
+                        let _ = stop_removed_owner(&mut owner).await;
+                    }
                     eprintln!("central background owner lease: {error:#}");
                     continue;
                 }
@@ -2147,7 +2285,16 @@ async fn recover_owners(broker: &Broker, requested: Option<Arc<Mutex<Owner>>>) {
         let launched = {
             let imports = broker.imports.lock().await;
             let mut owner = owner_ref.lock().await;
-            if !owner.vault.verified
+            let lifecycle = match central.as_ref() {
+                Some(central) => stop_if_removed(central, &mut owner).await,
+                None => Ok(false),
+            };
+            if !matches!(lifecycle, Ok(false)) {
+                if let Err(error) = lifecycle {
+                    eprintln!("central recovery launch lifecycle: {error:#}");
+                }
+                None
+            } else if !owner.vault.verified
                 || owner.available
                 || !owner.retryable_unavailable
                 || owner.routing_refused

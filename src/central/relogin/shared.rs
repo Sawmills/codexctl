@@ -570,7 +570,9 @@ async fn start_for(
         failure_reported: false,
     };
     if !db.login_create(&op).await.map_err(|error| {
-        if error.is::<crate::central::storage::login::LoginAuthorityEnded>() {
+        if error.is::<crate::central::storage::AccountRemoved>() {
+            broker.error(StatusCode::NOT_FOUND, "account_removed")
+        } else if error.is::<crate::central::storage::login::LoginAuthorityEnded>() {
             broker.error(StatusCode::UNAUTHORIZED, "login_authority_ended")
         } else {
             failure(&broker)

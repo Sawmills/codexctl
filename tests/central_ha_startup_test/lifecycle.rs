@@ -1,0 +1,713 @@
+//! Tombstones are authoritative across warm owners, leases and restarts.
+use super::*;
+
+#[tokio::test]
+async fn postgres_catalog_keeps_other_accounts_when_removal_commits_after_alias_listing() {
+    let f = login_fixture().await;
+    // Preserve the list statement's MVCC snapshot while removal commits. A
+    // one-shot alias projection gates only the first listing of this account.
+    f.control
+        .batch_execute(&format!(
+            r#"
+        CREATE SEQUENCE {s}.catalog_selected;
+        CREATE FUNCTION {s}.hold_first_alias(a TEXT) RETURNS TEXT LANGUAGE plpgsql AS $$
+        BEGIN
+            IF a='seat' AND (SELECT NOT is_called FROM {s}.catalog_selected) THEN
+                PERFORM nextval('{s}.catalog_selected');
+                PERFORM pg_advisory_xact_lock(hashtextextended('{s}',13275));
+            END IF;
+            RETURN a;
+        END $$;
+        ALTER TABLE {s}.central_accounts RENAME TO stored_accounts;
+        CREATE VIEW {s}.central_accounts AS SELECT account_id,user_id,
+            {s}.hold_first_alias(alias) AS alias,workspace,login,encrypted_vault,
+            revision,deleted_at,updated_at FROM {s}.stored_accounts;
+    "#,
+            s = f.schema
+        ))
+        .await
+        .unwrap();
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',13275))",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let bearer = f.token.clone();
+    let pending = tokio::spawn(async move {
+        http.get(format!("{url}/v1/accounts"))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let selected: bool = f
+                .control
+                .query_one(
+                    &format!("SELECT is_called FROM {}.catalog_selected", f.schema),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if selected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stage: active alias list must select seat before removal");
+    f.control
+        .batch_execute(&format!(
+            "UPDATE {}.stored_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'; COMMIT",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let response = timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        200,
+        "removal must not fail the whole catalog"
+    );
+    let accounts: Vec<Value> = response.json().await.unwrap();
+    assert!(!accounts.iter().any(|account| account["alias"] == "seat"));
+    assert!(accounts.iter().any(|account| account["alias"] == "other"));
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_background_recovery_still_stops_an_unsettled_child_during_lifecycle_outage() {
+    let mut f = login_fixture_with_expiry(false, false, false, 1).await;
+    f.first.stop().await;
+    store::atomic_write(&f.first.root.path().join("retry-clock"), b"100000").unwrap();
+    f.first = Pod::spawn_with_recovery(&f.database, &f.key, f.first.root, "postgres", true).await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"billing-error-marked").unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    store::atomic_write(
+        &f.first.root.path().join("mode"),
+        b"owner-native-hung-journal",
+    )
+    .unwrap();
+    store::atomic_write(&f.first.root.path().join("retry-clock"), b"1000000").unwrap();
+    timeout(Duration::from_secs(8), async {
+        while !f.first.root.path().join("native-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stage: background recovery must start its native probe");
+    let pid: i32 = std::fs::read_to_string(f.first.root.path().join("native-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.central_accounts IN ACCESS EXCLUSIVE MODE",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let stopped = timeout(Duration::from_secs(55), async {
+        loop {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    f.control.batch_execute("ROLLBACK").await.unwrap();
+    assert!(
+        stopped.is_ok(),
+        "stage: unavailable lifecycle reads must not bypass bounded recovery settlement"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_removal_during_migration_verification_refuses_publication_and_keeps_evidence() {
+    let f = login_fixture().await;
+    store::atomic_write(&f.first.root.path().join("mode"), b"owner-native-hold").unwrap();
+    let http = f.http.clone();
+    let url = f.first.url.clone();
+    let bearer = f.token.clone();
+    let pending = tokio::spawn(async move {
+        http.post(format!("{url}/v1/accounts"))
+            .bearer_auth(bearer)
+            .json(&json!({"alias":"seat","auth":renewal_grant()}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(5), async {
+        while !f.first.root.path().join("native-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stage: migration verification must reach the native read");
+    let pid: u32 = std::fs::read_to_string(f.first.root.path().join("native-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    store::atomic_write(&f.first.root.path().join("native-release"), b"1").unwrap();
+    let response = timeout(Duration::from_secs(5), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        404,
+        "removed verification must preserve the lifecycle result"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    wait_dead(pid).await;
+    let retained = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "seat"));
+    assert!(retained.join("vault.enc").exists());
+    assert!(retained.join("runtime/auth.json").exists());
+    assert_eq!(f.first.launches(), 1);
+    assert_eq!(request(&f.http, &f.second, &f.token).await.status(), 404);
+    assert_eq!(f.second.launches(), 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_lifecycle_outage_cannot_keep_an_unsettled_child_past_lease_custody() {
+    let f = login_fixture().await;
+    store::atomic_write(
+        &f.first.root.path().join("mode"),
+        b"owner-native-hung-journal",
+    )
+    .unwrap();
+    let response = timeout(
+        Duration::from_secs(13),
+        request(&f.http, &f.first, &f.token),
+    )
+    .await
+    .expect("stage: foreground native deadline");
+    assert_eq!(response.status(), 503);
+    let pid: i32 = std::fs::read_to_string(f.first.root.path().join("native-pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "unsettled child must still be live"
+    );
+    // Block both authority reads and lease renewal. No provider response or
+    // token request can perform cleanup while the local custody clock expires.
+    f.control
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.central_accounts IN ACCESS EXCLUSIVE MODE",
+            f.schema
+        ))
+        .await
+        .unwrap();
+    let stopped = timeout(Duration::from_secs(125), async {
+        loop {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    f.control.batch_execute("ROLLBACK").await.unwrap();
+    assert!(
+        stopped.is_ok(),
+        "stage: metadata outage must not bypass custody expiry"
+    );
+    assert!(
+        f.first
+            .root
+            .path()
+            .join("state/accounts")
+            .join(account_key("test", "seat"))
+            .join("vault.enc")
+            .exists()
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_removal_during_admission_refuses_token_and_renewal_without_starting_a_child() {
+    for renewal in [false, true] {
+        let f = login_fixture().await;
+        f.control
+            .batch_execute(&format!(
+                "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('{}',12484))",
+                f.schema
+            ))
+            .await
+            .unwrap();
+        let blocker: i32 = f
+            .control
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let http = f.http.clone();
+        let url = f.first.url.clone();
+        let bearer = f.token.clone();
+        let pending = tokio::spawn(async move {
+            let (path, body) = if renewal {
+                (
+                    "/v1/relogin/start",
+                    json!({"alias":"seat","id":"bc".repeat(32)}),
+                )
+            } else {
+                ("/v1/token", json!({"alias":"seat","billing":true}))
+            };
+            http.post(format!("{url}{path}"))
+                .bearer_auth(bearer)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        });
+        timeout(Duration::from_secs(4), async {
+            loop {
+                let waiting: bool = f.control.query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE NOT granted AND $1=ANY(pg_blocking_pids(pid)))", &[&blocker]
+                ).await.unwrap().get(0);
+                if waiting { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("stage: request must reach shared admission before removal");
+        f.control.batch_execute(&format!(
+            "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'; COMMIT", f.schema
+        )).await.unwrap();
+        let response = timeout(Duration::from_secs(4), pending)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "removal must win admission, renewal={renewal}"
+        );
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "account_removed"
+        );
+        assert_eq!(f.first.launches(), 0);
+        assert!(!f.first.root.path().join("login-pid").exists());
+        stop_fixture(f).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_removed_account_stops_deferred_settlement_and_releases_stopped_custody() {
+    let f = login_fixture().await;
+    f.control
+        .batch_execute(&format!(
+            r#"
+        CREATE SEQUENCE {s}.publication_attempt;
+        CREATE FUNCTION {s}.reject_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF NEW.revision > OLD.revision THEN
+                PERFORM nextval('{s}.publication_attempt');
+                RAISE EXCEPTION 'synthetic publication failure';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER reject_publication BEFORE UPDATE ON {s}.central_accounts
+        FOR EACH ROW EXECUTE FUNCTION {s}.reject_publication();
+    "#,
+            s = f.schema
+        ))
+        .await
+        .unwrap();
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 503);
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let attempts: i64 = f
+                .control
+                .query_one(
+                    &format!("SELECT last_value FROM {}.publication_attempt", f.schema),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if attempts >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stage: deferred publication must enter retry");
+    let launches = f.first.launches();
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    // Observe settlement without another token request performing cleanup.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let released: bool = f
+                .control
+                .query_one(
+                    &format!(
+                        "SELECT released FROM {}.account_refresh_leases WHERE account_id=$1",
+                        f.schema
+                    ),
+                    &[&account_key("test", "seat")],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if released {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("stage: removed settlement must stop and release proved-stopped custody");
+    for pod in [&f.first, &f.second] {
+        let response = request(&f.http, pod, &f.token).await;
+        assert_eq!(response.status(), 404);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "account_removed"
+        );
+    }
+    assert_eq!(f.first.launches(), launches);
+    assert_eq!(f.second.launches(), 0);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_removed_account_cannot_start_renewal_or_be_imported_from_stale_local_state() {
+    let f = login_fixture().await;
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let renew = f
+        .http
+        .post(format!("{}/v1/relogin/start", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","id":"ae".repeat(32)}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        renew.status(),
+        404,
+        "renewal must refuse before device polling starts"
+    );
+    assert_eq!(
+        renew.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    let imported = f
+        .http
+        .post(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"seat","auth":renewal_grant()}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        imported.status(),
+        404,
+        "a stale local owner cannot re-import the removed account"
+    );
+    assert_eq!(
+        imported.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    assert_eq!(f.first.launches(), 0);
+    assert!(!f.first.root.path().join("login-pid").exists());
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_removed_account_ends_a_lease_wait_without_waiting_for_expiry() {
+    let f = enable_fast_path(login_fixture().await).await;
+    let warm = request(&f.http, &f.first, &f.token).await;
+    assert_eq!(warm.status(), 200);
+    let warm = warm.json::<Value>().await.unwrap();
+    let revision = warm["revision"].as_str().unwrap().to_owned();
+    let account = account_key("test", "seat");
+    f.control.execute(&format!("UPDATE {}.account_refresh_leases SET holder_id='foreign',epoch=epoch+1,expires_at=clock_timestamp()+interval '1 hour',released=false WHERE account_id=$1",f.schema),&[&account]).await.unwrap();
+    f.control.batch_execute(&format!(
+        "CREATE TABLE {s}.claim_attempts(account_id TEXT); \
+         CREATE FUNCTION {s}.mark_claim() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO {s}.claim_attempts VALUES(NEW.account_id); RETURN NEW; END $$; \
+         CREATE TRIGGER mark_claim BEFORE INSERT ON {s}.account_refresh_leases FOR EACH ROW EXECUTE FUNCTION {s}.mark_claim()",s=f.schema
+    )).await.unwrap();
+    let http = f.http.clone();
+    let url = f.second.url.clone();
+    let token = f.token.clone();
+    let pending = tokio::spawn(async move {
+        http.post(format!("{url}/v1/token"))
+            .bearer_auth(token)
+            .json(&json!({"alias":"seat","previousRevision":revision,"billing":true}))
+            .send()
+            .await
+            .unwrap()
+    });
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let count: i64 = f
+                .control
+                .query_one(
+                    &format!("SELECT count(*) FROM {}.claim_attempts", f.schema),
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if count > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stage: waiting caller must attempt the lease claim");
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE account_id=$1",
+                f.schema
+            ),
+            &[&account],
+        )
+        .await
+        .unwrap();
+    let response = timeout(Duration::from_secs(5), pending)
+        .await
+        .expect("stage: Removed must end the foreign-lease wait promptly")
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    assert_eq!(
+        f.second.launches(),
+        0,
+        "a waiter cannot replace the foreign refresh child"
+    );
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_removed_account_refuses_both_committed_token_fast_paths() {
+    for vault in [false, true] {
+        let f = if vault {
+            login_fixture_in_database(false, false, false, 4102444800, true).await
+        } else {
+            login_fixture().await
+        };
+        let mut f = enable_fast_path(f).await;
+        if vault {
+            f.first.stop().await;
+            store::atomic_write(&f.first.root.path().join("vault-fast-path"), b"1").unwrap();
+            let root = std::mem::replace(&mut f.first.root, tempfile::tempdir().unwrap());
+            f.first = Pod::spawn(&f.database, &f.key, root, "postgres").await;
+        }
+        let warm = f
+            .http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            warm.status(),
+            200,
+            "valid active fast-path account, vault={vault}"
+        );
+        let launches = f.first.launches();
+        f.control.execute(&format!("UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",f.schema),&[]).await.unwrap();
+        let response = f
+            .http
+            .post(format!("{}/v1/token", f.first.url))
+            .bearer_auth(&f.token)
+            .json(&json!({"alias":"seat","billing":false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "fast path must preserve Removed, vault={vault}"
+        );
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "account_removed"
+        );
+        assert_eq!(f.first.launches(), launches);
+        stop_fixture(f).await;
+    }
+}
+
+#[tokio::test]
+async fn postgres_removed_account_is_hidden_from_warm_catalog_and_stale_local_restart() {
+    let mut f = login_fixture().await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    for stage in ["warm", "stopped restart", "unproven restart"] {
+        if stage != "warm" {
+            f.first.stop().await;
+            if stage == "unproven restart" {
+                let home = f
+                    .first
+                    .root
+                    .path()
+                    .join("state/accounts")
+                    .join(account_key("test", "seat"))
+                    .join("runtime");
+                store::ensure_private_dir(&home).unwrap();
+                store::atomic_write(&home.join("pid"), b"unreadable process evidence").unwrap();
+            }
+            let root = std::mem::replace(&mut f.first.root, tempfile::tempdir().unwrap());
+            f.first = Pod::spawn(&f.database, &f.key, root, "postgres").await;
+            assert_eq!(
+                f.first.launches(),
+                0,
+                "stale local vault cannot launch a removed account"
+            );
+        }
+        let response = f
+            .http
+            .get(format!("{}/v1/accounts", f.first.url))
+            .bearer_auth(&f.token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let accounts: Vec<Value> = response.json().await.unwrap();
+        assert!(
+            !accounts.iter().any(|a| a["alias"] == "seat"),
+            "removed account leaked from catalog, stage={stage}"
+        );
+        assert!(accounts.iter().any(|a| a["alias"] == "other"));
+        if stage == "unproven restart" {
+            let pid = f
+                .first
+                .root
+                .path()
+                .join("state/accounts")
+                .join(account_key("test", "seat"))
+                .join("runtime/pid");
+            assert_eq!(std::fs::read(pid).unwrap(), b"unreadable process evidence");
+        }
+    }
+    let row = f
+        .control
+        .query_one(
+            &format!(
+                "SELECT deleted_at IS NOT NULL FROM {}.central_accounts WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(row.get::<_, bool>(0), "startup must preserve the tombstone");
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
+async fn postgres_removed_account_refuses_a_warm_owner_without_disabling_other_accounts() {
+    let f = login_fixture().await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    let launches = f.first.launches();
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let response = request(&f.http, &f.first, &f.token).await;
+    assert_eq!(
+        response.status(),
+        404,
+        "a removed account is a definitive refusal"
+    );
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"],
+        "account_removed"
+    );
+    assert_eq!(
+        f.first.launches(),
+        launches,
+        "removal cannot launch a refresh child"
+    );
+    let other = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"other","billing":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other.status(), 200, "removal is scoped to one account");
+    stop_fixture(f).await;
+}

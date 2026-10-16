@@ -816,6 +816,19 @@ impl CentralStore {
             let tx = connection.transaction().await?;
             let _timing = identity::lock_admission(&tx).await?;
             if !authority_live(&tx, &op.user, &op.authority).await? { bail!(LoginAuthorityEnded); }
+            // Renewal admission must not start native polling for a removed
+            // account. Add intentionally has no selected account yet.
+            if let Some(account) = op.account_id.as_ref() {
+                let row = tx.query_opt(
+                    "SELECT deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1 AND user_id=$2",
+                    &[account, &op.user],
+                ).await?;
+                match row {
+                    Some(row) if row.get::<_, bool>(0) => bail!(super::AccountRemoved),
+                    Some(_) => {}
+                    None => bail!("renewal account missing"),
+                }
+            }
             let created = tx.execute("INSERT INTO central_login_operations(user_id,id,account_id,alias,device_id,phase,holder_id,expires_at,encrypted_payload,kind,browser_session_hash) SELECT $1,$2,$3,$4,$5,'starting',$6,clock_timestamp()+interval '30 seconds',$7,$8,$9 WHERE EXISTS(SELECT 1 FROM central_login_holders WHERE holder_id=$6 AND deleted_at IS NULL AND expires_at>clock_timestamp()) ON CONFLICT DO NOTHING",
                 &[&op.user,&op.id,&op.account_id,&op.alias,&op.authority.parts().0,&op.holder,&encrypted,&op.kind.as_str(),&op.authority.parts().1]).await? == 1;
             if created { audit_login(&tx, op, "start", "ok:started").await?; }

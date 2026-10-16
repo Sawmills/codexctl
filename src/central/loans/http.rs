@@ -277,11 +277,11 @@ impl Broker {
             .filter(|central| central.mode() != StoreMode::File)
         {
             Some(central) => match central
-                .load_account_by_alias(&grant.lender, &grant.alias)
+                .account_by_alias_state(&grant.lender, &grant.alias)
                 .await
                 .map_err(|_| self.error(StatusCode::SERVICE_UNAVAILABLE, "persistence_failed"))?
             {
-                Some(record) => {
+                crate::central::storage::AccountState::Active(record) => {
                     shared_subject = serde_json::from_value::<vault::Vault>(record.vault)
                         .ok()
                         .and_then(|vault| {
@@ -292,7 +292,8 @@ impl Broker {
                         });
                     false
                 }
-                None => true,
+                crate::central::storage::AccountState::Removed
+                | crate::central::storage::AccountState::Missing => true,
             },
             None => false,
         };

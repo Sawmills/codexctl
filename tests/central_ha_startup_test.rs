@@ -19,6 +19,9 @@ mod noinit;
 #[path = "central_ha_startup_test/storage_fixture.rs"]
 mod storage_fixture;
 
+#[path = "central_ha_startup_test/lifecycle.rs"]
+mod lifecycle;
+
 struct Pod {
     child: Child,
     root: tempfile::TempDir,
