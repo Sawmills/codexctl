@@ -2,6 +2,144 @@
 use super::*;
 
 #[tokio::test]
+async fn postgres_removed_account_with_unidentified_login_blocks_replacements_after_restart() {
+    let mut f = login_fixture().await;
+    assert_eq!(request(&f.http, &f.first, &f.token).await.status(), 200);
+    f.first.stop().await;
+    let account = f
+        .first
+        .root
+        .path()
+        .join("state/accounts")
+        .join(account_key("test", "seat"));
+    let runtime = std::fs::read(account.join("runtime/pid")).unwrap();
+    let operation = "de".repeat(32);
+    let journal = account.join("relogin").join(&operation);
+    store::ensure_private_dir(&journal).unwrap();
+    // A real live broker identity with durable spawn intent but no child PID
+    // cannot prove which login identity the unfinished child may hold.
+    let pid = std::process::id();
+    #[cfg(target_os = "linux")]
+    let incarnation = {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let fields: Vec<_> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        format!(
+            "{}:{}:{}",
+            std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap()
+                .trim(),
+            std::fs::read_link(format!("/proc/{pid}/ns/pid"))
+                .unwrap()
+                .display(),
+            fields[19]
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let incarnation = String::from_utf8(
+        Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .output()
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let evidence = serde_json::to_vec(&json!({
+        "sequence":1,"id":operation,"user":"test","device":"test-machine","alias":"seat",
+        "broker":{"pid":pid,"incarnation":incarnation},"child":{"status":"spawning"},
+        "original_revision":"synthetic","candidate_revision":null,"candidate":null,
+        "phase":"pending","code":null,"error":null,"retired":false
+    }))
+    .unwrap();
+    store::atomic_write(&journal.join("record.json"), &evidence).unwrap();
+    // The latest receipt is terminal, but complete inventory must still inspect
+    // an older non-retired child. The shared-mode preflight reads the latest.
+    let terminal_id = "df".repeat(32);
+    let terminal_home = account.join("relogin").join(&terminal_id);
+    store::ensure_private_dir(&terminal_home).unwrap();
+    let mut terminal: Value = serde_json::from_slice(&evidence).unwrap();
+    terminal["sequence"] = json!(2);
+    terminal["id"] = json!(terminal_id);
+    terminal["child"] = json!({"status":"exited"});
+    terminal["phase"] = json!("canceled");
+    terminal["retired"] = json!(true);
+    store::atomic_write(
+        &terminal_home.join("record.json"),
+        &serde_json::to_vec(&terminal).unwrap(),
+    )
+    .unwrap();
+    f.control
+        .execute(
+            &format!(
+                "UPDATE {}.central_accounts SET deleted_at=clock_timestamp() WHERE alias='seat'",
+                f.schema
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let root = std::mem::replace(&mut f.first.root, tempfile::tempdir().unwrap());
+    f.first = Pod::spawn(&f.database, &f.key, root, "postgres").await;
+    let response = f
+        .http
+        .get(format!("{}/metrics", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let metrics = response.text().await.unwrap();
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line
+                == "codexctl_central_ownership_unresolved{reason=\"recovery_failed\"} 1"),
+        "removed account's unidentified login must retain the startup ownership fence: {metrics}"
+    );
+    let response = f
+        .http
+        .get(format!("{}/v1/accounts", f.first.url))
+        .bearer_auth(&f.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let accounts: Vec<Value> = response.json().await.unwrap();
+    assert!(!accounts.iter().any(|a| a["alias"] == "seat"));
+    assert_eq!(
+        accounts.iter().find(|a| a["alias"] == "other").unwrap()["available"],
+        false
+    );
+    let response = f
+        .http
+        .post(format!("{}/v1/token", f.first.url))
+        .bearer_auth(&f.token)
+        .json(&json!({"alias":"other","billing":false}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 503);
+    assert_eq!(
+        f.first.launches(),
+        0,
+        "startup/request must not launch a replacement against unresolved inventory"
+    );
+    assert_eq!(
+        std::fs::read(journal.join("record.json")).unwrap(),
+        evidence
+    );
+    assert_eq!(std::fs::read(account.join("runtime/pid")).unwrap(), runtime);
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
 async fn postgres_warm_catalog_batches_lifecycle_reads_and_refuses_database_errors() {
     let f = login_fixture().await;
     // Listing and the cached physical alias may differ only in ASCII case.

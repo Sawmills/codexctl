@@ -2634,24 +2634,24 @@ pub async fn serve(
             relogin::identity_inventory(&entry.path(), key, &entry.path().join("runtime"));
         let journal_conflicts = inventory.journal_conflicts();
         let stopped = inventory.runtime == relogin::ProcessState::Stopped;
-        if matches!(
-            startup_lifecycles.get(entry.file_name().to_string_lossy().as_ref()),
-            Some(super::storage::AccountState::Removed)
-        ) {
-            // Retain the entire runtime/journal. An unproven old child can still
-            // overlap another identity, so it fences replacements globally.
-            if !stopped {
-                replacements_blocked = true;
-                ownership_unresolved = true;
-            }
-            continue;
-        }
         match inventory.candidates {
             Ok(candidates) => conflicting_journals.extend(candidates.into_iter().map(|c| c.auth)),
             Err(_) => {
                 replacements_blocked = true;
                 ownership_unresolved = true;
             }
+        }
+        if matches!(
+            startup_lifecycles.get(entry.file_name().to_string_lossy().as_ref()),
+            Some(super::storage::AccountState::Removed)
+        ) {
+            // Exclusion is not proof that retained login or journal evidence
+            // cannot overlap another account. Keep incomplete inventory fenced.
+            if !stopped || journal_conflicts {
+                replacements_blocked = true;
+                ownership_unresolved = true;
+            }
+            continue;
         }
         let stored = inventory.saved;
         let account_vault = match stored {
