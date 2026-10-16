@@ -22,6 +22,9 @@ mod storage_fixture;
 #[path = "central_ha_startup_test/lifecycle.rs"]
 mod lifecycle;
 
+#[path = "central_ha_startup_test/teardown.rs"]
+mod teardown;
+
 struct Pod {
     child: Child,
     root: tempfile::TempDir,
@@ -1228,7 +1231,8 @@ async fn login_fixture_in_database(
     let mut database = reqwest::Url::parse(&database).unwrap();
     database
         .query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
+        .append_pair("options", &format!("-csearch_path={schema}"))
+        .append_pair("application_name", &schema);
 
     let state = root.path().join("state");
     let key = root.path().join("key");
@@ -1376,6 +1380,40 @@ async fn login_alias_request(
 async fn stop_fixture(mut f: LoginFixture) {
     f.first.stop().await;
     f.second.stop().await;
+    // PostgreSQL may still be executing a request after its server has exited.
+    // Join only this fixture's tagged backends before taking DROP's DDL locks.
+    f.control
+        .query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+             WHERE datname=current_database() AND application_name=$1 \
+             AND pid<>pg_backend_pid()",
+            &[&f.schema],
+        )
+        .await
+        .unwrap();
+    // A backend may exit between the activity snapshot and termination. Its
+    // absence, rather than the termination boolean, proves cleanup completed.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let remaining: bool = f
+                .control
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
+                 WHERE datname=current_database() AND application_name=$1 \
+                 AND pid<>pg_backend_pid())",
+                    &[&f.schema],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if !remaining {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("fixture backends must exit before DROP SCHEMA");
     f.control
         .batch_execute(&format!("DROP SCHEMA {} CASCADE", f.schema))
         .await
