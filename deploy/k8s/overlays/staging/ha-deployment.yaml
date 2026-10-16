@@ -98,13 +98,33 @@ spec:
             - { name: projected, mountPath: /projected, readOnly: true }
             - { name: keys, mountPath: /keys }
         - name: initialize
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:415d6a9a9e977aac729fa4711b3c353e549a4cde78d52a5968af535096a60536
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b1b1cc38ab45e882db4a25f71a171f203938da3e329372a2d1ac90b10fa2822f
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
             [
-              "if [ ! -f /data/state/users.json ]; then codexctl-central setup --state /data/state --key-file /keys/vault-key; fi",
+              "if [ ! -f /data/state/users.json ]; then codexctl-central setup --state /data/state --key-file /keys/vault-key; fi; codexctl-central migrate --state /data/state --key-file /keys/vault-key",
             ]
+          env:
+            - name: CODEXCTL_CENTRAL_STORE
+              value: postgres
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef: { name: codexctl-postgres, key: db-hostname }
+            - name: DB_PORT
+              valueFrom:
+                secretKeyRef: { name: codexctl-postgres, key: db-port }
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef: { name: codexctl-postgres, key: db-name }
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef: { name: codexctl-postgres, key: db-user }
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: codexctl-postgres, key: db-password }
+            - name: CODEXCTL_CENTRAL_DB_CA_FILE
+              value: /etc/codexctl/rds-ca/global-bundle.pem
           securityContext:
             {
               allowPrivilegeEscalation: false,
@@ -114,12 +134,13 @@ spec:
           volumeMounts:
             - { name: keys, mountPath: /keys, readOnly: true }
             - { name: state, mountPath: /data }
+            - { name: rds-ca, mountPath: /etc/codexctl/rds-ca, readOnly: true }
           resources:
             requests: { cpu: 10m, memory: 32Mi }
             limits: { cpu: 100m, memory: 64Mi }
       containers:
         - name: broker
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:415d6a9a9e977aac729fa4711b3c353e549a4cde78d52a5968af535096a60536
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:b1b1cc38ab45e882db4a25f71a171f203938da3e329372a2d1ac90b10fa2822f
           imagePullPolicy: Always
           command: [sh, -ec]
           args:

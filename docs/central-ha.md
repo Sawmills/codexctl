@@ -872,7 +872,7 @@ for the full budget. Earlier DDL in that transaction rolls back on failure.
 A table-lock timeout emits a fixed JSON diagnostic with operation
 `schema_migration`, stage `ddl`, failure class `lock_timeout` and SQLSTATE
 `55P03`; it includes no SQL text, parameters or account identifiers. The command
-exits nonzero and does not retry internally. An operator or a future HA init
+exits nonzero and does not retry internally. An operator or an HA init
 container may run a new attempt after contention clears. Maintenance requiring
 drained writers still requires that separate procedure and approval.
 
@@ -881,6 +881,40 @@ the image containing this timeout, then review the initializer and matching pin
 in both overlays. Do not enable that rollout on an older image. Avoiding all
 repeat DDL with an applied-schema fingerprint is a follow-up under SAW-12757;
 the schema version alone cannot distinguish additive migrations within layout 8.
+
+### Ongoing HA schema upgrades after cutover
+
+Each HA pod runs `setup` for its empty local state, then runs
+`codexctl-central migrate` before the broker can start. The `initialize` container
+uses the broker's image, PostgreSQL Secret references, vault key and read-only RDS
+CA bundle. Both the tracked staging overlay and render-only `staging-ha` overlay
+carry this ordering. `serve` itself does not apply schema changes.
+
+Migration runs even when local state exists or schema version 8 is already
+recorded: additive upgrades such as `browser_sessions.auth_time_verified` and
+`dashboard_audit` intentionally retain version 8. DDL is transactional and
+serialized by the schema-scoped admission lock. A completed identity migration
+stays completed; ordinary repeat runs do not backfill credentials or settle
+legacy owners. Migration errors, lock timeouts or unsupported future schema
+versions leave that pod in init rather than starting a broker on a partial schema.
+Kubernetes can retry initialization after the cause is corrected.
+
+Roll only from three healthy replicas with the existing `maxSurge: 0` and
+`maxUnavailable: 1`; if a replacement cannot initialize, the two old replicas
+remain available. Keep at least two Ready during the roll, inspect each new
+initializer's exit status, and finish with three Ready across zones. Verify
+dashboard sign-in and a synthetic machine Revoke with its audit row after the
+roll. Readiness alone does not prove a dashboard schema is complete. Preserve
+the 2-second DB operation budget; do not conceal lock contention with an
+unbounded retry or raise the budget to force a rollout through.
+
+This startup path covers compatible additive upgrades on the completed HA
+layout. A migration requiring drained writers or a destructive change still
+needs its own reviewed maintenance procedure; do not use a rolling restart as
+that authorization. Never replay historical backfill Jobs for an ordinary image
+upgrade. Rollback is a reviewed manifest/image revert that leaves compatible
+additive schema objects intact, not a schema downgrade or DB reset. Rollout
+still requires HQ GO and the designated executor's watch and acceptance.
 
 ## 6. Test and acceptance plan
 

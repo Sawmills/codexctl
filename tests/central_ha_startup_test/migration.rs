@@ -1,30 +1,6 @@
 //! Exercise the migration command that HA initializers will run.
 use super::*;
 
-async fn old_pods_serve(f: &BrowserFixture, session: &str) {
-    for pod in [&f.first, &f.second] {
-        assert_eq!(
-            f.http
-                .get(format!("{}/ready", pod.url))
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
-        assert_eq!(
-            f.http
-                .get(format!("{}/accounts/data", pod.url))
-                .header("cookie", session)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
-    }
-}
-
 fn assert_bounded_lock_timeout(stderr: &[u8]) {
     let stderr = String::from_utf8_lossy(stderr);
     let logs: Vec<_> = stderr
