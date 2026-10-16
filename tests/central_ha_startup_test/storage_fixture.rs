@@ -205,14 +205,19 @@ mod tests {
         let hold = first_observer.join("backfill.hold");
         std::fs::write(&hold, b"hold first preparation").unwrap();
         let mut first_call = Box::pin(prepare(&first.database, &first.state, &first.key));
-        let observation = async {
+        // Includes waiting behind the other parallel fixtures, before the CLI budget.
+        let observation = timeout(Duration::from_secs(120), async {
             while !first_observer.join("backfill.started").exists() {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-        };
+        });
         tokio::select! {
             _ = first_call.as_mut() => panic!("first preparation completed before the controlled hold"),
-            _ = observation => {}
+            observed = observation => observed.unwrap_or_else(|_| panic!(
+                "stage=first_prepare_backfill_launch timed out: preparation=pending migrate_started={} backfill_started={}",
+                first_observer.join("migrate.started").exists(),
+                first_observer.join("backfill.started").exists(),
+            )),
         }
         assert!(first_observer.join("migrate.started").exists());
         let mut next_call = Box::pin(prepare(&next.database, &next.state, &next.key));
