@@ -7,7 +7,10 @@ use aes_gcm::{
 use codexctl::{central, store};
 use serde_json::json;
 use std::{path::PathBuf, process::Output};
-use tokio::process::Command;
+use tokio::{
+    process::Command,
+    sync::{OnceCell, Semaphore, SemaphorePermit},
+};
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -15,6 +18,7 @@ struct Fixture {
     control: tokio_postgres::Client,
     connection: tokio::task::JoinHandle<()>,
     schema: String,
+    _slot: SemaphorePermit<'static>,
 }
 
 impl Fixture {
@@ -42,6 +46,10 @@ impl Fixture {
     }
 
     async fn in_named_database(name: Option<&str>) -> Self {
+        // Migrations also take a database-wide loan DDL lock. Keep fixture work
+        // outside the CLI budget until the prior schema has been cleaned up.
+        static SLOT: Semaphore = Semaphore::const_new(1);
+        let slot = SLOT.acquire().await.unwrap();
         let mut database = std::env::var("DATABASE_URL").expect("DATABASE_URL required");
         let test_url = reqwest::Url::parse(&database).unwrap();
         assert!(
@@ -52,23 +60,35 @@ impl Fixture {
             "database fixtures require a loopback test server"
         );
         if let Some(name) = name {
-            assert!(matches!(name, "codexctl_a5" | "codexctl_a5_canary"));
-            let (admin, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
-                .await
-                .unwrap();
-            let connection = tokio::spawn(async move { connection.await.unwrap() });
-            if let Err(error) = admin
-                .batch_execute(&format!("CREATE DATABASE {name}"))
-                .await
-            {
-                // Concurrent same-name creation may lose the pg_database
-                // unique-index race instead of the preliminary name check.
-                assert!(
-                    error.code() == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
-                        || error.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
-                );
-            }
-            connection.abort();
+            static A5: OnceCell<()> = OnceCell::const_new();
+            static CANARY: OnceCell<()> = OnceCell::const_new();
+            let prepared = match name {
+                "codexctl_a5" => &A5,
+                "codexctl_a5_canary" => &CANARY,
+                _ => panic!("unsupported backfill test database"),
+            };
+            prepared
+                .get_or_init(|| async {
+                    let (admin, connection) =
+                        tokio_postgres::connect(&database, tokio_postgres::NoTls)
+                            .await
+                            .unwrap();
+                    let connection = tokio::spawn(async move { connection.await.unwrap() });
+                    if let Err(error) = admin
+                        .batch_execute(&format!("CREATE DATABASE {name}"))
+                        .await
+                    {
+                        // Another test process may have created the same named DB.
+                        assert!(
+                            error.code()
+                                == Some(&tokio_postgres::error::SqlState::DUPLICATE_DATABASE)
+                                || error.code()
+                                    == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION)
+                        );
+                    }
+                    connection.abort();
+                })
+                .await;
             let mut url = reqwest::Url::parse(&database).unwrap();
             url.set_path(&format!("/{name}"));
             database = url.to_string();
@@ -99,6 +119,7 @@ impl Fixture {
             control,
             connection,
             schema,
+            _slot: slot,
         };
         central::managed::setup(&fixture.state(), &fixture.root.path().join("key")).unwrap();
         fixture.write_users(true);
@@ -193,8 +214,16 @@ impl Fixture {
     }
 
     async fn backfill_with_exception(&self, scan_exception: Option<&str>) -> Output {
+        self.backfill_command(scan_exception)
+            .output()
+            .await
+            .unwrap()
+    }
+
+    fn backfill_command(&self, scan_exception: Option<&str>) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl-central"));
         command
+            .kill_on_drop(true)
             .arg("backfill")
             .arg("--state")
             .arg(self.state())
@@ -207,7 +236,7 @@ impl Fixture {
         if let Some(scan_exception) = scan_exception {
             command.arg("--scan-exception").arg(scan_exception);
         }
-        command.output().await.unwrap()
+        command
     }
 
     async fn finish(self) {
@@ -217,6 +246,19 @@ impl Fixture {
             .unwrap();
         self.connection.abort();
     }
+}
+
+fn assert_backfill_failure(stderr: &str, stage: &str) {
+    let diagnostics: Vec<serde_json::Value> = stderr
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|value| value["operation"] == "backfill")
+        .collect();
+    assert_eq!(
+        diagnostics,
+        vec![json!({"operation":"backfill","stage":stage,"reason":"failed"})],
+        "backfill must report its failing stage exactly once without row data: {stderr}",
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1096,6 +1138,245 @@ async fn postgres_h_exception_refuses_canary_before_even_the_count_probe() {
     assert!(
         !error.contains("central_users") && !error.contains("50001"),
         "scope must precede the count probe: {error}"
+    );
+    assert_backfill_failure(&error, "authorization");
+}
+
+#[tokio::test]
+async fn postgres_backfill_reports_the_migration_stage_when_the_loan_schema_lock_is_held() {
+    let fixture = Fixture::in_named_database(Some("codexctl_a5_canary")).await;
+    if chrono::Utc::now().date_naive() > chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap() {
+        fixture.finish().await;
+        return;
+    }
+    fixture
+        .control
+        .batch_execute(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('codexctl.account_loans.schema'))",
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fixture.backfill_with_exception(Some("b33-a5-canary")),
+    )
+    .await
+    .expect("held migration lock must refuse promptly");
+    fixture.control.batch_execute("ROLLBACK").await.unwrap();
+    let recovered = fixture.backfill_with_exception(Some("b33-a5-canary")).await;
+    fixture.finish().await;
+
+    assert!(!result.status.success());
+    assert!(
+        result.stdout.is_empty(),
+        "failed backfill must not issue a receipt"
+    );
+    let error = String::from_utf8(result.stderr).unwrap();
+    assert!(
+        error.contains("migrate central PostgreSQL schema"),
+        "{error}"
+    );
+    assert_backfill_failure(&error, "schema_migration");
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&recovered.stdout).unwrap();
+    assert_eq!(
+        receipt["inventory"]["central_users"],
+        json!({"source":1,"target_before":0,"target":1})
+    );
+}
+
+#[tokio::test]
+async fn postgres_backfill_fixture_waits_outside_the_cli_deadline_until_prior_cleanup() {
+    let first = Fixture::in_named_database(Some("codexctl_a5_canary")).await;
+    if chrono::Utc::now().date_naive() > chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap() {
+        first.finish().await;
+        return;
+    }
+    first
+        .control
+        .batch_execute(
+            "BEGIN; SELECT pg_advisory_xact_lock(hashtext('codexctl.account_loans.schema'))",
+        )
+        .await
+        .unwrap();
+    let next = async {
+        let fixture = Fixture::in_named_database(Some("codexctl_a5_canary")).await;
+        let result = fixture.backfill_with_exception(Some("b33-a5-canary")).await;
+        let schema = fixture.schema.clone();
+        fixture.finish().await;
+        (result, schema)
+    };
+    tokio::pin!(next);
+    // The first fixture owns a real migration lock for longer than the CLI's
+    // two-second budget. A queued fixture must not start its CLI in that time.
+    let early = tokio::time::timeout(std::time::Duration::from_secs(3), &mut next).await;
+    first.control.batch_execute("ROLLBACK").await.unwrap();
+    let database = first.database.clone();
+    let first_schema = first.schema.clone();
+    first.finish().await;
+    assert!(
+        early.is_err(),
+        "a second fixture ran before the first finished cleanup"
+    );
+    let (result, second_schema) = tokio::time::timeout(std::time::Duration::from_secs(30), next)
+        .await
+        .expect("queued fixture must make progress after cleanup");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(
+        receipt["inventory"]["central_users"],
+        json!({"source":1,"target_before":0,"target":1})
+    );
+    assert_ne!(first_schema, second_schema);
+    let (control, connection) = tokio_postgres::connect(&database, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let connection = tokio::spawn(async move { connection.await.unwrap() });
+    let remaining: i64 = control
+        .query_one(
+            "SELECT count(*) FROM pg_namespace WHERE nspname=ANY($1::text[])",
+            &[&vec![first_schema, second_schema]],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    connection.abort();
+    assert_eq!(remaining, 0, "both fixture schemas must be removed");
+}
+
+#[tokio::test]
+async fn postgres_backfill_reports_store_open_failure_before_scope_checks() {
+    let fixture = Fixture::in_named_database(Some("codexctl_a5_canary")).await;
+    fixture.control.batch_execute(&format!(
+        "CREATE TABLE {}.central_schema_migrations(version INTEGER); INSERT INTO {}.central_schema_migrations VALUES(9999)",
+        fixture.schema, fixture.schema,
+    )).await.unwrap();
+    let result = fixture.backfill_with_exception(Some("b33-a5")).await;
+    fixture.finish().await;
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    let error = String::from_utf8(result.stderr).unwrap();
+    assert!(error.contains("schema v9999 is newer"), "{error}");
+    assert!(!error.contains("requires database codexctl_a5"), "{error}");
+    assert_backfill_failure(&error, "open_store");
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn postgres_backfill_cancellation_terminates_the_owned_cli_before_fixture_cleanup() {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    // Keep a stable process handle for negative-control cleanup, even after
+    // cancellation drops Tokio's Child. Never signal a potentially reused PID.
+    struct Cleanup(OwnedFd);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+    let Some(mut fixture) = Fixture::new().await else {
+        return;
+    };
+    let application = format!("cancel_{}", fixture.schema);
+    let mut database = reqwest::Url::parse(&fixture.database).unwrap();
+    database
+        .query_pairs_mut()
+        .append_pair("application_name", &application);
+    fixture.database = database.to_string();
+    fixture
+        .control
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {}.central_schema_migrations IN ACCESS EXCLUSIVE MODE",
+            fixture.schema,
+        ))
+        .await
+        .unwrap();
+    let mut child = fixture
+        .backfill_command(Some("b33-a5"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    assert!(fd >= 0, "owned CLI must have a stable process handle");
+    let cleanup = Cleanup(unsafe { OwnedFd::from_raw_fd(fd) });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            fixture.control.batch_execute("SELECT pg_stat_clear_snapshot()").await.unwrap();
+            let waiting: bool = fixture.control.query_one(
+                "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock')",
+                &[&application],
+            ).await.unwrap().get(0);
+            if waiting { break; }
+            assert!(child.try_wait().unwrap().is_none(), "CLI exited before the controlled lock wait");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("actual CLI must reach the controlled lock wait");
+    // Signal only the still-owned Child. A stopped CLI cannot exit by running
+    // its normal two-second deadline after we cancel its output future.
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+    let mut pending = Box::pin(child.wait_with_output());
+    assert!(futures::poll!(pending.as_mut()).is_pending());
+    drop(pending);
+    let stopped_child_terminated = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            fixture
+                .control
+                .batch_execute("SELECT pg_stat_clear_snapshot()")
+                .await
+                .unwrap();
+            let mut process = libc::pollfd {
+                fd: cleanup.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let exited = unsafe { libc::poll(&mut process, 1, 0) } == 1;
+            let connected: bool = fixture
+                .control
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE application_name=$1)",
+                    &[&application],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if exited && !connected {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    drop(cleanup);
+    fixture.control.batch_execute("ROLLBACK").await.unwrap();
+    let recovered = fixture.backfill().await;
+    fixture.finish().await;
+    assert!(
+        stopped_child_terminated,
+        "cancelled output left a stopped CLI or its database connection alive"
+    );
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
     );
 }
 

@@ -17,6 +17,13 @@ const TABLES: [&str; 6] = [
     "account_loan_audit",
 ];
 
+pub(super) fn report_failure(stage: &'static str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({"operation":"backfill","stage":stage,"reason":"failed"})
+    );
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum BackfillScanException {
     #[value(name = "b33-a5")]

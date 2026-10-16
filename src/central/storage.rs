@@ -683,13 +683,18 @@ impl CentralStore {
             Self::Dual { postgres, .. } => postgres,
             Self::File(_) => bail!("backfill requires PostgreSQL or dual central storage"),
         };
-        backfill::authorize(target, scan_exception).await?;
+        backfill::authorize(target, scan_exception)
+            .await
+            .inspect_err(|_| backfill::report_failure("authorization"))?;
         let target_before = backfill::target_counts(target).await?;
         let source = backfill::source_counts(state, key)?;
         if super::relogin::add::pending_logins(state)? {
             bail!("finish pending logins in file mode before switching storage");
         }
-        target.migrate().await?;
+        target
+            .migrate()
+            .await
+            .inspect_err(|_| backfill::report_failure("schema_migration"))?;
         target
             .save_alias_tombstones(super::rename::alias_tombstones(state)?)
             .await?;

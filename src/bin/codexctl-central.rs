@@ -335,7 +335,14 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
             let Some(scan_exception) = scan_exception else {
                 anyhow::bail!("backfill requires explicit --scan-exception authorization");
             };
-            let store = central::storage::CentralStore::from_env(&state, &key_file).await?;
+            let store = central::storage::CentralStore::from_env(&state, &key_file)
+                .await
+                .inspect_err(|_| {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({"operation":"backfill","stage":"open_store","reason":"failed"})
+                    );
+                })?;
             let counts = store
                 .backfill(&state, &key_file, Some(scan_exception))
                 .await?;
