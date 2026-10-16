@@ -55,7 +55,12 @@ async fn credential(central: &CentralStore, user: &str, alias: &str) -> Result<v
         .load_account_by_alias(user, alias)
         .await?
         .ok_or_else(|| anyhow::anyhow!("account unavailable"))?;
-    let result = checked_credential(&record, user);
+    let result = async {
+        let saved = checked_credential(&record, user)?;
+        require_routing(central, &record, &saved).await?;
+        Ok(saved)
+    }
+    .await;
     if let Err(error) = &result {
         log_error("credential", error, &record.vault);
     }
@@ -78,6 +83,29 @@ fn checked_credential(
     );
     vault::account(&saved.auth)?;
     Ok(saved)
+}
+
+async fn require_routing(
+    central: &CentralStore,
+    record: &crate::central::storage::CredentialRecord,
+    saved: &vault::Vault,
+) -> Result<String> {
+    let revision = vault::digest(&serde_json::to_vec(&saved.auth)?);
+    let observed = central.fast_token_read(&record.account_id).await?;
+    let proved = observed
+        .as_ref()
+        .filter(|read| read.revision == record.revision && read.user_id == record.user_id)
+        .and_then(|read| read.evidence.as_ref())
+        .is_some_and(|proof| {
+            proof.routing_supported
+                && proof.account_revision == record.revision
+                && proof.auth_revision == revision
+                && proof.routing_age < crate::central::fast_path::EVIDENCE_MAX_AGE
+        });
+    if !proved {
+        return Err(Refusal("reset_routing_unverified").into());
+    }
+    Ok(revision)
 }
 
 fn log_error(stage: &'static str, error: &anyhow::Error, secrets: &Value) {
@@ -176,6 +204,7 @@ pub(in crate::central) async fn apply(
                         "refresh_in_progress"
                         | "login_pending"
                         | "reset_in_progress"
+                        | "reset_routing_unverified"
                         | "reset_custody_lost" => StatusCode::SERVICE_UNAVAILABLE,
                         _ => StatusCode::CONFLICT,
                     };
@@ -247,6 +276,9 @@ async fn run(
     if local.as_ref().is_some_and(|owner| owner.import_settling) {
         return Err(Refusal("refresh_in_progress").into());
     }
+    if local.as_ref().is_some_and(|owner| owner.routing_refused) {
+        return Err(Refusal("reset_routing_unverified").into());
+    }
     let custody = central.reset_custody(&record.account_id).await?;
     let current = central
         .load_account_by_alias(&caller.user, &request.alias)
@@ -271,6 +303,7 @@ async fn execute(
     record: &crate::central::storage::CredentialRecord,
 ) -> Result<api::ConsumeResetResponse> {
     let saved = checked_credential(record, &caller.user)?;
+    let auth_revision = require_routing(central, record, &saved).await?;
     let token = vault::token(&saved.auth)?;
     let workspace = vault::account(&saved.auth)?;
     let reader = &broker.reset_reader;
@@ -329,6 +362,7 @@ async fn execute(
                 ResetWrite::Reserve {
                     caller,
                     account_revision: record.revision,
+                    auth_revision: &auth_revision,
                     holder: &broker.holder_id,
                 },
             )

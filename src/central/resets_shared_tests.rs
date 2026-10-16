@@ -28,13 +28,64 @@ async fn postgres_fixture(base: &str) -> (Fixture, Arc<tokio_postgres::Client>, 
             .unwrap();
     }
     for (_, owner) in f.broker.owners.read().await.values() {
-        central
-            .save_account(&Broker::owner_record(&*owner.lock().await).unwrap())
-            .await
-            .unwrap();
+        let record = Broker::owner_record(&*owner.lock().await).unwrap();
+        central.save_account(&record).await.unwrap();
+        // The fixture's native import has already proved its workspace route.
+        let revision = vault::digest(&serde_json::to_vec(&record.vault["auth"]).unwrap());
+        control.execute("INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at) VALUES($1,$2,$3,true,clock_timestamp())",&[&record.account_id,&record.revision,&revision]).await.unwrap();
     }
     f.broker.central = Some(central);
     (f, control, schema)
+}
+
+#[tokio::test]
+async fn postgres_reset_requires_current_workspace_routing_before_any_provider_call() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let app=Router::new()
+        .route("/usage",get(||async {Json(json!({"rate_limit_reset_credits":{"available_count":1,"applicable_available_count":1}}))}))
+        .route("/credits",get(||async {Json(json!({"credits":[{"id":"only","status":"available","expires_at":"2036-07-26T00:00:00Z"}]}))}))
+        .route("/credits/consume",post(||async {Json(json!({"code":"reset","windows_reset":1}))}))
+        .layer(axum::middleware::from_fn(move |request:axum::extract::Request,next:axum::middleware::Next|{
+            counted.fetch_add(1,Ordering::SeqCst); async move {next.run(request).await}
+        }));
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for mutation in [
+        "DELETE FROM central_token_evidence",
+        "UPDATE central_token_evidence SET routing_supported=false",
+        "UPDATE central_token_evidence SET routing_observed_at=clock_timestamp()-interval '61 seconds'",
+        "UPDATE central_token_evidence SET auth_revision='another-credential'",
+        "UPDATE central_token_evidence SET account_revision=account_revision+1",
+        "UPDATE central_token_evidence SET deleted_at=clock_timestamp()",
+    ] {
+        let (fixture, control, schema) = postgres_fixture(&base).await;
+        control.batch_execute(mutation).await.unwrap();
+        calls.store(0, Ordering::SeqCst);
+        let reset = fixture.redeem("unproved-workspace").await;
+        let (_, inventory) = fixture.list().await;
+        let count = calls.load(Ordering::SeqCst);
+        fixture.stop().await;
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reset.0,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workspace routing must be positively proved ({mutation}): {}",
+            reset.1
+        );
+        assert_eq!(reset.1["error"], "reset_routing_unverified");
+        assert_eq!(inventory["accounts"][0]["error"], "reset_read_failed");
+        assert_eq!(
+            count, 0,
+            "unproved routing must not read usage, credits, or consume"
+        );
+    }
+    upstream.abort();
 }
 
 #[tokio::test]

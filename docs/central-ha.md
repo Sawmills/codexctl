@@ -167,6 +167,11 @@ reuse that credit and key, including after an uncertain response. The completed
 receipt and browser audit commit together. A disconnected browser does not cancel
 that settlement. Expired foreign refresh custody remains a refusal until it is
 released. Credentials and raw session tokens never enter the page or audit.
+Shared inventory/confirmation reads and new redemptions require positive workspace-routing
+evidence for the exact saved auth and account revision, observed within 60 seconds.
+If it is missing, refused or stale, a normal token read must establish it first;
+the reset path returns a retryable refusal and never starts native refresh.
+Completed receipts can still be replayed without a live token or routing proof.
 
 Active redemption holds the local owner mutex and an account-scoped PostgreSQL
 session advisory lock on a dedicated connection. Refresh claims, Renew admission

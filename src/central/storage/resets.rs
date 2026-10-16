@@ -20,6 +20,7 @@ pub(in crate::central) enum ResetWrite<'a> {
     Reserve {
         caller: &'a Caller,
         account_revision: i64,
+        auth_revision: &'a str,
         holder: &'a str,
     },
     Settle {
@@ -110,7 +111,7 @@ impl CentralStore {
         bounded_db(async {
             let mut client=Arc::try_unwrap(db.establish().await?).map_err(|_| anyhow::anyhow!("reset connection is shared"))?;
             let tx=client.transaction().await?;
-            if let ResetWrite::Reserve{caller,account_revision,holder}=stage {
+            if let ResetWrite::Reserve{caller,account_revision,auth_revision,holder}=stage {
                 let _admission=identity::lock_admission(&tx).await?;
                 authorize(&tx,caller).await?;
                 let row=tx.query_opt("SELECT revision FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE", &[&account,&caller.user]).await?;
@@ -123,6 +124,9 @@ impl CentralStore {
                 if tx.query_one("SELECT EXISTS(SELECT 1 FROM account_refresh_leases WHERE account_id=$1 AND NOT released AND holder_id<>$2)", &[&account,&holder]).await?.get::<_,bool>(0) {
                     return Err(Refusal("refresh_in_progress").into());
                 }
+                let routing_seconds=crate::central::fast_path::EVIDENCE_MAX_AGE.as_secs() as i64;
+                let routed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_token_evidence WHERE account_id=$1 AND account_revision=$2 AND auth_revision=$3 AND routing_supported AND deleted_at IS NULL AND routing_observed_at>clock_timestamp()-($4::bigint*interval '1 second'))",&[&account,&account_revision,&auth_revision,&routing_seconds]).await?.get(0);
+                if !routed { return Err(Refusal("reset_routing_unverified").into()); }
             }
             let changed=if expected==0 {
                 tx.execute("INSERT INTO account_reset_journals(account_id,revision,journal) VALUES($1,1,$2::text::jsonb) ON CONFLICT DO NOTHING", &[&account,&payload]).await?
