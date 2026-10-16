@@ -6,8 +6,10 @@ pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS account_reset_journals (
     account_id TEXT PRIMARY KEY REFERENCES central_accounts(account_id),
     revision BIGINT NOT NULL,
-    journal JSONB NOT NULL
+    journal JSONB NOT NULL,
+    deleted_at TIMESTAMPTZ
 );
+ALTER TABLE account_reset_journals ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
 DO $$ BEGIN
     IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='dashboard_audit'::regclass AND conname='dashboard_audit_operation_check' AND pg_get_constraintdef(oid) NOT LIKE '%account_reset%') THEN
         ALTER TABLE dashboard_audit DROP CONSTRAINT dashboard_audit_operation_check;
@@ -89,11 +91,16 @@ impl CentralStore {
         let db = self.browser_store()?;
         bounded_db(async { authorize(&*db.client().await?, caller).await }).await
     }
-    pub(in crate::central) async fn reset_journal(&self, account: &str) -> Result<(i64, Value)> {
+    pub(in crate::central) async fn reset_journal(
+        &self,
+        user: &str,
+        account: &str,
+    ) -> Result<(i64, Value)> {
         let db = self.browser_store()?;
         bounded_db(async {
-            Ok(match db.client().await?.query_opt("SELECT revision,journal::text FROM account_reset_journals WHERE account_id=$1", &[&account]).await? {
-                Some(row) => (row.get(0),serde_json::from_str(&row.get::<_,String>(1))?),
+            let row=db.client().await?.query_opt("SELECT j.revision,j.journal::text FROM central_accounts a LEFT JOIN account_reset_journals j ON j.account_id=a.account_id WHERE a.account_id=$1 AND a.user_id=$2 AND a.deleted_at IS NULL AND j.deleted_at IS NULL", &[&account,&user]).await?.ok_or(Refusal("account_not_found"))?;
+            Ok(match row.get::<_,Option<i64>>(0) {
+                Some(revision) => (revision,serde_json::from_str(&row.get::<_,String>(1))?),
                 None => (0,serde_json::json!({"pending":null,"completed":{}})),
             })
         }).await
@@ -101,6 +108,7 @@ impl CentralStore {
 
     pub(in crate::central) async fn write_reset_journal(
         &self,
+        user: &str,
         account: &str,
         expected: i64,
         journal: &Value,
@@ -113,8 +121,9 @@ impl CentralStore {
             let tx=client.transaction().await?;
             if let ResetWrite::Reserve{caller,account_revision,auth_revision,holder}=stage {
                 let _admission=identity::lock_admission(&tx).await?;
+                if caller.user != user { return Err(Refusal("account_not_found").into()); }
                 authorize(&tx,caller).await?;
-                let row=tx.query_opt("SELECT revision FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE", &[&account,&caller.user]).await?;
+                let row=tx.query_opt("SELECT revision FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE", &[&account,&user]).await?;
                 let row=row.ok_or(Refusal("account_not_found"))?;
                 if row.get::<_,i64>(0)!=account_revision {return Err(Refusal("account_changed").into());}
                 let login_query=concat!("SELECT EXISTS(SELECT 1 FROM central_login_operations WHERE ",login_fence!()," OR (account_id=$1 AND phase IN ('starting','pending')) OR (user_id=$2 AND phase IN ('starting','pending') AND kind='add'))");
@@ -128,10 +137,14 @@ impl CentralStore {
                 let routed:bool=tx.query_one("SELECT EXISTS(SELECT 1 FROM central_token_evidence WHERE account_id=$1 AND account_revision=$2 AND auth_revision=$3 AND routing_supported AND deleted_at IS NULL AND routing_observed_at>clock_timestamp()-($4::bigint*interval '1 second'))",&[&account,&account_revision,&auth_revision,&routing_seconds]).await?.get(0);
                 if !routed { return Err(Refusal("reset_routing_unverified").into()); }
             }
+            if let ResetWrite::Settle { .. } = stage {
+                // Removal takes the same account-row fence before tombstoning.
+                tx.query_opt("SELECT account_id FROM central_accounts WHERE account_id=$1 AND user_id=$2 AND deleted_at IS NULL FOR UPDATE", &[&account,&user]).await?.ok_or(Refusal("account_not_found"))?;
+            }
             let changed=if expected==0 {
                 tx.execute("INSERT INTO account_reset_journals(account_id,revision,journal) VALUES($1,1,$2::text::jsonb) ON CONFLICT DO NOTHING", &[&account,&payload]).await?
             } else {
-                tx.execute("UPDATE account_reset_journals SET revision=revision+1,journal=$3::text::jsonb WHERE account_id=$1 AND revision=$2", &[&account,&expected,&payload]).await?
+                tx.execute("UPDATE account_reset_journals SET revision=revision+1,journal=$3::text::jsonb WHERE account_id=$1 AND revision=$2 AND deleted_at IS NULL", &[&account,&expected,&payload]).await?
             };
             let mut audit_log=None;
             if changed==1 && let ResetWrite::Settle{audit,result}=stage {

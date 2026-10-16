@@ -766,6 +766,133 @@ async fn postgres_reset_excludes_removal_until_provider_work_finishes() {
 }
 
 #[tokio::test]
+async fn postgres_reset_journal_refuses_a_foreign_company_user() {
+    use crate::central::storage::resets::ResetWrite;
+    let (base, _, upstream) = redemption_upstream(1).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    assert_eq!(
+        fixture.redeem("tenant-boundary").await.0,
+        StatusCode::BAD_GATEWAY
+    );
+    let central = fixture.broker.central.as_ref().unwrap();
+    let id = account_key("test-user", "personal");
+    let (version, journal) = central.reset_journal("test-user", &id).await.unwrap();
+    let read = central.reset_journal("another-user", &id).await;
+    let write = central
+        .write_reset_journal(
+            "another-user",
+            &id,
+            version,
+            &journal,
+            ResetWrite::Settle {
+                audit: None,
+                result: "failed:test",
+            },
+        )
+        .await;
+    let after = central.reset_journal("test-user", &id).await.unwrap();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert!(
+        read.is_err(),
+        "a foreign company user cannot read a reset journal"
+    );
+    assert!(
+        write.is_err(),
+        "a foreign company user cannot settle a reset journal"
+    );
+    assert_eq!(
+        after,
+        (version, journal),
+        "foreign settlement cannot change history"
+    );
+}
+
+#[tokio::test]
+async fn postgres_reset_removal_retains_and_tombstones_its_journal() {
+    use crate::central::storage::resets::ResetWrite;
+    let (base, _, upstream) = redemption_upstream(1).await;
+    let (mut fixture, control, schema) = postgres_fixture(&base).await;
+    fixture.broker.browser_remove_enabled = true;
+    assert_eq!(
+        fixture.redeem("unknown-before-remove").await.0,
+        StatusCode::BAD_GATEWAY
+    );
+    let id = account_key("test-user", "personal");
+    let central = fixture.broker.central.as_ref().unwrap().clone();
+    let (version, journal) = central.reset_journal("test-user", &id).await.unwrap();
+    assert!(journal["pending"].is_object());
+    let (url, server) = browser_server(&mut fixture, &base).await;
+    let http = reqwest::Client::new();
+    let html = http
+        .get(format!("{url}/accounts/manage?alias=personal"))
+        .header("cookie", "codexctl-session=synthetic-session")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let response = http
+        .post(format!("{url}/accounts/remove"))
+        .header("cookie", "codexctl-session=synthetic-session")
+        .header("origin", "http://127.0.0.1")
+        .form(&[
+            ("alias", "personal".to_owned()),
+            ("confirmation", "personal".to_owned()),
+            ("account_id", hidden(&html, "account_id")),
+            ("revision", hidden(&html, "revision")),
+            ("attempt", hidden(&html, "attempt")),
+            ("form_token", hidden(&html, "form_token")),
+        ])
+        .send()
+        .await
+        .unwrap();
+    let removed = response.status();
+    let read = central.reset_journal("test-user", &id).await;
+    let write = central
+        .write_reset_journal(
+            "test-user",
+            &id,
+            version,
+            &journal,
+            ResetWrite::Settle {
+                audit: None,
+                result: "failed:test",
+            },
+        )
+        .await;
+    let retained=control.query_one("SELECT journal::text,(to_jsonb(j)->>'deleted_at') IS NOT NULL FROM account_reset_journals j WHERE account_id=$1",&[&id]).await.unwrap();
+    let stored: Value = serde_json::from_str(&retained.get::<_, String>(0)).unwrap();
+    let tombstoned: bool = retained.get(1);
+    server.abort();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(removed, StatusCode::OK);
+    assert!(
+        read.is_err(),
+        "a removed account's journal must not be replayable"
+    );
+    assert!(
+        write.is_err(),
+        "a removed account's journal must not settle"
+    );
+    assert!(tombstoned, "removal must tombstone the operational row");
+    assert_eq!(
+        stored, journal,
+        "pending key and dedupe history must be retained"
+    );
+}
+
+#[tokio::test]
 async fn postgres_reset_concurrent_unknown_result_stays_terminal_on_retry() {
     let (base, received, started, release, upstream) =
         concurrent_upstream(json!({"code":"new_unrecognized_code","windows_reset":0})).await;

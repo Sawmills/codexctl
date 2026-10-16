@@ -257,7 +257,9 @@ async fn run(
         .ok_or(Refusal("account_not_found"))?;
     // Replaying a receipt requires live caller authority and account scope, but
     // performs no provider work and must survive saved credential expiry.
-    let (_, value) = central.reset_journal(&record.account_id).await?;
+    let (_, value) = central
+        .reset_journal(&caller.user, &record.account_id)
+        .await?;
     let journal: Journal = serde_json::from_value(value)?;
     if let Some(completed) = journal.completed.get(&request.redeem_request_id) {
         return receipt(completed, true);
@@ -309,7 +311,9 @@ async fn execute(
     let reader = &broker.reset_reader;
     let mut prepared = None;
     for _ in 0..8 {
-        let (version, value) = central.reset_journal(&record.account_id).await?;
+        let (version, value) = central
+            .reset_journal(&caller.user, &record.account_id)
+            .await?;
         let mut journal: Journal = serde_json::from_value(value)?;
         if let Some(completed) = journal.completed.get(&request.redeem_request_id) {
             return receipt(completed, true);
@@ -356,6 +360,7 @@ async fn execute(
         }
         if central
             .write_reset_journal(
+                &caller.user,
                 &record.account_id,
                 version,
                 &serde_json::to_value(&journal)?,
@@ -394,7 +399,9 @@ async fn execute(
         Err(error) => return Err(error),
     };
     for _ in 0..8 {
-        let (version, value) = central.reset_journal(&record.account_id).await?;
+        let (version, value) = central
+            .reset_journal(&caller.user, &record.account_id)
+            .await?;
         let mut journal: Journal = serde_json::from_value(value)?;
         if let Some(completed) = journal.completed.get(&request.redeem_request_id) {
             return receipt(completed, true);
@@ -429,6 +436,7 @@ async fn execute(
         }
         if central
             .write_reset_journal(
+                &caller.user,
                 &record.account_id,
                 version,
                 &serde_json::to_value(&journal)?,

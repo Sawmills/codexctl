@@ -172,6 +172,10 @@ evidence for the exact saved auth and account revision, observed within 60 secon
 If it is missing, refused or stale, a normal token read must establish it first;
 the reset path returns a retryable refusal and never starts native refresh.
 Completed receipts can still be replayed without a live token or routing proof.
+Journal reads and settlements require the validated company user and an active
+server account. Remove tombstones its journal in the account-removal transaction,
+retaining pending keys, completed receipts and audit history. Removed accounts
+cannot read or settle that retained journal.
 
 Active redemption holds the local owner mutex and an account-scoped PostgreSQL
 session advisory lock on a dedicated connection. Refresh claims, Renew admission

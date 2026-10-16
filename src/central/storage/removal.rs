@@ -82,6 +82,7 @@ impl CentralStore {
             tx.execute("UPDATE central_accounts SET deleted_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE account_id=$1", &[&request.account_id]).await?;
             tx.execute("UPDATE account_refresh_leases SET released=true,expires_at=clock_timestamp() WHERE account_id=$1 AND holder_id=$2", &[&request.account_id,&holder]).await?;
             tx.execute("UPDATE account_live_sessions SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&request.account_id]).await?;
+            tx.execute("UPDATE account_reset_journals SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&request.account_id]).await?;
             let at=chrono::Utc::now().timestamp();
             tx.execute("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'account_remove',$3,'ok',$4)", &[&at,&actor,&request.account_id,&request.attempt]).await?;
             // Locks serialize sign-out and user changes, but do not stop time.
