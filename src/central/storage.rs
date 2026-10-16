@@ -1692,7 +1692,8 @@ impl PostgresStore {
             let client = connection.transaction().await?;
             let _admission_timing = identity::lock_admission(&client).await?;
             client
-                .batch_execute("SET LOCAL codexctl.identity_migration='1'")
+                // Do not queue DDL ahead of serving queries for the full DB budget.
+                .batch_execute("SET LOCAL lock_timeout='100ms'; SET LOCAL codexctl.identity_migration='1'")
                 .await?;
             client
                 .batch_execute(&format!(
@@ -1707,7 +1708,16 @@ impl PostgresStore {
             client.commit().await?;
             Ok(())
         })
-        .await?;
+        .await
+        .inspect_err(|error| {
+            if error.chain().any(|cause| {
+                cause.downcast_ref::<tokio_postgres::Error>().is_some_and(|database| {
+                    database.code() == Some(&tokio_postgres::error::SqlState::LOCK_NOT_AVAILABLE)
+                })
+            }) {
+                eprintln!("{}", serde_json::json!({"operation":"schema_migration","stage":"ddl","failure_class":"lock_timeout","sqlstate":"55P03"}));
+            }
+        })?;
         self.migrate_identity().await
     }
 
