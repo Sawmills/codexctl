@@ -83,8 +83,12 @@ async fn snapshot(
         .await?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     let user = identity.id;
-    let catalog =
-        managed::account_catalog(broker, &user, super::catalog::Freshness::RefreshAhead).await?;
+    let freshness = if broker.browser_resets_enabled {
+        super::catalog::Freshness::ResetApplicability
+    } else {
+        super::catalog::Freshness::RefreshAhead
+    };
+    let catalog = managed::account_catalog(broker, &user, freshness).await?;
     let sampled_at = Instant::now();
     // The dashboard offers lender-only actions, so it shows owned accounts only.
     let tasks = catalog

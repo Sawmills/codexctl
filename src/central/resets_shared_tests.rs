@@ -820,6 +820,20 @@ async fn postgres_dashboard_reset_reuses_one_usage_observation() {
         }
         let (url, server) = browser_server(&mut fixture, &base).await;
         usage_calls.store(0, Ordering::SeqCst);
+        if !clear_native {
+            let machine = accounts(State(fixture.broker.clone()), fixture.headers.clone())
+                .await
+                .unwrap_or_else(|_| panic!("machine catalog failed"));
+            let machine: Value =
+                serde_json::from_slice(&to_bytes(machine.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert!(machine[0]["primaryUsed"].is_number(), "{machine}");
+            assert_eq!(
+                usage_calls.load(Ordering::SeqCst),
+                0,
+                "browser reset gate must preserve native usage for machines"
+            );
+        }
         let http = reqwest::Client::new();
         let mut snapshots = Vec::new();
         for _ in 0..2 {
@@ -831,6 +845,25 @@ async fn postgres_dashboard_reset_reuses_one_usage_observation() {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             snapshots.push(response.json::<Value>().await.unwrap());
+        }
+        if !clear_native {
+            for (_, owner) in fixture.broker.owners.read().await.values() {
+                let mut owner = owner.lock().await;
+                owner.limits.as_mut().unwrap()["rateLimits"]["primary"]["usedPercent"] = json!(37);
+                let revision = vault::digest(owner.vault.auth.to_string().as_bytes());
+                owner.limits_observed = Some((std::time::Instant::now(), revision));
+            }
+            let machine = accounts(State(fixture.broker.clone()), fixture.headers.clone())
+                .await
+                .unwrap_or_else(|_| panic!("machine catalog failed"));
+            let machine: Value =
+                serde_json::from_slice(&to_bytes(machine.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert_eq!(
+                machine[0]["primaryUsed"].as_f64(),
+                Some(37.0),
+                "newer native usage must replace the earlier dashboard sample"
+            );
         }
         let calls = usage_calls.load(Ordering::SeqCst);
         server.abort();
