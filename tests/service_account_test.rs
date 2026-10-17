@@ -175,7 +175,7 @@ async fn service_token_connects_without_a_saved_human_login() {
         .env("HOME", home.path())
         .env_remove("CODEX_HOME")
         .env_remove("CODEXCTL_PINNED_ALIAS")
-        .env("CODEXCTL_SERVICE_TOKEN", "synthetic-shared-service")
+        .env("CODEXCTL_SERVICE_TOKEN", "synthetic-shared-service\n")
         .env("CODEXCTL_SERVER_URL", origin)
         .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
         .output()

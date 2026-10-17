@@ -47,7 +47,10 @@ fn environment() -> Result<Option<Environment>> {
         .to_string()
         .trim_end_matches('/')
         .to_owned();
-    Ok(Some(Environment { server, token }))
+    Ok(Some(Environment {
+        server,
+        token: token.trim().to_owned(),
+    }))
 }
 
 /// Service jobs use subscription capacity only and never inherit human auth.

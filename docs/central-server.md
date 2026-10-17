@@ -64,6 +64,11 @@ the host's active account. A refused credential or unavailable subscription
 capacity fails the job; it never falls back to human authentication. Billing and
 banked-reset approval flags are refused, including on explicit account launches.
 
+The Codex child inherits the service credential so its token helper can
+authenticate. Keep Codex's default shell environment exclusions; do not configure
+tools to forward tokens into shell sessions. Surrounding whitespace is removed
+from the service credential, including a Kubernetes Secret's trailing newline.
+
 ## Transfer Existing Accounts
 
 Before migration, stop every Codex session and credential owner for these accounts on all machines.
