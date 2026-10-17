@@ -197,6 +197,7 @@ fn enable(
     check_codex_version(allow_codex_version)?;
     let catalog =
         super::super::remote::catalog()?.context("app-auth requires a connected account server")?;
+    catalog.connection.token_file.file()?;
     let (account, connection) = launch::catalog_connection(&catalog, alias, false)?;
     if account.loan.is_some() {
         bail!("app-auth pins only your own server accounts, not a borrowed one");

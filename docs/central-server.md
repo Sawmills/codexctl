@@ -31,6 +31,44 @@ The client stores the server address, your immutable SSO identity, and a private
 You do not need a token file or an SSH tunnel.
 Your machine needs access to the private staging network.
 
+## Non-interactive Jobs
+
+An administrator can issue one shared service credential for an existing enabled
+company user. It is an ordinary machine credential: jobs see that company user's
+server accounts and use the existing subscription selection and pacing rules.
+
+On the account server, obtain the company-user ID from `codexctl-central users`,
+then issue the credential:
+
+```sh
+codexctl-central service-account issue COMPANY_USER_ID --state STATE --key-file KEY
+```
+
+The command emits the credential once, after storing its hash. Capture that output
+directly into the job runner's secret configuration; do not log it or write a token
+file. Repeating the command replaces the shared credential and rejects its previous
+value on every server replica. Existing human machine credentials are unaffected.
+
+Supply `CODEXCTL_SERVICE_TOKEN` through the job environment or a Kubernetes Secret,
+and set the nonsecret HTTPS origin in `CODEXCTL_SERVER_URL`:
+
+```sh
+# CODEXCTL_SERVICE_TOKEN is supplied by the runner, not entered on this command line.
+CODEXCTL_SERVER_URL=https://YOUR-SERVER codexctl codex exec "Run the job"
+```
+
+Use an isolated job home without `CODEX_HOME` or `CODEXCTL_PINNED_ALIAS`. No browser
+sign-in, saved human login, `connect`, or `use` is needed. Service jobs select an
+available included account and use a private launch connection without changing
+the host's active account. A refused credential or unavailable subscription
+capacity fails the job; it never falls back to human authentication. Billing and
+banked-reset approval flags are refused, including on explicit account launches.
+
+The Codex child inherits the service credential so its token helper can
+authenticate. Keep Codex's default shell environment exclusions; do not configure
+tools to forward tokens into shell sessions. Surrounding whitespace is removed
+from the service credential, including a Kubernetes Secret's trailing newline.
+
 ## Transfer Existing Accounts
 
 Before migration, stop every Codex session and credential owner for these accounts on all machines.

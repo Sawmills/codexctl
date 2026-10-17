@@ -83,7 +83,7 @@ struct Connection {
     #[serde(default)]
     alias: Option<String>,
     server: String,
-    device_token_file: PathBuf,
+    device_token_file: super::service_account::MachineCredential,
     account_id: String,
     revision: String,
     #[serde(default)]
@@ -745,7 +745,7 @@ pub(super) fn exclusive_mode(paths: &config::Paths) -> Result<std::fs::File> {
 }
 fn fetch(connection: &Connection, refresh: bool) -> Result<TokenResponse> {
     super::transport::origin(&connection.server)?;
-    let secret = String::from_utf8(vault::private_read(&connection.device_token_file)?)?;
+    let secret = connection.device_token_file.read_for(&connection.server)?;
     let http = super::transport::blocking()?;
     let mut request = http
         .post(format!(
@@ -837,7 +837,7 @@ pub fn connect(alias: &str, server: &str, token_file: &Path) -> Result<()> {
         user_id: None,
         alias: None,
         server: server.into(),
-        device_token_file: std::fs::canonicalize(token_file)?,
+        device_token_file: std::fs::canonicalize(token_file)?.into(),
         account_id: String::new(),
         revision: String::new(),
         allow_billing: false,
@@ -1321,6 +1321,9 @@ pub fn activate(
     allow_resets: bool,
     restart_daemon: bool,
 ) -> Result<bool> {
+    if super::service_account::enabled()? {
+        bail!("service jobs cannot activate the host account; run codexctl codex instead");
+    }
     let explicit = alias.is_some();
     // A borrowed reference is matched in its normalized, lowercase form.
     let normalized = alias
@@ -1830,6 +1833,7 @@ pub(super) fn sync_account(
     device: &super::remote::Connection,
     account: &super::managed::Account,
 ) -> Result<()> {
+    device.token_file.file()?;
     if account.user_id != device.user_id {
         bail!("server user identity changed");
     }
@@ -2239,7 +2243,7 @@ mod tests {
             user_id: Some("user".into()),
             alias: Some("remote".into()),
             server: "https://server.invalid".into(),
-            device_token_file: root.path().join("device.token"),
+            device_token_file: root.path().join("device.token").into(),
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
@@ -2471,7 +2475,7 @@ mod tests {
             user_id: Some("user".into()),
             alias: Some("remote".into()),
             server: "https://server.invalid".into(),
-            device_token_file: root.join("device.token"),
+            device_token_file: root.join("device.token").into(),
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,
@@ -2563,7 +2567,7 @@ mod tests {
             user_id: Some("user".into()),
             alias: Some("remote".into()),
             server: "https://server.invalid".into(),
-            device_token_file: root.path().join("device.token"),
+            device_token_file: root.path().join("device.token").into(),
             account_id: "account".into(),
             revision: "revision".into(),
             allow_billing: true,

@@ -34,6 +34,12 @@ pub fn run(
     allow_resets: bool,
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    #[cfg(feature = "central-prototype")]
+    let service_mode = codexctl::central::service_account::enabled()?;
+    #[cfg(feature = "central-prototype")]
+    if service_mode && (allow_billing || allow_resets) {
+        bail!("service jobs cannot approve billing or banked resets");
+    }
     if let Some(alias) = account {
         #[cfg(feature = "central-prototype")]
         return codexctl::central::native::run_pinned_codex(
@@ -45,8 +51,9 @@ pub fn run(
         bail!("server account launch for {alias} requires central support");
     }
     #[cfg(feature = "central-prototype")]
-    let selected_central_launch = if codexctl::central::native::central_active()?
-        && codexctl::central::remote::connection()?.is_some()
+    let selected_central_launch = if service_mode
+        || (codexctl::central::native::central_active()?
+            && codexctl::central::remote::connection()?.is_some())
     {
         codexctl::central::native::pinned_arguments(args)?;
         match codexctl::central::remote::select_codex_account()
@@ -60,6 +67,9 @@ pub fn run(
                 Some(launch)
             }
             Err(error) => {
+                if service_mode {
+                    return Err(error);
+                }
                 // The lender's lanes come first: never fall back onto a
                 // borrowed account at the borrower backoff.
                 codexctl::central::loans::guard_borrowed_fallback()?;
