@@ -110,6 +110,11 @@ The service manager restarts the relay when it exits. A bind failure is fatal. O
 the relay stops accepting and drains open streams for up to 30 s. An open stream that
 is cut then is retried by Codex as a dropped stream.
 
+The upstream client allows five minutes of silence per read, including the wait
+for response headers. Each successful read resets that timeout, so an active
+stream can run longer than five minutes. The relay does not retry a timed-out
+request; the client receives a gateway or stream error.
+
 `relay status` performs a bounded HMAC challenge against the exact listener. A plain
 `200 ok`, an old relay binary, a missing or unsafe identity file, a replaced listener,
 or a stopped relay fails closed. After upgrading codexctl, restart the service so it

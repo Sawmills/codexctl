@@ -77,12 +77,14 @@ const MAX_PARTIAL_FAILURE_INSPECTION: usize = 256;
 const MAX_TYPE_COUNTS: usize = 64;
 const MAX_ERROR_KEYS: usize = 32;
 const HTTP_ERROR_PEEK_TIMEOUT: Duration = Duration::from_millis(50);
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Relay settings. Build with [`RelayConfig::new`].
 pub struct RelayConfig {
     upstream: String,
     rate_budget: Duration,
     overloaded_budget: Duration,
+    read_timeout: Duration,
     log: Log,
     central: Option<CentralReporter>,
     evidence_dir: Option<std::path::PathBuf>,
@@ -105,6 +107,7 @@ impl RelayConfig {
             upstream: upstream.to_owned(),
             rate_budget: DEFAULT_RATE_BUDGET,
             overloaded_budget: DEFAULT_OVERLOADED_BUDGET,
+            read_timeout: DEFAULT_READ_TIMEOUT,
             log: Arc::new(|line| eprintln!("{line}")),
             central: None,
             evidence_dir: None,
@@ -122,6 +125,13 @@ impl RelayConfig {
     pub fn with_budgets(mut self, rate: Duration, overloaded: Duration) -> Self {
         self.rate_budget = rate;
         self.overloaded_budget = overloaded;
+        self
+    }
+
+    /// Bounds each upstream read, not the total lifetime of an active stream.
+    /// The default allows five minutes of silence between reads.
+    pub fn with_read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = timeout;
         self
     }
 
@@ -277,10 +287,11 @@ pub async fn serve(
         bail!("relay binds only to loopback, not {address}");
     }
     let identity = Arc::new(identity::Identity::open(&config.identity_root, address)?);
-    // No overall timeout: a Responses stream can run for many minutes, and
-    // Codex owns its own idle timeout.
+    // An active Responses stream may run for many minutes. Bound silence on
+    // each read without imposing an overall request deadline.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        .read_timeout(config.read_timeout)
         .build()
         .context("could not build relay HTTP client")?;
     let central_dropped = Arc::new(Mutex::new(BTreeMap::new()));
