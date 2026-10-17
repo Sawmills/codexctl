@@ -85,7 +85,7 @@ impl BrowserFixture {
         if let Some(overlay) = overlay {
             control
                 .batch_execute(&format!(
-                    "ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; \
+                    "DROP VIEW IF EXISTS {0}.dashboard_audit_history; ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; \
                  DROP TABLE {0}.dashboard_audit; \
                  INSERT INTO {0}.browser_sessions(token_hash,user_id,signed_in_at,expires_at) \
                  VALUES('legacy-session','legacy-user',now(),now()+interval '1 hour')",
@@ -569,7 +569,7 @@ async fn postgres_ha_rollout_failed_initializer_leaves_two_old_pods_serving() {
             // Dashboard reads use sessions, not this action-only audit table.
             // Its absence makes an accidental partial migration observable.
             f.control
-                .batch_execute(&format!("DROP TABLE {}.dashboard_audit", f.schema))
+                .batch_execute(&format!("DROP VIEW IF EXISTS {0}.dashboard_audit_history; DROP TABLE {0}.dashboard_audit", f.schema))
                 .await
                 .unwrap();
             if failure == "admission_lock" {
@@ -1042,7 +1042,7 @@ async fn postgres_dashboard_migration_is_additive_repeatable_and_keeps_version_e
     let before = chrono::Utc::now().timestamp();
     let (session, _) = f.sign_in().await;
     // Recreate PR1's table shape with a live session before upgrading.
-    f.control.batch_execute(&format!("ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; DROP TABLE {0}.dashboard_audit",f.schema)).await.unwrap();
+    f.control.batch_execute(&format!("DROP VIEW IF EXISTS {0}.dashboard_audit_history; ALTER TABLE {0}.browser_sessions DROP COLUMN auth_time_verified; DROP TABLE {0}.dashboard_audit",f.schema)).await.unwrap();
     for _ in 0..2 {
         storage_fixture::migrate(
             &f.database(),
@@ -1121,7 +1121,7 @@ async fn postgres_dashboard_audit_migration_preserves_logically_deleted_rows() {
         if upgrade {
             f.control
                 .batch_execute(&format!(
-                    "ALTER TABLE {}.dashboard_audit DROP COLUMN IF EXISTS deleted_at",
+                    "DROP VIEW IF EXISTS {0}.dashboard_audit_history; ALTER TABLE {0}.dashboard_audit DROP COLUMN IF EXISTS deleted_at",
                     f.schema,
                 ))
                 .await
