@@ -173,8 +173,10 @@ shared token evidence without forcing a refresh. Nothing-to-reset and no-credit
 outcomes preserve it. Unknown stays `failed:reset_rejected`; the next normal token
 read must establish fresh routing evidence.
 Completed receipts retain the newest 256 request IDs in completion order.
-The pending credit/key is never trimmed. A pending operation accepts at most
-256 participant IDs, including its original request; a new join at that limit
+An already-accepted pending batch larger than 256 keeps every receipt when it
+settles; ordinary FIFO pruning resumes on later settlements. The pending credit/key
+is never trimmed. New pending operations accept at most 256 participant IDs,
+including the original request; a new join at that limit
 returns `reset_busy`, while existing participants can finish and replay.
 Receipt replay covers the retained history; an evicted receipt does not prove
 that an old request was never applied.
