@@ -40,6 +40,7 @@ async fn postgres_fixture(base: &str) -> (Fixture, Arc<tokio_postgres::Client>, 
 
 #[tokio::test]
 async fn postgres_reset_requires_current_workspace_routing_before_any_provider_call() {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -63,10 +64,56 @@ async fn postgres_reset_requires_current_workspace_routing_before_any_provider_c
     ] {
         let (fixture, control, schema) = postgres_fixture(&base).await;
         control.batch_execute(mutation).await.unwrap();
+        let central = fixture.broker.central.as_ref().unwrap();
+        let mut verified = central
+            .load_account_by_alias("test-user", "personal")
+            .await
+            .unwrap()
+            .unwrap();
+        verified.alias = "verified".into();
+        verified.account_id = account_key("test-user", &verified.alias);
+        verified.login = Some("verified-login".into());
+        verified.vault["alias"] = json!(verified.alias);
+        let claims = json!({"sub":"verified-login","iat":2000000000_u64,"exp":4102444800_u64,"https://api.openai.com/auth":{"chatgpt_account_id":"synthetic-seat","chatgpt_plan_type":"pro"}});
+        verified.vault["auth"]["tokens"]["access_token"] = json!(format!(
+            "header.{}.",
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap())
+        ));
+        central.save_account(&verified).await.unwrap();
+        let revision = vault::digest(&serde_json::to_vec(&verified.vault["auth"]).unwrap());
+        control.execute("INSERT INTO central_token_evidence(account_id,account_revision,auth_revision,routing_supported,routing_observed_at) VALUES($1,$2,$3,true,clock_timestamp())", &[&verified.account_id,&verified.revision,&revision]).await.unwrap();
         calls.store(0, Ordering::SeqCst);
-        let reset = fixture.redeem("unproved-workspace").await;
-        let (_, inventory) = fixture.list().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = crate::central::resets::routes().with_state(fixture.broker.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let http = reqwest::Client::new();
+        let reset = http
+            .post(format!("{url}/v1/resets/redeem"))
+            .headers(fixture.headers.clone())
+            .json(&json!({"alias":"personal","redeem_request_id":"unproved-workspace"}))
+            .send()
+            .await
+            .unwrap();
+        let reset = (reset.status(), reset.json::<Value>().await.unwrap());
+        let redeem_calls = calls.load(Ordering::SeqCst);
+        let response = http
+            .get(format!("{url}/v1/resets"))
+            .headers(fixture.headers.clone())
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let inventory: Value = response.json().await.unwrap();
+        let read_failures = fixture
+            .broker
+            .failures
+            .lock()
+            .unwrap()
+            .get("reset_read_failed")
+            .map_or(0, |failure| failure.count);
         let count = calls.load(Ordering::SeqCst);
+        server.abort();
         fixture.stop().await;
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -79,10 +126,75 @@ async fn postgres_reset_requires_current_workspace_routing_before_any_provider_c
             reset.1
         );
         assert_eq!(reset.1["error"], "reset_routing_unverified");
-        assert_eq!(inventory["accounts"][0]["error"], "reset_read_failed");
+        assert_eq!(status, StatusCode::OK, "inventory: {inventory}");
         assert_eq!(
-            count, 0,
-            "unproved routing must not read usage, credits, or consume"
+            inventory["accounts"][0]["error"],
+            "reset_routing_unverified"
+        );
+        assert_eq!(
+            read_failures, 0,
+            "missing routing evidence is an unknown account, not a 502"
+        );
+        assert_eq!(inventory["accounts"][1]["alias"], "verified");
+        assert_eq!(inventory["accounts"][1]["applicable"], 1);
+        assert!(inventory["accounts"][1].get("error").is_none());
+        assert_eq!(
+            redeem_calls, 0,
+            "unproved routing must not redeem or read provider data"
+        );
+        assert_eq!(
+            count, 2,
+            "only the verified account reads usage and credits"
+        );
+    }
+    upstream.abort();
+}
+
+#[tokio::test]
+async fn postgres_dashboard_reset_unverified_routing_is_retryable_without_provider_work() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::BAD_GATEWAY }
+    });
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for mutation in [
+        "DELETE FROM central_token_evidence",
+        "UPDATE central_token_evidence SET routing_observed_at=clock_timestamp()-interval '61 seconds'",
+    ] {
+        let (mut fixture, control, schema) = postgres_fixture(&base).await;
+        fixture.broker.browser_resets_enabled = true;
+        control.batch_execute(mutation).await.unwrap();
+        let (url, server) = browser_server(&mut fixture, &base).await;
+        let response = reqwest::Client::new()
+            .get(format!("{url}/accounts/reset?alias=personal"))
+            .header("cookie", "codexctl-session=synthetic-session")
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        server.abort();
+        fixture.stop().await;
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "confirmation: {body}"
+        );
+        assert_eq!(body["error"], "reset_routing_unverified");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unknown confirmation never calls the provider"
         );
     }
     upstream.abort();
