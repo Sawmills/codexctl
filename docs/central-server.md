@@ -173,14 +173,20 @@ The server rechecks machine authorization before delivery.
 The company-user-scoped `POST /v1/resets/redeem` endpoint accepts an alias and a redemption request ID.
 The server rechecks applicability, chooses the credit, and keeps OpenAI credentials with the refresh owner.
 It saves the credit and provider idempotency key before sending, then saves the result.
-Concurrent requests for one account are serialized. Repeating a completed request returns `already_redeemed`.
+Concurrent requests for one account are serialized. Repeating a retained completed request returns `already_redeemed`.
+Receipt history normally keeps the newest 256 request IDs in completion order.
+Receipts without age metadata stay until 256 newly ordered completions replace
+them; request ID order does not establish receipt age.
+An already-accepted pending batch settles with every receipt intact, even if it
+exceeds that budget; later settlements resume ordinary FIFO pruning. An evicted
+ID does not prove that an earlier reset was never applied.
 An uncertain result retains the original credit and key across retries and server restarts;
 another operation cannot spend a second reset until that result is resolved.
 The client also persists its request ID. After a timeout or server error, rerun the same redemption command.
 If that machine is lost, another registered machine of the same company user can reconcile the pending operation.
 The server reuses the original credit and provider key and records the result for both request IDs; it never starts a second spend during reconciliation.
 Definitive non-retryable provider 4xx responses and unrecognized redemption codes close the operation with `reset_rejected`.
-The failure receipt prevents a repeated ID from sending again, and the client clears its pending ID so a deliberate new command can try again.
+While retained, the failure receipt prevents a repeated ID from sending again, and the client clears its pending ID so a deliberate new command can try again.
 Transport failures, HTTP 408/429, server errors, and unreadable responses retain the pending operation.
 Do not delete the pending request files to bypass an unresolved outcome.
 A retry of an already-sent operation may query the provider even after the exhausted window has cleared;

@@ -574,6 +574,11 @@ async fn start_for(
             broker.error(StatusCode::NOT_FOUND, "account_removed")
         } else if error.is::<crate::central::storage::login::LoginAuthorityEnded>() {
             broker.error(StatusCode::UNAUTHORIZED, "login_authority_ended")
+        } else if error
+            .downcast_ref::<crate::central::resets::Refusal>()
+            .is_some_and(|refusal| refusal.0 == "reset_in_progress")
+        {
+            broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_in_progress")
         } else {
             failure(&broker)
         }

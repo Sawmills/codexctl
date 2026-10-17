@@ -10,7 +10,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -37,6 +37,7 @@ struct Fixture {
     base: String,
     weekly_reset: Arc<AtomicI64>,
     long_window_seconds: Arc<AtomicI64>,
+    usage_calls: Arc<AtomicUsize>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     lender: HeaderMap,
     borrower: HeaderMap,
@@ -80,12 +81,15 @@ impl Fixture {
         }
         let weekly_reset = Arc::new(AtomicI64::new(now() + 3 * 24 * 3600));
         let long_window_seconds = Arc::new(AtomicI64::new(604_800));
+        let usage_calls = Arc::new(AtomicUsize::new(0));
         let usage = axum::Router::new().route(
             "/usage",
             axum::routing::get({
                 let weekly_reset = weekly_reset.clone();
                 let long_window_seconds = long_window_seconds.clone();
+                let usage_calls = usage_calls.clone();
                 move || {
+                    usage_calls.fetch_add(1, Ordering::SeqCst);
                     let reset = weekly_reset.load(Ordering::SeqCst);
                     let long = long_window_seconds.load(Ordering::SeqCst);
                     async move {
@@ -126,6 +130,7 @@ impl Fixture {
             base,
             weekly_reset,
             long_window_seconds,
+            usage_calls,
             tasks,
             lender,
             borrower,
@@ -272,6 +277,39 @@ fn kinds(events: &[Value]) -> Vec<String> {
         .iter()
         .map(|e| e["kind"].as_str().unwrap().to_owned())
         .collect()
+}
+
+#[tokio::test]
+async fn dashboard_reset_freshness_preserves_the_borrowed_usage_cache() {
+    let mut fixture = Fixture::new().await;
+    fixture.lend_main().await;
+    assert_eq!(fixture.catalog(&fixture.borrower).await.len(), 1);
+    let before = fixture.usage_calls.load(Ordering::SeqCst);
+    fixture.broker.catalog.age(Duration::from_secs(30)).await;
+    fixture.broker.browser_resets_enabled = true;
+    fixture.broker.sso = Some(Arc::new(crate::central::enrollment::Sso::testing_session(
+        BORROWER,
+    )));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/accounts/data", listener.local_addr().unwrap());
+    let app = crate::central::dashboard::routes("https://accounts.example")
+        .with_state(fixture.broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let response = reqwest::Client::new()
+        .get(url)
+        .header("cookie", "codexctl-session=synthetic-session")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot: Value = response.json().await.unwrap();
+    server.abort();
+    assert_eq!(snapshot["accounts"], json!([]));
+    assert_eq!(
+        fixture.usage_calls.load(Ordering::SeqCst),
+        before,
+        "reset applicability must not refresh a loan's still-fresh usage"
+    );
 }
 
 #[tokio::test]

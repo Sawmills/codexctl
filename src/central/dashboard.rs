@@ -83,8 +83,12 @@ async fn snapshot(
         .await?
         .ok_or_else(|| broker.error(StatusCode::UNAUTHORIZED, "browser_sign_in_required"))?;
     let user = identity.id;
-    let catalog =
-        managed::account_catalog(broker, &user, super::catalog::Freshness::RefreshAhead).await?;
+    let freshness = if broker.browser_resets_enabled {
+        super::catalog::Freshness::ResetApplicability
+    } else {
+        super::catalog::Freshness::RefreshAhead
+    };
+    let catalog = managed::account_catalog(broker, &user, freshness).await?;
     let sampled_at = Instant::now();
     // The dashboard offers lender-only actions, so it shows owned accounts only.
     let tasks = catalog
@@ -174,13 +178,7 @@ async fn account_snapshot(
     let observed = if account.available && !pending {
         broker
             .reset_reader
-            .dashboard_expiry(
-                &key,
-                &revision,
-                access.as_deref(),
-                &account.account_id,
-                broker.browser_resets_enabled,
-            )
+            .dashboard_expiry(&key, &revision, access.as_deref(), &account.account_id)
             .await
     } else {
         super::resets::ResetObservation {
@@ -235,7 +233,11 @@ async fn account_snapshot(
         usage_error: account.usage_error,
         banked_resets: Resets {
             count,
-            redeemable_now: observed.applicable.or(redeemable),
+            redeemable_now: redeemable.map(
+                |count| {
+                    if observed.qualifying_credit { count } else { 0 }
+                },
+            ),
             nearest_expiry: expiry,
             stale: reset_stale || account.usage_stale,
         },

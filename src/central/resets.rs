@@ -1,7 +1,7 @@
 //! Reset inventory and durable redemption. Credentials remain with the refresh owner.
 use super::{managed::Broker, server::TokenRequest};
 use crate::api;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Json,
     extract::State,
@@ -27,7 +27,7 @@ struct CachedExpiry {
 #[derive(Clone, Default)]
 pub(super) struct ResetObservation {
     pub count: Option<i64>,
-    pub applicable: Option<i64>,
+    pub qualifying_credit: bool,
     pub nearest_expiry: Option<i64>,
     pub stale: bool,
 }
@@ -97,7 +97,6 @@ impl Reader {
         revision: &str,
         token: Option<&str>,
         account: &str,
-        read_applicability: bool,
     ) -> ResetObservation {
         let entry = self
             .expiry_entries
@@ -123,50 +122,20 @@ impl Reader {
             .attempted
             .is_none_or(|at| at.elapsed() >= super::catalog::TTL)
         {
-            let result = async {
-                let usage = if read_applicability {
-                    Some(
-                        api::fetch_usage_at(
-                            &self.client,
-                            &self.usage_url,
-                            token.unwrap_or_default(),
-                            Some(account),
-                        )
-                        .await?,
-                    )
-                } else {
-                    None
-                };
-                let details = api::fetch_reset_credits_at(
-                    &self.client,
-                    &self.credits_url,
-                    token.unwrap_or_default(),
-                    Some(account),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((details, usage))
-            }
+            let result = api::fetch_reset_credits_at(
+                &self.client,
+                &self.credits_url,
+                token.unwrap_or_default(),
+                Some(account),
+            )
             .await;
             entry.attempted = Some(Instant::now());
             match result {
-                Ok((details, usage)) => {
+                Ok(details) => {
                     let now = chrono::Utc::now().timestamp();
-                    entry.observation.count = Some(
-                        details.available_count.max(
-                            usage
-                                .as_ref()
-                                .map_or(0, api::RateLimitResponse::reset_credits_available),
-                        ),
-                    );
-                    let qualifying = details.credits.iter().any(|c| {
+                    entry.observation.count = Some(details.available_count);
+                    entry.observation.qualifying_credit = details.credits.iter().any(|c| {
                         c.is_available() && c.expires_at_timestamp().is_none_or(|at| at > now)
-                    });
-                    entry.observation.applicable = usage.as_ref().map(|u| {
-                        if qualifying {
-                            u.reset_credits_applicable()
-                        } else {
-                            0
-                        }
                     });
                     entry.observation.nearest_expiry = details
                         .credits
@@ -454,10 +423,63 @@ struct Pending {
     #[serde(default)]
     joined_requests: std::collections::BTreeSet<String>,
 }
+const RECEIPT_LIMIT: usize = 256;
+
+impl Pending {
+    fn join(&mut self, request: &str) -> Result<bool> {
+        if request == self.request_id || self.joined_requests.contains(request) {
+            return Ok(false);
+        }
+        // Reserve a receipt for the original request and every accepted join.
+        if self.joined_requests.len() >= RECEIPT_LIMIT - 1 {
+            return Err(Refusal("reset_busy").into());
+        }
+        Ok(self.joined_requests.insert(request.into()))
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct Journal {
     pending: Option<Pending>,
     completed: std::collections::BTreeMap<String, api::ConsumeResetResponse>,
+    #[serde(default)]
+    completed_order: std::collections::VecDeque<String>,
+}
+impl Journal {
+    fn complete(
+        &mut self,
+        requests: impl IntoIterator<Item = String>,
+        response: &api::ConsumeResetResponse,
+    ) -> Result<()> {
+        // Keep every accepted request in this settlement. New joins are bounded,
+        // but an already-persisted pending batch may be larger.
+        let requests: std::collections::BTreeSet<_> = requests.into_iter().collect();
+        let limit = RECEIPT_LIMIT.max(requests.len());
+        for request in requests {
+            if self
+                .completed
+                .insert(request.clone(), response.clone())
+                .is_none()
+            {
+                self.completed_order.push_back(request);
+            }
+        }
+        // Unknown-age receipts cannot be ordered by their IDs. Keep them until
+        // a full new replay window can replace them with ordered completions.
+        if self.completed.len() > limit && self.completed_order.len() >= limit {
+            let ordered: std::collections::BTreeSet<_> = self.completed_order.iter().collect();
+            self.completed
+                .retain(|request, _| ordered.contains(request));
+        }
+        while self.completed_order.len() > limit {
+            let oldest = self
+                .completed_order
+                .pop_front()
+                .context("reset receipt order missing")?;
+            self.completed.remove(&oldest);
+        }
+        Ok(())
+    }
 }
 impl Reader {
     async fn redeem(
@@ -487,9 +509,7 @@ impl Reader {
         // An authorized machine may resolve another machine's uncertain attempt,
         // but it must reuse that attempt's credit and provider key.
         if let Some(pending) = journal.pending.as_mut()
-            && pending
-                .joined_requests
-                .insert(request.redeem_request_id.clone())
+            && pending.join(&request.redeem_request_id)?
         {
             crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
         }
@@ -593,15 +613,17 @@ impl Reader {
                     }
                     Err(error) => return Err(error),
                 };
-                for joined in &pending.joined_requests {
-                    journal.completed.insert(joined.clone(), response.clone());
-                }
-                let original_request = pending.request_id.clone();
-                journal.completed.insert(original_request, response.clone());
-                journal
-                    .completed
-                    .insert(request.redeem_request_id.clone(), response.clone());
-                journal.pending = None;
+                let completed = journal
+                    .pending
+                    .take()
+                    .context("missing redemption journal")?;
+                journal.complete(
+                    completed
+                        .joined_requests
+                        .into_iter()
+                        .chain([completed.request_id, request.redeem_request_id.clone()]),
+                    &response,
+                )?;
                 crate::store::atomic_write(&path, &serde_json::to_vec(&journal)?)?;
                 if let Some(reason) = rejection {
                     return Err(TerminalRejection(reason).into());

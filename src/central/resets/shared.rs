@@ -5,7 +5,10 @@ use crate::central::{
     relogin::shared::Caller,
     storage::resets::{ResetAudit, ResetWrite},
 };
+use futures::{StreamExt, stream};
 use serde_json::Value;
+
+const INVENTORY_CONCURRENCY: usize = 8;
 
 pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Response, HttpError> {
     let device = broker.authorize(headers).await?;
@@ -17,31 +20,37 @@ pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Respons
         .list_account_aliases(&device.user)
         .await
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_read_failed"))?;
-    let mut accounts = Vec::new();
-    for alias in aliases {
-        let outcome = match credential(central, &device.user, &alias).await {
-            Ok(saved) => {
-                let result = async {
-                    let token = vault::token(&saved.auth)?;
-                    let account = vault::account(&saved.auth)?;
-                    broker.reset_reader.read(token, &account).await
+    let user = &device.user;
+    let mut accounts = stream::iter(aliases.into_iter().enumerate())
+        .map(|(index, alias)| async move {
+            let outcome = match credential(central, user, &alias).await {
+                Ok(saved) => {
+                    let result = async {
+                        let token = vault::token(&saved.auth)?;
+                        let account = vault::account(&saved.auth)?;
+                        broker.reset_reader.read(token, &account).await
+                    }
+                    .await;
+                    if let Err(error) = &result {
+                        log_error("inventory", error, &saved.auth);
+                    }
+                    result
                 }
-                .await;
-                if let Err(error) = &result {
-                    log_error("inventory", error, &saved.auth);
+                Err(error) => Err(error),
+            }
+            .unwrap_or_else(|_| {
+                broker.record_failure("reset_read_failed", "resets", StatusCode::BAD_GATEWAY);
+                Outcome::Failed {
+                    error: "reset_read_failed".into(),
                 }
-                result
-            }
-            Err(error) => Err(error),
-        }
-        .unwrap_or_else(|_| {
-            broker.record_failure("reset_read_failed", "resets", StatusCode::BAD_GATEWAY);
-            Outcome::Failed {
-                error: "reset_read_failed".into(),
-            }
-        });
-        accounts.push(Account { alias, outcome });
-    }
+            });
+            (index, Account { alias, outcome })
+        })
+        .buffer_unordered(INVENTORY_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    accounts.sort_unstable_by_key(|(index, _)| *index);
+    let accounts = accounts.into_iter().map(|(_, account)| account).collect();
     broker.authorize(headers).await?;
     Ok((
         [("cache-control", "no-store")],
@@ -322,9 +331,7 @@ async fn execute(
             return receipt(completed, true);
         }
         if let Some(pending) = journal.pending.as_mut() {
-            pending
-                .joined_requests
-                .insert(request.redeem_request_id.clone());
+            pending.join(&request.redeem_request_id)?;
             if pending.actor.is_none() {
                 pending.actor = caller.dashboard_actor.clone();
             }
@@ -419,27 +426,23 @@ async fn execute(
             actor,
             attempt: &audit_key,
         });
-        let result = match response.code {
-            api::ConsumeResetCode::Reset => "ok:reset",
-            api::ConsumeResetCode::AlreadyRedeemed => "ok:already_redeemed",
-            api::ConsumeResetCode::NothingToReset => "refused:nothing_to_reset",
-            api::ConsumeResetCode::NoCredit => "refused:no_credit",
-            api::ConsumeResetCode::Unknown => "failed:reset_rejected",
-        };
-        for id in current
-            .joined_requests
-            .into_iter()
-            .chain([current.request_id])
-        {
-            journal.completed.insert(id, response.clone());
-        }
+        journal.complete(
+            current
+                .joined_requests
+                .into_iter()
+                .chain([current.request_id]),
+            &response,
+        )?;
         if central
             .write_reset_journal(
                 &caller.user,
                 &record.account_id,
                 version,
                 &serde_json::to_value(&journal)?,
-                ResetWrite::Settle { audit, result },
+                ResetWrite::Settle {
+                    audit,
+                    code: response.code,
+                },
             )
             .await?
         {

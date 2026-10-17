@@ -16,6 +16,7 @@ pub(super) const REFRESH_MARGIN: Duration = Duration::from_secs(35);
 pub(super) enum Freshness {
     Cached,
     RefreshAhead,
+    ResetApplicability,
 }
 
 #[derive(Default)]
@@ -148,7 +149,11 @@ impl Reader {
                 ..Default::default()
             };
         }
-        if let Some(seed) = seed
+        // Native observations omit reset applicability. Only the dashboard's
+        // reset action needs a complete HTTP observation; machines keep native usage.
+        let needs_applicability = matches!(freshness, Freshness::ResetApplicability);
+        if !needs_applicability
+            && let Some(seed) = seed
             && entry.sample.as_ref().is_none_or(|(_, at)| seed.1 > *at)
         {
             entry.sample = Some(seed);
@@ -157,12 +162,14 @@ impl Reader {
         }
         let refresh_after = match freshness {
             Freshness::Cached => self.ttl,
-            Freshness::RefreshAhead => self.ttl.saturating_sub(REFRESH_MARGIN),
+            Freshness::RefreshAhead | Freshness::ResetApplicability => {
+                self.ttl.saturating_sub(REFRESH_MARGIN)
+            }
         };
-        let fresh = entry
-            .sample
-            .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() < refresh_after);
+        let fresh = entry.sample.as_ref().is_some_and(|(usage, at)| {
+            at.elapsed() < refresh_after
+                && (!needs_applicability || usage.rate_limit_reset_credits.is_some())
+        });
         // Successful observations may refresh early; failures retain the full
         // cooldown so more frequent browser polling cannot hammer the upstream.
         let cooldown = if entry.error.is_some() {

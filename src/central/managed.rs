@@ -1448,6 +1448,14 @@ pub(super) async fn account_catalog(
     }
     let user = user.to_owned();
     let tasks = owners.into_iter().map(|(key, owner, loan)| {
+        // Borrowed accounts have no reset action on this dashboard. Keep their
+        // ordinary cache policy instead of requiring reset applicability.
+        let freshness =
+            if loan.is_some() && matches!(freshness, catalog::Freshness::ResetApplicability) {
+                catalog::Freshness::Cached
+            } else {
+                freshness
+            };
         let broker = broker.clone();
         let user = user.clone();
         tokio::spawn(async move {
