@@ -1089,12 +1089,21 @@ Before registration, pin both workload images to that digest in the staging over
 
 The staging application lives in `Sawmills/argocd-deploy` at
 `plat/ue1-staging/argocd/codexctl-application.yaml`.
-The checked-in [Application](../deploy/k8s/staging-application.yaml) tracks `main`
-and `deploy/k8s/overlays/staging`; its sync policy sets `CreateNamespace=true` but
-has no automated sync, prune, or self-heal. Review and manually register the
-Application if it is not installed; sync is also an explicit operator action.
-Verify the installed Application's policy and the Google client/secret readiness
-before an SSO change syncs.
+The registered `argocd/codexctl` Application tracks `main` and
+`deploy/k8s/overlays/staging` with automated sync, prune and selfHeal. A merged
+staging overlay change starts a rollout automatically. The checked-in
+[Application](../deploy/k8s/staging-application.yaml) is a bootstrap reference:
+it sets `CreateNamespace=true` and omits the registered automated sync policy.
+Inspect the live Application's source and policy before registration, policy
+changes or a rollout:
+
+```sh
+kubie exec plat-staging argocd kubectl get application codexctl -o json | \
+  jq '{source: .spec.source, syncPolicy: .spec.syncPolicy, sync: .status.sync}'
+```
+
+Verify the Google client/secret readiness before merging an SSO change that
+will sync automatically.
 The internal ALB terminates HTTPS. The broker uses a ClusterIP service.
 
 One StatefulSet replica owns an encrypted `ReadWriteOncePod` volume.
