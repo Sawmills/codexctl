@@ -12,6 +12,7 @@ mod evidence;
 mod identity;
 mod policy;
 mod routing;
+mod watchdog;
 
 pub(crate) use routing::{
     central_provider, configure as configure_central_route, preflight_configuration,
@@ -21,7 +22,10 @@ pub(crate) use routing::{
 use std::{
     collections::BTreeMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -244,11 +248,27 @@ struct Relay {
     streaks: Arc<Mutex<Streaks>>,
     counts: Arc<Mutex<BTreeMap<MetricKey, u64>>>,
     stream_failures: Arc<Mutex<BTreeMap<StreamMetricKey, u64>>>,
+    open_streams: Arc<AtomicU64>,
     stream_log: Arc<Mutex<StreamFailureLogState>>,
     log: Log,
     central_events: Option<mpsc::Sender<CapacityEvent>>,
     central_dropped: Arc<Mutex<BTreeMap<&'static str, u64>>>,
     evidence: evidence::Evidence,
+}
+
+struct OpenStream(Arc<AtomicU64>);
+
+impl OpenStream {
+    fn new(count: Arc<AtomicU64>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self(count)
+    }
+}
+
+impl Drop for OpenStream {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 struct StreamFailureLogState {
@@ -319,6 +339,12 @@ pub async fn serve(
         (None, None)
     };
     let (evidence, evidence_worker) = evidence::Evidence::start(config.evidence_dir)?;
+    let open_streams = Arc::new(AtomicU64::new(0));
+    let _watchdog = watchdog::Watchdog::start(
+        config.identity_root.join("relay/diag"),
+        config.log.clone(),
+        open_streams.clone(),
+    )?;
     let relay = Relay {
         upstream: config.upstream.into(),
         client,
@@ -328,6 +354,7 @@ pub async fn serve(
         ))),
         counts: Arc::default(),
         stream_failures: Arc::default(),
+        open_streams,
         stream_log: Arc::new(Mutex::new(StreamFailureLogState::new())),
         log: config.log,
         central_events,
@@ -396,6 +423,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
     if !path.starts_with(FORWARDED_PREFIX) {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let open_stream = OpenStream::new(relay.open_streams.clone());
     let (parts, body) = request.into_parts();
     let thread = header_str(&parts.headers, "thread-id")
         .or_else(|| header_str(&parts.headers, "session-id"))
@@ -510,8 +538,12 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
     };
     let (parts, body) = response.into_parts();
     let body = futures::stream::unfold(
-        (body.into_data_stream(), guard),
-        |(mut body, guard)| async move { body.next().await.map(|chunk| (chunk, (body, guard))) },
+        (body.into_data_stream(), guard, open_stream),
+        |(mut body, guard, open_stream)| async move {
+            body.next()
+                .await
+                .map(|chunk| (chunk, (body, guard, open_stream)))
+        },
     );
     Response::from_parts(parts, Body::from_stream(body))
 }
@@ -2147,6 +2179,10 @@ async fn metrics(State(relay): State<Relay>) -> Response {
         ));
     }
     out.push_str(&relay.evidence.metrics());
+    out.push_str(&format!(
+        "# TYPE codexctl_relay_open_streams gauge\ncodexctl_relay_open_streams {}\n",
+        relay.open_streams.load(Ordering::Relaxed),
+    ));
     out.push_str("# TYPE codexctl_relay_stream_failures_total counter\n");
     for ((kind, stage, model, account_class), count) in relay
         .stream_failures
@@ -2200,6 +2236,7 @@ mod tests {
             ))),
             counts: Arc::default(),
             stream_failures: Arc::default(),
+            open_streams: Arc::default(),
             stream_log: Arc::new(Mutex::new(StreamFailureLogState::new())),
             log: Arc::new(|_| {}),
             central_events: Some(sender),
@@ -2247,6 +2284,7 @@ mod tests {
             counts: Arc::default(),
             stream_failures: Arc::default(),
             stream_log: Arc::new(Mutex::new(StreamFailureLogState::new())),
+            open_streams: Arc::default(),
             log: Arc::new(move |line| sink.lock().expect("test log lock").push(line.to_owned())),
             central_events: None,
             central_dropped: Arc::default(),
@@ -2276,6 +2314,7 @@ mod tests {
             counts: Arc::default(),
             stream_failures: Arc::default(),
             stream_log: Arc::new(Mutex::new(StreamFailureLogState::new())),
+            open_streams: Arc::default(),
             log: Arc::new(|_| {}),
             central_events: None,
             central_dropped: Arc::default(),
