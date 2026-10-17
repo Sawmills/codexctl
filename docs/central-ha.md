@@ -189,7 +189,12 @@ released. Credentials and raw session tokens never enter the page or audit.
 Shared inventory/confirmation reads and new redemptions require positive workspace-routing
 evidence for the exact saved auth and account revision, observed within 60 seconds.
 If it is missing, refused or stale, a normal token read must establish it first;
-the reset path returns a retryable refusal and never starts native refresh.
+inventory returns HTTP 200 with that account marked `error: reset_routing_unverified`
+(resets unknown), while accounts with verified routing keep their reset details.
+This expected unknown state does not emit `reset_read_failed` or a 502 failure metric.
+Confirmation and redemption return a retryable refusal and never start native refresh.
+Include `reset_read_failed` in the rollout acceptance error list; require 300 seconds
+without new failures after the roll, alongside the existing readiness and error checks.
 Completed receipts can still be replayed without a live token or routing proof.
 Journal reads and settlements require the validated company user and an active
 server account. Remove tombstones its journal in the account-removal transaction,

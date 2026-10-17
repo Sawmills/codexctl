@@ -24,7 +24,7 @@ pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Respons
     let mut accounts = stream::iter(aliases.into_iter().enumerate())
         .map(|(index, alias)| async move {
             let outcome = match credential(central, user, &alias).await {
-                Ok(saved) => {
+                Ok(Some(saved)) => {
                     let result = async {
                         let token = vault::token(&saved.auth)?;
                         let account = vault::account(&saved.auth)?;
@@ -36,6 +36,9 @@ pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Respons
                     }
                     result
                 }
+                Ok(None) => Ok(Outcome::Failed {
+                    error: "reset_routing_unverified".into(),
+                }),
                 Err(error) => Err(error),
             }
             .unwrap_or_else(|_| {
@@ -62,15 +65,30 @@ pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Respons
         .into_response())
 }
 
-async fn credential(central: &CentralStore, user: &str, alias: &str) -> Result<vault::Vault> {
+async fn credential(
+    central: &CentralStore,
+    user: &str,
+    alias: &str,
+) -> Result<Option<vault::Vault>> {
     let record = central
         .load_account_by_alias(user, alias)
         .await?
         .ok_or_else(|| anyhow::anyhow!("account unavailable"))?;
     let result = async {
         let saved = checked_credential(&record, user)?;
-        require_routing(central, &record, &saved).await?;
-        Ok(saved)
+        match require_routing(central, &record, &saved).await {
+            Ok(_) => Ok(Some(saved)),
+            // A cold or expired observation makes inventory unknown, not failed.
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<Refusal>(),
+                    Some(Refusal("reset_routing_unverified"))
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
     .await;
     if let Err(error) = &result {
@@ -151,7 +169,8 @@ pub(in crate::central) async fn view(
         .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_unavailable"))?;
     let saved = credential(central, &caller.user, alias)
         .await
-        .map_err(|_| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?;
+        .map_err(|_| broker.error(StatusCode::NOT_FOUND, "account_not_found"))?
+        .ok_or_else(|| broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_routing_unverified"))?;
     let token = vault::token(&saved.auth)
         .map_err(|_| broker.error(StatusCode::SERVICE_UNAVAILABLE, "reset_read_failed"))?;
     let account = vault::account(&saved.auth)
