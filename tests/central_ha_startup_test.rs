@@ -248,6 +248,75 @@ async fn request(http: &reqwest::Client, pod: &Pod, token: &str) -> reqwest::Res
 }
 
 #[tokio::test]
+async fn postgres_shared_service_rotation_revokes_the_old_credential_on_every_replica() {
+    let f = login_fixture().await;
+    let issue = |user: &str| {
+        let mut admin = Command::new(env!("CARGO_BIN_EXE_codexctl-central"));
+        admin
+            .args(["service-account", "issue", user, "--state"])
+            .arg(f.first.root.path().join("state"))
+            .arg("--key-file")
+            .arg(&f.key)
+            .env("CODEXCTL_CENTRAL_STORE", "postgres")
+            .env("CODEXCTL_CENTRAL_DB_TLS", "0")
+            .env("DATABASE_URL", &f.database);
+        admin
+    };
+    let first = issue("test").output().await.unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first = String::from_utf8(first.stdout).unwrap();
+    assert_eq!(first.lines().count(), 1);
+    assert_eq!(first.trim().len(), 64);
+    for pod in [&f.first, &f.second] {
+        let response = f
+            .http
+            .get(format!("{}/v1/me", pod.url))
+            .bearer_auth(first.trim())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], "test");
+    }
+    let refused = issue("missing-company-user").output().await.unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        refused.stdout.is_empty(),
+        "failed issuance must emit no credential"
+    );
+    let second = issue("test").output().await.unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let second = String::from_utf8(second.stdout).unwrap();
+    assert_eq!(second.lines().count(), 1);
+    assert_eq!(second.trim().len(), 64);
+    assert!(
+        first != second,
+        "rotation must change the shared credential"
+    );
+    for pod in [&f.first, &f.second] {
+        for (token, expected) in [(&first, 401), (&second, 200), (&f.token, 200)] {
+            let response = f
+                .http
+                .get(format!("{}/v1/me", pod.url))
+                .bearer_auth(token.trim())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+    stop_fixture(f).await;
+}
+
+#[tokio::test]
 async fn three_postgres_servers_start_without_refresh_children_and_launch_only_under_lease() {
     let Ok(database) = std::env::var("DATABASE_URL") else {
         assert_ne!(

@@ -11,6 +11,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Administer the one shared machine credential for non-interactive jobs.
+    ServiceAccount {
+        #[command(subcommand)]
+        command: ServiceAccountCommand,
+    },
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     SuperviseLogin {
@@ -149,6 +154,19 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum ServiceAccountCommand {
+    /// Issue or rotate the shared token for an existing enabled company user.
+    Issue {
+        /// Company-user ID from `codexctl-central users`.
+        user: String,
+        #[arg(long)]
+        state: PathBuf,
+        #[arg(long)]
+        key_file: PathBuf,
+    },
+}
+
 // Native children use Linux PR_SET_PDEATHSIG, which follows the spawning thread.
 // Spawn directly on this long-lived main thread, never in spawn_blocking.
 #[tokio::main(flavor = "current_thread")]
@@ -205,6 +223,17 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         );
     }
     match cli.command {
+        Commands::ServiceAccount {
+            command:
+                ServiceAccountCommand::Issue {
+                    user,
+                    state,
+                    key_file,
+                },
+        } => {
+            let token = central::service_account::issue(&state, &key_file, &user).await?;
+            println!("{token}");
+        }
         #[cfg(target_os = "linux")]
         Commands::SuperviseLogin {
             state,

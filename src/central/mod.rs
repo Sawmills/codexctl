@@ -25,6 +25,7 @@ mod rename;
 pub(crate) mod resets;
 mod rpc;
 mod server;
+pub mod service_account;
 mod sessions;
 pub mod storage;
 mod transport;

@@ -23,6 +23,275 @@ mod readiness;
 mod relay_fixture;
 
 #[test]
+fn service_environment_cannot_persist_a_desktop_app_connection() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = app_auth_home(&server, "0.161.0");
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["app-auth", "enable", "--account", "lane", "--no-agent"])
+        .env("HOME", home.path())
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", home.path().join("bin").display()),
+        )
+        .env("CODEXCTL_APP_AUTH_APP_CODEX", "/nonexistent/codex")
+        .env("CODEXCTL_SERVICE_TOKEN", &server.amir)
+        .env("CODEXCTL_SERVER_URL", &server.url)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env_remove("CODEXCTL_PINNED_CONNECTION")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "service job persisted a desktop connection"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires a saved machine connection")
+    );
+    assert!(!home.path().join(".codex/auth.json").exists());
+    assert!(!home.path().join(".codexctl/app-auth/state.json").exists());
+}
+
+#[test]
+fn service_environment_cannot_activate_a_host_account() {
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["use", "lane"])
+        .env("HOME", home.path())
+        .env("CODEXCTL_SERVICE_TOKEN", &server.amir)
+        .env("CODEXCTL_SERVER_URL", &server.url)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env_remove("CODEXCTL_PINNED_CONNECTION")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "service job activated the host provider"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("service jobs cannot activate"));
+    for path in [
+        ".codex/config.toml",
+        ".codexctl/central/.native-active.json",
+        ".codexctl/central/.active-account",
+        ".codexctl/central/lane.json",
+    ] {
+        assert!(
+            !home.path().join(path).exists(),
+            "service activation wrote {path}"
+        );
+    }
+}
+
+#[test]
+fn service_server_url_without_token_never_reuses_a_saved_machine() {
+    let server = Server::start();
+    let home = server.connected_home();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["devices"])
+        .env("HOME", home.path())
+        .env("CODEXCTL_SERVER_URL", &server.url)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEXCTL_SERVICE_TOKEN")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CODEXCTL_SERVICE_TOKEN is required"));
+}
+
+#[test]
+fn service_only_codex_exec_uses_a_private_subscription_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join("bin");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import base64, http.server, json, os, pathlib, subprocess, sys, threading
+values = dict(arg.split('=', 1) for arg in sys.argv[1:] if arg.startswith('model_providers.codexctl-central.') and '=' in arg)
+assert 'exec' in sys.argv and 'synthetic prompt' in sys.argv
+assert values.get('model_providers.codexctl-central.requires_openai_auth') == 'false', 'service job fell back to human authentication'
+assert os.environ['CODEXCTL_PINNED_ALIAS'] == 'lane'
+command = json.loads(values['model_providers.codexctl-central.auth.command'])
+args = json.loads(values['model_providers.codexctl-central.auth.args'])
+connection = pathlib.Path(args[args.index('--connection') + 1])
+assert json.loads(connection.read_text())['device_token_file'] is None
+result = subprocess.run([command] + args, capture_output=True, text=True)
+assert result.returncode == 0, 'service helper failed: ' + result.stderr
+payload = result.stdout.strip().split('.')[1]
+claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+assert claims['https://api.openai.com/auth']['chatgpt_account_id'] == 'lane-seat'
+requests = []
+class OtherServer(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        requests.append(self.path)
+        self.send_response(401)
+        self.end_headers()
+    def log_message(self, *_):
+        pass
+with http.server.ThreadingHTTPServer(('127.0.0.1', 0), OtherServer) as other:
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    metadata = json.loads(connection.read_text())
+    metadata['server'] = f'http://127.0.0.1:{other.server_port}'
+    connection.write_text(json.dumps(metadata))
+    refused = subprocess.run([command] + args, capture_output=True, text=True)
+    other.shutdown()
+    assert refused.returncode != 0 and not refused.stdout
+    assert 'service credential belongs to another account server' in refused.stderr
+    assert not requests, 'service credential escaped its configured origin'
+print('CENTRAL-SERVICE-EXEC-OK')
+"##).unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["codex", "exec", "synthetic prompt"])
+        .env("HOME", home.path())
+        .env("CODEXCTL_SERVICE_TOKEN", &server.amir)
+        .env("CODEXCTL_SERVER_URL", &server.url)
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .env_remove("CODEXCTL_PINNED_CONNECTION")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "service-only exec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("CENTRAL-SERVICE-EXEC-OK"));
+    assert!(!home.path().join(".codex/auth.json").exists());
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.native-active.json")
+            .exists()
+    );
+    assert!(!home.path().join(".codexctl/central/.server.json").exists());
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.active-account")
+            .exists()
+    );
+    for output in [&output.stdout, &output.stderr] {
+        assert!(
+            !output
+                .windows(server.amir.len())
+                .any(|chunk| chunk == server.amir.as_bytes())
+        );
+    }
+    let mut directories = vec![home.path().to_owned()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                directories.push(entry.path());
+            } else if entry.file_type().unwrap().is_file() {
+                assert!(
+                    !std::fs::read(entry.path())
+                        .unwrap()
+                        .windows(server.amir.len())
+                        .any(|chunk| chunk == server.amir.as_bytes()),
+                    "service credential persisted by job"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn shared_service_issue_rotates_the_machine_credential_without_a_token_file() {
+    let server = Server::start();
+    let issue = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_codexctl-central"))
+            .args(["service-account", "issue", "amir", "--state"])
+            .arg(server.root.path().join("state"))
+            .arg("--key-file")
+            .arg(server.root.path().join("key"))
+            .env("CODEXCTL_CENTRAL_STORE", "file")
+            .env_remove("DATABASE_URL")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "admin issue failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            output.lines().count(),
+            1,
+            "admin emits one credential line only"
+        );
+        let token = output.trim().to_owned();
+        assert_eq!(
+            token.len(),
+            64,
+            "credential length only; do not print its value"
+        );
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        token
+    };
+    let status = |token: &str| {
+        server
+            .http
+            .get(format!("{}/v1/me", server.url))
+            .bearer_auth(token)
+            .send()
+            .unwrap()
+            .status()
+    };
+    let first = issue();
+    assert_eq!(status(&first), 200);
+    let second = issue();
+    assert!(
+        first != second,
+        "rotation must replace the shared credential"
+    );
+    assert_eq!(status(&first), 401);
+    assert_eq!(status(&second), 200);
+    let mut directories = vec![server.root.path().to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(first.len())
+                        .any(|chunk| chunk == first.as_bytes()),
+                    "first service credential persisted"
+                );
+                assert!(
+                    !bytes
+                        .windows(second.len())
+                        .any(|chunk| chunk == second.as_bytes()),
+                    "rotated service credential persisted"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn readiness_reports_file_mode_and_registry_health() {
     let server = Server::start();
     let ready = || {
