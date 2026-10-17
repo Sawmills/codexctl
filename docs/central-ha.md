@@ -1015,7 +1015,7 @@ Stop if the revision is wrong, sync is incomplete, or the ConfigMap check fails.
      access token has at least one hour left. Warm routing and, when requesting
      billing, billing/usage evidence for its current credential revision; keep
      that evidence within the 60-second freshness bound and every reported usage
-     window below 90%. Snapshot each pod's authenticated `/metrics`, then send
+     window below 90%. Snapshot each pod's `/metrics`, then send
      token requests **without `previousRevision`** directly to that pod. Require
      200 responses, zero upstream refreshes, and an increase of at least one in
      that pod's `codexctl_central_token_fast_path_total{result="served"}` counter.

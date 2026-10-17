@@ -1379,7 +1379,9 @@ A server outage prevents token acquisition and refresh. Existing access tokens c
 This first deployment has one server and does not promise uninterrupted availability.
 
 `/health` checks process availability. `/ready` checks readable user and device registries.
-Authenticated `/metrics` records each rejected API attempt once, including JSON and body-limit rejections.
+`/metrics` accepts scrapes without a bearer and records each rejected API attempt once,
+including JSON and body-limit rejections. Account and machine endpoints retain their
+existing authentication.
 Usage fetch failures during listing have separate bounded reasons:
 `catalog_usage_failed` and `catalog_usage_timeout`. The server counts each failed
 fetch once, even when several polls share it. These reasons use the existing
@@ -1387,14 +1389,18 @@ account-operation alert. A usage alert does not mean token delivery has failed.
 Session-write, cleanup, count, and queue failures use `live_session_failed` and
 the same alert. Each failed observation or count attempt is counted once.
 The staging overlay includes a PrometheusRule for the existing `kube-prometheus` selector.
-The staging `ScrapeConfig` supplies an authenticated scrape through the existing
-Prometheus operator. Its Secret reference selects only the metrics credential.
+The staging `ScrapeConfig` still supplies its legacy bearer through the existing
+Prometheus operator. The endpoint no longer checks it; its Secret reference and
+the validated `--metrics-token-file` launch option remain for the staged SAW-13160 cleanup.
 The ServiceMonitor schema lacks authentication fields, so this deployment uses
 that supported ScrapeConfig path without changing the shared monitoring hold.
 The endpoint declares Prometheus text format version 0.0.4.
 Availability alerts use failed or absent scrapes. Credential alerts use recent
 failure timestamps and the unresolved-ownership gauge.
 The metrics credential at `/app/codexctl/metrics-token` has no account API access.
+Image activation requires a separate operator GO: current staging ingress and
+NetworkPolicy permit VPC access to this route. Bound or explicitly accept that
+exposure and verify per-pod scrapes before rollout; no deployment wiring changes here.
 Failure timestamps allow the first failure to alert even before a zero counter was scraped.
 Alert routing and notification delivery are separate deployment checks.
 

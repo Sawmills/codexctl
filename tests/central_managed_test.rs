@@ -435,6 +435,9 @@ impl Server {
         panic!("login did not finish");
     }
     fn start() -> Self {
+        Self::start_with_metrics_token(true)
+    }
+    fn start_with_metrics_token(configured: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = root.path().join("state");
         let key = root.path().join("key");
@@ -474,11 +477,13 @@ impl Server {
             &root.path().join("alex.token"),
         )
         .unwrap();
-        store::atomic_write(
-            &root.path().join("metrics.token"),
-            b"synthetic-monitoring-credential-only",
-        )
-        .unwrap();
+        if configured {
+            store::atomic_write(
+                &root.path().join("metrics.token"),
+                b"synthetic-monitoring-credential-only",
+            )
+            .unwrap();
+        }
         store::atomic_write(&root.path().join("mode"), b"").unwrap();
         store::atomic_write(&root.path().join("count"), b"0").unwrap();
         store::atomic_write(&root.path().join("retry-clock"), b"0").unwrap();
@@ -526,14 +531,18 @@ impl Server {
         if let Some(value) = recovery {
             command.env("CODEXCTL_CENTRAL_BACKGROUND_RECOVERY", value);
         }
-        let mut child = command
+        command
             .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
             .args(["serve", "--state"])
             .arg(root.path().join("state"))
             .arg("--key-file")
-            .arg(root.path().join("key"))
-            .arg("--metrics-token-file")
-            .arg(root.path().join("metrics.token"))
+            .arg(root.path().join("key"));
+        if root.path().join("metrics.token").exists() {
+            command
+                .arg("--metrics-token-file")
+                .arg(root.path().join("metrics.token"));
+        }
+        let mut child = command
             .args([
                 "--listen",
                 "127.0.0.1:0",
@@ -7294,7 +7303,63 @@ fn wait_for_refresh(server: &Server) {
 }
 
 #[test]
-fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_rejections_count_once() {
+fn metrics_scrapes_need_no_bearer_and_grant_no_account_access() {
+    for configured in [true, false] {
+        let server = Server::start_with_metrics_token(configured);
+        for bearer in [
+            None,
+            Some("invalid"),
+            Some("synthetic-monitoring-credential-only"),
+        ] {
+            let mut request = server.http.get(format!("{}/metrics", server.url));
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            let response = request.send().unwrap();
+            assert_eq!(response.status(), 200, "configured={configured}");
+            assert_eq!(
+                response.headers()["content-type"],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            assert!(
+                response
+                    .text()
+                    .unwrap()
+                    .contains("codexctl_central_ownership_unresolved")
+            );
+            for (method, path) in [
+                (reqwest::Method::GET, "/v1/accounts"),
+                (reqwest::Method::POST, "/v1/token"),
+            ] {
+                let mut request = server.http.request(method, format!("{}{path}", server.url));
+                if let Some(bearer) = bearer {
+                    request = request.bearer_auth(bearer);
+                }
+                assert_eq!(
+                    request
+                        .json(&json!({"alias":"unused"}))
+                        .send()
+                        .unwrap()
+                        .status(),
+                    401
+                );
+            }
+        }
+        assert_eq!(
+            server
+                .http
+                .get(format!("{}/v1/accounts", server.url))
+                .bearer_auth(&server.amir)
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[test]
+fn metrics_scrapes_preserve_api_rejection_counts_without_creating_auth_failures() {
     let server = Server::start();
     let metrics = "synthetic-monitoring-credential-only";
     assert_eq!(
@@ -7343,7 +7408,7 @@ fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_reject
             .send()
             .unwrap()
             .status(),
-        401
+        200
     );
     let output = server
         .http
@@ -7354,7 +7419,7 @@ fn when_metrics_credentials_are_used_then_they_cannot_access_accounts_and_reject
         .text()
         .unwrap();
     assert!(
-        output.contains("reason=\"metrics_unauthorized\"} 1\n"),
+        !output.contains("reason=\"metrics_unauthorized\"}"),
         "{output}"
     );
 }
@@ -9666,7 +9731,7 @@ fn an_inaccessible_activation_marker_refuses_local_profile_save() {
 }
 
 #[test]
-fn a_monitoring_token_with_a_trailing_newline_authenticates_scrapes() {
+fn metrics_scrapes_accept_a_legacy_launch_file_with_a_trailing_newline() {
     let mut server = Server::start();
     server.stop();
     store::atomic_write(
