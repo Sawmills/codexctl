@@ -151,6 +151,56 @@ async fn postgres_reset_requires_current_workspace_routing_before_any_provider_c
 }
 
 #[tokio::test]
+async fn postgres_dashboard_reset_unverified_routing_is_retryable_without_provider_work() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new().fallback(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::BAD_GATEWAY }
+    });
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for mutation in [
+        "DELETE FROM central_token_evidence",
+        "UPDATE central_token_evidence SET routing_observed_at=clock_timestamp()-interval '61 seconds'",
+    ] {
+        let (mut fixture, control, schema) = postgres_fixture(&base).await;
+        fixture.broker.browser_resets_enabled = true;
+        control.batch_execute(mutation).await.unwrap();
+        let (url, server) = browser_server(&mut fixture, &base).await;
+        let response = reqwest::Client::new()
+            .get(format!("{url}/accounts/reset?alias=personal"))
+            .header("cookie", "codexctl-session=synthetic-session")
+            .header("accept", "application/json")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        server.abort();
+        fixture.stop().await;
+        control
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "confirmation: {body}"
+        );
+        assert_eq!(body["error"], "reset_routing_unverified");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unknown confirmation never calls the provider"
+        );
+    }
+    upstream.abort();
+}
+
+#[tokio::test]
 async fn postgres_reset_migration_keeps_the_existing_dashboard_audit_contract() {
     let (base, _, upstream) = redemption_upstream(0).await;
     let (fixture, control, schema) = postgres_fixture(&base).await;
