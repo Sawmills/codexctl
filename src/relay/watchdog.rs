@@ -17,6 +17,69 @@ use super::Log;
 
 const WINDOW: Duration = Duration::from_secs(10);
 const COOLDOWN: Duration = Duration::from_secs(60 * 60);
+#[cfg(any(target_os = "macos", test))]
+const MAX_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(target_os = "macos", test))]
+const MAX_SAMPLES: usize = 8;
+
+#[cfg(any(target_os = "macos", test))]
+fn prune_samples(
+    directory: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    let mut retained = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|name| name.strip_suffix(".txt")) else {
+            continue;
+        };
+        let Ok(at) = chrono::NaiveDateTime::parse_from_str(stem, "%Y%m%dT%H%M%S%.3fZ") else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if at.and_utc() < now - chrono::Duration::days(7)
+            || entry.metadata()?.len() > MAX_SAMPLE_BYTES
+        {
+            std::fs::remove_file(entry.path())?;
+        } else {
+            retained.push((at, entry.path()));
+        }
+    }
+    retained.sort_unstable_by_key(|(at, _)| *at);
+    let remove = retained.len().saturating_sub(MAX_SAMPLES - 1);
+    for (_, path) in retained.into_iter().take(remove) {
+        std::fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn limit_sample_output(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: after fork this closure only calls setrlimit and reads errno.
+    // Limits affect the sampler child only; core dumps are disabled there.
+    unsafe {
+        command.pre_exec(|| {
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            let size = libc::rlimit {
+                rlim_cur: MAX_SAMPLE_BYTES as libc::rlim_t,
+                rlim_max: MAX_SAMPLE_BYTES as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_CORE, &no_core) != 0
+                || libc::setrlimit(libc::RLIMIT_FSIZE, &size) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 pub(super) struct Watchdog {
     // Dropping the sender wakes the OS thread and releases its runtime handle.
@@ -148,6 +211,9 @@ fn capture(directory: &std::path::Path) -> &'static str {
     if crate::store::ensure_private_dir(directory).is_err() {
         return "directory";
     }
+    if prune_samples(directory, chrono::Utc::now()).is_err() {
+        return "retention";
+    }
     let path = directory.join(format!(
         "{}.txt",
         chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
@@ -161,7 +227,9 @@ fn capture(directory: &std::path::Path) -> &'static str {
     {
         return "file";
     }
-    let mut sample = match Command::new("/usr/bin/sample")
+    let mut command = Command::new("/usr/bin/sample");
+    limit_sample_output(&mut command);
+    let mut sample = match command
         .arg(std::process::id().to_string())
         .arg("3")
         .arg("-file")
@@ -177,7 +245,16 @@ fn capture(directory: &std::path::Path) -> &'static str {
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         match sample.try_wait() {
-            Ok(Some(status)) => return if status.success() { "captured" } else { "exit" },
+            Ok(Some(status)) => {
+                return if std::fs::metadata(&path).is_ok_and(|file| file.len() >= MAX_SAMPLE_BYTES)
+                {
+                    "size_limit"
+                } else if status.success() {
+                    "captured"
+                } else {
+                    "exit"
+                };
+            }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
             result => {
                 let _ = sample.kill();
@@ -197,12 +274,90 @@ fn capture(_directory: &std::path::Path) -> &'static str {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sample_retention_bounds_count_age_and_bytes_without_touching_other_files() {
+        use chrono::TimeZone;
+        let root = tempfile::tempdir().unwrap();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 17, 0, 0, 0).unwrap();
+        let name =
+            |at: chrono::DateTime<chrono::Utc>| format!("{}.txt", at.format("%Y%m%dT%H%M%S%.3fZ"));
+        let expired = root.path().join(name(now - chrono::Duration::days(8)));
+        std::fs::write(&expired, b"expired").unwrap();
+        let oversized = root.path().join(name(now - chrono::Duration::minutes(1)));
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_SAMPLE_BYTES + 1)
+            .unwrap();
+        for hour in 1..=24 {
+            std::fs::write(
+                root.path().join(name(now - chrono::Duration::hours(hour))),
+                b"sample",
+            )
+            .unwrap();
+        }
+        let unrelated = root.path().join("keep-me.txt");
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+        prune_samples(root.path(), now).unwrap();
+        assert!(!expired.exists(), "expired diagnostic remains");
+        assert!(!oversized.exists(), "oversized diagnostic remains");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), MAX_SAMPLES);
+        // Seven latest samples plus the unrelated file; one slot is reserved
+        // for the new capture, which brings retained diagnostics to eight.
+        for hour in 1..MAX_SAMPLES {
+            assert!(
+                root.path()
+                    .join(name(now - chrono::Duration::hours(hour as i64)))
+                    .exists()
+            );
+        }
+        assert_eq!(std::fs::read(unrelated).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn child_sample_cannot_write_more_than_four_mib() {
+        use std::process::{Command, Stdio};
+        let parent_limits = || {
+            [libc::RLIMIT_CORE, libc::RLIMIT_FSIZE].map(|kind| {
+                let mut limits = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: getrlimit receives a valid writable rlimit.
+                assert_eq!(unsafe { libc::getrlimit(kind, &mut limits) }, 0);
+                (limits.rlim_cur, limits.rlim_max)
+            })
+        };
+        let before = parent_limits();
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("sample.txt");
+        let mut command = Command::new("python3");
+        command
+            .args([
+                "-c",
+                "import sys; open(sys.argv[1], 'wb').write(b'x' * (8 * 1024 * 1024))",
+            ])
+            .arg(&output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        limit_sample_output(&mut command);
+        let status = command.status().unwrap();
+        assert_eq!(parent_limits(), before, "sampler changed parent limits");
+        assert!(!status.success(), "unbounded sample write succeeded");
+        assert!(std::fs::metadata(output).unwrap().len() <= MAX_SAMPLE_BYTES);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn native_self_sample_is_saved_in_a_private_file() {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("diag");
+        std::fs::create_dir(&directory).unwrap();
+        let expired = directory.join(format!(
+            "{}.txt",
+            (chrono::Utc::now() - chrono::Duration::days(8)).format("%Y%m%dT%H%M%S%.3fZ")
+        ));
+        std::fs::write(expired, b"expired synthetic sample").unwrap();
         assert_eq!(capture(&directory), "captured");
         let files = std::fs::read_dir(directory)
             .unwrap()
@@ -211,6 +366,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         let metadata = files[0].metadata().unwrap();
         assert!(metadata.len() > 0);
+        assert!(metadata.len() <= MAX_SAMPLE_BYTES);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 

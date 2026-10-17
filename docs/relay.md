@@ -119,8 +119,12 @@ The relay measures its own process CPU on a separate OS thread every ten seconds
 Three consecutive windows above 150% CPU log the worker, task, queue and active
 stream counts. On macOS the watchdog then runs `/usr/bin/sample` for three seconds,
 with an eight-second deadline. Samples are private files under
-`~/.codexctl/relay/diag/<UTC timestamp>.txt`. Attempts are limited to one per hour,
-including failed attempts. Other platforms log the counts and
+`~/.codexctl/relay/diag/<UTC timestamp>.txt`. Before each capture the relay prunes
+its timestamped samples older than seven days and retains at most eight samples,
+including the new capture. Each sampler child has a hard 4 MiB file-size limit,
+so retained samples use at most 32 MiB per relay. Other filenames are untouched.
+A retention error skips capture; a capped output logs `size_limit`. Attempts are
+limited to one per hour, including failed attempts. Other platforms log the counts and
 `unsupported_platform` for the sample result. The watchdog stops with the relay.
 
 `codexctl_relay_open_streams` is an unlabeled gauge on `/metrics`. It counts active
