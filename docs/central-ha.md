@@ -168,8 +168,10 @@ native refresh or billing probe. A pending operation records its selected credit
 and provider idempotency key before the provider call. Retries and other replicas
 reuse that credit and key, including after an uncertain response. The completed
 receipt and browser audit commit together. A disconnected browser does not cancel
-that settlement. Only a consumed or already-redeemed reset invalidates shared
-token evidence; nothing-to-reset, no-credit and rejected outcomes preserve it.
+that settlement. Consumed, already-redeemed and unknown provider outcomes invalidate
+shared token evidence without forcing a refresh. Nothing-to-reset and no-credit
+outcomes preserve it. Unknown stays `failed:reset_rejected`; the next normal token
+read must establish fresh routing evidence.
 Completed receipts retain the newest 256 request IDs in completion order.
 The pending credit/key is never trimmed. A pending operation accepts at most
 256 participant IDs, including its original request; a new join at that limit

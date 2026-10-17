@@ -175,7 +175,7 @@ impl CentralStore {
                     ConsumeResetCode::NoCredit => "refused:no_credit",
                     ConsumeResetCode::Unknown => "failed:reset_rejected",
                 };
-                if matches!(code,ConsumeResetCode::Reset|ConsumeResetCode::AlreadyRedeemed) {
+                if matches!(code,ConsumeResetCode::Reset|ConsumeResetCode::AlreadyRedeemed|ConsumeResetCode::Unknown) {
                     tx.execute("UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&account]).await?;
                 }
                 if let Some(audit)=audit {

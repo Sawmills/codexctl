@@ -1181,17 +1181,19 @@ async fn postgres_reset_concurrent_unknown_result_stays_terminal_on_retry() {
 }
 
 #[tokio::test]
-async fn postgres_reset_nonconsumption_preserves_token_evidence() {
-    for (code, consumed) in [
-        ("nothing_to_reset", false),
-        ("no_credit", false),
-        ("new_unrecognized_code", false),
-        ("reset", true),
-        ("already_redeemed", true),
+async fn postgres_reset_preserves_evidence_only_for_definite_nonconsumption() {
+    for (code, windows_reset, invalidate) in [
+        ("nothing_to_reset", 0, false),
+        ("no_credit", 0, false),
+        ("new_unrecognized_code", 0, true),
+        ("new_unrecognized_code", 1, true),
+        ("reset", 1, true),
+        ("already_redeemed", 1, true),
     ] {
         let (base, _, _, release, upstream) =
-            concurrent_upstream(json!({"code":code,"windows_reset":i64::from(consumed)})).await;
+            concurrent_upstream(json!({"code":code,"windows_reset":windows_reset})).await;
         let (fixture, control, schema) = postgres_fixture(&base).await;
+        let refreshes_before = std::fs::read(fixture._root.path().join("counter")).unwrap();
         let central = fixture.broker.central.as_ref().unwrap();
         let id = account_key("test-user", "personal");
         assert!(
@@ -1213,6 +1215,11 @@ async fn postgres_reset_nonconsumption_preserves_token_evidence() {
             .unwrap()
             .unwrap()
             .evidence;
+        assert_eq!(
+            std::fs::read(fixture._root.path().join("counter")).unwrap(),
+            refreshes_before,
+            "reset settlement must not force a native refresh ({code})"
+        );
         fixture.stop().await;
         control
             .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
@@ -1231,8 +1238,8 @@ async fn postgres_reset_nonconsumption_preserves_token_evidence() {
         );
         assert_eq!(
             evidence.is_none(),
-            consumed,
-            "only actual consumption invalidates token evidence ({code})"
+            invalidate,
+            "only definite nonconsumption preserves token evidence ({code}, windows_reset={windows_reset})"
         );
     }
 }
