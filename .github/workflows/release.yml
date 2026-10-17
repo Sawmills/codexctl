@@ -116,17 +116,16 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          archive="codexctl_${{ needs.setup.outputs.tag }}_${{ matrix.label }}.tar.gz"
-          strip "target/${{ matrix.target }}/release/codexctl" "target/${{ matrix.target }}/release/codexctl-central"
-          tar -czf "${archive}" -C "target/${{ matrix.target }}/release" codexctl codexctl-central
-          shasum -a 256 "${archive}" > "${archive}.sha256"
+          bash scripts/package-release.sh "${{ needs.setup.outputs.tag }}" "${{ matrix.target }}" "${{ matrix.label }}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: codexctl_${{ matrix.label }}
           path: |
             codexctl_*.tar.gz
-            codexctl_*.tar.gz.sha256
+            codexctl_*.dSYM.zip
+            codexctl_*.uuid.txt
+            codexctl_*.sha256
 
   release:
     name: Publish release
@@ -184,7 +183,7 @@ jobs:
             done
             echo "Existing release assets are byte-identical."
           else
-            gh release create "${tag}" dist/codexctl_*.tar.gz dist/codexctl_*.tar.gz.sha256 \
+            gh release create "${tag}" dist/codexctl_* \
               --repo "${{ github.repository }}" --target "${{ needs.setup.outputs.target }}" \
               --title "${tag}" --generate-notes
           fi
