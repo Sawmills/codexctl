@@ -1090,8 +1090,8 @@ Before registration, pin both workload images to that digest in the staging over
 The staging application lives in `Sawmills/argocd-deploy` at
 `plat/ue1-staging/argocd/codexctl-application.yaml`.
 The registered `argocd/codexctl` Application tracks `main` and
-`deploy/k8s/overlays/staging` with automated sync, prune and selfHeal. A merged
-staging overlay change starts a rollout automatically. The checked-in
+`deploy/k8s/overlays/staging` with automated sync, prune and selfHeal. Argo CD
+syncs merged staging overlay changes automatically. The checked-in
 [Application](../deploy/k8s/staging-application.yaml) is a bootstrap reference:
 it sets `CreateNamespace=true` and omits the registered automated sync policy.
 Inspect the live Application's source and policy before registration, policy
