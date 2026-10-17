@@ -18,6 +18,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+// Active reset execution is exclusive per account. Other mutations take a
+// nonblocking shared transaction lock; ordinary refresh never needs schema admission.
+macro_rules! reset_mutation_guard {
+    () => {
+        "pg_try_advisory_xact_lock_shared(hashtextextended(current_schema()||':'||$1,13322))"
+    };
+}
+
 pub(in crate::central) mod identity;
 pub(in crate::central) mod login;
 
@@ -220,6 +228,7 @@ macro_rules! login_fence {
 }
 
 mod removal;
+pub(in crate::central) mod resets;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS central_schema_migrations (
@@ -1815,10 +1824,11 @@ impl PostgresStore {
                 .await?;
             client
                 .batch_execute(&format!(
-                    "{SCHEMA}{}{}{}",
+                    "{SCHEMA}{}{}{}{}",
                     login::LOGIN_SCHEMA,
                     loans::SCHEMA,
-                    migration::SCHEMA
+                    migration::SCHEMA,
+                    resets::SCHEMA
                 ))
                 .await
                 .context("migrate central PostgreSQL schema")?;
@@ -2268,7 +2278,9 @@ impl PostgresStore {
         // it; FOR SHARE rechecks deleted_at after an in-flight writer commits.
         // Writers that also need schema admission take it before account/lease.
         const CLAIM: &str = concat!(
-            "INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR SHARE) AND ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
+            "WITH reset_guard AS MATERIALIZED (SELECT ",
+            reset_mutation_guard!(),
+            " AS available) INSERT INTO account_refresh_leases(account_id,holder_id,epoch,expires_at) SELECT $1,$2,1,clock_timestamp()+($3::bigint * interval '1 second') WHERE (SELECT available FROM reset_guard) AND EXISTS(SELECT 1 FROM central_accounts WHERE account_id=$1 AND deleted_at IS NULL FOR SHARE) AND ($4::text IS NULL OR EXISTS(SELECT 1 FROM central_login_operations o JOIN central_login_holders h ON h.holder_id=o.holder_id WHERE o.id=$4 AND o.account_id=$1 AND o.holder_id=$5 AND o.epoch=$6 AND o.phase='candidate' AND o.expires_at>clock_timestamp() AND h.deleted_at IS NULL AND h.expires_at>clock_timestamp())) AND NOT EXISTS (SELECT 1 FROM central_login_operations WHERE ",
             login_fence!(),
             " AND ($4::text IS NULL OR (phase<>'rejected' AND (id<>$4 OR account_id<>$1)))) ON CONFLICT(account_id) DO UPDATE SET holder_id=EXCLUDED.holder_id,epoch=account_refresh_leases.epoch+1,expires_at=EXCLUDED.expires_at,released=false,legacy_handoff=false WHERE (account_refresh_leases.expires_at <= clock_timestamp() OR account_refresh_leases.holder_id=EXCLUDED.holder_id) AND ($4::text IS NULL OR account_refresh_leases.released OR account_refresh_leases.holder_id=$7 OR account_refresh_leases.holder_id=EXCLUDED.holder_id) RETURNING epoch"
         );

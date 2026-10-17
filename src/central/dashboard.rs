@@ -15,6 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 mod actions;
 mod login;
 mod remove;
+mod resets;
 pub(super) use actions::recent_sign_in;
 mod render;
 use render::{Account, Identity, Machine, Resets, Snapshot, Window};
@@ -173,7 +174,13 @@ async fn account_snapshot(
     let observed = if account.available && !pending {
         broker
             .reset_reader
-            .dashboard_expiry(&key, &revision, access.as_deref(), &account.account_id)
+            .dashboard_expiry(
+                &key,
+                &revision,
+                access.as_deref(),
+                &account.account_id,
+                broker.browser_resets_enabled,
+            )
             .await
     } else {
         super::resets::ResetObservation {
@@ -228,7 +235,7 @@ async fn account_snapshot(
         usage_error: account.usage_error,
         banked_resets: Resets {
             count,
-            redeemable_now: redeemable,
+            redeemable_now: observed.applicable.or(redeemable),
             nearest_expiry: expiry,
             stale: reset_stale || account.usage_stale,
         },
@@ -313,6 +320,13 @@ fn routes_with_elapsed(public_url: &str, elapsed: fn(&Instant) -> Duration) -> R
                 .layer(axum::middleware::from_fn(login::errors)),
         )
         .route("/accounts", get(page))
+        .route(
+            "/accounts/reset",
+            get(resets::page)
+                .post(resets::submit)
+                .layer(axum::extract::DefaultBodyLimit::max(4096))
+                .layer(axum::middleware::from_fn(resets::errors)),
+        )
         .route(
             "/accounts/manage",
             get(remove::page).layer(axum::middleware::from_fn(remove::errors)),

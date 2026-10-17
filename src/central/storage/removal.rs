@@ -57,6 +57,7 @@ impl CentralStore {
             let tx=client.transaction().await?;
             let _admission=identity::lock_admission(&tx).await?;
             if let Err(reason)=authorize(&tx,caller).await? {return Ok(Err(reason));}
+            if !resets::mutation_allowed(&tx,&request.account_id).await? {return Ok(Err("reset_in_progress"));}
             let row=tx.query_opt("SELECT alias,revision,deleted_at IS NOT NULL FROM central_accounts WHERE account_id=$1 AND user_id=$2 FOR UPDATE", &[&request.account_id,&caller.user]).await?;
             let Some(row)=row else { return Ok(Err("account_not_found")); };
             let alias:String=row.get(0); let revision:i64=row.get(1); let removed:bool=row.get(2);
@@ -81,6 +82,7 @@ impl CentralStore {
             tx.execute("UPDATE central_accounts SET deleted_at=clock_timestamp(),revision=revision+1,updated_at=clock_timestamp() WHERE account_id=$1", &[&request.account_id]).await?;
             tx.execute("UPDATE account_refresh_leases SET released=true,expires_at=clock_timestamp() WHERE account_id=$1 AND holder_id=$2", &[&request.account_id,&holder]).await?;
             tx.execute("UPDATE account_live_sessions SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&request.account_id]).await?;
+            tx.execute("UPDATE account_reset_journals SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&request.account_id]).await?;
             let at=chrono::Utc::now().timestamp();
             tx.execute("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,'account_remove',$3,'ok',$4)", &[&at,&actor,&request.account_id,&request.attempt]).await?;
             // Locks serialize sign-out and user changes, but do not stop time.

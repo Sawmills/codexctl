@@ -69,6 +69,7 @@ pub(super) async fn remove(
             "browser_sign_in_required" => StatusCode::UNAUTHORIZED,
             "dashboard_remove_disabled"
             | "persistence_failed"
+            | "reset_in_progress"
             | "refresh_in_progress"
             | "owner_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::CONFLICT,

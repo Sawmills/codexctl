@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod shared;
+pub(super) use shared::{apply, view};
+
 #[derive(Default)]
 struct CachedExpiry {
     revision: String,
@@ -24,6 +27,7 @@ struct CachedExpiry {
 #[derive(Clone, Default)]
 pub(super) struct ResetObservation {
     pub count: Option<i64>,
+    pub applicable: Option<i64>,
     pub nearest_expiry: Option<i64>,
     pub stale: bool,
 }
@@ -93,6 +97,7 @@ impl Reader {
         revision: &str,
         token: Option<&str>,
         account: &str,
+        read_applicability: bool,
     ) -> ResetObservation {
         let entry = self
             .expiry_entries
@@ -118,18 +123,51 @@ impl Reader {
             .attempted
             .is_none_or(|at| at.elapsed() >= super::catalog::TTL)
         {
-            let result = api::fetch_reset_credits_at(
-                &self.client,
-                &self.credits_url,
-                token.unwrap_or_default(),
-                Some(account),
-            )
+            let result = async {
+                let usage = if read_applicability {
+                    Some(
+                        api::fetch_usage_at(
+                            &self.client,
+                            &self.usage_url,
+                            token.unwrap_or_default(),
+                            Some(account),
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                let details = api::fetch_reset_credits_at(
+                    &self.client,
+                    &self.credits_url,
+                    token.unwrap_or_default(),
+                    Some(account),
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((details, usage))
+            }
             .await;
             entry.attempted = Some(Instant::now());
             match result {
-                Ok(details) => {
+                Ok((details, usage)) => {
                     let now = chrono::Utc::now().timestamp();
-                    entry.observation.count = Some(details.available_count);
+                    entry.observation.count = Some(
+                        details.available_count.max(
+                            usage
+                                .as_ref()
+                                .map_or(0, api::RateLimitResponse::reset_credits_available),
+                        ),
+                    );
+                    let qualifying = details.credits.iter().any(|c| {
+                        c.is_available() && c.expires_at_timestamp().is_none_or(|at| at > now)
+                    });
+                    entry.observation.applicable = usage.as_ref().map(|u| {
+                        if qualifying {
+                            u.reset_credits_applicable()
+                        } else {
+                            0
+                        }
+                    });
                     entry.observation.nearest_expiry = details
                         .credits
                         .iter()
@@ -163,6 +201,13 @@ pub(super) async fn list(
     State(broker): State<Broker>,
     headers: HeaderMap,
 ) -> Result<Response, super::managed::HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == super::storage::StoreMode::Postgres)
+    {
+        return shared::list(&broker, &headers).await;
+    }
     if let Some(error) = broker.reject_unshared_workflow("reset_unavailable") {
         return Err(error);
     }
@@ -278,6 +323,22 @@ async fn redeem(
     headers: HeaderMap,
     body: Result<Json<Redemption>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, super::managed::HttpError> {
+    if broker
+        .central
+        .as_ref()
+        .is_some_and(|s| s.mode() == super::storage::StoreMode::Postgres)
+    {
+        let device = broker.authorize(&headers).await?;
+        let Json(request) =
+            body.map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_request"))?;
+        let caller = super::relogin::shared::Caller {
+            user: device.user,
+            authority: super::storage::login::LoginAuthority::Machine(device.id),
+            dashboard_actor: None,
+        };
+        let response = shared::apply(&broker, caller, request).await?;
+        return Ok(([("cache-control", "no-store")], Json(response)).into_response());
+    }
     if let Some(error) = broker.reject_unshared_workflow("reset_unavailable") {
         return Err(error);
     }
@@ -366,7 +427,7 @@ pub(super) fn redact_auth_strings(value: &serde_json::Value, detail: &mut String
 }
 
 #[derive(Debug)]
-struct Refusal(&'static str);
+pub(in crate::central) struct Refusal(pub &'static str);
 impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.0)
@@ -383,11 +444,13 @@ impl std::fmt::Display for TerminalRejection {
 }
 impl std::error::Error for TerminalRejection {}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Pending {
     request_id: String,
     credit_id: String,
     upstream_id: String,
+    #[serde(default)]
+    actor: Option<String>,
     #[serde(default)]
     joined_requests: std::collections::BTreeSet<String>,
 }
@@ -484,6 +547,7 @@ impl Reader {
                         .min_by_key(|c| c.expires_at_timestamp().unwrap_or(i64::MAX))
                         .ok_or(Refusal("no_reset_credit"))?;
                     journal.pending = Some(Pending {
+                        actor: None,
                         request_id: request.redeem_request_id.clone(),
                         joined_requests: std::collections::BTreeSet::new(),
                         credit_id: credit.id.clone(),

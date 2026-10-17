@@ -112,6 +112,7 @@ pub(super) fn render(
         token.as_deref(),
         broker.browser_logins_enabled,
         broker.browser_remove_enabled,
+        broker.browser_resets_enabled,
     ))
 }
 

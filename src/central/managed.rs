@@ -267,6 +267,7 @@ pub(super) struct Broker {
     pub(super) browser_sessions_available: bool,
     pub(super) browser_logins_enabled: bool,
     pub(super) browser_remove_enabled: bool,
+    pub(super) browser_resets_enabled: bool,
     pub(super) activity: Arc<super::activity::Activity>,
     pub(super) reset_reader: super::resets::Reader,
     pub(super) catalog: Arc<catalog::Reader>,
@@ -2867,6 +2868,8 @@ pub async fn serve(
             .is_ok_and(|v| v == "1"),
         browser_remove_enabled: std::env::var("CODEXCTL_CENTRAL_BROWSER_REMOVE")
             .is_ok_and(|v| v == "1"),
+        browser_resets_enabled: std::env::var("CODEXCTL_CENTRAL_BROWSER_RESETS")
+            .is_ok_and(|v| v == "1"),
         reset_reader: super::resets::Reader::new()?,
         catalog: Arc::new(catalog::Reader::new()?),
         failures: Arc::new(StdMutex::new(
@@ -3106,6 +3109,7 @@ impl Broker {
             browser_sessions_available: true,
             browser_logins_enabled: false,
             browser_remove_enabled: false,
+            browser_resets_enabled: false,
             activity: Arc::default(),
             reset_reader: super::resets::Reader::new().expect("reset reader"),
             catalog: Arc::new(catalog),
@@ -3252,6 +3256,7 @@ mod tests {
             browser_sessions_available: true,
             browser_logins_enabled: false,
             browser_remove_enabled: false,
+            browser_resets_enabled: false,
             activity: Arc::default(),
             reset_reader: crate::central::resets::Reader::new().unwrap(),
             catalog: Arc::new(catalog::Reader::new().unwrap()),
