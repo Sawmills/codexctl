@@ -98,7 +98,7 @@ spec:
             - { name: projected, mountPath: /projected, readOnly: true }
             - { name: keys, mountPath: /keys }
         - name: initialize
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:ee27eb797fc2f38daa44dbabeb49bdc0ecefe718714629bfa3345e7bdc6c6dc1
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f29924be5ed9c4fa9e538999a4934d3b799b9eada05ab373022984d6b5a273a1
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
@@ -140,7 +140,7 @@ spec:
             limits: { cpu: "1", memory: 256Mi }
       containers:
         - name: broker
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:ee27eb797fc2f38daa44dbabeb49bdc0ecefe718714629bfa3345e7bdc6c6dc1
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:f29924be5ed9c4fa9e538999a4934d3b799b9eada05ab373022984d6b5a273a1
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
@@ -187,6 +187,8 @@ spec:
               }
             - name: CODEXCTL_CENTRAL_DB_CA_FILE
               value: /etc/codexctl/rds-ca/global-bundle.pem
+            - name: CODEXCTL_CENTRAL_BROWSER_RESETS
+              value: "1"
           ports: [{ name: http, containerPort: 8787 }]
           startupProbe:
             httpGet: { path: /health, port: http }

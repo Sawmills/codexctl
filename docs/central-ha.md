@@ -139,16 +139,18 @@ the server image. Migration adds `browser_sessions` and its expiry index with
 The action upgrade also adds `dashboard_audit` and `browser_sessions.auth_time_verified`.
 It adds the nullable `dashboard_audit.deleted_at` marker to existing audit tables
 with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
-Run migrate before rolling this image. Both changes are additive and keep schema version 8.
+HA initialization runs migrate before each new account server starts. Both changes are
+additive and keep schema version 8.
 Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
 
 ### Dashboard banked resets
 
 `CODEXCTL_CENTRAL_BROWSER_RESETS` defaults to off; only `1` enables it. It is
-independent of the Add/Renew and Remove gates. This change enables no overlay.
-Run the normal migrate Job before rolling the binary. Migration adds
-`account_reset_journals` and a separate `reset_audit` table for `account_reset`
-events. The existing `dashboard_audit_operation_check` remains unchanged.
+independent of the Add/Renew and Remove gates. The staging overlays enable it
+explicitly. Each HA pod's initialize container runs `codexctl-central migrate`
+before starting the account server; this additive upgrade needs no separate migrate Job.
+Migration adds `account_reset_journals` and a separate `reset_audit` table for
+`account_reset` events. The existing `dashboard_audit_operation_check` remains unchanged.
 The additive `dashboard_audit_history` view combines both audit tables; history
 readers filter `deleted_at IS NULL`. Migration preserves existing receipts and
 is safe to repeat. Run one version and fix forward.

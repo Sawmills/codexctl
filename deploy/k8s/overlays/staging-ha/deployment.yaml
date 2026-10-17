@@ -182,6 +182,8 @@ spec:
               }
             - name: CODEXCTL_CENTRAL_DB_CA_FILE
               value: /etc/codexctl/rds-ca/global-bundle.pem
+            - name: CODEXCTL_CENTRAL_BROWSER_RESETS
+              value: "1"
           ports: [{ name: http, containerPort: 8787 }]
           startupProbe:
             httpGet: { path: /health, port: http }
