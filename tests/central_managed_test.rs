@@ -11654,6 +11654,87 @@ fn reset_listing_on_a_connected_machine_needs_no_local_auth() {
 }
 
 #[test]
+fn reset_listing_treats_unverified_routing_as_unknown() {
+    let output = reset_cli(json!({"userId":"amir", "accounts":[
+        {"alias":"known", "available":3, "applicable":1, "credits":[]},
+        {"alias":"waiting", "error":"reset_routing_unverified"}
+    ]}));
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("unknown (routing not yet verified, retry)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Partial total: 3 banked, 1 redeemable"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1 account(s) have unknown reset credits; retry after routing is verified."),
+        "{text}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn reset_listing_does_not_report_a_complete_zero_when_all_routes_are_unknown() {
+    let output = reset_cli(json!({"userId":"amir", "accounts":[
+        {"alias":"waiting", "error":"reset_routing_unverified"},
+        {"alias":"also-waiting", "error":"reset_routing_unverified"}
+    ]}));
+    let text = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        text.contains("Partial total: 0 banked, 0 redeemable"),
+        "{text}"
+    );
+    assert!(!text.contains("0 banked, 0 redeemable now."), "{text}");
+    assert!(
+        text.contains("2 account(s) have unknown reset credits; retry after routing is verified."),
+        "{text}"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn reset_listing_keeps_real_failures_fatal_beside_unknown_routes() {
+    for error in [
+        "reset_read_failed",
+        "owner_unavailable",
+        "reset_routing_unverified_extra",
+    ] {
+        let output = reset_cli(json!({"userId":"amir", "accounts":[
+            {"alias":"known", "available":3, "applicable":1, "credits":[]},
+            {"alias":"waiting", "error":"reset_routing_unverified"},
+            {"alias":"broken", "error":error}
+        ]}));
+        let text = String::from_utf8_lossy(&output.stdout);
+
+        assert!(!output.status.success(), "{error}: {output:?}");
+        assert!(
+            text.contains("Partial total: 3 banked, 1 redeemable"),
+            "{text}"
+        );
+        assert!(text.contains(error), "{text}");
+        assert!(
+            text.contains("unknown (routing not yet verified, retry)"),
+            "{text}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("reset credits unavailable for 1 account(s); total is incomplete"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
 fn reset_listing_failure_does_not_report_a_complete_zero_total() {
     let reply =
         json!({"userId":"amir", "accounts":[{"alias":"personal", "error":"reset_read_failed"}]});
