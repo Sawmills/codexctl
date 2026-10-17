@@ -10,12 +10,31 @@ CREATE TABLE IF NOT EXISTS account_reset_journals (
     deleted_at TIMESTAMPTZ
 );
 ALTER TABLE account_reset_journals ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS reset_audit (
+    id BIGSERIAL PRIMARY KEY,
+    at BIGINT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES central_users(id),
+    actor TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK (operation='account_reset'),
+    target TEXT NOT NULL REFERENCES central_accounts(account_id),
+    result TEXT NOT NULL,
+    coalesce_key TEXT NOT NULL UNIQUE,
+    deleted_at TIMESTAMPTZ
+);
 DO $$ BEGIN
-    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='dashboard_audit'::regclass AND conname='dashboard_audit_operation_check' AND pg_get_constraintdef(oid) NOT LIKE '%account_reset%') THEN
-        ALTER TABLE dashboard_audit DROP CONSTRAINT dashboard_audit_operation_check;
-        ALTER TABLE dashboard_audit ADD CONSTRAINT dashboard_audit_operation_check CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke','account_reset'));
+    IF to_regclass(format('%I.%I',current_schema(),'dashboard_audit_history')) IS NULL THEN
+        CREATE VIEW dashboard_audit_history AS
+            SELECT at,actor,operation,target,result,coalesce_key,deleted_at FROM dashboard_audit
+            UNION ALL
+            SELECT at,actor,operation,target,result,coalesce_key,deleted_at FROM reset_audit;
     END IF;
 END $$;";
+
+#[derive(Clone, Copy)]
+pub(in crate::central) struct ResetAudit<'a> {
+    pub actor: &'a str,
+    pub attempt: &'a str,
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::central) enum ResetWrite<'a> {
@@ -26,7 +45,7 @@ pub(in crate::central) enum ResetWrite<'a> {
         holder: &'a str,
     },
     Settle {
-        audit: Option<DashboardAudit<'a>>,
+        audit: Option<ResetAudit<'a>>,
         result: &'a str,
     },
 }
@@ -151,7 +170,7 @@ impl CentralStore {
                 tx.execute("UPDATE central_token_evidence SET deleted_at=clock_timestamp() WHERE account_id=$1 AND deleted_at IS NULL", &[&account]).await?;
                 if let Some(audit)=audit {
                     let at=chrono::Utc::now().timestamp();
-                    audit_log=tx.query_opt("INSERT INTO dashboard_audit(at,actor,operation,target,result,coalesce_key) VALUES($1,$2,$6,$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&account,&result,&audit.attempt,&audit.operation.as_str()]).await?;
+                    audit_log=tx.query_opt("INSERT INTO reset_audit(at,user_id,actor,operation,target,result,coalesce_key) VALUES($1,$6,$2,'account_reset',$3,$4,$5) ON CONFLICT(coalesce_key) DO NOTHING RETURNING at,actor,target,result", &[&at,&audit.actor,&account,&result,&audit.attempt,&user]).await?;
                 }
             }
             if let ResetWrite::Reserve{caller,..}=stage {authorize(&tx,caller).await?;}

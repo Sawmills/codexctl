@@ -16,7 +16,6 @@ pub(in crate::central) enum DashboardOperation {
     AccountAdd,
     AccountRenew,
     AccountRemove,
-    AccountReset,
 }
 impl DashboardOperation {
     pub(super) fn as_str(self) -> &'static str {
@@ -25,7 +24,6 @@ impl DashboardOperation {
             Self::AccountAdd => "account_add",
             Self::AccountRenew => "account_renew",
             Self::AccountRemove => "account_remove",
-            Self::AccountReset => "account_reset",
         }
     }
 }
@@ -197,7 +195,7 @@ impl CentralStore {
             // A lost COMMIT acknowledgement can have already persisted the real outcome.
             let row=match inserted {
                 Some(row)=>row,
-                None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit WHERE coalesce_key=$1 AND deleted_at IS NULL", &[&audit.attempt]).await?,
+                None=>client.query_one("SELECT at,actor,target,result FROM dashboard_audit_history WHERE coalesce_key=$1 AND operation=$2 AND deleted_at IS NULL", &[&audit.attempt,&audit.operation.as_str()]).await?,
             };
             if new { audit_log(row.get(0),row.get(1),row.get(2),row.get(3),audit.operation.as_str()); }
             Ok(())

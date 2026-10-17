@@ -89,6 +89,37 @@ async fn postgres_reset_requires_current_workspace_routing_before_any_provider_c
 }
 
 #[tokio::test]
+async fn postgres_reset_migration_keeps_the_existing_dashboard_audit_contract() {
+    let (base, _, upstream) = redemption_upstream(0).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    control.batch_execute("ALTER TABLE dashboard_audit DROP CONSTRAINT dashboard_audit_operation_check; ALTER TABLE dashboard_audit ADD CONSTRAINT dashboard_audit_operation_check CHECK(operation IN ('account_add','account_renew','account_remove','machine_revoke'))").await.unwrap();
+    let constraint = "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='dashboard_audit'::regclass AND conname='dashboard_audit_operation_check'";
+    let before: String = control.query_one(constraint, &[]).await.unwrap().get(0);
+    for _ in 0..2 {
+        crate::central::storage::test_support::bootstrap(fixture.broker.central.as_ref().unwrap())
+            .await
+            .unwrap();
+    }
+    let after: String = control.query_one(constraint, &[]).await.unwrap().get(0);
+    let additive: bool = control
+        .query_one("SELECT to_regclass('reset_audit') IS NOT NULL", &[])
+        .await
+        .unwrap()
+        .get(0);
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(
+        after, before,
+        "repeated migration must preserve the established audit constraint"
+    );
+    assert!(additive, "reset audit uses a new additive table");
+}
+
+#[tokio::test]
 async fn postgres_reset_inventory_lists_owned_accounts_without_spending() {
     let (base, received, upstream) = redemption_upstream(0).await;
     let (fixture, control, schema) = postgres_fixture(&base).await;
@@ -427,7 +458,24 @@ async fn postgres_dashboard_reset_confirms_and_applies_without_javascript() {
             results.push((response.status(), response.text().await.unwrap()));
         }
     }
-    let audit:i64=control.query_one("SELECT count(*) FROM dashboard_audit WHERE operation='account_reset' AND target=$1 AND result='ok:reset'",&[&account_key("test-user","personal")]).await.unwrap().get(0);
+    let audit:i64=control.query_one("SELECT count(*) FROM reset_audit WHERE operation='account_reset' AND user_id='test-user' AND target=$1 AND result='ok:reset'",&[&account_key("test-user","personal")]).await.unwrap().get(0);
+    let central = fixture.broker.central.as_ref().unwrap();
+    for _ in 0..2 {
+        central
+            .dashboard_audit(
+                crate::central::storage::DashboardAudit {
+                    operation: crate::central::storage::DashboardOperation::MachineRevoke,
+                    actor: "synthetic@sawmills.ai",
+                    attempt: "existing-dashboard-event",
+                },
+                "fixture-machine",
+                "ok",
+            )
+            .await
+            .unwrap();
+    }
+    let history: Vec<String> = control.query("SELECT operation FROM dashboard_audit_history WHERE deleted_at IS NULL ORDER BY operation", &[])
+        .await.unwrap().into_iter().map(|row| row.get(0)).collect();
     server.abort();
     fixture.stop().await;
     control
@@ -443,6 +491,11 @@ async fn postgres_dashboard_reset_confirms_and_applies_without_javascript() {
         assert!(body.contains("Reset applied"));
     }
     assert_eq!(received.lock().unwrap().len(), 1);
+    assert_eq!(
+        history,
+        ["account_reset", "machine_revoke"],
+        "combined history includes each retained operation once"
+    );
     assert_eq!(
         audit, 1,
         "reset receipt and one audit must persist together"
@@ -529,7 +582,7 @@ async fn postgres_dashboard_reset_audit_failure_retains_the_pending_key() {
         ("id", hidden(&html, "id")),
         ("form_token", hidden(&html, "form_token")),
     ];
-    control.batch_execute("CREATE FUNCTION reject_reset_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.operation='account_reset' THEN RAISE EXCEPTION 'synthetic reset audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_reset_audit BEFORE INSERT ON dashboard_audit FOR EACH ROW EXECUTE FUNCTION reject_reset_audit()").await.unwrap();
+    control.batch_execute("CREATE FUNCTION reject_reset_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.operation='account_reset' THEN RAISE EXCEPTION 'synthetic reset audit failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_reset_audit BEFORE INSERT ON reset_audit FOR EACH ROW EXECUTE FUNCTION reject_reset_audit()").await.unwrap();
     let first = http
         .post(format!("{url}/accounts/reset"))
         .header("cookie", "codexctl-session=synthetic-session")
@@ -540,7 +593,7 @@ async fn postgres_dashboard_reset_audit_failure_retains_the_pending_key() {
         .unwrap();
     let first_status = first.status();
     control
-        .batch_execute("DROP TRIGGER reject_reset_audit ON dashboard_audit")
+        .batch_execute("DROP TRIGGER reject_reset_audit ON reset_audit")
         .await
         .unwrap();
     let mut retries = Vec::new();
@@ -557,7 +610,7 @@ async fn postgres_dashboard_reset_audit_failure_retains_the_pending_key() {
     }
     let audits: i64 = control
         .query_one(
-            "SELECT count(*) FROM dashboard_audit WHERE operation='account_reset'",
+            "SELECT count(*) FROM reset_audit WHERE operation='account_reset'",
             &[],
         )
         .await

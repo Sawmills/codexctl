@@ -147,8 +147,11 @@ Existing sessions remain valid for observations, but need fresh sign-in before R
 `CODEXCTL_CENTRAL_BROWSER_RESETS` defaults to off; only `1` enables it. It is
 independent of the Add/Renew and Remove gates. This change enables no overlay.
 Run the normal migrate Job before rolling the binary. Migration adds
-`account_reset_journals` and permits `account_reset` audit events. It preserves
-existing receipts and is safe to repeat. Run one version and fix forward.
+`account_reset_journals` and a separate `reset_audit` table for `account_reset`
+events. The existing `dashboard_audit_operation_check` remains unchanged.
+The additive `dashboard_audit_history` view combines both audit tables; history
+readers filter `deleted_at IS NULL`. Migration preserves existing receipts and
+is safe to repeat. Run one version and fix forward.
 
 When enabled, each owned account has an Apply reset confirmation page with its
 count and nearest expiry. The action stays disabled without fresh applicability

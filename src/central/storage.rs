@@ -299,7 +299,7 @@ CREATE TABLE IF NOT EXISTS dashboard_audit (
     id BIGSERIAL PRIMARY KEY,
     at BIGINT NOT NULL,
     actor TEXT NOT NULL,
-    operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke','account_reset')),
+    operation TEXT NOT NULL CHECK (operation IN ('account_add','account_renew','account_remove','machine_revoke')),
     target TEXT NOT NULL,
     result TEXT NOT NULL,
     deleted_at TIMESTAMPTZ

@@ -1,7 +1,10 @@
 //! Shared reset operations use committed credentials, never a native refresh or billing probe.
 use super::*;
 use crate::central::{managed::HttpError, storage::CentralStore, vault};
-use crate::central::{relogin::shared::Caller, storage::resets::ResetWrite};
+use crate::central::{
+    relogin::shared::Caller,
+    storage::resets::{ResetAudit, ResetWrite},
+};
 use serde_json::Value;
 
 pub(super) async fn list(broker: &Broker, headers: &HeaderMap) -> Result<Response, HttpError> {
@@ -412,14 +415,10 @@ async fn execute(
             "reset intent changed"
         );
         let audit_key = format!("reset-outcome:{}", current.upstream_id);
-        let audit = current
-            .actor
-            .as_deref()
-            .map(|actor| crate::central::storage::DashboardAudit {
-                operation: crate::central::storage::DashboardOperation::AccountReset,
-                actor,
-                attempt: &audit_key,
-            });
+        let audit = current.actor.as_deref().map(|actor| ResetAudit {
+            actor,
+            attempt: &audit_key,
+        });
         let result = match response.code {
             api::ConsumeResetCode::Reset => "ok:reset",
             api::ConsumeResetCode::AlreadyRedeemed => "ok:already_redeemed",
