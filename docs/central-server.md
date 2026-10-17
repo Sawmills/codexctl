@@ -175,6 +175,8 @@ The server rechecks applicability, chooses the credit, and keeps OpenAI credenti
 It saves the credit and provider idempotency key before sending, then saves the result.
 Concurrent requests for one account are serialized. Repeating a retained completed request returns `already_redeemed`.
 Receipt history normally keeps the newest 256 request IDs in completion order.
+Receipts without age metadata stay until 256 newly ordered completions replace
+them; request ID order does not establish receipt age.
 An already-accepted pending batch settles with every receipt intact, even if it
 exceeds that budget; later settlements resume ordinary FIFO pruning. An evicted
 ID does not prove that an earlier reset was never applied.

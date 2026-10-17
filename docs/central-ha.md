@@ -173,6 +173,8 @@ shared token evidence without forcing a refresh. Nothing-to-reset and no-credit
 outcomes preserve it. Unknown stays `failed:reset_rejected`; the next normal token
 read must establish fresh routing evidence.
 Completed receipts retain the newest 256 request IDs in completion order.
+Receipts without age metadata stay until 256 newly ordered completions replace
+them; request ID order does not establish receipt age.
 An already-accepted pending batch larger than 256 keeps every receipt when it
 settles; ordinary FIFO pruning resumes on later settlements. The pending credit/key
 is never trimmed. New pending operations accept at most 256 participant IDs,

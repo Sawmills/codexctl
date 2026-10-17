@@ -1301,6 +1301,74 @@ async fn postgres_reset_completed_receipts_are_bounded_and_keep_the_newest_retry
 }
 
 #[tokio::test]
+async fn postgres_reset_preserves_unordered_receipts_until_a_full_new_replay_window() {
+    use crate::central::storage::resets::ResetWrite;
+    let (base, received, _, release, upstream) =
+        concurrent_upstream(json!({"code":"nothing_to_reset","windows_reset":0})).await;
+    let (fixture, control, schema) = postgres_fixture(&base).await;
+    let central = fixture.broker.central.as_ref().unwrap();
+    let id = account_key("test-user", "personal");
+    release.notify_one();
+    assert_eq!(fixture.redeem("a-recent-join").await.0, StatusCode::OK);
+    let (version, mut journal) = central.reset_journal("test-user", &id).await.unwrap();
+    let receipt = journal["completed"]["a-recent-join"].clone();
+    journal.as_object_mut().unwrap().remove("completed_order");
+    for n in 0..300 {
+        journal["completed"][format!("z-old-{n:03}")] = receipt.clone();
+    }
+    assert!(
+        central
+            .write_reset_journal(
+                "test-user",
+                &id,
+                version,
+                &journal,
+                ResetWrite::Settle {
+                    audit: None,
+                    code: crate::api::ConsumeResetCode::NothingToReset
+                }
+            )
+            .await
+            .unwrap()
+    );
+    tokio::time::timeout(Duration::from_secs(45), async {
+        for n in 0..256 {
+            release.notify_one();
+            assert_eq!(
+                fixture.redeem(&format!("new-{n:03}")).await.0,
+                StatusCode::OK
+            );
+            if n == 0 || n == 254 {
+                // Every call reloads the persisted journal. Lexical order says
+                // nothing about the age of a receipt without order metadata.
+                release.notify_one();
+                let replay = fixture.redeem("a-recent-join").await;
+                assert_eq!(replay.0, StatusCode::OK);
+                assert_eq!(
+                    received.lock().unwrap().len(),
+                    n + 2,
+                    "an unordered receipt replays until a complete new window displaces it"
+                );
+            }
+        }
+    })
+    .await
+    .expect("stage: unordered receipt replay and ordered-window replacement");
+    let (_, journal) = central.reset_journal("test-user", &id).await.unwrap();
+    fixture.stop().await;
+    control
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .await
+        .unwrap();
+    upstream.abort();
+    assert_eq!(received.lock().unwrap().len(), 257);
+    assert_eq!(journal["completed"].as_object().unwrap().len(), 256);
+    assert!(journal["completed"].get("a-recent-join").is_none());
+    assert!(journal["completed"].get("new-000").is_some());
+    assert!(journal["completed"].get("new-255").is_some());
+}
+
+#[tokio::test]
 async fn postgres_reset_retains_every_accepted_pending_receipt_through_settlement() {
     use crate::central::storage::resets::ResetWrite;
     for joined_count in [255, 300] {

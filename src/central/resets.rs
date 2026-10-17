@@ -455,10 +455,6 @@ impl Journal {
         // but an already-persisted pending batch may be larger.
         let requests: std::collections::BTreeSet<_> = requests.into_iter().collect();
         let limit = RECEIPT_LIMIT.max(requests.len());
-        // Receipts written before completion order was recorded predate new ones.
-        if self.completed_order.is_empty() {
-            self.completed_order.extend(self.completed.keys().cloned());
-        }
         for request in requests {
             if self
                 .completed
@@ -468,7 +464,14 @@ impl Journal {
                 self.completed_order.push_back(request);
             }
         }
-        while self.completed.len() > limit {
+        // Unknown-age receipts cannot be ordered by their IDs. Keep them until
+        // a full new replay window can replace them with ordered completions.
+        if self.completed.len() > limit && self.completed_order.len() >= limit {
+            let ordered: std::collections::BTreeSet<_> = self.completed_order.iter().collect();
+            self.completed
+                .retain(|request, _| ordered.contains(request));
+        }
+        while self.completed_order.len() > limit {
             let oldest = self
                 .completed_order
                 .pop_front()
