@@ -115,6 +115,28 @@ for response headers. Each successful read resets that timeout, so an active
 stream can run longer than five minutes. The relay does not retry a timed-out
 request; the client receives a gateway or stream error.
 
+The relay measures its own process CPU on a separate OS thread every ten seconds.
+Three consecutive windows above 150% CPU log the worker, task, queue and active
+stream counts. On macOS the watchdog then runs `/usr/bin/sample` for three seconds,
+with an eight-second deadline. Samples are private files under
+`~/.codexctl/relay/diag/<UTC timestamp>.txt`. Attempts are limited to one per hour,
+including failed attempts. Other platforms log the counts and
+`unsupported_platform` for the sample result. The watchdog stops with the relay.
+
+`codexctl_relay_open_streams` is an unlabeled gauge on `/metrics`. It counts active
+forwarded exchanges from upload through response drain, including those waiting
+for upstream headers. Completion, failure and cancellation release the count.
+Neither the gauge nor the local CPU watchdog has a dedicated external alert.
+
+Release builds retain line tables. Darwin release assets include both binaries'
+dSYMs in a ZIP and their `dwarfdump --uuid` output; the packager checks matching
+UUIDs and strips debug information with `strip -S`, retaining the symbol table.
+Linux debug archives include separate debug files and packed DWARF units when
+present, linked from each executable with `.gnu_debuglink`. Use the assets from
+the same release and architecture as the sampled process. Workflow publication
+must use `scripts/package-release.sh`; the A124 owner-applied workflow delta is
+tracked on SAW-13349.
+
 `relay status` performs a bounded HMAC challenge against the exact listener. A plain
 `200 ok`, an old relay binary, a missing or unsafe identity file, a replaced listener,
 or a stopped relay fails closed. After upgrading codexctl, restart the service so it

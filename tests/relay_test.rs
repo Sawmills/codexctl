@@ -482,6 +482,77 @@ fn retry_after(response: &reqwest::Response) -> Option<u64> {
 }
 
 #[tokio::test]
+async fn open_streams_gauge_tracks_response_cancellation_and_upstream_failure() {
+    let (_gate, rx) = mpsc::channel(1);
+    let (closed, dropped) = oneshot::channel();
+    let h = harness(vec![
+        Scripted::Gated(vec![CREATED.into(), COMPLETED.into()], rx, closed),
+        Scripted::Status(503, vec![], "unavailable".into()),
+    ])
+    .await;
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_open_streams 0\n")
+    );
+    let mut body = h.post("gauge-open").await.bytes_stream();
+    body.next().await.unwrap().unwrap();
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_open_streams 1\n")
+    );
+    h.post("gauge-failed").await.text().await.unwrap();
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_open_streams 1\n")
+    );
+    drop(body);
+    tokio::time::timeout(Duration::from_secs(2), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    let metrics = h.metrics().await;
+    assert!(metrics.contains("# TYPE codexctl_relay_open_streams gauge\n"));
+    assert!(metrics.contains("codexctl_relay_open_streams 0\n"));
+}
+
+#[tokio::test]
+async fn open_streams_gauge_includes_a_pending_upload_and_releases_it_on_disconnect() {
+    use tokio::io::AsyncWriteExt;
+    let h = harness(vec![]).await;
+    let mut upload = tokio::net::TcpStream::connect(h.relay_url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    upload.write_all(b"POST /backend-api/codex/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100000\r\n\r\n{").await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !h
+            .metrics()
+            .await
+            .contains("codexctl_relay_open_streams 1\n")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(upload);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !h
+            .metrics()
+            .await
+            .contains("codexctl_relay_open_streams 0\n")
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(h.upstream.seen.lock().unwrap().bodies.is_empty());
+}
+
+#[tokio::test]
 async fn upstream_read_timeout_resets_on_frames_then_closes_a_silent_stream() {
     let (gate, rx) = mpsc::channel(1);
     let (closed, dropped) = oneshot::channel();
