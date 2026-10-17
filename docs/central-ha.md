@@ -717,9 +717,10 @@ and production are outside this authorization.
 
 Before stopping the writer or submitting a Job, merge the reviewed CA change into
 `main` and reconcile Application `codexctl` using `deploy/k8s/overlays/staging`.
-Keep existing automated sync enabled and wait for that merge to sync. For an
-installation using the checked-in manual-sync Application, run the approved
-`argocd app sync codexctl`, then `argocd app wait codexctl --sync`.
+The registered staging Application auto-syncs `main` with prune and selfHeal.
+Keep that policy enabled and wait for the merge to sync. The checked-in
+`deploy/k8s/staging-application.yaml` is a bootstrap reference that omits the
+registered automated sync policy; inspect the live Application as shown below.
 Do not apply the HA overlay to satisfy this prerequisite.
 
 Verify the synced revision is the reviewed CA merge (or a reviewed descendant
@@ -727,7 +728,7 @@ that includes it), and verify the bundle key in namespace `codexctl`:
 
 ```sh
 kubie exec plat-staging argocd kubectl get application codexctl -o json | \
-  jq '{source: .spec.source, sync: .status.sync}'
+  jq '{source: .spec.source, syncPolicy: .spec.syncPolicy, sync: .status.sync}'
 kubie exec plat-staging codexctl kubectl get configmap codexctl-rds-ca -o json | \
   jq -e '.data["global-bundle.pem"] | startswith("-----BEGIN CERTIFICATE-----")'
 ```

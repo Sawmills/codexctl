@@ -1,4 +1,7 @@
-# Review before registering this application. It does not sync automatically.
+# Bootstrap reference; this is not the registered Application's full sync policy.
+# The registered argocd/codexctl Application auto-syncs main with prune and selfHeal.
+# This reference omits syncPolicy.automated. Inspect the live Application before
+# registration or policy changes; see docs/central-server.md#staging-deployment.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
