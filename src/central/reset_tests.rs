@@ -57,7 +57,6 @@ impl Fixture {
             reset_reader: crate::central::resets::Reader::with_base(base),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
-            metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),

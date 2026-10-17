@@ -273,7 +273,6 @@ pub(super) struct Broker {
     pub(super) catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     relay_metrics: Arc<StdMutex<RelayMetrics>>,
-    metrics_hash: Option<String>,
     pub(super) work: Arc<Semaphore>,
     pub(super) session_writes: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
@@ -2170,19 +2169,7 @@ pub(super) fn log_dashboard_failure(stage: &'static str, error: &anyhow::Error) 
     );
 }
 
-async fn metrics(State(broker): State<Broker>, headers: HeaderMap) -> Result<Response, HttpError> {
-    if let Some(expected) = &broker.metrics_hash {
-        let actual = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|v| vault::digest(v.as_bytes()));
-        if actual.as_ref() != Some(expected) {
-            return Err(broker.error(StatusCode::UNAUTHORIZED, "metrics_unauthorized"));
-        }
-    } else {
-        broker.authorize(&headers).await?;
-    }
+async fn metrics(State(broker): State<Broker>) -> Result<Response, HttpError> {
     let mut output: String = broker
         .failures
         .lock()
@@ -2861,6 +2848,16 @@ pub async fn serve(
             json!({"operation":"browser_sessions", "stage":"startup", "reason":"browser_sessions_unavailable"})
         );
     }
+    // Keep legacy launch-file validation until SAW-13160 retires deployment wiring.
+    if let Some(path) = metrics_token_file {
+        let bytes = vault::private_read(path)?;
+        let token = std::str::from_utf8(&bytes)
+            .context("metrics token must contain UTF-8 text")?
+            .trim();
+        if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+            bail!("metrics token must contain at least 32 visible ASCII characters");
+        }
+    }
     let broker = Broker {
         activity: Arc::default(),
         state: state.into(),
@@ -2916,18 +2913,6 @@ pub async fn serve(
         login_holder_live: Arc::new(AtomicBool::new(true)),
         registry,
         central,
-        metrics_hash: metrics_token_file
-            .map(|p| {
-                let bytes = vault::private_read(p)?;
-                let token = std::str::from_utf8(&bytes)
-                    .context("metrics token must contain UTF-8 text")?
-                    .trim();
-                if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-                    bail!("metrics token must contain at least 32 visible ASCII characters");
-                }
-                Ok(vault::digest(token.as_bytes()))
-            })
-            .transpose()?,
     };
     let (holder_stop, mut holder_stop_rx) = tokio::sync::oneshot::channel();
     let holder_task = if let Some(shared) = broker.central.as_ref() {
@@ -3123,7 +3108,6 @@ impl Broker {
             catalog: Arc::new(catalog),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
-            metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -3270,7 +3254,6 @@ mod tests {
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
-            metrics_hash: None,
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
