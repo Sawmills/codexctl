@@ -7,7 +7,7 @@
 //! credit closest to lapsing first.
 
 use anyhow::{Context, Result, bail};
-use comfy_table::{Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
+use comfy_table::{Attribute, Cell, Color, Table, presets::UTF8_FULL_CONDENSED};
 
 use crate::api;
 use crate::commands::status;
@@ -89,14 +89,24 @@ pub fn run_list() -> Result<()> {
     println!("{table}");
 
     println!();
-    let failed = rows.iter().filter(|row| row.error.is_some()).count();
-    if failed > 0 {
+    let unknown = rows.iter().filter(|row| row.is_routing_unknown()).count();
+    let failed = rows
+        .iter()
+        .filter(|row| row.error.is_some() && !row.is_routing_unknown())
+        .count();
+    if unknown + failed > 0 {
         println!(
             "Partial total: {total} banked, {redeemable} redeemable on accounts read successfully."
         );
-        bail!("reset credits unavailable for {failed} account(s); total is incomplete");
+        if failed > 0 {
+            bail!("reset credits unavailable for {failed} account(s); total is incomplete");
+        }
+        println!(
+            "{unknown} account(s) have unknown reset credits; retry after routing is verified."
+        );
+    } else {
+        println!("{total} banked, {redeemable} redeemable now.");
     }
-    println!("{total} banked, {redeemable} redeemable now.");
     if server_mode {
         println!("Redeem with `codexctl resets --redeem <alias>`.");
     } else if redeemable > 0 {
@@ -439,6 +449,12 @@ struct ResetsRow {
     error: Option<String>,
 }
 
+impl ResetsRow {
+    fn is_routing_unknown(&self) -> bool {
+        self.error.as_deref() == Some("reset_routing_unverified")
+    }
+}
+
 fn fetch_all(profiles: &[profile::Profile], active: &Option<String>) -> Result<Vec<ResetsRow>> {
     let paths = config::default_paths()?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -546,6 +562,18 @@ fn render_row(row: &ResetsRow) -> Vec<Cell> {
     } else {
         row.alias.clone()
     };
+
+    if row.is_routing_unknown() {
+        return [
+            Cell::new(alias),
+            Cell::new("-"),
+            Cell::new("-"),
+            Cell::new("unknown (routing not yet verified, retry)"),
+        ]
+        .into_iter()
+        .map(|cell| cell.add_attribute(Attribute::Dim))
+        .collect();
+    }
 
     if let Some(error) = &row.error {
         return vec![

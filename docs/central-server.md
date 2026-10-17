@@ -151,7 +151,9 @@ marker remain excluded, including migrations whose completion is unknown.
 `codexctl resets` lists banked counts, redeemable counts, and expiry dates for server accounts.
 It reads those values through the account server. Migration does not require local `auth.json` files for this command.
 Unmigrated profiles retain their local reset lookup.
-A failed account read shows an error and an incomplete total. The command exits with failure in both server and local modes.
+An account whose routing is not yet verified shows `unknown (routing not yet verified, retry)` in dim text.
+The command prints a partial total and a retry note, and succeeds when those are the only gaps. The JSON inventory keeps the account's `reset_routing_unverified` error field.
+Other failed account reads show an error and an incomplete total, and the command exits with failure in both server and local modes.
 An account server without the reset endpoint rejects this command until the operator deploys the new server.
 Redeem a server-account reset with `codexctl resets --redeem <alias>` (add `--yes` for unattended use).
 The list command never spends a reset or approves credit billing.
