@@ -482,6 +482,40 @@ fn retry_after(response: &reqwest::Response) -> Option<u64> {
 }
 
 #[tokio::test]
+async fn upstream_read_timeout_resets_on_frames_then_closes_a_silent_stream() {
+    let (gate, rx) = mpsc::channel(1);
+    let (closed, dropped) = oneshot::channel();
+    let h = harness_with(
+        vec![Scripted::Gated(
+            vec![CREATED.into(), DELTA.into(), DELTA.into()],
+            rx,
+            closed,
+        )],
+        |config| config.with_read_timeout(Duration::from_millis(400)),
+    )
+    .await;
+    let mut body = h.post("read-timeout").await.bytes_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), CREATED);
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        gate.send(()).await.unwrap();
+        assert_eq!(body.next().await.unwrap().unwrap(), DELTA);
+    }
+    // Total lifetime now exceeds the idle budget. Only the next silent read
+    // should expire, and the upstream body must be dropped without a retry.
+    let next = tokio::time::timeout(Duration::from_secs(2), body.next()).await;
+    assert!(
+        matches!(next, Ok(Some(Err(_)))),
+        "silent read did not time out: {next:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(1), dropped)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.upstream.seen.lock().unwrap().bodies.len(), 1);
+}
+
+#[tokio::test]
 async fn evidence_reader_refuses_special_files_promptly() {
     let home = tempfile::tempdir().unwrap();
     let directory = home.path().join(".codexctl/relay/evidence");
