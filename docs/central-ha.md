@@ -139,7 +139,7 @@ the server image. Migration adds `browser_sessions` and its expiry index with
 The action upgrade also adds `dashboard_audit` and `browser_sessions.auth_time_verified`.
 It adds the nullable `dashboard_audit.deleted_at` marker to existing audit tables
 with `ADD COLUMN IF NOT EXISTS`, preserving their rows and coalescing keys.
-HA initialization runs migrate before each new broker starts. Both changes are
+HA initialization runs migrate before each new account server starts. Both changes are
 additive and keep schema version 8.
 Existing sessions remain valid for observations, but need fresh sign-in before Revoke.
 
@@ -148,7 +148,7 @@ Existing sessions remain valid for observations, but need fresh sign-in before R
 `CODEXCTL_CENTRAL_BROWSER_RESETS` defaults to off; only `1` enables it. It is
 independent of the Add/Renew and Remove gates. The staging overlays enable it
 explicitly. Each HA pod's initialize container runs `codexctl-central migrate`
-before starting the broker; this additive upgrade needs no separate migrate Job.
+before starting the account server; this additive upgrade needs no separate migrate Job.
 Migration adds `account_reset_journals` and a separate `reset_audit` table for
 `account_reset` events. The existing `dashboard_audit_operation_check` remains unchanged.
 The additive `dashboard_audit_history` view combines both audit tables; history
