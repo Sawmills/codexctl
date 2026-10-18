@@ -1,5 +1,5 @@
 //! Bounded, payload-free observations and seven-day model/hour reports.
-use crate::outcomes::StopReason;
+use crate::outcomes::{StopReason, alias, error_class, request_id};
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -200,55 +200,11 @@ pub(super) fn retry_header(name: &str, value: &str) -> Option<String> {
     }
 }
 
-pub(super) fn alias(value: &str) -> Option<String> {
-    crate::store::validate_alias(value)
-        .ok()
-        .filter(|value| {
-            !value.starts_with("sk-") && !value.starts_with("rt-") && !value.starts_with("eyJ")
-        })
-        .map(str::to_owned)
-}
-
-fn request_id(value: &str) -> Option<String> {
-    let uuid = value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| {
-            if [8, 13, 18, 23].contains(&index) {
-                byte == b'-'
-            } else {
-                byte.is_ascii_hexdigit()
-            }
-        });
-    let named =
-        (value.starts_with("req-") || value.starts_with("req_") || value.starts_with("request-"))
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    (uuid || named).then(|| value.to_owned())
-}
-
 fn model(value: &str) -> &str {
     if crate::RELAY_KNOWN_MODELS.contains(&value) {
         value
     } else {
         "other"
-    }
-}
-
-fn error_class(value: &str) -> &'static str {
-    match value {
-        "server_is_overloaded" => "server_is_overloaded",
-        "rate_limit_exceeded" => "rate_limit_exceeded",
-        "slow_down" => "slow_down",
-        "usage_limit_reached" => "usage_limit_reached",
-        "usage_not_included" => "usage_not_included",
-        "insufficient_quota" => "insufficient_quota",
-        "credit_balance_exhausted" => "credit_balance_exhausted",
-        "organization_spend_limit_exceeded" => "organization_spend_limit_exceeded",
-        "project_spend_limit_exceeded" => "project_spend_limit_exceeded",
-        "organization_usage_limit_exceeded" => "organization_usage_limit_exceeded",
-        "flex_unavailable" => "flex_unavailable",
-        _ => "other",
     }
 }
 

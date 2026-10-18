@@ -172,7 +172,7 @@ async fn native_http_server_retries_do_not_count_as_capacity_lane_stops() {
 }
 
 #[tokio::test]
-async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
+async fn terminal_stop_is_reported_once_with_bounded_request_context() {
     let (events, mut received) = mpsc::channel(4);
     let app = Router::new()
         .route("/v1/relay/capacity-events", post(central_capacity_event))
@@ -183,7 +183,14 @@ async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
     let failure = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"token_refused\"}}}\n\n";
     let evidence = tempfile::tempdir().unwrap();
     let h = harness_with(
-        vec![Scripted::Sse(vec![failure.into(), failure.into()])],
+        vec![Scripted::Status(
+            200,
+            vec![
+                ("content-type", "text/event-stream".into()),
+                ("x-request-id", "req-synthetic-stop".into()),
+            ],
+            failure.repeat(2),
+        )],
         |config| {
             config
                 .with_evidence_dir(evidence.path())
@@ -193,7 +200,18 @@ async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
     )
     .await;
     assert_eq!(
-        h.post("private-thread").await.text().await.unwrap(),
+        h.client
+            .post(format!("{}/backend-api/codex/responses", h.relay_url))
+            .header("authorization", "Bearer synthetic-secret-token")
+            .header("thread-id", "private-thread")
+            .header("x-codexctl-account-alias", "synthetic-seat")
+            .json(&json!({"model":"gpt-6.1-sol", "input":"synthetic-body-marker"}))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
         failure.repeat(2)
     );
     let (headers, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
@@ -203,7 +221,11 @@ async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
     assert_eq!(headers["authorization"], "Bearer synthetic-machine-token");
     assert_eq!(
         serde_json::from_slice::<Value>(&body).unwrap(),
-        json!({"lane_stop":"token_refused"})
+        json!({
+            "lane_stop":"token_refused", "http_status":200,
+            "error_code":"token_refused", "account_alias":"synthetic-seat",
+            "route":"/backend-api/codex/responses", "request_id":"req-synthetic-stop"
+        })
     );
     h.shutdown().await;
     assert!(
