@@ -8,7 +8,7 @@ RUN cargo build --release --locked --features central-prototype --bin codexctl-c
 FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4
 ARG CODEX_VERSION=0.159.0
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends bubblewrap ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global @openai/codex@${CODEX_VERSION} \
     && npm cache clean --force \
