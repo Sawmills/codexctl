@@ -4,6 +4,47 @@ evaluation_interval: 1m
 tests:
   - interval: 1m
     input_series:
+      - series: codexctl_central_billed_selections_total{path="auto",pod="pod-a"}
+        values: 0+0x10
+      - series: codexctl_central_billed_selections_total{path="explicit",pod="pod-a"}
+        values: 1+1x10
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CodexctlAutomaticBillingSelected
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_billed_selections_total{path="auto",pod="new-pod"}
+        values: _ 1 1 0 0
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: CodexctlAutomaticBillingSelected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              service: codexctl
+              environment: staging
+            exp_annotations:
+              summary: Codexctl selected a credit-billing account automatically
+              description: Automatic selection must use included subscription accounts only. Inspect the billed-selection outcome logs, use an explicitly selected subscription account, and fix the selection guard. Token probes and refreshes must not count as selections.
+              runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
+      - eval_time: 3m
+        alertname: CodexctlAutomaticBillingSelected
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: codexctl_central_lane_stops_total{reason="capacity",pod="pod-a"}
+        values: 0+1x1440
+      - series: codexctl_central_lane_stops_total{reason="capacity",pod="pod-b"}
+        values: 0+1x1440
+    promql_expr_test:
+      - expr: codexctl:lane_stops:increase1d{reason="capacity"}
+        eval_time: 1d
+        exp_samples:
+          - labels: codexctl:lane_stops:increase1d{reason="capacity"}
+            value: 2880
+  - interval: 1m
+    input_series:
       - series: codexctl_central_owner_refresh_failed_total{account="personal",account_key="example-key",reason="refresh_token_invalidated",pod="pod-a"}
         values: _ 1+0x24
     alert_rule_test:

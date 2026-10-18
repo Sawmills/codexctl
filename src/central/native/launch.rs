@@ -414,6 +414,7 @@ fn prepare_pinned_codex(
     allow_billing: bool,
     included_only: bool,
 ) -> Result<PinnedLaunch> {
+    let mut selection = crate::outcomes::SelectionReceipt::default();
     let included_only = included_only || super::super::service_account::enabled()?;
     super::super::loans::AccountRef::parse(alias)?;
     if std::env::var_os("CODEX_HOME").is_some()
@@ -579,6 +580,12 @@ fn prepare_pinned_codex(
     // Unregistering signal-hook handlers does not restore the default action.
     // Leave fallback launches untouched when any preparation step fails.
     let signals = Arc::new(LaunchSignals::register()?);
+    selection.commit(
+        &connection.server,
+        || connection.device_token_file.read_for(&connection.server),
+        connection.approved_billing_class,
+        !included_only,
+    );
     Ok(PinnedLaunch {
         prepared: Some(prepared),
         _owner: owner,

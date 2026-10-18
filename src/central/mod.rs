@@ -28,7 +28,7 @@ mod server;
 pub mod service_account;
 mod sessions;
 pub mod storage;
-mod transport;
+pub(crate) mod transport;
 mod vault;
 
 pub use client::run_client;

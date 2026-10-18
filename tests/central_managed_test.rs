@@ -7529,6 +7529,164 @@ fn relay_capacity_events_require_valid_labels_and_are_exported() {
 }
 
 #[test]
+fn terminal_lane_stop_reports_are_authenticated_bounded_and_counted_once() {
+    let server = Server::start();
+    let endpoint = format!("{}/v1/relay/capacity-events", server.url);
+    let payload = json!({"lane_stop":"capacity"});
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .json(&payload)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    for reason in [
+        "capacity",
+        "rate_limited",
+        "login_required",
+        "token_refused",
+    ] {
+        assert_eq!(
+            server
+                .http
+                .post(&endpoint)
+                .bearer_auth(&server.amir)
+                .json(&json!({"lane_stop":reason}))
+                .send()
+                .unwrap()
+                .status(),
+            204
+        );
+    }
+    for bad in [
+        json!({"lane_stop":"private-alias"}),
+        json!({"lane_stop":"capacity","request_id":"req-secret"}),
+    ] {
+        assert_eq!(
+            server
+                .http
+                .post(&endpoint)
+                .bearer_auth(&server.amir)
+                .json(&bad)
+                .send()
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    for outcome in ["advised", "recovered", "exhausted"] {
+        assert_eq!(server.http.post(&endpoint).bearer_auth(&server.amir)
+            .json(&json!({"kind":"overloaded","model":"gpt-6.1-sol","account_class":"included","outcome":outcome}))
+            .send().unwrap().status(), 204);
+    }
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    for reason in [
+        "capacity",
+        "rate_limited",
+        "login_required",
+        "token_refused",
+    ] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_central_lane_stops_total{{reason=\"{reason}\"}} 1\n"
+            )),
+            "{metrics}"
+        );
+    }
+    assert!(!metrics.contains("private-alias") && !metrics.contains("req-secret"));
+}
+
+#[test]
+fn billed_selection_receipts_count_only_accepted_bounded_paths() {
+    let server = Server::start();
+    let metrics = || {
+        server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .send()
+            .unwrap()
+            .text()
+            .unwrap()
+    };
+    for path in ["auto", "explicit"] {
+        assert!(metrics().contains(&format!(
+            "codexctl_central_billed_selections_total{{path=\"{path}\"}} 0\n"
+        )));
+    }
+    let endpoint = format!("{}/v1/relay/capacity-events", server.url);
+    let report = json!({"billed_selection":"explicit"});
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .json(&report)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    for bad in [
+        json!({"billed_selection":"alias-private"}),
+        json!({"billed_selection":"auto","account":"must-not-be-a-label"}),
+    ] {
+        assert_eq!(
+            server
+                .http
+                .post(&endpoint)
+                .bearer_auth(&server.amir)
+                .json(&bad)
+                .send()
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .bearer_auth(&server.amir)
+            .json(&report)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let output = metrics();
+    assert!(
+        output.contains("codexctl_central_billed_selections_total{path=\"explicit\"} 1\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains("codexctl_central_billed_selections_total{path=\"auto\"} 0\n"),
+        "{output}"
+    );
+    // Receipt ingestion must measure a broken client guard as well, so the
+    // critical alert can see it. This does not select or authorize an account.
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .bearer_auth(&server.amir)
+            .json(&json!({"billed_selection":"auto"}))
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    assert!(metrics().contains("codexctl_central_billed_selections_total{path=\"auto\"} 1\n"));
+}
+
+#[test]
 fn relay_capacity_event_authorizes_before_reading_a_large_body() {
     use std::io::Write;
     let server = Server::start();
