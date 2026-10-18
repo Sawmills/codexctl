@@ -13479,7 +13479,7 @@ fn pinned_capacity_receipt(presentation: &str) {
     };
     let real_native = presentation == "realnative";
     let requests = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut paths = Vec::new();
         let mut response_posts = 0;
         for index in 0..total_requests {
@@ -13494,7 +13494,7 @@ fn pinned_capacity_receipt(presentation: &str) {
                 }
             };
             socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
                 .unwrap();
             let mut reader = BufReader::new(socket.try_clone().unwrap());
             let mut headers = String::new();

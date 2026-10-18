@@ -93,7 +93,6 @@ impl Pending {
 
     pub(super) fn clear(&mut self, labels: &Labels) {
         // Without a turn id, a response cannot prove which turn recovered.
-        // The wrapper's native turn.completed event clears that unknown entry.
         if labels.turn_id.is_none() {
             return;
         }
@@ -198,7 +197,7 @@ pub(super) fn accept(
         return StatusCode::BAD_REQUEST.into_response();
     };
     if receipt.action == Action::Recovered {
-        if receipt.turn_id.is_none() {
+        if receipt.turn_id.as_deref().is_some_and(valid_id) {
             pending.failures.remove(&key);
         }
         return StatusCode::NO_CONTENT.into_response();
@@ -361,10 +360,12 @@ impl TerminalObserver {
     }
 
     fn report(&mut self, action: Action) {
-        if self.reported {
+        if action == Action::Confirm && self.reported {
             return;
         }
-        self.reported = true;
+        if action == Action::Confirm {
+            self.reported = true;
+        }
         let Some((root, listen)) = &self.target else {
             return;
         };

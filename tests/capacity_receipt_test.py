@@ -27,6 +27,9 @@ for _ in range(settings["attempts"]):
         error.read()
 if settings.get("unrelated_success"):
     urllib.request.urlopen(urllib.request.Request(settings["url"], data=b'{}', headers={"thread-id":settings["thread"]})).read()
+if settings.get("later_completion"):
+    # Another same-thread turn completes before the held capacity confirmation.
+    print('{"type":"turn.completed"}', flush=True)
 if settings["recover"]:
     print(json.dumps({"type":"item.completed", "item":{"type":"agent_message","text":settings["message"]}}), flush=True)
     print('{"type":"turn.completed"}', flush=True)
@@ -43,7 +46,7 @@ sys.exit(0 if settings["recover"] else 1)
 
 
 class CapacityReceiptTest(unittest.TestCase):
-    def scenario(self, recover=False, streamed=False, quoted=False, code="server_is_overloaded", unrelated_success=False, stream_after_http=False):
+    def scenario(self, recover=False, streamed=False, quoted=False, code="server_is_overloaded", unrelated_success=False, stream_after_http=False, later_completion=False):
         calls = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -93,7 +96,7 @@ class CapacityReceiptTest(unittest.TestCase):
                         time.sleep(.02)
                 (home / ".codexctl" / "relay.json").write_text(json.dumps({"listen": address}))
                 attempts = 2 if recover or stream_after_http else 1 if streamed else 3
-                (home / "fixture.json").write_text(json.dumps({"url": f"http://{address}/backend-api/codex/responses", "thread": THREAD, "message": MESSAGE, "recover": recover, "attempts": attempts, "quoted": quoted, "unrelated_success": unrelated_success}))
+                (home / "fixture.json").write_text(json.dumps({"url": f"http://{address}/backend-api/codex/responses", "thread": THREAD, "message": MESSAGE, "recover": recover, "attempts": attempts, "quoted": quoted, "unrelated_success": unrelated_success, "later_completion": later_completion}))
                 result = subprocess.run([binary, "codex", "exec", "--json", "say hi"], env=environment, cwd=home, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, 0 if recover else 1, (result.stdout, result.stderr))
                 metrics = urllib.request.urlopen(f"http://{address}/metrics", timeout=2).read().decode()
@@ -119,6 +122,9 @@ class CapacityReceiptTest(unittest.TestCase):
 
     def test_unrelated_same_thread_success_without_turn_metadata_cannot_erase_a_stop(self):
         self.scenario(unrelated_success=True)
+
+    def test_later_same_thread_completion_without_a_turn_id_cannot_erase_a_stop(self):
+        self.scenario(later_completion=True)
 
     def test_recovered_http_capacity_is_not_a_stop_even_if_assistant_quotes_it(self):
         self.scenario(recover=True)
