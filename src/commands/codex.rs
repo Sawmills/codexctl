@@ -24,6 +24,7 @@ const SPEND_CAP_MESSAGE: &str = "You hit your spend cap set by the owner of your
 const SELF_MANAGED_SPEND_CAP_MESSAGE: &str =
     "You hit your spend cap set in your workspace. Increase your spend cap to continue.";
 const RATE_LIMIT_MESSAGE: &str = "exceeded retry limit, last status: 429";
+const USAGE_LIMIT_MESSAGE: &str = "You’ve hit your usage limit.";
 pub const DEFAULT_RECOVERY_PROMPT: &str = "Continue the previous request.";
 
 pub fn run(
@@ -1761,7 +1762,8 @@ fn spawn_output_thread(
     std::thread::spawn(move || {
         let mut stdout = std::io::stdout();
         let mut buffer = [0; 8192];
-        let mut recent = String::new();
+        let mut recent_bytes = Vec::new();
+        let mut recent_starts_mid_line = false;
         let mut pending_cr = false;
         let mut continue_goal_auto_enter = ContinueGoalAutoEnter::default();
         let mut state_watcher = state_reporter.as_ref().map(|_| CodexStateWatcher::new());
@@ -1780,8 +1782,23 @@ fn spawn_output_thread(
             }
             let _ = stdout.flush();
 
+            recent_bytes.extend_from_slice(chunk);
+            if recent_bytes.len() > 16_384 {
+                let drain_to = recent_bytes.len() - 8192;
+                recent_starts_mid_line = !matches!(recent_bytes[drain_to - 1], b'\n' | b'\r');
+                recent_bytes.drain(..drain_to);
+            }
+            // A clipped JSON record must never become a rendered error row.
+            let complete_lines = if recent_starts_mid_line {
+                recent_bytes
+                    .iter()
+                    .position(|byte| matches!(byte, b'\n' | b'\r'))
+                    .map_or(&[][..], |index| &recent_bytes[index + 1..])
+            } else {
+                &recent_bytes
+            };
+            let recent = String::from_utf8_lossy(complete_lines);
             let chunk_text = String::from_utf8_lossy(chunk);
-            push_bounded_recent(&mut recent, &chunk_text);
 
             if spend_cap_seen(&recent) {
                 spend_cap.store(true, Ordering::SeqCst);
@@ -2192,7 +2209,39 @@ fn spend_cap_seen(output: &str) -> bool {
 }
 
 fn rate_limit_seen(output: &str) -> bool {
-    let text = strip_ansi_escapes(output);
+    let output = strip_ansi_escapes(output);
+    let mut text = String::new();
+    for line in output.split(['\n', '\r']) {
+        if line.trim_start().starts_with('{') {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line)
+                && event.get("type").and_then(serde_json::Value::as_str) == Some("turn.failed")
+                && event
+                    .pointer("/error/message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| message.starts_with(USAGE_LIMIT_MESSAGE))
+            {
+                return true;
+            }
+            continue;
+        }
+        text.push_str(line);
+        text.push('\n');
+    }
+    let usage_needle = normalize_spend_cap_text(USAGE_LIMIT_MESSAGE);
+    let mut usage_message = String::new();
+    for line in text.lines() {
+        if let Some(message) = line.trim_start().strip_prefix('■') {
+            usage_message = normalize_spend_cap_text(message);
+        } else if !usage_message.is_empty() {
+            usage_message.push_str(&normalize_spend_cap_text(line));
+        }
+        if usage_message.starts_with(&usage_needle) {
+            return true;
+        }
+        if !usage_needle.starts_with(&usage_message) {
+            usage_message.clear();
+        }
+    }
     let needle = normalize_spend_cap_text(RATE_LIMIT_MESSAGE);
     if normalize_spend_cap_text(&text).contains(&format!("■{needle}")) {
         return true;
