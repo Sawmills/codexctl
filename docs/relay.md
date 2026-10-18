@@ -200,6 +200,7 @@ never holds a token or a body. `GET /metrics` on the relay serves:
 ```
 codexctl_relay_capacity_events_total{kind,model,account_class,outcome}
 codexctl_relay_stream_failures_total{kind,stage,model,account_class}
+codexctl_relay_lane_stops_total{reason}
 ```
 
 - `kind`: `rate_429` or `overloaded`.
@@ -226,12 +227,65 @@ elapsed times, model and account class, and upstream `cf-ray` and
 `x-oai-request-id` headers. Failure messages are reduced to their character length and
 one of the bounded classes `capacity`, `rate_limit`, or `other`; their text and
 parameters are never logged. Output text, deltas, request bodies, authorization, and
-cookies are never included. The process emits at most 30 failure lines per minute and
-then one suppression summary.
+cookies are never included. Stream-failure and terminal-stop logs share a limit of
+30 lines per minute, followed by one suppression summary. Suppression does not
+change outcome counters, retained evidence, or central reports.
 
-The existing central capacity endpoint accepts only its four capacity labels and does
-not have a `stream_failure` event schema. Stream-failure forwarding is therefore a
-follow-up server API change; this release keeps the observation local to the relay.
+The account server also accepts a typed terminal-outcome report through this same
+authenticated endpoint. It has one field, `lane_stop`, with one of four reasons:
+`rate_limited`, `capacity`, `login_required`, or `token_refused`. It does not accept
+identities, request IDs or messages in that report. General `stream_failure` detail
+stays local.
+
+`codexctl_relay_lane_stops_total{reason}` counts a terminal account failure once per
+HTTP request or SSE response. Exhausted HTTP 429 and capacity retry budgets count;
+advised attempts and recovered retries do not. Repeated failure frames in one
+response count once. Known login-expiry or refresh-grant errors use `login_required`;
+other HTTP 401/403 and known token errors use `token_refused`. Unclassified transport
+or server errors do not prove an account stop. Codex retries streamed rate-limit
+codes itself, so those frames alone do not prove it stopped. The relay cannot see
+when Codex spends a separate client retry budget while advice is still available.
+
+The account server exports `codexctl_central_lane_stops_total{reason}` for accepted
+terminal reports. These are the same events as the local counter, so do not add
+the two counters together. Reports use the existing best-effort queue and machine
+rate limit; the local counter can exceed the server counter when reporting fails.
+Use `codexctl_relay_central_dropped_total` to identify incomplete server coverage.
+All four reason series start at zero. The process counters restart at zero;
+retained evidence survives a relay restart within its retention and size bounds.
+
+The HA rules record `codexctl:lane_stops:increase1d` by reason for dashboards.
+Prometheus derives this rolling daily increase from samples; it is not an exact
+UTC-day ledger. There is no new lane-stop alert.
+
+`codexctl_central_billed_selections_total{path="auto"|"explicit"}` records the
+selection of an account with verified credit billing. Client activation, private
+launch preparation and app-auth enablement send one typed receipt only after
+their consent and automatic-placement guards pass and the selection commits.
+The path comes from the caller's selection intent. Token probes, declined
+selections, included accounts and credential refreshes do not send receipts.
+Both path series start at zero. This counts selections, not dollars spent.
+
+The receipt contains only `billed_selection`, with value `auto` or `explicit`.
+It uses the same authenticated endpoint and rate limit as other relay reports.
+The sender does not retry, follow redirects or use a proxy. It sends after
+mutation locks release, with a 250 ms HTTP deadline. A send failure logs
+`billed_selection_report_failed` and leaves the selection result unchanged.
+The local counter `codexctl_client_outcome_reports_failed_total` is exposed on the
+relay. Its small private tally at `~/.codexctl/outcome-metrics/report-failures`
+survives CLI and relay restarts. If its nonblocking lock or disk write fails, the
+log has `counter_available=false`; the persisted tally then omits that failure.
+Keep this coverage limit separate from the server's accepted-selection count.
+
+The staging and staging-ha rules raise the critical
+`CodexctlAutomaticBillingSelected` alert for an automatic billed-selection event
+within the last hour, including its first scraped sample. It clears after an
+hour without another event; the cumulative counter stays available. Automatic placement must
+stay on included subscription accounts. Inspect the bounded selection outcome
+logs, use an explicit subscription account, and fix the client placement guard.
+Probes must never produce this alert. The rule is tested with promtool; live
+critical notification delivery requires the platform Alertmanager route and is
+not established by those tests.
 
 `relay serve` also keeps sanitized evidence in `~/.codexctl/relay/evidence`.
 Private daily JSONL files retain the current UTC day and six previous days, with a
@@ -251,7 +305,11 @@ codexctl relay evidence        # counts by model and UTC hour
 codexctl relay evidence --json
 ```
 
-Counts distinguish requests, overloads, rate limits and other failures. They cover
+Counts distinguish requests, overloads, rate limits and other failures. The JSON
+report adds `lane_stops`, a map from terminal reason to count in each model/UTC-hour
+row; text output shows `reason=count`. Sum rows for the required UTC date to read
+its daily outcome. Terminal records do not count again as provider failures.
+Counts cover
 only valid retained records. A torn append does not prevent reports: both output
 formats warn on stderr with the number of damaged lines excluded from counts.
 The writer separates an unterminated crash tail before the next record, so that

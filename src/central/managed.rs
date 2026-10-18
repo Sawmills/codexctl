@@ -217,6 +217,30 @@ struct RelayCapacityEvent {
     outcome: String,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RelayEvent {
+    Capacity(RelayCapacityEvent),
+    Stop(crate::outcomes::StopReport),
+    Selection(crate::outcomes::SelectionReport),
+}
+
+enum AcceptedRelayEvent {
+    Capacity(RelayMetricKey),
+    Stop(crate::outcomes::StopReport),
+    Selection(crate::outcomes::SelectionReport),
+}
+
+impl RelayEvent {
+    fn validate(self) -> Option<AcceptedRelayEvent> {
+        match self {
+            Self::Capacity(event) => event.validate().ok().map(AcceptedRelayEvent::Capacity),
+            Self::Stop(report) => Some(AcceptedRelayEvent::Stop(report)),
+            Self::Selection(report) => Some(AcceptedRelayEvent::Selection(report)),
+        }
+    }
+}
+
 impl RelayCapacityEvent {
     fn validate(self) -> Result<RelayMetricKey, ()> {
         if !RELAY_EVENT_KINDS.contains(&self.kind.as_str())
@@ -273,6 +297,7 @@ pub(super) struct Broker {
     pub(super) catalog: Arc<catalog::Reader>,
     failures: Arc<StdMutex<BTreeMap<&'static str, Failure>>>,
     relay_metrics: Arc<StdMutex<RelayMetrics>>,
+    pub(super) outcomes: crate::outcomes::Outcomes,
     pub(super) work: Arc<Semaphore>,
     pub(super) session_writes: Arc<Semaphore>,
     pub(super) stopping: Arc<AtomicBool>,
@@ -302,7 +327,7 @@ impl Broker {
     async fn relay_accept(
         &self,
         device: &str,
-        key: RelayMetricKey,
+        event: AcceptedRelayEvent,
     ) -> std::result::Result<bool, HttpError> {
         let allowed = match self.central.as_ref() {
             Some(store) if !matches!(store.mode(), StoreMode::File) => {
@@ -328,6 +353,17 @@ impl Broker {
         if !allowed {
             return Ok(false);
         }
+        let key = match event {
+            AcceptedRelayEvent::Capacity(key) => key,
+            AcceptedRelayEvent::Stop(report) => {
+                self.outcomes.stopped(report);
+                return Ok(true);
+            }
+            AcceptedRelayEvent::Selection(report) => {
+                self.outcomes.selected(report);
+                return Ok(true);
+            }
+        };
         let mut metrics = self
             .relay_metrics
             .lock()
@@ -2183,6 +2219,7 @@ async fn metrics(State(broker): State<Broker>) -> Result<Response, HttpError> {
     output.push_str(&fast_path::metrics());
     output.push_str(&super::owner_refresh::metrics());
     output.push_str(&super::refresh_control::metrics());
+    output.push_str(&broker.outcomes.metrics("codexctl_central"));
     output.push_str(&format!(
         "codexctl_central_ownership_unresolved{{reason=\"recovery_failed\"}} {}\n",
         u8::from(broker.ownership_unresolved.load(Ordering::Acquire))
@@ -2226,9 +2263,9 @@ async fn relay_capacity_event(
     let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
         .await
         .map_err(|_| broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"))?;
-    let event = serde_json::from_slice::<RelayCapacityEvent>(&body)
+    let event = serde_json::from_slice::<RelayEvent>(&body)
         .ok()
-        .and_then(|event| event.validate().ok());
+        .and_then(RelayEvent::validate);
     let Some(event) = event else {
         broker.relay_reject("invalid_label");
         return Err(broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"));
@@ -2900,6 +2937,7 @@ pub async fn serve(
             .collect(),
         )),
         relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
+        outcomes: crate::outcomes::Outcomes::default(),
         work: Arc::new(Semaphore::new(128)),
         session_writes: Arc::new(Semaphore::new(32)),
         stopping: Arc::new(AtomicBool::new(false)),
@@ -3108,6 +3146,7 @@ impl Broker {
             catalog: Arc::new(catalog),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
+            outcomes: crate::outcomes::Outcomes::default(),
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -3254,6 +3293,7 @@ mod tests {
             catalog: Arc::new(catalog::Reader::new().unwrap()),
             failures: Arc::new(StdMutex::new(BTreeMap::new())),
             relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
+            outcomes: crate::outcomes::Outcomes::default(),
             work: Arc::new(Semaphore::new(128)),
             session_writes: Arc::new(Semaphore::new(32)),
             stopping: Arc::new(AtomicBool::new(false)),

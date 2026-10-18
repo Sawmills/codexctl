@@ -3,6 +3,8 @@ pub mod api;
 pub mod central;
 pub mod config;
 pub mod daemon;
+#[cfg(feature = "central-prototype")]
+mod outcomes;
 pub mod profile;
 #[cfg(feature = "central-prototype")]
 pub mod relay;

@@ -1321,6 +1321,7 @@ pub fn activate(
     allow_resets: bool,
     restart_daemon: bool,
 ) -> Result<bool> {
+    let mut selection = crate::outcomes::SelectionReceipt::default();
     if super::service_account::enabled()? {
         bail!("service jobs cannot activate the host account; run codexctl codex instead");
     }
@@ -1756,6 +1757,12 @@ pub fn activate(
             },
         ));
     }
+    selection.commit(
+        &connection.server,
+        || connection.device_token_file.read_for(&connection.server),
+        connection.approved_billing_class,
+        explicit,
+    );
     // Configuration, marker, connection, and pointer are committed together before
     // session repair. Keep that activation available so the operator can retry the
     // explicit repair command without exposing a half-installed provider.

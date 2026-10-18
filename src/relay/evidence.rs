@@ -1,4 +1,5 @@
 //! Bounded, payload-free observations and seven-day model/hour reports.
+use crate::outcomes::StopReason;
 use anyhow::{Context, Result, bail};
 use chrono::{NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ const DROP_REASONS: [&str; 3] = ["queue_full", "io", "daily_limit"];
 
 pub(super) enum Observation<'a> {
     Headers,
+    LaneStop(StopReason),
     Failure {
         error_code: Option<&'a str>,
         rate_429: Option<bool>,
@@ -42,6 +44,8 @@ pub(super) struct Metadata<'a> {
 #[serde(deny_unknown_fields)]
 struct Record {
     utc_hour: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lane_stop: Option<StopReason>,
     status: u16,
     /// The HTTP policy decision; absent for streams and older records.
     #[serde(default)]
@@ -130,15 +134,17 @@ impl Evidence {
         let Some(sender) = &self.sender else {
             return;
         };
-        let (observation, error_code, rate_429) = match metadata.observation {
-            Observation::Headers => ("headers", None, None),
+        let (observation, error_code, rate_429, lane_stop) = match metadata.observation {
+            Observation::Headers => ("headers", None, None, None),
+            Observation::LaneStop(reason) => ("lane_stop", None, None, Some(reason)),
             Observation::Failure {
                 error_code,
                 rate_429,
-            } => ("failure", error_code, rate_429),
+            } => ("failure", error_code, rate_429, None),
         };
         let record = Record {
             utc_hour: Utc::now().format("%Y-%m-%dT%H:00:00Z").to_string(),
+            lane_stop,
             rate_429,
             status: metadata.status,
             error_code: error_code.map(error_class).map(str::to_owned),
@@ -335,6 +341,7 @@ struct Counts {
     overloaded: u64,
     rate_429: u64,
     other_failures: u64,
+    lane_stops: BTreeMap<StopReason, u64>,
 }
 
 fn report(directory: &Path) -> Result<Vec<Counts>> {
@@ -392,7 +399,9 @@ fn report(directory: &Path) -> Result<Vec<Counts>> {
                     model: label,
                     ..Counts::default()
                 });
-            if record.observation == "headers" {
+            if let Some(reason) = record.lane_stop {
+                *row.lane_stops.entry(reason).or_default() += 1;
+            } else if record.observation == "headers" {
                 row.requests += 1;
             } else {
                 match record.rate_429 {
@@ -421,12 +430,22 @@ pub(super) fn render(directory: &Path, json: bool) -> Result<String> {
         return Ok(serde_json::to_string_pretty(&rows)?);
     }
     let mut text = String::from(
-        "UTC hour              Model            Requests Overloads Rate429 Other failures\n",
+        "UTC hour              Model            Requests Overloads Rate429 Other failures Lane stops (reason=count)\n",
     );
     for row in rows {
         text.push_str(&format!(
-            "{:<21} {:<16} {:>8} {:>9} {:>7} {:>14}\n",
-            row.utc_hour, row.model, row.requests, row.overloaded, row.rate_429, row.other_failures
+            "{:<21} {:<16} {:>8} {:>9} {:>7} {:>14} {}\n",
+            row.utc_hour,
+            row.model,
+            row.requests,
+            row.overloaded,
+            row.rate_429,
+            row.other_failures,
+            row.lane_stops
+                .iter()
+                .map(|(reason, count)| format!("{}={count}", reason.label()))
+                .collect::<Vec<_>>()
+                .join(",")
         ));
     }
     Ok(text)

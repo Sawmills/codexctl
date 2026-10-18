@@ -170,6 +170,7 @@ fn enable(
     no_agent: bool,
     allow_codex_version: bool,
 ) -> Result<()> {
+    let mut selection = crate::outcomes::SelectionReceipt::default();
     if std::env::var_os("CODEX_HOME").is_some() {
         bail!("app-auth writes ~/.codex for the desktop app; unset CODEX_HOME");
     }
@@ -262,6 +263,17 @@ fn enable(
     // Journal first: if the write below never lands, the marker still exists,
     // so the guards hold and disable can undo what enable began.
     write_auth(&paths, &mut state, &account_id, &token.access_token)?;
+    selection.commit(
+        &state.connection.server,
+        || {
+            state
+                .connection
+                .device_token_file
+                .read_for(&state.connection.server)
+        },
+        token.billing_class,
+        true,
+    );
     if !no_agent && let Err(error) = install_agent() {
         // A file with no refresh agent would expire unnoticed; say so.
         let _ = remove_agent_file();

@@ -10,6 +10,23 @@ spec:
   groups:
     - name: codexctl
       rules:
+        - record: codexctl:lane_stops:increase1d
+          expr: sum by (reason) (increase(codexctl_central_lane_stops_total[1d]))
+        - alert: CodexctlAutomaticBillingSelected
+          expr: |
+            sum(increase(codexctl_central_billed_selections_total{path="auto"}[1h])) > 0
+            or
+            sum(codexctl_central_billed_selections_total{path="auto"}
+              unless codexctl_central_billed_selections_total{path="auto"} offset 1h) > 0
+          for: 0m
+          labels:
+            severity: critical
+            service: codexctl
+            environment: staging
+          annotations:
+            summary: Codexctl selected a credit-billing account automatically
+            description: Automatic selection must use included subscription accounts only. Inspect the billed-selection outcome logs, use an explicitly selected subscription account, and fix the selection guard. Token probes and refreshes must not count as selections.
+            runbook_url: https://github.com/Sawmills/codexctl/blob/main/docs/relay.md
         - alert: CodexctlBrokerUnavailable
           expr: up{namespace="codexctl",service="codexctl"} == 0 or absent(up{namespace="codexctl",service="codexctl"})
           for: 5m

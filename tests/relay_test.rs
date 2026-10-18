@@ -29,6 +29,227 @@ const DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\"respon
 const REASONING_DELTA: &str = "event: response.reasoning_summary_text.delta\ndata: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"synthetic reasoning\"}\n\n";
 const COMPLETED: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n";
 
+#[tokio::test]
+async fn terminal_rate_limit_counts_one_lane_stop_after_the_retry_budget() {
+    let h = harness_with(
+        vec![Scripted::Status(429, vec![], RATE_429.into())],
+        |config| config.with_budgets(Duration::ZERO, Duration::ZERO),
+    )
+    .await;
+    let response = h.post("terminal-rate").await;
+    assert_eq!(response.status(), 429);
+    assert_eq!(retry_after(&response), None);
+    assert_eq!(response.text().await.unwrap(), RATE_429);
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("codexctl_relay_lane_stops_total{reason=\"rate_limited\"} 1\n"),
+        "one final lane-visible stop: {metrics}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_outcomes_count_auth_and_repeated_capacity_frames_once_per_request() {
+    let h = harness_with(
+        vec![
+            Scripted::Sse(vec![OVERLOADED.into(), OVERLOADED.into()]),
+            Scripted::Status(401, vec![], r#"{"error":{"code":"login_required"}}"#.into()),
+            Scripted::Status(403, vec![], r#"{"error":{"code":"invalid_token"}}"#.into()),
+            Scripted::Status(503, vec![], r#"{"error":{"code":"unavailable"}}"#.into()),
+        ],
+        |config| config.with_budgets(Duration::ZERO, Duration::ZERO),
+    )
+    .await;
+    assert_eq!(
+        h.post("capacity-twice").await.text().await.unwrap(),
+        OVERLOADED.repeat(2)
+    );
+    for (thread, status) in [("login", 401), ("token", 403), ("other", 503)] {
+        let response = h.post(thread).await;
+        assert_eq!(response.status(), status);
+        let _ = response.bytes().await.unwrap();
+    }
+    let metrics = h.metrics().await;
+    for reason in ["capacity", "login_required", "token_refused"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_relay_lane_stops_total{{reason=\"{reason}\"}} 1\n"
+            )),
+            "{metrics}"
+        );
+    }
+    let counters: Vec<_> = metrics
+        .lines()
+        .filter(|line| line.starts_with("codexctl_relay_lane_stops_total{"))
+        .collect();
+    assert_eq!(counters.len(), 4, "only bounded reasons: {metrics}");
+    assert!(
+        !counters
+            .iter()
+            .any(|line| line.contains("thread") || line.contains("account"))
+    );
+}
+
+#[tokio::test]
+async fn recovered_advised_retries_do_not_count_as_lane_stops() {
+    let h = harness(vec![
+        Scripted::Status(429, vec![], RATE_429.into()),
+        Scripted::Sse(vec![OVERLOADED.into()]),
+        Scripted::Sse(vec![CREATED.into(), DELTA.into(), COMPLETED.into()]),
+    ])
+    .await;
+    assert!(retry_after(&h.post("recovers").await).is_some());
+    assert!(
+        h.post("recovers")
+            .await
+            .text()
+            .await
+            .unwrap()
+            .contains("retry-after")
+    );
+    let _ = h.post("recovers").await.bytes().await.unwrap();
+    let metrics = h.metrics().await;
+    for reason in [
+        "rate_limited",
+        "capacity",
+        "login_required",
+        "token_refused",
+    ] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_relay_lane_stops_total{{reason=\"{reason}\"}} 0\n"
+            )),
+            "{metrics}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn native_stream_retry_codes_do_not_prove_a_terminal_account_stop() {
+    let rate = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n";
+    let auth = "event: error\ndata: {\"type\":\"error\",\"code\":\"invalid_token\"}\n\n";
+    let h = harness(vec![
+        Scripted::Sse(vec![rate.into()]),
+        Scripted::Sse(vec![auth.into()]),
+    ])
+    .await;
+    assert_eq!(
+        h.post("native-rate-retry").await.text().await.unwrap(),
+        rate
+    );
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("codexctl_relay_lane_stops_total{reason=\"rate_limited\"} 0\n"),
+        "{metrics}"
+    );
+    assert_eq!(h.post("native-auth-stop").await.text().await.unwrap(), auth);
+    assert!(
+        h.metrics()
+            .await
+            .contains("codexctl_relay_lane_stops_total{reason=\"token_refused\"} 1\n")
+    );
+}
+
+#[tokio::test]
+async fn native_http_server_retries_do_not_count_as_capacity_lane_stops() {
+    let overloaded = r#"{"error":{"code":"server_is_overloaded"}}"#;
+    let h = harness(vec![
+        Scripted::Status(503, vec![], overloaded.into()),
+        Scripted::Status(500, vec![], overloaded.into()),
+        Scripted::Sse(vec![COMPLETED.into()]),
+    ])
+    .await;
+    for status in [503, 500] {
+        let response = h.post("client-retries-5xx").await;
+        assert_eq!(response.status(), status);
+        assert_eq!(response.text().await.unwrap(), overloaded);
+    }
+    let _ = h.post("client-retries-5xx").await.bytes().await.unwrap();
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("codexctl_relay_lane_stops_total{reason=\"capacity\"} 0\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
+async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
+    let (events, mut received) = mpsc::channel(4);
+    let app = Router::new()
+        .route("/v1/relay/capacity-events", post(central_capacity_event))
+        .with_state(CentralSink { events });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let central_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let failure = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"token_refused\"}}}\n\n";
+    let evidence = tempfile::tempdir().unwrap();
+    let h = harness_with(
+        vec![Scripted::Sse(vec![failure.into(), failure.into()])],
+        |config| {
+            config
+                .with_evidence_dir(evidence.path())
+                .with_central_reporter(&central_url, "synthetic-machine-token")
+                .unwrap()
+        },
+    )
+    .await;
+    assert_eq!(
+        h.post("private-thread").await.text().await.unwrap(),
+        failure.repeat(2)
+    );
+    let (headers, body) = tokio::time::timeout(Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(headers["authorization"], "Bearer synthetic-machine-token");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"lane_stop":"token_refused"})
+    );
+    h.shutdown().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), received.recv())
+            .await
+            .is_err()
+    );
+    // Read the persisted public CLI report after the writer drains.
+    let home = tempfile::tempdir().unwrap();
+    let destination = home.path().join(".codexctl/relay/evidence");
+    std::fs::create_dir_all(&destination).unwrap();
+    for entry in std::fs::read_dir(evidence.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            std::fs::copy(&path, destination.join(path.file_name().unwrap())).unwrap();
+        }
+    }
+    let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["relay", "evidence", "--json"])
+        .env("HOME", home.path())
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(rows[0]["lane_stops"]["token_refused"], 1);
+    assert_eq!(rows[0]["requests"], 1);
+    assert_eq!(
+        rows[0]["other_failures"], 1,
+        "the outcome observation must not double the provider failure count"
+    );
+    assert!(
+        rows[0]["utc_hour"]
+            .as_str()
+            .unwrap()
+            .starts_with(&chrono::Utc::now().date_naive().to_string())
+    );
+}
+
 enum Scripted {
     Status(u16, Vec<(&'static str, String)>, String),
     Sse(Vec<String>),
@@ -296,7 +517,7 @@ async fn central_rate_limit_has_its_own_drop_reason() {
     let metrics = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             let metrics = h.metrics().await;
-            if metrics.contains("codexctl_relay_central_dropped_total{reason=\"rate_limited\"} 1") {
+            if metrics.contains("codexctl_relay_central_dropped_total{reason=\"rate_limited\"} 2") {
                 break metrics;
             }
             tokio::task::yield_now().await;
@@ -809,17 +1030,10 @@ async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
         assert_eq!(retry_after(&response).is_some(), advised);
         response.text().await.unwrap();
     }
-    let path = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if std::fs::read_to_string(&path).is_ok_and(|text| text.lines().count() == 6) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 2);
+    assert_eq!(metric(&metrics, "outcome=\"terminal_passthrough\""), 1);
+    h.shutdown().await;
     let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .args(["relay", "evidence", "--json"])
         .env("HOME", home.path())
@@ -833,13 +1047,10 @@ async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
         String::from_utf8_lossy(&report.stderr)
     );
     let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(rows[0]["requests"], 3);
     assert_eq!(rows[0]["rate_429"], 2);
     assert_eq!(rows[0]["other_failures"], 1);
-    assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 2);
-    assert_eq!(
-        metric(&h.metrics().await, "outcome=\"terminal_passthrough\""),
-        1
-    );
+    assert_eq!(rows[0]["lane_stops"]["rate_limited"], 1);
 }
 
 #[tokio::test]
@@ -1188,13 +1399,57 @@ async fn stream_failure_logs_are_rate_limited() {
         assert_eq!(h.post(&format!("limited-{index}")).await.status(), 200);
     }
     let logs = h.logs.lock().unwrap();
-    let stream_lines: Vec<Value> = logs
+    let failure_lines: Vec<Value> = logs
         .iter()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|line| line["outcome"] == "stream_failure")
+        .filter(|line| line["outcome"] == "stream_failure" || line["outcome"] == "lane_stop")
         .collect();
-    assert_eq!(stream_lines.len(), 30);
-    assert!(stream_lines.iter().all(|line| line["suppressed"].is_null()));
+    assert_eq!(failure_lines.len(), 30);
+    assert!(
+        failure_lines
+            .iter()
+            .all(|line| line["suppressed"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn terminal_auth_stop_logs_share_the_failure_limit_without_losing_counts() {
+    let login = r#"{"error":{"code":"login_required"}}"#;
+    let token = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_token\"}}}\n\n";
+    let script = (0..20)
+        .map(|_| Scripted::Status(401, vec![], login.into()))
+        .chain((0..20).map(|_| Scripted::Sse(vec![token.into()])))
+        .collect();
+    let h = harness(script).await;
+    for index in 0..40 {
+        let response = h.post(&format!("auth-limit-{index}")).await;
+        assert_eq!(response.status(), if index < 20 { 401 } else { 200 });
+        assert_eq!(
+            response.text().await.unwrap(),
+            if index < 20 { login } else { token }
+        );
+    }
+    let metrics = h.metrics().await;
+    for reason in ["login_required", "token_refused"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_relay_lane_stops_total{{reason=\"{reason}\"}} 20\n"
+            )),
+            "{metrics}"
+        );
+    }
+    let logs = h.logs.lock().unwrap();
+    let failures: Vec<Value> = logs
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["outcome"] == "stream_failure" || line["outcome"] == "lane_stop")
+        .collect();
+    assert_eq!(
+        failures.len(),
+        30,
+        "terminal and stream logs share one limit"
+    );
+    assert!(failures.iter().any(|line| line["outcome"] == "lane_stop"));
 }
 
 #[tokio::test]

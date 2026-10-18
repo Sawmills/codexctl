@@ -46,6 +46,7 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
+use crate::outcomes::{Outcomes, RequestOutcome, StopReport};
 use policy::{Advice, Http429, Kind, Streaks};
 
 /// The only remote upstream the relay forwards to.
@@ -211,7 +212,7 @@ impl CentralReporter {
         })
     }
 
-    async fn send(&self, event: &CapacityEvent) -> std::result::Result<(), CentralSendFailure> {
+    async fn send(&self, event: &CentralEvent) -> std::result::Result<(), CentralSendFailure> {
         let response = tokio::time::timeout(
             CENTRAL_EVENT_SEND_TIMEOUT,
             self.client
@@ -241,6 +242,13 @@ struct CapacityEvent {
     outcome: String,
 }
 
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CentralEvent {
+    Capacity(CapacityEvent),
+    Stop(StopReport),
+}
+
 #[derive(Clone)]
 struct Relay {
     upstream: Arc<str>,
@@ -251,9 +259,10 @@ struct Relay {
     open_streams: Arc<AtomicU64>,
     stream_log: Arc<Mutex<StreamFailureLogState>>,
     log: Log,
-    central_events: Option<mpsc::Sender<CapacityEvent>>,
+    central_events: Option<mpsc::Sender<CentralEvent>>,
     central_dropped: Arc<Mutex<BTreeMap<&'static str, u64>>>,
     evidence: evidence::Evidence,
+    outcomes: Outcomes,
 }
 
 struct OpenStream(Arc<AtomicU64>);
@@ -360,6 +369,7 @@ pub async fn serve(
         central_events,
         central_dropped,
         evidence,
+        outcomes: Outcomes::with_report_root(config.identity_root.clone()),
     };
     let suppression_relay = relay.clone();
     let suppression_task = tokio::spawn(async move {
@@ -549,6 +559,50 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
 }
 
 impl Relay {
+    fn lane_stop(
+        &self,
+        report: StopReport,
+        labels: &Labels,
+        request_id: Option<&str>,
+        status: u16,
+    ) {
+        self.evidence.observe(evidence::Metadata {
+            status,
+            retry_headers: BTreeMap::new(),
+            model: &labels.model,
+            account_alias: labels.account_alias.as_deref(),
+            account_class: labels.account_class,
+            request_id,
+            observation: evidence::Observation::LaneStop(report.lane_stop),
+        });
+        self.log_stream_failure(json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "component": "codexctl-relay",
+            "outcome": "lane_stop",
+            "reason": report.lane_stop,
+            "request_id": request_id,
+            "account_alias": labels.account_alias,
+        }));
+        self.send_central(CentralEvent::Stop(report));
+    }
+
+    fn send_central(&self, report: CentralEvent) {
+        let reason = match &self.central_events {
+            Some(sender) => match sender.try_send(report) {
+                Ok(()) => return,
+                Err(TrySendError::Full(_)) => "queue_full",
+                Err(TrySendError::Closed(_)) => "connection_closed",
+            },
+            None => "no_connection",
+        };
+        *self
+            .central_dropped
+            .lock()
+            .expect("central drop metric lock")
+            .entry(reason)
+            .or_default() += 1;
+    }
+
     async fn http_error(
         &self,
         upstream: reqwest::Response,
@@ -591,6 +645,13 @@ impl Relay {
             }
         }
         let trace = StreamTrace::new(headers_at);
+        if let Some(report) = self.outcomes.request().terminal(
+            status.as_u16(),
+            error.as_ref().and_then(evidence_error_code),
+            false,
+        ) {
+            self.lane_stop(report, &labels, request_id.as_deref(), status.as_u16());
+        }
         self.stream_failure(
             &trace,
             &labels,
@@ -764,6 +825,7 @@ impl Relay {
                 rate_429: Some(class == Http429::Rate),
             },
         });
+        let mut retrying = false;
         match class {
             Http429::Terminal => {
                 // Codex stops on this; the next request is a resume.
@@ -786,6 +848,7 @@ impl Relay {
                     .and_then(|value| value.trim().parse::<u64>().ok());
                 match self.failure(Kind::Rate429, &labels, request_id.as_deref(), upstream_secs) {
                     Some(secs) => {
+                        retrying = true;
                         headers.insert("retry-after", HeaderValue::from(secs));
                     }
                     None => {
@@ -793,6 +856,13 @@ impl Relay {
                     }
                 }
             }
+        }
+        if let Some(report) = self.outcomes.request().terminal(
+            429,
+            body.as_ref().and_then(evidence_error_code),
+            retrying,
+        ) {
+            self.lane_stop(report, &labels, request_id.as_deref(), 429);
         }
         let mut response = Response::builder().status(StatusCode::TOO_MANY_REQUESTS);
         *response.headers_mut().expect("fresh builder") = headers;
@@ -876,30 +946,7 @@ impl Relay {
                 account_class: labels.account_class.into(),
                 outcome: outcome.into(),
             };
-            match &self.central_events {
-                Some(sender) => {
-                    if let Err(error) = sender.try_send(report) {
-                        let reason = match error {
-                            TrySendError::Full(_) => "queue_full",
-                            TrySendError::Closed(_) => "connection_closed",
-                        };
-                        *self
-                            .central_dropped
-                            .lock()
-                            .expect("central drop metric lock")
-                            .entry(reason)
-                            .or_default() += 1;
-                    }
-                }
-                None => {
-                    *self
-                        .central_dropped
-                        .lock()
-                        .expect("central drop metric lock")
-                        .entry("no_connection")
-                        .or_default() += 1;
-                }
-            }
+            self.send_central(CentralEvent::Capacity(report));
         }
         let line = json!({
             "ts": chrono::Utc::now().to_rfc3339(),
@@ -1001,6 +1048,7 @@ impl StreamTrace {
 /// The relay never replays a request; Codex owns retry and prior output.
 struct FrameRewriter {
     relay: Relay,
+    outcome: RequestOutcome,
     labels: Labels,
     request_id: Option<String>,
     headers: HeaderMap,
@@ -1209,6 +1257,7 @@ impl FrameRewriter {
         http_status: u16,
     ) -> Self {
         Self {
+            outcome: relay.outcomes.request(),
             relay,
             labels,
             request_id,
@@ -1492,6 +1541,18 @@ impl FrameRewriter {
             };
         }
         let failure_kind = failure_kind(&kind, event.as_ref());
+        if let Some(report) = self.outcome.terminal(
+            self.http_status,
+            event.as_ref().and_then(evidence_error_code),
+            advised,
+        ) {
+            self.relay.lane_stop(
+                report,
+                &self.labels,
+                self.request_id.as_deref(),
+                self.http_status,
+            );
+        }
         if !self.trace.failure_recorded {
             self.trace.failure_recorded = true;
             self.relay.stream_failure(
@@ -2136,6 +2197,7 @@ fn evidence_error_code(event: &Value) -> Option<&str> {
         .pointer("/response/error/code")
         .or_else(|| event.pointer("/error/code"))
         .or_else(|| event.pointer("/error/type"))
+        .or_else(|| event.get("code"))
         .and_then(Value::as_str)
 }
 
@@ -2179,6 +2241,7 @@ async fn metrics(State(relay): State<Relay>) -> Response {
         ));
     }
     out.push_str(&relay.evidence.metrics());
+    out.push_str(&relay.outcomes.metrics("codexctl_relay"));
     out.push_str(&format!(
         "# TYPE codexctl_relay_open_streams gauge\ncodexctl_relay_open_streams {}\n",
         relay.open_streams.load(Ordering::Relaxed),
@@ -2242,6 +2305,7 @@ mod tests {
             central_events: Some(sender),
             central_dropped: dropped.clone(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         let labels = Labels {
             thread: "thread".into(),
@@ -2289,6 +2353,7 @@ mod tests {
             central_events: None,
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         relay
             .stream_log
@@ -2319,6 +2384,7 @@ mod tests {
             central_events: None,
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         let labels = Labels {
             thread: "thread".into(),
