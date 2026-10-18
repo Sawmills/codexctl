@@ -33,7 +33,8 @@ jobs:
             arch: amd64
           - runner: ubuntu-24.04-arm
             arch: arm64
-    runs-on: ${{ matrix.runner }}
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: ${{ fromJSON('{"ubuntu-24.04":"namespace-profile-sawmills-runner","ubuntu-24.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.runner] || matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -69,7 +70,8 @@ jobs:
 
   manifest:
     needs: build
-    runs-on: ubuntu-24.04
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     permissions:
       contents: read
       id-token: write
@@ -94,8 +96,11 @@ jobs:
           [[ "$arm64" =~ ^sha256:[a-f0-9]{64}$ ]]
           docker buildx imagetools create --tag "$IMAGE:sha-$GITHUB_SHA" \
             "$IMAGE@$amd64" "$IMAGE@$arm64"
-          digest="$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{.Manifest.Digest}}')"
-          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          digest="$(docker buildx imagetools inspect "$IMAGE:sha-$GITHUB_SHA" --format '{{json .Manifest}}' | jq -r .digest)"
+          if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            printf '::error::Invalid central image digest: %q\n' "$digest" >&2
+            exit 1
+          fi
           printf 'Deploy after review: `%s@%s`\n' "$IMAGE" "$digest" >> "$GITHUB_STEP_SUMMARY"
           printf '%s@%s\n' "$IMAGE" "$digest" > central-image.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
