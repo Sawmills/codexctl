@@ -50,6 +50,7 @@ pub fn run(
         #[cfg(not(feature = "central-prototype"))]
         bail!("server account launch for {alias} requires central support");
     }
+    HerdrAgentReporter::prepare_private_pty()?;
     #[cfg(feature = "central-prototype")]
     let selected_central_launch = if service_mode
         || (codexctl::central::native::central_active()?
@@ -467,6 +468,26 @@ impl HerdrAgentReporter {
     const SOURCE: &'static str = "codexctl";
     const CODEX_SESSION_SOURCE: &'static str = "herdr:codex";
     const AGENT: &'static str = "codex";
+
+    fn prepare_private_pty() -> Result<()> {
+        #[cfg(unix)]
+        if Self::from_env().is_some()
+            && std::env::var_os("HERDR_AGENT").as_deref() != Some(std::ffi::OsStr::new(Self::AGENT))
+        {
+            use std::os::unix::process::CommandExt;
+
+            // HerdR reads the foreground process's initial environment. Setting
+            // the hint only on the private-PTY child leaves the wrapper invisible.
+            let error = std::process::Command::new(
+                std::env::current_exe().context("locate codexctl for HerdR agent detection")?,
+            )
+            .args(std::env::args_os().skip(1))
+            .env("HERDR_AGENT", Self::AGENT)
+            .exec();
+            return Err(error).context("restart codexctl with the HerdR agent hint");
+        }
+        Ok(())
+    }
 
     fn from_env() -> Option<Self> {
         if std::env::var_os("HERDR_ENV").as_deref() != Some(std::ffi::OsStr::new("1")) {
