@@ -13449,6 +13449,11 @@ fn explicit_pinned_completion_survives_a_later_turn_success() {
 }
 
 #[test]
+fn explicit_pinned_missing_native_state_is_visible_without_changing_launch_status() {
+    pinned_capacity_receipt("missingstate");
+}
+
+#[test]
 #[ignore = "manual installed Codex protocol proof; set SAW13482_REAL_CODEX to the native binary"]
 fn explicit_pinned_real_native_capacity_completion() {
     assert!(std::env::var_os("SAW13482_REAL_CODEX").is_some());
@@ -13589,6 +13594,8 @@ with sqlite3.connect(native / 'state_5.sqlite') as db:
     db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)')
     db.execute('INSERT INTO threads VALUES (?, ?)', (thread,str(rollout)))
 rollout.write_text('')
+if os.environ['PRESENTATION'] == 'missingstate':
+    (native / 'state_5.sqlite').rename(native / 'state_6.sqlite')
 print('SYNTHETIC-STDERR-WARNING', file=sys.stderr, flush=True)
 if os.environ['PRESENTATION'] == 'json':
     print('{"type":"thread.started","thread_id":"11111111-2222-4333-8444-555555555555"}', flush=True)
@@ -13687,7 +13694,11 @@ sys.exit(17)
         assert!(String::from_utf8_lossy(&launched.stderr).contains("SYNTHETIC-STDERR-WARNING"));
     }
     assert!(!String::from_utf8_lossy(&launched.stdout).contains("SYNTHETIC-STDERR-WARNING"));
-    let expected = if presentation == "historical" { 0 } else { 1 };
+    let expected = if matches!(presentation, "historical" | "missingstate") {
+        0
+    } else {
+        1
+    };
     let metrics = server
         .http
         .get(format!("http://{}/metrics", relay.address))
@@ -13701,6 +13712,18 @@ sys.exit(17)
         )),
         "{metrics}"
     );
+    if presentation == "missingstate" {
+        assert!(
+            metrics.contains("codexctl_relay_capacity_confirm_unavailable_total 1\n"),
+            "{metrics}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&launched.stderr)
+                .matches("reason=native_state_unavailable")
+                .count(),
+            1
+        );
+    }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
         let metrics = server

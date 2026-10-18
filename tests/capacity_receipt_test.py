@@ -25,6 +25,8 @@ for _ in range(settings["attempts"]):
         urllib.request.urlopen(request).read()
     except urllib.error.HTTPError as error:
         error.read()
+if settings.get("unrelated_success"):
+    urllib.request.urlopen(urllib.request.Request(settings["url"], data=b'{}', headers={"thread-id":settings["thread"]})).read()
 if settings["recover"]:
     print(json.dumps({"type":"item.completed", "item":{"type":"agent_message","text":settings["message"]}}), flush=True)
     print('{"type":"turn.completed"}', flush=True)
@@ -41,16 +43,16 @@ sys.exit(0 if settings["recover"] else 1)
 
 
 class CapacityReceiptTest(unittest.TestCase):
-    def scenario(self, recover=False, streamed=False, quoted=False, code="server_is_overloaded"):
+    def scenario(self, recover=False, streamed=False, quoted=False, code="server_is_overloaded", unrelated_success=False, stream_after_http=False):
         calls = []
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("content-length", 0)))
                 calls.append(self.path)
-                success = recover and len(calls) > 1
+                success = (recover and len(calls) > 1) or (unrelated_success and len(calls) > 3)
                 body = {"error": {"code": code, "message": MESSAGE}}
-                if streamed or success:
+                if (streamed and (not stream_after_http or len(calls) > 1)) or success:
                     body = ("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\"}}\n\n" if success else
                             "event: response.failed\ndata: " + json.dumps({"type": "response.failed", "response": body}) + "\n\n").encode()
                     self.send_response(200)
@@ -90,14 +92,14 @@ class CapacityReceiptTest(unittest.TestCase):
                     except OSError:
                         time.sleep(.02)
                 (home / ".codexctl" / "relay.json").write_text(json.dumps({"listen": address}))
-                attempts = 2 if recover else 1 if streamed else 3
-                (home / "fixture.json").write_text(json.dumps({"url": f"http://{address}/backend-api/codex/responses", "thread": THREAD, "message": MESSAGE, "recover": recover, "attempts": attempts, "quoted": quoted}))
+                attempts = 2 if recover or stream_after_http else 1 if streamed else 3
+                (home / "fixture.json").write_text(json.dumps({"url": f"http://{address}/backend-api/codex/responses", "thread": THREAD, "message": MESSAGE, "recover": recover, "attempts": attempts, "quoted": quoted, "unrelated_success": unrelated_success}))
                 result = subprocess.run([binary, "codex", "exec", "--json", "say hi"], env=environment, cwd=home, stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, 0 if recover else 1, (result.stdout, result.stderr))
                 metrics = urllib.request.urlopen(f"http://{address}/metrics", timeout=2).read().decode()
                 expected = 0 if recover or quoted or code != "server_is_overloaded" else 1
                 self.assertIn(f'codexctl_relay_lane_stops_total{{reason="capacity"}} {expected}\n', metrics)
-                self.assertEqual(len(calls), attempts)
+                self.assertEqual(len(calls), attempts + int(unrelated_success))
                 for body, headers, expected_status in [
                     (b'{"thread_id":"' + THREAD.encode() + b'"}', {}, 401),
                     (b'{}', {"x-codexctl-receipt": "invalid"}, 401),
@@ -115,11 +117,17 @@ class CapacityReceiptTest(unittest.TestCase):
     def test_exhausted_http_capacity_is_counted_once_after_client_confirmation(self):
         self.scenario()
 
+    def test_unrelated_same_thread_success_without_turn_metadata_cannot_erase_a_stop(self):
+        self.scenario(unrelated_success=True)
+
     def test_recovered_http_capacity_is_not_a_stop_even_if_assistant_quotes_it(self):
         self.scenario(recover=True)
 
     def test_streamed_capacity_already_counted_by_relay_is_not_counted_twice(self):
         self.scenario(streamed=True)
+
+    def test_http_retry_followed_by_counted_stream_capacity_is_not_counted_twice(self):
+        self.scenario(streamed=True, stream_after_http=True)
 
     def test_marked_capacity_in_assistant_json_is_not_confirmation(self):
         self.scenario(quoted=True)

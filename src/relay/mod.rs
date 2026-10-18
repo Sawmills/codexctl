@@ -611,6 +611,14 @@ impl Relay {
         request_id: Option<&str>,
         status: u16,
     ) {
+        // An already-counted terminal capacity response needs no second
+        // confirmation, including HTTP retries without native turn metadata.
+        if report.lane_stop == crate::outcomes::StopReason::Capacity {
+            self.terminal
+                .lock()
+                .expect("terminal receipt lock")
+                .counted(labels);
+        }
         self.evidence.observe(evidence::Metadata {
             status,
             retry_headers: BTreeMap::new(),
@@ -2296,6 +2304,13 @@ async fn metrics(State(relay): State<Relay>) -> Response {
     }
     out.push_str(&relay.evidence.metrics());
     out.push_str(&relay.outcomes.metrics("codexctl_relay"));
+    out.push_str(
+        &relay
+            .terminal
+            .lock()
+            .expect("terminal receipt lock")
+            .metrics(),
+    );
     out.push_str(&format!(
         "# TYPE codexctl_relay_open_streams gauge\ncodexctl_relay_open_streams {}\n",
         relay.open_streams.load(Ordering::Relaxed),

@@ -1,5 +1,6 @@
 //! TUI confirmation uses the native completion record, independent of screen size/redraws.
 use std::{
+    collections::BTreeSet,
     io::{Read, Seek, SeekFrom},
     net::SocketAddr,
     os::unix::fs::OpenOptionsExt,
@@ -11,7 +12,7 @@ use std::{
     time::Duration,
 };
 
-use super::{MAX_LINE, MESSAGE, Receipt, Turn, identity, valid_id};
+use super::{Action, MAX_LINE, MESSAGE, Receipt, Turn, identity, valid_id};
 use anyhow::{Context, Result};
 
 pub(super) struct Watch {
@@ -54,31 +55,41 @@ impl Watch {
                         .error_for_status()?)
                 };
                 let mut warned = false;
+                let mut state_warned: BTreeSet<(String, String)> = BTreeSet::new();
                 loop {
                     let closing = done.load(Ordering::SeqCst);
-                    let poll = || -> Result<()> {
+                    let mut poll = || -> Result<()> {
                         let response = send(&Receipt {
                             thread_id: None,
                             turn_id: None,
                             launch_id: Some(launch.clone()),
-                            inspect: true,
+                            action: Action::Inspect,
                         })?;
                         let mut bytes = Vec::new();
                         response.take(4097).read_to_end(&mut bytes)?;
                         anyhow::ensure!(bytes.len() <= 4096, "pending receipt response too large");
                         let turns: Vec<Turn> = serde_json::from_slice(&bytes)?;
+                        state_warned.retain(|(thread, id)| turns.iter().any(|turn| thread == &turn.thread_id && id == &turn.turn_id));
                         for turn in turns.into_iter().take(8) {
                             if !valid_id(&turn.thread_id) || !valid_id(&turn.turn_id) {
                                 continue;
                             }
-                            if completed_capacity(&home, &turn)? {
+                            let action = match completed_capacity(&home, &turn) {
+                                Ok(true) => Action::Confirm,
+                                Ok(false) => continue,
+                                Err(_) => {
+                                    if state_warned.insert((turn.thread_id.clone(), turn.turn_id.clone())) {
+                                        eprintln!("terminal_capacity_report_failed reason=native_state_unavailable");
+                                    }
+                                    Action::NativeStateUnavailable
+                                }
+                            };
                                 send(&Receipt {
                                     thread_id: Some(turn.thread_id),
                                     turn_id: Some(turn.turn_id),
                                     launch_id: Some(launch.clone()),
-                                    inspect: false,
+                                    action,
                                 })?;
-                            }
                         }
                         Ok(())
                     };
@@ -151,12 +162,20 @@ fn completed_capacity(home: &Path, turn: &Turn) -> Result<bool> {
             continue;
         }
         let payload = &event["payload"];
-        if payload["type"] == "task_complete"
-            && payload["turn_id"] == turn.turn_id
-            && payload["error"]["codex_error_info"] == "server_overloaded"
-            && payload["error"]["message"] == MESSAGE
-        {
-            return Ok(true);
+        if payload["type"] == "task_complete" {
+            let id = payload["turn_id"]
+                .as_str()
+                .context("native completion schema has no turn id")?;
+            if id == turn.turn_id && !payload["error"].is_null() {
+                let error = &payload["error"];
+                let message = error["message"]
+                    .as_str()
+                    .context("native completion schema has no message")?;
+                let code = error
+                    .get("codex_error_info")
+                    .context("native completion schema has no error class")?;
+                return Ok(code == "server_overloaded" && message == MESSAGE);
+            }
         }
     }
     Ok(false)

@@ -23,6 +23,16 @@ const MAX_LINE: usize = 64 * 1024;
 const TTL: Duration = Duration::from_secs(600);
 mod completion;
 
+#[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    #[default]
+    Confirm,
+    Inspect,
+    Recovered,
+    NativeStateUnavailable,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
@@ -30,7 +40,7 @@ struct Receipt {
     launch_id: Option<String>,
     turn_id: Option<String>,
     #[serde(default)]
-    inspect: bool,
+    action: Action,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -59,19 +69,40 @@ struct Failure {
     request_id: Option<String>,
     status: u16,
     observed: Instant,
+    unavailable_reported: bool,
 }
 
 #[derive(Default)]
-pub(super) struct Pending(BTreeMap<String, Failure>);
+pub(super) struct Pending {
+    failures: BTreeMap<String, Failure>,
+    unavailable: u64,
+}
 
 impl Pending {
+    pub(super) fn counted(&mut self, labels: &Labels) {
+        if labels.terminal_request
+            && let Some(key) = key(
+                Some(&labels.thread),
+                labels.launch_id.as_deref(),
+                labels.turn_id.as_deref(),
+            )
+        {
+            self.failures.remove(&key);
+        }
+    }
+
     pub(super) fn clear(&mut self, labels: &Labels) {
+        // Without a turn id, a response cannot prove which turn recovered.
+        // The wrapper's native turn.completed event clears that unknown entry.
+        if labels.turn_id.is_none() {
+            return;
+        }
         if let Some(key) = key(
             Some(&labels.thread),
             labels.launch_id.as_deref(),
             labels.turn_id.as_deref(),
         ) {
-            self.0.remove(&key);
+            self.failures.remove(&key);
         }
     }
 
@@ -85,13 +116,9 @@ impl Pending {
         if !labels.terminal_request {
             return;
         }
-        self.clear(labels);
-        self.0.retain(|_, f| f.observed.elapsed() < TTL);
+        self.failures.retain(|_, f| f.observed.elapsed() < TTL);
         if !(500..600).contains(&status) || code != Some("server_is_overloaded") {
-            return;
-        }
-        if self.0.len() >= MAX_PENDING {
-            eprintln!("terminal_capacity_tracking_failed reason=pending_limit");
+            self.clear(labels);
             return;
         }
         if let Some(key) = key(
@@ -99,16 +126,32 @@ impl Pending {
             labels.launch_id.as_deref(),
             labels.turn_id.as_deref(),
         ) {
-            self.0.insert(
+            if self.failures.len() >= MAX_PENDING && !self.failures.contains_key(&key) {
+                eprintln!("terminal_capacity_tracking_failed reason=pending_limit");
+                return;
+            }
+            let unavailable_reported = self
+                .failures
+                .get(&key)
+                .is_some_and(|f| f.unavailable_reported);
+            self.failures.insert(
                 key,
                 Failure {
                     labels: labels.clone(),
                     request_id: request_id.map(str::to_owned),
                     status,
                     observed: Instant::now(),
+                    unavailable_reported,
                 },
             );
         }
+    }
+
+    pub(super) fn metrics(&self) -> String {
+        format!(
+            "# TYPE codexctl_relay_capacity_confirm_unavailable_total counter\ncodexctl_relay_capacity_confirm_unavailable_total {}\n",
+            self.unavailable
+        )
     }
 }
 
@@ -129,12 +172,12 @@ pub(super) fn accept(
         return StatusCode::BAD_REQUEST.into_response();
     };
     let mut pending = relay.terminal.lock().expect("terminal receipt lock");
-    if receipt.inspect {
+    if receipt.action == Action::Inspect {
         let Some(launch) = receipt.launch_id.as_deref().filter(|v| valid_id(v)) else {
             return StatusCode::BAD_REQUEST.into_response();
         };
         let turns: Vec<_> = pending
-            .0
+            .failures
             .values()
             .filter(|f| f.observed.elapsed() < TTL && f.labels.launch_id.as_deref() == Some(launch))
             .filter_map(|f| {
@@ -154,9 +197,32 @@ pub(super) fn accept(
     ) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    if receipt.action == Action::Recovered {
+        if receipt.turn_id.is_none() {
+            pending.failures.remove(&key);
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    if receipt.action == Action::NativeStateUnavailable {
+        if receipt.turn_id.is_none() || receipt.launch_id.is_none() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        if let Some(failure) = pending.failures.get_mut(&key)
+            && failure.observed.elapsed() < TTL
+            && !failure.unavailable_reported
+        {
+            failure.unavailable_reported = true;
+            pending.unavailable = pending.unavailable.saturating_add(1);
+            drop(pending);
+            (relay.log)(
+                "{\"component\":\"codexctl-relay\",\"level\":\"warning\",\"reason\":\"native_state_unavailable\"}",
+            );
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if receipt.turn_id.is_none() {
         let matching: Vec<_> = pending
-            .0
+            .failures
             .iter()
             .filter(|(_, f)| {
                 Some(f.labels.thread.as_str()) == receipt.thread_id.as_deref()
@@ -174,13 +240,13 @@ pub(super) fn accept(
     }
     if receipt.turn_id.is_some()
         && pending
-            .0
+            .failures
             .get(&key)
             .is_some_and(|f| f.labels.turn_id != receipt.turn_id)
     {
         return StatusCode::NO_CONTENT.into_response();
     }
-    let failure = pending.0.remove(&key);
+    let failure = pending.failures.remove(&key);
     drop(pending);
     if let Some(failure) = failure.filter(|f| f.observed.elapsed() < TTL) {
         let report = StopReport {
@@ -274,8 +340,9 @@ impl TerminalObserver {
                                 if value.pointer("/error/message").and_then(|v| v.as_str())
                                     == Some(MESSAGE) =>
                             {
-                                self.confirm()
+                                self.report(Action::Confirm)
                             }
+                            Some("turn.completed") => self.report(Action::Recovered),
                             _ => {}
                         }
                     }
@@ -293,7 +360,7 @@ impl TerminalObserver {
         }
     }
 
-    fn confirm(&mut self) {
+    fn report(&mut self, action: Action) {
         if self.reported {
             return;
         }
@@ -309,7 +376,7 @@ impl TerminalObserver {
                 thread_id: self.thread.clone(),
                 launch_id: self.launch.clone(),
                 turn_id: None,
-                inspect: false,
+                action,
             })?;
             let signature = identity::receipt_signature(root, *listen, &body)?;
             let response = reqwest::blocking::Client::builder()
