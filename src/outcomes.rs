@@ -201,12 +201,14 @@ pub(crate) struct SelectionReport {
     pub(crate) billed_selection: SelectionPath,
 }
 
+type StopLog = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub(crate) struct Outcomes {
     stops: Arc<[AtomicU64; 4]>,
     billed: Arc<[AtomicU64; 2]>,
     report_root: Option<Arc<PathBuf>>,
-    stop_log: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    stop_log: Option<StopLog>,
 }
 
 impl Outcomes {
