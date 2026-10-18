@@ -1030,17 +1030,10 @@ async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
         assert_eq!(retry_after(&response).is_some(), advised);
         response.text().await.unwrap();
     }
-    let path = directory.join(format!("{}.jsonl", chrono::Utc::now().date_naive()));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if std::fs::read_to_string(&path).is_ok_and(|text| text.lines().count() == 6) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    let metrics = h.metrics().await;
+    assert_eq!(metric(&metrics, "outcome=\"advised\""), 2);
+    assert_eq!(metric(&metrics, "outcome=\"terminal_passthrough\""), 1);
+    h.shutdown().await;
     let report = std::process::Command::new(env!("CARGO_BIN_EXE_codexctl"))
         .args(["relay", "evidence", "--json"])
         .env("HOME", home.path())
@@ -1054,13 +1047,10 @@ async fn evidence_counts_the_relays_429_classification_without_an_error_code() {
         String::from_utf8_lossy(&report.stderr)
     );
     let rows: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(rows[0]["requests"], 3);
     assert_eq!(rows[0]["rate_429"], 2);
     assert_eq!(rows[0]["other_failures"], 1);
-    assert_eq!(metric(&h.metrics().await, "outcome=\"advised\""), 2);
-    assert_eq!(
-        metric(&h.metrics().await, "outcome=\"terminal_passthrough\""),
-        1
-    );
+    assert_eq!(rows[0]["lane_stops"]["rate_limited"], 1);
 }
 
 #[tokio::test]
