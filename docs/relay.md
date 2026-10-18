@@ -227,8 +227,9 @@ elapsed times, model and account class, and upstream `cf-ray` and
 `x-oai-request-id` headers. Failure messages are reduced to their character length and
 one of the bounded classes `capacity`, `rate_limit`, or `other`; their text and
 parameters are never logged. Output text, deltas, request bodies, authorization, and
-cookies are never included. The process emits at most 30 failure lines per minute and
-then one suppression summary.
+cookies are never included. Stream-failure and terminal-stop logs share a limit of
+30 lines per minute, followed by one suppression summary. Suppression does not
+change outcome counters, retained evidence, or central reports.
 
 The account server also accepts a typed terminal-outcome report through this same
 authenticated endpoint. It has one field, `lane_stop`, with one of four reasons:

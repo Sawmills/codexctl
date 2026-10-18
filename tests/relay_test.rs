@@ -1409,13 +1409,57 @@ async fn stream_failure_logs_are_rate_limited() {
         assert_eq!(h.post(&format!("limited-{index}")).await.status(), 200);
     }
     let logs = h.logs.lock().unwrap();
-    let stream_lines: Vec<Value> = logs
+    let failure_lines: Vec<Value> = logs
         .iter()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|line| line["outcome"] == "stream_failure")
+        .filter(|line| line["outcome"] == "stream_failure" || line["outcome"] == "lane_stop")
         .collect();
-    assert_eq!(stream_lines.len(), 30);
-    assert!(stream_lines.iter().all(|line| line["suppressed"].is_null()));
+    assert_eq!(failure_lines.len(), 30);
+    assert!(
+        failure_lines
+            .iter()
+            .all(|line| line["suppressed"].is_null())
+    );
+}
+
+#[tokio::test]
+async fn terminal_auth_stop_logs_share_the_failure_limit_without_losing_counts() {
+    let login = r#"{"error":{"code":"login_required"}}"#;
+    let token = "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_token\"}}}\n\n";
+    let script = (0..20)
+        .map(|_| Scripted::Status(401, vec![], login.into()))
+        .chain((0..20).map(|_| Scripted::Sse(vec![token.into()])))
+        .collect();
+    let h = harness(script).await;
+    for index in 0..40 {
+        let response = h.post(&format!("auth-limit-{index}")).await;
+        assert_eq!(response.status(), if index < 20 { 401 } else { 200 });
+        assert_eq!(
+            response.text().await.unwrap(),
+            if index < 20 { login } else { token }
+        );
+    }
+    let metrics = h.metrics().await;
+    for reason in ["login_required", "token_refused"] {
+        assert!(
+            metrics.contains(&format!(
+                "codexctl_relay_lane_stops_total{{reason=\"{reason}\"}} 20\n"
+            )),
+            "{metrics}"
+        );
+    }
+    let logs = h.logs.lock().unwrap();
+    let failures: Vec<Value> = logs
+        .iter()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["outcome"] == "stream_failure" || line["outcome"] == "lane_stop")
+        .collect();
+    assert_eq!(
+        failures.len(),
+        30,
+        "terminal and stream logs share one limit"
+    );
+    assert!(failures.iter().any(|line| line["outcome"] == "lane_stop"));
 }
 
 #[tokio::test]

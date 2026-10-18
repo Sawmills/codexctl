@@ -575,17 +575,14 @@ impl Relay {
             request_id,
             observation: evidence::Observation::LaneStop(report.lane_stop),
         });
-        (self.log)(
-            &json!({
-                "ts": chrono::Utc::now().to_rfc3339(),
-                "component": "codexctl-relay",
-                "outcome": "lane_stop",
-                "reason": report.lane_stop,
-                "request_id": request_id,
-                "account_alias": labels.account_alias,
-            })
-            .to_string(),
-        );
+        self.log_stream_failure(json!({
+            "ts": chrono::Utc::now().to_rfc3339(),
+            "component": "codexctl-relay",
+            "outcome": "lane_stop",
+            "reason": report.lane_stop,
+            "request_id": request_id,
+            "account_alias": labels.account_alias,
+        }));
         self.send_central(CentralEvent::Stop(report));
     }
 
