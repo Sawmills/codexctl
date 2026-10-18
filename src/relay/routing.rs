@@ -139,7 +139,7 @@ impl Routing {
     ) -> Result<ProviderRoute> {
         let mut headers = toml_edit::InlineTable::new();
         if self.listen.is_some()
-            && let Some(alias) = alias.and_then(super::evidence::alias)
+            && let Some(alias) = alias.and_then(crate::outcomes::alias)
         {
             headers.insert("X-Codexctl-Account-Alias", alias.into());
             let class = match billing {
