@@ -15,7 +15,8 @@ env:
 jobs:
   setup:
     name: Resolve tag
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
@@ -70,7 +71,8 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: setup
-    runs-on: ${{ matrix.os }}
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: ${{ fromJSON('{"ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] || matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -130,7 +132,8 @@ jobs:
   release:
     name: Publish release
     needs: [setup, build]
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     permissions:
       contents: write
     outputs:
@@ -191,7 +194,8 @@ jobs:
   homebrew:
     name: Update Homebrew tap
     needs: [setup, release]
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     steps:
       - id: token
         name: Create token
