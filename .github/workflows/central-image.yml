@@ -33,8 +33,7 @@ jobs:
             arch: amd64
           - runner: ubuntu-24.04-arm
             arch: arm64
-    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: ${{ fromJSON('{"ubuntu-24.04":"namespace-profile-sawmills-runner","ubuntu-24.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.runner] || matrix.runner }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -70,8 +69,7 @@ jobs:
 
   manifest:
     needs: build
-    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: namespace-profile-sawmills-runner
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
