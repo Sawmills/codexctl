@@ -50,7 +50,9 @@ pub fn run(
         #[cfg(not(feature = "central-prototype"))]
         bail!("server account launch for {alias} requires central support");
     }
-    HerdrAgentReporter::prepare_private_pty()?;
+    if let Err(error) = HerdrAgentReporter::prepare_private_pty() {
+        eprintln!("codexctl: herdr agent hint skipped: {error:#}");
+    }
     #[cfg(feature = "central-prototype")]
     let selected_central_launch = if service_mode
         || (codexctl::central::native::central_active()?

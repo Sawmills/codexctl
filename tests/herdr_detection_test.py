@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import tempfile
 import unittest
 
@@ -26,7 +28,7 @@ sys.exit(17)
 
 
 class HerdrDetectionTest(unittest.TestCase):
-    def test_private_pty_resume_exposes_the_foreground_wrapper_to_herdr(self):
+    def run_resume(self, deleted_executable=False):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()
             scripts = home / "bin"
@@ -45,11 +47,26 @@ class HerdrDetectionTest(unittest.TestCase):
                 "HERDR_SOCKET_PATH": str(home / "absent.sock"),
             }
             args = ["resume", "11111111-2222-4333-8444-555555555555", "--model", "test-model"]
-            child = subprocess.Popen(
-                [os.environ["CODEXCTL_TEST_BINARY"], "codex", *args],
-                cwd=home, env=environment, stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
+            executable = os.environ["CODEXCTL_TEST_BINARY"]
+            descriptor = None
+            if deleted_executable:
+                # Execute the open inode after unlink: startup succeeds, but the
+                # wrapper's current_exe path cannot be used for its hint exec.
+                removed = home / "removed-codexctl"
+                shutil.copy2(executable, removed)
+                descriptor = os.open(removed, os.O_RDONLY)
+                removed.unlink()
+                executable = f"/proc/self/fd/{descriptor}"
+            try:
+                child = subprocess.Popen(
+                    [executable, "codex", *args],
+                    cwd=home, env=environment, stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    pass_fds=() if descriptor is None else (descriptor,),
+                )
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
             stdout, stderr = child.communicate(timeout=20)
             self.assertEqual(child.returncode, 17, (stdout, stderr))
             observed = json.loads(receipt.read_text())
@@ -57,8 +74,19 @@ class HerdrDetectionTest(unittest.TestCase):
             self.assertEqual(observed["parent"], child.pid, "keep the foreground PID")
             self.assertEqual(observed["args"], ["--cd", str(home), *args])
             self.assertEqual(observed["cwd"], str(home))
-            self.assertTrue(observed["parent_hint"], "HerdR reads the foreground process environment, not the child environment")
-            self.assertEqual(observed["child_hint"], "codex")
+            return observed, stderr.decode()
+
+    def test_private_pty_resume_exposes_the_foreground_wrapper_to_herdr(self):
+        observed, _ = self.run_resume()
+        self.assertTrue(observed["parent_hint"], "HerdR reads the foreground process environment, not the child environment")
+        self.assertEqual(observed["child_hint"], "codex")
+
+    @unittest.skipUnless(sys.platform == "linux", "open deleted executable via procfs")
+    def test_failed_hint_exec_warns_and_continues_the_codex_launch(self):
+        observed, stderr = self.run_resume(deleted_executable=True)
+        self.assertFalse(observed["parent_hint"])
+        self.assertIn("codexctl: herdr agent hint skipped:", stderr)
+        self.assertIn("No such file or directory", stderr)
 
 
 if __name__ == "__main__":
