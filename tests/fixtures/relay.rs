@@ -20,9 +20,14 @@ impl TestRelay {
     }
 
     pub fn start_at(home: &Path, address: &str) -> Self {
+        Self::start_upstream(home, address, "http://127.0.0.1:9")
+    }
+
+    pub fn start_upstream(home: &Path, address: &str, upstream: &str) -> Self {
         let command = || {
             let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
             command
+                .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
                 .env("HOME", home)
                 .env_remove("CODEX_HOME")
                 .env_remove("CODEXCTL_PINNED_ALIAS")
@@ -36,10 +41,10 @@ impl TestRelay {
                 "--listen",
                 address,
                 "--upstream",
-                "http://127.0.0.1:9",
+                upstream,
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let mut relay = Self {
@@ -48,10 +53,18 @@ impl TestRelay {
         };
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(
-                relay.child.try_wait().unwrap().is_none(),
-                "relay failed startup"
-            );
+            if relay.child.try_wait().unwrap().is_some() {
+                use std::io::Read;
+                let mut stderr = String::new();
+                relay
+                    .child
+                    .stderr
+                    .take()
+                    .unwrap()
+                    .read_to_string(&mut stderr)
+                    .unwrap();
+                panic!("relay failed startup: {stderr}");
+            }
             let status = command()
                 .args(["relay", "status", "--listen", address])
                 .output()

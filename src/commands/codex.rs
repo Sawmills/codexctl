@@ -1617,6 +1617,11 @@ fn run_codex_in_pty(
     let reader = master.as_ref().unwrap().try_clone_reader()?;
     let writer = Arc::new(Mutex::new(master.as_ref().unwrap().take_writer()?));
     let mut killer = child.clone_killer();
+    #[cfg(feature = "central-prototype")]
+    let terminal_observer = central_launch
+        .as_deref_mut()
+        .and_then(|launch| launch.take_terminal_observer())
+        .unwrap_or_else(codexctl::relay::TerminalObserver::from_env);
 
     let reader_thread = spawn_output_thread(
         reader,
@@ -1628,6 +1633,8 @@ fn run_codex_in_pty(
         invocation.continue_goal_on_start,
         !interactive,
         allow_rate_recovery,
+        #[cfg(feature = "central-prototype")]
+        terminal_observer,
         state_reporter,
         move || {
             let _ = killer.kill();
@@ -1755,6 +1762,7 @@ fn spawn_output_thread(
     continue_goal_on_start: bool,
     normalize_newlines: bool,
     allow_rate_recovery: bool,
+    #[cfg(feature = "central-prototype")] mut terminal_outcome: codexctl::relay::TerminalObserver,
     state_reporter: Option<HerdrAgentReporter>,
     mut kill_child: impl FnMut() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
@@ -1773,6 +1781,8 @@ fn spawn_output_thread(
                 Err(_) => break,
             };
             let chunk = &buffer[..bytes_read];
+            #[cfg(feature = "central-prototype")]
+            terminal_outcome.observe(chunk);
             if normalize_newlines {
                 write_normalized_chunk(&mut stdout, chunk, &mut pending_cr);
             } else {

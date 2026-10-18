@@ -12,7 +12,10 @@ mod evidence;
 mod identity;
 mod policy;
 mod routing;
+mod terminal;
 mod watchdog;
+
+pub use terminal::TerminalObserver;
 
 pub(crate) use routing::{
     central_provider, configure as configure_central_route, preflight_configuration,
@@ -36,7 +39,7 @@ use axum::{
     extract::{DefaultBodyLimit, RawQuery, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures::{Stream, StreamExt};
 use regex::Regex;
@@ -263,6 +266,7 @@ struct Relay {
     central_dropped: Arc<Mutex<BTreeMap<&'static str, u64>>>,
     evidence: evidence::Evidence,
     outcomes: Outcomes,
+    terminal: Arc<Mutex<terminal::Pending>>,
 }
 
 struct OpenStream(Arc<AtomicU64>);
@@ -370,6 +374,7 @@ pub async fn serve(
         central_dropped,
         evidence,
         outcomes: Outcomes::with_report_root(config.identity_root.clone()),
+        terminal: Arc::default(),
     };
     let suppression_relay = relay.clone();
     let suppression_task = tokio::spawn(async move {
@@ -379,6 +384,7 @@ pub async fn serve(
             suppression_relay.flush_suppression_summary();
         }
     });
+    let receipt_identity = identity.clone();
     let app = Router::new()
         .route(
             "/healthz",
@@ -388,6 +394,16 @@ pub async fn serve(
             }),
         )
         .route("/metrics", get(metrics))
+        .route(
+            "/v1/terminal-capacity",
+            post(
+                move |State(relay): State<Relay>, headers: HeaderMap, body: Bytes| {
+                    let identity = receipt_identity.clone();
+                    async move { terminal::accept(&relay, &identity, &headers, &body) }
+                },
+            )
+            .layer(DefaultBodyLimit::max(512)),
+        )
         .fallback(forward)
         .layer(DefaultBodyLimit::disable())
         .with_state(relay);
@@ -414,11 +430,15 @@ pub async fn serve(
     Ok(())
 }
 
+#[derive(Clone)]
 struct Labels {
     thread: String,
     model: String,
     account_class: &'static str,
     account_alias: Option<String>,
+    launch_id: Option<String>,
+    turn_id: Option<String>,
+    terminal_request: bool,
 }
 
 async fn forward(State(relay): State<Relay>, request: Request) -> Response {
@@ -456,7 +476,24 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         }
     }
     let prefix = head.concat();
+    let turn_metadata = header_str(&parts.headers, "x-codex-turn-metadata")
+        .filter(|v| v.len() <= 4096)
+        .and_then(|v| serde_json::from_str::<Value>(v).ok());
+    let terminal_request = is_responses
+        && parts.method == Method::POST
+        && turn_metadata
+            .as_ref()
+            .is_none_or(|v| v["request_kind"] == "turn" && v["thread_source"] == "user");
     let labels = Labels {
+        turn_id: turn_metadata
+            .as_ref()
+            .and_then(|v| v["turn_id"].as_str())
+            .filter(|v| terminal::valid_id(v))
+            .map(str::to_owned),
+        terminal_request,
+        launch_id: header_str(&parts.headers, "x-codexctl-launch-id")
+            .filter(|v| terminal::valid_id(v))
+            .map(str::to_owned),
         account_alias: header_str(&parts.headers, "x-codexctl-account-alias")
             .and_then(evidence::alias),
         thread,
@@ -475,6 +512,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         "transfer-encoding",
         ACCOUNT_CLASS_HEADER,
         "x-codexctl-account-alias",
+        "x-codexctl-launch-id",
     ] {
         headers.remove(name);
     }
@@ -494,6 +532,13 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
         Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
     };
     let status = upstream.status();
+    if labels.terminal_request && !status.is_server_error() {
+        relay
+            .terminal
+            .lock()
+            .expect("terminal receipt lock")
+            .clear(&labels);
+    }
     let headers_at = Instant::now();
     let mut headers = upstream.headers().clone();
     for name in ["connection", "transfer-encoding"] {
@@ -645,6 +690,15 @@ impl Relay {
             }
         }
         let trace = StreamTrace::new(headers_at);
+        self.terminal
+            .lock()
+            .expect("terminal receipt lock")
+            .observe(
+                &labels,
+                status.as_u16(),
+                error.as_ref().and_then(evidence_error_code),
+                request_id.as_deref(),
+            );
         if let Some(report) = self.outcomes.request().terminal(
             status.as_u16(),
             error.as_ref().and_then(evidence_error_code),
@@ -2306,12 +2360,16 @@ mod tests {
             central_dropped: dropped.clone(),
             evidence: evidence::Evidence::start(None).unwrap().0,
             outcomes: Outcomes::default(),
+            terminal: Arc::default(),
         };
         let labels = Labels {
             thread: "thread".into(),
             model: "gpt-6.1-sol".into(),
             account_class: "included",
             account_alias: None,
+            launch_id: None,
+            turn_id: None,
+            terminal_request: true,
         };
 
         for _ in 0..=CENTRAL_EVENT_QUEUE_CAPACITY {
@@ -2354,6 +2412,7 @@ mod tests {
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
             outcomes: Outcomes::default(),
+            terminal: Arc::default(),
         };
         relay
             .stream_log
@@ -2385,12 +2444,16 @@ mod tests {
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
             outcomes: Outcomes::default(),
+            terminal: Arc::default(),
         };
         let labels = Labels {
             thread: "thread".into(),
             model: "gpt-6.1-sol".into(),
             account_class: "included",
             account_alias: None,
+            launch_id: None,
+            turn_id: None,
+            terminal_request: true,
         };
         let mut frames = FrameRewriter::new(
             relay,

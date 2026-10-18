@@ -192,6 +192,29 @@ impl Identity {
         })
         .into_response()
     }
+
+    pub(super) fn verify_receipt(&self, body: &[u8], signature: &str) -> bool {
+        let Ok(signature) = URL_SAFE_NO_PAD.decode(signature) else {
+            return false;
+        };
+        receipt_mac(&self.key, self.address, body)
+            .verify_slice(&signature)
+            .is_ok()
+    }
+}
+
+fn receipt_mac(key: &[u8; 32], address: SocketAddr, body: &[u8]) -> Hmac<Sha256> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts a 256-bit key");
+    mac.update(b"codexctl-terminal-capacity-v1\0");
+    mac.update(address.to_string().as_bytes());
+    mac.update(b"\0");
+    mac.update(body);
+    mac
+}
+
+pub(super) fn receipt_signature(root: &Path, address: SocketAddr, body: &[u8]) -> Result<String> {
+    let key = read_key(&directory(root, false)?, &key_name(address)?)?;
+    Ok(URL_SAFE_NO_PAD.encode(receipt_mac(&key, address, body).finalize().into_bytes()))
 }
 
 fn key_name(address: SocketAddr) -> Result<CString> {

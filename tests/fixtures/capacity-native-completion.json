@@ -1,0 +1,18 @@
+{
+  "timestamp": "2026-10-18T10:30:53.222Z",
+  "ordinal": 11,
+  "type": "event_msg",
+  "payload": {
+    "type": "task_complete",
+    "root_turn_id": "01a14e90-7566-7b81-8e77-eb30a4425810",
+    "turn_id": "01a14e90-7566-7b81-8e77-eb30a4425810",
+    "last_agent_message": null,
+    "error": {
+      "message": "Selected model is at capacity. Please try a different model.",
+      "codex_error_info": "server_overloaded"
+    },
+    "started_at": 1792319452,
+    "completed_at": 1792319453,
+    "duration_ms": 702
+  }
+}
