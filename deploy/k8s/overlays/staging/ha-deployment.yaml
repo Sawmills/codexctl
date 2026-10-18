@@ -98,7 +98,7 @@ spec:
             - { name: projected, mountPath: /projected, readOnly: true }
             - { name: keys, mountPath: /keys }
         - name: initialize
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:9d5beaf64210f97e3f0e4180bd4fb2ebc9f2623f7319c2618dd112047fbb3717
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:7890a4d6c9944c84d6e275a602874d0274f613447b4be8834224d3f4efd95c94
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
@@ -140,7 +140,7 @@ spec:
             limits: { cpu: "1", memory: 256Mi }
       containers:
         - name: broker
-          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:9d5beaf64210f97e3f0e4180bd4fb2ebc9f2623f7319c2618dd112047fbb3717
+          image: 767398060436.dkr.ecr.us-east-1.amazonaws.com/codexctl-central@sha256:7890a4d6c9944c84d6e275a602874d0274f613447b4be8834224d3f4efd95c94
           imagePullPolicy: Always
           command: [sh, -ec]
           args:
