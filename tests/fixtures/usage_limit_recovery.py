@@ -136,7 +136,7 @@ def probe(binary, case):
             pass
 
     with tempfile.TemporaryDirectory(prefix="codexctl-usage-recovery-") as temporary:
-        home = Path(temporary)
+        home = Path(temporary).resolve()
         (home / "bin").mkdir()
         (home / "work").mkdir()
         # Execute the checked-in child; never race an executable being written.
@@ -193,7 +193,7 @@ def probe(binary, case):
                 if recovers:
                     assert SESSION in launches[1]["args"], launches
                     assert "INCLUDED-RECOVERY-OK" in result.stdout, result.stdout
-                assert all(launch["cwd"] == str(home / "work") for launch in launches)
+                assert all(launch["cwd"] == str(home / "work") for launch in launches), launches
                 assert set(requests) == set(expected_aliases), requests
                 print(f"PASS {case}: exit {expected_exit}, aliases {expected_aliases}; paid/excluded untouched")
             finally:

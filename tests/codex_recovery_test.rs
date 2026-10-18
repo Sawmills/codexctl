@@ -53,7 +53,14 @@ fn usage_limit_without_an_included_alternate_never_uses_paid_accounts() {
 }
 
 fn check_recovery(case: &str) {
+    let temporary = tempfile::tempdir().unwrap();
+    let real = temporary.path().join("real");
+    let alias = temporary.path().join("alias");
+    std::fs::create_dir(&real).unwrap();
+    // macOS temporary homes also pass through a directory symlink (/var).
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
     let output = Command::new("python3")
+        .env("TMPDIR", &alias)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/usage_limit_recovery.py"
