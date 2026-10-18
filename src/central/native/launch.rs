@@ -262,6 +262,7 @@ pub struct PinnedLaunch {
     alias: String,
     codex_args: Vec<String>,
     signals: Arc<LaunchSignals>,
+    terminal_observer: Option<crate::relay::TerminalObserver>,
 }
 
 impl Drop for PinnedLaunch {
@@ -276,6 +277,9 @@ impl Drop for PinnedLaunch {
 }
 
 impl PinnedLaunch {
+    pub fn take_terminal_observer(&mut self) -> Option<crate::relay::TerminalObserver> {
+        self.terminal_observer.take()
+    }
     fn child_command(&self) -> Result<std::process::Command> {
         let directory = self
             .prepared
@@ -497,7 +501,7 @@ fn prepare_pinned_codex(
     // Listener proof performs network I/O. Do it before store/native locks;
     // central_provider rechecks this exact route state under its relay lock.
     let route_proof = crate::relay::preflight_route(&paths)?;
-    let (prepared, owner, route) = {
+    let (prepared, owner, mut route) = {
         // Follow migration's lock order and recheck registration after network I/O.
         let _store = store::lock(&paths)?;
         let _native = native_lock(&directory)?;
@@ -526,6 +530,14 @@ fn prepare_pinned_codex(
         )?;
         (prepared, owner, route)
     };
+    let launch_id = vault::digest(&super::super::enrollment::random_bytes())[..32].to_owned();
+    let terminal_observer =
+        crate::relay::TerminalObserver::for_launch(&paths, route.listen, launch_id.clone());
+    if route.listen.is_some() {
+        route
+            .headers
+            .insert("X-Codexctl-Launch-Id", launch_id.into());
+    }
     let path = prepared.path().join("connection.json");
     let helper_args = serde_json::to_string(&[
         "central-token",
@@ -593,6 +605,7 @@ fn prepare_pinned_codex(
         alias: account.alias.clone(),
         codex_args,
         signals,
+        terminal_observer: Some(terminal_observer),
     })
 }
 

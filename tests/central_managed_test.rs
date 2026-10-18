@@ -13401,6 +13401,364 @@ fn interrupted_relay_configuration_recovers_on_the_next_account_launch() {
 }
 
 #[test]
+fn explicit_pin_preserves_a_signal_from_the_child() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    let home = server.connected_home();
+    let bin = home.path().join("bin");
+    store::atomic_write(&bin.join("codex"), b"#!/bin/sh\nkill -TERM $$\n").unwrap();
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args(["codex", "--account", "lane", "exec", "synthetic prompt"])
+        .env("HOME", home.path())
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert_eq!(launched.status.code(), Some(128 + libc::SIGTERM));
+}
+
+#[test]
+fn explicit_pinned_capacity_stop_is_reported_once_without_switching_accounts() {
+    pinned_capacity_receipt("json");
+}
+
+#[test]
+fn explicit_pinned_capacity_stop_from_real_codex_tui_is_reported_once() {
+    pinned_capacity_receipt("tui");
+}
+
+#[test]
+fn explicit_pinned_historical_redraw_cannot_confirm_a_current_turn() {
+    pinned_capacity_receipt("historical");
+}
+
+#[test]
+fn explicit_pinned_completion_survives_a_later_turn_success() {
+    pinned_capacity_receipt("laterturn");
+}
+
+#[test]
+fn explicit_pinned_missing_native_state_is_visible_without_changing_launch_status() {
+    pinned_capacity_receipt("missingstate");
+}
+
+#[test]
+#[ignore = "manual installed Codex protocol proof; set SAW13482_REAL_CODEX to the native binary"]
+fn explicit_pinned_real_native_capacity_completion() {
+    assert!(std::env::var_os("SAW13482_REAL_CODEX").is_some());
+    pinned_capacity_receipt("realnative");
+}
+
+fn pinned_capacity_receipt(presentation: &str) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt;
+    let server = Server::start();
+    server.import(&server.amir, "lane", "lane-login", "lane-seat");
+    server.import(&server.amir, "other", "other-login", "other-seat");
+    let home = server.connected_home();
+    store::ensure_private_dir(&home.path().join(".codexctl")).unwrap();
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_url = format!("http://{}", upstream.local_addr().unwrap());
+    upstream.set_nonblocking(true).unwrap();
+    let total_requests = match presentation {
+        "laterturn" => 6,
+        "realnative" => 16,
+        _ => 5,
+    };
+    let real_native = presentation == "realnative";
+    let requests = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut paths = Vec::new();
+        let mut response_posts = 0;
+        for index in 0..total_requests {
+            let mut socket = loop {
+                match upstream.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(std::time::Instant::now() < deadline, "missing native retry");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            socket
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            let mut reader = BufReader::new(socket.try_clone().unwrap());
+            let mut headers = String::new();
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            assert!(
+                !headers
+                    .to_ascii_lowercase()
+                    .contains("x-codexctl-launch-id")
+            );
+            let mut body = vec![0; length];
+            paths.push(
+                headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .take(2)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            reader.read_exact(&mut body).unwrap();
+            let is_get = headers.starts_with("GET ");
+            let body: &[u8] = if real_native && is_get {
+                br#"{"models":[]}"#
+            } else {
+                br#"{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity. Please try a different model."}}"#
+            };
+            let status = if (real_native && !is_get) || (!real_native && index < 3) {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            socket.write_all(body).unwrap();
+            if real_native && !is_get {
+                response_posts += 1;
+                if response_posts == 3 {
+                    break;
+                }
+            }
+        }
+        paths
+    });
+    let port = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = port.local_addr().unwrap().to_string();
+    drop(port);
+    let relay = relay_fixture::TestRelay::start_upstream(home.path(), &address, &upstream_url);
+    let enabled = server.cli(
+        home.path(),
+        &["relay", "enable", "--listen", &relay.address],
+    );
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    if presentation == "realnative" {
+        let path = home.path().join(".codex/config.toml");
+        let mut config: toml_edit::DocumentMut = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .parse()
+            .unwrap();
+        config["model_providers"]["codexctl-central"]["request_max_retries"] = toml_edit::value(2);
+        config["model_providers"]["codexctl-central"]["stream_max_retries"] = toml_edit::value(0);
+        store::atomic_write(&path, config.to_string().as_bytes()).unwrap();
+    }
+    let bin = home.path().join("bin");
+    store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
+import json, os, re, sqlite3, sys, urllib.error, urllib.request
+from pathlib import Path
+values = dict(arg.split('=', 1) for arg in sys.argv[1:] if arg.startswith('model_providers.codexctl-central.') and '=' in arg)
+url = json.loads(values['model_providers.codexctl-central.base_url']) + '/responses'
+headers = dict(re.findall(r'([A-Za-z-]+)\s*=\s*"([^"]*)"', values['model_providers.codexctl-central.http_headers']))
+assert os.environ['CODEXCTL_PINNED_ALIAS'] == 'lane'
+connection = Path(os.environ['CODEXCTL_PINNED_CONNECTION'])
+assert json.loads(connection.read_text())['alias'] == 'lane'
+Path.home().joinpath('connection-path').write_text(str(connection))
+thread = '11111111-2222-4333-8444-555555555555'
+turn = '11111111-2222-4333-8444-666666666666'
+headers['thread-id'] = thread
+headers['x-codex-turn-metadata'] = json.dumps({'turn_id':turn,'request_kind':'turn','thread_source':'user'})
+native = Path.home() / '.codex'
+rollout = native / 'sessions' / 'synthetic.jsonl'
+rollout.parent.mkdir(parents=True, exist_ok=True)
+with sqlite3.connect(native / 'state_5.sqlite') as db:
+    db.execute('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)')
+    db.execute('INSERT INTO threads VALUES (?, ?)', (thread,str(rollout)))
+rollout.write_text('')
+if os.environ['PRESENTATION'] == 'missingstate':
+    (native / 'state_5.sqlite').rename(native / 'state_6.sqlite')
+print('SYNTHETIC-STDERR-WARNING', file=sys.stderr, flush=True)
+if os.environ['PRESENTATION'] == 'json':
+    print('{"type":"thread.started","thread_id":"11111111-2222-4333-8444-555555555555"}', flush=True)
+    print('{"type":"turn.started"}', flush=True)
+for _ in range(3):
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=b'{"model":"gpt-6.1-sol"}', headers=headers)).read()
+    except urllib.error.HTTPError as error:
+        assert error.code == 503
+        error.read()
+# Unrelated successful traffic must not clear this thread's pending failure.
+urllib.request.urlopen(urllib.request.Request(url, data=b'{}', headers=dict(headers, **{'thread-id':'99999999-2222-4333-8444-555555555555'}))).read()
+urllib.request.urlopen(urllib.request.Request(url.replace('/responses','/models'), headers=headers)).read()
+if os.environ['PRESENTATION'] == 'laterturn':
+    later = dict(headers)
+    later['x-codex-turn-metadata'] = json.dumps({'turn_id':'99999999-2222-4333-8444-666666666666','request_kind':'turn','thread_source':'user'})
+    urllib.request.urlopen(urllib.request.Request(url, data=b'{}', headers=later)).read()
+completion = json.loads(Path(os.environ['COMPLETION']).read_text())
+completion['payload']['turn_id'] = turn if os.environ['PRESENTATION'] != 'historical' else '99999999-2222-4333-8444-666666666666'
+rollout.write_text(json.dumps(completion) + '\n')
+if os.environ['PRESENTATION'] == 'json':
+    event = '{"type":"turn.failed","error":{"message":"Selected model is at capacity. Please try a different model."}}'
+    print(event, flush=True)
+    print(event, flush=True)
+else:
+    data = json.loads(Path(os.environ['TRANSCRIPT']).read_text())['output'].encode()
+    # Long terminal redraws, a tall cursor coordinate and repainting an old
+    # error are deliberately irrelevant to authoritative native completion.
+    sys.stdout.buffer.write(b'\x1b[75;1H' * 10000)
+    for offset in range(0, len(data), 97):
+        sys.stdout.buffer.write(data[offset:offset+97]); sys.stdout.buffer.flush()
+sys.exit(17)
+"##).unwrap();
+    if presentation == "realnative" {
+        store::atomic_write(
+            &bin.join("codex"),
+            b"#!/bin/sh\nexec \"$SAW13482_REAL_CODEX\" \"$@\"\n",
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launched = Command::new(env!("CARGO_BIN_EXE_codexctl"))
+        .args([
+            "codex",
+            "--account",
+            "lane",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "-m",
+            "gpt-6.1-sol",
+            "synthetic prompt",
+        ])
+        .env("HOME", home.path())
+        .env("PRESENTATION", presentation)
+        .env(
+            "COMPLETION",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/capacity-native-completion.json"
+            ),
+        )
+        .env(
+            "TRANSCRIPT",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/capacity-terminal-tui.json"
+            ),
+        )
+        .env(
+            "PATH",
+            std::env::join_paths(
+                std::iter::once(bin)
+                    .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+            )
+            .unwrap(),
+        )
+        .env("CODEXCTL_ALLOW_INSECURE_LOOPBACK", "1")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEXCTL_PINNED_ALIAS")
+        .output()
+        .unwrap();
+    assert_eq!(
+        launched.status.code(),
+        Some(if presentation == "realnative" { 1 } else { 17 }),
+        "{}",
+        String::from_utf8_lossy(&launched.stderr)
+    );
+    let paths = requests.join().unwrap();
+    if presentation == "realnative" {
+        println!("synthetic native paths: {paths:?}");
+    }
+    if presentation != "realnative" {
+        assert!(String::from_utf8_lossy(&launched.stderr).contains("SYNTHETIC-STDERR-WARNING"));
+    }
+    assert!(!String::from_utf8_lossy(&launched.stdout).contains("SYNTHETIC-STDERR-WARNING"));
+    let expected = if matches!(presentation, "historical" | "missingstate") {
+        0
+    } else {
+        1
+    };
+    let metrics = server
+        .http
+        .get(format!("http://{}/metrics", relay.address))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(
+        metrics.contains(&format!(
+            "codexctl_relay_lane_stops_total{{reason=\"capacity\"}} {expected}\n"
+        )),
+        "{metrics}"
+    );
+    if presentation == "missingstate" {
+        assert!(
+            metrics.contains("codexctl_relay_capacity_confirm_unavailable_total 1\n"),
+            "{metrics}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&launched.stderr)
+                .matches("reason=native_state_unavailable")
+                .count(),
+            1
+        );
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let metrics = server
+            .http
+            .get(format!("{}/metrics", server.url))
+            .bearer_auth("synthetic-monitoring-credential-only")
+            .send()
+            .unwrap()
+            .text()
+            .unwrap();
+        if metrics.contains(&format!(
+            "codexctl_central_lane_stops_total{{reason=\"capacity\"}} {expected}\n"
+        )) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{metrics}");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if presentation != "realnative" {
+        let connection = std::fs::read_to_string(home.path().join("connection-path")).unwrap();
+        assert!(
+            !std::path::Path::new(&connection).exists(),
+            "private connection retained"
+        );
+    }
+    assert!(
+        !home
+            .path()
+            .join(".codexctl/central/.active-account")
+            .exists()
+    );
+    assert!(!home.path().join(".codex/auth.json").exists());
+}
+
+#[test]
 fn relay_enabled_account_launches_keep_the_supported_route_and_private_auth() {
     use std::os::unix::fs::PermissionsExt;
     let server = Server::start();

@@ -40,6 +40,19 @@ pub(crate) struct RouteProof {
     routing: Routing,
 }
 
+pub(super) fn receipt_listener(paths: &Paths) -> Result<Option<SocketAddr>> {
+    let state = route_state(paths)?;
+    let routing: Routing = if let FileState::Bytes(bytes) = state.pending {
+        serde_json::from_slice::<Pending>(&bytes)?.routing
+    } else if let FileState::Bytes(bytes) = state.relay {
+        serde_json::from_slice(&bytes)?
+    } else {
+        Routing::default()
+    };
+    routing.url()?;
+    Ok(routing.listen)
+}
+
 fn lock(paths: &Paths) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     store::ensure_private_dir(&paths.codexctl_dir())?;
@@ -115,6 +128,7 @@ impl Routing {
 pub(crate) struct ProviderRoute {
     pub(crate) url: String,
     pub(crate) headers: toml_edit::InlineTable,
+    pub(crate) listen: Option<SocketAddr>,
 }
 
 impl Routing {
@@ -138,6 +152,7 @@ impl Routing {
         Ok(ProviderRoute {
             url: self.url()?,
             headers,
+            listen: self.listen,
         })
     }
 }
