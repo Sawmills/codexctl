@@ -15,7 +15,8 @@ env:
 jobs:
   setup:
     name: Resolve tag
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
@@ -70,7 +71,12 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: setup
-    runs-on: ${{ matrix.os }}
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: ${{ fromJSON('{"ubuntu-latest":"namespace-profile-sawmills-runner","ubuntu-22.04-arm":"namespace-profile-sawmills-runner-arm64"}')[matrix.os] || matrix.os }}
+    container: ${{ matrix.container || '' }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -88,7 +94,15 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             label: Linux_arm64
+            container: ubuntu:22.04
     steps:
+      - name: Install Ubuntu 22.04 build prerequisites
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install --yes --no-install-recommends \
+            binutils build-essential ca-certificates curl git libssl-dev pkg-config
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ needs.setup.outputs.checkout_ref }}
@@ -104,6 +118,20 @@ jobs:
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify Linux arm64 GLIBC symbol baseline
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          for name in codexctl codexctl-central; do
+            binary="target/${{ matrix.target }}/release/${name}"
+            highest="$(objdump -T "${binary}" | grep -oE 'GLIBC_[0-9.]+' | sort -V | tail -1)"
+            printf '%s requires %s\n' "${binary}" "${highest}"
+            if [[ "$(printf '%s\n' GLIBC_2.35 "${highest}" | sort -V | tail -1)" != GLIBC_2.35 ]]; then
+              echo "::error::${binary} requires ${highest}; maximum supported version is GLIBC_2.35"
+              exit 1
+            fi
+          done
 
       - name: Verify Linux arm64 compatibility
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -130,7 +158,8 @@ jobs:
   release:
     name: Publish release
     needs: [setup, build]
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     permissions:
       contents: write
     outputs:
@@ -191,7 +220,8 @@ jobs:
   homebrew:
     name: Update Homebrew tap
     needs: [setup, release]
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     steps:
       - id: token
         name: Create token

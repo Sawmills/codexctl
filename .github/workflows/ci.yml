@@ -20,7 +20,8 @@ env:
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     services:
       postgres:
         image: postgres:16
@@ -67,7 +68,8 @@ jobs:
 
   audit:
     name: Dependency Audit
-    runs-on: ubuntu-latest
+    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
+    runs-on: namespace-profile-sawmills-runner
     permissions:
       contents: read
       checks: write
