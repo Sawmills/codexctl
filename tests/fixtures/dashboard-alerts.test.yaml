@@ -45,6 +45,14 @@ tests:
             value: 2880
   - interval: 1m
     input_series:
+      - series: codexctl_central_billed_selections_total{path="auto",pod="pod-a"}
+        values: _ 1+0x70
+    alert_rule_test:
+      - eval_time: 61m
+        alertname: CodexctlAutomaticBillingSelected
+        exp_alerts: []
+  - interval: 1m
+    input_series:
       - series: codexctl_central_owner_refresh_failed_total{account="personal",account_key="example-key",reason="refresh_token_invalidated",pod="pod-a"}
         values: _ 1+0x24
     alert_rule_test:

@@ -22,6 +22,7 @@ mod relay_fixture;
 
 struct Fixture {
     home: tempfile::TempDir,
+    server: String,
     receipts: Arc<Mutex<Vec<Value>>>,
     probes: Arc<AtomicUsize>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -52,6 +53,10 @@ impl Fixture {
         let reads = probes.clone();
         let receipt_home = home.path().to_path_buf();
         let app = Router::new()
+            .route(
+                "/v1/me",
+                get(|| async { Json(json!({"id":"synthetic-user"})) }),
+            )
             .route(
                 "/v1/accounts",
                 get(move || async move { Json(json!([account])) }),
@@ -117,6 +122,7 @@ impl Fixture {
         });
         Self {
             home,
+            server: url,
             receipts,
             probes,
             stop: Some(stop),
@@ -124,8 +130,9 @@ impl Fixture {
         }
     }
 
-    fn cli(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_codexctl"))
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_codexctl"));
+        command
             .args(args)
             .env("HOME", self.home.path())
             .env(
@@ -141,7 +148,18 @@ impl Fixture {
             .env_remove("CODEXCTL_PINNED_ALIAS")
             .env_remove("CODEXCTL_PINNED_CONNECTION")
             .env_remove("CODEXCTL_SERVICE_TOKEN")
-            .env_remove("CODEXCTL_SERVER_URL")
+            .env_remove("CODEXCTL_SERVER_URL");
+        command
+    }
+
+    fn cli(&self, args: &[&str]) -> std::process::Output {
+        self.command(args).output().unwrap()
+    }
+
+    fn service_cli(&self, args: &[&str]) -> std::process::Output {
+        self.command(args)
+            .env("CODEXCTL_SERVER_URL", &self.server)
+            .env("CODEXCTL_SERVICE_TOKEN", "synthetic-machine")
             .output()
             .unwrap()
     }
@@ -164,11 +182,12 @@ fn billed_selection_receipt_excludes_declined_probes_and_automatic_placement() {
         "must exercise a billing=true token probe"
     );
     assert!(fixture.receipts.lock().unwrap().is_empty());
+    let automatic = fixture.service_cli(&["codex", "exec", "synthetic"]);
+    assert!(!automatic.status.success());
     assert!(
-        !fixture
-            .cli(&["codex", "exec", "synthetic"])
-            .status
-            .success()
+        String::from_utf8_lossy(&automatic.stderr).contains("included"),
+        "{}",
+        String::from_utf8_lossy(&automatic.stderr)
     );
     assert!(fixture.receipts.lock().unwrap().is_empty());
     let approved = fixture.cli(&[
@@ -194,12 +213,13 @@ fn billed_selection_receipt_excludes_declined_probes_and_automatic_placement() {
 #[test]
 fn included_automatic_launch_sends_no_billed_selection_receipt() {
     let fixture = Fixture::new("rate_limited", false);
-    let output = fixture.cli(&["codex", "exec", "synthetic"]);
+    let output = fixture.service_cli(&["codex", "exec", "synthetic"]);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(fixture.probes.load(Ordering::Relaxed) > 0);
     assert!(fixture.receipts.lock().unwrap().is_empty());
 }
 

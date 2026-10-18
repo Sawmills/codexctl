@@ -277,8 +277,9 @@ log has `counter_available=false`; the persisted tally then omits that failure.
 Keep this coverage limit separate from the server's accepted-selection count.
 
 The staging and staging-ha rules raise the critical
-`CodexctlAutomaticBillingSelected` alert whenever the automatic billed-selection
-counter is positive, including its first scraped sample. Automatic placement must
+`CodexctlAutomaticBillingSelected` alert for an automatic billed-selection event
+within the last hour, including its first scraped sample. It clears after an
+hour without another event; the cumulative counter stays available. Automatic placement must
 stay on included subscription accounts. Inspect the bounded selection outcome
 logs, use an explicit subscription account, and fix the client placement guard.
 Probes must never produce this alert. The rule is tested with promtool; live

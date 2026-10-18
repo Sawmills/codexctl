@@ -286,7 +286,9 @@ impl RequestOutcome {
         code: Option<&str>,
         retrying: bool,
     ) -> Option<StopReport> {
-        if self.recorded || retrying {
+        // Codex owns HTTP 5xx retries. A relay response cannot prove their
+        // client-side budget was exhausted, regardless of its error code.
+        if self.recorded || retrying || status >= 500 {
             return None;
         }
         let report = StopReport {

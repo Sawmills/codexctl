@@ -13,7 +13,11 @@ spec:
         - record: codexctl:lane_stops:increase1d
           expr: sum by (reason) (increase(codexctl_central_lane_stops_total[1d]))
         - alert: CodexctlAutomaticBillingSelected
-          expr: sum(codexctl_central_billed_selections_total{path="auto"}) > 0
+          expr: |
+            sum(increase(codexctl_central_billed_selections_total{path="auto"}[1h])) > 0
+            or
+            sum(codexctl_central_billed_selections_total{path="auto"}
+              unless codexctl_central_billed_selections_total{path="auto"} offset 1h) > 0
           for: 0m
           labels:
             severity: critical

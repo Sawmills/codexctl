@@ -2308,6 +2308,7 @@ mod tests {
             central_events: Some(sender),
             central_dropped: dropped.clone(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         let labels = Labels {
             thread: "thread".into(),
@@ -2355,6 +2356,7 @@ mod tests {
             central_events: None,
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         relay
             .stream_log
@@ -2385,6 +2387,7 @@ mod tests {
             central_events: None,
             central_dropped: Arc::default(),
             evidence: evidence::Evidence::start(None).unwrap().0,
+            outcomes: Outcomes::default(),
         };
         let labels = Labels {
             thread: "thread".into(),

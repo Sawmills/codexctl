@@ -150,6 +150,28 @@ async fn native_stream_retry_codes_do_not_prove_a_terminal_account_stop() {
 }
 
 #[tokio::test]
+async fn native_http_server_retries_do_not_count_as_capacity_lane_stops() {
+    let overloaded = r#"{"error":{"code":"server_is_overloaded"}}"#;
+    let h = harness(vec![
+        Scripted::Status(503, vec![], overloaded.into()),
+        Scripted::Status(500, vec![], overloaded.into()),
+        Scripted::Sse(vec![COMPLETED.into()]),
+    ])
+    .await;
+    for status in [503, 500] {
+        let response = h.post("client-retries-5xx").await;
+        assert_eq!(response.status(), status);
+        assert_eq!(response.text().await.unwrap(), overloaded);
+    }
+    let _ = h.post("client-retries-5xx").await.bytes().await.unwrap();
+    let metrics = h.metrics().await;
+    assert!(
+        metrics.contains("codexctl_relay_lane_stops_total{reason=\"capacity\"} 0\n"),
+        "{metrics}"
+    );
+}
+
+#[tokio::test]
 async fn terminal_stop_is_reported_once_without_identity_or_payload_fields() {
     let (events, mut received) = mpsc::channel(4);
     let app = Router::new()
