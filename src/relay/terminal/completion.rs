@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+use super::diagnostics::{self, Reason};
 use super::{Action, MAX_LINE, MESSAGE, Receipt, Turn, identity, valid_id};
 use anyhow::{Context, Result};
 
@@ -40,7 +41,7 @@ impl Watch {
                     .timeout(Duration::from_millis(250))
                     .build();
                 let Ok(client) = client else {
-                    eprintln!("terminal_capacity_report_failed reason=client_unavailable");
+                    diagnostics::record(&root, Reason::ClientUnavailable);
                     return;
                 };
                 let send = |receipt: &Receipt| -> Result<reqwest::blocking::Response> {
@@ -69,7 +70,11 @@ impl Watch {
                         response.take(4097).read_to_end(&mut bytes)?;
                         anyhow::ensure!(bytes.len() <= 4096, "pending receipt response too large");
                         let turns: Vec<Turn> = serde_json::from_slice(&bytes)?;
-                        state_warned.retain(|(thread, id)| turns.iter().any(|turn| thread == &turn.thread_id && id == &turn.turn_id));
+                        state_warned.retain(|(thread, id)| {
+                            turns
+                                .iter()
+                                .any(|turn| thread == &turn.thread_id && id == &turn.turn_id)
+                        });
                         for turn in turns.into_iter().take(8) {
                             if !valid_id(&turn.thread_id) || !valid_id(&turn.turn_id) {
                                 continue;
@@ -78,25 +83,25 @@ impl Watch {
                                 Ok(true) => Action::Confirm,
                                 Ok(false) => continue,
                                 Err(_) => {
-                                    if state_warned.insert((turn.thread_id.clone(), turn.turn_id.clone())) {
-                                        eprintln!("terminal_capacity_report_failed reason=native_state_unavailable");
+                                    if state_warned
+                                        .insert((turn.thread_id.clone(), turn.turn_id.clone()))
+                                    {
+                                        diagnostics::record(&root, Reason::NativeStateUnavailable);
                                     }
                                     Action::NativeStateUnavailable
                                 }
                             };
-                                send(&Receipt {
-                                    thread_id: Some(turn.thread_id),
-                                    turn_id: Some(turn.turn_id),
-                                    launch_id: Some(launch.clone()),
-                                    action,
-                                })?;
+                            send(&Receipt {
+                                thread_id: Some(turn.thread_id),
+                                turn_id: Some(turn.turn_id),
+                                launch_id: Some(launch.clone()),
+                                action,
+                            })?;
                         }
                         Ok(())
                     };
                     if poll().is_err() && !warned {
-                        eprintln!(
-                            "terminal_capacity_report_failed reason=native_completion_unavailable"
-                        );
+                        diagnostics::record(&root, Reason::NativeCompletionUnavailable);
                         warned = true;
                     }
                     if closing {

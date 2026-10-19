@@ -22,6 +22,7 @@ const MAX_PENDING: usize = 1024;
 const MAX_LINE: usize = 64 * 1024;
 const TTL: Duration = Duration::from_secs(600);
 mod completion;
+mod diagnostics;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,7 +286,10 @@ impl TerminalObserver {
             match completion::Watch::start(paths, listen, launch.clone()) {
                 Ok(watch) => Some(watch),
                 Err(_) => {
-                    eprintln!("terminal_capacity_report_failed reason=watcher_start_failed");
+                    diagnostics::record(
+                        &paths.codexctl_dir(),
+                        diagnostics::Reason::WatcherStartFailed,
+                    );
                     None
                 }
             }
@@ -397,7 +401,7 @@ impl TerminalObserver {
             Ok(())
         };
         if send().is_err() {
-            eprintln!("terminal_capacity_report_failed reason=delivery_failed");
+            diagnostics::record(root, diagnostics::Reason::DeliveryFailed);
         }
     }
 }

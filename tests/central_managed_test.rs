@@ -13784,9 +13784,16 @@ sys.exit(17)
             metrics.contains("codexctl_relay_capacity_confirm_unavailable_total 1\n"),
             "{metrics}"
         );
+        assert!(
+            !String::from_utf8_lossy(&launched.stderr).contains("terminal_capacity_report_failed")
+        );
+        let diagnostics =
+            std::fs::read_to_string(home.path().join(".codexctl/terminal-capacity.jsonl")).unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&launched.stderr)
-                .matches("reason=native_state_unavailable")
+            diagnostics
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|row| row["reason"] == "native_state_unavailable")
                 .count(),
             1
         );
