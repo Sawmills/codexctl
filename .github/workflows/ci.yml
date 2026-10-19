@@ -20,8 +20,29 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  preflight:
+    name: PR preflight
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          test -n "$TITLE"
+          [[ "$TITLE" != *$'\n'* ]]
+      - name: Format
+        run: cargo fmt --all -- --check
+
   check:
     name: Check
+    needs: preflight
+    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
     # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
     runs-on: namespace-profile-fleet-small
     services:
@@ -48,9 +69,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Format
-        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-targets
@@ -88,20 +106,12 @@ jobs:
   trunk:
     name: Trunk Check
     needs: check
-    # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
-    runs-on: namespace-profile-fleet-small
+    if: ${{ always() && github.event_name != 'merge_group' && needs.check.result == 'success' }}
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Cache Trunk and Rust artifacts
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        # yamllint disable-line rule:line-length
-        uses: namespacelabs/nscloud-cache-action@15799a6b54e5765f85b2aac25b3f0df43ed571c0
-        with:
-          cache: rust
-          path: |
-            /home/runner/.cache/trunk
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
