@@ -254,8 +254,10 @@ terminal reports. These are the same events as the local counter, so do not add
 the two counters together. Reports use the existing best-effort queue and machine
 rate limit; the local counter can exceed the server counter when reporting fails.
 Use `codexctl_relay_central_dropped_total` to identify incomplete server coverage.
-All four reason series start at zero. The process counters restart at zero;
+All five reason series start at zero. The process counters restart at zero;
 retained evidence survives a relay restart within its retention and size bounds.
+Deploy an account server that understands `capacity_unconfirmed` before
+upgrading relays that may emit it.
 
 The HA rules record `codexctl:lane_stops:increase1d` by reason for dashboards.
 Prometheus derives this rolling daily increase from samples; it is not an exact
