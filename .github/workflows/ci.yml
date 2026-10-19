@@ -43,8 +43,6 @@ jobs:
 
   check:
     name: Check
-    needs: preflight
-    if: ${{ always() && (needs.preflight.result == 'success' || needs.preflight.result == 'skipped') }}
     # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
     runs-on: namespace-profile-fleet-small
     services:
@@ -113,8 +111,7 @@ jobs:
 
   trunk:
     name: Trunk Check
-    needs: check
-    if: ${{ always() && github.event_name != 'merge_group' && needs.check.result == 'success' }}
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
