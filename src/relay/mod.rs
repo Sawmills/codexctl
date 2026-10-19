@@ -620,11 +620,7 @@ impl Relay {
         let report = report.with_request(labels.account_alias.as_deref(), labels.route, request_id);
         // An already-counted terminal capacity response needs no second
         // confirmation, including HTTP retries without native turn metadata.
-        if matches!(
-            report.lane_stop,
-            crate::outcomes::StopReason::Capacity
-                | crate::outcomes::StopReason::CapacityUnconfirmed
-        ) {
+        if report.lane_stop == crate::outcomes::StopReason::Capacity {
             self.terminal
                 .lock()
                 .expect("terminal receipt lock")

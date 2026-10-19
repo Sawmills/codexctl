@@ -13521,6 +13521,16 @@ fn explicit_pinned_missing_native_state_is_visible_without_changing_launch_statu
 }
 
 #[test]
+fn explicit_pinned_startup_native_state_race_does_not_emit_unconfirmed_stop() {
+    pinned_capacity_receipt("startup_race");
+}
+
+#[test]
+fn explicit_pinned_nonmatching_native_state_report_is_ignored() {
+    pinned_capacity_receipt("nonmatching");
+}
+
+#[test]
 #[ignore = "manual installed Codex protocol proof; set SAW13482_REAL_CODEX to the native binary"]
 fn explicit_pinned_real_native_capacity_completion() {
     assert!(std::env::var_os("SAW13482_REAL_CODEX").is_some());
@@ -13641,7 +13651,7 @@ fn pinned_capacity_receipt(presentation: &str) {
     }
     let bin = home.path().join("bin");
     store::atomic_write(&bin.join("codex"), br##"#!/usr/bin/env python3
-import json, os, re, sqlite3, sys, urllib.error, urllib.request
+import base64, hashlib, hmac, json, os, re, sqlite3, sys, time, urllib.error, urllib.request
 from pathlib import Path
 values = dict(arg.split('=', 1) for arg in sys.argv[1:] if arg.startswith('model_providers.codexctl-central.') and '=' in arg)
 url = json.loads(values['model_providers.codexctl-central.base_url']) + '/responses'
@@ -13673,6 +13683,31 @@ for _ in range(3):
     except urllib.error.HTTPError as error:
         assert error.code == 503
         error.read()
+if os.environ['PRESENTATION'] == 'startup_race':
+    (native / 'state_5.sqlite').rename(native / 'state_6.sqlite')
+    diagnostics = Path.home() / '.codexctl' / 'terminal-capacity.jsonl'
+    deadline = time.time() + 2
+    while time.time() < deadline and (not diagnostics.exists() or 'native_state_unavailable' not in diagnostics.read_text()):
+        time.sleep(0.05)
+    assert diagnostics.exists() and 'native_state_unavailable' in diagnostics.read_text()
+    (native / 'state_6.sqlite').rename(native / 'state_5.sqlite')
+if os.environ['PRESENTATION'] == 'nonmatching':
+    receipt = json.dumps({
+        'thread_id': '99999999-2222-4333-8444-555555555555',
+        'launch_id': headers['X-Codexctl-Launch-Id'],
+        'turn_id': '99999999-2222-4333-8444-666666666666',
+        'action': 'native_state_unavailable',
+    }, separators=(',', ':')).encode()
+    identity = next((Path.home() / '.codexctl' / 'relay' / 'identity').glob('v1-*.key')).read_bytes()
+    address = url.split('/backend-api', 1)[0].removeprefix('http://')
+    mac = hmac.new(identity, b'codexctl-terminal-capacity-v1\0' + address.encode() + b'\0' + receipt, hashlib.sha256).digest()
+    signature = base64.urlsafe_b64encode(mac).rstrip(b'=').decode()
+    response = urllib.request.urlopen(urllib.request.Request(
+        url.split('/backend-api', 1)[0] + '/v1/terminal-capacity',
+        data=receipt,
+        headers={'content-type': 'application/json', 'x-codexctl-receipt': signature},
+    ))
+    assert response.status == 204
 # Unrelated successful traffic must not clear this thread's pending failure.
 urllib.request.urlopen(urllib.request.Request(url, data=b'{}', headers=dict(headers, **{'thread-id':'99999999-2222-4333-8444-555555555555'}))).read()
 urllib.request.urlopen(urllib.request.Request(url.replace('/responses','/models'), headers=headers)).read()
@@ -13807,6 +13842,18 @@ sys.exit(17)
                 .count(),
             1
         );
+    } else if matches!(presentation, "startup_race" | "nonmatching") {
+        assert!(
+            !metrics
+                .contains("codexctl_relay_lane_stops_total{reason=\"capacity_unconfirmed\"} 1\n"),
+            "{metrics}"
+        );
+        if presentation == "startup_race" {
+            let diagnostics =
+                std::fs::read_to_string(home.path().join(".codexctl/terminal-capacity.jsonl"))
+                    .unwrap();
+            assert!(diagnostics.contains("native_state_unavailable"));
+        }
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {

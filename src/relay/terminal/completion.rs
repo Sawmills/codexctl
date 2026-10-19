@@ -88,6 +88,14 @@ impl Watch {
                                     {
                                         diagnostics::record(&root, Reason::NativeStateUnavailable);
                                     }
+                                    // A live turn may still be retrying while its
+                                    // native state is temporarily unreadable.
+                                    // Defer the unconfirmed receipt until the
+                                    // launch closes so a later confirmed result
+                                    // wins and the pending failure stays intact.
+                                    if !closing {
+                                        continue;
+                                    }
                                     Action::NativeStateUnavailable
                                 }
                             };
