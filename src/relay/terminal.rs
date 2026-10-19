@@ -244,6 +244,9 @@ pub(super) fn accept(
             pending.unavailable = pending.unavailable.saturating_add(1);
             diagnostic = true;
         }
+        if report.is_some() {
+            pending.failures.remove(&key);
+        }
         drop(pending);
         if diagnostic {
             (relay.log)(
