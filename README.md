@@ -598,3 +598,6 @@ See [server setup, migration, and staging deployment](docs/central-server.md).
 `codexctl relay` keeps an opted-in Codex lane working through short OpenAI 429 and
 "model at capacity" stops. It adds retry advice that Codex honors and passes everything
 else through. See [the relay guide](docs/relay.md).
+
+Launcher capacity-report diagnostics go to the private
+`~/.codexctl/terminal-capacity.jsonl` log, keeping the Codex terminal clear.
