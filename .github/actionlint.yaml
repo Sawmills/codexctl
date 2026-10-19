@@ -4,3 +4,4 @@ self-hosted-runner:
     - namespace-profile-sawmills-runner-arm64
     - namespace-profile-fleet-small
     - namespace-profile-fleet-medium
+    - ubuntu-slim

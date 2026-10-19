@@ -111,7 +111,6 @@ jobs:
 
   trunk:
     name: Trunk Check
-    if: github.event_name != 'merge_group'
     runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
