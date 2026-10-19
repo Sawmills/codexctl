@@ -81,7 +81,7 @@ async fn terminal_outcomes_count_auth_and_repeated_capacity_frames_once_per_requ
         .lines()
         .filter(|line| line.starts_with("codexctl_relay_lane_stops_total{"))
         .collect();
-    assert_eq!(counters.len(), 4, "only bounded reasons: {metrics}");
+    assert_eq!(counters.len(), 5, "only bounded reasons: {metrics}");
     assert!(
         !counters
             .iter()
