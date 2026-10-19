@@ -22,8 +22,8 @@ env:
 jobs:
   check:
     name: Check
-    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: namespace-profile-sawmills-runner
+    # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
+    runs-on: namespace-profile-fleet-small
     services:
       postgres:
         image: postgres:16
@@ -88,8 +88,8 @@ jobs:
   trunk:
     name: Trunk Check
     needs: check
-    # trunk-ignore(actionlint/runner-label): Namespace profile
-    runs-on: namespace-profile-sawmills-runner
+    # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
+    runs-on: namespace-profile-fleet-small
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
