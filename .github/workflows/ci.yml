@@ -3,8 +3,12 @@ name: CI
 on:
   push:
     branches: [main]
+    tags:
+      - v*
   pull_request:
     branches: [main]
+  merge_group: {}
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -68,6 +72,7 @@ jobs:
 
   audit:
     name: Dependency Audit
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     # trunk-ignore(actionlint/runner-label): Existing Namespace profile
     runs-on: namespace-profile-sawmills-runner
     permissions:
@@ -85,7 +90,7 @@ jobs:
   trunk:
     name: Trunk Check
     # trunk-ignore(actionlint/runner-label): Namespace profile
-    runs-on: namespace-profile-sawmills-runner-large
+    runs-on: namespace-profile-sawmills-runner
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -127,6 +132,7 @@ jobs:
 
   build-windows:
     name: Build (Windows)
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

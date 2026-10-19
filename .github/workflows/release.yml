@@ -6,6 +6,10 @@ on:
       - v*
   workflow_dispatch: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -79,6 +83,7 @@ jobs:
         shell: bash
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - os: macos-14
