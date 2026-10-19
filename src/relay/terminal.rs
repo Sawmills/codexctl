@@ -207,16 +207,30 @@ pub(super) fn accept(
         if receipt.turn_id.is_none() || receipt.launch_id.is_none() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        if let Some(failure) = pending.failures.get_mut(&key)
-            && failure.observed.elapsed() < TTL
-            && !failure.unavailable_reported
-        {
-            failure.unavailable_reported = true;
+        if pending.failures.get(&key).is_some_and(|failure| {
+            failure.observed.elapsed() < TTL && !failure.unavailable_reported
+        }) {
+            let (labels, request_id, status) = {
+                let failure = pending.failures.get_mut(&key).expect("pending failure");
+                failure.unavailable_reported = true;
+                (
+                    failure.labels.clone(),
+                    failure.request_id.clone(),
+                    failure.status,
+                )
+            };
             pending.unavailable = pending.unavailable.saturating_add(1);
+            let report = StopReport::new(
+                StopReason::CapacityUnconfirmed,
+                status,
+                Some("capacity_unconfirmed"),
+            );
             drop(pending);
             (relay.log)(
                 "{\"component\":\"codexctl-relay\",\"level\":\"warning\",\"reason\":\"native_state_unavailable\"}",
             );
+            relay.outcomes.stopped(&report);
+            relay.lane_stop(report, &labels, request_id.as_deref(), status);
         }
         return StatusCode::NO_CONTENT.into_response();
     }

@@ -20,14 +20,16 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum StopReason {
     RateLimited,
     Capacity,
+    CapacityUnconfirmed,
     LoginRequired,
     TokenRefused,
 }
 
 impl StopReason {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::RateLimited,
         Self::Capacity,
+        Self::CapacityUnconfirmed,
         Self::LoginRequired,
         Self::TokenRefused,
     ];
@@ -36,6 +38,7 @@ impl StopReason {
         match self {
             Self::RateLimited => "rate_limited",
             Self::Capacity => "capacity",
+            Self::CapacityUnconfirmed => "capacity_unconfirmed",
             Self::LoginRequired => "login_required",
             Self::TokenRefused => "token_refused",
         }
@@ -155,6 +158,7 @@ pub(crate) fn request_id(value: &str) -> Option<String> {
 pub(crate) fn error_class(value: &str) -> &'static str {
     match value {
         "server_is_overloaded" => "server_is_overloaded",
+        "capacity_unconfirmed" => "capacity_unconfirmed",
         "rate_limit_exceeded" => "rate_limit_exceeded",
         "slow_down" => "slow_down",
         "usage_limit_reached" => "usage_limit_reached",
@@ -205,7 +209,7 @@ type StopLog = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Outcomes {
-    stops: Arc<[AtomicU64; 4]>,
+    stops: Arc<[AtomicU64; 5]>,
     billed: Arc<[AtomicU64; 2]>,
     report_root: Option<Arc<PathBuf>>,
     stop_log: Option<StopLog>,

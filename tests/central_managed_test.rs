@@ -13761,10 +13761,11 @@ sys.exit(17)
         assert!(String::from_utf8_lossy(&launched.stderr).contains("SYNTHETIC-STDERR-WARNING"));
     }
     assert!(!String::from_utf8_lossy(&launched.stdout).contains("SYNTHETIC-STDERR-WARNING"));
-    let expected = if matches!(presentation, "historical" | "missingstate") {
-        0
+    let expected = if presentation == "historical" { 0 } else { 1 };
+    let expected_reason = if presentation == "missingstate" {
+        "capacity_unconfirmed"
     } else {
-        1
+        "capacity"
     };
     let metrics = server
         .http
@@ -13775,13 +13776,22 @@ sys.exit(17)
         .unwrap();
     assert!(
         metrics.contains(&format!(
-            "codexctl_relay_lane_stops_total{{reason=\"capacity\"}} {expected}\n"
+            "codexctl_relay_lane_stops_total{{reason=\"{expected_reason}\"}} {expected}\n"
         )),
         "{metrics}"
     );
     if presentation == "missingstate" {
         assert!(
             metrics.contains("codexctl_relay_capacity_confirm_unavailable_total 1\n"),
+            "{metrics}"
+        );
+        assert!(
+            metrics
+                .contains("codexctl_relay_lane_stops_total{reason=\"capacity_unconfirmed\"} 1\n"),
+            "{metrics}"
+        );
+        assert!(
+            !metrics.contains("codexctl_relay_lane_stops_total{reason=\"capacity\"} 1\n"),
             "{metrics}"
         );
         assert!(
@@ -13809,7 +13819,7 @@ sys.exit(17)
             .text()
             .unwrap();
         if metrics.contains(&format!(
-            "codexctl_central_lane_stops_total{{reason=\"capacity\"}} {expected}\n"
+            "codexctl_central_lane_stops_total{{reason=\"{expected_reason}\"}} {expected}\n"
         )) {
             break;
         }
