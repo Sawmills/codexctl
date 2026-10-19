@@ -65,6 +65,7 @@ impl Watch {
                             turn_id: None,
                             launch_id: Some(launch.clone()),
                             action: Action::Inspect,
+                            closing: false,
                         })?;
                         let mut bytes = Vec::new();
                         response.take(4097).read_to_end(&mut bytes)?;
@@ -88,14 +89,6 @@ impl Watch {
                                     {
                                         diagnostics::record(&root, Reason::NativeStateUnavailable);
                                     }
-                                    // A live turn may still be retrying while its
-                                    // native state is temporarily unreadable.
-                                    // Defer the unconfirmed receipt until the
-                                    // launch closes so a later confirmed result
-                                    // wins and the pending failure stays intact.
-                                    if !closing {
-                                        continue;
-                                    }
                                     Action::NativeStateUnavailable
                                 }
                             };
@@ -104,6 +97,7 @@ impl Watch {
                                 turn_id: Some(turn.turn_id),
                                 launch_id: Some(launch.clone()),
                                 action,
+                                closing,
                             })?;
                         }
                         Ok(())

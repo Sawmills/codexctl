@@ -42,6 +42,8 @@ struct Receipt {
     turn_id: Option<String>,
     #[serde(default)]
     action: Action,
+    #[serde(default)]
+    closing: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,6 +73,7 @@ struct Failure {
     status: u16,
     observed: Instant,
     unavailable_reported: bool,
+    unavailable_finalized: bool,
 }
 
 #[derive(Default)]
@@ -116,7 +119,8 @@ impl Pending {
         if !labels.terminal_request {
             return;
         }
-        self.failures.retain(|_, f| f.observed.elapsed() < TTL);
+        self.failures
+            .retain(|_, f| f.unavailable_reported || f.observed.elapsed() < TTL);
         if !(500..600).contains(&status) || code != Some("server_is_overloaded") {
             self.clear(labels);
             return;
@@ -134,6 +138,10 @@ impl Pending {
                 .failures
                 .get(&key)
                 .is_some_and(|f| f.unavailable_reported);
+            let unavailable_finalized = self
+                .failures
+                .get(&key)
+                .is_some_and(|f| f.unavailable_finalized);
             self.failures.insert(
                 key,
                 Failure {
@@ -142,6 +150,7 @@ impl Pending {
                     status,
                     observed: Instant::now(),
                     unavailable_reported,
+                    unavailable_finalized,
                 },
             );
         }
@@ -207,28 +216,41 @@ pub(super) fn accept(
         if receipt.turn_id.is_none() || receipt.launch_id.is_none() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        if pending.failures.get(&key).is_some_and(|failure| {
-            failure.observed.elapsed() < TTL && !failure.unavailable_reported
-        }) {
-            let (labels, request_id, status) = {
-                let failure = pending.failures.get_mut(&key).expect("pending failure");
+        let mut report = None;
+        let mut diagnostic = false;
+        let mut newly_reported = false;
+        if let Some(failure) = pending.failures.get_mut(&key)
+            && (failure.unavailable_reported || failure.observed.elapsed() < TTL)
+        {
+            if !failure.unavailable_reported {
                 failure.unavailable_reported = true;
-                (
+                newly_reported = true;
+            }
+            if receipt.closing && !failure.unavailable_finalized {
+                failure.unavailable_finalized = true;
+                report = Some((
+                    StopReport::new(
+                        StopReason::CapacityUnconfirmed,
+                        failure.status,
+                        Some("capacity_unconfirmed"),
+                    ),
                     failure.labels.clone(),
                     failure.request_id.clone(),
                     failure.status,
-                )
-            };
+                ));
+            }
+        }
+        if newly_reported {
             pending.unavailable = pending.unavailable.saturating_add(1);
-            let report = StopReport::new(
-                StopReason::CapacityUnconfirmed,
-                status,
-                Some("capacity_unconfirmed"),
-            );
-            drop(pending);
+            diagnostic = true;
+        }
+        drop(pending);
+        if diagnostic {
             (relay.log)(
                 "{\"component\":\"codexctl-relay\",\"level\":\"warning\",\"reason\":\"native_state_unavailable\"}",
             );
+        }
+        if let Some((report, labels, request_id, status)) = report {
             relay.outcomes.stopped(&report);
             relay.lane_stop(report, &labels, request_id.as_deref(), status);
         }
@@ -265,7 +287,7 @@ pub(super) fn accept(
     let Some(failure) = failure.filter(|f| f.observed.elapsed() < TTL) else {
         return StatusCode::NO_CONTENT.into_response();
     };
-    if failure.unavailable_reported {
+    if failure.unavailable_finalized {
         return StatusCode::NO_CONTENT.into_response();
     }
     let report = StopReport::new(
@@ -402,6 +424,7 @@ impl TerminalObserver {
                 launch_id: self.launch.clone(),
                 turn_id: None,
                 action,
+                closing: false,
             })?;
             let signature = identity::receipt_signature(root, *listen, &body)?;
             let response = reqwest::blocking::Client::builder()
