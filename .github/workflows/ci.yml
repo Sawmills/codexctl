@@ -87,6 +87,7 @@ jobs:
 
   trunk:
     name: Trunk Check
+    needs: check
     # trunk-ignore(actionlint/runner-label): Namespace profile
     runs-on: namespace-profile-sawmills-runner
     steps:

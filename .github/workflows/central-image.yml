@@ -31,7 +31,7 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         include:
           - runner: ubuntu-24.04
