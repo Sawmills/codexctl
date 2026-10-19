@@ -232,10 +232,13 @@ cookies are never included. Stream-failure and terminal-stop logs share a limit 
 change outcome counters, retained evidence, or central reports.
 
 The account server also accepts a typed terminal-outcome report through this same
-authenticated endpoint. It has one field, `lane_stop`, with one of four reasons:
-`rate_limited`, `capacity`, `login_required`, or `token_refused`. It does not accept
-identities, request IDs or messages in that report. General `stream_failure` detail
-stays local.
+authenticated endpoint. It has one field, `lane_stop`, with one of five reasons:
+`rate_limited`, `capacity`, `capacity_unconfirmed`, `login_required`, or
+`token_refused`. `capacity_unconfirmed` is emitted only when an authenticated
+terminal receipt matches a pending `server_is_overloaded` response but native
+completion state is unavailable at launch close; the private diagnostic JSONL alone
+never creates this report. It does not accept identities, request IDs or messages in
+that report. General `stream_failure` detail stays local.
 
 `codexctl_relay_lane_stops_total{reason}` counts a terminal account failure once per
 HTTP request or SSE response. Exhausted HTTP 429 and capacity retry budgets count;
@@ -251,8 +254,10 @@ terminal reports. These are the same events as the local counter, so do not add
 the two counters together. Reports use the existing best-effort queue and machine
 rate limit; the local counter can exceed the server counter when reporting fails.
 Use `codexctl_relay_central_dropped_total` to identify incomplete server coverage.
-All four reason series start at zero. The process counters restart at zero;
+All five reason series start at zero. The process counters restart at zero;
 retained evidence survives a relay restart within its retention and size bounds.
+Deploy an account server that understands `capacity_unconfirmed` before
+upgrading relays that may emit it.
 
 The HA rules record `codexctl:lane_stops:increase1d` by reason for dashboards.
 Prometheus derives this rolling daily increase from samples; it is not an exact

@@ -65,6 +65,7 @@ impl Watch {
                             turn_id: None,
                             launch_id: Some(launch.clone()),
                             action: Action::Inspect,
+                            closing: false,
                         })?;
                         let mut bytes = Vec::new();
                         response.take(4097).read_to_end(&mut bytes)?;
@@ -96,6 +97,7 @@ impl Watch {
                                 turn_id: Some(turn.turn_id),
                                 launch_id: Some(launch.clone()),
                                 action,
+                                closing,
                             })?;
                         }
                         Ok(())

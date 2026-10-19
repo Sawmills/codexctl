@@ -21,6 +21,7 @@ const MESSAGE: &str = "Selected model is at capacity. Please try a different mod
 const MAX_PENDING: usize = 1024;
 const MAX_LINE: usize = 64 * 1024;
 const TTL: Duration = Duration::from_secs(600);
+const UNAVAILABLE_TTL: Duration = Duration::from_secs(3600);
 mod completion;
 mod diagnostics;
 
@@ -42,6 +43,8 @@ struct Receipt {
     turn_id: Option<String>,
     #[serde(default)]
     action: Action,
+    #[serde(default)]
+    closing: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,6 +74,25 @@ struct Failure {
     status: u16,
     observed: Instant,
     unavailable_reported: bool,
+}
+
+struct UnavailableObservation {
+    newly_reported: bool,
+    report: Option<(StopReport, Labels, Option<String>, u16)>,
+}
+
+impl Failure {
+    fn ttl(&self) -> Duration {
+        if self.unavailable_reported {
+            UNAVAILABLE_TTL
+        } else {
+            TTL
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.observed.elapsed() < self.ttl()
+    }
 }
 
 #[derive(Default)]
@@ -116,7 +138,7 @@ impl Pending {
         if !labels.terminal_request {
             return;
         }
-        self.failures.retain(|_, f| f.observed.elapsed() < TTL);
+        self.failures.retain(|_, f| f.live());
         if !(500..600).contains(&status) || code != Some("server_is_overloaded") {
             self.clear(labels);
             return;
@@ -153,6 +175,45 @@ impl Pending {
             self.unavailable
         )
     }
+
+    fn mark_unavailable(&mut self, key: &str, closing: bool) -> Option<UnavailableObservation> {
+        let (newly_reported, report) = {
+            let failure = self.failures.get_mut(key)?;
+            if !failure.live() {
+                return None;
+            }
+            let newly_reported = !failure.unavailable_reported;
+            failure.unavailable_reported = true;
+            if !closing {
+                // The watcher polls every 200 ms while the native state is
+                // unavailable. Keep the bounded evidence alive while those
+                // polls continue, but let a silent watcher expire it.
+                failure.observed = Instant::now();
+                (newly_reported, None)
+            } else {
+                (
+                    newly_reported,
+                    Some((
+                        StopReport::new(
+                            StopReason::CapacityUnconfirmed,
+                            failure.status,
+                            Some("capacity_unconfirmed"),
+                        ),
+                        failure.labels.clone(),
+                        failure.request_id.clone(),
+                        failure.status,
+                    )),
+                )
+            }
+        };
+        if report.is_some() {
+            self.failures.remove(key);
+        }
+        Some(UnavailableObservation {
+            newly_reported,
+            report,
+        })
+    }
 }
 
 pub(super) fn accept(
@@ -179,7 +240,7 @@ pub(super) fn accept(
         let turns: Vec<_> = pending
             .failures
             .values()
-            .filter(|f| f.observed.elapsed() < TTL && f.labels.launch_id.as_deref() == Some(launch))
+            .filter(|f| f.live() && f.labels.launch_id.as_deref() == Some(launch))
             .filter_map(|f| {
                 Some(Turn {
                     thread_id: f.labels.thread.clone(),
@@ -207,16 +268,24 @@ pub(super) fn accept(
         if receipt.turn_id.is_none() || receipt.launch_id.is_none() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        if let Some(failure) = pending.failures.get_mut(&key)
-            && failure.observed.elapsed() < TTL
-            && !failure.unavailable_reported
-        {
-            failure.unavailable_reported = true;
+        let mut report = None;
+        let mut diagnostic = false;
+        if let Some(observation) = pending.mark_unavailable(&key, receipt.closing) {
+            diagnostic = observation.newly_reported;
+            report = observation.report;
+        }
+        if diagnostic {
             pending.unavailable = pending.unavailable.saturating_add(1);
-            drop(pending);
+        }
+        drop(pending);
+        if diagnostic {
             (relay.log)(
                 "{\"component\":\"codexctl-relay\",\"level\":\"warning\",\"reason\":\"native_state_unavailable\"}",
             );
+        }
+        if let Some((report, labels, request_id, status)) = report {
+            relay.outcomes.stopped(&report);
+            relay.lane_stop(report, &labels, request_id.as_deref(), status);
         }
         return StatusCode::NO_CONTENT.into_response();
     }
@@ -248,20 +317,21 @@ pub(super) fn accept(
     }
     let failure = pending.failures.remove(&key);
     drop(pending);
-    if let Some(failure) = failure.filter(|f| f.observed.elapsed() < TTL) {
-        let report = StopReport::new(
-            StopReason::Capacity,
-            failure.status,
-            Some("server_is_overloaded"),
-        );
-        relay.outcomes.stopped(&report);
-        relay.lane_stop(
-            report,
-            &failure.labels,
-            failure.request_id.as_deref(),
-            failure.status,
-        );
-    }
+    let Some(failure) = failure.filter(Failure::live) else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    let report = StopReport::new(
+        StopReason::Capacity,
+        failure.status,
+        Some("server_is_overloaded"),
+    );
+    relay.outcomes.stopped(&report);
+    relay.lane_stop(
+        report,
+        &failure.labels,
+        failure.request_id.as_deref(),
+        failure.status,
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -384,6 +454,7 @@ impl TerminalObserver {
                 launch_id: self.launch.clone(),
                 turn_id: None,
                 action,
+                closing: false,
             })?;
             let signature = identity::receipt_signature(root, *listen, &body)?;
             let response = reqwest::blocking::Client::builder()
@@ -403,5 +474,79 @@ impl TerminalObserver {
         if send().is_err() {
             diagnostics::record(root, diagnostics::Reason::DeliveryFailed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failure(observed: Instant, unavailable_reported: bool) -> Failure {
+        Failure {
+            labels: Labels {
+                thread: "11111111-2222-4333-8444-555555555555".into(),
+                route: "/backend-api/codex/responses",
+                model: "gpt-6.1-sol".into(),
+                account_class: "subscription",
+                account_alias: Some("lane".into()),
+                launch_id: Some("11111111-2222-4333-8444-666666666666".into()),
+                turn_id: Some("11111111-2222-4333-8444-777777777777".into()),
+                terminal_request: true,
+            },
+            request_id: None,
+            status: 503,
+            observed,
+            unavailable_reported,
+        }
+    }
+
+    #[test]
+    fn unavailable_receipts_refresh_then_close_within_bounded_window() {
+        let now = Instant::now();
+        let normal = failure(now - TTL - Duration::from_secs(1), false);
+        assert!(!normal.live());
+
+        let thread = "11111111-2222-4333-8444-555555555555";
+        let launch = "11111111-2222-4333-8444-666666666666";
+        let turn = "11111111-2222-4333-8444-777777777777";
+        let receipt_key = key(Some(thread), Some(launch), Some(turn)).unwrap();
+        let mut pending = Pending::default();
+        pending
+            .failures
+            .insert(receipt_key.clone(), failure(now, false));
+
+        let first = pending.mark_unavailable(&receipt_key, false).unwrap();
+        assert!(first.newly_reported);
+        assert!(first.report.is_none());
+        {
+            let failure = pending.failures.get_mut(&receipt_key).unwrap();
+            failure.observed = Instant::now() - TTL - Duration::from_secs(1);
+        }
+        let refreshed = pending.mark_unavailable(&receipt_key, false).unwrap();
+        assert!(!refreshed.newly_reported);
+        assert!(refreshed.report.is_none());
+        assert!(pending.failures.get(&receipt_key).unwrap().live());
+
+        {
+            let failure = pending.failures.get_mut(&receipt_key).unwrap();
+            failure.observed = Instant::now() - UNAVAILABLE_TTL + Duration::from_secs(1);
+        }
+        let closing = pending.mark_unavailable(&receipt_key, true).unwrap();
+        assert!(!closing.newly_reported);
+        assert!(closing.report.is_some());
+        assert!(!pending.failures.contains_key(&receipt_key));
+
+        let mut silent = Pending::default();
+        silent.failures.insert(
+            receipt_key.clone(),
+            failure(
+                Instant::now() - UNAVAILABLE_TTL - Duration::from_secs(1),
+                true,
+            ),
+        );
+        assert!(silent.mark_unavailable(&receipt_key, true).is_none());
+        let stale_labels = silent.failures.get(&receipt_key).unwrap().labels.clone();
+        silent.observe(&stale_labels, 200, None, None);
+        assert!(!silent.failures.contains_key(&receipt_key));
     }
 }
