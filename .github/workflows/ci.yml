@@ -43,8 +43,8 @@ jobs:
 
   check:
     name: Check
-    # trunk-ignore(actionlint/runner-label): Namespace fleet-small profile
-    runs-on: namespace-profile-fleet-small
+    # trunk-ignore(actionlint/runner-label): Namespace fleet-medium profile
+    runs-on: namespace-profile-fleet-medium
     services:
       postgres:
         image: postgres:16
