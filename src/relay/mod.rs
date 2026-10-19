@@ -433,6 +433,7 @@ pub async fn serve(
 #[derive(Clone)]
 struct Labels {
     thread: String,
+    route: &'static str,
     model: String,
     account_class: &'static str,
     account_alias: Option<String>,
@@ -485,6 +486,11 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             .as_ref()
             .is_none_or(|v| v["request_kind"] == "turn" && v["thread_source"] == "user");
     let labels = Labels {
+        route: if is_responses {
+            "/backend-api/codex/responses"
+        } else {
+            "/backend-api/codex/*"
+        },
         turn_id: turn_metadata
             .as_ref()
             .and_then(|v| v["turn_id"].as_str())
@@ -495,7 +501,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             .filter(|v| terminal::valid_id(v))
             .map(str::to_owned),
         account_alias: header_str(&parts.headers, "x-codexctl-account-alias")
-            .and_then(evidence::alias),
+            .and_then(crate::outcomes::alias),
         thread,
         model: relay.model_label(&parts.headers, &prefix[..prefix.len().min(MODEL_PREFIX)]),
         account_class: match header_str(&parts.headers, ACCOUNT_CLASS_HEADER) {
@@ -611,6 +617,7 @@ impl Relay {
         request_id: Option<&str>,
         status: u16,
     ) {
+        let report = report.with_request(labels.account_alias.as_deref(), labels.route, request_id);
         // An already-counted terminal capacity response needs no second
         // confirmation, including HTTP retries without native turn metadata.
         if report.lane_stop == crate::outcomes::StopReason::Capacity {
@@ -2379,6 +2386,7 @@ mod tests {
         };
         let labels = Labels {
             thread: "thread".into(),
+            route: "/backend-api/codex/responses",
             model: "gpt-6.1-sol".into(),
             account_class: "included",
             account_alias: None,
@@ -2463,6 +2471,7 @@ mod tests {
         };
         let labels = Labels {
             thread: "thread".into(),
+            route: "/backend-api/codex/responses",
             model: "gpt-6.1-sol".into(),
             account_class: "included",
             account_alias: None,

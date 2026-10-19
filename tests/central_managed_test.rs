@@ -7563,7 +7563,7 @@ fn terminal_lane_stop_reports_are_authenticated_bounded_and_counted_once() {
     }
     for bad in [
         json!({"lane_stop":"private-alias"}),
-        json!({"lane_stop":"capacity","request_id":"req-secret"}),
+        json!({"lane_stop":"capacity","credential":"synthetic-secret"}),
     ] {
         assert_eq!(
             server
@@ -7603,6 +7603,73 @@ fn terminal_lane_stop_reports_are_authenticated_bounded_and_counted_once() {
         );
     }
     assert!(!metrics.contains("private-alias") && !metrics.contains("req-secret"));
+}
+
+#[test]
+fn terminal_lane_stop_log_contains_safe_request_context() {
+    let server = Server::start();
+    let endpoint = format!("{}/v1/relay/capacity-events", server.url);
+    let report = json!({
+        "lane_stop": "rate_limited", "http_status": 429,
+        "error_code": "rate_limit_exceeded", "account_alias": "synthetic-seat",
+        "route": "/backend-api/codex/responses", "request_id": "req-synthetic-stop"
+    });
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .json(&report)
+            .send()
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        server
+            .http
+            .post(&endpoint)
+            .bearer_auth(&server.amir)
+            .json(&report)
+            .send()
+            .unwrap()
+            .status(),
+        204
+    );
+    let logs = std::fs::read_to_string(server.root.path().join("server.stderr")).unwrap();
+    let stops: Vec<Value> = logs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line["outcome"] == "lane_stop")
+        .collect();
+    assert_eq!(
+        stops.len(),
+        1,
+        "one accepted stop, no unauthenticated log: {logs}"
+    );
+    assert_eq!(stops[0]["level"], "WARN");
+    assert_eq!(stops[0]["reason"], "rate_limited");
+    for key in [
+        "http_status",
+        "error_code",
+        "account_alias",
+        "route",
+        "request_id",
+    ] {
+        assert_eq!(stops[0][key], report[key], "{key}: {logs}");
+    }
+    assert!(
+        !logs.contains(&server.amir),
+        "never log the reporter credential"
+    );
+    let metrics = server
+        .http
+        .get(format!("{}/metrics", server.url))
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    assert!(metrics.contains("codexctl_central_lane_stops_total{reason=\"rate_limited\"} 1\n"));
+    assert!(!metrics.contains("synthetic-seat") && !metrics.contains("req-synthetic-stop"));
 }
 
 #[test]

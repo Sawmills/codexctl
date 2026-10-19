@@ -356,7 +356,7 @@ impl Broker {
         let key = match event {
             AcceptedRelayEvent::Capacity(key) => key,
             AcceptedRelayEvent::Stop(report) => {
-                self.outcomes.stopped(report);
+                self.outcomes.stopped(&report);
                 return Ok(true);
             }
             AcceptedRelayEvent::Selection(report) => {
@@ -2937,7 +2937,7 @@ pub async fn serve(
             .collect(),
         )),
         relay_metrics: Arc::new(StdMutex::new(RelayMetrics::default())),
-        outcomes: crate::outcomes::Outcomes::default(),
+        outcomes: crate::outcomes::Outcomes::with_stop_log(|line| eprintln!("{line}")),
         work: Arc::new(Semaphore::new(128)),
         session_writes: Arc::new(Semaphore::new(32)),
         stopping: Arc::new(AtomicBool::new(false)),

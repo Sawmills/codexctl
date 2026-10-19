@@ -66,11 +66,117 @@ impl StopReason {
     }
 }
 
-/// The wire schema cannot carry an alias, credential, or arbitrary reason label.
-#[derive(Clone, Copy, Serialize, Deserialize)]
+/// Diagnostic context never becomes a metric label. Normalize before sending
+/// and again before logging an authenticated client's report.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StopReport {
     pub(crate) lane_stop: StopReason,
+    http_status: Option<u16>,
+    error_code: Option<String>,
+    account_alias: Option<String>,
+    route: Option<String>,
+    request_id: Option<String>,
+}
+
+impl StopReport {
+    pub(crate) fn new(reason: StopReason, status: u16, code: Option<&str>) -> Self {
+        Self {
+            lane_stop: reason,
+            http_status: Some(status),
+            error_code: code.map(error_class).map(str::to_owned),
+            account_alias: None,
+            route: None,
+            request_id: None,
+        }
+    }
+
+    pub(crate) fn with_request(
+        mut self,
+        account_alias: Option<&str>,
+        route: &str,
+        upstream_request_id: Option<&str>,
+    ) -> Self {
+        self.account_alias = account_alias.and_then(alias);
+        self.route = stop_route(route).map(str::to_owned);
+        self.request_id = upstream_request_id.and_then(request_id);
+        self
+    }
+
+    fn log(&self) -> String {
+        serde_json::json!({
+            "ts": chrono::Utc::now().to_rfc3339(), "level": "WARN",
+            "outcome": "lane_stop", "reason": self.lane_stop,
+            "http_status": self.http_status.filter(|s| (100..600).contains(s)),
+            "error_code": self.error_code.as_deref().map(error_class),
+            "account_alias": self.account_alias.as_deref().and_then(alias),
+            "route": self.route.as_deref().and_then(stop_route),
+            "request_id": self.request_id.as_deref().and_then(request_id),
+        })
+        .to_string()
+    }
+}
+
+fn stop_route(value: &str) -> Option<&'static str> {
+    match value {
+        "/backend-api/codex/responses" => Some("/backend-api/codex/responses"),
+        "/backend-api/codex/*" => Some("/backend-api/codex/*"),
+        _ => None,
+    }
+}
+
+pub(crate) fn alias(value: &str) -> Option<String> {
+    crate::store::validate_alias(value)
+        .ok()
+        .filter(|value| {
+            !value.starts_with("sk-") && !value.starts_with("rt-") && !value.starts_with("eyJ")
+        })
+        .map(str::to_owned)
+}
+
+pub(crate) fn request_id(value: &str) -> Option<String> {
+    let uuid = value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        });
+    let named =
+        (value.starts_with("req-") || value.starts_with("req_") || value.starts_with("request-"))
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    (uuid || named).then(|| value.to_owned())
+}
+
+pub(crate) fn error_class(value: &str) -> &'static str {
+    match value {
+        "server_is_overloaded" => "server_is_overloaded",
+        "rate_limit_exceeded" => "rate_limit_exceeded",
+        "slow_down" => "slow_down",
+        "usage_limit_reached" => "usage_limit_reached",
+        "usage_not_included" => "usage_not_included",
+        "insufficient_quota" => "insufficient_quota",
+        "credit_balance_exhausted" => "credit_balance_exhausted",
+        "organization_spend_limit_exceeded" => "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded" => "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded" => "organization_usage_limit_exceeded",
+        "flex_unavailable" => "flex_unavailable",
+        "login_required" => "login_required",
+        "session_expired" => "session_expired",
+        "invalid_grant" => "invalid_grant",
+        "refresh_token_invalidated" => "refresh_token_invalidated",
+        "refresh_token_expired" => "refresh_token_expired",
+        "refresh_token_reused" => "refresh_token_reused",
+        "invalid_api_key" => "invalid_api_key",
+        "invalid_token" => "invalid_token",
+        "token_expired" => "token_expired",
+        "token_refused" => "token_refused",
+        _ => "other",
+    }
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -95,14 +201,24 @@ pub(crate) struct SelectionReport {
     pub(crate) billed_selection: SelectionPath,
 }
 
+type StopLog = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub(crate) struct Outcomes {
     stops: Arc<[AtomicU64; 4]>,
     billed: Arc<[AtomicU64; 2]>,
     report_root: Option<Arc<PathBuf>>,
+    stop_log: Option<StopLog>,
 }
 
 impl Outcomes {
+    pub(crate) fn with_stop_log(log: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        Self {
+            stop_log: Some(Arc::new(log)),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn with_report_root(root: PathBuf) -> Self {
         Self {
             report_root: Some(Arc::new(root)),
@@ -117,8 +233,11 @@ impl Outcomes {
         }
     }
 
-    pub(crate) fn stopped(&self, report: StopReport) {
+    pub(crate) fn stopped(&self, report: &StopReport) {
         self.stops[report.lane_stop as usize].fetch_add(1, Ordering::Relaxed);
+        if let Some(log) = &self.stop_log {
+            log(&report.log());
+        }
     }
 
     pub(crate) fn selected(&self, report: SelectionReport) {
@@ -291,11 +410,127 @@ impl RequestOutcome {
         if self.recorded || retrying || status >= 500 {
             return None;
         }
-        let report = StopReport {
-            lane_stop: StopReason::classify(status, code)?,
-        };
+        let report = StopReport::new(StopReason::classify(status, code)?, status, code);
         self.recorded = true;
-        self.outcomes.stopped(report);
+        self.outcomes.stopped(&report);
         Some(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+
+    fn logged() -> (Outcomes, Arc<Mutex<Vec<Value>>>) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = lines.clone();
+        let outcomes = Outcomes::with_stop_log(move |line| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::from_str(line).unwrap());
+        });
+        (outcomes, lines)
+    }
+
+    #[test]
+    fn terminal_stop_counts_and_logs_once_but_advised_retries_do_neither() {
+        let (outcomes, lines) = logged();
+        let mut request = outcomes.request();
+        assert!(
+            request
+                .terminal(429, Some("rate_limit_exceeded"), true)
+                .is_none()
+        );
+        assert!(lines.lock().unwrap().is_empty());
+        assert!(
+            request
+                .terminal(429, Some("rate_limit_exceeded"), false)
+                .is_some()
+        );
+        assert!(
+            request
+                .terminal(429, Some("rate_limit_exceeded"), false)
+                .is_none()
+        );
+        let logs = lines.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["level"], "WARN");
+        assert_eq!(logs[0]["reason"], "rate_limited");
+        assert_eq!(logs[0]["http_status"], 429);
+        assert_eq!(logs[0]["error_code"], "rate_limit_exceeded");
+        drop(logs);
+        assert!(
+            outcomes
+                .metrics("codexctl_central")
+                .contains("codexctl_central_lane_stops_total{reason=\"rate_limited\"} 1\n")
+        );
+        assert!(
+            outcomes
+                .request()
+                .terminal(503, Some("server_is_overloaded"), false)
+                .is_none()
+        );
+        assert_eq!(lines.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn accepted_stop_preserves_bounded_context_across_the_wire() {
+        let (outcomes, lines) = logged();
+        let report = StopReport::new(StopReason::RateLimited, 429, Some("rate_limit_exceeded"))
+            .with_request(
+                Some("synthetic-seat"),
+                "/backend-api/codex/responses",
+                Some("req-synthetic"),
+            );
+        let wire = serde_json::to_vec(&report).unwrap();
+        outcomes.stopped(&serde_json::from_slice(&wire).unwrap());
+        let logs = lines.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        for (key, value) in [
+            ("reason", json!("rate_limited")),
+            ("http_status", json!(429)),
+            ("error_code", json!("rate_limit_exceeded")),
+            ("account_alias", json!("synthetic-seat")),
+            ("route", json!("/backend-api/codex/responses")),
+            ("request_id", json!("req-synthetic")),
+        ] {
+            assert_eq!(logs[0][key], value, "{key}");
+        }
+        assert!(!outcomes.metrics("codexctl_central").contains("synthetic"));
+    }
+
+    #[test]
+    fn stop_context_drops_secrets_before_sending_and_before_logging() {
+        let context = |status| {
+            json!({
+                "lane_stop":"rate_limited", "http_status":status,
+                "error_code":"sk-synthetic-secret", "account_alias":"sk-synthetic-secret",
+                "route":"/backend-api/codex/responses?token=synthetic-secret",
+                "request_id":"Bearer synthetic-secret"
+            })
+        };
+        let (outcomes, lines) = logged();
+        let hostile: StopReport = serde_json::from_value(context(999)).unwrap();
+        outcomes.stopped(&hostile);
+        let logs = lines.lock().unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0]["error_code"], "other");
+        for key in ["http_status", "account_alias", "route", "request_id"] {
+            assert!(logs[0][key].is_null(), "{key}: {}", logs[0]);
+        }
+        assert!(!logs[0].to_string().contains("synthetic-secret"));
+        let outgoing = StopReport::new(StopReason::RateLimited, 429, Some("sk-synthetic-secret"))
+            .with_request(
+                Some("sk-synthetic-secret"),
+                "/unknown?token=synthetic-secret",
+                Some("Bearer synthetic-secret"),
+            );
+        assert!(
+            !serde_json::to_string(&outgoing)
+                .unwrap()
+                .contains("synthetic-secret")
+        );
     }
 }

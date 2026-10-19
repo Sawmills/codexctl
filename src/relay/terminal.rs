@@ -248,10 +248,12 @@ pub(super) fn accept(
     let failure = pending.failures.remove(&key);
     drop(pending);
     if let Some(failure) = failure.filter(|f| f.observed.elapsed() < TTL) {
-        let report = StopReport {
-            lane_stop: StopReason::Capacity,
-        };
-        relay.outcomes.stopped(report);
+        let report = StopReport::new(
+            StopReason::Capacity,
+            failure.status,
+            Some("server_is_overloaded"),
+        );
+        relay.outcomes.stopped(&report);
         relay.lane_stop(
             report,
             &failure.labels,
