@@ -1,6 +1,7 @@
 //! Safe, holder-aware maintenance for the local Codex state directory.
 
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
@@ -70,11 +71,15 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
         .apply
         .then(|| StateCapLock::acquire(&config.root))
         .transpose()?;
+    if config.apply {
+        read_index(&config.root)?;
+    }
+    let databases = discover_state_databases(&config.root)?;
     let mut report = StateCapReport {
         max_bytes: config.max_bytes,
         ..StateCapReport::default()
     };
-    report.total_bytes = state_bytes(&config.root)?;
+    report.total_bytes = state_bytes(&config.root, &databases)?;
     report.free_bytes = free_bytes(&config.root)?;
     report.free_space_ok = report.free_bytes >= config.min_free_bytes;
     if !report.free_space_ok {
@@ -83,7 +88,7 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
         );
     }
 
-    checkpoint_databases(config, &mut report)?;
+    checkpoint_databases(config, &databases, &mut report)?;
     let candidates = rollout_candidates(&config.root, config.older_than)?;
     for path in candidates {
         if config.apply
@@ -112,28 +117,31 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
             }
         }
     }
-    report.final_bytes = state_bytes(&config.root)?;
+    report.final_bytes = state_bytes(&config.root, &databases)?;
     report.free_bytes = free_bytes(&config.root)?;
     report.free_space_ok = report.free_bytes >= config.min_free_bytes;
     report.cap_met = report.final_bytes <= report.max_bytes && report.free_space_ok;
     Ok(report)
 }
 
-fn checkpoint_databases(config: &StateCapConfig, report: &mut StateCapReport) -> Result<()> {
-    for name in ["logs_2.sqlite", "thread_history_1.sqlite"] {
-        let db = config.root.join(name);
+fn checkpoint_databases(
+    config: &StateCapConfig,
+    databases: &[PathBuf],
+    report: &mut StateCapReport,
+) -> Result<()> {
+    for db in databases {
         if !db.is_file() {
             continue;
         }
         if !all_unheld(
-            &[db.clone(), sidecar(&db, "-wal"), sidecar(&db, "-shm")],
+            &[db.clone(), sidecar(db, "-wal"), sidecar(db, "-shm")],
             report,
         )? {
             continue;
         }
         if config.apply {
             let status = Command::new("sqlite3")
-                .arg(&db)
+                .arg(db)
                 .arg("PRAGMA wal_checkpoint(TRUNCATE);")
                 .status()
                 .with_context(|| format!("cannot run sqlite3 for {}", db.display()))?;
@@ -235,6 +243,10 @@ fn archive_rollout(path: &Path, root: &Path) -> Result<u64> {
         .with_context(|| format!("cannot publish archive {}", archive.display()))?;
     fs::remove_file(&temp)?;
     temp_guard.disarm();
+    let parent = path.parent().context("rollout has no parent directory")?;
+    File::open(parent)?
+        .sync_all()
+        .context("cannot sync published archive directory; keeping source")?;
     if let Err(error) = append_index(
         root,
         &ArchiveEntry {
@@ -259,6 +271,9 @@ fn archive_rollout(path: &Path, root: &Path) -> Result<u64> {
         return Ok(0);
     }
     fs::remove_file(path)?;
+    File::open(parent)?
+        .sync_all()
+        .context("cannot sync source removal; durable archive and index retained")?;
     let archived_size = fs::metadata(&archive)?.len();
     Ok(original_size.saturating_sub(archived_size))
 }
@@ -278,6 +293,9 @@ fn append_index(root: &Path, entry: &ArchiveEntry) -> Result<()> {
         entry.session_id, original, archive, entry.bytes, entry._mtime, entry.sha256
     )?;
     file.sync_all()?;
+    File::open(root)?
+        .sync_all()
+        .context("cannot sync archive index directory; keeping source")?;
     Ok(())
 }
 
@@ -385,17 +403,41 @@ fn collect_rollouts(path: &Path, age: Duration, output: &mut Vec<PathBuf>) -> Re
     Ok(())
 }
 
-fn state_bytes(root: &Path) -> Result<u64> {
+fn discover_state_databases(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut databases = BTreeSet::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let base = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+            .unwrap_or(name);
+        let number = base
+            .strip_prefix("logs_")
+            .or_else(|| base.strip_prefix("thread_history_"))
+            .and_then(|name| name.strip_suffix(".sqlite"));
+        if number.is_some_and(|number| {
+            !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+        }) {
+            databases.insert(root.join(base));
+        }
+    }
+    Ok(databases.into_iter().collect())
+}
+
+fn state_bytes(root: &Path, databases: &[PathBuf]) -> Result<u64> {
     let mut total: u64 = 0;
-    for path in [
-        root.join("thread_history_1.sqlite"),
-        root.join("thread_history_1.sqlite-wal"),
-        root.join("thread_history_1.sqlite-shm"),
-        root.join("logs_2.sqlite"),
-        root.join("logs_2.sqlite-wal"),
-        root.join("logs_2.sqlite-shm"),
-    ] {
-        total = total.saturating_add(path_bytes(&path)?);
+    for database in databases {
+        for path in [
+            database.clone(),
+            sidecar(database, "-wal"),
+            sidecar(database, "-shm"),
+        ] {
+            total = total.saturating_add(path_bytes(&path)?);
+        }
     }
     total = total.saturating_add(path_bytes(&root.join("sessions"))?);
     Ok(total)
@@ -677,8 +719,11 @@ fn read_index(root: &Path) -> Result<Vec<ArchiveEntry>> {
         Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
     };
     let mut entries = Vec::new();
-    for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let parsed = (|| {
+    for (line_number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: Result<ArchiveEntry> = (|| {
             let fields: Vec<_> = line.split('\t').collect();
             if fields.len() != 6 {
                 bail!("invalid state-cap index line");
@@ -686,6 +731,9 @@ fn read_index(root: &Path) -> Result<Vec<ArchiveEntry>> {
             let session_id = fields[0].to_owned();
             if !is_safe_session_id(&session_id) {
                 bail!("invalid indexed session id");
+            }
+            if fields[5].len() != 64 || !fields[5].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("invalid indexed SHA-256");
             }
             Ok(ArchiveEntry {
                 session_id,
@@ -696,10 +744,13 @@ fn read_index(root: &Path) -> Result<Vec<ArchiveEntry>> {
                 sha256: fields[5].to_owned(),
             })
         })();
-        match parsed {
-            Ok(entry) => entries.push(entry),
-            Err(error) => eprintln!("state-cap: ignoring malformed archive index line: {error:#}"),
-        }
+        entries.push(parsed.with_context(|| {
+            format!(
+                "malformed archive index {} at line {}",
+                path.display(),
+                line_number + 1
+            )
+        })?);
     }
     Ok(entries)
 }
@@ -721,6 +772,9 @@ fn index_path(root: &Path, path: &Path) -> Result<String> {
 }
 
 fn resolve_index_path(root: &Path, value: &str) -> Result<PathBuf> {
+    if value.is_empty() {
+        bail!("indexed path is empty");
+    }
     let candidate = PathBuf::from(value);
     let path = if candidate.is_absolute() {
         candidate

@@ -23,6 +23,14 @@ fn resume_last_refuses_during_archive_publication_even_without_an_index() {
     check_resume("exec", "locked");
 }
 
+#[test]
+fn malformed_archive_index_prevents_explicit_and_last_child_launches() {
+    for command in ["codex", "exec"] {
+        check_resume(command, "malformed-explicit");
+        check_resume(command, "malformed-last");
+    }
+}
+
 fn check_resume(command: &str, case: &str) {
     let output = std::process::Command::new("python3")
         .arg(concat!(

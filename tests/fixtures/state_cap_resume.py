@@ -53,6 +53,12 @@ def check(binary, command, case):
         (profile / "meta.json").write_text(json.dumps({"alias": "a", "saved_at": "2026-01-01T00:00:00Z"}))
         (root / "auth.json").write_text(auth)
         native_args = ["--cd", str(home), "resume", "--last", "--all"]
+        if case.startswith("malformed-"):
+            # Preserve a valid row before the bad row: parsing must not partly
+            # restore or fall through to the native child for either selector.
+            (root / "state-cap-archive-index.tsv").write_text(entries[0] + "broken-index-row\n")
+            if case == "malformed-explicit":
+                native_args = ["--cd", str(home), "resume", ids[0]]
         env = {key: value for key, value in os.environ.items() if not key.startswith(("CODEX", "CLAUDE", "HERDR"))}
         env.update(HOME=str(home), PATH=str(bindir) + os.pathsep + os.environ["PATH"], RESUME_EXPECTED_ARGS=json.dumps(native_args))
         if case == "inherited":
@@ -80,7 +86,10 @@ def check(binary, command, case):
             assert (root / "state-cap-archive-index.tsv").read_text() == ""
         else:
             assert result.returncode != 0, (result.stdout, result.stderr)
-            reason = "insufficient free space" if case == "low-space" else "state-cap lock is held"
+            if case.startswith("malformed-"):
+                reason = "malformed archive index"
+            else:
+                reason = "insufficient free space" if case == "low-space" else "state-cap lock is held"
             assert reason in result.stderr, result.stderr
             assert not (home / "child.json").exists(), "child started after restore refusal"
             assert len(list(sessions.glob("*.gz"))) == 2
