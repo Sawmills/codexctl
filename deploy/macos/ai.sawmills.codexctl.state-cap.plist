@@ -8,7 +8,7 @@
   <array>
     <string>/bin/zsh</string>
     <string>-lc</string>
-    <string>exec "${HOME}/.cargo/bin/codexctl" state cap --max-bytes 21474836480 --older-than-days 7 --min-free-bytes 16106127360 --reserve-bytes 1073741824 --apply</string>
+    <string>exec /opt/homebrew/bin/codexctl state cap --max-bytes 21474836480 --older-than-days 7 --min-free-bytes 16106127360 --reserve-bytes 1073741824 --apply</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
