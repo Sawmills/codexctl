@@ -133,11 +133,6 @@ spec:
   scrapeInterval: 30s
   scrapeTimeout: 5s
   scrapeProtocols: [PrometheusText0.0.4]
-  authorization:
-    type: Bearer
-    credentials:
-      name: codexctl-secrets
-      key: metrics-token
   # B33 attempt 4, PR H: one target per HA pod. The labels keep the existing
   # alert expressions valid.
   dnsSDConfigs:

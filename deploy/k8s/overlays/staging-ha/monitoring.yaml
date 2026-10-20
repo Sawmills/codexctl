@@ -115,11 +115,6 @@ spec:
   scrapeInterval: 30s
   scrapeTimeout: 5s
   scrapeProtocols: [PrometheusText0.0.4]
-  authorization:
-    type: Bearer
-    credentials:
-      name: codexctl-secrets
-      key: metrics-token
   kubernetesSDConfigs:
     - role: pod
       namespaces:
