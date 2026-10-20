@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::api;
 use crate::commands::alias;
-use crate::commands::codex::session_id_from_codex_args;
+use crate::commands::codex::restore_before_codex_resume;
 use crate::config::{self, Paths};
 use crate::profile;
 use crate::store;
@@ -64,10 +64,8 @@ fn run_from(paths: &Paths, account: &str, args: &[String]) -> Result<i32> {
     if Path::new(program)
         .file_stem()
         .is_some_and(|name| name == "codex")
-        && let Some(session_id) = session_id_from_codex_args(arguments)
-        && codexctl::state_cap::restore_indexed_rollout(&paths.codex_home(), &session_id)?
     {
-        eprintln!("codexctl: restored archived session {session_id} before resume");
+        restore_before_codex_resume(&paths.codex_home(), arguments)?;
     }
     let status = Command::new(program)
         .args(arguments)

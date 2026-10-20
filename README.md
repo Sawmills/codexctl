@@ -245,14 +245,20 @@ codexctl state cap --max-bytes 21474836480
 Pass `--apply` only from the reviewed Mac schedule. It checkpoints SQLite only when the database,
 WAL, and shared-memory files have no holders, and compresses only rollout files older than the
 configured age. Each archive is indexed with its original path and SHA-256. Before
-`codexctl codex resume <id>` launches Codex, an indexed archive is restored and verified. A held
-or changed file is skipped or refused; the original is never removed on a failed archive.
+`codexctl codex resume <id>` launches Codex, an indexed archive is restored and verified.
+For `resume --last`, all indexed archives are restored under one maintenance lock before
+Codex selects the session, with native arguments unchanged. The full expansion must fit
+with a 1 GiB free-space reserve; each restore checks that reserve again. If space is short,
+the launch fails with an error. This can temporarily grow the state directory by several
+cold sessions. The same restore policy applies to `codexctl exec --account <alias> -- codex resume`.
+A held or changed file is skipped or refused; the original is never removed on a failed archive.
 
 The reviewed daily LaunchAgent is
 `deploy/macos/ai.sawmills.codexctl.state-cap.plist`. Install it only after the guide's CX-LD
 notice, then use `launchctl bootout gui/$(id -u) "$HOME/Library/LaunchAgents/ai.sawmills.codexctl.state-cap.plist"`
-to roll it back. The plist keeps a 20 GiB state cap, a 15 GiB free-space floor, and a 1 GiB
-temporary reserve.
+to roll it back. The plist uses a 20 GiB state cap and a 15 GiB free-space target.
+Below that target it still reclaims eligible state. Compression requires the source
+file's size plus a 1 GiB temporary reserve in free space.
 
 
 ### Pinned launches

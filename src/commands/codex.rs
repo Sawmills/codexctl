@@ -37,12 +37,7 @@ pub fn run(
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let paths = config::default_paths()?;
-    if let Some(session_id) = session_id_from_codex_args(args) {
-        let live_home = paths.codex_home();
-        if state_cap::restore_indexed_rollout(&live_home, &session_id)? {
-            eprintln!("codexctl: restored archived session {session_id} before resume");
-        }
-    }
+    restore_before_codex_resume(&codex_home_for_child(&paths), args)?;
     #[cfg(feature = "central-prototype")]
     let service_mode = codexctl::central::service_account::enabled()?;
     #[cfg(feature = "central-prototype")]
@@ -821,6 +816,22 @@ fn long_option_is_preserved_flag(arg: &str) -> bool {
 
 fn short_option_is_preserved_flag(_arg: &str) -> bool {
     false
+}
+
+pub(crate) fn restore_before_codex_resume(root: &Path, args: &[String]) -> Result<()> {
+    if resume_args_shape(args).is_some_and(|shape| shape.has_last) {
+        let restored = state_cap::restore_indexed_rollouts_before_last(root)?;
+        if restored > 0 {
+            eprintln!(
+                "codexctl: restored {restored} archived sessions before native --last selection"
+            );
+        }
+    } else if let Some(session_id) = session_id_from_codex_args(args)
+        && state_cap::restore_indexed_rollout(root, &session_id)?
+    {
+        eprintln!("codexctl: restored archived session {session_id} before resume");
+    }
+    Ok(())
 }
 
 pub(crate) fn session_id_from_codex_args(args: &[String]) -> Option<String> {

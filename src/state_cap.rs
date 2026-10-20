@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 const INDEX_FILE: &str = "state-cap-archive-index.tsv";
+const RESTORE_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct StateCapConfig {
@@ -77,8 +78,9 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
     report.free_bytes = free_bytes(&config.root)?;
     report.free_space_ok = report.free_bytes >= config.min_free_bytes;
     if !report.free_space_ok {
-        report.errors += 1;
-        eprintln!("state-cap: free space is below the configured floor; apply will skip mutation");
+        eprintln!(
+            "state-cap: free space is below the target; reclaiming while the allocation reserve permits"
+        );
     }
 
     checkpoint_databases(config, &mut report)?;
@@ -86,6 +88,7 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
     for path in candidates {
         if config.apply
             && report.total_bytes.saturating_sub(report.reclaimed_bytes) <= config.max_bytes
+            && free_bytes(&config.root)? >= config.min_free_bytes
         {
             break;
         }
@@ -111,15 +114,12 @@ pub fn run(config: &StateCapConfig) -> Result<StateCapReport> {
     }
     report.final_bytes = state_bytes(&config.root)?;
     report.free_bytes = free_bytes(&config.root)?;
-    report.cap_met =
-        report.final_bytes <= report.max_bytes && report.free_bytes >= config.min_free_bytes;
+    report.free_space_ok = report.free_bytes >= config.min_free_bytes;
+    report.cap_met = report.final_bytes <= report.max_bytes && report.free_space_ok;
     Ok(report)
 }
 
 fn checkpoint_databases(config: &StateCapConfig, report: &mut StateCapReport) -> Result<()> {
-    if config.apply && free_bytes(&config.root)? < config.min_free_bytes {
-        return Ok(());
-    }
     for name in ["logs_2.sqlite", "thread_history_1.sqlite"] {
         let db = config.root.join(name);
         if !db.is_file() {
@@ -166,9 +166,6 @@ fn eligible_rollout(
     }
     let size = fs::metadata(path)?.len();
     let free = free_bytes(&config.root)?;
-    if free < config.min_free_bytes {
-        return Ok(None);
-    }
     if free < size.saturating_add(config.reserve_bytes) {
         return Ok(None);
     }
@@ -244,7 +241,7 @@ fn archive_rollout(path: &Path, root: &Path) -> Result<u64> {
             session_id: session_id.clone(),
             original: path.to_path_buf(),
             archive: archive.clone(),
-            _bytes: original_size,
+            bytes: original_size,
             _mtime: original_mtime
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -278,7 +275,7 @@ fn append_index(root: &Path, entry: &ArchiveEntry) -> Result<()> {
     writeln!(
         file,
         "{}\t{}\t{}\t{}\t{}\t{}",
-        entry.session_id, original, archive, entry._bytes, entry._mtime, entry.sha256
+        entry.session_id, original, archive, entry.bytes, entry._mtime, entry.sha256
     )?;
     file.sync_all()?;
     Ok(())
@@ -304,7 +301,7 @@ fn remove_index_entry(root: &Path, session_id: &str) -> Result<()> {
         writeln!(
             file,
             "{}\t{}\t{}\t{}\t{}\t{}",
-            entry.session_id, original, archive, entry._bytes, entry._mtime, entry.sha256
+            entry.session_id, original, archive, entry.bytes, entry._mtime, entry.sha256
         )?;
     }
     file.sync_all()?;
@@ -464,7 +461,7 @@ struct ArchiveEntry {
     session_id: String,
     original: PathBuf,
     archive: PathBuf,
-    _bytes: u64,
+    bytes: u64,
     _mtime: i64,
     sha256: String,
 }
@@ -534,14 +531,65 @@ impl Drop for StateCapLock {
 /// Returns `true` when an archive was restored and `false` when the session is
 /// not in the state-cap index. Existing files are never overwritten silently.
 pub fn restore_indexed_rollout(root: &Path, session_id: &str) -> Result<bool> {
+    if !root.exists() {
+        return Ok(false);
+    }
+    let _lock = StateCapLock::acquire(root)?;
     let Some(entry) = read_index(root)?
         .into_iter()
         .find(|entry| entry.session_id == session_id)
     else {
         return Ok(false);
     };
-    let _lock = StateCapLock::acquire(root)?;
+    restore_entry(root, &entry)
+}
 
+/// Restore all indexed candidates before native `codex resume --last` selects.
+///
+/// One lock covers index lookup and every restore. The full expansion must fit
+/// with a 1 GiB reserve; each archive is checked again before allocating. A
+/// refusal returns before the caller can launch Codex. Native selection stays
+/// with Codex because its database and filters determine which session is last.
+pub fn restore_indexed_rollouts_before_last(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let _lock = StateCapLock::acquire(root)?;
+    let entries = read_index(root)?;
+    let expansion = entries
+        .iter()
+        .filter(|entry| !entry.original.exists())
+        .try_fold(0u64, |total, entry| {
+            total
+                .checked_add(entry.bytes)
+                .context("indexed restore size overflow")
+        })?;
+    if expansion > 0 {
+        require_restore_space(root, expansion)?;
+    }
+    let mut restored = 0;
+    for entry in entries {
+        restored += usize::from(restore_entry(root, &entry)?);
+    }
+    Ok(restored)
+}
+
+fn require_restore_space(root: &Path, bytes: u64) -> Result<()> {
+    let required = bytes
+        .checked_add(RESTORE_RESERVE_BYTES)
+        .context("indexed restore size plus reserve overflow")?;
+    let available = free_bytes(root)?;
+    if available < required {
+        bail!(
+            "cannot restore archived sessions: insufficient free space (need {required} bytes including 1 GiB reserve; available {available}); free space before resuming"
+        );
+    }
+    Ok(())
+}
+
+// The caller holds StateCapLock from before index lookup until publication.
+fn restore_entry(root: &Path, entry: &ArchiveEntry) -> Result<bool> {
+    let session_id = &entry.session_id;
     if entry.original.exists() {
         if is_held(&entry.original)? {
             bail!("cannot restore session {session_id}: destination is held by a process");
@@ -561,6 +609,7 @@ pub fn restore_indexed_rollout(root: &Path, session_id: &str) -> Result<bool> {
         );
     }
 
+    require_restore_space(root, entry.bytes)?;
     let parent = entry
         .original
         .parent()
@@ -642,7 +691,7 @@ fn read_index(root: &Path) -> Result<Vec<ArchiveEntry>> {
                 session_id,
                 original: resolve_index_path(root, fields[1])?,
                 archive: resolve_index_path(root, fields[2])?,
-                _bytes: fields[3].parse().context("invalid indexed byte count")?,
+                bytes: fields[3].parse().context("invalid indexed byte count")?,
                 _mtime: fields[4].parse().context("invalid indexed mtime")?,
                 sha256: fields[5].to_owned(),
             })

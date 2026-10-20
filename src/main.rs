@@ -274,7 +274,7 @@ enum StateAction {
         /// Age in days before a closed rollout is eligible for compression.
         #[arg(long, default_value_t = 7)]
         older_than_days: u64,
-        /// Minimum free bytes that must remain on the Codex volume.
+        /// Free-space target for the Codex volume; reclamation continues below it.
         #[arg(long, default_value_t = 15 * 1024 * 1024 * 1024)]
         min_free_bytes: u64,
         /// Temporary free-space reserve required before compressing one rollout.
