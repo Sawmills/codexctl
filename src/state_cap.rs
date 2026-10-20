@@ -262,6 +262,7 @@ fn archive_rollout(path: &Path, root: &Path) -> Result<u64> {
             sha256: original_sha.clone(),
         },
     ) {
+        let _ = remove_index_entry(root, &session_id);
         let _ = fs::remove_file(&archive);
         return Err(error);
     }

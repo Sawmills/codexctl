@@ -79,10 +79,17 @@ def check(binary, case):
         if not original.exists():
             assert gzip.decompress(archive.read_bytes()) == source
             assert (root / "state-cap-archive-index.tsv").read_text().startswith("durable\t")
-        if case == "archive":
+        if case in {"archive", "index"}:
             # A failed publication sync must not leave an unindexed archive
             # that prevents maintenance from retrying once the disk recovers.
             assert not archive.exists(), "unindexed archive left after failed sync"
+            index = root / "state-cap-archive-index.tsv"
+            assert not index.exists() or index.read_text() == "", "stale index left after failed sync"
+            if case == "index":
+                # A subsequent native write must not encounter a stale hash
+                # left behind by the failed index-directory publication.
+                source += b"\n{}\n"
+                original.write_bytes(source)
             trace.unlink()
             fields, result = run(binary, home, apply=True, extra_env={
                 "LD_PRELOAD": str(library), "STATE_CAP_TEST_ROOT": str(root),
