@@ -260,7 +260,6 @@ to roll it back. The plist uses a 20 GiB state cap and a 15 GiB free-space targe
 Below that target it still reclaims eligible state. Compression requires the source
 file's size plus a 1 GiB temporary reserve in free space.
 
-
 ### Pinned launches
 
 For one server-account lane, use `codexctl codex --account <alias> [codex args...]`,
