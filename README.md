@@ -251,7 +251,8 @@ Codex selects the session, with native arguments unchanged. The full expansion m
 with a 1 GiB free-space reserve; each restore checks that reserve again. If space is short,
 the launch fails with an error. This can temporarily grow the state directory by several
 cold sessions. The same restore policy applies to `codexctl exec --account <alias> -- codex resume`.
-A held or changed file is skipped or refused; the original is never removed on a failed archive.
+A held or changed file is skipped or refused. Failures before source deletion keep
+the original. After deletion, verified content remains in the durable archive and index.
 Sizing and checkpointing use the same inventory of numbered `logs_*.sqlite` and
 `thread_history_*.sqlite` databases and their WAL/SHM sidecars. A malformed archive
 index refuses resume before Codex starts. Archive and index directories are synced
