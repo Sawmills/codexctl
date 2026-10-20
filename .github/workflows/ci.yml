@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  merge_group: {}
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -18,10 +20,31 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
+  preflight:
+    name: PR preflight
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt
+      - name: PR title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          test -n "$TITLE"
+          [[ "$TITLE" != *$'\n'* ]]
+      - name: Format
+        run: cargo fmt --all -- --check
+
   check:
     name: Check
-    # trunk-ignore(actionlint/runner-label): Existing Namespace profile
-    runs-on: namespace-profile-sawmills-runner
+    # trunk-ignore(actionlint/runner-label): Namespace fleet-medium profile
+    runs-on: namespace-profile-fleet-medium
     services:
       postgres:
         image: postgres:16
@@ -38,6 +61,12 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres@localhost:5432/codexctl?sslmode=disable
       CODEXCTL_CENTRAL_DB_TLS: "0"
+      CARGO_BUILD_JOBS: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
+      CARGO_PROFILE_TEST_SPLIT_DEBUGINFO: "off"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -46,9 +75,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-
-      - name: Format
-        run: cargo fmt --all -- --check
 
       - name: Clippy
         run: cargo clippy --all-targets
@@ -68,6 +94,7 @@ jobs:
 
   audit:
     name: Dependency Audit
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     # trunk-ignore(actionlint/runner-label): Existing Namespace profile
     runs-on: namespace-profile-sawmills-runner
     permissions:
@@ -84,28 +111,35 @@ jobs:
 
   trunk:
     name: Trunk Check
-    # trunk-ignore(actionlint/runner-label): Namespace profile
-    runs-on: namespace-profile-sawmills-runner-large
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 0
           persist-credentials: false
-      - name: Cache Trunk and Rust artifacts
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        # yamllint disable-line rule:line-length
-        uses: namespacelabs/nscloud-cache-action@15799a6b54e5765f85b2aac25b3f0df43ed571c0
-        with:
-          cache: rust
-          path: |
-            /home/runner/.cache/trunk
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       - name: Set up Trunk
         uses: trunk-io/trunk-action/setup@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
-      - name: Trunk Check
+      - name: Install OSV scanner
         run: |
-          "$TRUNK_PATH" check --all --ci
+          mkdir -p .trunk/tools
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output .trunk/tools/osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64
+          chmod +x .trunk/tools/osv-scanner
+      - name: Trunk Check
+        env:
+          TRUNK_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          TRUNK_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            baseline=(--upstream "$TRUNK_BASE_SHA")
+          else
+            baseline=(--all)
+          fi
+          "$TRUNK_PATH" check --ci "${baseline[@]}" --github-commit "$TRUNK_HEAD_SHA"
           .trunk/tools/osv-scanner --version
           .trunk/tools/osv-scanner --lockfile=Cargo.lock --format json
 
@@ -127,6 +161,7 @@ jobs:
 
   build-windows:
     name: Build (Windows)
+    if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
