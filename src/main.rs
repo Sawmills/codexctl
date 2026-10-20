@@ -242,6 +242,11 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Maintain the local Codex state directory.
+    State {
+        #[command(subcommand)]
+        action: StateAction,
+    },
     /// Run a command with its Codex credentials pinned to one saved local profile,
     /// without switching the active profile. Server accounts are not supported.
     Exec {
@@ -256,6 +261,28 @@ enum Commands {
     Completions {
         /// Shell to generate completions for
         shell: Shell,
+    },
+}
+
+#[derive(Subcommand)]
+enum StateAction {
+    /// Report or apply the holder-aware local state cap.
+    Cap {
+        /// Maximum total bytes for the managed Codex state.
+        #[arg(long)]
+        max_bytes: u64,
+        /// Age in days before a closed rollout is eligible for compression.
+        #[arg(long, default_value_t = 7)]
+        older_than_days: u64,
+        /// Minimum free bytes that must remain on the Codex volume.
+        #[arg(long, default_value_t = 15 * 1024 * 1024 * 1024)]
+        min_free_bytes: u64,
+        /// Temporary free-space reserve required before compressing one rollout.
+        #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+        reserve_bytes: u64,
+        /// Apply checkpoint and compression actions. Without this flag the command is a dry run.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -445,6 +472,33 @@ fn main() {
             allow_resets,
         ))
         .into_result(),
+        Commands::State { action } => (|| match action {
+            StateAction::Cap {
+                max_bytes,
+                older_than_days,
+                min_free_bytes,
+                reserve_bytes,
+                apply,
+            } => {
+                let config = codexctl::state_cap::StateCapConfig {
+                    root: config::default_paths()?.codex_home(),
+                    max_bytes,
+                    older_than: std::time::Duration::from_secs(
+                        older_than_days.saturating_mul(24 * 60 * 60),
+                    ),
+                    min_free_bytes,
+                    reserve_bytes,
+                    apply,
+                };
+                let report = codexctl::state_cap::run(&config)?;
+                report.print(apply);
+                if report.cap_met {
+                    Ok(())
+                } else {
+                    anyhow::bail!("Codex state cap was not met")
+                }
+            }
+        })(),
         Commands::Exec {
             ref account,
             ref args,

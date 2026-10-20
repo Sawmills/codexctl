@@ -234,6 +234,27 @@ If no fresh included launch can be prepared, codexctl warns and launches the cur
 account through the existing provider. This fallback keeps that account's existing
 approval; it does not grant new billing approval or redeem a reset.
 
+### Cap local Codex state
+
+`codexctl state cap` reports the size of the local Codex state and is a dry run by default:
+
+```bash
+codexctl state cap --max-bytes 21474836480
+```
+
+Pass `--apply` only from the reviewed Mac schedule. It checkpoints SQLite only when the database,
+WAL, and shared-memory files have no holders, and compresses only rollout files older than the
+configured age. Each archive is indexed with its original path and SHA-256. Before
+`codexctl codex resume <id>` launches Codex, an indexed archive is restored and verified. A held
+or changed file is skipped or refused; the original is never removed on a failed archive.
+
+The reviewed daily LaunchAgent is
+`deploy/macos/ai.sawmills.codexctl.state-cap.plist`. Install it only after the guide's CX-LD
+notice, then use `launchctl bootout gui/$(id -u) "$HOME/Library/LaunchAgents/ai.sawmills.codexctl.state-cap.plist"`
+to roll it back. The plist keeps a 20 GiB state cap, a 15 GiB free-space floor, and a 1 GiB
+temporary reserve.
+
+
 ### Pinned launches
 
 For one server-account lane, use `codexctl codex --account <alias> [codex args...]`,
