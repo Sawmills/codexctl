@@ -341,3 +341,31 @@ retrying and does not need operator action. Alerts carry `severity=warning` and
 owned outside this repository, so `amtool` cannot validate the live route here. The
 monitoring guide must run `amtool config routes test` against that platform file with
 `severity=warning service=codexctl` and confirm `warnings-slack`.
+
+## Account/Model Capacity Recovery
+
+Unpinned `codexctl codex` launches use a shared account-server policy when the
+launch names a known model in its arguments or configuration. Three distinct
+upstream `server_is_overloaded` requests for one account and model within
+120 seconds start a 300-second cooldown. Duplicate reports do not extend it.
+A completed response clears failures that preceded it. Delayed success reports
+preserve newer failures and any cooldown those failures justify. Failure IDs expire after their 120-second observation window. Reports preserve their
+observation time, so an old report cannot count as a new request.
+
+Fresh placement skips cooling accounts. After a terminal capacity stop, the
+wrapper can resume the same session on another eligible included account. The
+account server requires matching terminal evidence and permits at most three
+capacity moves per session per hour, including across launcher restarts. A peer
+without reports is an eligible trial; that does not establish that it is healthy.
+When no alternate qualifies, the wrapper leaves a running child in place and
+records the refusal in its private capacity diagnostic log.
+
+The wrapper preserves the model, working directory and resume options. Explicit
+`--account` launches stay pinned. Capacity recovery uses no billed account or
+banked reset, and leaves the machine's active account and other lanes unchanged.
+Plain `codex` launches do not use wrapper recovery.
+
+Deploy the account server with its additive capacity-policy schema before
+installing clients that use `/v1/capacity/plan`. A missing or unavailable policy
+fails a model-aware automatic launch instead of falling back onto a cooling
+account. Existing relay stop counters remain separate from policy evidence.

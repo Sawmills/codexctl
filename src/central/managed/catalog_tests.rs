@@ -2124,3 +2124,145 @@ async fn retry_keeps_recovery_epoch_after_the_native_process_stops() {
     );
     central.release_lease(&lease).await.unwrap();
 }
+
+#[tokio::test]
+async fn capacity_http_requires_authorized_account_and_shares_selection_policy() {
+    let fixture = Fixture::new(Duration::from_secs(2)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = format!("http://{}", listener.local_addr().unwrap());
+    let app = api_routes().with_state(fixture.broker.clone());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    let report = |alias: &str, id: &str| {
+        json!({"account_capacity":{
+            "alias":alias,"model":"gpt-6.1-sol","event_id":id,"outcome":"overloaded","session_id":null,"observed_at":chrono::Utc::now().timestamp()
+        }})
+    };
+    let event_url = format!("{address}/v1/relay/capacity-events");
+    assert_eq!(
+        client
+            .post(&event_url)
+            .json(&report("fixture", "one"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&event_url)
+            .headers(fixture.headers.clone())
+            .json(&report("someone-else", "one"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let plan_url = format!("{address}/v1/capacity/plan");
+    let plan =
+        |model: &str| json!({"model":model,"session_id":null,"failed_alias":null,"tried":[]});
+    for _ in 0..4 {
+        assert_eq!(
+            client
+                .post(&event_url)
+                .headers(fixture.headers.clone())
+                .json(&report("fixture", "one"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    let response: Value = client
+        .post(&plan_url)
+        .headers(fixture.headers.clone())
+        .json(&plan("gpt-6.1-sol"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        response["alias"], "fixture",
+        "duplicate delivery must not cool the account"
+    );
+    for id in ["two", "three"] {
+        assert_eq!(
+            client
+                .post(&event_url)
+                .headers(fixture.headers.clone())
+                .json(&report("fixture", id))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    let cooled: Value = client
+        .post(&plan_url)
+        .headers(fixture.headers.clone())
+        .json(&plan("gpt-6.1-sol"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(cooled["alias"].is_null());
+    assert_eq!(cooled["reason"], "no_included_alternate");
+    let unaffected: Value = client
+        .post(&plan_url)
+        .headers(fixture.headers.clone())
+        .json(&plan("gpt-6-sol"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(unaffected["alias"], "fixture");
+    task.abort();
+}
+
+#[tokio::test]
+async fn capacity_success_reports_do_not_consume_stop_report_budget() {
+    let fixture = Fixture::new(Duration::from_secs(2)).await;
+    let device = fixture
+        .broker
+        .authorize(&fixture.headers)
+        .await
+        .map_err(|e| e.reason)
+        .unwrap();
+    for i in 0..40 {
+        let report: RelayEvent=serde_json::from_value(json!({"account_capacity":{
+            "alias":"fixture","model":"gpt-6.1-sol","event_id":format!("completed-{i}"),"outcome":"completed","session_id":null,"observed_at":chrono::Utc::now().timestamp()
+        }})).unwrap();
+        assert!(
+            fixture
+                .broker
+                .relay_accept(&device, report.validate().unwrap())
+                .await
+                .map_err(|e| e.reason)
+                .unwrap()
+        );
+    }
+    let stop: RelayEvent = serde_json::from_value(
+        json!({"lane_stop":"capacity","http_status":200,"error_code":"server_is_overloaded"}),
+    )
+    .unwrap();
+    assert!(
+        fixture
+            .broker
+            .relay_accept(&device, stop.validate().unwrap())
+            .await
+            .map_err(|e| e.reason)
+            .unwrap()
+    );
+}

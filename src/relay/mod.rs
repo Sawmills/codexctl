@@ -26,7 +26,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -45,7 +45,6 @@ use futures::{Stream, StreamExt};
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -66,7 +65,7 @@ const MODEL_PREFIX: usize = 4 * 1024;
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:47631";
 /// Rate limits stop after this so the board can move the account (M5).
 pub const DEFAULT_RATE_BUDGET: Duration = Duration::from_secs(180);
-/// Model capacity is not per account, so it waits longer (M5).
+/// Let Codex retry capacity in-request before considering account recovery.
 pub const DEFAULT_OVERLOADED_BUDGET: Duration = Duration::from_secs(600);
 
 type Log = Arc<dyn Fn(&str) + Send + Sync>;
@@ -248,6 +247,7 @@ struct CapacityEvent {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum CentralEvent {
+    AccountCapacity(crate::central::capacity::Report),
     Capacity(CapacityEvent),
     Stop(StopReport),
 }
@@ -432,6 +432,8 @@ pub async fn serve(
 
 #[derive(Clone)]
 struct Labels {
+    capacity_id: String,
+    capacity_observed: Arc<OnceLock<i64>>,
     thread: String,
     route: &'static str,
     model: String,
@@ -486,6 +488,11 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             .as_ref()
             .is_none_or(|v| v["request_kind"] == "turn" && v["thread_source"] == "user");
     let labels = Labels {
+        capacity_observed: Arc::new(OnceLock::new()),
+        capacity_id: crate::central::enrollment::random_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
         route: if is_responses {
             "/backend-api/codex/responses"
         } else {
@@ -501,7 +508,7 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
             .filter(|v| terminal::valid_id(v))
             .map(str::to_owned),
         account_alias: header_str(&parts.headers, "x-codexctl-account-alias")
-            .and_then(crate::outcomes::alias),
+            .and_then(capacity_alias),
         thread,
         model: relay.model_label(&parts.headers, &prefix[..prefix.len().min(MODEL_PREFIX)]),
         account_class: match header_str(&parts.headers, ACCOUNT_CLASS_HEADER) {
@@ -610,6 +617,47 @@ async fn forward(State(relay): State<Relay>, request: Request) -> Response {
 }
 
 impl Relay {
+    fn account_capacity(
+        &self,
+        labels: &Labels,
+        outcome: crate::central::capacity::Outcome,
+        request_id: Option<&str>,
+    ) {
+        if !labels.terminal_request || !crate::RELAY_KNOWN_MODELS.contains(&labels.model.as_str()) {
+            return;
+        }
+        let Some(alias) = &labels.account_alias else {
+            return;
+        };
+        let event = crate::central::capacity::Evidence {
+            alias: alias.clone(),
+            model: labels.model.clone(),
+            event_id: request_id
+                .filter(|id| crate::central::capacity::valid_event_id(id))
+                .unwrap_or(&labels.capacity_id)
+                .to_owned(),
+            outcome,
+            session_id: Some(labels.thread.clone()),
+            observed_at: Some(
+                if outcome == crate::central::capacity::Outcome::Overloaded {
+                    *labels
+                        .capacity_observed
+                        .get_or_init(|| chrono::Utc::now().timestamp())
+                } else {
+                    chrono::Utc::now().timestamp()
+                },
+            ),
+            identity: None,
+        };
+        if event.validate().is_ok() {
+            self.send_central(CentralEvent::AccountCapacity(
+                crate::central::capacity::Report {
+                    account_capacity: event,
+                },
+            ));
+        }
+    }
+
     fn lane_stop(
         &self,
         report: StopReport,
@@ -617,6 +665,13 @@ impl Relay {
         request_id: Option<&str>,
         status: u16,
     ) {
+        if report.lane_stop == crate::outcomes::StopReason::Capacity {
+            self.account_capacity(
+                labels,
+                crate::central::capacity::Outcome::Terminal,
+                request_id,
+            );
+        }
         let report = report.with_request(labels.account_alias.as_deref(), labels.route, request_id);
         // An already-counted terminal capacity response needs no second
         // confirmation, including HTTP retries without native turn metadata.
@@ -705,6 +760,13 @@ impl Relay {
             }
         }
         let trace = StreamTrace::new(headers_at);
+        if error.as_ref().and_then(evidence_error_code) == Some("server_is_overloaded") {
+            self.account_capacity(
+                &labels,
+                crate::central::capacity::Outcome::Overloaded,
+                request_id.as_deref(),
+            );
+        }
         self.terminal
             .lock()
             .expect("terminal receipt lock")
@@ -950,6 +1012,13 @@ impl Relay {
         request_id: Option<&str>,
         upstream_secs: Option<u64>,
     ) -> Option<u64> {
+        if matches!(kind, Kind::Overloaded) {
+            self.account_capacity(
+                labels,
+                crate::central::capacity::Outcome::Overloaded,
+                request_id,
+            );
+        }
         let advice = {
             let mut streaks = self.streaks.lock().expect("streak lock");
             streaks.failure(&labels.thread, kind, Instant::now(), upstream_secs)
@@ -973,6 +1042,7 @@ impl Relay {
     }
 
     fn success(&self, labels: &Labels) {
+        self.account_capacity(labels, crate::central::capacity::Outcome::Completed, None);
         let recovered = self
             .streaks
             .lock()
@@ -2354,6 +2424,14 @@ async fn metrics(State(relay): State<Relay>) -> Response {
         .into_response()
 }
 
+fn capacity_alias(value: &str) -> Option<String> {
+    let reference = crate::central::loans::AccountRef::parse(value).ok()?;
+    value
+        .split('/')
+        .all(|part| crate::outcomes::alias(part).is_some())
+        .then(|| reference.name())
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
@@ -2385,6 +2463,11 @@ mod tests {
             terminal: Arc::default(),
         };
         let labels = Labels {
+            capacity_observed: Arc::new(OnceLock::new()),
+            capacity_id: crate::central::enrollment::random_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
             thread: "thread".into(),
             route: "/backend-api/codex/responses",
             model: "gpt-6.1-sol".into(),
@@ -2470,6 +2553,11 @@ mod tests {
             terminal: Arc::default(),
         };
         let labels = Labels {
+            capacity_observed: Arc::new(OnceLock::new()),
+            capacity_id: crate::central::enrollment::random_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
             thread: "thread".into(),
             route: "/backend-api/codex/responses",
             model: "gpt-6.1-sol".into(),

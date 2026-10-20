@@ -435,6 +435,25 @@ impl TerminalObserver {
         }
     }
 
+    /// A marked native error row is confirmed only against this launch's
+    /// unique pending upstream overload. Text alone never creates a report.
+    pub fn record_capacity_policy_stop() {
+        if let Ok(paths) = crate::config::default_paths() {
+            diagnostics::record(
+                &paths.codexctl_dir(),
+                diagnostics::Reason::CapacityPolicyStopped,
+            );
+        }
+    }
+
+    pub fn confirm_capacity_for_session(&mut self, session: &str) {
+        if !valid_id(session) || self.thread.as_deref().is_some_and(|id| id != session) {
+            return;
+        }
+        self.thread = Some(session.into());
+        self.report(Action::Confirm);
+    }
+
     fn report(&mut self, action: Action) {
         if action == Action::Confirm && self.reported {
             return;
@@ -484,6 +503,8 @@ mod tests {
     fn failure(observed: Instant, unavailable_reported: bool) -> Failure {
         Failure {
             labels: Labels {
+                capacity_id: "synthetic-request".into(),
+                capacity_observed: std::sync::Arc::new(std::sync::OnceLock::new()),
                 thread: "11111111-2222-4333-8444-555555555555".into(),
                 route: "/backend-api/codex/responses",
                 model: "gpt-6.1-sol".into(),

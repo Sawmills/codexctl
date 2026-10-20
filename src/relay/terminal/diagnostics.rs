@@ -12,6 +12,7 @@ use serde::Serialize;
 #[serde(rename_all = "snake_case")]
 pub(super) enum Reason {
     WatcherStartFailed,
+    CapacityPolicyStopped,
     DeliveryFailed,
     ClientUnavailable,
     NativeStateUnavailable,

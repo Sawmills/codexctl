@@ -36,7 +36,7 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn owner_subject(owner: &Owner) -> Option<super::CredentialSubject> {
+pub(in crate::central) fn owner_subject(owner: &Owner) -> Option<super::CredentialSubject> {
     Some(super::credential_subject(
         &vault::account(&owner.vault.auth).ok()?,
         vault::token(&owner.vault.auth).ok()?,

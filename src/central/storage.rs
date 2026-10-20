@@ -35,6 +35,7 @@ const DB_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 mod backfill;
 pub use backfill::BackfillScanException;
 mod browser;
+mod capacity;
 pub(in crate::central) use browser::{
     BrowserIdentity, DashboardAudit, DashboardOperation, MachineRevoke,
 };
@@ -524,13 +525,37 @@ impl CentralStore {
         }
     }
 
+    /// Capacity evidence has a separate budget so normal completions cannot
+    /// consume the diagnostic stop-report allowance.
+    pub(in crate::central) async fn capacity_event_allowed(&self, device: &str) -> Result<bool> {
+        let id = format!("capacity:{device}");
+        match self {
+            Self::File(_) => Ok(true),
+            Self::Postgres(db) => db.relay_event_allowed_with_limits(&id, 256.0, 64.0).await,
+            Self::Dual { postgres, .. } => {
+                postgres
+                    .relay_event_allowed_with_limits(&id, 256.0, 64.0)
+                    .await
+            }
+        }
+    }
+
     /// Retain a tombstone for a revoked device's relay limiter state. A
     /// tombstoned row is never eligible for a future bucket upsert.
     pub async fn retire_relay_event_limiter(&self, device: &str) -> Result<()> {
         match self {
             Self::File(_) => Ok(()),
-            Self::Postgres(db) => db.retire_relay_event_limiter(device).await,
-            Self::Dual { postgres, .. } => postgres.retire_relay_event_limiter(device).await,
+            Self::Postgres(db) => {
+                db.retire_relay_event_limiter(device).await?;
+                db.retire_relay_event_limiter(&format!("capacity:{device}"))
+                    .await
+            }
+            Self::Dual { postgres, .. } => {
+                postgres.retire_relay_event_limiter(device).await?;
+                postgres
+                    .retire_relay_event_limiter(&format!("capacity:{device}"))
+                    .await
+            }
         }
     }
 
@@ -1777,12 +1802,22 @@ impl PostgresStore {
     }
 
     async fn relay_event_allowed(&self, device: &str) -> Result<bool> {
+        self.relay_event_allowed_with_limits(device, 32.0, 1.0)
+            .await
+    }
+
+    async fn relay_event_allowed_with_limits(
+        &self,
+        device: &str,
+        capacity: f64,
+        refill: f64,
+    ) -> Result<bool> {
         bounded_db(async {
             let client = self.client().await?;
             let row = client
                 .query_opt(
-                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,31,clock_timestamp(),true,NULL) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 THEN LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))))-1.0 ELSE LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) END,updated_at=clock_timestamp(),allowed=LEAST(32.0,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at)))) >= 1.0 WHERE central_relay_rate_limits.deleted_at IS NULL RETURNING allowed",
-                    &[&device],
+                    "INSERT INTO central_relay_rate_limits(device_id,tokens,updated_at,allowed,deleted_at) VALUES($1,$2::double precision-1.0,clock_timestamp(),true,NULL) ON CONFLICT(device_id) DO UPDATE SET tokens=CASE WHEN LEAST($2::double precision,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))*$3::double precision)) >= 1.0 THEN LEAST($2::double precision,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))*$3::double precision))-1.0 ELSE LEAST($2::double precision,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))*$3::double precision)) END,updated_at=clock_timestamp(),allowed=LEAST($2::double precision,central_relay_rate_limits.tokens+GREATEST(0.0,EXTRACT(EPOCH FROM (clock_timestamp()-central_relay_rate_limits.updated_at))*$3::double precision)) >= 1.0 WHERE central_relay_rate_limits.deleted_at IS NULL RETURNING allowed",
+                    &[&device, &capacity, &refill],
                 )
                 .await?;
             Ok(row.is_some_and(|row| row.get(0)))
@@ -1824,11 +1859,12 @@ impl PostgresStore {
                 .await?;
             client
                 .batch_execute(&format!(
-                    "{SCHEMA}{}{}{}{}",
+                    "{SCHEMA}{}{}{}{}{}",
                     login::LOGIN_SCHEMA,
                     loans::SCHEMA,
                     migration::SCHEMA,
-                    resets::SCHEMA
+                    resets::SCHEMA,
+                    capacity::SCHEMA
                 ))
                 .await
                 .context("migrate central PostgreSQL schema")?;
