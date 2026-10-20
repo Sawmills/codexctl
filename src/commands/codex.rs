@@ -60,7 +60,7 @@ pub fn run(
             && codexctl::central::remote::connection()?.is_some())
     {
         codexctl::central::native::pinned_arguments(args)?;
-        match codexctl::central::remote::select_codex_account()
+        match codexctl::central::remote::select_codex_account_for_model(args)
             .and_then(|alias| codexctl::central::native::prepare_included_codex(&alias))
         {
             Ok(launch) => {
@@ -71,7 +71,7 @@ pub fn run(
                 Some(launch)
             }
             Err(error) => {
-                if service_mode {
+                if service_mode || codexctl::central::remote::effective_model(args)?.is_some() {
                     return Err(error);
                 }
                 // The lender's lanes come first: never fall back onto a
@@ -156,12 +156,31 @@ pub fn run(
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CodexRunOutcome {
     Exited(i32),
-    SpendCap { session_id: Option<String> },
-    RateLimited429 { session_id: Option<String> },
+    SpendCap {
+        session_id: Option<String>,
+    },
+    RateLimited429 {
+        session_id: Option<String>,
+    },
+    Capacity {
+        session_id: Option<String>,
+        alias: String,
+    },
+}
+
+#[derive(Default)]
+struct CapacityDecision {
+    #[cfg(feature = "central-prototype")]
+    generation: u64,
+    selected: Option<(String, String)>,
 }
 
 trait CodexRunner {
-    fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome>;
+    fn run_codex(
+        &mut self,
+        invocation: &CodexInvocation,
+        tried: &[String],
+    ) -> Result<CodexRunOutcome>;
 }
 
 trait ProfileSwitcher {
@@ -303,13 +322,18 @@ fn run_with_reporter_inner(
     let mut rate_limit_recoveries = Vec::new();
 
     loop {
-        match runner.run_codex(&invocation)? {
+        match runner.run_codex(&invocation, &tried)? {
             CodexRunOutcome::Exited(code) => return Ok(code),
             outcome @ (CodexRunOutcome::SpendCap { .. }
-            | CodexRunOutcome::RateLimited429 { .. }) => {
-                let (session_id, rate_limited) = match outcome {
-                    CodexRunOutcome::SpendCap { session_id } => (session_id, false),
-                    CodexRunOutcome::RateLimited429 { session_id } => (session_id, true),
+            | CodexRunOutcome::RateLimited429 { .. }
+            | CodexRunOutcome::Capacity { .. }) => {
+                let capacity = matches!(outcome, CodexRunOutcome::Capacity { .. });
+                let (session_id, rate_limited, capacity_alias) = match outcome {
+                    CodexRunOutcome::SpendCap { session_id } => (session_id, false, None),
+                    CodexRunOutcome::RateLimited429 { session_id } => (session_id, true, None),
+                    CodexRunOutcome::Capacity { session_id, alias } => {
+                        (session_id, false, Some(alias))
+                    }
                     CodexRunOutcome::Exited(_) => unreachable!(),
                 };
                 if rate_limited {
@@ -337,7 +361,15 @@ fn run_with_reporter_inner(
                     recovery = Some(rec);
                 }
 
-                let candidate = if rate_limited {
+                let candidate = if capacity {
+                    let alias =
+                        capacity_alias.context("capacity recovery lacks an approved account")?;
+                    use_profile::RecoveryCandidate {
+                        alias,
+                        bills_credits: false,
+                        cost: use_profile::RecoveryCost::Headroom,
+                    }
+                } else if rate_limited {
                     loop {
                         let Some(candidate) = switcher.find_recovery_candidate(&tried)? else {
                             bail!(
@@ -368,7 +400,7 @@ fn run_with_reporter_inner(
                         candidate.alias
                     );
                 }
-                if !rate_limited && candidate.bills_credits {
+                if !rate_limited && !capacity && candidate.bills_credits {
                     eprintln!("codexctl: spend cap reached; only credit-billing accounts remain.");
                     if !consent.allow_billing_account(&candidate.alias) {
                         bail!(
@@ -376,7 +408,7 @@ fn run_with_reporter_inner(
                             candidate.alias
                         );
                     }
-                } else if !rate_limited && candidate.reset_plan().is_none() {
+                } else if !rate_limited && !capacity && candidate.reset_plan().is_none() {
                     eprintln!("codexctl: spend cap detected; switching to a no-overage account");
                 }
 
@@ -387,8 +419,8 @@ fn run_with_reporter_inner(
                     );
                 }
 
-                if rate_limited {
-                    // 429 recovery never spends a banked reset.
+                if rate_limited || capacity {
+                    // Capacity and 429 recovery never spend a banked reset.
                 } else if let Some(plan) = candidate.reset_plan() {
                     eprintln!(
                         "codexctl: no account has rate-limit headroom left; {} can redeem a banked reset.",
@@ -1548,7 +1580,11 @@ impl PtyCodexRunner {
 type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 impl CodexRunner for PtyCodexRunner {
-    fn run_codex(&mut self, invocation: &CodexInvocation) -> Result<CodexRunOutcome> {
+    fn run_codex(
+        &mut self,
+        invocation: &CodexInvocation,
+        tried: &[String],
+    ) -> Result<CodexRunOutcome> {
         #[cfg(feature = "central-prototype")]
         let mut central_launch = self
             .central_launch
@@ -1559,6 +1595,7 @@ impl CodexRunner for PtyCodexRunner {
             self.state_reporter.clone(),
             #[cfg(feature = "central-prototype")]
             central_launch.as_mut(),
+            tried,
         )
     }
 }
@@ -1569,6 +1606,7 @@ fn run_codex_in_pty(
     #[cfg(feature = "central-prototype")] mut central_launch: Option<
         &mut codexctl::central::native::PinnedLaunch,
     >,
+    #[cfg_attr(not(feature = "central-prototype"), allow(unused_variables))] tried: &[String],
 ) -> Result<CodexRunOutcome> {
     let interactive = std::io::stdin().is_terminal();
     let _raw_mode = RawModeGuard::enable(interactive)?;
@@ -1578,6 +1616,11 @@ fn run_codex_in_pty(
         .context("failed to open pty")?;
     #[cfg(feature = "central-prototype")]
     let allow_rate_recovery = central_launch.is_some();
+    #[cfg(feature = "central-prototype")]
+    let allow_capacity_recovery = allow_rate_recovery
+        && codexctl::central::remote::effective_model(&invocation.args)?.is_some();
+    #[cfg(not(feature = "central-prototype"))]
+    let allow_capacity_recovery = false;
     #[cfg(not(feature = "central-prototype"))]
     let allow_rate_recovery = false;
     let mut command = CommandBuilder::new("codex");
@@ -1612,12 +1655,20 @@ fn run_codex_in_pty(
     let stop_input = Arc::new(AtomicBool::new(false));
     let spend_cap = Arc::new(AtomicBool::new(false));
     let rate_limited = Arc::new(AtomicBool::new(false));
+    let capacity = Arc::new(Mutex::new(CapacityDecision::default()));
+    let mut capacity_killer = child.clone_killer();
+    let mut approved_capacity = None;
     let session_id = Arc::new(Mutex::new(None));
 
     let mut master = Some(pair.master);
     let reader = master.as_ref().unwrap().try_clone_reader()?;
     let writer = Arc::new(Mutex::new(master.as_ref().unwrap().take_writer()?));
     let mut killer = child.clone_killer();
+    #[cfg(feature = "central-prototype")]
+    let capacity_context = central_launch
+        .as_deref()
+        .filter(|_| allow_capacity_recovery)
+        .map(|_| (invocation.clone(), tried.to_vec()));
     #[cfg(feature = "central-prototype")]
     let terminal_observer = central_launch
         .as_deref_mut()
@@ -1628,12 +1679,16 @@ fn run_codex_in_pty(
         reader,
         Arc::clone(&spend_cap),
         Arc::clone(&rate_limited),
+        Arc::clone(&capacity),
         Arc::clone(&session_id),
         Arc::clone(&stop_input),
         Arc::clone(&writer),
         invocation.continue_goal_on_start,
         !interactive,
         allow_rate_recovery,
+        allow_capacity_recovery,
+        #[cfg(feature = "central-prototype")]
+        capacity_context,
         #[cfg(feature = "central-prototype")]
         terminal_observer,
         state_reporter,
@@ -1658,6 +1713,17 @@ fn run_codex_in_pty(
     #[cfg_attr(not(feature = "central-prototype"), allow(unused_mut))]
     let mut cleanup: Result<()> = Ok(());
     let status = loop {
+        if approved_capacity.is_none() {
+            approved_capacity = capacity
+                .lock()
+                .ok()
+                .and_then(|mut decision| decision.selected.take());
+            if approved_capacity.is_some() {
+                stop_input.store(true, Ordering::SeqCst);
+                let _ = capacity_killer.kill();
+            }
+        }
+
         #[cfg(feature = "central-prototype")]
         if let Some(launch) = central_launch.as_deref_mut()
             && launch.received_signal() != 0
@@ -1706,6 +1772,16 @@ fn run_codex_in_pty(
     if spend_cap.load(Ordering::SeqCst) {
         let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
         Ok(CodexRunOutcome::SpendCap { session_id })
+    } else if let Some((session, alias)) = approved_capacity.or_else(|| {
+        capacity
+            .lock()
+            .ok()
+            .and_then(|mut decision| decision.selected.take())
+    }) {
+        Ok(CodexRunOutcome::Capacity {
+            session_id: Some(session),
+            alias,
+        })
     } else if rate_limited.load(Ordering::SeqCst) {
         let session_id = session_id.lock().ok().and_then(|guard| guard.clone());
         Ok(CodexRunOutcome::RateLimited429 { session_id })
@@ -1757,12 +1833,17 @@ fn spawn_output_thread(
     mut reader: Box<dyn Read + Send>,
     spend_cap: Arc<AtomicBool>,
     rate_limited: Arc<AtomicBool>,
+    #[cfg_attr(not(feature = "central-prototype"), allow(unused_variables))] capacity: Arc<
+        Mutex<CapacityDecision>,
+    >,
     session_id: Arc<Mutex<Option<String>>>,
     stop_input: Arc<AtomicBool>,
     continue_goal_writer: SharedPtyWriter,
     continue_goal_on_start: bool,
     normalize_newlines: bool,
     allow_rate_recovery: bool,
+    allow_capacity_recovery: bool,
+    #[cfg(feature = "central-prototype")] capacity_context: Option<(CodexInvocation, Vec<String>)>,
     #[cfg(feature = "central-prototype")] mut terminal_outcome: codexctl::relay::TerminalObserver,
     state_reporter: Option<HerdrAgentReporter>,
     mut kill_child: impl FnMut() + Send + 'static,
@@ -1773,8 +1854,13 @@ fn spawn_output_thread(
         let mut recent_bytes = Vec::new();
         let mut recent_starts_mid_line = false;
         let mut pending_cr = false;
+        #[cfg(feature = "central-prototype")]
+        let mut capacity_attempted = false;
+        #[cfg(feature = "central-prototype")]
+        let mut capacity_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
         let mut continue_goal_auto_enter = ContinueGoalAutoEnter::default();
-        let mut state_watcher = state_reporter.as_ref().map(|_| CodexStateWatcher::new());
+        let mut state_watcher =
+            (state_reporter.is_some() || allow_capacity_recovery).then(CodexStateWatcher::new);
 
         loop {
             let bytes_read = match reader.read(&mut buffer) {
@@ -1783,6 +1869,21 @@ fn spawn_output_thread(
                 Err(_) => break,
             };
             let chunk = &buffer[..bytes_read];
+            let observed_state = state_watcher
+                .as_mut()
+                .and_then(|watcher| watcher.observe(chunk));
+            if observed_state == Some(HerdrAgentState::Working) {
+                recent_bytes.clear();
+                recent_starts_mid_line = false;
+                #[cfg(feature = "central-prototype")]
+                {
+                    capacity_attempted = false;
+                    if let Ok(mut decision) = capacity.lock() {
+                        decision.generation += 1;
+                        decision.selected = None;
+                    }
+                }
+            }
             #[cfg(feature = "central-prototype")]
             terminal_outcome.observe(chunk);
             if normalize_newlines {
@@ -1808,6 +1909,10 @@ fn spawn_output_thread(
                 &recent_bytes
             };
             let recent = String::from_utf8_lossy(complete_lines);
+            #[cfg(feature = "central-prototype")]
+            if !capacity_seen(&recent) {
+                capacity_attempted = false;
+            }
             let chunk_text = String::from_utf8_lossy(chunk);
 
             if spend_cap_seen(&recent) {
@@ -1820,6 +1925,67 @@ fn spawn_output_thread(
                 stop_input.store(true, Ordering::SeqCst);
                 kill_child();
                 break;
+            }
+
+            if allow_capacity_recovery && capacity_seen(&recent) {
+                #[cfg(feature = "central-prototype")]
+                if !capacity_attempted && let Some((invocation, excluded)) = &capacity_context {
+                    capacity_attempted = true;
+                    let detected = session_id_from_codex_args(&invocation.args)
+                        .or_else(|| {
+                            recent
+                                .lines()
+                                .filter_map(|line| {
+                                    serde_json::from_str::<serde_json::Value>(line).ok()
+                                })
+                                .find_map(|event| {
+                                    (event["type"] == "thread.started")
+                                        .then(|| {
+                                            event["thread_id"]
+                                                .as_str()
+                                                .filter(|s| is_session_id(s))
+                                                .map(str::to_owned)
+                                        })
+                                        .flatten()
+                                })
+                        })
+                        .or_else(|| find_resume_hint_session_id(&recent))
+                        .or_else(|| {
+                            FilesystemSessionStore::new(&config::default_paths().ok()?)
+                                .ok()?
+                                .discover_latest_session_id(invocation)
+                                .ok()
+                                .flatten()
+                        });
+                    if let Some(id) = detected {
+                        terminal_outcome.confirm_capacity_for_session(&id);
+                        let generation = capacity
+                            .lock()
+                            .map(|decision| decision.generation)
+                            .unwrap_or(0);
+                        let capacity = Arc::clone(&capacity);
+                        let args = invocation.args.clone();
+                        let excluded = excluded.clone();
+                        capacity_workers.retain(|worker| !worker.is_finished());
+                        capacity_workers.push(std::thread::spawn(move || {
+                            match codexctl::central::remote::capacity_recovery_candidate(
+                                &args, &id, &excluded,
+                            ) {
+                                Ok(Some(alias)) => {
+                                    if let Ok(mut decision) = capacity.lock()
+                                        && decision.generation == generation
+                                    {
+                                        decision.selected = Some((id, alias));
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(_) => {
+                                    codexctl::relay::TerminalObserver::record_capacity_policy_stop()
+                                }
+                            }
+                        }));
+                    }
+                }
             }
 
             if allow_rate_recovery && rate_limit_seen(&recent) {
@@ -1838,12 +2004,13 @@ fn spawn_output_thread(
                 let _ = write_continue_goal_enter_to_pty(&continue_goal_writer);
             }
 
-            if let (Some(reporter), Some(watcher)) =
-                (state_reporter.as_ref(), state_watcher.as_mut())
-                && let Some(state) = watcher.observe(chunk)
-            {
+            if let (Some(reporter), Some(state)) = (state_reporter.as_ref(), observed_state) {
                 reporter.report(state, None);
             }
+        }
+        #[cfg(feature = "central-prototype")]
+        for worker in capacity_workers {
+            let _ = worker.join();
         }
         if normalize_newlines && pending_cr {
             let _ = stdout.write_all(b"\r");
@@ -2216,6 +2383,36 @@ fn spend_cap_seen(output: &str) -> bool {
             let needle = format!("\u{25a0}{}", normalize_spend_cap_text(message));
             normalized.contains(&needle)
         })
+}
+
+fn capacity_seen(output: &str) -> bool {
+    const MESSAGE: &str = "Selected model is at capacity. Please try a different model.";
+    let output = strip_ansi_escapes(output);
+    let mut rendered = String::new();
+    for line in output.split(['\n', '\r']) {
+        if line.trim_start().starts_with('{') {
+            if let Ok(event) = serde_json::from_str::<serde_json::Value>(line)
+                && event["type"] == "turn.failed"
+                && event["error"]["message"] == MESSAGE
+            {
+                return true;
+            }
+            continue;
+        }
+        if let Some(text) = line.trim_start().strip_prefix('■') {
+            rendered = normalize_spend_cap_text(text);
+        } else if !rendered.is_empty() {
+            rendered.push_str(&normalize_spend_cap_text(line));
+        }
+        let expected = normalize_spend_cap_text(MESSAGE);
+        if rendered == expected {
+            return true;
+        }
+        if !expected.starts_with(&rendered) {
+            rendered.clear();
+        }
+    }
+    false
 }
 
 fn rate_limit_seen(output: &str) -> bool {
@@ -4276,7 +4473,11 @@ mod tests {
     }
 
     impl CodexRunner for FakeCodexRunner {
-        fn run_codex(&mut self, invocation: &CodexInvocation) -> anyhow::Result<CodexRunOutcome> {
+        fn run_codex(
+            &mut self,
+            invocation: &CodexInvocation,
+            _tried: &[String],
+        ) -> anyhow::Result<CodexRunOutcome> {
             self.calls.push(invocation.clone());
             Ok(self.outcomes.remove(0))
         }

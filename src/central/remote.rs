@@ -2340,3 +2340,117 @@ mod tests {
         assert!(!profile.dir.join(".central-transfer.json").exists());
     }
 }
+
+/// Resolve a model only when the CLI or configuration names it exactly.
+pub fn effective_model(args: &[String]) -> Result<Option<String>> {
+    let paths = crate::config::default_paths()?;
+    let path = paths.codex_home().join("config.toml");
+    let doc = if path.try_exists()? {
+        std::fs::read_to_string(path)?.parse::<toml_edit::DocumentMut>()?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+    let profile = doc.get("profile").and_then(toml_edit::Item::as_str);
+    let mut model = profile
+        .and_then(|p| doc.get("profiles")?.get(p)?.get("model")?.as_str())
+        .or_else(|| doc.get("model").and_then(toml_edit::Item::as_str))
+        .map(str::to_owned);
+    let normalized = super::native::pinned_arguments(args)?;
+    let mut arguments = normalized.iter();
+    while let Some(arg) = arguments.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--model" || arg == "-m" {
+            model = arguments.next().cloned();
+        } else if let Some(value) = arg
+            .strip_prefix("--model=")
+            .or_else(|| arg.strip_prefix("-m").filter(|v| !v.is_empty()))
+        {
+            model = Some(value.into());
+        } else if arg == "-c" || arg == "--config" {
+            if let Some(value) = arguments.next() {
+                let parsed = value.parse::<toml_edit::DocumentMut>();
+                if let Some((key, raw)) = value.split_once('=')
+                    && key.trim() == "model"
+                {
+                    model = Some(
+                        parsed
+                            .ok()
+                            .and_then(|doc| {
+                                doc.get("model")
+                                    .and_then(toml_edit::Item::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .unwrap_or_else(|| raw.trim().to_owned()),
+                    );
+                }
+            }
+        }
+    }
+    Ok(model.filter(|m| crate::RELAY_KNOWN_MODELS.contains(&m.as_str())))
+}
+
+fn capacity_plan(
+    args: &[String],
+    session: Option<&str>,
+    tried: &[String],
+) -> Result<Option<String>> {
+    let model =
+        effective_model(args)?.context("capacity recovery requires an exact known model")?;
+    let catalog = catalog()?.context("capacity recovery requires an account server")?;
+    let connection = catalog.connection;
+    let rates = recent_429_rates(catalog.accounts.iter().map(|a| a.alias.as_str()));
+    let input = super::capacity::PlanRequest {
+        model,
+        session_id: session.map(str::to_owned),
+        failed_alias: tried.last().cloned(),
+        tried: tried.to_vec(),
+        recent_429_rates: rates,
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        transport::origin(&connection.server)?;
+        let response: super::capacity::Plan = check(
+            transport::blocking()?
+                .post(format!(
+                    "{}/v1/capacity/plan",
+                    connection.server.trim_end_matches('/')
+                ))
+                .timeout(Duration::from_secs(3))
+                .bearer_auth(secret(&connection)?)
+                .json(&input)
+                .send()?,
+        )?
+        .json()?;
+        if let Some(alias) = response.alias {
+            return Ok(Some(alias));
+        }
+        if session.is_some()
+            && response.reason.as_deref() == Some("evidence_pending")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        bail!(
+            "capacity policy stopped: {}",
+            response.reason.as_deref().unwrap_or("invalid_plan")
+        );
+    }
+}
+
+pub fn select_codex_account_for_model(args: &[String]) -> Result<String> {
+    if effective_model(args)?.is_none() {
+        return select_codex_account();
+    }
+    capacity_plan(args, None, &[])?.context("capacity policy: no available included account")
+}
+
+pub fn capacity_recovery_candidate(
+    args: &[String],
+    session: &str,
+    tried: &[String],
+) -> Result<Option<String>> {
+    capacity_plan(args, Some(session), tried)
+}

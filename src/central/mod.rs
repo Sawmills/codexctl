@@ -1,5 +1,6 @@
 //! Experimental single-account credential broker and local App Server client.
 mod activity;
+pub mod capacity;
 mod catalog;
 mod client;
 mod dashboard;

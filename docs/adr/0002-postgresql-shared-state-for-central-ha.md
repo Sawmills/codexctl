@@ -61,3 +61,22 @@ readiness/alerts are part of the implementation. In return, replicas can run
 on independent nodes and zones, refresh ownership survives pod failure without
 Multi-Attach, and every write that can spend or rotate credentials has a
 transactional fence.
+
+## Account/Model Capacity Recovery (FLT-525)
+
+The capacity recovery policy is shared derived state. Unlike diagnostic failure
+counters, its expiring observations and session move budget affect account
+selection across machines and replicas. PostgreSQL stores bounded documents in
+`central_capacity_policy`, one per exact model and one per company user's session
+budgets. Recovery locks the model and budget together. Unchanged documents do
+not cause a payload write. Each document is capped at 4 MiB.
+
+File mode uses private files under the account server's `capacity/` directory and
+a file lock. It publishes the budget first, so an interrupted write can charge an
+unused move but cannot erase a charged move. This policy does not change refresh
+leases or credential ownership.
+
+Histories and move exclusions use the resolved workspace and login claims,
+including namespace-preserving legacy claim transitions. Renames and loan
+references therefore share the account's cooldown. Session budgets remain scoped
+to the enrolled company user and native session ID.

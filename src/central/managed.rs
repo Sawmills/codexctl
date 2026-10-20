@@ -184,21 +184,30 @@ impl Default for RelayMetrics {
 struct RelayTokenBucket {
     tokens: f64,
     last: std::time::Instant,
+    capacity: f64,
+    refill: f64,
 }
 
 impl RelayTokenBucket {
     fn new() -> Self {
+        Self::with_limits(
+            RELAY_EVENT_BUCKET_CAPACITY,
+            RELAY_EVENT_BUCKET_REFILL_PER_SECOND,
+        )
+    }
+    fn with_limits(capacity: f64, refill: f64) -> Self {
         Self {
-            tokens: RELAY_EVENT_BUCKET_CAPACITY,
+            tokens: capacity,
             last: std::time::Instant::now(),
+            capacity,
+            refill,
         }
     }
 
     fn take(&mut self) -> bool {
         let now = std::time::Instant::now();
         let elapsed = now.duration_since(self.last).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * RELAY_EVENT_BUCKET_REFILL_PER_SECOND)
-            .min(RELAY_EVENT_BUCKET_CAPACITY);
+        self.tokens = (self.tokens + elapsed * self.refill).min(self.capacity);
         self.last = now;
         if self.tokens < 1.0 {
             return false;
@@ -220,12 +229,14 @@ struct RelayCapacityEvent {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum RelayEvent {
+    AccountCapacity(super::capacity::Report),
     Capacity(RelayCapacityEvent),
     Stop(crate::outcomes::StopReport),
     Selection(crate::outcomes::SelectionReport),
 }
 
 enum AcceptedRelayEvent {
+    AccountCapacity(super::capacity::Report),
     Capacity(RelayMetricKey),
     Stop(crate::outcomes::StopReport),
     Selection(crate::outcomes::SelectionReport),
@@ -234,6 +245,11 @@ enum AcceptedRelayEvent {
 impl RelayEvent {
     fn validate(self) -> Option<AcceptedRelayEvent> {
         match self {
+            Self::AccountCapacity(report) => report
+                .account_capacity
+                .validate()
+                .ok()
+                .map(|_| AcceptedRelayEvent::AccountCapacity(report)),
             Self::Capacity(event) => event.validate().ok().map(AcceptedRelayEvent::Capacity),
             Self::Stop(report) => Some(AcceptedRelayEvent::Stop(report)),
             Self::Selection(report) => Some(AcceptedRelayEvent::Selection(report)),
@@ -326,12 +342,18 @@ impl Broker {
 
     async fn relay_accept(
         &self,
-        device: &str,
+        device: &vault::Device,
         event: AcceptedRelayEvent,
     ) -> std::result::Result<bool, HttpError> {
+        let capacity = matches!(&event, AcceptedRelayEvent::AccountCapacity(_));
         let allowed = match self.central.as_ref() {
             Some(store) if !matches!(store.mode(), StoreMode::File) => {
-                store.relay_event_allowed(device).await.map_err(|_| {
+                let allowed = if capacity {
+                    store.capacity_event_allowed(&device.id).await
+                } else {
+                    store.relay_event_allowed(&device.id).await
+                };
+                allowed.map_err(|_| {
                     self.error(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "relay_rate_limiter_unavailable",
@@ -345,8 +367,18 @@ impl Broker {
                     .expect("relay metric lock poisoned");
                 let bucket = metrics
                     .buckets
-                    .entry(device.to_owned())
-                    .or_insert_with(RelayTokenBucket::new);
+                    .entry(if capacity {
+                        format!("capacity:{}", device.id)
+                    } else {
+                        device.id.clone()
+                    })
+                    .or_insert_with(|| {
+                        if capacity {
+                            RelayTokenBucket::with_limits(256.0, 64.0)
+                        } else {
+                            RelayTokenBucket::new()
+                        }
+                    });
                 bucket.take()
             }
         };
@@ -354,6 +386,10 @@ impl Broker {
             return Ok(false);
         }
         let key = match event {
+            AcceptedRelayEvent::AccountCapacity(report) => {
+                super::capacity::accept(self, device, report).await?;
+                return Ok(true);
+            }
             AcceptedRelayEvent::Capacity(key) => key,
             AcceptedRelayEvent::Stop(report) => {
                 self.outcomes.stopped(&report);
@@ -2270,7 +2306,7 @@ async fn relay_capacity_event(
         broker.relay_reject("invalid_label");
         return Err(broker.error(StatusCode::BAD_REQUEST, "invalid_relay_event"));
     };
-    if !broker.relay_accept(&device.id, event).await? {
+    if !broker.relay_accept(&device, event).await? {
         broker.relay_reject("rate_limited");
         return Err(broker.error(StatusCode::TOO_MANY_REQUESTS, "relay_event_rate_limited"));
     }
@@ -3183,6 +3219,7 @@ pub(super) fn api_routes() -> Router<Broker> {
         .route("/v1/accounts/login/status", post(relogin::add::status))
         .route("/v1/accounts/login/cancel", post(relogin::add::cancel))
         .route("/v1/relay/capacity-events", post(relay_capacity_event))
+        .route("/v1/capacity/plan", post(super::capacity::plan_http))
         .route("/metrics", get(metrics))
         .route("/ready", get(ready))
         .route("/health", get(|| async { StatusCode::OK }))
