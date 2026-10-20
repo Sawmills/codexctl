@@ -252,6 +252,10 @@ with a 1 GiB free-space reserve; each restore checks that reserve again. If spac
 the launch fails with an error. This can temporarily grow the state directory by several
 cold sessions. The same restore policy applies to `codexctl exec --account <alias> -- codex resume`.
 A held or changed file is skipped or refused; the original is never removed on a failed archive.
+Sizing and checkpointing use the same inventory of numbered `logs_*.sqlite` and
+`thread_history_*.sqlite` databases and their WAL/SHM sidecars. A malformed archive
+index refuses resume before Codex starts. Archive and index directories are synced
+before source deletion; the source directory is synced after deletion.
 
 The reviewed daily LaunchAgent is
 `deploy/macos/ai.sawmills.codexctl.state-cap.plist`. Install it only after the guide's CX-LD

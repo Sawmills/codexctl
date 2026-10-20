@@ -79,6 +79,19 @@ def check(binary, case):
         if not original.exists():
             assert gzip.decompress(archive.read_bytes()) == source
             assert (root / "state-cap-archive-index.tsv").read_text().startswith("durable\t")
+        if case == "archive":
+            # A failed publication sync must not leave an unindexed archive
+            # that prevents maintenance from retrying once the disk recovers.
+            assert not archive.exists(), "unindexed archive left after failed sync"
+            trace.unlink()
+            fields, result = run(binary, home, apply=True, extra_env={
+                "LD_PRELOAD": str(library), "STATE_CAP_TEST_ROOT": str(root),
+                "STATE_CAP_TEST_SOURCE": str(original), "STATE_CAP_TEST_TRACE": str(trace),
+                "STATE_CAP_TEST_FAIL": "success"})
+            assert fields["errors"] == "0", (fields, result.stderr)
+            assert trace.read_text().splitlines() == ["sync-archive", "sync-index", "unlink-source", "sync-source"]
+            assert not original.exists()
+            assert gzip.decompress(archive.read_bytes()) == source
 
 
 if __name__ == "__main__":

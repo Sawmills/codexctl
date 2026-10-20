@@ -244,9 +244,10 @@ fn archive_rollout(path: &Path, root: &Path) -> Result<u64> {
     fs::remove_file(&temp)?;
     temp_guard.disarm();
     let parent = path.parent().context("rollout has no parent directory")?;
-    File::open(parent)?
-        .sync_all()
-        .context("cannot sync published archive directory; keeping source")?;
+    if let Err(error) = File::open(parent).and_then(|directory| directory.sync_all()) {
+        let _ = fs::remove_file(&archive);
+        return Err(error).context("cannot sync published archive directory; keeping source");
+    }
     if let Err(error) = append_index(
         root,
         &ArchiveEntry {
