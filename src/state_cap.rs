@@ -424,6 +424,12 @@ fn discover_state_databases(root: &Path) -> Result<Vec<PathBuf>> {
         if number.is_some_and(|number| {
             !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
         }) {
+            if fs::symlink_metadata(entry.path())?.file_type().is_symlink() {
+                bail!(
+                    "symlinked state database entry {}; refusing state maintenance",
+                    entry.path().display()
+                );
+            }
             databases.insert(root.join(base));
         }
     }

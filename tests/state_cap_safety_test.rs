@@ -10,6 +10,11 @@ fn every_numbered_state_database_is_checkpointed_when_unheld() {
     check("checkpoint");
 }
 
+#[test]
+fn symlinked_state_databases_are_rejected_without_touching_external_wal() {
+    check("symlink");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn archive_and_index_are_durable_before_source_removal() {

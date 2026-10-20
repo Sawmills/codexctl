@@ -9,7 +9,7 @@ import sys
 import tempfile
 
 
-def run(binary, home, apply=False, extra_env=None):
+def run(binary, home, apply=False, extra_env=None, expect_report=True):
     env = {key: value for key, value in os.environ.items() if not key.startswith(("CODEX", "CLAUDE", "HERDR"))}
     env["HOME"] = str(home)
     env.update(extra_env or {})
@@ -17,9 +17,15 @@ def run(binary, home, apply=False, extra_env=None):
     if apply:
         args.append("--apply")
     result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=30)
-    assert "Codex state cap:" in result.stdout, (result.stdout, result.stderr)
+    if expect_report:
+        assert "Codex state cap:" in result.stdout, (result.stdout, result.stderr)
     fields = dict(word.split("=", 1) for word in result.stdout.split() if "=" in word)
     return fields, result
+
+
+def leave_committed_wal(path):
+    # A crashed writer leaves committed WAL frames with no holder.
+    subprocess.run([sys.executable, "-c", "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA wal_autocheckpoint=0'); c.execute('CREATE TABLE fixture(value)'); c.execute('INSERT INTO fixture VALUES(42)'); c.commit(); os._exit(0)", str(path)], check=True, timeout=10)
 
 
 def check(binary, case):
@@ -27,6 +33,18 @@ def check(binary, case):
         home = Path(temporary).resolve()
         root = home / ".codex"
         root.mkdir()
+        if case == "symlink":
+            external = home / "outside.sqlite"
+            leave_committed_wal(external)
+            files = [external, home / "outside.sqlite-wal", home / "outside.sqlite-shm"]
+            before = [path.read_bytes() for path in files]
+            (root / "logs_27.sqlite").symlink_to(external)
+            for apply in [False, True]:
+                _, result = run(binary, home, apply=apply, expect_report=False)
+                assert result.returncode != 0, (result.stdout, result.stderr)
+                assert "symlinked state database entry" in result.stderr, result.stderr
+                assert [path.read_bytes() for path in files] == before, "external database was modified"
+            return
         if case == "accounting":
             files = {"logs_27.sqlite": 100, "logs_27.sqlite-wal": 25, "logs_27.sqlite-shm": 13,
                      "thread_history_8.sqlite": 200, "thread_history_8.sqlite-wal": 31,
@@ -42,8 +60,7 @@ def check(binary, case):
             return
         if case == "checkpoint":
             for name in ["logs_27.sqlite", "thread_history_8.sqlite"]:
-                # A crashed writer leaves committed WAL frames with no holder.
-                subprocess.run([sys.executable, "-c", "import os,sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL'); c.execute('PRAGMA wal_autocheckpoint=0'); c.execute('CREATE TABLE fixture(value)'); c.execute('INSERT INTO fixture VALUES(42)'); c.commit(); os._exit(0)", str(root / name)], check=True, timeout=10)
+                leave_committed_wal(root / name)
                 assert (root / (name + "-wal")).stat().st_size > 0
             fields, result = run(binary, home, apply=True)
             assert fields["errors"] == "0", (fields, result.stderr)
