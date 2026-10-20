@@ -122,6 +122,13 @@ jobs:
           components: rustfmt, clippy
       - name: Set up Trunk
         uses: trunk-io/trunk-action/setup@04ba50e7658c81db7356da96657e6e77f220bfa3 # v1
+      - name: Install OSV scanner
+        run: |
+          mkdir -p .trunk/tools
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output .trunk/tools/osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64
+          chmod +x .trunk/tools/osv-scanner
       - name: Trunk Check
         env:
           TRUNK_BASE_SHA: ${{ github.event.pull_request.base.sha }}
