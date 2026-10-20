@@ -132,28 +132,28 @@ impl Evidence {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::central) struct State {
-    histories: BTreeMap<String, History>,
-    sessions: BTreeMap<String, Session>,
+    pub(super) histories: BTreeMap<String, History>,
+    pub(super) sessions: BTreeMap<String, Session>,
 }
-#[derive(Default, Serialize, Deserialize)]
-struct History {
-    identity: super::loans::CredentialSubject,
-    model: String,
-    anchor_until: i64,
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct History {
+    pub(super) identity: super::loans::CredentialSubject,
+    pub(super) model: String,
+    pub(super) anchor_until: i64,
     #[serde(default)]
-    completed_at: Option<i64>,
+    pub(super) completed_at: Option<i64>,
     #[serde(default)]
-    completed_ids: BTreeMap<String, i64>,
-    seen: BTreeMap<String, i64>,
-    failures: Vec<i64>,
-    cooling_until: i64,
-    terminal: BTreeMap<String, (String, i64)>,
+    pub(super) completed_ids: BTreeMap<String, i64>,
+    pub(super) seen: BTreeMap<String, i64>,
+    pub(super) failures: Vec<i64>,
+    pub(super) cooling_until: i64,
+    pub(super) terminal: BTreeMap<String, (String, i64)>,
 }
-#[derive(Default, Serialize, Deserialize)]
-struct Session {
-    moves: Vec<(i64, String, String, String)>,
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct Session {
+    pub(super) moves: Vec<(i64, String, String, String)>,
 }
 
 impl State {

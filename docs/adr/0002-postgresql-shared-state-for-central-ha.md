@@ -66,15 +66,28 @@ transactional fence.
 
 The capacity recovery policy is shared derived state. Unlike diagnostic failure
 counters, its expiring observations and session move budget affect account
-selection across machines and replicas. PostgreSQL stores bounded documents in
-`central_capacity_policy`, one per exact model and one per company user's session
-budgets. Recovery locks the model and budget together. Unchanged documents do
-not cause a payload write. Each document is capped at 4 MiB.
+selection across machines and replicas. PostgreSQL stores typed history columns
+and bounded evidence arrays in `central_capacity_histories`, and typed move
+receipts in `central_capacity_moves`. `central_capacity_policy` records each
+scope's generation, schema version, expiry and logical deletion marker. SQL
+constraints enforce supported versions and evidence bounds. Unique active-row
+indexes prevent two active scope generations or two active history/move
+revisions. They are correctness constraints.
+
+Recovery locks model and budget scopes in sorted order in one transaction.
+Transaction advisory locks also serialize scope creation; active generations
+then use row locks. Only changed histories or move receipts are written. Expiry
+marks a generation deleted and retains its histories and move receipts. Scope
+reuse opens a new generation and reads only its active rows, so expired evidence
+cannot return to account selection or restore an expired move budget. A pruned
+history or move gets a deletion marker; reuse inserts a new row revision and
+retains that marker. Historical rows accumulate. This change adds no physical
+purge or retention horizon; live-state limits do not bound historical storage.
 
 File mode uses private files under the account server's `capacity/` directory and
 a file lock. It publishes the budget first, so an interrupted write can charge an
-unused move but cannot erase a charged move. This policy does not change refresh
-leases or credential ownership.
+unused move but cannot erase a charged move. Each file is capped at 4 MiB. This
+policy does not change refresh leases or credential ownership.
 
 Histories and move exclusions use the resolved workspace and login claims,
 including namespace-preserving legacy claim transitions. Renames and loan
