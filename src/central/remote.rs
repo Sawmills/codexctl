@@ -2368,23 +2368,23 @@ pub fn effective_model(args: &[String]) -> Result<Option<String>> {
             .or_else(|| arg.strip_prefix("-m").filter(|v| !v.is_empty()))
         {
             model = Some(value.into());
-        } else if arg == "-c" || arg == "--config" {
-            if let Some(value) = arguments.next() {
-                let parsed = value.parse::<toml_edit::DocumentMut>();
-                if let Some((key, raw)) = value.split_once('=')
-                    && key.trim() == "model"
-                {
-                    model = Some(
-                        parsed
-                            .ok()
-                            .and_then(|doc| {
-                                doc.get("model")
-                                    .and_then(toml_edit::Item::as_str)
-                                    .map(str::to_owned)
-                            })
-                            .unwrap_or_else(|| raw.trim().to_owned()),
-                    );
-                }
+        } else if (arg == "-c" || arg == "--config")
+            && let Some(value) = arguments.next()
+        {
+            let parsed = value.parse::<toml_edit::DocumentMut>();
+            if let Some((key, raw)) = value.split_once('=')
+                && key.trim() == "model"
+            {
+                model = Some(
+                    parsed
+                        .ok()
+                        .and_then(|doc| {
+                            doc.get("model")
+                                .and_then(toml_edit::Item::as_str)
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| raw.trim().to_owned()),
+                );
             }
         }
     }
