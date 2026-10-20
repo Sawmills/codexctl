@@ -918,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_respects_the_free_space_floor() {
+    fn apply_reclaims_below_the_free_space_target_even_when_under_the_byte_cap() {
         let root = std::env::temp_dir().join(format!(
             "codexctl-state-cap-floor-{}",
             SystemTime::now()
@@ -929,7 +929,14 @@ mod tests {
         let sessions = root.join("sessions/2026/10/19");
         fs::create_dir_all(&sessions).unwrap();
         let original = sessions.join("rollout-floor.jsonl");
-        fs::write(&original, b"{\"payload\":{\"session_id\":\"floor\"}}\n").unwrap();
+        fs::write(
+            &original,
+            format!(
+                "{{\"payload\":{{\"session_id\":\"floor\",\"pad\":\"{}\"}}}}\n",
+                "x".repeat(4096)
+            ),
+        )
+        .unwrap();
         let file = File::options().append(true).open(&original).unwrap();
         file.set_times(
             std::fs::FileTimes::new()
@@ -939,16 +946,49 @@ mod tests {
         drop(file);
         let report = run(&StateCapConfig {
             root: root.clone(),
-            max_bytes: 0,
+            max_bytes: u64::MAX,
             older_than: Duration::from_secs(7 * 24 * 60 * 60),
             min_free_bytes: u64::MAX,
             reserve_bytes: 0,
             apply: true,
         })
         .unwrap();
+        assert!(report.reclaimed_bytes > 0);
+        assert!(!report.free_space_ok);
+        assert!(!report.cap_met);
+        assert_eq!(report.errors, 0);
+        assert!(!original.exists());
+        assert!(original.with_extension("jsonl.gz").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn restore_with_no_index_refuses_while_archive_publication_holds_the_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = StateCapLock::acquire(root.path()).unwrap();
+        let error = restore_indexed_rollout(root.path(), "not-indexed-yet").unwrap_err();
+        assert!(error.to_string().contains("state-cap lock is held"));
+        drop(lock);
+        assert!(!restore_indexed_rollout(root.path(), "not-indexed-yet").unwrap());
+    }
+
+    #[test]
+    fn apply_keeps_the_source_when_the_allocation_reserve_is_unavailable() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let original = sessions.join("rollout-reserve.jsonl");
+        fs::write(&original, b"{\"payload\":{\"session_id\":\"reserve\"}}\n").unwrap();
+        let report = run(&StateCapConfig {
+            root: root.path().to_owned(),
+            max_bytes: 0,
+            older_than: Duration::ZERO,
+            min_free_bytes: u64::MAX,
+            reserve_bytes: u64::MAX,
+            apply: true,
+        })
+        .unwrap();
         assert_eq!(report.reclaimed_bytes, 0);
         assert!(original.exists());
         assert!(!original.with_extension("jsonl.gz").exists());
-        let _ = fs::remove_dir_all(root);
     }
 }
