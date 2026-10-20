@@ -1119,7 +1119,6 @@ Create these SSM SecureString values through the operator secret workflow:
 - `/app/codexctl/vault-key`: base64 of the 32-byte encryption key.
 - `/app/codexctl/google-oidc-client-secret`: the Google client secret that the broker uses.
 - `/app/codexctl/oidc-client-secret`: the Clerk client secret, kept only for rollback.
-- `/app/codexctl/metrics-token`: a separate random bearer credential of at least 32 visible ASCII characters. The server trims surrounding whitespace.
 
 The ExternalSecret reads all of them from SSM through
 `ClusterSecretStore/aws-parameter-store`; there is no AWS Secrets Manager store.
@@ -1391,18 +1390,20 @@ account-operation alert. A usage alert does not mean token delivery has failed.
 Session-write, cleanup, count, and queue failures use `live_session_failed` and
 the same alert. Each failed observation or count attempt is counted once.
 The staging overlay includes a PrometheusRule for the existing `kube-prometheus` selector.
-The staging `ScrapeConfig` still supplies its legacy bearer through the existing
-Prometheus operator. The endpoint no longer checks it; its Secret reference and
-the validated `--metrics-token-file` launch option remain for the staged SAW-13160 cleanup.
-The ServiceMonitor schema lacks authentication fields, so this deployment uses
-that supported ScrapeConfig path without changing the shared monitoring hold.
+Staging uses `ScrapeConfig` through the existing Prometheus operator.
+[PR #259](https://github.com/Sawmills/codexctl/pull/259) removes the retired
+metrics-file and scrape-bearer wiring. Omit `--metrics-token-file` from new
+launch commands. The legacy option remains accepted and validates a supplied
+file, but does not protect `/metrics`.
+The standalone ServiceMonitor is an unregistered example; this documentation
+change does not install it or change the shared monitoring hold.
 The endpoint declares Prometheus text format version 0.0.4.
 Availability alerts use failed or absent scrapes. Credential alerts use recent
 failure timestamps and the unresolved-ownership gauge.
-The metrics credential at `/app/codexctl/metrics-token` has no account API access.
-Image activation requires a separate operator GO: current staging ingress and
-NetworkPolicy permit VPC access to this route. Bound or explicitly accept that
-exposure and verify per-pod scrapes before rollout; no deployment wiring changes here.
+Current staging ingress and NetworkPolicy permit VPC access to this route.
+Activation and per-pod scrape readback remain separate operator gates; PR #259
+does not establish live scrape behavior. Deleting an existing SSM parameter
+requires separate approval. Account API authentication and network exposure stay unchanged.
 Failure timestamps allow the first failure to alert even before a zero counter was scraped.
 Alert routing and notification delivery are separate deployment checks.
 
