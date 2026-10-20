@@ -29,10 +29,11 @@ this machine, sign in with company SSO, and compare the browser and terminal cod
 codexctl connect --server https://YOUR-SERVER
 ```
 
-Then check your server accounts and launch Codex:
+Then check your server accounts, activate one, and launch Codex:
 
 ```sh
 codexctl status
+codexctl use
 codexctl codex
 ```
 

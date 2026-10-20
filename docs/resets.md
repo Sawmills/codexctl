@@ -42,11 +42,12 @@ Local automatic selection prefers the eligible account whose weekly window
 resets soonest within its billing class. Accounts that cannot bill credits rank
 before accounts that can. Usage-based accounts are never selected automatically.
 
-Within each billing class, automatic selection skips a candidate at or above 95%
-usage when another candidate is below 95%. This rule applies to local and server
-selection. A server account at 10% can therefore rank before one at 97%, even if
-the latter resets sooner. Server launches also consider live sessions and recent
-429s; see [launching and recovery](launching.md#recovery).
+Within each billing class, automatic `use` selection skips a candidate at or above
+95% usage when another candidate is below 95%. This applies to local and server
+accounts. A server account at 10% can therefore rank before one at 97%, even if
+the latter resets sooner. Fresh server `codex` launches use a separate policy:
+they exclude exhausted windows at 100% and rank by live sessions and recent 429s.
+See [launching and recovery](launching.md#recovery).
 
 For local selection, choose the most-headroom-first order instead:
 
