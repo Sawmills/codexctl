@@ -7,6 +7,11 @@ fn resume_last_restores_all_archives_before_native_selection() {
 }
 
 #[test]
+fn resume_last_in_a_pinned_home_uses_the_canonical_archive_index() {
+    check_resume("codex", "inherited");
+}
+
+#[test]
 fn resume_last_refuses_low_space_before_starting_the_child() {
     check_resume("codex", "low-space");
     check_resume("exec", "low-space");

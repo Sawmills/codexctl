@@ -55,6 +55,12 @@ def check(binary, command, case):
         native_args = ["--cd", str(home), "resume", "--last", "--all"]
         env = {key: value for key, value in os.environ.items() if not key.startswith(("CODEX", "CLAUDE", "HERDR"))}
         env.update(HOME=str(home), PATH=str(bindir) + os.pathsep + os.environ["PATH"], RESUME_EXPECTED_ARGS=json.dumps(native_args))
+        if case == "inherited":
+            pinned = home / ".codexctl/exec-homes/a"
+            pinned.mkdir(parents=True)
+            (pinned / "sessions").symlink_to(sessions)
+            (pinned / "auth.json").write_text(auth)
+            env["CODEX_HOME"] = str(pinned)
         lock = None
         if case == "low-space":
             # 1 GiB + 12 KiB fits either 8 KiB source, but not both.
@@ -67,7 +73,7 @@ def check(binary, command, case):
         result = subprocess.run(args + native_args, env=env, cwd=home, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
         if lock:
             lock.close()
-        if case == "restores":
+        if case in {"restores", "inherited"}:
             assert result.returncode == 0, (result.stdout, result.stderr)
             receipt = json.loads((home / "child.json").read_text())
             assert receipt == {"args": native_args, "selected": ids[0]}, receipt

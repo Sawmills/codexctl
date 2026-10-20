@@ -37,7 +37,7 @@ pub fn run(
 ) -> Result<i32> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let paths = config::default_paths()?;
-    restore_before_codex_resume(&codex_home_for_child(&paths), args)?;
+    restore_before_codex_resume(&paths.codex_home(), args)?;
     #[cfg(feature = "central-prototype")]
     let service_mode = codexctl::central::service_account::enabled()?;
     #[cfg(feature = "central-prototype")]
