@@ -138,6 +138,7 @@ impl CentralStore {
                 let tx = connection.transaction().await?;
                 let mut states = BTreeMap::new();
                 let mut originals = BTreeMap::new();
+                let mut pruned_states = BTreeMap::new();
                 let mut generations = BTreeMap::new();
                 for scope in &scopes {
                     // Serializes absent as well as existing scopes across replicas.
@@ -151,17 +152,22 @@ impl CentralStore {
                     } else {
                         tx.query_one("INSERT INTO central_capacity_policy(scope_id,generation,expires_at) SELECT $1,COALESCE(MAX(generation),0)+1,$2 FROM central_capacity_policy WHERE scope_id=$1 RETURNING generation", &[scope,&(now+3600)]).await?.get(0)
                     };
-                    let state = load_state(&tx,scope,generation).await?;
+                    let mut state = load_state(&tx,scope,generation).await?;
                     originals.insert(scope.clone(),state.clone());
+                    // A callback may recreate a just-pruned key. Keep the live
+                    // baseline so retirement cannot disappear from the diff.
+                    state.prune(now);
+                    pruned_states.insert(scope.clone(),state.clone());
                     states.insert(scope.clone(),state);
                     generations.insert(scope.clone(),generation);
                 }
                 let result = operation(&mut states)?;
                 for (scope,state) in states {
                     let before = originals.remove(&scope).context("capacity scope absent")?;
-                    if state != before {
+                    let pruned = pruned_states.remove(&scope).context("capacity live scope absent")?;
+                    if state != before || pruned != before {
                         let generation = generations[&scope];
-                        save_state(&tx,&scope,generation,&before,&state,now).await?;
+                        save_state(&tx,&scope,generation,&before,&pruned,&state,now).await?;
                         tx.execute("UPDATE central_capacity_policy SET expires_at=$3 WHERE scope_id=$1 AND generation=$2 AND deleted_at IS NULL", &[&scope,&generation,&(now+3600)]).await?;
                     }
                 }
@@ -207,18 +213,19 @@ async fn save_state(
     scope: &str,
     generation: i64,
     before: &State,
+    pruned: &State,
     state: &State,
     now: i64,
 ) -> Result<()> {
     for key in before
         .histories
         .keys()
-        .filter(|key| !state.histories.contains_key(*key))
+        .filter(|key| !pruned.histories.contains_key(*key) || !state.histories.contains_key(*key))
     {
         tx.execute("UPDATE central_capacity_histories SET deleted_at=$4 WHERE scope_id=$1 AND generation=$2 AND identity_key=$3 AND deleted_at IS NULL", &[&scope,&generation,key,&now]).await?;
     }
     for (key, history) in &state.histories {
-        if before.histories.get(key) == Some(history) {
+        if before.histories.get(key) == Some(history) && pruned.histories.contains_key(key) {
             continue;
         }
         let seen_ids = history.seen.keys().cloned().collect::<Vec<_>>();
@@ -240,17 +247,21 @@ async fn save_state(
     }
     for (session, previous) in &before.sessions {
         for (_, _, _, event) in &previous.moves {
-            if state
-                .sessions
-                .get(session)
-                .is_none_or(|s| !s.moves.iter().any(|(_, _, _, id)| id == event))
-            {
+            let retained = |snapshot: &State| {
+                snapshot
+                    .sessions
+                    .get(session)
+                    .is_some_and(|s| s.moves.iter().any(|(_, _, _, id)| id == event))
+            };
+            if !retained(pruned) || !retained(state) {
                 tx.execute("UPDATE central_capacity_moves SET deleted_at=$5 WHERE scope_id=$1 AND generation=$2 AND session_key=$3 AND event_key=$4 AND deleted_at IS NULL", &[&scope,&generation,session,event,&now]).await?;
             }
         }
     }
     for (session, moves) in &state.sessions {
-        if before.sessions.get(session) == Some(moves) {
+        if before.sessions.get(session) == Some(moves)
+            && pruned.sessions.get(session) == Some(moves)
+        {
             continue;
         }
         for (at, failed, selected, event) in &moves.moves {
@@ -435,17 +446,90 @@ mod tests {
         assert_eq!(versions[0].get::<_, Option<i64>>(1), Some(1303));
         assert_eq!(versions[1].get::<_, i64>(0), 2);
         assert_eq!(versions[1].get::<_, Option<i64>>(1), None);
+        // A single recovery plan can prune a stale alternate and select that
+        // same seat. Its previous revision must survive this one operation.
+        let next_session = "119e8489-aa28-7071-ab90-16b81c7cfd1d";
+        for (n, at) in [(0, 1419), (1, 1420), (2, 1421)] {
+            policy
+                .observe(
+                    Evidence {
+                        alias: "b".into(),
+                        model: model.into(),
+                        event_id: format!("b-failure-{n}"),
+                        outcome: Outcome::Overloaded,
+                        session_id: Some(next_session.into()),
+                        observed_at: None,
+                        identity: Some(crate::central::loans::CredentialSubject {
+                            workspace: "workspace".into(),
+                            uid: None,
+                            sub: Some("b".into()),
+                        }),
+                    },
+                    at,
+                )
+                .await
+                .unwrap();
+        }
+        policy
+            .observe(
+                Evidence {
+                    alias: "b".into(),
+                    model: model.into(),
+                    event_id: "b-terminal".into(),
+                    outcome: Outcome::Terminal,
+                    session_id: Some(next_session.into()),
+                    observed_at: None,
+                    identity: Some(crate::central::loans::CredentialSubject {
+                        workspace: "workspace".into(),
+                        uid: None,
+                        sub: Some("b".into()),
+                    }),
+                },
+                1422,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            policy
+                .plan(
+                    PlanRequest {
+                        model: model.into(),
+                        session_id: Some(next_session.into()),
+                        failed_alias: Some("b".into()),
+                        tried: vec!["b".into()],
+                        recent_429_rates: Default::default(),
+                    },
+                    accounts(),
+                    1425
+                )
+                .await
+                .unwrap()
+                .alias
+                .as_deref(),
+            Some("a")
+        );
+        let reused = control.query("SELECT revision,deleted_at,completed_at,anchor_until FROM central_capacity_histories WHERE login_sub='a' ORDER BY revision",&[]).await.unwrap();
+        assert_eq!(
+            reused.len(),
+            3,
+            "single-operation prune/reuse must retain the prior revision"
+        );
+        assert_eq!(reused[1].get::<_, Option<i64>>(1), Some(1425));
+        assert_eq!(reused[1].get::<_, Option<i64>>(2), Some(1304));
+        assert_eq!(reused[2].get::<_, i64>(0), 3);
+        assert_eq!(reused[2].get::<_, Option<i64>>(1), None);
+        assert_eq!(reused[2].get::<_, i64>(3), 5025);
         // An ordinary operation expires the old generation and opens a fresh
         // scope. The old typed rows and their expiry marker remain readable.
         let scope = format!("model:{model}");
         let (left, right) = tokio::join!(
-            store.capacity_state(&scope, 5000, |_| Ok(())),
-            replica.capacity_state(&scope, 5000, |_| Ok(())),
+            store.capacity_state(&scope, 6000, |_| Ok(())),
+            replica.capacity_state(&scope, 6000, |_| Ok(())),
         );
         left.unwrap();
         right.unwrap();
         let old = control.query_one("SELECT p.deleted_at,h.cooling_until FROM central_capacity_policy p JOIN central_capacity_histories h USING(scope_id,generation) WHERE p.generation=1 AND h.login_sub='a' AND h.revision=1", &[]).await.unwrap();
-        assert_eq!(old.get::<_, Option<i64>>(0), Some(5000));
+        assert_eq!(old.get::<_, Option<i64>>(0), Some(6000));
         assert_eq!(old.get::<_, i64>(1), 1302);
         let live = control
             .query_one(
@@ -457,12 +541,12 @@ mod tests {
         assert_eq!(live.get::<_, i64>(0), 2);
         let active = control.query_one("SELECT count(*) FROM central_capacity_histories h JOIN central_capacity_policy p USING(scope_id,generation) WHERE p.deleted_at IS NULL AND h.deleted_at IS NULL", &[]).await.unwrap();
         assert_eq!(active.get::<_, i64>(0), 0);
-        let retained_move = control.query_one("SELECT p.deleted_at,m.observed_at FROM central_capacity_moves m JOIN central_capacity_policy p USING(scope_id,generation)",&[]).await.unwrap();
-        assert_eq!(retained_move.get::<_, Option<i64>>(0), Some(5000));
+        let retained_move = control.query_one("SELECT p.deleted_at,m.observed_at FROM central_capacity_moves m JOIN central_capacity_policy p USING(scope_id,generation) WHERE m.observed_at=1004",&[]).await.unwrap();
+        assert_eq!(retained_move.get::<_, Option<i64>>(0), Some(6000));
         assert_eq!(retained_move.get::<_, i64>(1), 1004);
         // The active generation survives a second independent connection.
         replica
-            .capacity_state(&format!("model:{model}"), 5001, |_| Ok(()))
+            .capacity_state(&format!("model:{model}"), 6001, |_| Ok(()))
             .await
             .unwrap();
         assert_eq!(

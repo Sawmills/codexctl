@@ -172,7 +172,7 @@ impl State {
                 )
             })
     }
-    fn prune(&mut self, now: i64) {
+    pub(super) fn prune(&mut self, now: i64) {
         self.histories.retain(|_, h| {
             h.seen.retain(|_, at| now.saturating_sub(*at) <= WINDOW);
             h.failures.retain(|at| now.saturating_sub(*at) <= WINDOW);
