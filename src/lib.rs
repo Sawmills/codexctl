@@ -8,6 +8,7 @@ mod outcomes;
 pub mod profile;
 #[cfg(feature = "central-prototype")]
 pub mod relay;
+pub mod state_cap;
 pub mod status_format;
 pub mod status_json;
 pub mod status_pace;

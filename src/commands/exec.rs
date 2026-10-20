@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::api;
 use crate::commands::alias;
+use crate::commands::codex::restore_before_codex_resume;
 use crate::config::{self, Paths};
 use crate::profile;
 use crate::store;
@@ -60,6 +61,12 @@ fn run_from(paths: &Paths, account: &str, args: &[String]) -> Result<i32> {
     };
 
     let home = provision_exec_home(paths, alias)?;
+    if Path::new(program)
+        .file_stem()
+        .is_some_and(|name| name == "codex")
+    {
+        restore_before_codex_resume(&paths.codex_home(), arguments)?;
+    }
     let status = Command::new(program)
         .args(arguments)
         .env("CODEX_HOME", &home)
