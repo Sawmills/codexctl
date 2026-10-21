@@ -8,5 +8,4 @@
   value: >-
     cp /projected/vault-key /keys/vault-key;
     cp /projected/google-oidc-client-secret /keys/oidc-client-secret;
-    cp /projected/metrics-token /keys/metrics-token;
-    chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+    chmod 600 /keys/vault-key /keys/oidc-client-secret

@@ -83,8 +83,7 @@ spec:
             - >-
               cp /projected/vault-key /keys/vault-key;
               cp /projected/google-oidc-client-secret /keys/oidc-client-secret;
-              cp /projected/metrics-token /keys/metrics-token;
-              chmod 600 /keys/vault-key /keys/oidc-client-secret /keys/metrics-token
+              chmod 600 /keys/vault-key /keys/oidc-client-secret
           securityContext:
             {
               allowPrivilegeEscalation: false,
@@ -147,7 +146,7 @@ spec:
             - >-
               exec codexctl-central serve --state /data/state --key-file /keys/vault-key
               --listen 0.0.0.0:8787 --public-url https://codexctl.ue1.staging.plat.sm-svc.com
-              --metrics-token-file /keys/metrics-token --sso-config /configuration/sso.json
+              --sso-config /configuration/sso.json
           env:
             - name: CODEXCTL_CENTRAL_STORE
               value: postgres
