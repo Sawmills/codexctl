@@ -158,6 +158,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_backfill_clock_keeps_the_administrative_expiry() {
+        let database = std::env::var("DATABASE_URL").expect("owned DATABASE_URL required");
+        let database = super::super::backfill_test_database(&database).await;
+        let case = Case::new(&database).await;
+        let expired = command(&case.database, &case.state, &case.key, "backfill")
+            .env("CODEXCTL_TEST_BACKFILL_DATE", "2026-10-21")
+            .output()
+            .await
+            .unwrap();
+        assert!(!expired.status.success());
+        assert!(
+            String::from_utf8_lossy(&expired.stderr)
+                .contains("backfill scan exception expired after 2026-10-20")
+        );
+        let authorized = command(&case.database, &case.state, &case.key, "backfill")
+            .env("CODEXCTL_TEST_BACKFILL_DATE", "2026-10-20")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            authorized.status.success(),
+            "fixed fixture clock must allow the real backfill within its expiry: {}",
+            String::from_utf8_lossy(&authorized.stderr)
+        );
+        case.finish().await;
+    }
+
+    #[tokio::test]
+    async fn fixture_backfill_clock_rejects_other_databases() {
+        let database = std::env::var("DATABASE_URL").expect("owned DATABASE_URL required");
+        let case = Case::new(&database).await;
+        let result = command(&case.database, &case.state, &case.key, "backfill")
+            .output()
+            .await
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("fixture backfill clock requires a synthetic loopback database")
+        );
+        case.finish().await;
+    }
+
+    #[tokio::test]
     async fn cancelled_admission_never_starts_a_cli_and_the_next_fixture_progresses() {
         let database = std::env::var("DATABASE_URL").expect("owned DATABASE_URL required");
         let database = super::super::backfill_test_database_named(&database, true).await;

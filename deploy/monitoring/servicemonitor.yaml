@@ -13,6 +13,3 @@ spec:
     - port: http
       path: /metrics
       interval: 30s
-      bearerTokenSecret:
-        name: codexctl-secrets
-        key: metrics-token
