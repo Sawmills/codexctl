@@ -70,7 +70,10 @@ fn fixture_authorization_date(target: &PostgresStore, observed: &str) -> Result<
                 if matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
         })
         || !config.get_hostaddrs().iter().all(|host| host.is_loopback())
-        || !matches!(config.get_dbname(), Some("codexctl_a5" | "codexctl_a5_canary"))
+        || !matches!(
+            config.get_dbname(),
+            Some("codexctl_a5" | "codexctl_a5_canary")
+        )
     {
         bail!("fixture backfill clock requires a synthetic loopback database");
     }
