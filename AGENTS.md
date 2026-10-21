@@ -18,8 +18,7 @@
 - `src/api.rs` contains API code.
 - `src/config.rs` and `src/profile.rs` contain configuration and profile code.
 - `tests/api_test.rs`, `tests/cli_test.rs`, `tests/config_test.rs`, `tests/exec_test.rs`, and `tests/profile_test.rs` contain tests.
-- `docs/superpowers/specs/` contains design specifications.
-- `docs/superpowers/plans/` contains implementation runbooks. Use the existing matching plan instead of adding task workflow here.
+- `docs/superpowers/plans/` retains linked B33 and SSO cutover runbooks.
 
 ## Commands
 
