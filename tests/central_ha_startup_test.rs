@@ -197,6 +197,7 @@ fn command(database: &str, state: &Path, key: &Path, operation: &str) -> Command
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost");
     if operation == "backfill" {
+        command.env("CODEXCTL_TEST_BACKFILL_DATE", "2026-10-20");
         let canary = reqwest::Url::parse(database).unwrap().path() == "/codexctl_a5_canary";
         command
             .arg("--scan-exception")

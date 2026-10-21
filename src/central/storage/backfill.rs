@@ -44,11 +44,41 @@ pub(super) async fn authorize(
     }).await?;
     let database: &str = row.get(0);
     let date: &str = row.get(1);
+    #[cfg(feature = "central-real-db-tests")]
+    let fixture_date = fixture_authorization_date(target, date)?;
+    #[cfg(feature = "central-real-db-tests")]
+    let date = fixture_date.as_str();
     check_scope(
         exception,
         database,
         chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?,
     )
+}
+
+#[cfg(feature = "central-real-db-tests")]
+fn fixture_authorization_date(target: &PostgresStore, observed: &str) -> Result<String> {
+    let Some(date) = std::env::var_os("CODEXCTL_TEST_BACKFILL_DATE") else {
+        return Ok(observed.to_owned());
+    };
+    let config = target
+        .url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|_| anyhow::anyhow!("fixture backfill clock requires a URL connection"))?;
+    if config.get_hosts().is_empty()
+        || !config.get_hosts().iter().all(|host| {
+            matches!(host, tokio_postgres::config::Host::Tcp(name)
+                if matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+        })
+        || !config.get_hostaddrs().iter().all(|host| host.is_loopback())
+        || !matches!(
+            config.get_dbname(),
+            Some("codexctl_a5" | "codexctl_a5_canary")
+        )
+    {
+        bail!("fixture backfill clock requires a synthetic loopback database");
+    }
+    date.into_string()
+        .map_err(|_| anyhow::anyhow!("fixture backfill date must be valid UTF-8"))
 }
 
 fn check_scope(
