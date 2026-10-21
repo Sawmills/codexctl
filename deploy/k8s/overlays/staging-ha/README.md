@@ -19,7 +19,9 @@ Staging's NodePool expires after 336 hours with no NodePool termination grace;
 the annotation can block expiry drain indefinitely. Coordinate maintenance with
 HQ and the infra owner; see [Kubernetes shape](../../../../docs/central-ha.md#4-kubernetes-shape).
 The `codexctl-secrets`
-ExternalSecret supplies the vault key, SSO secret, and metrics token. The infra
+ExternalSecret supplies the vault key and SSO secret. `/metrics` needs no bearer;
+[PR #259](https://github.com/Sawmills/codexctl/pull/259) retires its manifest wiring.
+Rollout, scrape readback and existing SSM parameter deletion remain separate operator gates. The infra
 repository owns `codexctl-postgres`; infra#1605 repoints its five SSM references
 to `/rds/quota-manager/codexctl-a5/`. Egress allows DNS, HTTPS, and private VPC PostgreSQL. The container
 mounts the [AWS RDS global CA bundle](../../rds-ca/README.md) read-only at
