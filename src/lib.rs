@@ -26,7 +26,9 @@ pub(crate) const RELAY_KNOWN_MODELS: &[&str] = &[
     "gpt-5.5",
     "gpt-6",
     "gpt-6.1",
+    // Preserve the model label when reading stored relay evidence.
     "gpt-6.1-sol",
+    "gpt-6.2-sol",
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
