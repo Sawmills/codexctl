@@ -46,7 +46,7 @@ path = "src/bin/codexctl-central.rs"
 required-features = ["central-prototype"]
 
 [dependencies]
-openidconnect = { version = "4", optional = true, default-features = false, features = [
+openidconnect = { version = "4.1", optional = true, default-features = false, features = [
   "reqwest",
   "rustls-tls",
 ] }
@@ -69,7 +69,7 @@ webpki-roots = { version = "1", optional = true }
 anyhow = "1"
 hostname = "0.4"
 regex = "1"
-rusqlite = { version = "0.40", default-features = false, features = [
+rusqlite = { version = "0.41", default-features = false, features = [
   "bundled",
 ] }
 chrono = { version = "0.4", features = ["serde"] }
