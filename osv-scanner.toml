@@ -1,3 +1,7 @@
 [[IgnoredVulns]]
 id = "RUSTSEC-2023-0071"
 reason = "openidconnect uses RSA public-key verification only; the private-key timing path is unreachable. Reassess if signing/decryption is added. See docs/research/central-staging.md."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "Codexctl uses Chrono for RFC 3339 parsing and UTC timestamps in token expiry and usage windows. This maintenance notice identifies no vulnerable code path or patched release. Reassess when migrating those paths to a maintained crate or if a security advisory affects them."
