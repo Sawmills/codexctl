@@ -7790,9 +7790,10 @@ fn relay_capacity_exhausted_series_exist_before_the_first_event() {
                 && line.contains("outcome=\"exhausted\"")
         })
         .collect();
+    // GPT-6.2 Sol adds two event kinds across three account classes.
     assert_eq!(
         exhausted.len(),
-        78,
+        84,
         "all allowed exhausted series: {metrics}"
     );
     assert!(

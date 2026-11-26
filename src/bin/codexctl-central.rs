@@ -148,7 +148,7 @@ enum Commands {
         token_file: PathBuf,
         #[arg(long, default_value = "codex")]
         codex_bin: PathBuf,
-        #[arg(long, default_value = "gpt-6.1-sol")]
+        #[arg(long, default_value = "gpt-6.2-sol")]
         model: String,
         prompt: String,
     },
@@ -428,4 +428,26 @@ async fn execute(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, Parser};
+
+    #[test]
+    fn run_defaults_to_gpt_6_2_sol_when_model_is_omitted() {
+        let cli = Cli::parse_from([
+            "codexctl-central",
+            "run",
+            "--server",
+            "https://central.example",
+            "--token-file",
+            "device.token",
+            "Reply OK",
+        ]);
+        let Commands::Run { model, .. } = cli.command else {
+            panic!("expected the run command");
+        };
+        assert_eq!(model, "gpt-6.2-sol");
+    }
 }
