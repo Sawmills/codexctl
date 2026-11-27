@@ -145,7 +145,7 @@ jobs:
 
   build-macos:
     name: Build (macOS)
-    # macOS release builds run on every tag in release.yml (macos-14, macos-15-intel).
+    # macOS release builds run on every tag in release.yml (macos-15, macos-15-intel).
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: macos-latest
     steps:

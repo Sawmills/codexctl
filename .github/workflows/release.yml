@@ -86,7 +86,7 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             label: Darwin_arm64
           # trunk-ignore(actionlint/runner-label): Current GitHub Intel macOS runner label.
